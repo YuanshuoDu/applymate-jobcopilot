@@ -6,6 +6,17 @@ import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verifica
 
 const jobId = "job-current"
 const artifact = { artifactId: "private-artifact", version: 1, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+type VerificationFixture = Readonly<{
+  status: "passed" | "failed" | "unverified"
+  reasonCode: string
+  evidenceDigest: string | null
+  resultDigest: string | null
+  criteria: readonly Readonly<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: string }>[]
+}>
+const passedVerification: VerificationFixture = {
+  status: "passed", reasonCode: "criteria_met", evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64),
+  criteria: [{ criterionId: "coverage", status: "passed", reasonCode: "criteria_met" }],
+}
 function node(templateId: string, index: number, resultProjection: unknown) {
   return {
     key: `private-node-${index}`, templateId, taskId: `private-task-${index}`, status: "completed", readiness: "terminal",
@@ -16,15 +27,14 @@ function node(templateId: string, index: number, resultProjection: unknown) {
 function projection(role: string, details: Record<string, unknown>) {
   return { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available", role, status: "completed", ...details }
 }
-function makeRecord(turn: string, root: string, score: number, throughSequence = "11", selectedJobId = jobId): SelectedJobMemoryRecord {
-  const verification = {
-    verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
-    evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64),
-    criteria: [{ criterionId: "coverage", status: "passed", reasonCode: "criteria_met" }],
-  }
+function makeRecord(turn: string, root: string, score: number, throughSequence = "11", selectedJobId = jobId,
+  verification: VerificationFixture = passedVerification): SelectedJobMemoryRecord {
+  const verificationReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, ...verification }
   const graphNodes = [
     { ...node("scout", 0, projection("scout", { candidateCount: 1, evidenceCount: 1, candidates: [{ jobId: selectedJobId, source: "greenhouse", evidenceKinds: ["job"] }] })) },
-    { ...node("analyst", 1, projection("analyst", { findingCount: 1, evidenceCount: 2, findings: [{ jobId: selectedJobId, score, evidenceKinds: ["job", "resume"] }] })), verificationCriterionIds: ["coverage"], verificationReport: verification },
+    { ...node("analyst", 1, projection("analyst", { findingCount: 1, evidenceCount: 2, findings: [{ jobId: selectedJobId, score, evidenceKinds: ["job", "resume"] }] })),
+      status: verification.status === "passed" ? "completed" : "failed",
+      verificationCriterionIds: verification.criteria.map(criterion => criterion.criterionId), verificationReport },
     { ...node("cover_letter_writer", 2, projection("writer", { artifactRef: artifact })) },
     { ...node("cover_letter_reviewer", 3, projection("reviewer", { artifactRef: artifact, reviewHash: `sha256:${"e".repeat(64)}`, reviewStatus: "passed" })) },
   ]
@@ -64,6 +74,90 @@ describe("selected-job history projection", () => {
     expect(serialized).toContain("reviewOutcome")
     expect(serialized).toContain("passed")
     expect(Buffer.byteLength(JSON.stringify(projected?.content), "utf8")).toBeLessThanOrEqual(8 * 1024)
+  })
+
+  it("adds sorted deduplicated negative reason hints to retained and direct histories only", () => {
+    const failed = makeRecord("private-failed-turn", "private-failed-root", 2, "12", jobId, {
+      status: "failed", reasonCode: "reported_score_below_minimum", evidenceDigest: "f".repeat(64), resultDigest: "e".repeat(64),
+      criteria: [
+        { criterionId: "private-score-check", status: "failed", reasonCode: "reported_score_below_minimum" },
+        { criterionId: "private-count-check", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "private-second-count-check", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "private-passed-check", status: "passed", reasonCode: "criteria_met" },
+      ],
+    })
+    const retained = projectSelectedJobHistory([history(failed, 41n)])
+    const direct = projectSelectedJobHistoryOutcomes([outcome(failed, 41n)])
+    expect(direct).toEqual(retained)
+    const turns = (direct?.content as { turns: Array<{ nodes: Array<{ role: string; reasonHints?: string[] }> }> }).turns
+    expect(turns[0]?.nodes.find(value => value.role === "analyst")?.reasonHints)
+      .toEqual(["criterion_not_met", "reported_score_below_minimum"])
+    expect(turns[0]?.nodes.find(value => value.role === "scout")).not.toHaveProperty("reasonHints")
+    const serialized = json(direct)
+    for (const secret of ["private-failed-turn", "private-failed-root", "private-score-check", "private-count-check", "evidenceDigest", "resultDigest", "sha256:", "criteria_met", "verification", "criteria", "PASS"]) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it("adds the unverified evidence-gap reason but keeps passed and missing reports byte-compatible", () => {
+    const unverified = makeRecord("private-gap-turn", "private-gap-root", 3, "13", jobId, {
+      status: "unverified", reasonCode: "canonical_evidence_missing", evidenceDigest: null, resultDigest: null,
+      criteria: [
+        { criterionId: "private-evidence-check", status: "unverified", reasonCode: "canonical_evidence_missing" },
+        { criterionId: "private-second-evidence-check", status: "unverified", reasonCode: "canonical_evidence_missing" },
+      ],
+    })
+    const historyBlock = projectSelectedJobHistory([history(unverified, 43n)])
+    expect(projectSelectedJobHistoryOutcomes([outcome(unverified, 43n)])).toEqual(historyBlock)
+    const turns = (historyBlock?.content as { turns: Array<{ nodes: Array<{ role: string; reasonHints?: string[] }> }> }).turns
+    expect(turns[0]?.nodes.find(value => value.role === "analyst")?.reasonHints).toEqual(["canonical_evidence_missing"])
+
+    const passed = projectSelectedJobHistory([history(makeRecord("private-pass-turn", "private-pass-root", 8), 45n)])
+    const passedNodes = (passed?.content as { turns: Array<{ nodes: Array<{ role: string; status: string; result: unknown; reasonHints?: string[] }> }> }).turns[0]?.nodes
+    const analyst = passedNodes?.find(value => value.role === "analyst")
+    expect(analyst).toBeDefined()
+    expect(Object.keys(analyst!)).toEqual(["role", "status", "result"])
+    expect(JSON.stringify(analyst)).toBe(JSON.stringify({
+      role: "analyst", status: "completed", result: { availability: "available", score: 8, evidenceKinds: ["job", "resume"] },
+    }))
+    const scout = passedNodes?.find(value => value.role === "scout")
+    expect(scout).toBeDefined()
+    expect(JSON.stringify(scout)).toBe(JSON.stringify({
+      role: "scout", status: "completed",
+      result: { availability: "available", source: "greenhouse", evidenceKinds: ["job"] },
+    }))
+  })
+
+  it("accepts eight distinct negative hints and sorts them lexically", () => {
+    const source = outcome(makeRecord("private-eight-hints-turn", "private-eight-hints-root", 4), 47n)
+    const reasonCodes: Array<NonNullable<SelectedJobMemoryNode["verification"]>["criteria"][number]["reasonCode"]> = [
+      "result_invalid", "result_evidence_unbound", "canonical_evidence_missing", "contract_invalid",
+      "result_ambiguous", "canonical_evidence_ambiguous", "projection_invalid", "canonical_evidence_invalid",
+    ]
+    const nodes: SelectedJobMemoryNode[] = source.nodes.map(value => value.role === "analyst" ? {
+      ...value, status: "failed", verification: { status: "unverified",
+        criteria: reasonCodes.map(reasonCode => ({ status: "unverified" as const, reasonCode })) },
+    } : value)
+    const projected = projectSelectedJobHistoryOutcomes([{ ...source, nodes }])
+    const turns = (projected?.content as { turns: Array<{ nodes: Array<{ role: string; reasonHints?: string[] }> }> }).turns
+    const hints = turns[0]?.nodes.find(value => value.role === "analyst")?.reasonHints
+    expect(hints).toHaveLength(8)
+    expect(hints).toEqual([
+      "canonical_evidence_ambiguous", "canonical_evidence_invalid", "canonical_evidence_missing", "contract_invalid",
+      "projection_invalid", "result_ambiguous", "result_evidence_unbound", "result_invalid",
+    ])
+  })
+
+  it("rejects unknown or success reason codes smuggled into a direct typed node", () => {
+    const record = makeRecord("turn-invalid-hint", "root-invalid-hint", 4)
+    const valid = outcome(record, 47n)
+    const node = record.nodes.find(value => value.role === "analyst")
+    if (!node) throw new Error("expected analyst node")
+    for (const reasonCode of ["private_reason", "criteria_met"]) {
+      const malformed = { ...node, verification: { status: "failed", criteria: [{ status: "failed", reasonCode }] } }
+      const value = { ...valid, nodes: [malformed] as unknown as SelectedJobMemoryNode[] }
+      expect(projectSelectedJobHistoryOutcomes([value])).toBeUndefined()
+    }
   })
 
   it("keeps only the two newest terminal Turns, eight nodes, and deterministic order", () => {

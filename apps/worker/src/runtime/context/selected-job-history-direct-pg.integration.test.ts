@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
-import { taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
+import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFIER_VERSION, verifyTaskGraphNodeEvidence } from "../subagents/task-graph-pg-verification.js"
 import { createPgDirectSelectedJobHistoryStore, type DirectSelectedJobHistoryLoadInput } from "./selected-job-history-direct-store.js"
+import { projectSelectedJobHistoryOutcomes } from "./selected-job-history.js"
 import type { TurnLease } from "../turns/lease.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -21,7 +24,7 @@ function disposableUrl(): string | null {
   return value
 }
 
-type Source = Readonly<{ turnId: string; rootTaskId: string; childId: string; finalItemId: string; sessionId: string; userId: string; jobId: string; startSequence: number; stepId?: string; status?: "completed" | "failed" | "interrupted" }>
+type Source = Readonly<{ turnId: string; rootTaskId: string; childId: string; finalItemId: string; sessionId: string; userId: string; jobId: string; startSequence: number; stepId?: string; status?: "completed" | "failed" | "interrupted"; verification?: TaskGraphVerificationContract }>
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
 const userId = `direct-history-user-${suffix}`, otherUserId = `direct-history-other-user-${suffix}`
 const sessionId = `direct-history-session-${suffix}`, otherSessionId = `direct-history-other-session-${suffix}`
@@ -38,7 +41,10 @@ const otherJobSource: Source = { turnId: `direct-history-other-job-turn-${suffix
   sessionId, userId, jobId: otherJobId, stepId: `direct-history-other-job-step-${suffix}`, startSequence: 25 }
 const failedSource: Source = { turnId: `direct-history-failed-turn-${suffix}`, rootTaskId: `direct-history-failed-root-${suffix}`,
   childId: `direct-history-failed-child-${suffix}`, finalItemId: `direct-history-failed-final-${suffix}`,
-  sessionId, userId, jobId, startSequence: 21, status: "failed" }
+  sessionId, userId, jobId, startSequence: 21, status: "failed", verification: {
+    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+    criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
+  } }
 const interruptedSource: Source = { turnId: `direct-history-interrupted-turn-${suffix}`, rootTaskId: `direct-history-interrupted-root-${suffix}`,
   childId: `direct-history-interrupted-child-${suffix}`, finalItemId: `direct-history-interrupted-final-${suffix}`,
   sessionId, userId, jobId, startSequence: 23, status: "interrupted" }
@@ -63,8 +69,9 @@ async function insertSession(id: string, owner: string, sequence: number): Promi
 async function insertSource(source: Source): Promise<void> {
   const status = source.status ?? "completed"
   const input = JSON.stringify({ selectedJobPreparation: { jobId: source.jobId } })
-  const graph = { schemaVersion: "agent-harness.v2.task-graph", nodes: [{ key: "scout", templateId: "scout",
-    goal: "Find a suitable role", successCriteria: ["Find one role"], dependsOn: [], depth: 1, taskId: source.childId }] }
+  const graph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "scout", templateId: "scout",
+    goal: "Find a suitable role", successCriteria: ["Find one role"], dependsOn: [], depth: 1, taskId: source.childId,
+    ...(source.verification ? { verificationDisposition: "typed", verification: source.verification } : {}) }] })
   await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
     "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
     VALUES ($1, $2, $3, $6, 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $5, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
@@ -76,9 +83,9 @@ async function insertSource(source: Source): Promise<void> {
   [source.rootTaskId, source.sessionId, source.turnId, status])
   await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
-    VALUES ($1, $2, $3, $4, $4, '/source/scout', 1, 'scout', 'scout', 'completed', 'Find a suitable role', '[]'::jsonb, '["Find one role"]'::jsonb,
+    VALUES ($1, $2, $3, $4, $4, '/source/scout', 1, 'scout', 'scout', $5, 'Find a suitable role', '[]'::jsonb, '["Find one role"]'::jsonb,
       '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP)`,
-  [source.childId, source.sessionId, source.turnId, source.rootTaskId])
+  [source.childId, source.sessionId, source.turnId, source.rootTaskId, source.verification ? "running" : "completed"])
   if (status === "completed") {
     if (!source.stepId) throw new Error("Completed history source needs its canonical Step ID")
     await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
@@ -106,6 +113,37 @@ async function insertSource(source: Source): Promise<void> {
     `turn:${source.turnId}:event:turn-started`, JSON.stringify({ taskId: source.rootTaskId, rootTaskId: source.rootTaskId }),
     `direct-history-terminal-${source.turnId}`, terminalItemId, terminal, terminalType, correlationId, terminalKey,
     JSON.stringify(terminalPayload)])
+  if (source.verification) await persistUnverifiedVerificationReport(source, graph)
+}
+
+async function persistUnverifiedVerificationReport(
+  source: Source,
+  snapshot: ReturnType<typeof parseTaskGraphSnapshot>,
+): Promise<void> {
+  if (source.status !== "failed" || !source.verification) throw new Error("typed history fixture must be a failed source")
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN")
+    const verification = await verifyTaskGraphNodeEvidence(client, {
+      scope: { userId: source.userId, sessionId: source.sessionId, turnId: source.turnId,
+        rootTaskId: source.rootTaskId, parentTaskId: source.rootTaskId, taskId: source.childId, attemptCount: 1 },
+      snapshot, node: snapshot.nodes[0]!, structuredResult: {},
+    })
+    if (verification.report.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION || verification.report.status !== "unverified"
+      || verification.report.reasonCode !== "canonical_evidence_invalid" || verification.report.evidenceDigest !== null
+      || verification.report.resultDigest !== null) throw new Error("typed history fixture did not produce the expected verifier report")
+    const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'failed', "failureReason" = 'task_graph_verification_unverified',
+      "result" = $1::jsonb, "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "rootTaskId" = $5 AND "parentTaskId" = $5 AND "status" = 'running' AND "attemptCount" = 1`,
+    [JSON.stringify({ taskGraphVerificationReport: verification.report }), source.childId, source.sessionId, source.turnId, source.rootTaskId])
+    if (updated.rowCount !== 1) throw new Error("typed history fixture child update lost its source fence")
+    await client.query("COMMIT")
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+  }
 }
 
 describePg("direct selected-job history PostgreSQL source validation", () => {
@@ -162,6 +200,26 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
     expect(history.every(item => item.jobId === jobId && item.nodes.length === 1 && !JSON.stringify(item.nodes).includes("Find a suitable role"))).toBe(true)
     expect(history.some(item => item.sourceTurnId === otherJobSource.turnId || item.sourceTurnId === otherSessionSource.turnId
       || item.sourceTurnId === otherUserSource.turnId)).toBe(false)
+  })
+
+  it("projects a validated stored unverified report as bounded reason hints", async () => {
+    const input: DirectSelectedJobHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+      rootAttemptCount: 2, stepId: currentStepId, jobId, now: new Date() }
+    const outcomes = await createPgDirectSelectedJobHistoryStore(pool!).load(input)
+    const outcome = outcomes.find(item => item.sourceTurnId === failedSource.turnId)
+    if (!outcome) throw new Error("typed failed source was not returned by the direct reader")
+    expect(outcome.nodes[0]).toMatchObject({ status: "failed", verification: { status: "unverified",
+      criteria: [{ status: "unverified", reasonCode: "canonical_evidence_invalid" }] } })
+
+    const block = projectSelectedJobHistoryOutcomes([outcome])
+    expect(block?.id).toBe("selected-job-history")
+    const encoded = JSON.stringify(block?.content ?? null)
+    expect(JSON.parse(encoded)).toMatchObject({ kind: "selected_job_history", informationalOnly: true,
+      turns: [{ nodes: [{ role: "scout", status: "failed", reasonHints: ["canonical_evidence_invalid"] }] }] })
+    for (const privateValue of [failedSource.turnId, failedSource.rootTaskId, "candidate-count", TASK_GRAPH_VERIFIER_VERSION,
+      "verificationStatus", "taskGraphVerificationReport", "evidenceDigest", "resultDigest", "task_graph_verification_unverified"]) {
+      expect(encoded).not.toContain(privateValue)
+    }
   })
 
   it("counts a malformed wrong-actor duplicate Root terminal event as ambiguous", async () => {

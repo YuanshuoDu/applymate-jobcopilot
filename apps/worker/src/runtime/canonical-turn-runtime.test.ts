@@ -21,7 +21,7 @@ import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
-import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
+import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
@@ -1144,9 +1144,25 @@ describe("createCanonicalTurnRuntime", () => {
       ...node.resultProjection, findings: [{ jobId: "job-1", score: 6.5, evidenceKinds: ["job"] }],
     } })) }
     const priorHistory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", throughSequence: "9", graph: priorGraph })!
-    const outcome: ValidatedSelectedJobHistoryOutcome = {
-      jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: priorHistory.nodes,
+    const failedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "failed", criteria: [
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+        { status: "failed", reasonCode: "criterion_not_met" },
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+      ] },
     }
+    const unverifiedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "unverified", criteria: [
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+      ] },
+    }
+    const outcomes: ValidatedSelectedJobHistoryOutcome[] = [
+      { jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: [failedNode] },
+      { jobId: "job-1", sourceTurnId: "private-unverified-turn", sourceRootTaskId: "private-unverified-root", terminalSequence: 28n, nodes: [unverifiedNode] },
+    ]
     const currentGraph = graph as unknown as TaskGraphCurrentState
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 4, nodes: [], readyTaskIds: [] })),
@@ -1158,7 +1174,7 @@ describe("createCanonicalTurnRuntime", () => {
     selectedJobDirectHistory.load.mockReset()
     selectedJobDirectHistory.load.mockImplementation(async () => {
       eventTypesAtHistoryRead = events.map(event => event.type)
-      return [outcome]
+      return outcomes
     })
     const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
     const compactionRunner = vi.fn(async () => ({ status: "compacted" }))
@@ -1186,6 +1202,8 @@ describe("createCanonicalTurnRuntime", () => {
     await runtime.execute({ lease, signal: new AbortController().signal })
     const requestText = requests[0]?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
     expect(requestText).toContain("selected_job_history")
+    expect(requestText).toContain('"reasonHints":["criterion_not_met","reported_score_below_minimum"]')
+    expect(requestText).toContain('"reasonHints":["canonical_evidence_missing"]')
     expect(requestText).toContain('"score":6.5')
     expect(requestText).toContain("CURRENT_GRAPH_RUNTIME_SENTINEL")
     expect(requestText).not.toContain("selected_job_memory")
@@ -1202,6 +1220,15 @@ describe("createCanonicalTurnRuntime", () => {
     expect(flags.turnBoundaryCompactionEnabled).toBe(false)
     expect(requestText).not.toContain("private-prior-turn")
     expect(requestText).not.toContain("private-prior-root")
+    expect(requestText).not.toContain("private-unverified-turn")
+    expect(requestText).not.toContain("private-unverified-root")
+    expect(requestText).not.toContain("verification")
+    expect(requestText).not.toContain("criteria")
+    expect(requestText).not.toContain("criteria_met")
+    expect(requestText).not.toContain("criterionId")
+    expect(requestText).not.toContain("evidenceDigest")
+    expect(requestText).not.toContain("resultDigest")
+    expect(requestText).not.toContain("PASS")
     expect(requestText).not.toContain("must be filtered")
   })
 
@@ -1227,11 +1254,47 @@ describe("createCanonicalTurnRuntime", () => {
       ...node.resultProjection, findings: [{ jobId: "job-1", score: 6.5, evidenceKinds: ["job"] }],
     } })) }
     const priorHistory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", throughSequence: "9", graph: priorGraph })!
-    const outcome: ValidatedSelectedJobHistoryOutcome = {
-      jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: priorHistory.nodes,
+    const failedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "failed", criteria: [
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+        { status: "failed", reasonCode: "criterion_not_met" },
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+      ] },
     }
+    const unverifiedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "unverified", criteria: [
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+      ] },
+    }
+    const outcomes: ValidatedSelectedJobHistoryOutcome[] = [
+      { jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: [failedNode] },
+      { jobId: "job-1", sourceTurnId: "private-unverified-turn", sourceRootTaskId: "private-unverified-root", terminalSequence: 28n, nodes: [unverifiedNode] },
+    ]
+    const freshSteer: StoredAgentInput = {
+      id: "accepted-fresh-steer", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "fresh-steer-message", delivery: "steer", status: "accepted",
+      content: [{ type: "text", text: "CURRENT_STEERING_MEMORY_SENTINEL: prioritize Dublin" }], acceptedSequence: 3n,
+      consumedByStepId: null, consumedAt: null, createdAt: lease.leaseStartedAt,
+    }
+    const runtimeClaimStore: InputClaimStore = {
+      scope: { userId: lease.userId },
+      withTransaction: work => work({
+        getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [freshSteer], newlyClaimedInputIds: [freshSteer.id] }),
+        persistCheckpoint: async () => undefined,
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const contexts: StepContext[] = []
+    const baseContextBuilder = new StepContextBuilder(runtimeClaimStore, ownerFence)
     const requests: HarnessModelRequest[] = []
-    selectedJobDirectHistory.load.mockReset().mockImplementation(async () => [outcome])
+    selectedJobDirectHistory.load.mockReset().mockImplementation(async () => outcomes)
     const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
     const planningTools = tools(true)
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
@@ -1243,13 +1306,25 @@ describe("createCanonicalTurnRuntime", () => {
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
       stateLoader: async () => ({
         ...selectedJobState(), toolPolicySnapshot: {}, selectedJobMemories: [sameTurnMemory, otherJobMemory],
-        snapshot: { ...selectedJobState().snapshot, toolObservations: [
+        snapshot: { ...selectedJobState().snapshot,
+          goal: { id: "goal-current", content: "CURRENT_GOAL_MEMORY_SENTINEL: find Dublin roles" },
+          steerHistory: [
+            { id: "qa-current", content: { question: "Preferred location?", answer: "Dublin" } },
+            { id: "steer-current", content: "CURRENT_STEERING_MEMORY_SENTINEL: prioritize Dublin" },
+          ],
+          toolObservations: [
           { id: "task-graph-current", content: { kind: "task_graph_current", revision: graph.revision, nodes: graph.nodes } },
         ] },
       }),
       rootTaskStore: rootStore() as never,
       toolRuntimeFactory: () => ({ ...planningTools, registry: { ...planningTools.registry, register: vi.fn() } }) as never,
-      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => ({
+        build: async request => {
+          const context = await baseContextBuilder.build(request)
+          contexts.push(context)
+          return context
+        },
+      }),
       modelRuntimeFactory: async () => ({ adapter: {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
@@ -1259,14 +1334,34 @@ describe("createCanonicalTurnRuntime", () => {
 
     await runtime.execute({ lease, signal: new AbortController().signal })
     const requestText = requests[0]?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const systemText = requests[0]?.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const historyBlocks = contexts[0]?.blocks.filter(block => block.id === "observation:selected-job-history") ?? []
+    const serializedHistory = JSON.stringify(historyBlocks[0]?.content)
     expect(requestText).toContain("selected_job_history")
+    expect(requestText.split("selected_job_history").length - 1).toBe(1)
+    expect(requestText).toContain('"reasonHints":["criterion_not_met","reported_score_below_minimum"]')
+    expect(requestText).toContain('"reasonHints":["canonical_evidence_missing"]')
     expect(requestText).toContain("selected_job_memory")
     expect(requestText).toContain('"score":6.5')
     expect(requestText).toContain('"score":8')
+    expect(requestText).toContain("CURRENT_GOAL_MEMORY_SENTINEL")
+    expect(requestText).toContain("CURRENT_STEERING_MEMORY_SENTINEL")
+    expect(requestText).toContain("Preferred location?")
     expect(requestText).toContain("CURRENT_GRAPH_WITH_MEMORY")
+    expect(requestText).toContain('"revision":4')
+    expect(historyBlocks).toHaveLength(1)
+    expect(historyBlocks[0]).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
     expect(requestText).not.toContain("other-job-559")
     expect(requestText).not.toContain("private-prior-turn")
     expect(requestText).not.toContain("private-prior-root")
+    expect(requestText).not.toContain("private-unverified-turn")
+    expect(requestText).not.toContain("private-unverified-root")
+    for (const privateValue of ["verification", "criteria", "criteria_met", "criterionId", "evidenceDigest", "resultDigest", "PASS"]) {
+      expect(serializedHistory).not.toContain(privateValue)
+    }
+    expect(systemText).not.toContain("reported_score_below_minimum")
+    expect(systemText).not.toContain("canonical_evidence_missing")
     expect(selectedJobDirectHistory.load).toHaveBeenCalledTimes(1)
     expect(selectedJobDirectHistory.load.mock.calls[0]?.[0]).not.toHaveProperty("records")
     expect(selectedJobHistory.load).not.toHaveBeenCalled()
