@@ -8,6 +8,8 @@ import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } fro
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
+import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
 type GateWriter = Pick<TurnExecutionEventWriter, "append">
@@ -39,7 +41,9 @@ describe("assertCompletionAllowed", () => {
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
     expect(completionRecoverySnapshot(snapshot, "step-2", STEERING_RECONCILIATION_FEEDBACK).system[0]?.content)
       .toContain("Review the current user instructions")
-    expect(completionRecoverySnapshot(snapshot, "step-3", "criterion=evidence missing").system[0]?.content)
+    expect(completionRecoverySnapshot(snapshot, "step-3", tagTaskGraphRepairRecovery(
+      "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. nodeOrdinal=1 status=failed reasonCode=evidence_missing", 0,
+    )).system[0]?.content)
       .toContain("Replan or repair the affected criteria, then verify again.")
   })
 
@@ -85,6 +89,20 @@ describe("assertCompletionAllowed", () => {
     }, `final-rejected:${step.id}`)
     expect(STEERING_RECONCILIATION_FEEDBACK).not.toContain("inputId")
     expect(STEERING_RECONCILIATION_FEEDBACK).not.toContain("PASS")
+  })
+
+  it("keeps original multi-action native feedback in the rejection event and strips typed IDs from recovery", async () => {
+    const feedback = "Independent native verification is uncertain. Actions: evidence_missing: gather current owned evidence. evidence_conflict: reconcile current owned sources and resolve contradictions. target=private-task criterion=private-criterion status=uncertain reason=evidence_missing"
+    const completionGate = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback }))
+    const append = vi.fn(async (..._args: Parameters<GateWriter["append"]>) => "event-1")
+    const result = await assertCompletionAllowed(gateOptions(completionGate), { append }, step, new AbortController().signal, () => nowValue, "candidate")
+    if (!result || !("feedback" in result)) throw new Error("expected completion recovery")
+    expect(append.mock.calls[0]?.[3]).toMatchObject({ feedback })
+    const recovered = applyCompletionRecovery({ system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, "step-1", result.feedback)
+    expect(recovered.system[0]?.content).toContain("gather current owned evidence")
+    expect(recovered.system[0]?.content).toContain("reconcile current owned sources and resolve contradictions")
+    expect(recovered.system[0]?.content).not.toContain("private-task")
+    expect(recovered.system[0]?.content).not.toContain("private-criterion")
   })
 
   it("fails closed when steering recovery feedback is not the server-owned fixed text", async () => {
@@ -137,10 +155,11 @@ function report(status: "passed" | "failed" | "unverified") {
 function storedResult(status: "passed" | "failed" | "unverified") {
   return { taskGraphVerificationReport: report(status), ...(status === "unverified" ? {} : { structuredResult: structuredResult(status) }) }
 }
-function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>) {
+function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>, revision = 1, onQuery?: (sql: string, params?: unknown[]) => void) {
   const content = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }
-  return { query: vi.fn(async (sql: string) => {
-    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: "graph-item", revision: 1, content }], rowCount: 1 }
+  return { query: vi.fn(async (sql: string, params?: unknown[]) => {
+    onQuery?.(sql, params)
+    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: "graph-item", revision, content }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: tasks, rowCount: tasks.length }
     if (sql.includes('FROM "agent_events" AS event')) return { rows: [], rowCount: 0 }
     throw new Error(`Unexpected graph query: ${sql}`)
@@ -148,6 +167,43 @@ function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>) {
 }
 
 describe("TaskGraph terminal verification gate", () => {
+  it("carries the gate's owner-scoped graph revision into recovery after recording original feedback", async () => {
+    const target = node("scout", "task-scout")
+    const reads: Array<{ sql: string; params?: unknown[] }> = []
+    const client = graphClient([target], [{ id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: storedResult("failed") }], 7,
+      (sql, params) => reads.push({ sql, params }))
+    const completionGate = vi.fn(async () => checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
+    const append = vi.fn(async (..._args: Parameters<GateWriter["append"]>) => "event-1")
+    const writer = { append }
+    const result = await assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate")
+    if (!result || !("feedback" in result)) throw new Error("expected completion recovery")
+    const snapshot: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+    const recovered = applyCompletionRecovery(snapshot, "step-1", result.feedback)
+    expect(recovered.system[0]?.content).toContain("at graph revision 7:")
+    expect(recovered.system[0]?.content).toContain("nodeOrdinal=1 criterionOrdinal=1")
+    expect(reads[0]?.sql).toContain('item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4')
+    expect(reads[0]?.params).toEqual([expect.any(String), "session-1", "turn-1", "root-1", "user-1"])
+    expect(append).toHaveBeenCalledWith("final.rejected", step.id, null, expect.objectContaining({ feedback: expect.stringContaining("nodeOrdinal=1") }), `final-rejected:${step.id}`)
+    expect(JSON.stringify(append.mock.calls[0]?.[3])).not.toContain("task-graph-repair-recovery.v1")
+  })
+
+  it("does not stamp missing or invalid graph revisions as ordinal authority", async () => {
+    const missing = { query: vi.fn(async (sql: string) => sql.includes('FROM "agent_items" AS item')
+      ? { rows: [], rowCount: 0 } : { rows: [{ id: "proposal" }], rowCount: 1 }) } as never
+    const invalid = graphClient([node("scout", "task-scout")], [{ id: "task-scout", status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: storedResult("failed") }], 0)
+    for (const completionGate of [
+      async () => checkTaskGraphTerminalVerification(missing, graphLease, "root-1"),
+      async () => checkTaskGraphTerminalVerification(invalid, graphLease, "root-1"),
+    ]) {
+      const decision = await assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "candidate")
+      if (!decision || !("feedback" in decision)) throw new Error("expected completion recovery")
+      const snapshot: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+      const recovered = applyCompletionRecovery(snapshot, "step-1", decision.feedback)
+      expect(recovered.system[0]?.content).toContain("no validated graph revision is available")
+      expect(recovered.system[0]?.content).not.toContain("nodeOrdinal=")
+    }
+  })
+
   it("denies terminal completion when a native command receipt remains but the owned graph row is missing", async () => {
     const queries: string[] = []
     const client = { query: vi.fn(async (sql: string) => {
