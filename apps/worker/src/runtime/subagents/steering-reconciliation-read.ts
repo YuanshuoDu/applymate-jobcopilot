@@ -78,11 +78,8 @@ async function readInputs(client: Client, scope: SteeringReconciliationScope, hi
     const matches = all.filter(input => input.clientMessageId === bound)
     if (matches.length !== 1) throw new Error("steering_reconciliation_original_input_invalid")
     rootId = matches[0]!.id
-  } else if (all.length > 0) {
-    if (all.length > 1 && all[0]!.acceptedSequence === all[1]!.acceptedSequence) throw new Error("steering_reconciliation_original_input_ambiguous")
-    rootId = all[0]!.id
   }
-  if (hint !== undefined && hint !== null && hint !== rootId) throw new Error("steering_reconciliation_original_input_mismatch")
+  if (bound !== undefined && hint !== undefined && hint !== null && hint !== rootId) throw new Error("steering_reconciliation_original_input_mismatch")
   const result = await client.query<Row>(`SELECT input."id", input."clientMessageId", input."delivery", input."status", input."acceptedSequence", input."consumedByStepId", input."consumedAt", input."cancelledAt",
       event."type" AS "acceptedType", event."actor" AS "acceptedActor", event."taskId" AS "acceptedTaskId", event."correlationId" AS "acceptedCorrelationId", event."itemId" AS "acceptedItemId", event."sequence" AS "acceptedEventSequence", event."payload" AS "acceptedPayload",
       accepted_item."type" AS "acceptedItemType", accepted_item."taskId" AS "acceptedItemTaskId", accepted_item."status" AS "acceptedItemStatus", accepted_item."content" AS "acceptedItemContent"
