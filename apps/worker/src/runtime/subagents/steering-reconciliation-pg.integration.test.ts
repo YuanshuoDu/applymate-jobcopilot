@@ -266,6 +266,8 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_inputs", "agent_items", "agent_events", "agent_outbox" TO "${runtimeRole}"`)
     await adminPool.query(`GRANT UPDATE ("updatedAt") ON "agent_sessions", "agent_turns", "sub_agent_tasks" TO "${runtimeRole}"`)
     await adminPool.query(`GRANT UPDATE ("status") ON "agent_steps" TO "${runtimeRole}"`)
+    await adminPool.query(`GRANT UPDATE ("status", "consumedByStepId", "consumedAt") ON "agent_inputs" TO "${runtimeRole}"`)
+    await adminPool.query(`GRANT UPDATE ("inputThroughSequence", "consumedInputIds") ON "agent_steps" TO "${runtimeRole}"`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${runtimeRole}"`)
     await adminPool.query(`GRANT INSERT ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt") ON "agent_items" TO "${runtimeRole}"`)
     await adminPool.query(`GRANT UPDATE ("stepId", "revision", "content", "status", "completedAt", "updatedAt") ON "agent_items" TO "${runtimeRole}"`)
@@ -546,7 +548,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     const acceptedSequence = await acceptanceTransaction({ id: steerId, messageId: `${steerId}-message`, text: "Prioritize remote roles in Ireland" })
     expect(acceptedSequence).toBeGreaterThan(priorCursor)
 
-    const builder = new StepContextBuilder(createPgInputClaimStore(adminPool!, { userId: ids.user }), undefined, () => new Date(), hydrationScope)
+    const builder = new StepContextBuilder(createPgInputClaimStore(restrictedCommandPool(runtimePool!), { userId: ids.user }), undefined, () => new Date(), hydrationScope)
     const stepContext = await builder.build({ scope: { userId: ids.user }, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, stepId,
       snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [], taskGraphRevision: 2 } })
     expect(stepContext.consumedInputIds).toContain(steerId)
@@ -565,18 +567,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     const failedSequence = await acceptanceTransaction({ id: failedSteerId, messageId: `${failedSteerId}-message`, text: "This input must roll back" })
     await adminPool!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{source}', '"system"'::jsonb) WHERE "id" = $1`,
       [`${failedSteerId}-accepted-event`])
-    const failedMarkerKey = steeringMarkerIdempotencyKey(ids.session, ids.turn, failedSteerId)
-    const failedMarkerEventId = `steering-marker-event:${failedMarkerKey}`
-    const failedMarkerOutboxKey = `agent-event:${failedMarkerEventId}`
-    const markerState = async () => (await adminPool!.query<{ eventSequence: string; markerCount: number; outboxCount: number }>(
-      `SELECT session."eventSequence"::text AS "eventSequence",
-        (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."idempotencyKey" = $2) AS "markerCount",
-        (SELECT COUNT(*)::int FROM "agent_outbox" AS outbox WHERE outbox."aggregateId" = session."id" AND outbox."idempotencyKey" = $3) AS "outboxCount"
-       FROM "agent_sessions" AS session WHERE session."id" = $1`, [ids.session, failedMarkerKey, failedMarkerOutboxKey])).rows[0]
-    const beforeFailure = await markerState()
-    expect(beforeFailure).toEqual({ eventSequence: String(failedSequence), markerCount: 0, outboxCount: 0 })
     await expect(builder.build({ scope: { userId: ids.user }, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, stepId: failedStepId,
-      steeringMarkerContext: { taskId: ids.root, obligationId: `steering-obligation-${suffix}`, goalRevision: 1, planRevision: 2 },
       snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }))
       .rejects.toThrow("steering_reconciliation_acceptance_invalid")
     const rolledBack = await adminPool!.query<{ status: string; consumedByStepId: string | null; consumedAt: Date | null; cursor: string; ids: unknown }>(
@@ -585,8 +576,39 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
        WHERE input."id" = $1 AND step."sessionId" = input."sessionId" AND step."turnId" = input."targetTurnId"`, [failedSteerId, failedStepId])
     expect(rolledBack.rows[0]).toEqual({ status: "accepted", consumedByStepId: null, consumedAt: null,
       cursor: String(failedPriorCursor), ids: [] })
-    expect(await markerState()).toEqual(beforeFailure)
     expect(failedSequence).toBeGreaterThan(failedPriorCursor)
   })
-})
 
+  it("rolls back an observed steering marker and outbox row when checkpoint hydration rejects its provenance", async () => {
+    const steerId = `steering-marker-invalid-steer-${suffix}`, stepId = `steering-marker-invalid-step-${suffix}`
+    const priorCursor = Number((await adminPool!.query<{ eventSequence: string }>(
+      `SELECT "eventSequence"::text AS "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [ids.session])).rows[0]?.eventSequence)
+    await seedStep(stepId, 11, "streaming", priorCursor, [])
+    const acceptedSequence = await acceptanceTransaction({ id: steerId, messageId: `${steerId}-message`, text: "This marker must roll back" })
+    await adminPool!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{source}', '"system"'::jsonb) WHERE "id" = $1`,
+      [`${steerId}-accepted-event`])
+    const markerKey = steeringMarkerIdempotencyKey(ids.session, ids.turn, steerId)
+    const markerEventId = `steering-marker-event:${markerKey}`
+    const markerOutboxKey = `agent-event:${markerEventId}`
+    const markerState = async () => (await adminPool!.query<{ eventSequence: string; markerCount: number; outboxCount: number }>(
+      `SELECT session."eventSequence"::text AS "eventSequence",
+        (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."idempotencyKey" = $2) AS "markerCount",
+        (SELECT COUNT(*)::int FROM "agent_outbox" AS outbox WHERE outbox."aggregateId" = session."id" AND outbox."idempotencyKey" = $3) AS "outboxCount"
+       FROM "agent_sessions" AS session WHERE session."id" = $1`, [ids.session, markerKey, markerOutboxKey])).rows[0]
+    const beforeFailure = await markerState()
+    expect(beforeFailure).toEqual({ eventSequence: String(acceptedSequence), markerCount: 0, outboxCount: 0 })
+    const builder = new StepContextBuilder(createPgInputClaimStore(adminPool!, { userId: ids.user }), undefined, () => new Date(), hydrationScope)
+    await expect(builder.build({ scope: { userId: ids.user }, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, stepId,
+      steeringMarkerContext: { taskId: ids.root, obligationId: `steering-obligation-${suffix}`, goalRevision: 1, planRevision: 2 },
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }))
+      .rejects.toThrow("steering_reconciliation_acceptance_invalid")
+    const rolledBack = await adminPool!.query<{ status: string; consumedByStepId: string | null; consumedAt: Date | null; cursor: string; ids: unknown }>(
+      `SELECT input."status", input."consumedByStepId", input."consumedAt", step."inputThroughSequence"::text AS "cursor", step."consumedInputIds" AS "ids"
+       FROM "agent_inputs" AS input JOIN "agent_steps" AS step ON step."id" = $2
+       WHERE input."id" = $1 AND step."sessionId" = input."sessionId" AND step."turnId" = input."targetTurnId"`, [steerId, stepId])
+    expect(rolledBack.rows[0]).toEqual({ status: "accepted", consumedByStepId: null, consumedAt: null,
+      cursor: String(priorCursor), ids: [] })
+    expect(await markerState()).toEqual(beforeFailure)
+    expect(acceptedSequence).toBeGreaterThan(priorCursor)
+  })
+})
