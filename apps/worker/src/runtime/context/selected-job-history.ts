@@ -104,8 +104,13 @@ function projectCandidates(candidates: readonly OutcomeCandidate[]): ContextSeed
       conflicts.add(value.identity)
     }
   }
+  const uniqueSequences = new Set<bigint>()
+  for (const value of byIdentity.values()) {
+    if (uniqueSequences.has(value.terminalSequence)) return undefined
+    uniqueSequences.add(value.terminalSequence)
+  }
   const ordered = [...byIdentity.values()].sort((left, right) => left.terminalSequence > right.terminalSequence ? -1
-    : left.terminalSequence < right.terminalSequence ? 1 : left.identity.localeCompare(right.identity))
+    : left.terminalSequence < right.terminalSequence ? 1 : 0)
   const turns: Array<{ label: string; nodes: SafeNode[] }> = []
   let nodeCount = 0
   for (const value of ordered) {

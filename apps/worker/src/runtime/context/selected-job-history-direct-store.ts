@@ -117,7 +117,7 @@ async function candidates(client: Client, input: DirectSelectedJobHistoryLoadInp
           AND "payload"->>'errorCode' = BTRIM("payload"->>'errorCode') AND "itemId" IS NULL AND "correlationId" = "turnId"
           AND "idempotencyKey" = 'turn:' || "turnId" || ':event:turn-interrupted')
       )
-    ORDER BY "sequence" DESC, "turnId" DESC LIMIT $6`,
+    ORDER BY "sequence" DESC LIMIT $6`,
   [input.lease.sessionId, input.lease.userId, input.lease.turnId, input.jobId, String(before), CANDIDATE_LIMIT])
   return result.rows.flatMap(row => {
     const candidate = validCandidate(row, input, before)

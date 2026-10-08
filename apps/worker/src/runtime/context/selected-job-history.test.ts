@@ -114,17 +114,17 @@ describe("selected-job history projection", () => {
     expect(conflictProjection).toEqual(projectSelectedJobHistory([separate]))
   })
 
-  it("uses stable private identity ordering only for equal terminal sequences", () => {
+  it("fails closed when distinct sources have equal terminal sequences", () => {
     const candidates = [
       history(makeRecord("turn-z", "root-z", 9), 25n),
       history(makeRecord("turn-a", "root-a", 2), 25n),
     ]
-    const projected = projectSelectedJobHistory(candidates)
-    const turns = (projected?.content as { turns: Array<{ nodes: Array<{ role: string; result: { score?: number } }> }> }).turns
-    expect(turns[0]?.nodes.find(item => item.role === "analyst")?.result.score).toBe(2)
-    expect(projected).toEqual(projectSelectedJobHistory([...candidates].reverse()))
-    expect(json(projected)).not.toContain("turn-a")
-    expect(json(projected)).not.toContain("root-z")
+    expect(projectSelectedJobHistory(candidates)).toBeUndefined()
+    expect(projectSelectedJobHistory([...candidates].reverse())).toBeUndefined()
+
+    const outcomes = candidates.map(value => outcome(value.record, value.terminalSequence))
+    expect(projectSelectedJobHistoryOutcomes(outcomes)).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([...outcomes].reverse())).toBeUndefined()
   })
 
   it("fails closed on sparse, malformed, mixed-job, oversized, or nonpositive metadata", () => {
