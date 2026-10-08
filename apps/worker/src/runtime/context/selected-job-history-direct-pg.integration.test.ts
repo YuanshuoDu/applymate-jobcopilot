@@ -21,7 +21,7 @@ function disposableUrl(): string | null {
   return value
 }
 
-type Source = Readonly<{ turnId: string; rootTaskId: string; childId: string; finalItemId: string; sessionId: string; userId: string; jobId: string; startSequence: number; status?: "completed" | "failed" | "interrupted" }>
+type Source = Readonly<{ turnId: string; rootTaskId: string; childId: string; finalItemId: string; sessionId: string; userId: string; jobId: string; startSequence: number; stepId?: string; status?: "completed" | "failed" | "interrupted" }>
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
 const userId = `direct-history-user-${suffix}`, otherUserId = `direct-history-other-user-${suffix}`
 const sessionId = `direct-history-session-${suffix}`, otherSessionId = `direct-history-other-session-${suffix}`
@@ -31,11 +31,11 @@ const currentStepId = `direct-history-current-step-${suffix}`, workerId = `worke
 const matchingSources: Source[] = Array.from({ length: 10 }, (_, index) => ({
   turnId: `direct-history-source-turn-${index}-${suffix}`, rootTaskId: `direct-history-source-root-${index}-${suffix}`,
   childId: `direct-history-source-child-${index}-${suffix}`, finalItemId: `direct-history-source-final-${index}-${suffix}`,
-  sessionId, userId, jobId, startSequence: index * 2 + 1,
+  sessionId, userId, jobId, stepId: `direct-history-source-step-${index}-${suffix}`, startSequence: index * 2 + 1,
 }))
 const otherJobSource: Source = { turnId: `direct-history-other-job-turn-${suffix}`, rootTaskId: `direct-history-other-job-root-${suffix}`,
   childId: `direct-history-other-job-child-${suffix}`, finalItemId: `direct-history-other-job-final-${suffix}`,
-  sessionId, userId, jobId: otherJobId, startSequence: 25 }
+  sessionId, userId, jobId: otherJobId, stepId: `direct-history-other-job-step-${suffix}`, startSequence: 25 }
 const failedSource: Source = { turnId: `direct-history-failed-turn-${suffix}`, rootTaskId: `direct-history-failed-root-${suffix}`,
   childId: `direct-history-failed-child-${suffix}`, finalItemId: `direct-history-failed-final-${suffix}`,
   sessionId, userId, jobId, startSequence: 21, status: "failed" }
@@ -44,10 +44,10 @@ const interruptedSource: Source = { turnId: `direct-history-interrupted-turn-${s
   sessionId, userId, jobId, startSequence: 23, status: "interrupted" }
 const otherSessionSource: Source = { turnId: `direct-history-other-session-turn-${suffix}`, rootTaskId: `direct-history-other-session-root-${suffix}`,
   childId: `direct-history-other-session-child-${suffix}`, finalItemId: `direct-history-other-session-final-${suffix}`,
-  sessionId: otherSessionId, userId, jobId, startSequence: 1 }
+  sessionId: otherSessionId, userId, jobId, stepId: `direct-history-other-session-step-${suffix}`, startSequence: 1 }
 const otherUserSource: Source = { turnId: `direct-history-other-user-turn-${suffix}`, rootTaskId: `direct-history-other-user-root-${suffix}`,
   childId: `direct-history-other-user-child-${suffix}`, finalItemId: `direct-history-other-user-final-${suffix}`,
-  sessionId: foreignSessionId, userId: otherUserId, jobId, startSequence: 1 }
+  sessionId: foreignSessionId, userId: otherUserId, jobId, stepId: `direct-history-other-user-step-${suffix}`, startSequence: 1 }
 let pool: PgPool | undefined
 let lease: TurnLease
 
@@ -79,6 +79,12 @@ async function insertSource(source: Source): Promise<void> {
     VALUES ($1, $2, $3, $4, $4, '/source/scout', 1, 'scout', 'scout', 'completed', 'Find a suitable role', '[]'::jsonb, '["Find one role"]'::jsonb,
       '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP)`,
   [source.childId, source.sessionId, source.turnId, source.rootTaskId])
+  if (status === "completed") {
+    if (!source.stepId) throw new Error("Completed history source needs its canonical Step ID")
+    await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+      VALUES ($1, $2, $3, $4, 1, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`,
+    [source.stepId, source.sessionId, source.turnId, source.rootTaskId])
+  }
   await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
       ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
@@ -86,7 +92,7 @@ async function insertSource(source: Source): Promise<void> {
   const start = source.startSequence, terminal = start + 1
   const terminalType = status === "completed" ? "turn.completed" : status === "failed" ? "turn.failed" : "turn.interrupted"
   const terminalItemId = status === "completed" ? source.finalItemId : null
-  const correlationId = status === "completed" ? "source-step" : source.turnId
+  const correlationId = status === "completed" ? source.stepId : source.turnId
   const errorCode = status === "failed" ? "task_failed" : status === "interrupted" ? "interrupted" : undefined
   const terminalKey = status === "completed" ? `turn:${source.turnId}:event:turn-completed`
     : status === "failed" ? `turn:${source.turnId}:event:turn-failed:${errorCode}` : `turn:${source.turnId}:event:turn-interrupted`
@@ -177,6 +183,33 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
       expect(history.some(item => item.sourceTurnId === source.turnId)).toBe(false)
     } finally {
       await pool!.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2`, [duplicateId, source.sessionId])
+    }
+  })
+
+  it("omits completed history when the terminal correlation Step is missing or belongs to another source", async () => {
+    const missingStepSource = matchingSources[9], foreignStepSource = matchingSources[8]
+    const foreignStepId = otherSessionSource.stepId
+    if (!missingStepSource.stepId || !foreignStepSource.stepId || !foreignStepId) throw new Error("completed source Step fixtures are missing")
+    const missingEventId = `direct-history-terminal-${missingStepSource.turnId}`
+    const foreignEventId = `direct-history-terminal-${foreignStepSource.turnId}`
+    const input: DirectSelectedJobHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+      rootAttemptCount: 2, stepId: currentStepId, jobId, now: new Date() }
+    try {
+      await pool!.query(`UPDATE "agent_events" SET "correlationId" = $1 WHERE "id" = $2 AND "sessionId" = $3`,
+        [`missing-step-${suffix}`, missingEventId, sessionId])
+      await pool!.query(`UPDATE "agent_events" SET "correlationId" = $1 WHERE "id" = $2 AND "sessionId" = $3`,
+        [foreignStepId, foreignEventId, sessionId])
+
+      const history = await createPgDirectSelectedJobHistoryStore(pool!).load(input)
+
+      expect(history.some(item => item.sourceTurnId === missingStepSource.turnId)).toBe(false)
+      expect(history.some(item => item.sourceTurnId === foreignStepSource.turnId)).toBe(false)
+      expect(history.some(item => item.sourceTurnId === matchingSources[7].turnId)).toBe(true)
+    } finally {
+      await pool!.query(`UPDATE "agent_events" SET "correlationId" = $1 WHERE "id" = $2 AND "sessionId" = $3`,
+        [missingStepSource.stepId, missingEventId, sessionId])
+      await pool!.query(`UPDATE "agent_events" SET "correlationId" = $1 WHERE "id" = $2 AND "sessionId" = $3`,
+        [foreignStepSource.stepId, foreignEventId, sessionId])
     }
   })
 

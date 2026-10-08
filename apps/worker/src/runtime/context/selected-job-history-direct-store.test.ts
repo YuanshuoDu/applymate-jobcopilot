@@ -14,6 +14,8 @@ function candidate(index: number, sequence = String(index * 2 + 2)): Row {
     taskRootTaskId: rootTaskId, parentTaskId: null, taskRole: "orchestrator", taskType: "root", taskStatus: "completed",
     eventTurnId: turnId, eventTaskId: rootTaskId, itemId: `final-${index}`, sequence,
     type: "turn.completed", actor: "orchestrator", correlationId: `step-${index}`,
+    correlationStepId: `step-${index}`, correlationStepSessionId: "session-1",
+    correlationStepTurnId: turnId, correlationStepTaskId: rootTaskId,
     idempotencyKey: `turn:${turnId}:event:turn-completed`,
     payload: { turnId, taskId: rootTaskId, finalItemId: `final-${index}` }, terminalEventCount: 1, childId,
   }
@@ -132,6 +134,10 @@ describe("direct selected-job history PostgreSQL store", () => {
       { ...valid, sequence: "100" },
       { ...valid, type: "turn.failed" },
       { ...valid, eventTaskId: "child-source-1" },
+      { ...valid, correlationStepId: null },
+      { ...valid, correlationStepSessionId: "foreign-session" },
+      { ...valid, correlationStepTurnId: "foreign-turn" },
+      { ...valid, correlationStepTaskId: "foreign-root" },
     ]
     const test = fixture({ candidates: invalid })
 

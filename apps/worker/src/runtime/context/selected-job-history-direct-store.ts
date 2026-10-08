@@ -64,7 +64,9 @@ function validCandidate(row: Row, input: DirectSelectedJobHistoryLoadInput, befo
   const expectedKey = `turn:${turnId}:event:`
   if (row.turnStatus === "completed") {
     return row.type === "turn.completed" && text(payload.finalItemId) && row.itemId === payload.finalItemId
-      && text(row.correlationId) && row.idempotencyKey === `${expectedKey}turn-completed`
+      && text(row.correlationId) && row.correlationStepId === row.correlationId
+      && row.correlationStepSessionId === row.sessionId && row.correlationStepTurnId === turnId
+      && row.correlationStepTaskId === rootTaskId && row.idempotencyKey === `${expectedKey}turn-completed`
       ? { turnId, rootTaskId, terminalSequence } : undefined
   }
   if (row.turnStatus === "failed") {
@@ -85,6 +87,8 @@ async function candidates(client: Client, input: DirectSelectedJobHistoryLoadInp
         task."role" AS "taskRole", task."taskType", task."status" AS "taskStatus",
         event."turnId" AS "eventTurnId", event."taskId" AS "eventTaskId", event."itemId", event."sequence",
         event."type", event."actor", event."correlationId", event."idempotencyKey", event."payload",
+        correlation_step."id" AS "correlationStepId", correlation_step."sessionId" AS "correlationStepSessionId",
+        correlation_step."turnId" AS "correlationStepTurnId", correlation_step."taskId" AS "correlationStepTaskId",
         COUNT(*) OVER (PARTITION BY turn."id", task."id") AS "terminalEventCount"
       FROM "agent_turns" AS turn
       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = $2
@@ -92,6 +96,7 @@ async function candidates(client: Client, input: DirectSelectedJobHistoryLoadInp
         AND task."turnId" = turn."id" AND task."rootTaskId" = task."id"
       JOIN "agent_events" AS event ON event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
         AND event."taskId" = task."id" AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
+      LEFT JOIN "agent_steps" AS correlation_step ON event."type" = 'turn.completed' AND correlation_step."id" = event."correlationId"
       WHERE turn."sessionId" = $1 AND turn."userId" = $2 AND turn."id" <> $3
         AND turn."status" IN ('completed', 'failed', 'interrupted') AND task."status" = turn."status"
         AND task."parentTaskId" IS NULL AND task."role" = 'orchestrator' AND task."taskType" = 'root'
@@ -104,7 +109,10 @@ async function candidates(client: Client, input: DirectSelectedJobHistoryLoadInp
           AND jsonb_typeof("payload"->'finalItemId') = 'string' AND NULLIF(BTRIM("payload"->>'finalItemId'), '') IS NOT NULL
           AND "payload"->>'finalItemId' = BTRIM("payload"->>'finalItemId') AND "itemId" = "payload"->>'finalItemId'
           AND "correlationId" IS NOT NULL AND NULLIF(BTRIM("correlationId"), '') IS NOT NULL
-          AND "correlationId" = BTRIM("correlationId") AND "idempotencyKey" = 'turn:' || "turnId" || ':event:turn-completed')
+          AND "correlationId" = BTRIM("correlationId")
+          AND "correlationStepId" = "correlationId" AND "correlationStepSessionId" = "sessionId"
+          AND "correlationStepTurnId" = "turnId" AND "correlationStepTaskId" = "taskId"
+          AND "idempotencyKey" = 'turn:' || "turnId" || ':event:turn-completed')
         OR ("turnStatus" = 'failed' AND "type" = 'turn.failed' AND "actor" = 'orchestrator'
           AND jsonb_typeof("payload"->'errorCode') = 'string' AND NULLIF(BTRIM("payload"->>'errorCode'), '') IS NOT NULL
           AND "payload"->>'errorCode' = BTRIM("payload"->>'errorCode')
