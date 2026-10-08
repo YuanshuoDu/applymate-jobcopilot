@@ -43,7 +43,7 @@ const REPAIR_FEEDBACK_STATES = {
   missing: true, pending: true, terminal: true, unavailable: true, missing_receipt: true, rejected: true,
   invalid_receipt: true, invalid_report: true,
 } satisfies Record<RepairFeedbackState, true>
-const TASK_GRAPH_DETAIL = new RegExp(`^ nodeOrdinal=([1-9][0-9]*)(?: criterionOrdinal=([1-9][0-9]*))? status=(?:failed|unverified) reasonCode=(?:${Object.keys(TASK_GRAPH_REASON_CODES).join("|")})(?: repair=(?:${Object.keys(REPAIR_FEEDBACK_STATES).join("|")}))?`)
+const TASK_GRAPH_DETAIL = new RegExp(`^ nodeOrdinal=([1-9][0-9]*)(?: criterionOrdinal=([1-9][0-9]*))? status=(?:failed|unverified) reasonCode=(?:${Object.keys(TASK_GRAPH_REASON_CODES).join("|")})(?: repair=(?:${Object.keys(REPAIR_FEEDBACK_STATES).join("|")}))?(?= |$)`)
 const TASK_GRAPH_ISSUE = new RegExp(`^ issue=(?:${Object.keys(GATE_FEEDBACK_CODES).join("|")})`)
 const TASK_GRAPH_OMISSION = /^ \(([1-9][0-9]*) feedback items omitted; inspect TaskGraph before retrying\.\)$/
 const MAX_TASK_GRAPH_FEEDBACK_ITEMS = TASK_GRAPH_LIMITS.maxNodes * TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria * 2 + 1

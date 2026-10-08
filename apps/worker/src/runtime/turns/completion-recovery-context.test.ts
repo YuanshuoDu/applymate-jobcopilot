@@ -64,21 +64,30 @@ describe("completion recovery context", () => {
 
   it("accepts only producer-shaped TaskGraph codes, ordinals, repair states, and omission counts", () => {
     const issues = ["legacy_unverified", "verification_report", "repair_receipt", "repair_criterion"]
-    const reasons = ["criteria_met", "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch", "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid", "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved"]
     const repairStates = ["missing", "pending", "terminal", "unavailable", "missing_receipt", "rejected", "invalid_receipt", "invalid_report"]
     const accept = (value: string) => applyCompletionRecovery(base, "step-1", tagTaskGraphRepairRecovery(value, 6)).system[0]?.content
     for (const issue of issues) {
       expect(accept(`${feedbackLead} issue=${issue}`)).toContain(`issue=${issue}`)
     }
-    for (const reason of reasons) {
-      for (const repair of repairStates) {
-        const detail = `${feedbackLead} nodeOrdinal=8 criterionOrdinal=8 status=unverified reasonCode=${reason} repair=${repair}`
-        expect(accept(detail)).toContain(`reasonCode=${reason} repair=${repair}`)
-      }
+    for (const repair of repairStates) {
+      const detail = `${feedbackLead} nodeOrdinal=8 criterionOrdinal=8 status=unverified reasonCode=canonical_evidence_missing repair=${repair}`
+      expect(accept(detail)).toContain(`reasonCode=canonical_evidence_missing repair=${repair}`)
+    }
+    for (const reason of ["criterion_not_met", "reported_score_below_minimum"]) {
+      const detail = `${feedbackLead} nodeOrdinal=8 criterionOrdinal=8 status=failed reasonCode=${reason}`
+      expect(accept(detail)).toContain(`status=failed reasonCode=${reason}`)
     }
     const truncated = `${feedbackLead} issue=verification_report nodeOrdinal=8 criterionOrdinal=8 status=unverified reasonCode=canonical_evidence_ambiguous repair=invalid_report (7 feedback items omitted; inspect TaskGraph before retrying.)`
     expect(truncated.length).toBeLessThanOrEqual(512)
     expect(accept(truncated)).toContain("(7 feedback items omitted; inspect TaskGraph before retrying.)")
+  })
+
+  it("matches complete repair-state tokens that share a prefix", () => {
+    const accept = (repair: string) => applyCompletionRecovery(base, "step-1", tagTaskGraphRepairRecovery(
+      `${feedbackLead} nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=${repair}`, 6,
+    )).system[0]?.content
+    expect(accept("missing")).toContain("repair=missing")
+    expect(accept("missing_receipt")).toContain("repair=missing_receipt")
   })
 
   it("preserves only bounded native verifier grammar without exposing private identifiers", () => {

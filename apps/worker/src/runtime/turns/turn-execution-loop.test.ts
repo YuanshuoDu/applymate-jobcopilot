@@ -32,6 +32,7 @@ const profile = {
   supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" as const,
 }
 const lateSteerText = "Prioritize senior engineering roles in Dublin."
+const taskGraphFeedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCount = 1): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
@@ -1406,7 +1407,7 @@ describe("owner-agnostic turn execution loop", () => {
 
   it("replans in the same root loop after a TaskGraph evidence denial", async () => {
     let checks = 0
-    const denialFeedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing"
+    const denialFeedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`
     const gate = vi.fn(async () => {
       if (++checks > 1) return { ok: true as const }
       const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: denialFeedback }
@@ -1779,7 +1780,7 @@ describe("owner-agnostic turn execution loop", () => {
       toolCallId: "seed-search", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed",
       output: { jobs: [{ id: "job-1" }] }, errorCode: null,
     } }]), inputStore = new LateSteerInputClaimStore()
-    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. nodeOrdinal=2 criterionOrdinal=1 status=failed reasonCode=evidence_missing"
+    const feedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met`
     const humanHistory = "The user clarified that Dublin remains the preferred location for senior engineering roles."
     const verifiedNode: TaskGraphCurrentState["nodes"][number] = {
       key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return verified links"], dependsOn: [],
@@ -1868,15 +1869,15 @@ describe("owner-agnostic turn execution loop", () => {
     expect(dispatchedCalls).toEqual(["agent.plan", "jobs.search", "jobs.search"])
     expect(second).toContain(lateSteerText)
     expect(second).toContain("at graph revision 5")
-    expect(second).toContain("nodeOrdinal=2")
+    expect(second).toContain("nodeOrdinal=1")
     expect(third).toContain('"revision":6')
     expect(third).not.toContain("at graph revision 5")
-    expect(third).not.toContain("nodeOrdinal=2")
+    expect(third).not.toContain("nodeOrdinal=1")
     expect(third).toContain(humanHistory)
     expect(third).toContain('"verificationReport"')
     expect(third).toContain("a".repeat(64))
     expect(last).not.toContain("at graph revision 5")
-    expect(last).not.toContain("nodeOrdinal=2")
+    expect(last).not.toContain("nodeOrdinal=1")
     expect(rejection).toMatchObject({ feedback })
     expect(JSON.stringify(rejection)).not.toContain("task-graph-repair-recovery.v1")
     expect(JSON.stringify(noProgress)).not.toContain("task-graph-repair-recovery.v1")
@@ -1884,7 +1885,7 @@ describe("owner-agnostic turn execution loop", () => {
   })
 
   it("shows fixed generic recovery on the next request when the denial revision is unknown", async () => {
-    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. nodeOrdinal=99 criterionOrdinal=private-criterion status=failed reasonCode=evidence_missing"
+    const feedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=8 criterionOrdinal=8 status=unverified reasonCode=canonical_evidence_missing`
     let checks = 0
     const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ++checks === 1
       ? ({ ok: false, blocker: "task_graph_verification_unverified", feedback })
