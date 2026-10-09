@@ -29,6 +29,73 @@ function rootInput() {
     consumedByStepId: null, consumedAt: null, cancelledAt: null }
 }
 
+function queryData(query: unknown) {
+  const values: unknown[] = []
+  function render(value: unknown): string {
+    if (!value || typeof value !== "object") return String(value)
+    const sql = value as { strings?: readonly string[]; values?: readonly unknown[] }
+    if (!Array.isArray(sql.strings) || !Array.isArray(sql.values) || sql.strings.length !== sql.values.length + 1) return String(value)
+    let text = sql.strings[0] ?? ""
+    for (let index = 0; index < sql.values.length; index++) {
+      const nested = sql.values[index]
+      if (nested && typeof nested === "object" && Array.isArray((nested as { strings?: unknown }).strings)) text += render(nested)
+      else { values.push(nested); text += `$${values.length}` }
+      text += sql.strings[index + 1]
+    }
+    return text
+  }
+  return { sql: render(query), values }
+}
+
+function sortableSequence(value: unknown): bigint | null {
+  if (typeof value === "bigint") return value
+  if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value)
+  if (typeof value === "string" && /^(0|[1-9][0-9]{0,18})$/.test(value)) return BigInt(value)
+  return null
+}
+
+function keysetPage(rows: Row[], query: unknown, marker: string, sequenceKey: string, cursorStart: number, extra?: (row: Row, sql: string, values: readonly unknown[]) => boolean) {
+  const { sql, values } = queryData(query), hasCursor = sql.includes(marker)
+  const cursorSequence = hasCursor ? BigInt(values[cursorStart] as bigint) : null
+  const cursorId = hasCursor ? String(values[cursorStart + 2]) : null
+  const pageSize = Number(values[values.length - 1])
+  return rows.filter(row => {
+    const rowSequence = sortableSequence(row[sequenceKey])
+    if (rowSequence === null) return true
+    const afterCursor = cursorSequence === null || rowSequence > cursorSequence || rowSequence === cursorSequence && String(row.id ?? row.eventId) > cursorId!
+    return afterCursor && (!extra || extra(row, sql, values))
+  }).sort((left, right) => {
+    const a = sortableSequence(left[sequenceKey]), b = sortableSequence(right[sequenceKey])
+    if (a === null || b === null) return a === null ? b === null ? 0 : 1 : -1
+    return a === b ? String(left.id ?? left.eventId).localeCompare(String(right.id ?? right.eventId)) : a < b ? -1 : 1
+  }).slice(0, pageSize)
+}
+
+function capacityQueryMock(data: { inputs: Row[]; receiptEvents: Row[]; callRows: Row[]; historyStep: Row[]; agendas: Row[] }) {
+  return vi.fn(async (query: unknown): Promise<Row[]> => {
+    const { sql, values } = queryData(query)
+    if (sql.includes('SELECT "input", "rootTaskId" FROM "agent_turns"')) return [{ input: { clientMessageId: "root-client" }, rootTaskId: scope.rootTaskId }]
+    if (sql.includes('FROM "sub_agent_tasks"')) return [{ id: scope.rootTaskId, sessionId: scope.sessionId, turnId: scope.turnId, attemptCount: 1 }]
+    if (sql.includes('SELECT "revision" FROM "agent_items"')) return [{ revision: 1 }]
+    if (sql.includes('FROM "agent_inputs" AS input')) return keysetPage(data.inputs, query, 'input."acceptedSequence" >', "acceptedSequence", 3, (row, text, params) =>
+      !text.includes('input."acceptedSequence" <=') || BigInt(row.acceptedSequence as bigint) <= BigInt(params[3 + (text.includes('input."acceptedSequence" >') ? 3 : 0)] as bigint))
+    if (sql.includes("event.\"type\" = 'agent.plan.reconciliation'")) return keysetPage(data.receiptEvents, query, 'event."sequence" >', "sequence", 2)
+    if (sql.includes("event.\"type\" = 'tool_call.started'")) {
+      const ids = values.find(Array.isArray) as string[] | undefined
+      return keysetPage(data.callRows.filter(row => ids?.includes(String(row.stepId))), query, 'event."sequence" >', "eventSequence", 5)
+    }
+    if (sql.includes('FROM "agent_steps"')) {
+      const ids = values.find(Array.isArray) as string[] | undefined
+      return data.historyStep.filter(row => ids?.includes(String(row.id)))
+    }
+    if (sql.includes("event.\"type\" = 'cognitive.agenda'")) {
+      const ids = values.find(Array.isArray) as string[] | undefined
+      return keysetPage(data.agendas.filter(row => ids?.includes(String(row.correlationId))), query, 'event."sequence" >', "sequence", 4)
+    }
+    throw new Error(`unexpected capacity query: ${sql}`)
+  })
+}
+
 function agenda(stepId: string) {
   const signal = { count: 0, ids: [] }
   return {
@@ -50,6 +117,7 @@ function facts(count: number, withReceipt = false) {
     inputThroughSequence: first.acceptedSequence, consumedInputIds: [] }
   const callId = "call-1"
   const call = {
+    eventId: "call-event", eventSequence: first.acceptedSequence + BigInt(50),
     type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item",
     correlationId: callId, idempotencyKey: `turn:${scope.turnId}:event:tool-started:${callId}`,
     payload: { taskId: scope.rootTaskId, toolCallId: callId, toolName: "agent.reconcile" }, callItemId: "call-item",
@@ -70,21 +138,39 @@ function facts(count: number, withReceipt = false) {
   const historyStep = withReceipt ? [sourceStep, decisionStep] : []
   const receiptEvents = withReceipt ? [receiptEvent] : []
   const callRows = withReceipt ? [call] : []
-  const agendas = withReceipt ? [{ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: "decision-step", payload: agenda("decision-step") }] : []
-  const queryRaw = vi.fn(async (query: unknown): Promise<Row[]> => {
-      const sql = ((query as { strings?: readonly string[] }).strings ?? []).join(" ")
-      if (sql.includes('SELECT "input", "rootTaskId" FROM "agent_turns"')) return [{ input: { clientMessageId: "root-client" }, rootTaskId: scope.rootTaskId }]
-      if (sql.includes('FROM "sub_agent_tasks"')) return [{ id: scope.rootTaskId, sessionId: scope.sessionId, turnId: scope.turnId, attemptCount: 1 }]
-      if (sql.includes('SELECT "revision" FROM "agent_items"')) return [{ revision: 1 }]
-      if (sql.includes('FROM "agent_inputs" AS input')) return inputs
-      if (sql.includes("event.\"type\" = 'agent.plan.reconciliation'")) return receiptEvents
-      if (sql.includes("event.\"type\" = 'tool_call.started'")) return callRows
-      if (sql.includes('FROM "agent_steps"')) return historyStep
-      if (sql.includes("event.\"type\" = 'cognitive.agenda'")) return agendas
-      throw new Error(`unexpected capacity query: ${sql}`)
-    })
+  const agendas = withReceipt ? [{ id: "agenda-decision-step", sequence: first.acceptedSequence + BigInt(60), actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: "decision-step", payload: agenda("decision-step") }] : []
+  const queryRaw = capacityQueryMock({ inputs, receiptEvents, callRows, historyStep, agendas })
   const tx = { $queryRaw: queryRaw } as unknown as CommandTransaction
   return { tx, queryRaw, inputs, receiptEvents, callRows, sourceStep, decisionStep, first }
+}
+
+function largeFacts(receiptCount: number, unresolvedCount = 2) {
+  const inputs: Row[] = [rootInput()], receiptEvents: Row[] = [], callRows: Row[] = [], historyStep: Row[] = [], agendas: Row[] = []
+  const addCall = (stepId: string, callId: string, eventId: string, eventSequence: bigint): Row => ({
+    eventId, eventSequence, type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: `${callId}-item`,
+    correlationId: callId, idempotencyKey: `turn:${scope.turnId}:event:tool-started:${callId}`,
+    payload: { taskId: scope.rootTaskId, toolCallId: callId, toolName: "agent.reconcile" }, callItemId: `${callId}-item`, stepId,
+    itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: callId, toolName: "agent.reconcile", toolVersion: "1", input: { decision: "keep", expectedRevision: 1 } },
+  })
+  for (let index = 0; index < receiptCount; index++) {
+    const input = acceptedRow(index, "consumed", `consumer-${index}`), sequence = input.acceptedSequence as bigint
+    const decisionStepId = `decision-${index}`, callId = `call-${index}`
+    inputs.push(input)
+    historyStep.push({ id: `consumer-${index}`, taskId: scope.rootTaskId, ordinal: 0, attempt: 1, status: "completed", inputThroughSequence: sequence, consumedInputIds: [input.id] })
+    historyStep.push({ id: decisionStepId, taskId: scope.rootTaskId, ordinal: 1, attempt: 1, status: "completed", inputThroughSequence: sequence, consumedInputIds: [] })
+    const receipt = { schemaVersion: "agent-harness.v2.plan-reconciliation.v1", sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      stepId: decisionStepId, decision: "keep", observedRevision: 1, resultingRevision: 1, steerInputIds: [input.id], inputCheckpoint: { throughSequence: sequence.toString() } }
+    const receiptKey = `agent.plan.reconciliation:sha256:${createHash("sha256").update(JSON.stringify([scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, decisionStepId, callId]), "utf8").digest("hex")}`
+    receiptEvents.push({ id: `receipt-${index}`, itemId: null, taskId: scope.rootTaskId, type: "agent.plan.reconciliation", actor: "orchestrator",
+      correlationId: scope.turnId, causationId: decisionStepId, sequence: BigInt(100000 + index), idempotencyKey: receiptKey, payload: receipt, hasOutbox: false })
+    callRows.push(addCall(decisionStepId, callId, `call-event-${index}`, BigInt(1000 + index * 2)))
+    callRows.push(addCall(decisionStepId, `noise-${index}`, `noise-event-${index}`, BigInt(1001 + index * 2)))
+    agendas.push({ id: `agenda-event-${index}`, sequence: BigInt(50000 + index), actor: "orchestrator", itemId: null, taskId: scope.rootTaskId,
+      correlationId: decisionStepId, payload: agenda(decisionStepId) })
+  }
+  for (let index = 0; index < unresolvedCount; index++) inputs.push(acceptedRow(receiptCount + index, index % 2 ? "queued" : "accepted"))
+  const queryRaw = capacityQueryMock({ inputs, receiptEvents, callRows, historyStep, agendas })
+  return { tx: { $queryRaw: queryRaw } as unknown as CommandTransaction, queryRaw, inputs, receiptEvents, callRows, historyStep, agendas }
 }
 
 async function invokeWorkerReader(fixture: ReturnType<typeof facts>): Promise<number> {
@@ -209,18 +295,44 @@ describe("steer acceptance capacity", () => {
     const receipt = fixture.receiptEvents[0]!
     const unconsumed = fixture.inputs[2]!
     const through = String(unconsumed.acceptedSequence)
-    fixture.queryRaw.mockImplementation(async (query: unknown) => {
-      const sql = ((query as { strings?: readonly string[] }).strings ?? []).join(" ")
-      if (sql.includes("event.\"type\" = 'agent.plan.reconciliation'")) return [{ ...receipt, payload: { ...(receipt.payload as object), steerInputIds: ["steer-0", "steer-1"], inputCheckpoint: { throughSequence: through } } }]
-      if (sql.includes("event.\"type\" = 'tool_call.started'")) return fixture.callRows
-      if (sql.includes('FROM "agent_steps"')) return [fixture.sourceStep, { ...fixture.decisionStep, inputThroughSequence: unconsumed.acceptedSequence }]
-      if (sql.includes("event.\"type\" = 'cognitive.agenda'")) return [{ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: "decision-step", payload: agenda("decision-step") }]
-      if (sql.includes('SELECT "input", "rootTaskId" FROM "agent_turns"')) return [{ input: { clientMessageId: "root-client" }, rootTaskId: scope.rootTaskId }]
-      if (sql.includes('FROM "sub_agent_tasks"')) return [{ id: scope.rootTaskId, sessionId: scope.sessionId, turnId: scope.turnId, attemptCount: 1 }]
-      if (sql.includes('SELECT "revision" FROM "agent_items"')) return [{ revision: 1 }]
-      if (sql.includes('FROM "agent_inputs" AS input')) return fixture.inputs
-      throw new Error(`unexpected capacity query: ${sql}`)
-    })
+    receipt.payload = { ...receipt.payload, steerInputIds: ["steer-0", "steer-1"], inputCheckpoint: { throughSequence: through } }
+    fixture.decisionStep.inputThroughSequence = unconsumed.acceptedSequence
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
+  })
+
+  it("folds large resolved histories in pages and counts only the current unresolved steers", async () => {
+    const fixture = largeFacts(270, 2)
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })).resolves.toBe(2)
+    const queries = fixture.queryRaw.mock.calls.map(([query]) => queryData(query).sql)
+    expect(queries.filter(sql => sql.includes('FROM "agent_inputs" AS input')).length).toBeGreaterThan(4)
+    expect(queries.filter(sql => sql.includes("event.\"type\" = 'agent.plan.reconciliation'")).length).toBeGreaterThan(1)
+    expect(queries.filter(sql => sql.includes("event.\"type\" = 'tool_call.started'")).length).toBeGreaterThan(1)
+  })
+
+  it("fails closed when a receipt deep in paged history is malformed", async () => {
+    const fixture = largeFacts(270)
+    const row = fixture.receiptEvents[269]!
+    row.payload = { ...(row.payload as object), rootTaskId: "other-root" }
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
+  })
+
+  it("fails closed when the historic matching tool call after the old scan cap is malformed", async () => {
+    const fixture = largeFacts(270)
+    const row = fixture.callRows.find(call => call.eventId === "call-event-269")!
+    row.payload = { ...(row.payload as object), toolName: "agent.plan" }
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
+  })
+
+  it.each(["missing", "null", "equal", "later"] as const)("fails closed when matching call start is %s relative to the receipt", async ordering => {
+    const fixture = facts(2, true)
+    const receiptSequence = fixture.receiptEvents[0]!.sequence as bigint
+    if (ordering === "missing") fixture.callRows.length = 0
+    else if (ordering === "null") Object.assign(fixture.callRows[0]!, { eventSequence: null })
+    else fixture.callRows[0]!.eventSequence = ordering === "equal" ? receiptSequence : receiptSequence + BigInt(1)
+
     await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
       .rejects.toMatchObject({ code: "invalid_command", status: 409 })
   })
@@ -262,7 +374,9 @@ describe("steer acceptance capacity", () => {
             return [{ id: persistedKey.sessionId }]
           }
           if (sql.includes('SELECT "input", "rootTaskId" FROM "agent_turns"')) return [{ input: { clientMessageId: "root-client" }, rootTaskId: null }]
-          if (sql.includes('FROM "agent_inputs" AS input')) return [rootInput(), ...Array.from({ length: unresolved }, (_, index) => acceptedRow(index))]
+          if (sql.includes('FROM "agent_inputs" AS input')) return keysetPage([rootInput(), ...Array.from({ length: unresolved }, (_, index) => acceptedRow(index))], query,
+            'input."acceptedSequence" >', "acceptedSequence", 3, (row, text, params) => !text.includes('input."acceptedSequence" <=')
+              || BigInt(row.acceptedSequence as bigint) <= BigInt(params[3 + (text.includes('input."acceptedSequence" >') ? 3 : 0)] as bigint))
           if (sql.includes('event."type" = \'agent.plan.reconciliation\'')) return []
           throw new Error(`unexpected Web acceptance query: ${sql}`)
         },
