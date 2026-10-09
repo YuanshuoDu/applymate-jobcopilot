@@ -59,6 +59,7 @@ export class TurnQuestionStoreError extends Error {
 
 export type TurnQuestionRecovery =
   | { readonly status: "none" }
+  | { readonly status: "replayable"; readonly stepId: string; readonly toolCallId: string; readonly callItemId: string; readonly intent: TurnQuestionIntentEnvelope }
   | { readonly status: "prepared"; readonly stepId: string; readonly toolCallId: string; readonly waitId: string; readonly itemId: string }
   | { readonly status: "waiting"; readonly stepId: string; readonly toolCallId: string; readonly waitId: string; readonly itemId: string; readonly turnId: string }
   | { readonly status: "answered"; readonly stepId: string; readonly toolCallId: string; readonly waitId: string; readonly itemId: string; readonly turnId: string }

@@ -11,7 +11,7 @@ const output = {
   text: "", reasoningSummary: "", finishReason: "tool_calls" as const, provider: "fixture", model: "fixture", continuation: null,
   usage: { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }, toolCalls: [{ id: "call-1", name: "agent.ask_user", arguments: { question: "Which city?", choices: [{ label: "Berlin", value: "berlin" }] } }],
 }
-const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [{ label: "Berlin", value: "berlin" }] }
+const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [{ label: "Berlin", value: "berlin" }] } as const
 
 function options(store: Partial<TurnQuestionStore> = {}): TurnExecutionOptions {
   return { identity, store, signal: new AbortController().signal } as never
@@ -59,6 +59,16 @@ describe("native question runtime decisions", () => {
     const malformed = options({ readPendingQuestion: async () => { throw new TurnQuestionStoreError("question_receipt_malformed", "Malformed question receipt") } })
     await expect(recoverableNativeQuestionCalls(malformed, [replay] as never, () => new Date())).rejects.toMatchObject({ code: "question_receipt_malformed" })
     await expect(recoverableNativeQuestionCalls(options({ readPendingQuestion: async () => ({ status: "prepared", stepId: "step-1", toolCallId: "call-1", waitId: "q1", itemId: "i1" }) }), [replay] as never, () => new Date())).resolves.toEqual([replay])
+  })
+
+  it("replays only the exact durable incomplete ask_user call before terminal question preflight", async () => {
+    const replay = { action: "replay", stepId: "step-1", toolVersion: "1", call: { id: "call-1", name: "agent.ask_user", arguments: output.toolCalls[0]?.arguments }, callItem: { id: "call-item-1", revision: 0 } }
+    const pending = { status: "replayable" as const, stepId: "step-1", toolCallId: "call-1", callItemId: "call-item-1", intent }
+    await expect(recoverableNativeQuestionCalls(options({ readPendingQuestion: async () => pending }), [replay] as never, () => new Date())).resolves.toEqual([replay])
+    await expect(recoverableNativeQuestionCalls(options({ readPendingQuestion: async () => pending }), [{ ...replay, stepId: "other-step" }] as never, () => new Date()))
+      .rejects.toMatchObject({ code: "turn_state_refresh_retry_required" })
+    await expect(recoverPendingNativeQuestion(options({ readPendingQuestion: async () => pending }), () => new Date(), 0, 0))
+      .rejects.toMatchObject({ code: "turn_state_refresh_retry_required" })
   })
 
   it("retries uncertain wait commits without converting pause or owner fences", async () => {

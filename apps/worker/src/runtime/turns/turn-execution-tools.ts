@@ -9,7 +9,8 @@ import type { StepContext } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import { isDurableWaitId } from "../tools/redaction.js"
 import { nativeReceiptFromToolCall } from "../tools/task-graph-coordination-bridge.js"
-import { executeNativeQuestionTool, nativeQuestionResultCall, questionWaitResult, recoverableNativeQuestionCalls, rejectQuestionReplay } from "./turn-execution-question.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
+import { executeNativeQuestionTool, nativeQuestionResultCall, PreparedQuestionRetryError, questionWaitResult, recoverableNativeQuestionCalls, rejectQuestionReplay } from "./turn-execution-question.js"
 
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
 type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState }
@@ -156,7 +157,8 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
           call: { id: item.call.id, toolName: item.call.name, toolVersion: item.toolVersion, input: item.call.arguments },
         })
       } catch (error: unknown) {
-        if (options.signal?.aborted) throw error
+        if (options.signal?.aborted || item.call.name === "agent.ask_user" && isSessionPauseRequestedError(error)) throw error
+        if (item.call.name === "agent.ask_user") throw new PreparedQuestionRetryError()
         result = { id: item.call.id, toolName: item.call.name, toolVersion: item.toolVersion, status: "failed", errorCode: "tool_execution_failed" }
       }
     }

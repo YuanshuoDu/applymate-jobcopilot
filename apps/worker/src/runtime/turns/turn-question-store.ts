@@ -1,6 +1,6 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionStore, type TurnQuestionUsageInput, type TurnQuestionWaitInput, type TurnQuestionWaitReceipt } from "./turn-question-contract.js"
-import { admitQuestionWork, assertQuestionOwner, assertQuestionUsage, completedQuestionResult, lockQuestionStep, persistedUsage, questionConflict, questionId, questionItemId, withQuestionTransaction, type TurnQuestionPool, type TurnQuestionQueryClient, type TurnQuestionStepRow } from "./turn-question-store-guards.js"
+import { admitQuestionWork, assertQuestionOwner, assertQuestionUsage, completedQuestionResult, lockQuestionStep, persistedUsage, questionConflict, questionId, questionItemId, recoverIncompleteQuestionCall, withQuestionTransaction, type TurnQuestionPool, type TurnQuestionQueryClient, type TurnQuestionStepRow } from "./turn-question-store-guards.js"
 import { appendQuestionStartedEvents, OrphanPauseUsageRecoveredError, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
 import { cancelPausedQuestion, hasQuestionPauseEvents, recoverPausedPartialQuestion } from "./turn-question-store-cancellation.js"
@@ -139,9 +139,11 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
         return pending
       }
       catch (error: unknown) {
-        if (!(error instanceof TurnQuestionStoreError) || error.code !== "question_receipt_missing"
-          || !await recoverPausedPartialQuestion(pool, input.owner, input.now)) throw error
-        throw new OrphanPauseUsageRecoveredError()
+        if (!(error instanceof TurnQuestionStoreError) || error.code !== "question_receipt_missing") throw error
+        if (await recoverPausedPartialQuestion(pool, input.owner, input.now)) throw new OrphanPauseUsageRecoveredError()
+        const replayable = await recoverIncompleteQuestionCall(pool, input.owner, input.now)
+        if (replayable) return replayable
+        throw error
       }
     },
   }

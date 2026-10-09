@@ -4,7 +4,7 @@ import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertSessionWorkAdmission, OPEN_SESSION } from "../session-gate.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
-import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionUsageInput, type TurnQuestionWaitInput } from "./turn-question-contract.js"
+import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionUsageInput, type TurnQuestionWaitInput } from "./turn-question-contract.js"
 
 export type TurnQuestionPool = Pick<pg.Pool, "connect">
 export type TurnQuestionClient = Pick<pg.PoolClient, "query" | "release">
@@ -137,4 +137,110 @@ export function persistedUsage(step: TurnQuestionStepRow, allowedStatuses: reado
     throw new TurnQuestionStoreError("question_usage_unavailable", "Question step has no durable model usage")
   }
   return { inputTokens, outputTokens, estimatedCostUsd }
+}
+
+function eventSequence(value: unknown): bigint | null {
+  if (typeof value === "bigint") return value >= 0n ? value : null
+  if (typeof value !== "string" && typeof value !== "number") return null
+  const text = String(value)
+  if (!/^\d+$/.test(text)) return null
+  try { return BigInt(text) } catch { return null }
+}
+
+async function questionModelUsage(client: TurnQuestionQueryClient, owner: TurnExecutionOwnerFence, stepId: string): Promise<{
+  readonly usage: TurnUsage; readonly startedSequence: bigint
+}> {
+  const types = ["model.started", "model.completed", "model.usage"] as const
+  const keys = types.map(type => `turn:${owner.turnId}:event:${type.replace(".", "-")}:${stepId}`)
+  const found = await client.query<Row>(`SELECT "id", "sequence", "sessionId", "turnId", "taskId", "itemId", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload"
+    FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND (("correlationId" = $3 AND "type" = ANY($4::text[])) OR "idempotencyKey" = ANY($5::text[]))
+    ORDER BY "sequence" FOR SHARE`, [owner.sessionId, owner.turnId, stepId, types, keys])
+  const byType = new Map<string, Row>()
+  for (const row of found.rows) {
+    if (typeof row.type !== "string" || !types.includes(row.type as typeof types[number]) || byType.has(row.type)) throw questionConflict(`model usage event ${stepId}`)
+    byType.set(row.type, row)
+  }
+  const receipts = types.map((type, index) => {
+    const row = byType.get(type), payload = row && record(row.payload), sequence = eventSequence(row?.sequence)
+    const expected = type === "model.usage" ? ["provider", "model", "usage", "taskId"] : ["taskId", "provider", "model"]
+    if (!row || typeof row.id !== "string" || !row.id.trim() || row.sessionId !== owner.sessionId || row.turnId !== owner.turnId
+      || row.taskId !== owner.taskId || row.itemId !== null || row.actor !== "orchestrator" || row.correlationId !== stepId
+      || row.idempotencyKey !== keys[index] || !payload || !exactKeys(payload, expected) || payload.taskId !== owner.taskId
+      || typeof payload.provider !== "string" || !payload.provider || typeof payload.model !== "string" || !payload.model || sequence === null) {
+      throw new TurnQuestionStoreError("question_usage_unavailable", "Persisted ask_user call has no exact model receipt chain")
+    }
+    return { row, payload, sequence }
+  })
+  const [started, completed, usageEvent] = receipts, usage = record(usageEvent?.payload.usage)
+  if (!started || !completed || !usageEvent || completed.row.causationId !== started.row.id || usageEvent.row.causationId !== completed.row.id
+    || completed.sequence <= started.sequence || usageEvent.sequence <= completed.sequence
+    || completed.payload.provider !== started.payload.provider || completed.payload.model !== started.payload.model
+    || usageEvent.payload.provider !== completed.payload.provider || usageEvent.payload.model !== completed.payload.model
+    || !usage || !exactKeys(usage, ["inputTokens", "outputTokens", "estimatedCostUsd"])
+    || typeof usage.inputTokens !== "number" || !Number.isSafeInteger(usage.inputTokens) || usage.inputTokens < 0
+    || typeof usage.outputTokens !== "number" || !Number.isSafeInteger(usage.outputTokens) || usage.outputTokens < 0
+    || typeof usage.estimatedCostUsd !== "number" || !Number.isFinite(usage.estimatedCostUsd) || usage.estimatedCostUsd < 0) {
+    throw new TurnQuestionStoreError("question_usage_unavailable", "Persisted ask_user model usage is malformed")
+  }
+  return { usage: { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, estimatedCostUsd: usage.estimatedCostUsd }, startedSequence: started.sequence }
+}
+
+/** Restore only the exact owned in-progress call needed for idempotent ask_user replay. */
+export async function recoverIncompleteQuestionCall(pool: TurnQuestionPool, owner: TurnExecutionOwnerFence, now: Date): Promise<TurnQuestionRecovery | null> {
+  assertQuestionOwner(owner)
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Question recovery time is invalid")
+  return withQuestionTransaction(pool, owner, async (client, turn) => {
+    if (turn.status !== "in_progress") return null
+    const found = await client.query<Row>(`SELECT callItem."id" AS "callItemId", callItem."stepId", callItem."status" AS "callStatus", callItem."content" AS "callContent",
+        step."status" AS "stepStatus", step."errorCode" AS "stepErrorCode", step."finishReason", step."inputTokens", step."outputTokens", step."estimatedCostUsd",
+        resultItem."id" AS "resultItemId", resultItem."status" AS "resultStatus", resultItem."content" AS "resultContent",
+        COUNT(resultItem."id") OVER (PARTITION BY callItem."id") AS "resultCount"
+      FROM "agent_items" AS callItem JOIN "agent_steps" AS step ON step."id" = callItem."stepId" AND step."sessionId" = callItem."sessionId"
+        AND step."turnId" = callItem."turnId" AND step."taskId" = callItem."taskId" AND step."attempt" = 1
+      LEFT JOIN "agent_items" AS resultItem ON resultItem."sessionId" = callItem."sessionId" AND resultItem."turnId" = callItem."turnId"
+        AND resultItem."stepId" = callItem."stepId" AND resultItem."taskId" = callItem."taskId" AND resultItem."type" = 'tool_result'
+        AND resultItem."content"->>'toolCallId' = callItem."content"->>'toolCallId'
+      WHERE callItem."sessionId" = $1 AND callItem."turnId" = $2 AND callItem."taskId" = $3 AND callItem."type" = 'tool_call'
+        AND callItem."content"->>'toolName' = 'agent.ask_user' ORDER BY step."ordinal" DESC, callItem."startedAt" DESC, callItem."id" DESC LIMIT 65`,
+    [owner.sessionId, owner.turnId, owner.taskId])
+    if (found.rows.length >= 65) throw questionConflict("question recovery scan bound")
+    const partial = found.rows.filter(row => (row.callStatus === "started" || row.callStatus === "completed")
+      && (Number(row.resultCount) === 0 || Number(row.resultCount) === 1 && row.resultStatus === "started"))
+    if (partial.length > 1) throw questionConflict("multiple incomplete ask_user calls")
+    const row = partial[0]
+    if (!row || typeof row.callItemId !== "string" || !row.callItemId || typeof row.stepId !== "string") return null
+    const call = record(row.callContent), callId = call?.toolCallId, requested = parseTurnQuestionArguments(call?.input)
+    if (!call || typeof callId !== "string" || !callId || !requested || call.toolName !== "agent.ask_user" || call.toolVersion !== "1"
+      || !(row.callStatus === "started" && exactKeys(call, ["toolCallId", "toolName", "toolVersion", "input"]) && call.status === undefined
+        || row.callStatus === "completed" && exactKeys(call, ["toolCallId", "toolName", "toolVersion", "status", "errorCode", "input"]) && call.status === "completed" && call.errorCode === null)
+      || row.callStatus === "started" && Number(row.resultCount) !== 0) return null
+    if (Number(row.resultCount) === 1) {
+      const result = record(row.resultContent), intent = result && parseTurnQuestionIntentEnvelope(result.output)
+      if (!result || row.resultStatus !== "started" || typeof row.resultItemId !== "string" || !exactKeys(result, ["toolCallId", "output", "errorCode"])
+        || result.toolCallId !== callId || result.errorCode !== null || !intent || JSON.stringify(intent) !== JSON.stringify(requested)) return null
+    }
+    const step = await lockQuestionStep(client, owner, row.stepId)
+    if (row.stepStatus !== "streaming" || step.status !== "streaming" || step.errorCode !== null && step.errorCode !== undefined) return null
+    const durable = await questionModelUsage(client, owner, row.stepId)
+    const pause = await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'session.pause_requested'
+      AND "sequence" > $3 ORDER BY "sequence" LIMIT 1 FOR SHARE`, [owner.sessionId, owner.turnId, durable.startedSequence.toString()])
+    if (pause.rows.length) return null
+    const current = [Number(step.inputTokens), Number(step.outputTokens), Number(step.estimatedCostUsd)]
+    const expected = [durable.usage.inputTokens, durable.usage.outputTokens, durable.usage.estimatedCostUsd]
+    if (step.finishReason === null ? current.some(value => value !== 0) : step.finishReason !== "tool_calls" || current.some((value, index) => value !== expected[index])) {
+      throw questionConflict(`step ${row.stepId} model usage`)
+    }
+    const id = questionId(owner, row.stepId, callId)
+    const question = await client.query<Row>(`SELECT "id" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`,
+      [questionItemId(id), owner.sessionId, owner.turnId])
+    if (question.rows.length) throw questionConflict(`question item ${questionItemId(id)} exists for incomplete call`)
+    await admitQuestionWork(client, owner)
+    if (step.finishReason === null) {
+      const updated = await client.query(`UPDATE "agent_steps" SET "finishReason" = 'tool_calls', "inputTokens" = $1, "outputTokens" = $2, "estimatedCostUsd" = $3
+        WHERE "id" = $4 AND "sessionId" = $5 AND "turnId" = $6 AND "taskId" = $7 AND "attempt" = 1 AND "status" = 'streaming'`,
+      [durable.usage.inputTokens, durable.usage.outputTokens, durable.usage.estimatedCostUsd, row.stepId, owner.sessionId, owner.turnId, owner.taskId])
+      if (updated.rowCount !== 1) throw questionConflict(`step ${row.stepId} usage recovery`)
+    }
+    return { status: "replayable", stepId: row.stepId, toolCallId: callId, callItemId: row.callItemId, intent: requested }
+  })
 }

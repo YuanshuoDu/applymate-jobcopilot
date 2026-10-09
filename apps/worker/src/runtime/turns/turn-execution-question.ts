@@ -127,6 +127,16 @@ export async function recoverableNativeQuestionCalls(
 ): Promise<readonly ToolCallRecovery[]> {
   if (!calls.some(item => item.call.name === "agent.ask_user")) return calls
   const pending = await readPendingNativeQuestion(options, now)
+  if (pending?.status === "replayable") {
+    const matching = calls.filter(item => item.call.name === "agent.ask_user" && item.call.id === pending.toolCallId
+      && item.stepId === pending.stepId && item.callItem.id === pending.callItemId && item.toolVersion === "1"
+      && nativeQuestionResultMatches(item.call.arguments, pending.intent)
+      && (item.action === "replay" && item.durableResult == null
+        || item.action === "reconcile" && item.durableResult?.status === "completed" && item.durableResult.errorCode === null
+          && nativeQuestionResultMatches(item.call.arguments, item.durableResult.output)))
+    if (matching.length !== 1) throw new TurnStateRefreshRetryError()
+    return calls
+  }
   return pending?.status === "none"
     ? calls.filter(item => item.call.name !== "agent.ask_user")
     : calls
@@ -138,6 +148,7 @@ export async function recoverPendingNativeQuestion(
 ): Promise<TurnEngineResult | null> {
   const pending = recovered === undefined ? await readPendingNativeQuestion(options, now) : recovered
   if (!pending) return null
+  if (pending.status === "replayable") throw new TurnStateRefreshRetryError()
   if (pending.status === "none" || pending.status === "answered") return null
   if (pending.status === "closed" || pending.status === "not_current") {
     throw new TurnQuestionStoreError("question_not_current", "Native question is no longer current")

@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 
 import { recoverAnsweredQuestionHistory } from "../question-answer-recovery.js"
 import { resumeAgentTurn } from "../wakeup/consumer.js"
+import { TurnEngine } from "./turn-engine.js"
+import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { claimTurnLease } from "./lease.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
@@ -32,6 +34,7 @@ const callId = `question-call-${suffix}`
 const ids = { user: `question-user-${suffix}`, session: `question-session-${suffix}`, turn: `question-turn-${suffix}`, root: `question-root-${suffix}`, step: `question-step-${suffix}` }
 const pausedIds = { session: `question-paused-session-${suffix}`, turn: `question-paused-turn-${suffix}`, root: `question-paused-root-${suffix}`, step: `question-paused-step-${suffix}`, call: `question-paused-call-${suffix}`, item: `question-paused-item-${suffix}` }
 const orphanIds = { session: `question-orphan-session-${suffix}`, turn: `question-orphan-turn-${suffix}`, root: `question-orphan-root-${suffix}`, step: `question-orphan-step-${suffix}` }
+const recoveryIds = { session: `question-recovery-session-${suffix}`, turn: `question-recovery-turn-${suffix}`, root: `question-recovery-root-${suffix}`, step: `question-recovery-step-${suffix}`, call: `question-recovery-call-${suffix}`, item: `question-recovery-item-${suffix}` }
 const owner: TurnExecutionOwnerFence = {
   kind: "turn", userId: ids.user, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, rootTaskId: ids.root,
   ownerId: `question-lease-${suffix}`, leaseVersion: 1, leaseExpiresAt: new Date(Date.now() + 5 * 60_000),
@@ -40,6 +43,8 @@ const pausedOwner: TurnExecutionOwnerFence = { ...owner, sessionId: pausedIds.se
   ownerId: `question-paused-lease-${suffix}` }
 const orphanOwner: TurnExecutionOwnerFence = { ...owner, sessionId: orphanIds.session, turnId: orphanIds.turn, taskId: orphanIds.root, rootTaskId: orphanIds.root,
   ownerId: `question-orphan-lease-${suffix}` }
+const recoveryOwner: TurnExecutionOwnerFence = { ...owner, sessionId: recoveryIds.session, turnId: recoveryIds.turn, taskId: recoveryIds.root, rootTaskId: recoveryIds.root,
+  ownerId: `question-recovery-lease-${suffix}` }
 const intent: TurnQuestionIntentEnvelope = {
   schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
   question: "Which region should I prioritize?", options: [{ label: "Berlin", value: "berlin" }],
@@ -148,6 +153,47 @@ async function seedOrphanPauseCase(pool: PgPool): Promise<void> {
   await pool.query(`UPDATE "agent_sessions" SET "eventSequence" = 4 WHERE "id" = $1`, [orphanIds.session])
 }
 
+async function seedIncompleteCallRecovery(pool: PgPool): Promise<void> {
+  await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt") VALUES ($1, $2, 'question call recovery', 'running', 'test', CURRENT_TIMESTAMP)`, [recoveryIds.session, ids.user])
+  await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+    VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, NULL, $4, $5, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
+  [recoveryIds.turn, recoveryIds.session, ids.user, recoveryOwner.ownerId, recoveryOwner.leaseExpiresAt])
+  await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+    VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'question call recovery', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, $4, $5, CURRENT_TIMESTAMP)`,
+  [recoveryIds.root, recoveryIds.session, recoveryIds.turn, recoveryOwner.ownerId, recoveryOwner.leaseExpiresAt])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [recoveryIds.root])
+  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [recoveryIds.root, recoveryIds.turn])
+  await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "startedAt")
+    VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, NULL, 0, 0, 0, CURRENT_TIMESTAMP)`,
+  [recoveryIds.step, recoveryIds.session, recoveryIds.turn, recoveryIds.root])
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', 'commentary', $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [recoveryIds.item, recoveryIds.session, recoveryIds.turn, recoveryIds.step, recoveryIds.root,
+    JSON.stringify({ toolCallId: recoveryIds.call, toolName: "agent.ask_user", toolVersion: "1", input: { question: intent.question, choices: intent.options } })])
+  const turnStartedId = `turn:${recoveryIds.turn}:event:turn-started`, modelStartedId = `turn:${recoveryIds.turn}:event:model-started:${recoveryIds.step}`
+  const modelCompletedId = `turn:${recoveryIds.turn}:event:model-completed:${recoveryIds.step}`, modelUsageId = `turn:${recoveryIds.turn}:event:model-usage:${recoveryIds.step}`
+  const callItemEventId = `turn:${recoveryIds.turn}:event:item-started:${recoveryIds.item}`, toolStartedId = `turn:${recoveryIds.turn}:event:tool-started:${recoveryIds.call}`
+  const chain = [
+    { id: turnStartedId, type: "turn.started", correlationId: recoveryIds.turn, causationId: null, key: `turn:${recoveryIds.turn}:event:turn-started`, itemId: null, payload: { goal: "question call recovery", taskId: recoveryIds.root, rootTaskId: recoveryIds.root } },
+    { id: modelStartedId, type: "model.started", correlationId: recoveryIds.step, causationId: turnStartedId, key: `turn:${recoveryIds.turn}:event:model-started:${recoveryIds.step}`, itemId: null, payload: { provider: "fixture", model: "fixture", taskId: recoveryIds.root } },
+    { id: modelCompletedId, type: "model.completed", correlationId: recoveryIds.step, causationId: modelStartedId, key: `turn:${recoveryIds.turn}:event:model-completed:${recoveryIds.step}`, itemId: null, payload: { provider: "fixture", model: "fixture", taskId: recoveryIds.root } },
+    { id: modelUsageId, type: "model.usage", correlationId: recoveryIds.step, causationId: modelCompletedId, key: `turn:${recoveryIds.turn}:event:model-usage:${recoveryIds.step}`, itemId: null, payload: { provider: "fixture", model: "fixture", usage: { inputTokens: 41, outputTokens: 17, estimatedCostUsd: 0.012 }, taskId: recoveryIds.root } },
+    { id: callItemEventId, type: "item.started", correlationId: recoveryIds.step, causationId: modelUsageId, key: `turn:${recoveryIds.turn}:event:item-started:${recoveryIds.item}`, itemId: recoveryIds.item, payload: { itemId: recoveryIds.item, type: "tool_call", phase: "commentary" } },
+    { id: toolStartedId, type: "tool_call.started", correlationId: recoveryIds.call, causationId: callItemEventId, key: `turn:${recoveryIds.turn}:event:tool-started:${recoveryIds.call}`, itemId: recoveryIds.item, payload: { toolCallId: recoveryIds.call, toolName: "agent.ask_user", taskId: recoveryIds.root } },
+  ] as const
+  for (const [index, event] of chain.entries()) {
+    const sequence = String(index + 1), envelope = { eventId: event.id, sessionId: recoveryIds.session, turnId: recoveryIds.turn, taskId: recoveryIds.root,
+      itemId: event.itemId, sequence, type: event.type, actor: "orchestrator", correlationId: event.correlationId, causationId: event.causationId,
+      idempotencyKey: event.key, payload: event.payload }
+    await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'orchestrator', $8, $9, $10, $11::jsonb)`,
+    [event.id, recoveryIds.session, recoveryIds.turn, event.itemId, recoveryIds.root, sequence, event.type, event.correlationId, event.causationId, event.key, JSON.stringify(event.payload)])
+    await pool.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb)`,
+      [`agent-outbox-${event.id}`, recoveryIds.session, `agent-event:${event.id}`, JSON.stringify(envelope)])
+  }
+  await pool.query(`UPDATE "agent_sessions" SET "eventSequence" = $1 WHERE "id" = $2`, [chain.length, recoveryIds.session])
+}
+
 async function appendBrokerEvent(client: PoolClient, input: {
   type: "question.answered" | "turn.wakeup"; correlationId: string; causationId: string; key: string
   payload: Record<string, unknown>; topic: "agent.session.event" | "agent.turn.wakeup"
@@ -189,7 +235,7 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
     await admin.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "revision", "completedAt", "updatedAt") ON "agent_turns" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "errorCode", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "completedAt") ON "agent_steps" TO "${role}"`)
-    await admin.query(`GRANT UPDATE ("status", "content", "revision", "completedAt", "updatedAt") ON "agent_items" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("status", "phase", "content", "revision", "startedAt", "completedAt", "updatedAt") ON "agent_items" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("id") ON "agent_events", "agent_outbox" TO "${role}"`)
     await admin.query(`GRANT INSERT ON "agent_items", "agent_events", "agent_outbox" TO "${role}"`)
     await seed(admin)
@@ -200,12 +246,59 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
   afterAll(async () => {
     await writer?.end()
     if (!admin) return
-    await admin.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [[ids.session, pausedIds.session, orphanIds.session]])
+    await admin.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [[ids.session, pausedIds.session, orphanIds.session, recoveryIds.session]])
     await admin.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.user])
     await admin.query(`DROP OWNED BY "${role}"`)
     await admin.query(`DROP ROLE "${role}"`)
     await admin.end()
   })
+
+  it("replays an incomplete persisted ask_user call after restart without a pause event and commits the same question", async () => {
+    await seedIncompleteCallRecovery(admin!)
+    let modelCalls = 0
+    const executeTool = vi.fn(async ({ call }: { call: { id: string; toolName: string } }) => ({
+      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: intent, errorCode: null,
+    }))
+    const result = await new TurnEngine({
+      lease: { turnId: recoveryIds.turn, sessionId: recoveryIds.session, ownerId: recoveryOwner.ownerId, userId: ids.user,
+        leaseVersion: recoveryOwner.leaseVersion, leaseStartedAt: new Date(), leaseExpiresAt: recoveryOwner.leaseExpiresAt },
+      scope: { userId: ids.user }, goal: "question call recovery", rootTaskId: recoveryIds.root,
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+      contextBuilder: { build: async () => { throw new Error("context should not be rebuilt before the recovered wait") } },
+      store: createPgTurnEngineStore(runtimePool(writer!)),
+      model: { id: "must-not-run", profile: {}, async *stream() { modelCalls += 1; throw new Error("model was invoked during question recovery") } },
+      tools: [], executeTool: executeTool as never, now: () => new Date(), idFactory: (prefix: string) => prefix,
+      toolCallRecovery: [{ action: "replay", stepId: recoveryIds.step, toolVersion: "1",
+        call: { id: recoveryIds.call, name: "agent.ask_user", arguments: { question: intent.question, choices: intent.options } },
+        callItem: { id: recoveryIds.item, revision: 0 } }],
+    } as never).run()
+
+    expect(result).toMatchObject({ status: "waiting_for_user" })
+    expect(modelCalls).toBe(0)
+    expect(executeTool).toHaveBeenCalledOnce()
+    const state = await admin!.query<{ turnStatus: string; stepStatus: string; finishReason: string; inputTokens: number; outputTokens: number;
+      callStatus: string; resultStatus: string; questionCount: string; pauseCount: string; terminalCount: string; questionItemId: string;
+      questionStepId: string; questionStatus: string; questionId: string; questionCallId: string; questionText: string }>(
+      `SELECT turn."status" AS "turnStatus", step."status" AS "stepStatus", step."finishReason", step."inputTokens", step."outputTokens",
+        call."status" AS "callStatus", result."status" AS "resultStatus",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question') AS "questionCount",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'session.pause_requested') AS "pauseCount",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" IN ('turn.completed', 'turn.failed')) AS "terminalCount",
+        question."id" AS "questionItemId", question."stepId" AS "questionStepId", question."status" AS "questionStatus",
+        question."content"->>'questionId' AS "questionId", question."content"->>'toolCallId' AS "questionCallId", question."content"->>'question' AS "questionText"
+       FROM "agent_turns" AS turn JOIN "agent_steps" AS step ON step."turnId" = turn."id"
+       JOIN "agent_items" AS call ON call."stepId" = step."id" AND call."type" = 'tool_call'
+       JOIN "agent_items" AS result ON result."stepId" = step."id" AND result."type" = 'tool_result'
+       JOIN "agent_items" AS question ON question."sessionId" = turn."sessionId" AND question."turnId" = turn."id"
+         AND question."stepId" = step."id" AND question."type" = 'question' AND question."content"->>'toolCallId' = $3
+       WHERE turn."id" = $2 AND call."content"->>'toolCallId' = $3 AND result."content"->>'toolCallId' = $3`,
+      [recoveryIds.session, recoveryIds.turn, recoveryIds.call])
+    expect(state.rows).toHaveLength(1)
+    expect(state.rows[0]).toMatchObject({ turnStatus: "waiting_for_user", stepStatus: "waiting_for_user", finishReason: "tool_calls",
+      inputTokens: 41, outputTokens: 17, callStatus: "completed", resultStatus: "completed", questionCount: "1", pauseCount: "0", terminalCount: "0" })
+    expect(state.rows[0]).toMatchObject({ questionItemId: `agent-wait:question:${state.rows[0]?.questionId}`, questionStepId: recoveryIds.step,
+      questionStatus: "started", questionCallId: recoveryIds.call, questionText: intent.question })
+  }, 30_000)
 
   it("atomically cancels and replays a paused pre-intent call with restricted-role readback", async () => {
     await seedPausedCase(admin!)
