@@ -188,17 +188,49 @@ async function invokeWorkerReader(fixture: ReturnType<typeof facts>): Promise<nu
     // Load the real Worker reader only at test runtime, outside Web's static TypeScript module graph.
     const reader = await vi.importActual<WorkerReader>(readerPath)
     const client = {
-      async query(sql: string): Promise<{ rows: Row[] }> {
+      async query(sql: string, values?: readonly unknown[]): Promise<{ rows: Row[] }> {
         if (sql.includes('SELECT turn."input" FROM "agent_turns"')) return { rows: [{ input: { clientMessageId: "root-client" } }] }
-        if (sql.includes('FROM "agent_inputs" WHERE')) return { rows: fixture.inputs.map(({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt }) =>
-          ({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt })) }
-        if (sql.includes('LEFT JOIN "agent_events"')) return { rows: (fixture.inputs as Row[])
-          .filter(row => row.delivery === "steer" && ["accepted", "queued", "consumed"].includes(String(row.status))) }
+        if (sql.includes('FROM "agent_inputs" WHERE') && sql.includes('"clientMessageId" = $4')) {
+          const matches = fixture.inputs.filter(row => row.clientMessageId === values?.[3]).slice(0, 2)
+          return { rows: matches.map(({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt }) =>
+            ({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt })) }
+        }
+        if (sql.includes('FROM "agent_inputs" WHERE') && sql.includes('ORDER BY "acceptedSequence", "id"')) {
+          const afterSequence = values?.[3] == null ? null : BigInt(String(values[3])), afterId = String(values?.[4] ?? "")
+          const rows = fixture.inputs.filter(row => {
+            const sequence = BigInt(String(row.acceptedSequence))
+            return afterSequence === null || sequence > afterSequence || sequence === afterSequence && String(row.id) > afterId
+          }).sort((left, right) => {
+            const a = BigInt(String(left.acceptedSequence)), b = BigInt(String(right.acceptedSequence))
+            return a === b ? String(left.id).localeCompare(String(right.id)) : a < b ? -1 : 1
+          }).slice(0, 64)
+          return { rows: rows.map(({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt }) =>
+            ({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt })) }
+        }
+        if (sql.includes('LEFT JOIN "agent_events"')) {
+          const acceptedIds = values?.[3] as string[] | undefined
+          return { rows: (fixture.inputs as Row[]).filter(row => acceptedIds?.includes(String(row.id))
+            && row.delivery === "steer" && ["accepted", "queued", "consumed"].includes(String(row.status))) }
+        }
         if (sql.includes('SELECT item."revision"')) return { rows: [{ revision: 1 }] }
         if (sql.includes('FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $3')) {
-          return { rows: fixture.receiptEvents.map(row => ({ ...row, hasOutbox: false })) }
+          const afterSequence = values?.[3] == null ? null : BigInt(String(values[3])), afterId = String(values?.[4] ?? "")
+          const rows = fixture.receiptEvents.filter(row => {
+            const sequence = BigInt(String(row.sequence))
+            return afterSequence === null || sequence > afterSequence || sequence === afterSequence && String(row.id) > afterId
+          }).sort((left, right) => {
+            const a = BigInt(String(left.sequence)), b = BigInt(String(right.sequence))
+            return a === b ? String(left.id).localeCompare(String(right.id)) : a < b ? -1 : 1
+          }).slice(0, 64)
+          return { rows: rows.map(row => ({ ...row, hasOutbox: false })) }
         }
-        if (sql.includes('event."type" = \'tool_call.started\'')) return { rows: fixture.callRows }
+        if (sql.includes('event."type" = \'tool_call.started\'')) {
+          const stepIds = values?.[3] as string[] | undefined, afterId = values?.[4] == null ? null : String(values[4])
+          const rows = fixture.callRows.filter(row => stepIds?.includes(String(row.stepId))
+            && (afterId === null || String(row.eventId) > afterId))
+            .sort((left, right) => String(left.eventId).localeCompare(String(right.eventId))).slice(0, 64)
+          return { rows }
+        }
         if (sql.includes('FROM "agent_steps"') && sql.includes('"consumedInputIds"')) return { rows: fixture.sourceStep ? [fixture.sourceStep] : [] }
         if (sql.includes('FROM "agent_steps"')) return { rows: fixture.decisionStep ? [fixture.decisionStep] : [] }
         if (sql.includes('event."type" = \'cognitive.agenda\'')) return { rows: fixture.receiptEvents.length
