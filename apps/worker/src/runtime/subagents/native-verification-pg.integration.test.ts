@@ -451,7 +451,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
     if (rootPacket.target.kind !== "root_goal") throw new Error("native_root_goal_packet_unavailable")
     expect(profileBlocks[0]).toEqual({ goal: rootPacket.goal, criteria: rootPacket.criteria,
       target: { kind: rootPacket.target.kind, referenceId: rootPacket.target.referenceId, candidateText: rootPacket.target.candidateText },
-      evidence: attestation })
+      evidence: rootPacket.evidence })
     const systemMessages = modelRequest.messages.filter(message => message.role === "system")
     const systemText = systemMessages.flatMap(message => message.content)
       .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
