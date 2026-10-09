@@ -27,22 +27,27 @@ type Source = Readonly<{
   status?: "completed" | "failed" | "interrupted"; rootStatus?: "completed" | "failed" | "interrupted"
   correlationTargetId?: string; stepStatus?: "completed" | "streaming" | "failed"
   stepReceipt?: "missing" | "mismatched" | "duplicate"
+  turnSource?: string; terminalCreatedAt?: Date
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
 const userId = `root-history-user-${suffix}`, otherUserId = `root-history-other-user-${suffix}`
 const sessionId = `root-history-session-${suffix}`, otherSessionId = `root-history-other-session-${suffix}`
 const foreignSessionId = `root-history-foreign-session-${suffix}`
+const archivedSessionId = `root-history-archived-session-${suffix}`
 const currentTurnId = `root-history-current-turn-${suffix}`, currentRootTaskId = `root-history-current-root-${suffix}`
 const currentStepId = `root-history-current-step-${suffix}`, workerId = `worker-${suffix}`
+const currentStartCreatedAt = new Date("2030-01-01T00:00:00.000Z")
 const objective = "Plan an engineering search"
 const criteria = ["Keep the search within the saved locations"]
 const matching: Source[] = [
   { turnId: `root-history-source-a-${suffix}`, rootTaskId: `root-history-root-a-${suffix}`, childId: `root-history-child-a-${suffix}`,
-    finalItemId: `root-history-final-a-${suffix}`, sessionId, userId, goal: objective, criteria, input: { goal: ` ${objective} `, successCriteria: criteria }, startSequence: 1 },
+    finalItemId: `root-history-final-a-${suffix}`, sessionId, userId, goal: objective, criteria, input: { goal: ` ${objective} `, successCriteria: criteria }, startSequence: 1,
+    terminalCreatedAt: new Date("2020-01-01T00:00:00.000Z") },
   { turnId: `root-history-source-b-${suffix}`, rootTaskId: `root-history-root-b-${suffix}`, childId: `root-history-child-b-${suffix}`,
     finalItemId: `root-history-final-b-${suffix}`, sessionId, userId, goal: objective, criteria,
-    input: { input: { goal: objective, successCriteria: criteria } }, startSequence: 5, status: "failed" },
+    input: { input: { goal: objective, successCriteria: criteria } }, startSequence: 5, status: "failed",
+    terminalCreatedAt: new Date("2021-01-01T00:00:00.000Z") },
 ]
 const mismatched: Source = { turnId: `root-history-mismatch-${suffix}`, rootTaskId: `root-history-mismatch-root-${suffix}`,
   childId: `root-history-mismatch-child-${suffix}`, finalItemId: `root-history-mismatch-final-${suffix}`, sessionId, userId,
@@ -55,7 +60,21 @@ const selectedJob: Source = { turnId: `root-history-selected-job-${suffix}`, roo
   goal: objective, criteria, input: { input: { goal: objective, successCriteria: criteria, selectedJobPreparation: null } }, startSequence: 16 }
 const otherSession: Source = { turnId: `root-history-other-session-turn-${suffix}`, rootTaskId: `root-history-other-session-root-${suffix}`,
   childId: `root-history-other-session-child-${suffix}`, finalItemId: `root-history-other-session-final-${suffix}`,
-  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
+  terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z") }
+const crossWrongSource: Source = { turnId: `root-history-cross-source-${suffix}`, rootTaskId: `root-history-cross-source-root-${suffix}`,
+  childId: `root-history-cross-source-child-${suffix}`, finalItemId: `root-history-cross-source-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 5,
+  turnSource: "automation", terminalCreatedAt: new Date("2023-01-01T00:00:00.000Z") }
+const crossWrongOrigin: Source = { turnId: `root-history-cross-origin-${suffix}`, rootTaskId: `root-history-cross-origin-root-${suffix}`,
+  childId: `root-history-cross-origin-child-${suffix}`, finalItemId: `root-history-cross-origin-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { goal: objective, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } }, startSequence: 9,
+  terminalCreatedAt: new Date("2024-01-01T00:00:00.000Z") }
+const archivedSource: Source = { turnId: `root-history-archived-${suffix}`, rootTaskId: `root-history-archived-root-${suffix}`,
+  childId: `root-history-archived-child-${suffix}`, finalItemId: `root-history-archived-final-${suffix}`,
+  sessionId: archivedSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
+  terminalCreatedAt: new Date("2025-01-01T00:00:00.000Z") }
 const foreignScopeCorrelation: Source = { turnId: `root-history-foreign-step-turn-${suffix}`, rootTaskId: `root-history-foreign-step-root-${suffix}`,
   childId: `root-history-foreign-step-child-${suffix}`, finalItemId: `root-history-foreign-step-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 24,
@@ -65,7 +84,12 @@ const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, ro
   sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
-  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 101 }
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 101,
+  terminalCreatedAt: new Date("2031-01-01T00:00:00.000Z") }
+const equalCutoff: Source = { turnId: `root-history-equal-cutoff-${suffix}`, rootTaskId: `root-history-equal-cutoff-root-${suffix}`,
+  childId: `root-history-equal-cutoff-child-${suffix}`, finalItemId: `root-history-equal-cutoff-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 13,
+  terminalCreatedAt: currentStartCreatedAt }
 const inconsistentTerminal: Source = { turnId: `root-history-terminal-mismatch-turn-${suffix}`, rootTaskId: `root-history-terminal-mismatch-root-${suffix}`,
   childId: `root-history-terminal-mismatch-child-${suffix}`, finalItemId: `root-history-terminal-mismatch-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 20,
@@ -100,12 +124,13 @@ async function insertSession(id: string, owner: string, sequence: number): Promi
 async function insertSource(source: Source): Promise<void> {
   const status = source.status ?? "completed"
   const rootStatus = source.rootStatus ?? status
+  const terminalCreatedAt = source.terminalCreatedAt ?? new Date()
   const graph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "scout", templateId: "scout",
     goal: "Find matching roles", successCriteria: ["Find one role"], dependsOn: [], depth: 1, taskId: source.childId }] })
   await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
     "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-    VALUES ($1, $2, $3, $4, 'user', $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
-  [source.turnId, source.sessionId, source.userId, status, JSON.stringify(source.input), source.rootTaskId])
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $7, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
+  [source.turnId, source.sessionId, source.userId, status, source.turnSource ?? "user", JSON.stringify(source.input), source.rootTaskId])
   await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $1, NULL, '/source', 0, 'orchestrator', 'root', $4, $5, '[]'::jsonb, $6::jsonb, '[]'::jsonb,
@@ -147,13 +172,13 @@ async function insertSource(source: Source): Promise<void> {
   const terminalPayload = status === "completed" ? { turnId: source.turnId, taskId: source.rootTaskId, finalItemId: source.finalItemId }
     : status === "failed" ? { turnId: source.turnId, taskId: source.rootTaskId, errorCode, finalItemId: null }
       : { turnId: source.turnId, taskId: source.rootTaskId, errorCode }
-  await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-    VALUES ($1, $2, $3, NULL, $4, $5, 'turn.started', 'orchestrator', $3, $6, $7::jsonb),
-      ($8, $2, $3, $9, $4, $10, $11, 'orchestrator', $12, $13, $14::jsonb)`,
+  await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
+    VALUES ($1, $2, $3, NULL, $4, $5, 'turn.started', 'orchestrator', $3, $6, $7::jsonb, $15),
+      ($8, $2, $3, $9, $4, $10, $11, 'orchestrator', $12, $13, $14::jsonb, $16)`,
   [`root-history-start-${source.turnId}`, source.sessionId, source.turnId, source.rootTaskId, source.startSequence,
     `turn:${source.turnId}:event:turn-started`, JSON.stringify({ goal: source.goal, taskId: source.rootTaskId, rootTaskId: source.rootTaskId }),
     `root-history-terminal-${source.turnId}`, terminalItemId, terminalSequence, terminalType, correlationId, terminalKey,
-    JSON.stringify(terminalPayload)])
+    JSON.stringify(terminalPayload), new Date(terminalCreatedAt.getTime() - 1), terminalCreatedAt])
 }
 
 describePg("direct Root-task history PostgreSQL source validation", () => {
@@ -166,14 +191,20 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSession(sessionId, userId, 100)
     await insertSession(otherSessionId, userId, 4)
     await insertSession(foreignSessionId, otherUserId, 4)
+    await insertSession(archivedSessionId, userId, 4)
+    await pool!.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
     for (const source of matching) await insertSource(source)
     await insertSource(mismatched)
     await insertSource(changedCriteria)
     await insertSource(selectedJob)
     await insertSource(otherSession)
+    await insertSource(crossWrongSource)
+    await insertSource(crossWrongOrigin)
+    await insertSource(archivedSource)
     await insertSource(foreignScopeCorrelation)
     await insertSource(otherUser)
     await insertSource(future)
+    await insertSource(equalCutoff)
     await insertSource(inconsistentTerminal)
     await insertSource(streamingTerminalStep)
     await insertSource(failedTerminalStep)
@@ -194,10 +225,10 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
       VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
-    await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-      VALUES ($1, $2, $3, NULL, $4, 100, 'turn.started', 'orchestrator', $3, $5, $6::jsonb)`,
+    await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
+      VALUES ($1, $2, $3, NULL, $4, 100, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, $7)`,
     [`root-history-current-start-${suffix}`, sessionId, currentTurnId, currentRootTaskId,
-      `turn:${currentTurnId}:event:turn-started`, JSON.stringify({ goal: objective, taskId: currentRootTaskId, rootTaskId: currentRootTaskId })])
+      `turn:${currentTurnId}:event:turn-started`, JSON.stringify({ goal: objective, taskId: currentRootTaskId, rootTaskId: currentRootTaskId }), currentStartCreatedAt])
   })
 
   afterAll(async () => {
@@ -221,5 +252,18 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       otherSession.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId, inconsistentTerminal.turnId,
       streamingTerminalStep.turnId, failedTerminalStep.turnId, missingStepReceipt.turnId, mismatchedStepReceipt.turnId,
       duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
+  })
+
+  it("reads only opt-in exact-origin prior history from eligible same-user sessions", async () => {
+    const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+      rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+    const history = await createPgDirectRootTaskHistoryStore(pool!).load(input)
+
+    expect(history.map(item => item.sourceTurnId)).toEqual([otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId])
+    expect(history.every(item => item.taskGraph.nodes.length === 1)).toBe(true)
+    expect(history.some(item => [mismatched.turnId, changedCriteria.turnId, selectedJob.turnId, foreignScopeCorrelation.turnId,
+      otherUser.turnId, future.turnId, equalCutoff.turnId, crossWrongSource.turnId, crossWrongOrigin.turnId, archivedSource.turnId,
+      inconsistentTerminal.turnId, streamingTerminalStep.turnId, failedTerminalStep.turnId, missingStepReceipt.turnId,
+      mismatchedStepReceipt.turnId, duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
   })
 })

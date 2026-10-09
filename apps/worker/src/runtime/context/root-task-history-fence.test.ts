@@ -1,7 +1,7 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
-import { readRootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { readRootTaskHistoryFence, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { rootTaskObjectiveDigest } from "./root-task-objective.js"
 
 type Row = Record<string, unknown>
@@ -18,7 +18,8 @@ function start(sequence = "20"): Row {
   return {
     sessionId: "session-1", turnId: "turn-current", taskId: "root-current", itemId: null, sequence,
     type: "turn.started", actor: "orchestrator", correlationId: "turn-current",
-    idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" }, startEventCount: 1,
+    idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" },
+    createdAt: new Date("2026-10-07T12:00:00.000Z"), startEventCount: 1,
   }
 }
 
@@ -41,9 +42,9 @@ function fixture(options: Options = {}) {
         id: "step-current", sessionId: "session-1", turnId: "turn-current", taskId: "root-current",
         attempt: options.stepAttempt ?? 1, status: "streaming",
       }] }
-      if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "input"')) return { rows: [{
+      if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "source", "input"')) return { rows: [{
         id: "turn-current", sessionId: "session-1", userId: "user-1", rootTaskId: "root-current", status: "in_progress",
-        input: options.turnInput ?? { goal: " Plan a role " },
+        source: "user", input: options.turnInput ?? { goal: " Plan a role " },
       }] }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [start()] }
       throw new Error(`unexpected query: ${sql}`)
@@ -105,6 +106,24 @@ describe("root task history current fence", () => {
       const test = fixture({ startRows })
       await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toBeUndefined()
     }
+  })
+
+  it("derives opt-in source, validated intent, and DB-time cutoff from persisted current rows", async () => {
+    const test = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "interactive_discovery_shortlist", version: 1 } } })
+    const input = { ...test.input, crossSessionRootTaskHistoryEnabled: true }
+
+    await expect(readRootTaskHistoryFence(test.client, input)).resolves.toMatchObject({
+      currentStartSequence: 20n, currentStartCreatedAt: new Date("2026-10-07T12:00:00.000Z"),
+      currentOrigin: JSON.stringify(["user", "interactive_discovery_shortlist", 1]),
+    })
+    expect(rootTaskHistoryOrigin("automation", { goal: "x" })).toBe(JSON.stringify(["automation", "none"]))
+    expect(rootTaskHistoryOrigin("user", { goal: "x", intent: { kind: "other", version: 1 } })).toBeUndefined()
+    expect(rootTaskHistoryOrigin("user", { goal: "x", intent: { kind: "interactive_discovery_shortlist", version: 1, extra: true } })).toBeUndefined()
+  })
+
+  it("keeps legacy same-session eligibility unchanged for unknown intents when opt-in is absent", async () => {
+    const test = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "future_intent", version: 9 } } })
+    await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toMatchObject({ objectiveDigest: expect.any(String) })
   })
 
   it("rejects a noncanonical current streaming Step or Root status", async () => {
