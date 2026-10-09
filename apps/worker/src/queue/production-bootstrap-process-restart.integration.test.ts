@@ -5,6 +5,9 @@ import { Queue } from "bullmq"
 import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
+import { redactSensitiveText } from "@jobcopilot/shared"
+import { InMemoryToolLifecycleSink, ToolLifecycle, type LifecycleCall } from "../runtime/tools/lifecycle.js"
+import { redactJobReadOutput } from "../runtime/tools/job-read-output-redaction.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RESULT_MARKER = "durable-child-result-after-process-restart"
@@ -52,6 +55,83 @@ function dedicatedRedisUrl(): string | null {
 const databaseUrl = dedicatedDatabaseUrl()
 const redisUrl = dedicatedRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
+
+const PHONE_LIKE_UUID = "00000000-0000-4000-8000-000000000000"
+
+function alphaOnlyUuidSuffix(value: string): string {
+  if (!/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)) throw new Error("invalid_fixture_uuid_nonce")
+  // Hex nibbles map bijectively to a-p; q marks the original hyphen boundaries.
+  return value.toLowerCase().replace(/[0-9a-f-]/g, character =>
+    character === "-" ? "q" : String.fromCharCode(97 + Number.parseInt(character, 16)))
+}
+
+describe("duplicate redelivery fixture redaction-safe suffix", () => {
+  it("keeps the nonce injective without exposing phone-like UUIDs in lifecycle or job results", async () => {
+    const suffix = alphaOnlyUuidSuffix(PHONE_LIKE_UUID)
+    const nextSuffix = alphaOnlyUuidSuffix("00000000-0000-4000-8000-000000000001")
+    expect(suffix).toMatch(/^[a-q]+$/)
+    expect(nextSuffix).not.toBe(suffix)
+    expect(redactSensitiveText(PHONE_LIKE_UUID)).toBe("[REDACTED_PHONE]")
+    expect(redactSensitiveText(suffix)).toBe(suffix)
+
+    const description = "recruiter@example.com +353 87 123 4567"
+    const outputFor = (company: string, role: string) => ({
+      jobs: [{ id: DUPLICATE_REDELIVERY_JOB_ID, company, role, description }],
+      page: 1,
+      hasMore: false,
+    })
+    const oldRawOutput = outputFor(
+      `Fixture Employer ${PHONE_LIKE_UUID}`,
+      `Fixture Engineer ${PHONE_LIKE_UUID}`,
+    )
+    const oldOutput = redactJobReadOutput("jobs.search", oldRawOutput)
+    expect(oldOutput).toMatchObject({
+      jobs: [{
+        id: DUPLICATE_REDELIVERY_JOB_ID,
+        company: "Fixture Employer [REDACTED_PHONE]",
+        role: "Fixture Engineer [REDACTED_PHONE]",
+        description: "[REDACTED_EMAIL] [REDACTED_PHONE]",
+      }],
+      page: 1,
+      hasMore: false,
+    })
+
+    const safeOutput = outputFor(`Fixture Employer ${suffix}`, `Fixture Engineer ${suffix}`)
+    const directResult = redactJobReadOutput("jobs.search", safeOutput)
+    expect(directResult).toEqual({
+      jobs: [{
+        id: DUPLICATE_REDELIVERY_JOB_ID,
+        company: `Fixture Employer ${suffix}`,
+        role: `Fixture Engineer ${suffix}`,
+        description: "[REDACTED_EMAIL] [REDACTED_PHONE]",
+      }],
+      page: 1,
+      hasMore: false,
+    })
+
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const call: LifecycleCall = {
+      id: `duplicate-read:${PHONE_LIKE_UUID}`,
+      toolName: "jobs.search",
+      toolVersion: "1",
+      sessionId: "fixture-session",
+      turnId: "fixture-turn",
+      stepId: "fixture-step",
+    }
+    await lifecycle.started(call, { target: PHONE_LIKE_UUID, limit: 1 })
+    expect(sink.events[0]?.item).toMatchObject({ input: { target: "[REDACTED_PHONE]", limit: 1 } })
+    const oldLifecycleResult = await lifecycle.completed(call, oldRawOutput)
+    expect(oldLifecycleResult).toEqual(oldOutput)
+    expect(sink.events[1]?.item).toMatchObject({ type: "tool_result", output: oldOutput })
+    const safeCall = { ...call, id: `duplicate-read:${suffix}` }
+    await lifecycle.started(safeCall, { target: suffix, limit: 1 })
+    expect(sink.events[2]?.item).toMatchObject({ toolCallId: safeCall.id, input: { target: suffix, limit: 1 } })
+    const lifecycleResult = await lifecycle.completed(safeCall, safeOutput)
+    expect(lifecycleResult).toEqual(directResult)
+    expect(sink.events[3]?.item).toMatchObject({ type: "tool_result", output: directResult })
+  })
+})
 
 type FixtureFollowUp = { clientMessageId: string; text: string }
 type CheckpointKind = "approval" | "question" | "tool-result"
@@ -1280,18 +1360,20 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   )
 
   it("redelivers the retained completed BullMQ job ID without repeating persisted Turn work", async () => {
-    const suffix = randomUUID()
+    const uuidNonce = randomUUID()
+    const suffix = alphaOnlyUuidSuffix(uuidNonce)
     ids.suffix = suffix
-    ids.sessionId = `duplicate-redelivery-session-${suffix}`
+    ids.sessionId = `duplicate-redelivery-session-${uuidNonce}`
     const readCallId = `duplicate-read:${suffix}`
     const readJobId = DUPLICATE_REDELIVERY_JOB_ID
+    const readJobRole = `Fixture Engineer ${suffix}`
     const readJobDescription = `recruiter-${suffix}@example.com +353 87 123 4567`
     fixtureSessionIds.add(ids.sessionId)
     fixtureJobIds.add(readJobId)
     await pool!.query(
       `INSERT INTO "Job" ("id", "userId", "company", "role", "description", "updatedAt")
-       VALUES ($1, $2, $3, 'Fixture Engineer', $4, CURRENT_TIMESTAMP)`,
-      [readJobId, ids.userId, `Fixture Employer ${suffix}`, readJobDescription],
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
+      [readJobId, ids.userId, `Fixture Employer ${suffix}`, readJobRole, readJobDescription],
     )
     await pool!.query(
       `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
@@ -1361,7 +1443,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
           jobs: [expect.objectContaining({
             id: readJobId,
             company: `Fixture Employer ${suffix}`,
-            role: "Fixture Engineer",
+            role: readJobRole,
             description: "[REDACTED_EMAIL] [REDACTED_PHONE]",
           })],
           page: 1,
