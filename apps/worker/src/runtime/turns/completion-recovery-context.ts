@@ -148,12 +148,35 @@ export function applyCompletionRecovery(snapshot: StepContextSnapshot, stepId: s
   }
 }
 
+const VERSIONED_TEXT_SUFFIX = " These ordinals apply only to this graph revision. Replan or repair the affected criteria, then verify again."
+const NATIVE_TEXT_PREFIX = "Native verification recovery: "
+const NATIVE_TYPED_TEXT_SUFFIX = " Repair against current owned evidence. No prior node or criterion ordinal is actionable."
+const NATIVE_FIXED_TEXT_SUFFIX = " Inspect the current TaskGraph before retrying; no prior ordinal is actionable."
+
+function isCurrentTaskGraphRepairSeed(seed: StepContextSnapshot["system"][number], revision: number): boolean {
+  if (typeof seed.content !== "string" || seed.content.length > MAX_ENVELOPE || !validRevision(revision)) return false
+  const prefix = `${VERSIONED_TEXT_PREFIX}${revision}: `
+  if (!seed.content.startsWith(prefix) || !seed.content.endsWith(VERSIONED_TEXT_SUFFIX)) return false
+  const feedback = seed.content.slice(prefix.length, -VERSIONED_TEXT_SUFFIX.length)
+  return feedback.length <= MAX_FEEDBACK && validTaskGraphFeedback(feedback)
+}
+
+function isNativeRepairSeed(content: unknown): boolean {
+  if (typeof content !== "string" || content.length > MAX_ENVELOPE || !content.startsWith(NATIVE_TEXT_PREFIX)) return false
+  const typedFeedback = content.slice(NATIVE_TEXT_PREFIX.length, -NATIVE_TYPED_TEXT_SUFFIX.length)
+  if (content.endsWith(NATIVE_TYPED_TEXT_SUFFIX)
+    && typedFeedback.startsWith("Independent native verification is ")
+    && safeNativeFeedback(typedFeedback) === typedFeedback) return true
+  const fixedFeedback = content.slice(NATIVE_TEXT_PREFIX.length, -NATIVE_FIXED_TEXT_SUFFIX.length)
+  return content.endsWith(NATIVE_FIXED_TEXT_SUFFIX) && NATIVE_FIXED.has(fixedFeedback)
+}
+
 export function retireStaleTaskGraphRepair(snapshot: StepContextSnapshot, trustedGraphRevision: number): StepContextSnapshot {
   const currentId = `${SEED_PREFIX}${trustedGraphRevision}`
   let latestCurrent = -1, latestNative = -1, latestUnversioned = -1
   snapshot.system.forEach((seed, index) => {
-    if (seed.id === currentId) latestCurrent = index
-    if (seed.id === `${SEED_PREFIX}native`) latestNative = index
+    if (seed.id === currentId && isCurrentTaskGraphRepairSeed(seed, trustedGraphRevision)) latestCurrent = index
+    if (seed.id === `${SEED_PREFIX}native` && isNativeRepairSeed(seed.content)) latestNative = index
     if (seed.id === `${SEED_PREFIX}unversioned` && seed.content === GENERIC_FEEDBACK) latestUnversioned = index
   })
   return {
@@ -162,10 +185,11 @@ export function retireStaleTaskGraphRepair(snapshot: StepContextSnapshot, truste
       if (seed.id.startsWith("completion-recovery:") && typeof seed.content === "string" && seed.content.startsWith(LEGACY_TEXT_PREFIX)) return false
       if (!seed.id.startsWith(SEED_PREFIX)) return true
       const suffix = seed.id.slice(SEED_PREFIX.length)
-      if (suffix === "native") return index === latestNative
+      if (suffix === "native") return isNativeRepairSeed(seed.content) && index === latestNative
       if (suffix === "unversioned") return seed.content === GENERIC_FEEDBACK && index === latestUnversioned
       const revision = suffix === String(trustedGraphRevision) && validRevision(Number(suffix)) ? Number(suffix) : null
-      return revision !== null && revision === trustedGraphRevision && index === latestCurrent
+      return revision !== null && revision === trustedGraphRevision
+        && isCurrentTaskGraphRepairSeed(seed, revision) && index === latestCurrent
     }),
   }
 }
