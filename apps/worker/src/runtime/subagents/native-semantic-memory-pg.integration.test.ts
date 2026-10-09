@@ -385,7 +385,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await adminPool!.query(`INSERT INTO "agent_steps"
       ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode",
        "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "completedAt")
-      VALUES ($1, $2, $3, $4, 16, 1, 'completed', 'stop', NULL, 0, $5::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, $4, 0, 1, 'completed', 'stop', NULL, 0, $5::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
     [sourceStepId, sessionId, turnId, rootTaskId, JSON.stringify([rootInputId])])
     await adminPool!.query(`INSERT INTO "agent_inputs"
       ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
