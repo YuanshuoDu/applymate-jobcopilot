@@ -19,20 +19,53 @@ const input = { owner, stepId: "step-4", finishReason: "stop", errorCode: null, 
   estimatedCostUsd: 0.00012345, now: new Date("2026-10-07T00:00:00Z"), identity }
 const packetText = "Whole final candidate\n"
 
-function client(options: { stepStatus?: string; sequence?: string; receipt?: Record<string, unknown> | null; insertRows?: number; history?: string[] } = {}) {
+function client(options: {
+  stepStatus?: string; probeStatus?: string; stepTaskId?: string; stepAttempt?: number; checkpoint?: string
+  stepInputTokens?: number; stepOutputTokens?: number; stepCost?: string; receipt?: Record<string, unknown> | null
+  insertRows?: number; history?: string[]; rootOwned?: boolean; rootAttempt?: number; sessionOpen?: boolean
+  rootWallClockLive?: boolean; rootWallClockSequence?: boolean[]
+  rootLeaseAtStatementLive?: boolean
+  turnWallClockLive?: boolean; turnWallClockSequence?: boolean[]; turnLeaseAtStatementLive?: boolean
+  turnOwned?: boolean; workAdmitted?: boolean; mode?: string; costMatches?: boolean
+} = {}) {
   const calls: { sql: string; values?: readonly unknown[] }[] = []
+  let rootWallClockChecks = 0
+  let turnWallClockChecks = 0
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
-    if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "s" }], rowCount: 1 }
-    if (sql.startsWith('SELECT turn."id"')) return { rows: [{ id: "t" }], rowCount: 1 }
-    if (sql.includes("to_jsonb(turn)")) return { rows: [{ mode: "durable_v1" }], rowCount: 1 }
-    if (sql.includes("FROM \"sub_agent_tasks\"")) return { rows: [{ attemptCount: 1, status: "running" }], rowCount: 1 }
-    if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-4", taskId: "root", attempt: 1, status: options.stepStatus ?? "streaming",
-      finishReason: options.stepStatus === "completed" ? input.finishReason : null, errorCode: null,
-      inputTokens: options.stepStatus === "completed" ? input.inputTokens : 0, outputTokens: options.stepStatus === "completed" ? input.outputTokens : 0,
-      estimatedCostUsd: options.stepStatus === "completed" ? "0.00012345" : "0", inputThroughSequence: options.sequence ?? "8" }], rowCount: 1 }
-    if (sql.includes("numeric(12,8)")) return { rows: [{ same: true }], rowCount: 1 }
-    if (sql.startsWith('UPDATE "agent_steps"')) return { rows: [], rowCount: 1 }
+    if (sql.includes('FROM "agent_sessions"')) {
+      const admitted = sql.includes("pause_request") ? options.workAdmitted !== false : options.sessionOpen !== false
+      return { rows: admitted ? [{ id: "s" }] : [], rowCount: admitted ? 1 : 0 }
+    }
+    if (sql.startsWith('SELECT turn."id"')) {
+      const wallClockOwned = sql.includes("clock_timestamp()")
+        ? options.turnWallClockSequence?.[turnWallClockChecks++] ?? options.turnWallClockLive !== false
+        : options.turnOwned !== false
+      return { rows: wallClockOwned ? [{ id: "t" }] : [], rowCount: wallClockOwned ? 1 : 0 }
+    }
+    if (sql.includes("to_jsonb(turn)")) return { rows: [{ mode: options.mode ?? "durable_v1" }], rowCount: 1 }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) {
+      const wallClockOwned = sql.includes("clock_timestamp()")
+        ? options.rootWallClockSequence?.[rootWallClockChecks++] ?? options.rootWallClockLive !== false
+        : options.rootOwned !== false
+      const owned = wallClockOwned
+      return { rows: owned ? [{ attemptCount: options.rootAttempt ?? 1, status: "running" }] : [], rowCount: owned ? 1 : 0 }
+    }
+    if (sql.includes('FROM "agent_steps"')) {
+      const locked = sql.includes('"inputTokens"'), status = locked ? options.stepStatus ?? "streaming" : options.probeStatus ?? options.stepStatus ?? "streaming"
+      const completed = status === "completed"
+      return { rows: [{ id: "step-4", taskId: options.stepTaskId ?? "root", attempt: options.stepAttempt ?? 1, status,
+        finishReason: completed ? input.finishReason : null, errorCode: null,
+        inputTokens: completed ? options.stepInputTokens ?? input.inputTokens : 0,
+        outputTokens: completed ? options.stepOutputTokens ?? input.outputTokens : 0,
+        estimatedCostUsd: completed ? options.stepCost ?? "0.00012345" : "0", inputThroughSequence: options.checkpoint ?? "8" }], rowCount: 1 }
+    }
+    if (sql.includes("numeric(12,8)")) return { rows: [{ same: options.costMatches !== false }], rowCount: 1 }
+    if (sql.startsWith('UPDATE "agent_steps"')) {
+      const rootLeaseLive = !sql.includes('root_fence."leaseExpiresAt" > clock_timestamp()') || options.rootLeaseAtStatementLive !== false
+      const turnLeaseLive = !sql.includes('turn."leaseExpiresAt" > clock_timestamp()') || options.turnLeaseAtStatementLive !== false
+      return { rows: [], rowCount: rootLeaseLive && turnLeaseLive ? 1 : 0 }
+    }
     if (sql.includes('FROM "agent_native_semantic_rejections" AS rejection')) return { rows: (options.history ?? ["step-4"]).map(stepId => ({ stepId })), rowCount: options.history?.length ?? 1 }
     if (sql.startsWith('SELECT * FROM "agent_native_semantic_rejections"')) return { rows: options.receipt ? [options.receipt] : [], rowCount: options.receipt ? 1 : 0 }
     if (sql.startsWith('INSERT INTO "agent_native_semantic_rejections"')) return { rows: [], rowCount: options.insertRows ?? 1 }
@@ -60,10 +93,16 @@ describe("atomic native semantic rejection completion", () => {
     expect(readers.proof).toHaveBeenCalledWith(mock.client, expect.objectContaining({
       candidateText: packetText, controlTaskId: identity.controlTaskId, stepId: input.stepId,
     }))
+    expect(readers.graph).toHaveBeenCalledWith(mock.client, expect.objectContaining({ userId: "u", sessionId: "s", turnId: "t",
+      rootTaskId: "root", parentTaskId: "root", turnLeaseOwner: "lease", turnLeaseVersion: 2,
+      parentLeaseOwner: "lease", parentAttemptCount: 1 }), true)
     const updateIndex = mock.calls.findIndex(call => call.sql.startsWith('UPDATE "agent_steps"'))
     const insertIndex = mock.calls.findIndex(call => call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))
+    const update = mock.calls[updateIndex]
     expect(updateIndex).toBeGreaterThanOrEqual(0)
     expect(insertIndex).toBeGreaterThan(updateIndex)
+    expect(update?.sql).toContain('root_fence."leaseExpiresAt" > clock_timestamp()')
+    expect(update?.sql).toContain('root_fence."interruptRequestedAt" IS NULL')
     expect(mock.calls[insertIndex]?.values).toEqual(["u", "s", "t", "root", "step-4", "8", identity.candidateDigest,
       identity.controlTaskId, identity.controlOperationId, identity.controlAttempt, identity.controlReportDigest, input.now])
   })
@@ -85,25 +124,193 @@ describe("atomic native semantic rejection completion", () => {
     expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"'))).toBe(false)
   })
 
-  it("rejects a changed epoch in fresh private readback before Step mutation", async () => {
+  it("rejects a proof identity checkpoint that differs from the expected checkpoint before mutation", async () => {
     readers.proof.mockResolvedValue({ ...identity, inputThroughSequence: 9n })
     const mock = client()
     await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
     expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
   })
 
-  it("rejects when the locked Step epoch differs from the proof identity before mutation", async () => {
-    const mock = client({ sequence: "9" })
+  it("rejects when the proof identity checkpoint differs from the locked Step before mutation", async () => {
+    const mock = client({ checkpoint: "9" })
     await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
     expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
   })
 
+  it("rejects the fresh completion when the statement-time root lease fence expires after recheck", async () => {
+    const mock = client({ rootWallClockSequence: [true], rootLeaseAtStatementLive: false })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    const stepLockIndex = mock.calls.findIndex(call => call.sql.includes('FROM "agent_steps"') && call.sql.includes("FOR UPDATE"))
+    const lateRootCheckIndex = mock.calls.findIndex(call => call.sql.startsWith('SELECT task."attemptCount"') && call.sql.includes("clock_timestamp()"))
+    const updateIndex = mock.calls.findIndex(call => call.sql.startsWith('UPDATE "agent_steps"'))
+    expect(lateRootCheckIndex).toBeGreaterThan(stepLockIndex)
+    expect(updateIndex).toBeGreaterThan(lateRootCheckIndex)
+    expect(mock.calls[updateIndex]?.sql).toContain('root_fence."leaseExpiresAt" > clock_timestamp()')
+    expect(mock.calls.some(call => call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("rejects fresh completion when the Turn lease expires while acquiring the Step lock", async () => {
+    const mock = client({ turnWallClockSequence: [false] })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    const stepLockIndex = mock.calls.findIndex(call => call.sql.includes('FROM "agent_steps"') && call.sql.includes("FOR UPDATE"))
+    const turnCheckIndex = mock.calls.findIndex(call => call.sql.startsWith('SELECT turn."id"') && call.sql.includes("clock_timestamp()"))
+    expect(turnCheckIndex).toBeGreaterThan(stepLockIndex)
+    expect(mock.calls[turnCheckIndex]?.sql).toContain('turn."leaseExpiresAt" > clock_timestamp()')
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("rejects fresh completion when the Turn lease expires after the Step-lock recheck", async () => {
+    const mock = client({ turnWallClockSequence: [true], turnLeaseAtStatementLive: false })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    const stepLockIndex = mock.calls.findIndex(call => call.sql.includes('FROM "agent_steps"') && call.sql.includes("FOR UPDATE"))
+    const turnCheckIndex = mock.calls.findIndex(call => call.sql.startsWith('SELECT turn."id"') && call.sql.includes("clock_timestamp()"))
+    const updateIndex = mock.calls.findIndex(call => call.sql.startsWith('UPDATE "agent_steps"'))
+    expect(turnCheckIndex).toBeGreaterThan(stepLockIndex)
+    expect(updateIndex).toBeGreaterThan(turnCheckIndex)
+    expect(mock.calls[turnCheckIndex]?.sql).toContain('turn."leaseOwnerId" = $4')
+    expect(mock.calls[turnCheckIndex]?.sql).toContain('turn."leaseVersion" = $5')
+    expect(mock.calls[turnCheckIndex]?.sql).toContain('turn."leaseExpiresAt" > clock_timestamp()')
+    expect(mock.calls[updateIndex]?.sql).toContain('turn."leaseExpiresAt" > clock_timestamp()')
+    expect(mock.calls.some(call => call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
   it("replays only the exact completed Step and receipt without an update or duplicate insert", async () => {
+    readers.proof.mockResolvedValue(null)
     const mock = client({ stepStatus: "completed", receipt })
     await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).resolves.toEqual({ inputThroughSequence: 8n, distinctStepCount: 1 })
+    expect(readers.graph).not.toHaveBeenCalled()
+    expect(readers.state).not.toHaveBeenCalled()
+    expect(readers.controls).not.toHaveBeenCalled()
+    expect(readers.proof).not.toHaveBeenCalled()
     expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+    const rootLock = mock.calls.find(call => call.sql.includes('FOR UPDATE OF task'))
+    expect(rootLock?.sql).toContain('task."status" = \'running\'')
+    expect(rootLock?.sql).toContain('task."interruptRequestedAt" IS NULL')
+    expect(rootLock?.sql).toContain('task."leaseExpiresAt" > CURRENT_TIMESTAMP')
+    expect(rootLock?.sql).toContain('task."leaseOwner" = $4')
+    expect(rootLock?.values).toEqual(["root", "s", "t", "lease", "u"])
+    expect(mock.calls.some(call => call.sql.includes('FROM "agent_steps"') && call.sql.includes('FOR UPDATE'))).toBe(true)
     const receiptRead = mock.calls.find(call => call.sql.startsWith('SELECT * FROM "agent_native_semantic_rejections"'))
     expect(receiptRead?.sql).not.toMatch(/\bFOR\s+UPDATE\b/i)
+    const countRead = mock.calls.find(call => call.sql.includes('FROM "agent_native_semantic_rejections" AS rejection'))
+    expect(mock.calls.filter(call => call.sql.startsWith('SELECT task."attemptCount"') && call.sql.includes("clock_timestamp()"))).toHaveLength(3)
+    expect(countRead?.sql).toContain('rejection."inputThroughSequence" = $5')
+    expect(countRead?.sql).toContain('rejection."controlReportDigest" = $10')
+    expect(countRead?.sql).toContain('LIMIT 3')
+    expect(countRead?.values).toEqual(["u", "s", "t", "root", "8", identity.candidateDigest, identity.controlTaskId,
+      identity.controlOperationId, identity.controlAttempt, identity.controlReportDigest])
+  })
+
+  it.each([
+    ["user owner", { ...receipt, userId: "other-user" }],
+    ["session owner", { ...receipt, sessionId: "other-session" }],
+    ["Turn owner", { ...receipt, turnId: "other-turn" }],
+    ["root owner", { ...receipt, rootTaskId: "other-root" }],
+    ["Step ID", { ...receipt, stepId: "other-step" }],
+    ["Step attempt", { ...receipt, attempt: 2 }],
+    ["input epoch", { ...receipt, inputThroughSequence: "9" }],
+    ["candidate", { ...receipt, candidateDigest: "c".repeat(64) }],
+    ["control task", { ...receipt, controlTaskId: "other-control" }],
+    ["control operation", { ...receipt, controlOperationId: "other-operation" }],
+    ["control attempt", { ...receipt, controlAttempt: 3 }],
+    ["report digest", { ...receipt, controlReportDigest: "c".repeat(64) }],
+  ])("rejects completed replay with mismatched %s receipt", async (_name, mismatchedReceipt) => {
+    const mock = client({ stepStatus: "completed", receipt: mismatchedReceipt })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("does not return a completed replay if the root lease expires after its receipt read", async () => {
+    const mock = client({ stepStatus: "completed", receipt, rootWallClockSequence: [true, true, false] })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.startsWith('SELECT * FROM "agent_native_semantic_rejections"'))).toBe(true)
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("does not return a completed replay when the Turn lease expires before the final return check", async () => {
+    const mock = client({ stepStatus: "completed", receipt, turnWallClockSequence: [true, false] })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    const stepLockIndex = mock.calls.findIndex(call => call.sql.includes('FROM "agent_steps"') && call.sql.includes("FOR UPDATE"))
+    const countReadIndex = mock.calls.findIndex(call => call.sql.includes('FROM "agent_native_semantic_rejections" AS rejection'))
+    const turnChecks = mock.calls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) => call.sql.startsWith('SELECT turn."id"') && call.sql.includes("clock_timestamp()"))
+    expect(turnChecks).toHaveLength(2)
+    expect(turnChecks[0]?.index).toBeGreaterThan(stepLockIndex)
+    expect(turnChecks[1]?.index).toBeGreaterThan(countReadIndex)
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("rejects completed replay with changed persisted usage, epoch, or numeric cost", async () => {
+    for (const options of [
+      { stepStatus: "completed", receipt, stepInputTokens: 13 },
+      { stepStatus: "completed", receipt, checkpoint: "9" },
+      { stepStatus: "completed", receipt, costMatches: false },
+    ]) {
+      const mock = client(options)
+      await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+      expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+    }
+  })
+
+  it("does not write when the non-locking completed probe changes before Step lock", async () => {
+    const mock = client({ probeStatus: "completed", stepStatus: "streaming" })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(readers.proof).not.toHaveBeenCalled()
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("does not read proof or write for a Step that is neither completed nor streaming", async () => {
+    const mock = client({ stepStatus: "failed" })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(readers.proof).not.toHaveBeenCalled()
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it.each([
+    ["completed replay", { stepStatus: "completed", receipt }],
+    ["fresh completion", { stepStatus: "streaming" }],
+  ])("stops %s when the root lease expires before the late wall-clock recheck", async (_name, options) => {
+    const mock = client({ ...options, rootWallClockLive: false })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    const initialRootLock = mock.calls.find(call => call.sql.includes('FROM "sub_agent_tasks" AS task') && call.sql.includes("FOR UPDATE OF task"))
+    const lateRootCheckIndex = mock.calls.findIndex(call => call.sql.startsWith('SELECT task."attemptCount"') && call.sql.includes("clock_timestamp()"))
+    const stepLockIndex = mock.calls.findIndex(call => call.sql.includes('FROM "agent_steps"') && call.sql.includes("FOR UPDATE"))
+    const lateRootCheck = mock.calls[lateRootCheckIndex]
+    expect(initialRootLock?.sql).toContain('task."leaseExpiresAt" > CURRENT_TIMESTAMP')
+    expect(lateRootCheckIndex).toBeGreaterThan(stepLockIndex)
+    expect(lateRootCheck?.sql).toContain('task."status" = \'running\' AND task."interruptRequestedAt" IS NULL')
+    expect(lateRootCheck?.values).toEqual(["root", "s", "t", "lease", "u"])
+    expect(mock.calls.some(call => call.sql.startsWith('SELECT * FROM "agent_native_semantic_rejections"'))).toBe(false)
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it.each([
+    ["wrong task", { stepTaskId: "other-root" }],
+    ["wrong attempt", { stepAttempt: 2 }],
+  ])("rejects completed replay with %s lineage before proof readback", async (_name, options) => {
+    const mock = client({ ...options, stepStatus: "completed", receipt })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(readers.proof).not.toHaveBeenCalled()
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it.each([
+    ["closed Session", { sessionOpen: false }],
+    ["lost Turn lease", { turnOwned: false }],
+    ["lost or interrupted Root lease", { rootOwned: false }],
+    ["invalid Root attempt", { rootAttempt: 0 }],
+    ["unpinned durable mode", { mode: "legacy_v1" }],
+  ])("rejects completed replay after %s", async (_name, options) => {
+    const mock = client({ ...options, stepStatus: "completed", receipt })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("rejects completed replay when session work is paused", async () => {
+    const mock = client({ workAdmitted: false, stepStatus: "completed", receipt })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "session_pause_requested" })
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
   })
 
   it("delegates numeric(12,8) half-boundary comparison to PostgreSQL", async () => {

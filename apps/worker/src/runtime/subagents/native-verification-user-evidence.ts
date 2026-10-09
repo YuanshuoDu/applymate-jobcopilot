@@ -6,8 +6,9 @@ import {
 } from "./native-verification-contract.js"
 import { appendNativeQuestionSelfAttestations } from "./native-verification-question-evidence.js"
 import { isNativeSteeringEvidence } from "./native-verification-steering-contract.js"
+import { isNativeOriginalTaskReferenceEvidence } from "./native-verification-original-input-source.js"
 import {
-  readNativeVerificationSteeringSource,
+  readNativeVerificationUserReferenceSources,
   type NativeSteeringCheckpointSelection,
 } from "./native-verification-steering-source.js"
 import type { NativeVerificationPacketContent } from "./native-verification-pg-evidence.js"
@@ -26,17 +27,22 @@ export async function appendNativeUserSelfAttestations(
 ): Promise<NativeVerificationPacketContent | null> {
   const withQuestions = await appendNativeQuestionSelfAttestations(client, scope, content)
   if (!withQuestions) return null
-  const steering = await readNativeVerificationSteeringSource(client, scope, selection)
-  if (!steering || !Array.isArray(steering) || steering.length > MAX_STEERING_INPUTS
-    || steering.some(item => !isNativeSteeringEvidence(item))) return null
-  if (!steering.length) return withQuestions
+  const sources = await readNativeVerificationUserReferenceSources(client, scope, selection)
+  if (!sources || !Array.isArray(sources.steering) || sources.steering.length > MAX_STEERING_INPUTS
+    || sources.steering.some(item => !isNativeSteeringEvidence(item))
+    || !Array.isArray(sources.originalTaskReference) || sources.originalTaskReference.length > 1
+    || sources.originalTaskReference.some(item => !isNativeOriginalTaskReferenceEvidence(item))
+    || sources.originalTaskReferenceRequired && sources.originalTaskReference.length === 0) return null
+  if (!sources.steering.length && !sources.originalTaskReference.length) return withQuestions
 
   const references = new Set([withQuestions.target.referenceId, ...withQuestions.evidence.map(item => item.referenceId)])
-  for (const item of steering) {
+  for (const item of [...sources.originalTaskReference, ...sources.steering]) {
     if (references.has(item.referenceId)) return null
     references.add(item.referenceId)
   }
-  const evidence: readonly NativeVerificationEvidence[] = [...withQuestions.evidence, ...steering]
+  const evidence: readonly NativeVerificationEvidence[] = [
+    ...withQuestions.evidence, ...sources.originalTaskReference, ...sources.steering,
+  ]
   if (evidence.length > MAX_EVIDENCE) return null
   const combined = { ...withQuestions, evidence }
   try {

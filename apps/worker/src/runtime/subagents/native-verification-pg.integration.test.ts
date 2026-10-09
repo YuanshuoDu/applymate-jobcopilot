@@ -221,6 +221,7 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
   const answeredEventId = `${eventPrefix}-answered-event-${suffix}`
   const answerPayload = { waitKind: "question", waitId, itemId, turnId: seed.turnId,
     toolCallId, status: "answered", nextTurnRevision: 3, answerAvailable: true }
+  const answerKey = "question-answer:" + seed.turnId + ":" + waitId
   const eventRows = [
     { id: `${eventPrefix}-step-event-${suffix}`, itemId: null, taskId: seed.rootTaskId, sequence: firstSequence + 1, type: "step.completed",
       actor: "orchestrator", correlationId: seed.stepId, causationId: previousRootEvent.rows[0]?.id ?? null,
@@ -230,10 +231,10 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
       actor: "orchestrator", correlationId: itemId, causationId: waitId, key: `agent-wait:${itemId}:started`,
       payload: { itemId, waitKind: "question", questionId: waitId, toolCallId }, topic: "agent.events" },
     { id: answeredEventId, itemId, taskId: null, sequence: firstSequence + 3, type: "question.answered",
-      actor: "user", correlationId: waitId, causationId: itemId, key: `question-answer:${suffix}`, payload: answerPayload, topic: "agent.session.event" },
+      actor: "user", correlationId: waitId, causationId: itemId, key: answerKey, payload: answerPayload, topic: "agent.session.event" },
     { id: `${eventPrefix}-wakeup-event-${suffix}`, itemId, taskId: null, sequence: firstSequence + 4, type: "turn.wakeup",
       actor: "user", correlationId: seed.turnId, causationId: answeredEventId,
-      key: `question-answer:${suffix}:wakeup`, payload: answerPayload, topic: "agent.turn.wakeup" },
+      key: answerKey + ":wakeup", payload: answerPayload, topic: "agent.turn.wakeup" },
   ]
   for (const event of eventRows) {
     const envelope = { eventId: event.id, sessionId: ids.session, turnId: seed.turnId, itemId: event.itemId,
@@ -417,6 +418,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
       question: answeredQuestion.question, options: [], answer: answeredQuestion.answer })
     expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
+      statementSource: "user_statement", turnRelation: "earlier_turn",
       question: priorQuestion.question, options: [], answer: priorQuestion.answer })
     const privateReferenceIds = attestation.map(item => item.referenceId)
     if (!rootControl || !rootPacket || privateReferenceIds.some(value => !value)) throw new Error("native_answer_evidence_packet_unavailable")
@@ -433,8 +435,22 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const modelText = modelRequest.messages.flatMap(message => message.content)
       .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
       .map(part => part.text).join("\n")
-    expect(modelText.includes(JSON.stringify(answeredQuestion.answer))).toBe(true)
-    expect(modelText.includes(JSON.stringify(priorQuestion.answer))).toBe(true)
+    const profilePrefix = "[harness context layer=profile trust=UNTRUSTED_DATA source=native-verification-packet]\n"
+    const profileBlocks = modelRequest.messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> =>
+        part.type === "text" && part.text.startsWith(profilePrefix))
+    expect(profileBlocks).toHaveLength(1)
+    const requestProfile = JSON.parse(profileBlocks[0]!.text.slice(profilePrefix.length)) as {
+      evidence: Array<{ kind: string; referenceId: string; summary: string }>
+    }
+    const requestAttestation = requestProfile.evidence.filter(item => item.kind === "user_self_attestation")
+    expect(requestAttestation.map(item => ({ referenceId: item.referenceId, summary: JSON.parse(item.summary) })))
+      .toEqual(attestation.map(item => ({ referenceId: item.referenceId, summary: JSON.parse(item.summary) })))
+    const systemText = modelRequest.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
+      .map(part => part.text).join("\n")
+    expect(systemText).not.toContain(answeredQuestion.answer)
+    expect(systemText).not.toContain(priorQuestion.answer)
     expect(modelText.includes("not independent proof of external facts")).toBe(true)
     expect(modelText.includes("action, approval, consent, credential, or submission authority")).toBe(true)
     expect(executed.usageAuthorizations).toHaveLength(1)

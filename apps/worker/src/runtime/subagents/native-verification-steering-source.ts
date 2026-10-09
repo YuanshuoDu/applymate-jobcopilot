@@ -9,13 +9,20 @@ import {
   type NativeVerificationEvidence,
 } from "./native-verification-contract.js"
 import {
+  nativeOriginalInputOwnerIsCurrent,
+  nativeOriginalInputStepCoversCheckpoint,
+  nativeOriginalTaskReferenceEvidence,
+  nativeOriginalTaskReferenceProjection,
+  readNativeOriginalInputBinding,
+  type NativeOriginalInputBinding,
+} from "./native-verification-original-input-source.js"
+import {
   NATIVE_VERIFICATION_USER_STEERING_MAX_INPUTS,
   NATIVE_VERIFICATION_USER_STEERING_MAX_SOURCE_BYTES,
   NATIVE_VERIFICATION_USER_STEERING_MAX_TOTAL_BYTES,
   NATIVE_VERIFICATION_USER_STEERING_SCHEMA,
   NATIVE_VERIFICATION_USER_STEERING_STAGE,
   nativeSteeringCheckpointInputIdsMatch,
-  parseNativeSteeringTurnInput,
   parseNativeUserSteeringContent,
 } from "./native-verification-steering-contract.js"
 
@@ -32,7 +39,6 @@ export type NativeSteeringCheckpointSelection =
 type Step = Readonly<{ id: string; taskId: string; ordinal: number; attempt: number; status: string; inputThroughSequence: bigint; consumedInputIds: readonly string[] }>
 type Source = Readonly<{ id: string; userId: string; sessionId: string; targetTurnId: string; delivery: string; status: string; content: unknown; acceptedSequence: bigint; consumedByStepId: string | null;
   consumedAt: Date | null; cancelledAt: Date | null }>
-type OriginalInputBinding = Readonly<{ id: string; consumedByStepId: string; acceptedSequence: bigint }>
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const prototype = Object.getPrototypeOf(value)
@@ -84,51 +90,6 @@ function source(value: unknown): Source | null {
     consumedByStepId: row.consumedByStepId, consumedAt: row.consumedAt, cancelledAt: row.cancelledAt }
 }
 function compareStep(left: Step, right: Step): number { return left.ordinal - right.ordinal || left.attempt - right.attempt }
-async function currentOwner(client: Client, scope: TaskGraphReadScope): Promise<boolean> {
-  const result = await client.query<Row>(`SELECT turn."id" AS "turnId", turn."leaseOwnerId", turn."leaseVersion",
-      turn."leaseExpiresAt" > clock_timestamp() AS "turnLeaseLive", root."id" AS "rootTaskId",
-      root."rootTaskId" AS "taskRootTaskId", root."parentTaskId", root."status" AS "rootStatus",
-      root."leaseOwner", root."attemptCount", root."interruptRequestedAt",
-      root."leaseExpiresAt" > clock_timestamp() AS "rootLeaseLive"
-    FROM "agent_turns" AS turn JOIN "agent_sessions" AS session
-      ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
-    JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
-      AND root."turnId" = turn."id" AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL
-    WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4
-      AND turn."status" = 'in_progress' AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6
-      AND root."status" = 'running' AND root."leaseOwner" = $7 AND root."attemptCount" = $8
-      AND root."interruptRequestedAt" IS NULL`,
-  [scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId, scope.turnLeaseOwner, scope.turnLeaseVersion,
-    scope.parentLeaseOwner, scope.parentAttemptCount])
-  const row = result.rows[0]
-  return result.rows.length === 1 && row?.turnId === scope.turnId && row.leaseOwnerId === scope.turnLeaseOwner
-    && Number(row.leaseVersion) === scope.turnLeaseVersion && row.turnLeaseLive === true
-    && row.rootTaskId === scope.rootTaskId && row.taskRootTaskId === scope.rootTaskId && row.parentTaskId === null
-    && row.rootStatus === "running" && row.leaseOwner === scope.parentLeaseOwner
-    && Number(row.attemptCount) === scope.parentAttemptCount && row.interruptRequestedAt === null && row.rootLeaseLive === true
-}
-
-async function rootInputId(client: Client, scope: TaskGraphReadScope): Promise<OriginalInputBinding | null> {
-  const turn = await client.query<Row>(`SELECT "input" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4`,
-    [scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId])
-  const turnInput = turn.rows.length === 1 ? parseNativeSteeringTurnInput(turn.rows[0]?.input) : null
-  if (!turnInput) return null
-  const matches = await client.query<Row>(`SELECT "id", "sessionId", "userId", "targetTurnId", "clientMessageId", "delivery", "status", "content",
-      "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt" FROM "agent_inputs"
-    WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3 AND "clientMessageId" = $4 LIMIT 2`,
-    [scope.sessionId, scope.userId, scope.turnId, turnInput.clientMessageId])
-  if (matches.rows.length !== 1) return null
-  const input = record(matches.rows[0])
-  const consumedByStepId = input?.consumedByStepId
-  const acceptedSequence = sequence(input?.acceptedSequence)
-  if (!input || !id(input.id) || input.sessionId !== scope.sessionId || input.userId !== scope.userId
-    || input.targetTurnId !== scope.turnId || input.clientMessageId !== turnInput.clientMessageId || input.delivery !== "follow_up"
-    || input.status !== "consumed" || acceptedSequence === null || !id(consumedByStepId)
-    || !date(input.consumedAt) || input.cancelledAt !== null || !Array.isArray(input.content) || input.content.length < 1) return null
-  try { return canonicalNativeVerificationJson(input.content) === canonicalNativeVerificationJson(turnInput.content)
-    ? { id: input.id, consumedByStepId, acceptedSequence } : null } catch { return null }
-}
-
 async function selectStep(client: Client, scope: TaskGraphReadScope, selection: NativeSteeringCheckpointSelection): Promise<Step | null> {
   const base = `FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`
   const values = [scope.sessionId, scope.turnId, scope.rootTaskId]
@@ -168,7 +129,7 @@ async function steeringRows(client: Client, scope: TaskGraphReadScope, cutoff: b
   return parsed.some(item => item === null) ? null : parsed as Source[]
 }
 
-async function sourceSteps(client: Client, scope: TaskGraphReadScope, inputs: readonly Source[], original: OriginalInputBinding | null, checkpoint: Step): Promise<Map<string, Step> | null> {
+async function sourceSteps(client: Client, scope: TaskGraphReadScope, inputs: readonly Source[], original: NativeOriginalInputBinding | null, checkpoint: Step): Promise<Map<string, Step> | null> {
   const stepIds = [...new Set(inputs.map(input => input.consumedByStepId).filter((value): value is string => value !== null))]
   if (stepIds.length !== new Set(inputs.map(input => input.consumedByStepId)).size) return null
   if (original && !stepIds.includes(original.consumedByStepId)) stepIds.push(original.consumedByStepId)
@@ -181,9 +142,8 @@ async function sourceSteps(client: Client, scope: TaskGraphReadScope, inputs: re
   if (values.some(item => item === null || item.taskId !== scope.rootTaskId)) return null
   const map = new Map((values as Step[]).map(item => [item.id, item]))
   const originalStep = original ? map.get(original.consumedByStepId) : null
-  if (original && (!originalStep || originalStep.ordinal !== 0 || originalStep.attempt !== checkpoint.attempt || !SOURCE_STEP_STATUS.has(originalStep.status)
-    || !originalStep.consumedInputIds.includes(original.id) || original.acceptedSequence > originalStep.inputThroughSequence
-    || originalStep.inputThroughSequence > checkpoint.inputThroughSequence || (checkpoint.ordinal === 0 && originalStep.id !== checkpoint.id))) return null
+  if (original && (!originalStep || !SOURCE_STEP_STATUS.has(originalStep.status)
+    || !nativeOriginalInputStepCoversCheckpoint(original, originalStep, checkpoint))) return null
   return map.size === stepIds.length ? map : null
 }
 
@@ -207,18 +167,31 @@ function evidence(scope: TaskGraphReadScope, input: Source, consumedStep: Step):
   } catch { return null }
 }
 
-export async function readNativeVerificationSteeringSource(
+export type NativeVerificationUserReferenceSources = Readonly<{
+  originalTaskReference: readonly NativeVerificationEvidence[]
+  originalTaskReferenceRequired: boolean
+  steering: readonly NativeVerificationEvidence[]
+}>
+
+export async function readNativeVerificationUserReferenceSources(
   client: Client, scope: TaskGraphReadScope, selection: NativeSteeringCheckpointSelection,
-): Promise<readonly NativeVerificationEvidence[] | null> {
+): Promise<NativeVerificationUserReferenceSources | null> {
   if (!id(scope.userId) || !id(scope.sessionId) || !id(scope.turnId) || !id(scope.rootTaskId)
     || !id(scope.parentTaskId) || !id(scope.turnLeaseOwner) || !id(scope.parentLeaseOwner)
     || scope.parentTaskId !== scope.rootTaskId || !Number.isSafeInteger(scope.turnLeaseVersion) || scope.turnLeaseVersion < 1
     || !Number.isSafeInteger(scope.parentAttemptCount) || scope.parentAttemptCount < 1) return null
-  if (!await currentOwner(client, scope)) return null
-  const original = await rootInputId(client, scope), originalId = original?.id ?? null
+  if (!await nativeOriginalInputOwnerIsCurrent(client, scope)) return null
+  const resolution = await readNativeOriginalInputBinding(client, scope)
+  if (!resolution) return null
+  const original = resolution.kind === "bound" ? resolution.input : null
+  const originalId = original?.id ?? null
+  const originalProjection = original ? nativeOriginalTaskReferenceProjection(original) : null
+  if (originalProjection?.kind === "unavailable") return null
   if (selection.kind === "exact" && selection.stepId === undefined) {
     const found = await steeringRows(client, scope, null, originalId)
-    return found?.length === 0 ? [] : null
+    if (found?.length !== 0) return null
+    return { steering: [], originalTaskReference: [],
+      originalTaskReferenceRequired: originalProjection?.kind === "reference" }
   }
   const checkpoint = await selectStep(client, scope, selection)
   const usable = selection.kind === "latest" ? RECOVERY_STEP_STATUS : USABLE_STEP_STATUS
@@ -246,5 +219,20 @@ export async function readNativeVerificationSteeringSource(
     if (totalBytes > NATIVE_VERIFICATION_USER_STEERING_MAX_TOTAL_BYTES) return null
     result.push(item)
   }
-  return result
+  let originalTaskReference: readonly NativeVerificationEvidence[] = []
+  if (original && originalProjection?.kind === "reference") {
+    const consumer = sourceStepMap.get(original.consumedByStepId)
+    if (!consumer || !nativeOriginalInputStepCoversCheckpoint(original, consumer, checkpoint)) return null
+    const item = nativeOriginalTaskReferenceEvidence(scope, original, consumer)
+    if (!item) return null
+    originalTaskReference = [item]
+  }
+  return { steering: result, originalTaskReference, originalTaskReferenceRequired: false }
+}
+
+export async function readNativeVerificationSteeringSource(
+  client: Client, scope: TaskGraphReadScope, selection: NativeSteeringCheckpointSelection,
+): Promise<readonly NativeVerificationEvidence[] | null> {
+  const sources = await readNativeVerificationUserReferenceSources(client, scope, selection)
+  return sources?.steering ?? null
 }
