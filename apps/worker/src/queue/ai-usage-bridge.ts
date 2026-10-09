@@ -125,7 +125,8 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
     for (let attempt = 0; ; attempt++) {
       try {
-        await post(endpoint, secret, { operation: "release", input }, fetcher, timeoutMs)
+        const response = await post(endpoint, secret, { operation: "release", input }, fetcher, timeoutMs)
+        if (response.status !== "released") throw new UsageBridgeError("usage_broker_unavailable")
         return
       } catch (error: unknown) {
         const delay = RELEASE_RETRY_DELAYS_MS[attempt]

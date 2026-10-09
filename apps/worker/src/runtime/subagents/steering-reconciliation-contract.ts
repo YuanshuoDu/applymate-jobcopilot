@@ -7,7 +7,7 @@ export const STEERING_RECONCILIATION_EVENT_TYPE = "agent.plan.reconciliation" as
 export const STEERING_RECONCILIATION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v1" as const
 export const STEERING_RECONCILIATION_BLOCKER = "steering_reconciliation_pending" as const
 export const STEERING_RECONCILIATION_FEEDBACK = "Accepted user steering must be reconciled against the current TaskGraph before completion. Review current input and plan, then use agent.reconcile to keep the current revision or agent.plan to revise it." as const
-const MAX_INPUTS = 128
+export const STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS = 128
 const MAX_BYTES = 16 * 1024
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n
 type Row = Record<string, unknown>
@@ -48,7 +48,6 @@ export type SteeringReconciliationState = Readonly<{
   decisionInputThroughSequence: bigint | null
   agendaPlanRevision: number | null
   unresolvedInputs: readonly SteeringReconciliationPendingInput[]
-  resolvedInputIds: readonly string[]
 }>
 export type PreparedSteeringReconciliation = Readonly<{
   scope: TaskGraphExecutionScope
@@ -131,7 +130,7 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
       || row.resultingRevision !== (row.decision === "keep" ? row.observedRevision : row.observedRevision + 1)
       || !Array.isArray(row.steerInputIds)) return null
     const inputIds = row.steerInputIds as unknown[]
-    if (inputIds.length === 0 || inputIds.length > MAX_INPUTS || !inputIds.every(steeringReconciliationId)
+    if (inputIds.length === 0 || inputIds.length > STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS || !inputIds.every(steeringReconciliationId)
       || new Set(inputIds).size !== inputIds.length || inputIds.some((id, index) => index > 0 && String(inputIds[index - 1]) >= id)) return null
     const checkpoint = record(row.inputCheckpoint)
     if (!checkpoint || !exact(checkpoint, ["throughSequence"]) || steeringReconciliationSequence(checkpoint.throughSequence) === null) return null
