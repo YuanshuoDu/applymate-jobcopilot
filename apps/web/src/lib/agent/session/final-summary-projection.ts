@@ -1,4 +1,4 @@
-import { redactSensitiveText } from "@jobcopilot/shared"
+import { redactSensitiveText } from "@jobcopilot/shared/agent-redaction"
 
 const MAX_FINAL_SUMMARY_LENGTH = 1_000
 
