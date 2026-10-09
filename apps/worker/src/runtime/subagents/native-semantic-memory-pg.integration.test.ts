@@ -71,7 +71,7 @@ async function seedOwnerRows(): Promise<void> {
      "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
     VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', $4,
       '[]'::jsonb, $5::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
-      '{"subagentPolicy":{"maxConcurrency":8,"maxDepth":8,"maxFanOut":8,"maxAttempts":2}}'::jsonb,
+      '{"subagentPolicy":{"maxConcurrency":8,"maxDepth":8,"maxFanOut":64,"maxAttempts":2}}'::jsonb,
       1, 2, $6, $7, CURRENT_TIMESTAMP)`,
   [rootTaskId, sessionId, turnId, goal, JSON.stringify([criterion]), turnOwnerId, future])
   await adminPool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [rootTaskId])
@@ -266,24 +266,27 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
       ...usage, now: times.get(stepIds[0]!)!, identity: identityB })).rejects.toThrow()
 
     await seedStep(stepIds[4]!, 5, "9")
-    await expect(readAfterReconstruction({ owner, stepId: stepIds[4]!, identity: identityB })).resolves.toMatchObject({
+    await expect(readAfterReconstruction({ owner, stepId: stepIds[4]!, identity: identityB })).rejects.toThrow()
+    const identityBAtCheckpoint9 = await ensureRejectedCandidate(candidateB, stepIds[4]!)
+    expect(Reflect.get(identityBAtCheckpoint9, "inputThroughSequence")).toBe(9n)
+    await expect(readAfterReconstruction({ owner, stepId: stepIds[4]!, identity: identityBAtCheckpoint9 })).resolves.toMatchObject({
       inputThroughSequence: 9n, stepIds: [],
     })
-    await expect(finish(stepIds[4]!, identityB)).resolves.toMatchObject({ distinctStepCount: 1 })
+    await expect(finish(stepIds[4]!, identityBAtCheckpoint9)).resolves.toMatchObject({ distinctStepCount: 1 })
 
     await seedStep(stepIds[5]!, 6, "9")
-    const staleIdentityB = { ...identityB, controlAttempt: identityB.controlAttempt + 1 }
+    const staleIdentityB = { ...identityBAtCheckpoint9, controlAttempt: identityBAtCheckpoint9.controlAttempt + 1 }
     await expect(complete({ owner, stepId: stepIds[5]!, finishReason: "stop", errorCode: null,
       ...usage, now: new Date(), identity: staleIdentityB })).rejects.toThrow()
     const foreignOwner = { ...owner, userId: `native-semantic-foreign-${suffix}` }
     await expect(complete({ owner: foreignOwner, stepId: stepIds[5]!, finishReason: "stop", errorCode: null,
-      ...usage, now: new Date(), identity: identityB })).rejects.toThrow()
+      ...usage, now: new Date(), identity: identityBAtCheckpoint9 })).rejects.toThrow()
     const otherOwner = { ...owner, ownerId: `${turnOwnerId}-stale`, leaseVersion: 2 }
     await expect(complete({ owner: otherOwner, stepId: stepIds[5]!, finishReason: "stop", errorCode: null,
-      ...usage, now: new Date(), identity: identityB })).rejects.toThrow()
+      ...usage, now: new Date(), identity: identityBAtCheckpoint9 })).rejects.toThrow()
     const untouched = await adminPool!.query<{ status: string }>(`SELECT "status" FROM "agent_steps" WHERE "id" = $1`, [stepIds[5]])
     expect(untouched.rows[0]?.status).toBe("streaming")
-    await expect(finish(stepIds[5]!, identityB)).resolves.toMatchObject({ distinctStepCount: 2 })
+    await expect(finish(stepIds[5]!, identityBAtCheckpoint9)).resolves.toMatchObject({ distinctStepCount: 2 })
 
     const privileges = await adminPool!.query<{ canSelect: boolean; canInsert: boolean; canUpdate: boolean; canDelete: boolean }>(
       `SELECT has_table_privilege($1, 'public.agent_native_semantic_rejections', 'SELECT') AS "canSelect",
