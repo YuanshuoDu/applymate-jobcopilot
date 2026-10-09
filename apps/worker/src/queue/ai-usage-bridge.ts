@@ -27,6 +27,7 @@ export type WorkerUsageSettlementInput = {
 
 export type WorkerUsageAuthorization = {
   settle(input: WorkerUsageSettlementInput): Promise<void>
+  release?(): Promise<void>
 }
 
 type UsageBridgeFetch = typeof fetch
@@ -117,12 +118,26 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
   const timeoutMs = options.timeoutMs ?? 15_000
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new RangeError("Usage bridge timeout must be positive")
 
+  const release = async (input: WorkerUsageAuthorizationInput): Promise<void> => {
+    requiredContext(input)
+    if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
+    await post(endpoint, secret, { operation: "release", input }, fetcher, timeoutMs)
+  }
   return async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
-    const response = await post(endpoint, secret, { operation: "authorize", input }, fetcher, timeoutMs)
+    let response: Record<string, unknown>
+    try {
+      response = await post(endpoint, secret, { operation: "authorize", input }, fetcher, timeoutMs)
+    } catch (error: unknown) {
+      if (error instanceof UsageBridgeError && error.code === "usage_broker_unavailable") await release(input).catch(() => undefined)
+      throw error
+    }
     const operationId = response.operationId
-    if (typeof operationId !== "string" || operationId.length < 1) throw new UsageBridgeError("usage_broker_unavailable")
+    if (typeof operationId !== "string" || operationId.length < 1) {
+      await release(input).catch(() => undefined)
+      throw new UsageBridgeError("usage_broker_unavailable")
+    }
     return {
       settle: async (settlement) => {
         await post(endpoint, secret, {
@@ -130,6 +145,7 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
           input: { operationId, userId: input.userId, provider: input.provider, model: input.model, ...settlement },
         }, fetcher, timeoutMs)
       },
+      release: () => release(input),
     }
   }
 }
