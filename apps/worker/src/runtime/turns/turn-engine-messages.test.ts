@@ -23,7 +23,7 @@ function context(): StepContext {
 describe("TurnEngine model message mapping", () => {
   it("adds bounded fresh-steering guidance using only trusted revision and visible tools", () => {
     const steering = { id: "steer:private", layer: "pending_input" as const, role: "data" as const, trust: "external_untrusted" as const, source: "user_input", content: { inputId: "steer-private", text: "PRIVATE_STEER_SENTINEL" } }
-    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }]
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }, { name: "agent.ask_user", version: "1" }]
     const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
     const request = buildModelRequest({
       context: { ...context(), taskGraphRevision: 0, blocks: [...context().blocks, steering] }, model, tools,
@@ -36,7 +36,8 @@ describe("TurnEngine model message mapping", () => {
     expect(text).toContain("TaskGraph revision is 0")
     expect(text).toContain("agent.plan with expectedRevision 0")
     expect(text).toContain("agent.followup mode=replace_unstarted")
-    expect(text).toContain("state what clarification is needed")
+    expect(text).toContain("use only the request-visible agent.ask_user tool")
+    expect(text).toContain("cannot execute an uncertain action")
     expect(text).not.toContain("PRIVATE_STEER_SENTINEL")
     expect(request.tools).toEqual(tools)
     expect(JSON.stringify(request.messages)).toContain("PRIVATE_STEER_SENTINEL")
@@ -69,6 +70,8 @@ describe("TurnEngine model message mapping", () => {
     expect(text).not.toContain("agent.plan")
     expect(text).not.toContain("agent.followup")
     expect(text).not.toContain("agent.ask")
+    expect(text).toContain("no request-visible tool can ask the user")
+    expect(text).toContain("cannot execute an uncertain action")
     expect(text).toContain("do not take an uncertain plan action")
   })
 
@@ -83,10 +86,12 @@ describe("TurnEngine model message mapping", () => {
     const text = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
 
     expect(request.tools).toEqual(tools)
-    expect(text).not.toContain("If clarification is necessary, use")
+    expect(text).not.toContain("agent.ask_user")
+    expect(text).not.toContain("If intent remains ambiguous, use")
     expect(text).not.toContain("agent.task_send")
     expect(text).not.toContain("question_read")
-    expect(text).toContain("If intent remains ambiguous, state what clarification is needed")
+    expect(text).toContain("no request-visible tool can ask the user")
+    expect(text).toContain("cannot execute an uncertain action")
     expect(text).toContain("do not take an uncertain plan action")
   })
 
