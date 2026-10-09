@@ -40,13 +40,14 @@ export type WorkerUsageBridgeOptions = {
 }
 
 export class UsageBridgeError extends Error {
-  constructor(readonly code: string, message = code) {
+  constructor(readonly code: string, message = code, readonly retryable = false) {
     super(message)
     this.name = "UsageBridgeError"
   }
 }
 
 const USAGE_PATH = "/api/internal/agent-runtime/usage"
+const RELEASE_RETRY_DELAYS_MS = [50, 100] as const
 
 function endpointFromEnvironment(): string | undefined {
   // AGENT_RUNTIME_USAGE_URL is the complete internal endpoint. The other
@@ -99,12 +100,13 @@ async function post(
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch {
-    throw new UsageBridgeError("usage_broker_unavailable")
+    throw new UsageBridgeError("usage_broker_unavailable", undefined, true)
   }
   const payload = await response.json().catch(() => null) as unknown
   if (!response.ok) {
     const row = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {}
-    throw new UsageBridgeError(response.status >= 500 ? "usage_broker_unavailable" : safeCode(row.code, "usage_denied"))
+    const transient = response.status >= 500
+    throw new UsageBridgeError(transient ? "usage_broker_unavailable" : safeCode(row.code, "usage_denied"), undefined, transient)
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new UsageBridgeError("usage_broker_unavailable")
   return payload as Record<string, unknown>
@@ -121,7 +123,16 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
   const release = async (input: WorkerUsageAuthorizationInput): Promise<void> => {
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
-    await post(endpoint, secret, { operation: "release", input }, fetcher, timeoutMs)
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await post(endpoint, secret, { operation: "release", input }, fetcher, timeoutMs)
+        return
+      } catch (error: unknown) {
+        const delay = RELEASE_RETRY_DELAYS_MS[attempt]
+        if (!(error instanceof UsageBridgeError) || !error.retryable || delay === undefined) throw error
+        await new Promise<void>(resolve => setTimeout(resolve, delay))
+      }
+    }
   }
   return async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
     requiredContext(input)
