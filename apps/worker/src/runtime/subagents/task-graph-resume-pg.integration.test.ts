@@ -9039,9 +9039,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(root.rows).toHaveLength(1)
       expect(root.rows[0]?.status).toBe("completed")
-      expect(record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist).toEqual({
-        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
-      })
+      const persistedShortlist = record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist
       const children = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
         `SELECT "id", "role", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "role" = ANY($4::text[]) ORDER BY "role"`,
         [value.turnId, value.sessionId, root.rows[0]!.id, ["analyst", "scout"]],
@@ -9111,7 +9109,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [value.turnId, value.sessionId, value.userId],
       )
       expect(turn.rows[0]?.leaseVersion).toBeGreaterThan(checkpointTurn.rows[0]!.leaseVersion)
-      expect(turn.rows[0]?.finalResponse).toContain(jobId)
+      expect(persistedShortlist).toEqual({
+        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
+      })
       expect(workerTwo.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(false)
       expect(workerThree.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(true)
       expect(workerThree.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_SETTLED ${analyst!.id} analyst completed`))).toHaveLength(1)
@@ -9425,7 +9425,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
         const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
         const finalCandidateText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
-        if (turn.rows[0]?.status !== "completed" || finalCandidateText !== "p3-process-restart-discovery-shortlist-ready") {
+        if (turn.rows[0]?.status !== "completed" || finalCandidateText !== JSON.stringify({
+          schemaVersion: "agent-harness.v2.final", response: "p3-process-restart-discovery-shortlist-ready",
+        })) {
           throw new Error("Interactive discovery trace final outcome does not preserve its verified model candidate")
         }
         await writeFile(interactiveDiscoveryTraceArtifactPath, JSON.stringify({
@@ -9799,7 +9801,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(waits.rows.every(wait => wait.consumedAt instanceof Date)).toBe(true)
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [discoveryOwner.turnId])
     const finalResponse = JSON.parse(final.rows[0]?.finalResponse ?? "null") as RecordValue
-    expect(finalResponse.response).toBe("Shortlist ready")
+    expect(finalResponse.response).toBe(JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }))
     expect(finalResponse.summary).toContain("discovered jobs: 1 (complete)")
   }, 90_000)
 
@@ -10541,7 +10543,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(secondJobSeeded).toBe(true)
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
     expect(turn.rows[0]?.status).toBe("completed")
-    expect(turn.rows[0]?.finalResponse).toContain("verified shortlist")
+    const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
+    expect(finalResponse.response).toBe(JSON.stringify({
+      schemaVersion: "agent-harness.v2.final", response: "The verified shortlist is ready",
+    }))
     const rootTaskId = turn.rows[0]?.rootTaskId
     expect(rootTaskId).toBeTruthy()
     const rejection = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected' AND "payload"->>'blocker' = 'task_graph_verification_unverified'`, [value.turnId, value.sessionId])
