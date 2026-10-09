@@ -26,6 +26,7 @@ type Source = Readonly<{
   goal: string; criteria: readonly string[]; input: unknown; startSequence: number
   status?: "completed" | "failed" | "interrupted"; rootStatus?: "completed" | "failed" | "interrupted"
   correlationTargetId?: string; stepStatus?: "completed" | "streaming" | "failed"
+  stepReceipt?: "missing" | "mismatched" | "duplicate"
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
@@ -41,40 +42,49 @@ const matching: Source[] = [
     finalItemId: `root-history-final-a-${suffix}`, sessionId, userId, goal: objective, criteria, input: { goal: ` ${objective} `, successCriteria: criteria }, startSequence: 1 },
   { turnId: `root-history-source-b-${suffix}`, rootTaskId: `root-history-root-b-${suffix}`, childId: `root-history-child-b-${suffix}`,
     finalItemId: `root-history-final-b-${suffix}`, sessionId, userId, goal: objective, criteria,
-    input: { input: { goal: objective, successCriteria: criteria } }, startSequence: 3, status: "failed" },
+    input: { input: { goal: objective, successCriteria: criteria } }, startSequence: 5, status: "failed" },
 ]
 const mismatched: Source = { turnId: `root-history-mismatch-${suffix}`, rootTaskId: `root-history-mismatch-root-${suffix}`,
   childId: `root-history-mismatch-child-${suffix}`, finalItemId: `root-history-mismatch-final-${suffix}`, sessionId, userId,
-  goal: "A different search", criteria, input: { goal: "A different search", successCriteria: criteria }, startSequence: 5 }
+  goal: "A different search", criteria, input: { goal: "A different search", successCriteria: criteria }, startSequence: 8 }
 const changedCriteria: Source = { turnId: `root-history-criteria-${suffix}`, rootTaskId: `root-history-criteria-root-${suffix}`,
   childId: `root-history-criteria-child-${suffix}`, finalItemId: `root-history-criteria-final-${suffix}`, sessionId, userId,
-  goal: objective, criteria: ["Different criterion"], input: { goal: objective, successCriteria: criteria }, startSequence: 9 }
+  goal: objective, criteria: ["Different criterion"], input: { goal: objective, successCriteria: criteria }, startSequence: 12 }
 const selectedJob: Source = { turnId: `root-history-selected-job-${suffix}`, rootTaskId: `root-history-selected-job-root-${suffix}`,
   childId: `root-history-selected-job-child-${suffix}`, finalItemId: `root-history-selected-job-final-${suffix}`, sessionId, userId,
-  goal: objective, criteria, input: { input: { goal: objective, successCriteria: criteria, selectedJobPreparation: null } }, startSequence: 7 }
+  goal: objective, criteria, input: { input: { goal: objective, successCriteria: criteria, selectedJobPreparation: null } }, startSequence: 16 }
 const otherSession: Source = { turnId: `root-history-other-session-turn-${suffix}`, rootTaskId: `root-history-other-session-root-${suffix}`,
   childId: `root-history-other-session-child-${suffix}`, finalItemId: `root-history-other-session-final-${suffix}`,
   sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
 const foreignScopeCorrelation: Source = { turnId: `root-history-foreign-step-turn-${suffix}`, rootTaskId: `root-history-foreign-step-root-${suffix}`,
   childId: `root-history-foreign-step-child-${suffix}`, finalItemId: `root-history-foreign-step-final-${suffix}`,
-  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 13,
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 24,
   correlationTargetId: `source-step-${otherSession.turnId}` }
 const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, rootTaskId: `root-history-other-user-root-${suffix}`,
   childId: `root-history-other-user-child-${suffix}`, finalItemId: `root-history-other-user-final-${suffix}`,
   sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
-  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 21 }
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 101 }
 const inconsistentTerminal: Source = { turnId: `root-history-terminal-mismatch-turn-${suffix}`, rootTaskId: `root-history-terminal-mismatch-root-${suffix}`,
   childId: `root-history-terminal-mismatch-child-${suffix}`, finalItemId: `root-history-terminal-mismatch-final-${suffix}`,
-  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 11,
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 20,
   status: "completed", rootStatus: "failed" }
 const streamingTerminalStep: Source = { turnId: `root-history-streaming-step-turn-${suffix}`, rootTaskId: `root-history-streaming-step-root-${suffix}`,
   childId: `root-history-streaming-step-child-${suffix}`, finalItemId: `root-history-streaming-step-final-${suffix}`, sessionId, userId,
-  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 15, stepStatus: "streaming" }
+  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 28, stepStatus: "streaming" }
 const failedTerminalStep: Source = { turnId: `root-history-failed-step-turn-${suffix}`, rootTaskId: `root-history-failed-step-root-${suffix}`,
   childId: `root-history-failed-step-child-${suffix}`, finalItemId: `root-history-failed-step-final-${suffix}`, sessionId, userId,
-  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 17, stepStatus: "failed" }
+  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 32, stepStatus: "failed" }
+const missingStepReceipt: Source = { turnId: `root-history-missing-step-event-turn-${suffix}`, rootTaskId: `root-history-missing-step-event-root-${suffix}`,
+  childId: `root-history-missing-step-event-child-${suffix}`, finalItemId: `root-history-missing-step-event-final-${suffix}`, sessionId, userId,
+  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 36, stepReceipt: "missing" }
+const mismatchedStepReceipt: Source = { turnId: `root-history-mismatched-step-event-turn-${suffix}`, rootTaskId: `root-history-mismatched-step-event-root-${suffix}`,
+  childId: `root-history-mismatched-step-event-child-${suffix}`, finalItemId: `root-history-mismatched-step-event-final-${suffix}`, sessionId, userId,
+  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 40, stepReceipt: "mismatched" }
+const duplicateStepReceipt: Source = { turnId: `root-history-duplicate-step-event-turn-${suffix}`, rootTaskId: `root-history-duplicate-step-event-root-${suffix}`,
+  childId: `root-history-duplicate-step-event-child-${suffix}`, finalItemId: `root-history-duplicate-step-event-final-${suffix}`, sessionId, userId,
+  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 44, stepReceipt: "duplicate" }
 let pool: PgPool | undefined
 let lease: TurnLease
 
@@ -110,7 +120,7 @@ async function insertSource(source: Source): Promise<void> {
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
       ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [taskGraphItemId(source.rootTaskId), source.sessionId, source.turnId, source.rootTaskId, JSON.stringify(graph), source.finalItemId])
-  const terminalSequence = source.startSequence + 1
+  const terminalSequence = source.startSequence + (status === "completed" ? 3 : 2)
   const terminalType = status === "completed" ? "turn.completed" : status === "failed" ? "turn.failed" : "turn.interrupted"
   const terminalItemId = status === "completed" ? source.finalItemId : null
   const sourceStepId = `source-step-${source.turnId}`
@@ -118,6 +128,17 @@ async function insertSource(source: Source): Promise<void> {
     await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
       VALUES ($1, $2, $3, $4, 1, 1, $5, 0, '[]'::jsonb, '{}'::jsonb)`,
     [sourceStepId, source.sessionId, source.turnId, source.rootTaskId, source.stepStatus ?? "completed"])
+    if (source.stepReceipt !== "missing") {
+      const count = source.stepReceipt === "duplicate" ? 2 : 1
+      for (let index = 0; index < count; index += 1) {
+        const stepPayload = { stepId: sourceStepId, status: source.stepReceipt === "mismatched" ? "failed" : "completed", taskId: source.rootTaskId }
+        const key = `turn:${source.turnId}:event:step-completed:${sourceStepId}${index ? `:duplicate-${index}` : ""}`
+        await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+          VALUES ($1, $2, $3, NULL, $4, $5, 'step.completed', 'orchestrator', $6, $7, $8::jsonb)`,
+        [`root-history-step-completed-${index}-${source.turnId}`, source.sessionId, source.turnId, source.rootTaskId,
+          source.startSequence + 1 + index, sourceStepId, key, JSON.stringify(stepPayload)])
+      }
+    }
   }
   const correlationId = status === "completed" ? (source.correlationTargetId ?? sourceStepId) : source.turnId
   const errorCode = status === "failed" ? "task_failed" : status === "interrupted" ? "interrupted" : undefined
@@ -142,7 +163,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }
     await insertUser(userId)
     await insertUser(otherUserId)
-    await insertSession(sessionId, userId, 20)
+    await insertSession(sessionId, userId, 100)
     await insertSession(otherSessionId, userId, 4)
     await insertSession(foreignSessionId, otherUserId, 4)
     for (const source of matching) await insertSource(source)
@@ -156,6 +177,9 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(inconsistentTerminal)
     await insertSource(streamingTerminalStep)
     await insertSource(failedTerminalStep)
+    await insertSource(missingStepReceipt)
+    await insertSource(mismatchedStepReceipt)
+    await insertSource(duplicateStepReceipt)
     const input = { goal: objective, successCriteria: criteria }
     await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
       "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
@@ -171,7 +195,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
     await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-      VALUES ($1, $2, $3, NULL, $4, 20, 'turn.started', 'orchestrator', $3, $5, $6::jsonb)`,
+      VALUES ($1, $2, $3, NULL, $4, 100, 'turn.started', 'orchestrator', $3, $5, $6::jsonb)`,
     [`root-history-current-start-${suffix}`, sessionId, currentTurnId, currentRootTaskId,
       `turn:${currentTurnId}:event:turn-started`, JSON.stringify({ goal: objective, taskId: currentRootTaskId, rootTaskId: currentRootTaskId })])
   })
@@ -190,11 +214,12 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
 
     expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
     expect(history.map(item => item.sourceRootTaskId)).toEqual([matching[1]!.rootTaskId, matching[0]!.rootTaskId])
-    expect(history.map(item => item.terminalSequence)).toEqual([4n, 2n])
+    expect(history.map(item => item.terminalSequence)).toEqual([7n, 4n])
     expect(history.every(item => item.taskGraph.nodes.length === 1)).toBe(true)
     expect(history.some(item => item.sourceTurnId === matching[0]!.turnId)).toBe(true)
     expect(history.some(item => [mismatched.turnId, changedCriteria.turnId, selectedJob.turnId,
       otherSession.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId, inconsistentTerminal.turnId,
-      streamingTerminalStep.turnId, failedTerminalStep.turnId].includes(item.sourceTurnId))).toBe(false)
+      streamingTerminalStep.turnId, failedTerminalStep.turnId, missingStepReceipt.turnId, mismatchedStepReceipt.turnId,
+      duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
   })
 })

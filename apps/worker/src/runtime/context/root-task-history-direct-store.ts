@@ -57,17 +57,26 @@ function validStart(row: Row, turnId: string, rootTaskId: string): bigint | unde
     && payload?.taskId === rootTaskId && payload.rootTaskId === rootTaskId ? value : undefined
 }
 
-function validTerminal(row: Row, turnId: string, rootTaskId: string, status: string): bigint | undefined {
+function validTerminal(row: Row, turnId: string, rootTaskId: string, status: string, startSequence: bigint): bigint | undefined {
   const payload = object(row.terminalPayload), value = sequence(row.terminalSequence)
   if (!payload || !value || Number(row.terminalEventCount) !== 1 || row.terminalTurnId !== turnId
     || row.terminalTaskId !== rootTaskId || row.terminalActor !== "orchestrator"
     || payload.turnId !== turnId || payload.taskId !== rootTaskId) return undefined
   const prefix = `turn:${turnId}:event:`
   if (status === "completed") {
+    const stepPayload = object(row.terminalStepEventPayload), stepSequence = sequence(row.terminalStepEventSequence)
+    const exactStepPayload = !!stepPayload && Object.keys(stepPayload).sort().join(",") === "status,stepId,taskId"
     return row.terminalType === "turn.completed" && text(payload.finalItemId) && row.terminalItemId === payload.finalItemId
       && text(row.terminalCorrelationId) && row.terminalStepId === row.terminalCorrelationId
       && row.terminalStepSessionId === row.sessionId && row.terminalStepTurnId === turnId
       && row.terminalStepTaskId === rootTaskId && row.terminalStepStatus === "completed"
+      && Number(row.terminalStepEventCount) === 1 && row.terminalStepEventSessionId === row.sessionId
+      && row.terminalStepEventTurnId === turnId && row.terminalStepEventTaskId === rootTaskId
+      && row.terminalStepEventItemId === null && row.terminalStepEventType === "step.completed"
+      && row.terminalStepEventActor === "orchestrator" && row.terminalStepEventCorrelationId === row.terminalStepId
+      && row.terminalStepEventIdempotencyKey === `${prefix}step-completed:${row.terminalStepId}`
+      && stepSequence !== undefined && stepSequence > startSequence && stepSequence < value
+      && exactStepPayload && stepPayload?.stepId === row.terminalStepId && stepPayload.status === "completed" && stepPayload.taskId === rootTaskId
       && row.terminalIdempotencyKey === `${prefix}turn-completed` ? value : undefined
   }
   if (status === "failed") {
@@ -90,7 +99,7 @@ function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: NonNullabl
     || !["completed", "failed", "interrupted"].includes(String(row.turnStatus))
     || row.turnStatus !== row.taskStatus || hasSelectedJobPreparation(row.input)) return undefined
   const start = validStart(row, turnId, rootTaskId)
-  const terminal = validTerminal(row, turnId, rootTaskId, String(row.turnStatus))
+  const terminal = start === undefined ? undefined : validTerminal(row, turnId, rootTaskId, String(row.turnStatus), start)
   if (start === undefined || terminal === undefined || start >= terminal || terminal >= fence.currentStartSequence
     || objectiveDigest(row.input, row.goal, row.successCriteria) !== fence.objectiveDigest) return undefined
   return { turnId, rootTaskId, terminalSequence: terminal }
@@ -129,7 +138,13 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
       terminal."payload" AS "terminalPayload", terminal."terminalEventCount",
       terminal_step."id" AS "terminalStepId", terminal_step."sessionId" AS "terminalStepSessionId",
       terminal_step."turnId" AS "terminalStepTurnId", terminal_step."taskId" AS "terminalStepTaskId",
-      terminal_step."status" AS "terminalStepStatus"
+      terminal_step."status" AS "terminalStepStatus",
+      terminal_step_event."sessionId" AS "terminalStepEventSessionId", terminal_step_event."turnId" AS "terminalStepEventTurnId",
+      terminal_step_event."taskId" AS "terminalStepEventTaskId", terminal_step_event."itemId" AS "terminalStepEventItemId",
+      terminal_step_event."sequence" AS "terminalStepEventSequence", terminal_step_event."type" AS "terminalStepEventType",
+      terminal_step_event."actor" AS "terminalStepEventActor", terminal_step_event."correlationId" AS "terminalStepEventCorrelationId",
+      terminal_step_event."idempotencyKey" AS "terminalStepEventIdempotencyKey", terminal_step_event."payload" AS "terminalStepEventPayload",
+      terminal_step_event."stepCompletedEventCount" AS "terminalStepEventCount"
     FROM roots
     JOIN LATERAL (
       SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
@@ -148,6 +163,16 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
         AND step."taskId" = roots."rootTaskId"
       LIMIT 1
     ) AS terminal_step ON true
+    LEFT JOIN LATERAL (
+      SELECT event."sessionId", event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
+        event."correlationId", event."idempotencyKey", event."payload", COUNT(*) OVER () AS "stepCompletedEventCount"
+      FROM "agent_events" AS event
+      WHERE terminal."type" = 'turn.completed' AND event."sessionId" = roots."sessionId"
+        AND event."turnId" = roots."turnId" AND event."taskId" = roots."rootTaskId"
+        AND (event."idempotencyKey" = ('turn:' || roots."turnId" || ':event:step-completed:' || terminal_step."id")
+          OR (event."type" = 'step.completed' AND event."correlationId" = terminal_step."id"))
+      ORDER BY event."sequence" DESC LIMIT 1
+    ) AS terminal_step_event ON true
     LEFT JOIN LATERAL (
       SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
         event."correlationId", event."idempotencyKey", event."payload", COUNT(*) OVER () AS "startEventCount"

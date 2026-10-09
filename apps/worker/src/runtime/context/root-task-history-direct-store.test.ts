@@ -19,7 +19,7 @@ type Options = Readonly<{
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
   const turnId = `turn-source-${index}`, rootTaskId = `root-source-${index}`
-  const startSequence = String(Number(terminalSequence) - 1)
+  const startSequence = String(Number(terminalSequence) - 2)
   const input = { input: { goal: "Explore roles", successCriteria: ["Respect location"] } }
   const common = {
     turnId, sessionId: "session-1", userId: "user-1", rootTaskId, turnStatus: status, input,
@@ -34,6 +34,12 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     terminalSequence, terminalType: "turn.completed", terminalActor: "orchestrator", terminalCorrelationId: `step-${index}`,
     terminalStepId: `step-${index}`, terminalStepSessionId: "session-1",
     terminalStepTurnId: turnId, terminalStepTaskId: rootTaskId, terminalStepStatus: "completed",
+    terminalStepEventSessionId: "session-1", terminalStepEventTurnId: turnId, terminalStepEventTaskId: rootTaskId,
+    terminalStepEventItemId: null, terminalStepEventSequence: String(Number(terminalSequence) - 1),
+    terminalStepEventType: "step.completed", terminalStepEventActor: "orchestrator",
+    terminalStepEventCorrelationId: `step-${index}`,
+    terminalStepEventIdempotencyKey: `turn:${turnId}:event:step-completed:step-${index}`,
+    terminalStepEventPayload: { stepId: `step-${index}`, status: "completed", taskId: rootTaskId }, terminalStepEventCount: 1,
     terminalIdempotencyKey: `turn:${turnId}:event:turn-completed`,
     terminalPayload: { turnId, taskId: rootTaskId, finalItemId: `final-${index}` }, terminalEventCount: 1,
   }
@@ -174,7 +180,7 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(0)
   })
 
-  it("requires a completed receipt correlation target in the same session, Turn, and Root task", async () => {
+  it("requires one canonical completed-step receipt scoped before the terminal Turn event", async () => {
     const valid = candidate(12)
     const missingStep = { ...candidate(13), terminalStepId: null }
     const otherTurn = { ...candidate(14), terminalStepTurnId: "turn-elsewhere" }
@@ -182,7 +188,13 @@ describe("direct Root-task history PostgreSQL store", () => {
     const otherSession = { ...candidate(16), terminalStepSessionId: "session-elsewhere" }
     const streamingStep = { ...candidate(17), terminalStepStatus: "streaming" }
     const failedStep = { ...candidate(18), terminalStepStatus: "failed" }
-    const test = fixture({ candidates: [valid, missingStep, otherTurn, otherRoot, otherSession, streamingStep, failedStep] })
+    const missingReceipt = { ...candidate(19), terminalStepEventCount: 0 }
+    const wrongReceiptScope = { ...candidate(20), terminalStepEventTaskId: "root-elsewhere" }
+    const wrongReceiptPayload = { ...candidate(21), terminalStepEventPayload: { stepId: "step-other", status: "completed", taskId: "root-source-21" } }
+    const duplicateReceipt = { ...candidate(22), terminalStepEventCount: 2 }
+    const outOfOrderReceipt = { ...candidate(23), terminalStepEventSequence: candidate(23).startSequence }
+    const test = fixture({ candidates: [valid, missingStep, otherTurn, otherRoot, otherSession, streamingStep, failedStep,
+      missingReceipt, wrongReceiptScope, wrongReceiptPayload, duplicateReceipt, outOfOrderReceipt] })
 
     const outcomes = await test.store.load(test.input)
 
@@ -198,6 +210,9 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(scan?.sql).toContain('step."taskId" = roots."rootTaskId"')
     expect(scan?.sql).toContain('terminal_step."status" AS "terminalStepStatus"')
     expect(scan?.sql).toContain('terminal_step."id" = terminal."correlationId"')
+    expect(scan?.sql).toContain('event."idempotencyKey" = (\'turn:\' || roots."turnId" || \':event:step-completed:\' || terminal_step."id")')
+    expect(scan?.sql).toContain('event."type" = \'step.completed\' AND event."correlationId" = terminal_step."id"')
+    expect(scan?.sql).toContain('COUNT(*) OVER () AS "stepCompletedEventCount"')
   })
 
   it("rejects a nonterminal source Turn before loading its terminal Root graph", async () => {
