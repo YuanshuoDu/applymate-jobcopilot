@@ -50,6 +50,7 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
@@ -10568,7 +10569,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(analyst).toMatchObject({ status: "completed", failureReason: null })
     expectPassedVerificationReport(record(analyst?.result)?.taskGraphVerificationReport, "finding-count")
     if (!terminalGateLease || !rootTaskId) throw new Error("repair fixture lost its terminal-gate identity")
-    expect(await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)).toEqual({ ok: true })
+    const persistedGraph = await pool!.query<{ revision: number }>(`SELECT "revision" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+    [taskGraphItemId(rootTaskId), value.sessionId, value.turnId])
+    const persistedRevision = Number(persistedGraph.rows[0]?.revision ?? 0)
+    const terminalDecision = await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)
+    expect(terminalDecision.ok).toBe(true)
+    if (!terminalDecision.ok) throw new Error("repaired current TaskGraph did not pass its terminal gate")
+    const binding = terminalDecision[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+    expect(binding).toBeDefined()
+    expect(persistedRevision).toBeGreaterThan(0)
+    expect(binding?.graphRevision).toBe(persistedRevision)
+    expect(binding?.summary.graphRevision).toBe(persistedRevision)
+    expect(JSON.stringify(terminalDecision)).toBe('{"ok":true}')
   }, 120_000)
 
   it("drains a fenced running TaskGraph child after root failure without changing root or Turn", async () => {
