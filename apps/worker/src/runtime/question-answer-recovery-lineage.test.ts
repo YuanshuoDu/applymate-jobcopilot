@@ -89,6 +89,7 @@ describe("durable question answer lineage", () => {
     expect(result).toHaveLength(1)
     expect(result[0]?.item).toEqual(rootQuestion)
     expect(f.query.mock.calls.some(([sql]) => sql.includes('item."taskId" = $4')
+      && sql.includes('answer_event."taskId" = item."taskId"')
       && sql.includes('ask_call."content"->>\'toolName\' = \'agent.ask_user\'') && sql.includes("question.answered"))).toBe(true)
     const legacy = input({ toolItems: [{ id: "broker-call-item", stepId: "step-1", taskId: rootTaskId,
       type: "tool_call", content: { toolCallId: "broker-call" } }] })
