@@ -12,7 +12,7 @@ const scope: TaskGraphExecutionScope = { userId: "user-1", sessionId: "session-1
   stepId: "step-3", turnLeaseOwner: "worker-1", turnLeaseVersion: 2, parentLeaseOwner: "worker-1", parentAttemptCount: 1 }
 const candidateText = "The current answer"
 const identity = { candidateDigest: digestNativeVerificationValue(candidateText), controlTaskId: "control-1", controlOperationId: "operation-1",
-  controlAttempt: 2, controlReportDigest: "b".repeat(64) }
+  controlAttempt: 2, controlReportDigest: "b".repeat(64), inputThroughSequence: 4n }
 
 describe("native semantic rejection runtime", () => {
   it("keeps custom legacy stores compatible and requires storage when durable mode is requested", async () => {

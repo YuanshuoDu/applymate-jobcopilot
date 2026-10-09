@@ -14,12 +14,12 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 
 const owner: TurnExecutionOwnerFence = { kind: "turn", userId: "u", sessionId: "s", turnId: "t", taskId: "root", rootTaskId: "root",
   ownerId: "lease", leaseVersion: 2, leaseExpiresAt: new Date("2030-01-01T00:00:00Z") }
-const identity = { candidateDigest: "a".repeat(64), controlTaskId: "control", controlOperationId: "operation", controlAttempt: 2, controlReportDigest: "b".repeat(64) }
+const identity = { candidateDigest: "a".repeat(64), inputThroughSequence: 8n, controlTaskId: "control", controlOperationId: "operation", controlAttempt: 2, controlReportDigest: "b".repeat(64) }
 const input = { owner, stepId: "step-4", finishReason: "stop", errorCode: null, inputTokens: 12, outputTokens: 7,
   estimatedCostUsd: 0.00012345, now: new Date("2026-10-07T00:00:00Z"), identity }
 const packetText = "Whole final candidate\n"
 
-function client(options: { stepStatus?: string; receipt?: Record<string, unknown> | null; insertRows?: number; history?: string[] } = {}) {
+function client(options: { stepStatus?: string; sequence?: string; receipt?: Record<string, unknown> | null; insertRows?: number; history?: string[] } = {}) {
   const calls: { sql: string; values?: readonly unknown[] }[] = []
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
@@ -30,7 +30,7 @@ function client(options: { stepStatus?: string; receipt?: Record<string, unknown
     if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-4", taskId: "root", attempt: 1, status: options.stepStatus ?? "streaming",
       finishReason: options.stepStatus === "completed" ? input.finishReason : null, errorCode: null,
       inputTokens: options.stepStatus === "completed" ? input.inputTokens : 0, outputTokens: options.stepStatus === "completed" ? input.outputTokens : 0,
-      estimatedCostUsd: options.stepStatus === "completed" ? "0.00012345" : "0", inputThroughSequence: "8" }], rowCount: 1 }
+      estimatedCostUsd: options.stepStatus === "completed" ? "0.00012345" : "0", inputThroughSequence: options.sequence ?? "8" }], rowCount: 1 }
     if (sql.includes("numeric(12,8)")) return { rows: [{ same: true }], rowCount: 1 }
     if (sql.startsWith('UPDATE "agent_steps"')) return { rows: [], rowCount: 1 }
     if (sql.includes('FROM "agent_native_semantic_rejections" AS rejection')) return { rows: (options.history ?? ["step-4"]).map(stepId => ({ stepId })), rowCount: options.history?.length ?? 1 }
@@ -83,6 +83,19 @@ describe("atomic native semantic rejection completion", () => {
     const mock = client()
     await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
     expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"'))).toBe(false)
+  })
+
+  it("rejects a changed epoch in fresh private readback before Step mutation", async () => {
+    readers.proof.mockResolvedValue({ ...identity, inputThroughSequence: 9n })
+    const mock = client()
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("rejects when the locked Step epoch differs from the proof identity before mutation", async () => {
+    const mock = client({ sequence: "9" })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
   })
 
   it("replays only the exact completed Step and receipt without an update or duplicate insert", async () => {

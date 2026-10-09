@@ -39,7 +39,7 @@ function sameReceipt(row: TurnEngineRow, input: CompletionInput, checkpoint: big
 function identityMatches(actual: NativeSemanticRejectionIdentity | null, expected: NativeSemanticRejectionIdentity): boolean {
   return actual !== null && actual.candidateDigest === expected.candidateDigest && actual.controlTaskId === expected.controlTaskId
     && actual.controlOperationId === expected.controlOperationId && actual.controlAttempt === expected.controlAttempt
-    && actual.controlReportDigest === expected.controlReportDigest
+    && actual.controlReportDigest === expected.controlReportDigest && actual.inputThroughSequence === expected.inputThroughSequence
 }
 async function currentFailedProof(client: TurnEngineQueryClient, input: CompletionInput): Promise<NativeSemanticRejectionIdentity | null> {
   const { owner, identity } = input
@@ -96,6 +96,7 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
   if (!step || step.taskId !== owner.taskId || Number(step.attempt) !== 1) throw conflict(`step ${input.stepId} lineage`)
   let checkpoint: bigint
   try { checkpoint = nativeSemanticCheckpoint(step.inputThroughSequence) } catch { throw conflict("step checkpoint") }
+  if (checkpoint !== identity.inputThroughSequence) throw conflict(`step ${input.stepId} proof checkpoint`)
   try {
     if (step.status === "completed") {
       if (!sameStep(step, input, checkpoint) || !await samePersistedCost(client, step, input)) throw conflict(`step ${input.stepId} replay`)

@@ -284,6 +284,50 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     expect(privileges.rows[0]).toEqual({ canSelect: true, canInsert: true, canUpdate: false, canDelete: false })
   }, 60_000)
 
+  it("binds a failed-root identity to the persisted BIGINT checkpoint through Step completion", async () => {
+    const checkpointX = 9_007_199_254_740_993n
+    const checkpointY = checkpointX + 1n
+    const staleStepId = `native-semantic-stale-checkpoint-${suffix}`
+    const controlStepId = `native-semantic-equal-checkpoint-${suffix}`
+    const usage = { inputTokens: 23, outputTokens: 8, estimatedCostUsd: 0.0023 }
+    const complete = requiredStoreMethod(store!, "completeNativeSemanticRejectionStep")
+
+    await seedStep(staleStepId, 13, checkpointX.toString())
+    const persistedBeforeRead = await adminPool!.query<{ inputThroughSequence: string }>(
+      `SELECT "inputThroughSequence" FROM "agent_steps" WHERE "id" = $1`, [staleStepId])
+    expect(persistedBeforeRead.rows[0]?.inputThroughSequence).toBe(checkpointX.toString())
+    const staleIdentity = await ensureRejectedCandidate(candidateA, staleStepId)
+    expect(Reflect.get(staleIdentity, "inputThroughSequence")).toBe(checkpointX)
+    expect(candidateA).not.toContain(checkpointX.toString())
+
+    await adminPool!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2::bigint WHERE "id" = $1`,
+      [staleStepId, checkpointY.toString()])
+    const completion = { owner, stepId: staleStepId, finishReason: "stop", errorCode: null as null,
+      ...usage, now: new Date(), identity: staleIdentity }
+    await expect(complete(completion)).rejects.toThrow()
+
+    const rejectedState = await adminPool!.query<{
+      status: string; finishReason: string | null; errorCode: string | null; inputTokens: number; outputTokens: number
+      estimatedCostUsd: string; inputThroughSequence: string; completedAt: Date | null; receipts: number
+    }>(`SELECT step."status", step."finishReason", step."errorCode", step."inputTokens", step."outputTokens",
+        step."estimatedCostUsd", step."inputThroughSequence", step."completedAt",
+        (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS rejection WHERE rejection."stepId" = step."id") AS "receipts"
+      FROM "agent_steps" AS step WHERE step."id" = $1`, [staleStepId])
+    expect(rejectedState.rows[0]).toEqual({ status: "streaming", finishReason: null, errorCode: null, inputTokens: 0,
+      outputTokens: 0, estimatedCostUsd: "0.00000000", inputThroughSequence: checkpointY.toString(), completedAt: null, receipts: 0 })
+
+    await seedStep(controlStepId, 14, checkpointX.toString())
+    const controlIdentity = await ensureRejectedCandidate(candidateA, controlStepId)
+    expect(Reflect.get(controlIdentity, "inputThroughSequence")).toBe(checkpointX)
+    const controlCompletion = { ...completion, stepId: controlStepId, identity: controlIdentity, now: new Date() }
+    await expect(complete(controlCompletion)).resolves.toMatchObject({ inputThroughSequence: checkpointX, distinctStepCount: 1 })
+    await expect(complete(controlCompletion)).resolves.toMatchObject({ inputThroughSequence: checkpointX, distinctStepCount: 1 })
+    const controlReceipt = await adminPool!.query<{ inputThroughSequence: string; count: number }>(
+      `SELECT "inputThroughSequence", COUNT(*) OVER()::int AS "count" FROM "agent_native_semantic_rejections"
+        WHERE "turnId" = $1 AND "stepId" = $2`, [turnId, controlStepId])
+    expect(controlReceipt.rows[0]).toEqual({ inputThroughSequence: checkpointX.toString(), count: 1 })
+  }, 60_000)
+
   it("rolls back Step completion when the restrictive role cannot insert its receipt", async () => {
     await seedStep(stepIds[7]!, 8, "9")
     const identity = await ensureRejectedCandidate(candidateB, stepIds[7]!, "evidence_conflict")
