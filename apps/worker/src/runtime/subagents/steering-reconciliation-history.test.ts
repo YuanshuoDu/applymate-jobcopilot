@@ -8,7 +8,7 @@ import { buildCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.j
 import type { StepContext } from "../context/step-context-builder.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_SCHEMA_VERSION, validSteeringReconciliationToolCall } from "./steering-reconciliation-contract.js"
-import { readSteeringReconciliationHistory } from "./steering-reconciliation-history.js"
+import { assertSteeringReconciliationCall, readSteeringReconciliationHistory, type SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
 
 const scope: TaskGraphExecutionScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   stepId: "later-step", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "root-owner", parentAttemptCount: 1 }
@@ -53,9 +53,9 @@ function toolStartKey(callId: string): string {
     rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner, leaseVersion: scope.turnLeaseVersion, leaseExpiresAt: new Date(0) }
   return `${executionKey(identity)}:event:tool-started:${callId}`
 }
-function agenda() {
-  const payload = buildCognitiveAgendaReceipt({ sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, stepId: decisionStepId,
-    agenda: { ...buildCognitiveActionAgenda(context), planRevision: 1 } })
+function agenda(stepId = decisionStepId) {
+  const payload = buildCognitiveAgendaReceipt({ sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, stepId,
+    agenda: { ...buildCognitiveActionAgenda({ ...context, stepId }), planRevision: 1 } })
   if (!payload) throw new Error("agenda fixture should be valid")
   return payload
 }
@@ -66,27 +66,77 @@ function fixture(change: Readonly<{ event?: Record<string, unknown>; tool?: Reco
   const storedEvent = { id: "receipt-event", itemId: null, taskId: scope.rootTaskId, type: "agent.plan.reconciliation", actor: "orchestrator",
     correlationId: scope.turnId, causationId: decisionStepId, sequence: "30", idempotencyKey: receiptKey, payload: receipt, hasOutbox: false, ...change.event }
   const toolName = "agent.reconcile"
-  const toolEvent = { type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item", correlationId: callId,
+  const toolEvent = { eventId: "tool-event", eventSequence: "20", type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item", correlationId: callId,
     idempotencyKey: toolStartKey(callId), payload: { toolCallId: callId, toolName, taskId: scope.rootTaskId }, callItemId: "call-item", stepId: decisionStepId,
     itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: callId, toolName, toolVersion: "1", input: { decision: "keep", expectedRevision: 1 } }, ...change.tool }
   const step = { id: decisionStepId, taskId: scope.rootTaskId, ordinal: 1, attempt: 1, status: "completed", inputThroughSequence: "10", ...change.step }
   const agendaRow = { actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: decisionStepId, payload: agenda(), ...change.agenda }
   const calls: string[] = []
-  const client = { query: vi.fn(async (sql: string) => {
+  const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
     calls.push(sql)
-    if (sql.includes('event."type" = $3')) return { rows: change.noReceipt ? [] : [storedEvent], rowCount: change.noReceipt ? 0 : 1 }
-    if (sql.includes("tool_call.started")) return { rows: [toolEvent], rowCount: 1 }
+    if (sql.includes('event."type" = $3')) {
+      const rows = change.noReceipt || values?.[3] != null ? [] : [storedEvent]
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes("tool_call.started")) {
+      const rows = values?.[4] == null ? [toolEvent] : []
+      return { rows, rowCount: rows.length }
+    }
     if (sql.includes('FROM "agent_steps"')) return { rows: [step], rowCount: 1 }
     if (sql.includes("cognitive.agenda")) return { rows: [agendaRow], rowCount: 1 }
     return { rows: [], rowCount: 0 }
   }) } as unknown as Pick<pg.PoolClient, "query">
   return { client, calls, storedEvent }
 }
+async function historyEntries(client: Pick<pg.PoolClient, "query">): Promise<SteeringReconciliationHistoryEntry[]> {
+  const history: SteeringReconciliationHistoryEntry[] = []
+  for await (const entry of readSteeringReconciliationHistory(client, scope, 1)) history.push(entry)
+  return history
+}
+function longHistoryFixture(count: number, malformedIndex = -1) {
+  const receipts: Array<Record<string, unknown>> = [], toolEvents: Array<Record<string, unknown>> = []
+  const steps: Array<Record<string, unknown>> = [], agendas: Array<Record<string, unknown>> = []
+  for (let index = 0; index < count; index++) {
+    const suffix = String(index).padStart(4, "0"), stepId = `decision-step-${suffix}`, toolCallId = `reconcile-call-${suffix}`
+    const receipt = { ...baseReceipt, stepId, steerInputIds: [`steer-${suffix}`], inputCheckpoint: { throughSequence: String(index + 10) } }
+    const key = steeringReconciliationIdempotencyKey({ ...scope, stepId }, toolCallId)
+    receipts.push({ id: `receipt-event-${suffix}`, itemId: null, taskId: scope.rootTaskId, type: "agent.plan.reconciliation",
+      actor: index === malformedIndex ? "user" : "orchestrator", correlationId: scope.turnId, causationId: stepId,
+      sequence: String(index * 4 + 103), idempotencyKey: key, payload: receipt, hasOutbox: false })
+    toolEvents.push({ eventId: `tool-event-${suffix}`, eventSequence: String(index * 4 + 102), type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId,
+      eventItemId: `call-item-${suffix}`, correlationId: toolCallId, idempotencyKey: toolStartKey(toolCallId),
+      payload: { toolCallId, toolName: "agent.reconcile", taskId: scope.rootTaskId }, callItemId: `call-item-${suffix}`, stepId,
+      itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId, toolName: "agent.reconcile", toolVersion: "1", input: { decision: "keep", expectedRevision: 1 } } })
+    steps.push({ id: stepId, taskId: scope.rootTaskId, ordinal: index + 1, attempt: 1, status: "completed", inputThroughSequence: String(index + 10) })
+    agendas.push({ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: stepId, payload: agenda(stepId) })
+  }
+  const calls: Array<{ sql: string; values?: unknown[]; rows: number }> = []
+  const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+    let rows: Array<Record<string, unknown>> = []
+    if (sql.includes('event."type" = $3') && values?.[2] === "agent.plan.reconciliation") {
+      const after = values[3] == null ? null : BigInt(String(values[3])), afterId = String(values?.[4] ?? "")
+      rows = receipts.filter(row => after === null || BigInt(String(row.sequence)) > after
+        || BigInt(String(row.sequence)) === after && String(row.id) > afterId).slice(0, 64)
+    } else if (sql.includes("tool_call.started")) {
+      const stepIds = values?.[3] as string[], afterId = String(values?.[4] ?? "")
+      rows = toolEvents.filter(row => stepIds.includes(String(row.stepId)) && String(row.eventId) > afterId).slice(0, 64)
+    } else if (sql.includes('FROM "agent_steps"') && sql.includes("ANY($4::text[])")) {
+      const stepIds = values?.[3] as string[]
+      rows = steps.filter(row => stepIds.includes(String(row.id)))
+    } else if (sql.includes("cognitive.agenda") && sql.includes("ANY($4::text[])")) {
+      const stepIds = values?.[3] as string[]
+      rows = agendas.filter(row => stepIds.includes(String(row.correlationId)))
+    }
+    calls.push({ sql, values, rows: rows.length })
+    return { rows, rowCount: rows.length }
+  }) } as unknown as Pick<pg.PoolClient, "query">
+  return { client, calls }
+}
 
 describe("durable steering reconciliation history", () => {
   it("validates an earlier Step's private keep against its actual tool call and agenda", async () => {
     const f = fixture()
-    const history = await readSteeringReconciliationHistory(f.client, scope, 1)
+    const history = await historyEntries(f.client)
     expect(history).toEqual([{ receipt: baseReceipt, stepOrdinal: 1, stepAttempt: 1 }])
     expect(f.calls.some(sql => sql.includes('item."stepId" = ANY($4::text[])'))).toBe(true)
   })
@@ -111,6 +161,8 @@ describe("durable steering reconciliation history", () => {
     ["outbox copy", { event: { hasOutbox: true } }],
     ["hash receipt key not bound to the persisted call", { event: { idempotencyKey: `agent.plan.reconciliation:sha256:${"0".repeat(64)}` } }],
     ["forged tool actor", { tool: { actor: "subagent" } }],
+    ["tool call starts at the receipt sequence", { tool: { eventSequence: "30" } }],
+    ["tool call starts after the receipt", { tool: { eventSequence: "31" } }],
     ["wrong tool name", { tool: { payload: { toolCallId: callId, toolName: "agent.wait", taskId: scope.rootTaskId } } }],
     ["hash without a matching call", { tool: { idempotencyKey: `agent.plan.reconciliation:sha256:${"0".repeat(64)}` } }],
     ["foreign Turn writer key", { tool: { idempotencyKey: toolStartKey(callId).replace(scope.turnId, "other-turn") } }],
@@ -119,12 +171,52 @@ describe("durable steering reconciliation history", () => {
     ["step cursor mismatch", { step: { inputThroughSequence: "9" } }],
     ["stale resulting revision", { event: { payload: { ...baseReceipt, resultingRevision: 2 } } }],
   ] as const)("rejects %s history instead of clearing an obligation", async (_name, change) => {
-    await expect(readSteeringReconciliationHistory(fixture(change).client, scope, 1)).rejects.toThrow()
+    await expect(historyEntries(fixture(change).client)).rejects.toThrow()
   })
 
   it("does not query or invent a decision when no receipt exists", async () => {
     const f = fixture({ noReceipt: true })
-    await expect(readSteeringReconciliationHistory(f.client, scope, 1)).resolves.toEqual([])
+    await expect(historyEntries(f.client)).resolves.toEqual([])
     expect(f.calls.some(sql => sql.includes("tool_call.started"))).toBe(false)
+  })
+
+  it("checks a current call by its exact ID with a bounded duplicate probe", async () => {
+    const actual = await actualRootToolCall()
+    const currentScope = { ...scope, stepId: decisionStepId }
+    const query = vi.fn(async () => ({ rows: [actual.event && {
+      type: actual.event.type, actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: actual.event.itemId,
+      correlationId: callId, idempotencyKey: toolStartKey(callId), payload: actual.event.payload,
+      callItemId: actual.item?.id, stepId: decisionStepId, itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: actual.item?.content,
+    }].filter(Boolean), rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    await assertSteeringReconciliationCall(client, currentScope, callId, "keep", 1)
+    const [sql, values] = query.mock.calls[0] as unknown as [string, unknown[]]
+    expect(sql).toContain('event."correlationId" = $4')
+    expect(sql).toContain("LIMIT 2")
+    expect(values).toEqual([scope.sessionId, scope.turnId, scope.rootTaskId, callId, decisionStepId])
+  })
+
+  it("reads more than 256 valid receipts through bounded keyset pages", async () => {
+    const f = longHistoryFixture(270)
+    let count = 0
+    for await (const _entry of readSteeringReconciliationHistory(f.client, scope, 1)) count++
+
+    const receiptPages = f.calls.filter(call => call.sql.includes('event."type" = $3') && call.values?.[2] === "agent.plan.reconciliation")
+    const callPages = f.calls.filter(call => call.sql.includes("tool_call.started"))
+    expect(count).toBe(270)
+    expect(receiptPages.length).toBeGreaterThan(4)
+    expect(receiptPages.every(call => call.sql.includes("LIMIT 64") && call.sql.includes('event."sequence" > $4::bigint'))).toBe(true)
+    expect(callPages.every(call => call.sql.includes("LIMIT 64") && call.sql.includes('event."id" > $5::text'))).toBe(true)
+    expect(Math.max(...f.calls.map(call => call.rows))).toBeLessThanOrEqual(64)
+  })
+
+  it("fails closed on a malformed receipt after the first history pages", async () => {
+    const f = longHistoryFixture(270, 269)
+    let count = 0
+    await expect(async () => {
+      for await (const _entry of readSteeringReconciliationHistory(f.client, scope, 1)) count++
+    }).rejects.toThrow("steering_reconciliation_receipt_invalid")
+    expect(count).toBe(256)
+    expect(f.calls.filter(call => call.sql.includes('event."type" = $3')).length).toBeGreaterThan(4)
   })
 })
