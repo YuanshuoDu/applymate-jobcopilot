@@ -17,6 +17,7 @@ import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
+import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
 const DEFAULT_MAX_STEPS = 32
 function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
 function hasNewlyAcceptedInput(context: StepContext, previouslyConsumedIds: readonly string[]): boolean {
@@ -54,6 +55,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     )
     const recoveredToolObservations = await recoverPersistedToolCalls(executionOptions, writer, now)
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
+    const recoveredQuestion = await recoverPendingNativeQuestion(executionOptions, now, steps, toolCalls)
+    if (recoveredQuestion) return recoveredQuestion
     for (let ordinal = options.resume?.nextOrdinal ?? 0; ; ordinal += 1) {
       assertExecutionAlive(options, signal)
       budget.reserveStep()
@@ -66,6 +69,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       })
       lastStep = step
       let stepOutput: ModelStepResult | null = null
+      let questionIntentCallId: string | null = null
       try {
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
         const context = await options.contextBuilder.build({
@@ -115,6 +119,9 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         stepOutput = output; continuation = output.continuation ?? undefined
         await publishReasoningSummary(writer, options, step, output.reasoningSummary, now)
         if (output.toolCalls.length > 0) {
+          const questionCallId = nativeQuestionCallId(output, options.identity)
+          if (questionCallId && (!executionOptions.store.stageQuestionUsage || !executionOptions.store.cancelPausedQuestion)) throw new TurnEngineError("invalid_output", "Native question store is unavailable")
+          questionIntentCallId = questionCallId
           progress.observe({ snapshot, toolCalls: output.toolCalls })
           budget.reserveToolCalls(output.toolCalls.length)
           if (output.text) await publishCommentary(writer, options, step, output.text, now)
@@ -128,6 +135,10 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           }
           snapshot = outcome.snapshot
           steeringMarkerState = outcome.steeringMarkerState
+          if (questionIntentCallId && outcome.wait?.status === "waiting_for_user") {
+            closedSteps.add(step.id)
+            return { ...outcome.wait, stepCount: steps, toolCallCount: toolCalls }
+          }
           // Tool results are server-owned context; do not reuse a provider cursor across this boundary.
           continuation = undefined
           assertExecutionAlive(options, signal)
@@ -157,6 +168,25 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
         snapshot = taskGraphRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
       } catch (error: unknown) {
+        if (isPreparedQuestionRetryError(error) || isTurnStateRefreshRetryError(error)) throw error
+        if (questionIntentCallId && isSessionPauseRequestedError(error)) {
+          const questionCall = stepOutput?.toolCalls.find(call => call.id === questionIntentCallId)
+          if (!questionCall || !stepOutput?.usage || !executionOptions.store.cancelPausedQuestion) throw error
+          let disposition: "cancelled" | "prepared"
+          try {
+            disposition = await executionOptions.store.cancelPausedQuestion({
+              identity: options.identity, stepId: step.id, toolCallId: questionIntentCallId, callArguments: questionCall.arguments,
+              finishReason: stepOutput.finishReason, usage: stepOutput.usage, now: now(),
+            })
+          } catch {
+            // A failed cleanup transaction must not turn the original pause into a terminal step failure.
+            throw error
+          }
+          if (disposition === "prepared") throw new PreparedQuestionRetryError()
+          closedSteps.add(step.id)
+          throw error
+        }
+        if (questionIntentCallId && (signal.aborted || options.isOwnershipLost?.(error, signal))) throw error
         if (closedSteps.has(step.id) && (isSessionPauseRequestedError(error) || error instanceof NoProgressError)) throw error
         const status = signalWasInterrupted(signal) || isSessionPauseRequestedError(error) ? "interrupted" : "failed"
         await updateExecutionStep(options, {
@@ -173,6 +203,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       }
     }
   } catch (error: unknown) {
+    if (isPreparedQuestionRetryError(error) || isTurnStateRefreshRetryError(error)) throw error
     if (signalWasInterrupted(signal)) {
       const code = turnErrorCode(error)
       await writer.append(

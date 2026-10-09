@@ -71,11 +71,14 @@ describe("TaskGraph turn observation", () => {
       toolObservations: [
         { id: "search-result", content: { toolName: "jobs.search" } },
         { id: "wait-result:wait-1", content: { toolName: "agent.wait", output: { status: "ready" } } },
+        { id: "question-result:ask-1", content: { toolName: "agent.ask_user", status: "completed", output: { kind: "user_question", stage: "user_input", question: "Which city?" } } },
         { id: "task-graph-current", content: { kind: "task_graph_current", revision: 1 } },
       ],
     }
-    expect(selectedJobSnapshot(original).toolObservations.map(item => item.id)).toEqual(["wait-result:wait-1", "task-graph-current"])
+    expect(selectedJobSnapshot(original).toolObservations.map(item => item.id)).toEqual(["wait-result:wait-1", "question-result:ask-1", "task-graph-current"])
     expect(isSelectedJobRootTool({ name: "agent.plan" })).toBe(true)
+    expect(isSelectedJobRootTool({ name: "agent.ask_user" })).toBe(true)
+    expect(selectedJobToolAllowed("agent.ask_user")).toBe(true)
     expect(selectedJobToolAllowed("jobs.search")).toBe(false)
   })
 
