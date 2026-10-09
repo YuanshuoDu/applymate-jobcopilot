@@ -141,11 +141,7 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
       catch (error: unknown) {
         if (!(error instanceof TurnQuestionStoreError) || error.code !== "question_receipt_missing"
           || !await recoverPausedPartialQuestion(pool, input.owner, input.now)) throw error
-        const pending = await read()
-        if (pending.status === "none" && await recoverPausedOrphanUsage(pool, input.owner, input.now)) {
-          throw new OrphanPauseUsageRecoveredError()
-        }
-        return pending
+        throw new OrphanPauseUsageRecoveredError()
       }
     },
   }

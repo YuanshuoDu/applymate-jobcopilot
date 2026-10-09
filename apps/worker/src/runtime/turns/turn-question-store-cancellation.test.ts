@@ -316,7 +316,7 @@ describe("native question pause cancellation readback", () => {
       arguments: { question: "Which city?" } }, callItem: { id: "call-item-1", revision: 1 }, durableResult: null }]
     const executionStore = { readPendingQuestion: ({ identity, now }: { identity: typeof owner; now: Date }) => store.readPendingQuestion({ owner: identity, now }) }
 
-    await expect(store.readPendingQuestion(input)).resolves.toEqual({ status: "none" })
+    await expect(store.readPendingQuestion(input)).rejects.toMatchObject({ code: "orphan_pause_usage_recovered_reload_required" })
     await expect(store.readPendingQuestion(input)).resolves.toEqual({ status: "none" })
     await expect(recoverableNativeQuestionCalls({ identity: owner, store: executionStore } as never, recoveredAsk as never, () => input.now)).resolves.toEqual([])
 
