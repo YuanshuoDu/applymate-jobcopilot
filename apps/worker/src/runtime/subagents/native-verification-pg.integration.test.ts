@@ -217,6 +217,9 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
 
   const eventPrefix = seed.turnId === ids.turn ? "native-question" : "native-prior-question"
   const answeredEventId = `${eventPrefix}-answered-event-${suffix}`
+  const answerIdempotencyKey = seed.turnId === ids.turn
+    ? `question-answer:${suffix}`
+    : `question-answer:${seed.turnId}:${waitId}`
   const answerPayload = { waitKind: "question", waitId, itemId, turnId: seed.turnId,
     toolCallId, status: "answered", nextTurnRevision: 3, answerAvailable: true }
   const eventRows = [
@@ -228,10 +231,10 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
       actor: "orchestrator", correlationId: itemId, causationId: waitId, key: `agent-wait:${itemId}:started`,
       payload: { itemId, waitKind: "question", questionId: waitId, toolCallId }, topic: "agent.events" },
     { id: answeredEventId, itemId, taskId: null, sequence: firstSequence + 3, type: "question.answered",
-      actor: "user", correlationId: waitId, causationId: itemId, key: `question-answer:${suffix}`, payload: answerPayload, topic: "agent.session.event" },
+      actor: "user", correlationId: waitId, causationId: itemId, key: answerIdempotencyKey, payload: answerPayload, topic: "agent.session.event" },
     { id: `${eventPrefix}-wakeup-event-${suffix}`, itemId, taskId: null, sequence: firstSequence + 4, type: "turn.wakeup",
       actor: "user", correlationId: seed.turnId, causationId: answeredEventId,
-      key: `question-answer:${suffix}:wakeup`, payload: answerPayload, topic: "agent.turn.wakeup" },
+      key: `${answerIdempotencyKey}:wakeup`, payload: answerPayload, topic: "agent.turn.wakeup" },
   ]
   for (const event of eventRows) {
     const envelope = { eventId: event.id, sessionId: ids.session, turnId: seed.turnId, itemId: event.itemId,
@@ -389,6 +392,10 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const answeredQuestion = await seedAnsweredQuestion()
     const priorQuestion = priorQuestionFixture
     if (!priorQuestion) throw new Error("native_prior_question_fixture_unavailable")
+    const answerEvents = await pool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_events"
+      WHERE "id" IN ($1, $2)`, [answeredQuestion.answerEventId, priorQuestion.answerEventId])
+    expect(answerEvents.rows).toHaveLength(2)
+    expect(new Set(answerEvents.rows.map(event => event.idempotencyKey)).size).toBe(2)
     const childControl = await pool!.query<{ context: unknown; expectedOutputSchema: unknown }>(
       `SELECT "context", "expectedOutputSchema" FROM "sub_agent_tasks" WHERE "id" = $1`, [first.controlTaskIds[0]])
     const childMarker = parseNativeVerificationControl(childControl.rows[0]?.expectedOutputSchema)
