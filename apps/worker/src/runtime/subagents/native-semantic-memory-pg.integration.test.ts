@@ -215,14 +215,20 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
       async connect() { const client = await runtimePool!.connect(); await client.query(`SET ROLE "${runtimeRole}"`); return client },
     } as unknown as Pick<Pool, "connect">)
     const readAfterReconstruction = requiredStoreMethod(reconstructedStore, "readNativeSemanticRejections")
+    const completeAfterReconstruction = requiredStoreMethod(reconstructedStore, "completeNativeSemanticRejectionStep")
+    const firstReplay = { owner, stepId: stepIds[0]!, finishReason: "stop", errorCode: null as null,
+      ...usage, now: times.get(stepIds[0]!)!, identity: identityA }
+    await expect(completeAfterReconstruction(firstReplay)).resolves.toMatchObject({ distinctStepCount: 1 })
+    await expect(completeAfterReconstruction({ ...firstReplay, inputTokens: 42 })).rejects.toThrow()
+
     await seedStep(stepIds[1]!, 2, "0")
     await expect(readAfterReconstruction({ owner, stepId: stepIds[1]!, identity: identityA })).resolves.toMatchObject({
       inputThroughSequence: 0n, stepIds: [stepIds[0]],
     })
     await expect(finish(stepIds[0]!, identityA)).resolves.toMatchObject({ distinctStepCount: 1 })
-    await expect(finish(stepIds[0]!, identityA, { ...usage, inputTokens: 42 })).rejects.toThrow()
-
     await expect(finish(stepIds[1]!, identityA)).resolves.toMatchObject({ distinctStepCount: 2 })
+    await expect(finish(stepIds[1]!, identityA)).resolves.toMatchObject({ distinctStepCount: 2 })
+
     await seedStep(stepIds[2]!, 3, "0")
     const reconstructedAfterTwo = createPgTurnEngineStore({
       async connect() { const client = await runtimePool!.connect(); await client.query(`SET ROLE "${runtimeRole}"`); return client },
@@ -232,9 +238,11 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await expect(readAfterTwo({ owner, stepId: stepIds[2]!, identity: identityA })).resolves.toMatchObject({
       inputThroughSequence: 0n, stepIds: [stepIds[0], stepIds[1]],
     })
-    await expect(completeAfterTwo({ owner, stepId: stepIds[2]!, finishReason: "stop", errorCode: null,
-      ...usage, now: new Date(), identity: identityA })).resolves.toMatchObject({ distinctStepCount: 3 })
-    await expect(finish(stepIds[0]!, identityA)).resolves.toMatchObject({ distinctStepCount: 3 })
+    const thirdReplay = { owner, stepId: stepIds[2]!, finishReason: "stop", errorCode: null as null,
+      ...usage, now: new Date(), identity: identityA }
+    await expect(completeAfterTwo(thirdReplay)).resolves.toMatchObject({ distinctStepCount: 3 })
+    await expect(completeAfterTwo(thirdReplay)).resolves.toMatchObject({ distinctStepCount: 3 })
+    await expect(completeAfterTwo(firstReplay)).resolves.toMatchObject({ distinctStepCount: 3 })
     const ledger = await adminPool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_native_semantic_rejections"
       WHERE "turnId" = $1 AND "candidateDigest" = $2 AND "controlTaskId" = $3 AND "controlOperationId" = $4
         AND "controlAttempt" = $5 AND "controlReportDigest" = $6 AND "inputThroughSequence" = 0`,
