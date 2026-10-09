@@ -52,6 +52,9 @@ function check(value: unknown, role: "scout" | "analyst"): boolean {
   if (kind === "all_candidates_have_evidence" && role === "scout" || kind === "all_findings_have_evidence" && role === "analyst") {
     return exact(value, "kind,minimumItems") && positive(value.minimumItems)
   }
+  if (kind === "findings_from_scout_dependency" && role === "analyst") {
+    return exact(value, "dependencyNodeKey,kind") && boundedId(value.dependencyNodeKey)
+  }
   return kind === "reported_score_gte" && role === "analyst" && exact(value, "aggregation,kind,minimumFindings,minimumScore")
     && positive(value.minimumFindings) && typeof value.minimumScore === "number" && Number.isFinite(value.minimumScore)
     && value.minimumScore >= 0 && value.minimumScore <= 10 && (value.aggregation === "any" || value.aggregation === "all")
@@ -109,7 +112,11 @@ export function parsePersistedTaskGraphNode(value: unknown): TaskGraphSnapshotNo
 }
 
 function report(value: unknown): value is Record<string, unknown> {
-  if (!record(value) || !exact(value, "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
+  if (!record(value)) return false
+  const hasBindings = Object.hasOwn(value, "dependencyBindings")
+  if (!exact(value, hasBindings
+    ? "criteria,dependencyBindings,evidenceDigest,reasonCode,resultDigest,status,verifierVersion"
+    : "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
     || value.verifierVersion !== VERIFIER_VERSION || typeof value.reasonCode !== "string" || !REPORT_REASONS.has(value.reasonCode)
     || typeof value.status !== "string" || !["passed", "failed", "unverified"].includes(value.status)
     || !(value.evidenceDigest === null || typeof value.evidenceDigest === "string" && DIGEST.test(value.evidenceDigest))
@@ -122,6 +129,17 @@ function report(value: unknown): value is Record<string, unknown> {
       || !REPORT_REASONS.has(item.reasonCode) || typeof item.status !== "string"
       || !["passed", "failed", "unverified"].includes(item.status)) return false
     ids.add(item.criterionId)
+  }
+  if (hasBindings) {
+    if (value.status === "unverified" || !dense(value.dependencyBindings, 1, 8)) return false
+    let previous: string | undefined
+    for (const item of value.dependencyBindings) {
+      if (!record(item) || !exact(item, "attemptCount,evidenceDigest,nodeDigest,nodeKey,reportDigest,resultDigest,taskId")
+        || !boundedId(item.nodeKey) || !boundedId(item.taskId) || !Number.isSafeInteger(item.attemptCount) || Number(item.attemptCount) < 1
+        || ![item.nodeDigest, item.resultDigest, item.evidenceDigest, item.reportDigest].every(digest => typeof digest === "string" && DIGEST.test(digest))
+        || previous !== undefined && previous >= item.nodeKey) return false
+      previous = item.nodeKey
+    }
   }
   return value.criteria.length > 0 || value.status === "unverified" && value.reasonCode === "contract_invalid"
     && value.evidenceDigest === null && value.resultDigest === null

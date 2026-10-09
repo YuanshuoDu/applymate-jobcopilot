@@ -51,6 +51,7 @@ import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } fr
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
+import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
@@ -102,6 +103,14 @@ const ANALYST_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "analyst",
   criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} as const
+const DISCOVERY_ANALYST_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [
+    { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    { id: "findings-from-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
+  ],
 } as const
 
 function expectVerifiedDependencyProjectionItems(
@@ -3000,12 +3009,13 @@ async function collectPlanReceiptFailureDiagnostics(
   }
 }
 
-function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number): RecordValue & { tasks: unknown[] } {
+function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number, requiredRole?: "scout" | "analyst"): RecordValue & { tasks: unknown[] } {
   const outcomes = request.messages.flatMap(message => message.content.flatMap(part => {
     if (part.type !== "tool_result" || !part.toolUseId.startsWith("wait:") || typeof part.content !== "string") return []
     try {
       const outcome = record(JSON.parse(part.content) as unknown)
-      return outcome && Array.isArray(outcome.tasks) && outcome.tasks.length === taskCount ? [outcome] : []
+      return outcome && Array.isArray(outcome.tasks) && outcome.tasks.length === taskCount
+        && (!requiredRole || outcome.tasks.some(task => record(task)?.role === requiredRole)) ? [outcome] : []
     } catch { return [] }
   }))
   const outcome = outcomes[0]
@@ -3027,13 +3037,13 @@ function currentGraphFromRequest(request: HarnessModelRequest): RecordValue | nu
   return null
 }
 
-function expectPassedVerificationReport(value: unknown, criterionId: string): void {
+function expectPassedVerificationReport(value: unknown, ...criterionIds: string[]): void {
   const report = record(value)
   expect(report).toMatchObject({
     verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
     status: "passed",
     reasonCode: "criteria_met",
-    criteria: [{ criterionId, status: "passed", reasonCode: "criteria_met" }],
+    criteria: criterionIds.map(criterionId => ({ criterionId, status: "passed", reasonCode: "criteria_met" })),
   })
   expect(typeof report?.evidenceDigest).toBe("string")
   expect(String(report?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
@@ -9489,6 +9499,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     let rootExecution = 0
     let discoveryRootModelFailure: string | null = null
+    let discoveryScoutGraphRevision = -1
     let discoveryRootStage: "not_started" | "initial_plan" | "scout_wait" | "replan" | "analyst_plan_receipt" | "analyst_wait" | "final" = "not_started"
     let discoveryChildStage: "not_started" | "search_visibility" | "search_call_emitted" | "parent_wait" | "result_emitted" = "not_started"
     let discoveryJobsSearchAppeared = false
@@ -9547,9 +9558,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
               const revision = graph?.revision
               if (typeof revision !== "number") throw new Error("Discovery replan did not receive the durable graph revision")
+              discoveryScoutGraphRevision = revision
               yield { type: "tool_call_completed", callId: "p3-discovery-plan-analyst", name: "agent.plan", arguments: {
                 expectedRevision: revision,
-                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION }],
+                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION }],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
@@ -9571,9 +9583,115 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(nodes.map(node => node?.key)).toEqual(["scout", "analyst"])
               expect(nodes.map(node => node?.status)).toEqual(["completed", "completed"])
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
-              expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count")
-              const wait = waitOutcomeFromRequest(request, 1)
+              expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count", "findings-from-scout")
+              expect(typeof graph?.revision).toBe("number")
+              expect(graph?.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              const publicReportKeys = ["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"]
+              const publicGraphReport = record(nodes[1]?.verificationReport)
+              expect(Object.keys(publicGraphReport ?? {}).sort()).toEqual(publicReportKeys)
+              expect(JSON.stringify(publicGraphReport)).not.toContain("dependencyBindings")
+              const wait = waitOutcomeFromRequest(request, 1, "analyst")
               expect(wait.status).toBe("ready")
+              const waitedAnalyst = record(wait.tasks[0])
+              const publicWaitReport = record(waitedAnalyst?.verificationReport)
+              expect(waitedAnalyst?.role).toBe("analyst")
+              expectPassedVerificationReport(publicWaitReport, "finding-count", "findings-from-scout")
+              expect(Object.keys(publicWaitReport ?? {}).sort()).toEqual(publicReportKeys)
+              expect(JSON.stringify(publicWaitReport)).not.toContain("dependencyBindings")
+
+              const ownerRows = await pool!.query<{
+                rootTaskId: string; turnLeaseOwner: string; turnLeaseVersion: number
+                parentLeaseOwner: string; parentAttemptCount: number
+              }>(`SELECT turn."rootTaskId", turn."leaseOwnerId" AS "turnLeaseOwner", turn."leaseVersion" AS "turnLeaseVersion",
+                    root."leaseOwner" AS "parentLeaseOwner", root."attemptCount" AS "parentAttemptCount"
+                 FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root
+                   ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+                 WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND root."status" = 'running'`,
+              [discoveryOwner.turnId, discoveryOwner.sessionId, discoveryOwner.userId])
+              const currentOwner = ownerRows.rows[0]
+              if (!currentOwner) throw new Error("Discovery root lease was unavailable for current graph readback")
+              const readScope = {
+                userId: discoveryOwner.userId, sessionId: discoveryOwner.sessionId, turnId: discoveryOwner.turnId,
+                rootTaskId: currentOwner.rootTaskId, parentTaskId: currentOwner.rootTaskId,
+                turnLeaseOwner: currentOwner.turnLeaseOwner, turnLeaseVersion: currentOwner.turnLeaseVersion,
+                parentLeaseOwner: currentOwner.parentLeaseOwner, parentAttemptCount: currentOwner.parentAttemptCount,
+              }
+              const currentGraphState = await discoveryCommandPort.readCurrent(readScope)
+              expect(currentGraphState.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              const currentScout = currentGraphState.nodes.find(node => node.key === "scout")
+              const currentAnalyst = currentGraphState.nodes.find(node => node.key === "analyst")
+              expectPassedVerificationReport(currentScout?.verificationReport, "candidate-count")
+              expectPassedVerificationReport(currentAnalyst?.verificationReport, "finding-count", "findings-from-scout")
+
+              const childRows = await pool!.query<{ id: string; role: string; result: unknown }>(
+                `SELECT "id", "role", "result" FROM "sub_agent_tasks"
+                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "rootTaskId" = $3 AND "parentTaskId" = $3
+                   AND "role" = ANY($4::text[])`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId, ["analyst", "scout"]],
+              )
+              const scoutTask = childRows.rows.find(task => task.role === "scout")
+              const analystTask = childRows.rows.find(task => task.role === "analyst")
+              const scoutResult = record(scoutTask?.result)
+              const scoutStructured = record(scoutResult?.structuredResult)
+              const sourceCandidates = Array.isArray(scoutStructured?.candidates)
+                ? scoutStructured.candidates.map(record).filter((candidate): candidate is RecordValue => candidate !== null) : []
+              const analystResult = record(analystTask?.result)
+              const storedReport = record(analystResult?.taskGraphVerificationReport)
+              if (!scoutTask || !analystTask || !scoutResult || !scoutStructured || !sourceCandidates.length || !analystResult || !storedReport) {
+                throw new Error("Discovery source or Analyst verification result was missing")
+              }
+              expect(Object.keys(storedReport).sort()).toEqual([
+                "criteria", "dependencyBindings", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion",
+              ])
+              const parsedStoredReport = parseStoredTaskGraphVerificationReport(
+                storedReport, ["finding-count", "findings-from-scout"], ["scout"],
+              )
+              expect(parsedStoredReport?.status).toBe("passed")
+              const bindings = Array.isArray(parsedStoredReport?.dependencyBindings)
+                ? parsedStoredReport.dependencyBindings.map(record) : []
+              expect(bindings).toHaveLength(1)
+              const sourceBinding = bindings[0]
+              if (!sourceBinding) throw new Error("Discovery Analyst private dependency binding was invalid")
+              expect(Object.keys(sourceBinding ?? {}).sort()).toEqual([
+                "attemptCount", "evidenceDigest", "nodeDigest", "nodeKey", "reportDigest", "resultDigest", "taskId",
+              ])
+              expect(sourceBinding).toMatchObject({ nodeKey: "scout", taskId: scoutTask.id, attemptCount: 1 })
+              for (const key of ["nodeDigest", "resultDigest", "evidenceDigest", "reportDigest"] as const) {
+                expect(sourceBinding?.[key]).toMatch(/^[a-f0-9]{64}$/)
+              }
+              expect(JSON.stringify(sourceBinding)).not.toContain(jobId)
+
+              const expectReadbackRejectsMutation = async (taskId: string, original: RecordValue, changed: RecordValue) => {
+                const update = async (value: RecordValue) => pool!.query(
+                  `UPDATE "sub_agent_tasks" SET "result" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+                  [JSON.stringify(value), taskId, discoveryOwner.sessionId, discoveryOwner.turnId],
+                )
+                expect((await update(changed)).rowCount).toBe(1)
+                try {
+                  await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+                } finally {
+                  expect((await update(original)).rowCount).toBe(1)
+                }
+              }
+              const changedCandidates = sourceCandidates.map(candidate => ({ ...candidate, jobId: `${jobId}-changed` }))
+              await expectReadbackRejectsMutation(scoutTask.id, scoutResult, {
+                ...scoutResult, structuredResult: { ...scoutStructured, candidates: changedCandidates },
+              })
+              const missingBindingReport = { ...storedReport }
+              delete missingBindingReport.dependencyBindings
+              await expectReadbackRejectsMutation(analystTask.id, analystResult, {
+                ...analystResult, taskGraphVerificationReport: missingBindingReport,
+              })
+              await expectReadbackRejectsMutation(analystTask.id, analystResult, {
+                ...analystResult, taskGraphVerificationReport: {
+                  ...storedReport, dependencyBindings: [{ ...sourceBinding, taskId: `replaced-${scoutTask.id}` }],
+                },
+              })
+              const restoredGraphState = await discoveryCommandPort.readCurrent(readScope)
+              expect(restoredGraphState.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              expectPassedVerificationReport(restoredGraphState.nodes.find(node => node.key === "scout")?.verificationReport, "candidate-count")
+              expectPassedVerificationReport(restoredGraphState.nodes.find(node => node.key === "analyst")?.verificationReport,
+                "finding-count", "findings-from-scout")
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }) }
               yield { type: "completed", finishReason: "stop" }
               return

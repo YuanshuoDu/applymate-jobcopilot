@@ -117,6 +117,26 @@ describe("parseTaskGraphSnapshot", () => {
     expect(rewritten.nodes[0]).not.toHaveProperty("verification")
   })
 
+  it("requires a named findings source to be a direct typed registered Scout in the same snapshot", () => {
+    const check = { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" }
+    const scout = { ...storedNode("scout-source"), verification: scoutVerification, verificationDisposition: "typed" }
+    const analyst = {
+      ...storedNode("analyst", ["scout-source"]), templateId: "analyst",
+      verification: { ...analystVerification, criteria: [{ id: "in-scout", check }] }, verificationDisposition: "typed",
+    }
+    expect(parseTaskGraphSnapshot(snapshotWithNodes([scout, analyst])).nodes[1]).toMatchObject({ key: "analyst" })
+
+    const middle = { ...storedNode("middle", ["scout-source"]), templateId: "analyst", verification: analystVerification, verificationDisposition: "typed" }
+    const legacyScout = { ...storedNode("scout-source"), verificationDisposition: "legacy_unverified" }
+    for (const nodes of [
+      [scout, { ...analyst, dependsOn: ["middle"] }, middle],
+      [legacyScout, analyst],
+      [{ ...scout, templateId: "analyst", verification: analystVerification }, analyst],
+    ]) {
+      expect(() => parseTaskGraphSnapshot(snapshotWithNodes(nodes))).toThrow("task_graph_snapshot_verification_dependency_invalid")
+    }
+  })
+
   it("rejects conflicting or invalid verification dispositions instead of upgrading legacy nodes", () => {
     const base = storedNode("node-1")
     for (const node of [

@@ -94,8 +94,29 @@ describe("agent.plan tool executor", () => {
         criteria: [{ id: "reported-score", check: { kind: "reported_score_gte", minimumScore: 7, minimumFindings: 1, aggregation: "any" } }],
       } }],
     }, "1")).toBe(true)
+    const scout = { ...proposal.nodes[0], key: "scout-source" }
+    const analyst = {
+      key: "analysis", templateId: "analyst", goal: "Analyze Scout jobs",
+      successCriteria: ["Analyze jobs from the selected Scout"], dependsOn: ["scout-source"],
+      verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [{ id: "source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } }],
+      },
+    }
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [scout, analyst] }, "1")).toBe(true)
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...analyst, verification: { ...analyst.verification, criteria: [{
+        id: "source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source", taskId: "forged" },
+      }] },
+    }] }, "1")).toEqual(expect.any(String))
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...scout, verification: { ...scout.verification, criteria: [{
+        id: "source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" },
+      }] },
+    }] }, "1")).toEqual(expect.any(String))
     expect(tool.description).toContain("successCriteria prose is explanatory and never proof")
     expect(tool.description).toContain("reported_score_gte checks an Analyst-reported number, not its correctness")
+    expect(tool.description).toContain("findings_from_scout_dependency")
   })
 
   it("exposes and forwards the bounded repair relation only for typed roles", async () => {

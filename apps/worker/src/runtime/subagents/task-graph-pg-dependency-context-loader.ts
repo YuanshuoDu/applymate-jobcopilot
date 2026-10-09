@@ -1,11 +1,12 @@
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
-import { evaluateTaskGraphVerification, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationEvidenceProjection } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationEvidenceProjection } from "../planning/task-graph-verification.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus, type TaskGraphRepairReceipt, type TaskGraphVerificationReport } from "./task-graph-command-port.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA, validateRoleResult, type AnalystResult, type ScoutResult, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import type { ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
+import { verifyRepairedTaskGraphFindings } from "./task-graph-pg-completed-dependency-verification.js"
 
 type Node = TaskGraphSnapshot["nodes"][number]
 type Row = Record<string, unknown>
@@ -39,7 +40,7 @@ export async function loadScopedTaskGraphDependencyContext(
     const related = repairs.filter(repair => repair.repairOf?.nodeKey === key && repair.repairOf.taskId === node.taskId)
     const task = scoped(row, key, node, scope)
     if (row.status === "failed") {
-      const composite = composeRepairResult(task, node, related.map(repair => ({ node: repair, row: byId.get(repair.taskId) })), scope.rootTaskId)
+      const composite = await composeRepairResult(task, node, related.map(repair => ({ node: repair, row: byId.get(repair.taskId) })), scope, graphNodes, client)
       dependencies.push({ ...task, status: "completed", result: composite.result, failureReason: null, repairComposite: true,
         verificationReport: composite.report, repairLineage: composite.repairLineage })
     } else dependencies.push(task)
@@ -61,15 +62,15 @@ export async function loadTaskGraphDependencyResults(client: Queryable, scope: G
       AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6 AND turn."userId" = $6`,
   [ids, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
   const rows = new Map(result.rows.map(raw => { const row = raw as Row; return [String(row.id), row] as const }))
-  return dependencyKeys.flatMap(key => {
+  return (await Promise.all(dependencyKeys.map(async key => {
     const node = byKey.get(key), row = node && rows.get(node.taskId)
     if (!node || !row) return []
     const task = scoped(row, key, node, scope)
     if (row.status !== "failed") return [task]
     const related = repairs.filter(repair => repair.repairOf?.nodeKey === key && repair.repairOf.taskId === node.taskId)
-    const composite = composeRepairResult(task, node, related.map(repair => ({ node: repair, row: rows.get(repair.taskId) })), scope.rootTaskId)
+    const composite = await composeRepairResult(task, node, related.map(repair => ({ node: repair, row: rows.get(repair.taskId) })), scope, graphNodes, client)
     return [{ ...task, status: "completed", result: composite.result, failureReason: null, repairComposite: true as const, verificationReport: composite.report, repairLineage: composite.repairLineage }]
-  })
+  }))).flat()
 }
 function scoped(row: Row, key: string, node: Node, scope: GraphIdentityScope): ScopedDependencyResult {
   return {
@@ -84,7 +85,7 @@ function scoped(row: Row, key: string, node: Node, scope: GraphIdentityScope): S
   }
 }
 
-function composeRepairResult(target: ScopedDependencyResult, node: Node, repairs: Array<{ node: Node; row?: Row }>, rootTaskId: string): RepairComposition {
+async function composeRepairResult(target: ScopedDependencyResult, node: Node, repairs: Array<{ node: Node; row?: Row }>, scope: GraphIdentityScope, graphNodes: readonly Node[], client: Queryable): Promise<RepairComposition> {
   const ids = node.verification?.criteria.map(item => item.id) ?? []
   const original = record(parseResult(target.result)), report = node.verificationDisposition === "typed"
     ? parseTaskGraphVerificationReport(original?.taskGraphVerificationReport, ids) : undefined
@@ -100,7 +101,7 @@ function composeRepairResult(target: ScopedDependencyResult, node: Node, repairs
     const receipt = parseTaskGraphRepairReceipt(stored?.taskGraphRepairReceipt, {
       repairOf: relation, repairNodeKey: repair.key, repairTaskId: repair.taskId, report: proof,
     })
-    if (!relation || relation.graphRootTaskId !== rootTaskId || relation.nodeKey !== node.key || relation.taskId !== node.taskId
+    if (!relation || relation.graphRootTaskId !== scope.rootTaskId || relation.nodeKey !== node.key || relation.taskId !== node.taskId
       || row?.status !== "completed" || row.failureReason !== null || row.role !== target.role || !proof
       || !taskGraphVerificationReportMatchesStatus(proof, "completed") || !receipt
       || receipt.criterionIds.some(id => !missing.has(id))) continue
@@ -121,7 +122,7 @@ function composeRepairResult(target: ScopedDependencyResult, node: Node, repairs
   const projection = roleResult.role === "scout"
     ? { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: roleResult.role, candidates: roleResult.candidates.map(({ jobId, evidenceIds }) => ({ jobId, evidenceIds })), evidenceIds: canonicalResultEvidenceIds(roleResult) }
     : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: roleResult.role, findings: roleResult.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })), evidenceIds: canonicalResultEvidenceIds(roleResult) }
-  if (evaluateTaskGraphVerification(node.verification, projection as TaskGraphVerificationEvidenceProjection).status !== "passed") {
+  if (!await verifyRepairedTaskGraphFindings(client, scope, { schemaVersion: "agent-harness.v2.task-graph", nodes: graphNodes }, node, projection as TaskGraphVerificationEvidenceProjection)) {
     throw new Error("task_graph_dependency_repair_composite_unverified")
   }
   return { report, repairLineage, result: { status: "completed", stepCount: 0, toolCallCount: 0, finalItemId: null,

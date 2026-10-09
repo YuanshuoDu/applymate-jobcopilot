@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
 import type { TurnLease } from "../turns/lease.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./task-graph-command-port.js"
+
+const { loadGraph } = vi.hoisted(() => ({ loadGraph: vi.fn() }))
+vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: loadGraph }))
 
 const lease: TurnLease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -75,7 +78,31 @@ function legacyWaitSnapshot(targetIds: readonly string[]) {
   })) }
 }
 
+const dependencyVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+  criteria: [{ id: "source-match", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } }],
+} as const
+const dependencyReport = {
+  verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+  criteria: [{ criterionId: "source-match", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+} as const
+const boundDependencyReport = { ...dependencyReport, dependencyBindings: [{ nodeKey: "scout", taskId: "scout-task", attemptCount: 1,
+  nodeDigest: "c".repeat(64), resultDigest: "d".repeat(64), evidenceDigest: "e".repeat(64), reportDigest: "f".repeat(64) }] }
+function dependencySnapshot() {
+  return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    { key: "scout", taskId: "scout-task", templateId: "scout", goal: "Search", successCriteria: ["Find"], dependsOn: [], depth: 1,
+      verification: scoutVerification, verificationDisposition: "typed" },
+    { key: "analyst", taskId: "child-1", templateId: "analyst", goal: "Assess", successCriteria: ["Score"], dependsOn: ["scout"], depth: 2,
+      verification: dependencyVerification, verificationDisposition: "typed" },
+  ] }
+}
+function dependencyLoadedGraph(snapshot: ReturnType<typeof dependencySnapshot>, result: unknown) {
+  return { rootTaskId: "root-1", item: { id: "task-graph:root-1", revision: 2, content: snapshot, createdAt: now }, snapshot, state: null,
+    tasks: new Map([["child-1", { id: "child-1", status: "completed", role: "analyst", failureReason: null, result }]]) }
+}
+
 describe("durable wait outcome consumer", () => {
+  beforeEach(() => loadGraph.mockReset())
   it("projects a ready all result and consumes it once", async () => {
     const fake = fixture()
     const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
@@ -128,6 +155,35 @@ describe("durable wait outcome consumer", () => {
     expect(fake.state.updates).toBe(0)
     const corrupt = fixture({ consumed: true, snapshot, targetStatuses: ["failed"], storedReport: { ...waitVerificationReport, criteria: [] } })
     await expect(consumeDurableWaitOutcomes({ client: corrupt.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+  })
+
+  it("revalidates live cross-node wait output and exposes only the public report", async () => {
+    const snapshot = dependencySnapshot(), result = { structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "ok" }, taskGraphVerificationReport: boundDependencyReport }
+    loadGraph.mockResolvedValue(dependencyLoadedGraph(snapshot, result))
+    const fake = fixture({ snapshot, targetStatus: "completed", targetRole: "analyst", targetResults: [result] })
+    const output = outputOf((await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]!.content)
+    expect(loadGraph).toHaveBeenCalledTimes(1)
+    expect(loadGraph.mock.calls[0]?.[2]).toBe(false)
+    expect(output.tasks[0]?.verificationReport).toEqual(dependencyReport)
+    expect(JSON.stringify(output)).not.toContain("dependencyBindings")
+  })
+
+  it("rejects a stale archived cross-node report even when the current source binding revalidates", async () => {
+    const snapshot = dependencySnapshot(), currentReport = { ...boundDependencyReport, evidenceDigest: "9".repeat(64) }
+    const result = { taskGraphVerificationReport: currentReport }
+    loadGraph.mockResolvedValue(dependencyLoadedGraph(snapshot, result))
+    const fake = fixture({ consumed: true, snapshot, targetStatus: "completed", targetRole: "analyst", targetResults: [result], storedReport: dependencyReport })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+    expect(loadGraph).toHaveBeenCalledTimes(1)
+    expect(fake.state.updates).toBe(0)
+  })
+
+  it.each([false, true])("blocks %s cross-node wait output when fresh source binding validation fails", async consumed => {
+    loadGraph.mockResolvedValue({ rootTaskId: "root-1", item: null, snapshot: null, state: null, tasks: new Map() })
+    const snapshot = dependencySnapshot(), fake = fixture({ consumed, snapshot, targetStatus: "completed", targetRole: "analyst",
+      targetResults: [{ taskGraphVerificationReport: boundDependencyReport }], storedReport: dependencyReport })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_verification_report_invalid")
+    expect(fake.state.updates).toBe(0)
   })
 
   it("rejects a terminal typed task with a missing server report and keeps legacy snapshots compatible", async () => {
