@@ -111,7 +111,7 @@ function fixture(options: { steerStatus?: string; steerConsumer?: string | null;
   }) } as unknown as Pick<pg.PoolClient, "query">
   return { client, calls, rootHint: options.rootHint }
 }
-function longReadFixture(count: number, malformedIndex = -1) {
+function longReadFixture(count: number, malformedIndex = -1, reverseDetails = false) {
   const root = input("original-input", "steer", "accepted", "1", null)
   root.clientMessageId = "root-client-message"
   const steers = Array.from({ length: count }, (_, index) => {
@@ -148,7 +148,7 @@ function longReadFixture(count: number, malformedIndex = -1) {
   const currentStep = { id: scope.stepId, taskId: scope.rootTaskId, ordinal: count + 1, attempt: 1, status: "streaming",
     inputThroughSequence: String(count * 4 + 10), consumedInputIds: [] }
   const currentAgenda = agendaPayload(scope.stepId)
-  const calls: Array<{ sql: string; values?: unknown[]; rows: number }> = []
+  const calls: Array<{ sql: string; values?: unknown[]; rows: number }> = [], detailPageIds: string[][] = []
   const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
     let rows: Array<Record<string, unknown>> = []
     if (sql.startsWith('SELECT session."id"') && sql.includes("pause_request")) rows = [{ id: scope.sessionId }]
@@ -165,6 +165,8 @@ function longReadFixture(count: number, malformedIndex = -1) {
     } else if (sql.includes('FROM "agent_inputs" AS input')) {
       const acceptedIds = values?.[3] as string[]
       rows = acceptedRows.filter(row => acceptedIds.includes(String(row.id)))
+      if (reverseDetails) rows.reverse()
+      detailPageIds.push(rows.map(row => String(row.id)))
     } else if (sql.includes('FROM "agent_steps"') && sql.includes("ANY($4::text[])")) {
       const stepIds = values?.[3] as string[]
       rows = sql.includes('"consumedInputIds"') ? consumers.filter(row => stepIds.includes(row.id)) : decisionSteps.filter(row => stepIds.includes(row.id))
@@ -184,7 +186,7 @@ function longReadFixture(count: number, malformedIndex = -1) {
     calls.push({ sql, values, rows: rows.length })
     return { rows, rowCount: rows.length }
   }) } as unknown as Pick<pg.PoolClient, "query">
-  return { client, calls }
+  return { client, calls, detailPageIds }
 }
 
 function capacityReadFixture(pendingCount: number, consumedCount = 0) {
@@ -338,6 +340,13 @@ describe("durable steering reconciliation reader", () => {
     expect(receiptPages.length).toBeGreaterThan(4)
     expect(receiptPages.every(call => call.sql.includes("LIMIT 64") && call.sql.includes('event."sequence" > $4::bigint'))).toBe(true)
     expect(Math.max(...f.calls.map(call => call.rows))).toBeLessThanOrEqual(64)
+  })
+
+  it("keeps accepted-sequence order when a page detail query returns rows in reverse order", async () => {
+    const f = longReadFixture(3, -1, true)
+    const state = await readSteeringReconciliationState(f.client, scope)
+    expect(f.detailPageIds[0]).toEqual(["steer-0002", "steer-0001", "steer-0000"])
+    expect(state.unresolvedInputs).toEqual([])
   })
 
   it("returns exactly 128 accepted or queued steers when none has a consumer", async () => {

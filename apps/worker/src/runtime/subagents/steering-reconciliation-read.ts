@@ -109,20 +109,23 @@ async function* readInputCandidates(client: Client, scope: SteeringReconciliatio
         AND input."delivery" = 'steer' AND input."status" IN ('accepted', 'queued', 'consumed')`,
     [scope.sessionId, scope.turnId, scope.userId, active.map(input => input.id)])
     if (details.rows.length !== active.length) throw new Error("steering_reconciliation_input_invalid")
-    const pageInputs = new Map<string, StoredInput>(active.map(input => [input.id, input])), accepted: Array<{ input: Input; consumerId: string | null }> = []
+    const pageInputs = new Map<string, StoredInput>(active.map(input => [input.id, input])), acceptedById = new Map<string, { input: Input; consumerId: string | null }>()
+    const detailIds = new Set<string>()
     for (const row of details.rows) {
       const stored = pageInputs.get(String(row.id))
-      if (!stored || stored.clientMessageId !== row.clientMessageId || stored.delivery !== row.delivery || stored.status !== row.status
+      if (!stored || detailIds.has(stored.id) || stored.clientMessageId !== row.clientMessageId || stored.delivery !== row.delivery || stored.status !== row.status
         || stored.acceptedSequence.toString() !== String(row.acceptedSequence) || stored.consumedByStepId !== row.consumedByStepId) throw new Error("steering_reconciliation_input_invalid")
+      detailIds.add(stored.id)
       const event = acceptedEvent(row, scope.turnId)
       if (!event || row.acceptedActor === null || row.acceptedEventSequence === null || String(row.acceptedEventSequence) !== stored.acceptedSequence.toString()) throw new Error("steering_reconciliation_acceptance_invalid")
       if (stored.status === "consumed") {
         if (!stored.consumedByStepId || !stored.consumedAt || !date(stored.consumedAt) || stored.cancelledAt !== null) throw new Error("steering_reconciliation_consumption_invalid")
       } else if (stored.consumedByStepId !== null || stored.consumedAt !== null || stored.cancelledAt !== null) throw new Error("steering_reconciliation_consumption_invalid")
-      if (event.source === "user") accepted.push({ input: { id: stored.id, clientMessageId: stored.clientMessageId, acceptedSequence: stored.acceptedSequence,
+      if (event.source === "user") acceptedById.set(stored.id, { input: { id: stored.id, clientMessageId: stored.clientMessageId, acceptedSequence: stored.acceptedSequence,
         status: stored.status as Input["status"], consumedByStepId: stored.consumedByStepId, consumingOrdinal: null, cancelledAt: stored.cancelledAt }, consumerId: stored.consumedByStepId })
     }
-    const consumerIds = accepted.map(input => input.consumerId).filter((id): id is string => id !== null)
+    if (detailIds.size !== active.length) throw new Error("steering_reconciliation_input_invalid")
+    const consumerIds = active.map(input => acceptedById.get(input.id)?.consumerId).filter((id): id is string => id !== null && id !== undefined)
     const steps = consumerIds.length ? await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"
       FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])`,
     [scope.sessionId, scope.turnId, scope.rootTaskId, [...new Set(consumerIds)]]) : { rows: [] as Row[] }
@@ -133,7 +136,9 @@ async function* readInputCandidates(client: Client, scope: SteeringReconciliatio
       if (!parsed || row.taskId !== scope.rootTaskId || parsed.attempt > scope.parentAttemptCount) throw new Error("steering_reconciliation_consuming_step_invalid")
       sourceById.set(parsed.id, parsed)
     }
-    for (const entry of accepted) {
+    for (const stored of active) {
+      const entry = acceptedById.get(stored.id)
+      if (!entry) continue
       if (!entry.consumerId) { yield { ...entry.input, consumer: null }; continue }
       const consumer = sourceById.get(entry.consumerId)
       if (!consumer || !consumer.ids.includes(entry.input.id) || consumer.cursor < entry.input.acceptedSequence) throw new Error("steering_reconciliation_consumption_invalid")
