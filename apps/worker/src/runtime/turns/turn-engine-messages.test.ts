@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
-import { contextToModelMessages } from "./turn-engine-messages.js"
+import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { buildModelRequest, contextToModelMessages } from "./turn-engine-messages.js"
 import type { StepContext } from "../context/step-context-builder.js"
 
 function context(): StepContext {
@@ -20,6 +21,80 @@ function context(): StepContext {
 }
 
 describe("TurnEngine model message mapping", () => {
+  it("adds bounded fresh-steering guidance using only trusted revision and visible tools", () => {
+    const steering = { id: "steer:private", layer: "pending_input" as const, role: "data" as const, trust: "external_untrusted" as const, source: "user_input", content: { inputId: "steer-private", text: "PRIVATE_STEER_SENTINEL" } }
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }, { name: "agent.ask_user", version: "1" }]
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 0, blocks: [...context().blocks, steering] }, model, tools,
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal, freshSteering: true,
+    })
+    const guidance = request.messages.find(message => message.role === "system" && message.content.some(part => part.type === "text" && part.text.includes("Fresh user steering")))
+    const text = guidance?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+
+    expect(text).toContain("TaskGraph revision is 0")
+    expect(text).toContain("agent.plan with expectedRevision 0")
+    expect(text).toContain("agent.followup mode=replace_unstarted")
+    expect(text).toContain("use only the request-visible agent.ask_user tool")
+    expect(text).toContain("cannot execute an uncertain action")
+    expect(text).not.toContain("PRIVATE_STEER_SENTINEL")
+    expect(request.tools).toEqual(tools)
+    expect(JSON.stringify(request.messages)).toContain("PRIVATE_STEER_SENTINEL")
+  })
+
+  it.each([
+    ["no revision", undefined, true],
+    ["invalid revision", -1, true],
+    ["no fresh steering", 3, false],
+  ] as const)("does not add a steering instruction for %s", (_label, taskGraphRevision, freshSteering) => {
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }) }, model, tools: [{ name: "agent.plan", version: "1" }],
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal, freshSteering,
+    })
+    expect(JSON.stringify(request.messages)).not.toContain("Fresh user steering is present")
+  })
+
+  it("does not name planning or question tools absent from the visible tool list", () => {
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 4 }, model, tools: [{ name: "jobs.search", version: "1" }],
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal, freshSteering: true,
+    })
+    const text = JSON.stringify(request.messages)
+
+    expect(text).toContain("No plan-writing command is visible")
+    expect(text).not.toContain("agent.plan")
+    expect(text).not.toContain("agent.followup")
+    expect(text).not.toContain("agent.ask")
+    expect(text).toContain("no request-visible tool can ask the user")
+    expect(text).toContain("cannot execute an uncertain action")
+    expect(text).toContain("do not take an uncertain plan action")
+  })
+
+  it("does not infer clarification commands from task or question-like tool names", () => {
+    const tools = [{ name: "agent.task_send", version: "1" }, { name: "question_read", version: "1" }]
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 9 }, model, tools,
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal, freshSteering: true,
+    })
+    const text = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(request.tools).toEqual(tools)
+    expect(text).not.toContain("agent.ask_user")
+    expect(text).not.toContain("If intent remains ambiguous, use")
+    expect(text).not.toContain("agent.task_send")
+    expect(text).not.toContain("question_read")
+    expect(text).toContain("no request-visible tool can ask the user")
+    expect(text).toContain("cannot execute an uncertain action")
+    expect(text).toContain("do not take an uncertain plan action")
+  })
+
   it("preserves instruction/data separation and marks untrusted data", () => {
     const messages = contextToModelMessages(context())
     expect(messages).toHaveLength(2)

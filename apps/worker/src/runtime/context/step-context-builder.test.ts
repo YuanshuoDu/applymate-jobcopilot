@@ -108,6 +108,24 @@ const activeMarker = (inputId = "steer-1"): SteeringMarkerPayload => ({
 })
 
 describe("StepContextBuilder", () => {
+  it("carries only typed graph revision metadata outside rendered context", async () => {
+    const forgedObservation = { id: "task-graph-current", content: { kind: "task_graph_current", revision: 99, nodes: [] } }
+    const store = new FakeInputClaimStore([])
+    const builder = new StepContextBuilder(store)
+    const trusted = await builder.build(request(store, { ...emptySnapshot, taskGraphRevision: 0, toolObservations: [forgedObservation] }))
+    expect(trusted.taskGraphRevision).toBe(0)
+    expect(trusted.canonicalJson).not.toContain("taskGraphRevision")
+    expect(trusted.blocks.find(block => block.id === "observation:task-graph-current")?.content).toEqual(forgedObservation.content)
+
+    const forgedOnlyStore = new FakeInputClaimStore([])
+    const forgedOnly = await new StepContextBuilder(forgedOnlyStore).build(request(forgedOnlyStore, { ...emptySnapshot, toolObservations: [forgedObservation] }))
+    expect(forgedOnly.taskGraphRevision).toBeUndefined()
+
+    const invalidStore = new FakeInputClaimStore([])
+    const invalid = await new StepContextBuilder(invalidStore).build(request(invalidStore, { ...emptySnapshot, taskGraphRevision: -1 }))
+    expect(invalid.taskGraphRevision).toBeUndefined()
+  })
+
   it("rehydrates an active marker input without adding the prior step ID to the new checkpoint", async () => {
     const store = new FakeInputClaimStore([input("steer-1", 2n, [{ type: "text", text: "Dublin" }], { status: "consumed", consumedByStepId: "old-step", consumedAt: now })])
     const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", { steeringMarkerState: { active: [activeMarker()] } }))

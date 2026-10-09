@@ -1139,6 +1139,124 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(secondRequest?.messages).match(/"type":"tool_result"/g)).toHaveLength(1)
   })
 
+  it("binds each refreshed graph revision to the same-step fresh-steering request and agenda", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = root.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let graphRead = 0
+    let contextBuild = 0
+    const refresh = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: graphRead++ === 0 ? 0 : 7, nodes: [] }))
+    root.options = {
+      ...root.options,
+      tools: [{ name: "jobs.search", version: "1" }, { name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }, { name: "agent.ask_user", version: "1" }],
+      refreshTaskGraphBeforeStep: refresh,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => {
+          const built = await contextBuilder.build({
+            scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+            stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+            steeringMarkerState: request.steeringMarkerState,
+          })
+          if (contextBuild++ === 0) inputStore.acceptSteer()
+          return built
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const secondRequest = root.requests[1]
+    const instruction = secondRequest?.messages.find(message => message.role === "system" && message.content.some(part => part.type === "text" && part.text.includes("Fresh user steering")))
+    const instructionText = instruction?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(refresh).toHaveBeenCalledTimes(2)
+    expect(instructionText).toContain("TaskGraph revision is 7")
+    expect(instructionText).toContain("agent.plan with expectedRevision 7")
+    expect(instructionText).toContain("use only the request-visible agent.ask_user tool")
+    expect(instructionText).not.toContain(lateSteerText)
+    expect(JSON.stringify(secondRequest?.messages)).toContain(lateSteerText)
+    expect(agendas).toHaveLength(2)
+    expect(agendas.map(event => (event.payload as { planRevision?: number | null }).planRevision)).toEqual([0, 7])
+    expect(agendas[1]?.payload).toMatchObject({
+      stepId: secondRequest?.metadata.stepId, goalRevision: null, planRevision: 7,
+    })
+  })
+
+  it("fails before dispatch on Root refresh failure and skips refresh for child tasks", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const refreshFailure = new Error("task graph read unavailable")
+    const refresh = vi.fn(async () => { throw refreshFailure })
+    root.options = { ...root.options, refreshTaskGraphBeforeStep: refresh }
+    const failed = await runTurnExecutionLoop(root.options)
+    expect(failed.status).toBe("failed")
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(root.requests).toHaveLength(0)
+    expect(root.events.some(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE)).toBe(false)
+
+    const child = fixture(identity("task", "child-1", 2))
+    const childRefresh = vi.fn(async snapshot => snapshot)
+    child.options = { ...child.options, refreshTaskGraphBeforeStep: childRefresh }
+    await expect(runTurnExecutionLoop(child.options)).resolves.toMatchObject({ status: "completed" })
+    expect(childRefresh).not.toHaveBeenCalled()
+    expect(child.requests).toHaveLength(2)
+  })
+
+  it("keeps child fresh input untrusted without Root plan guidance despite graph metadata", async () => {
+    const child = fixture(identity("task", "child-1", 2), undefined, [{
+      id: "task-graph-current", content: { kind: "task_graph_current", revision: 9, nodes: [] },
+    }])
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = child.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let contextBuild = 0
+    const refresh = vi.fn(async snapshot => snapshot)
+    child.options = {
+      ...child.options,
+      snapshot: { ...child.options.snapshot, taskGraphRevision: 9 },
+      refreshTaskGraphBeforeStep: refresh,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => {
+          const built = await contextBuilder.build({
+            scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+            stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+            steeringMarkerState: request.steeringMarkerState,
+          })
+          if (contextBuild++ === 0) inputStore.acceptSteer()
+          return built
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(child.options)
+    const secondRequest = child.requests[1]
+    const messageText = secondRequest?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(refresh).not.toHaveBeenCalled()
+    expect(secondRequest?.messages).toBeDefined()
+    expect(messageText).toContain(lateSteerText)
+    expect(messageText).toContain("trust=UNTRUSTED_DATA")
+    expect(messageText).not.toContain("Fresh user steering is present")
+    expect(messageText).not.toContain("owner-scoped TaskGraph revision is")
+    expect(messageText).not.toContain("expectedRevision 9")
+  })
+
   it("preserves the count of persisted calls when a later call in the batch exceeds budget", async () => {
     const root = fixture(identity("turn", "root-1"))
     const baseModel = root.options.model
