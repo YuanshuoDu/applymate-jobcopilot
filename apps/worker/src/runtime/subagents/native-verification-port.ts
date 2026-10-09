@@ -60,6 +60,7 @@ export type NativeVerificationTerminalProofReader = (
     scope: TaskGraphReadScope
     candidateText: string
     witness: NativeVerificationRootGoalWitness
+    stepId?: string
   }>,
 ) => Promise<boolean>
 

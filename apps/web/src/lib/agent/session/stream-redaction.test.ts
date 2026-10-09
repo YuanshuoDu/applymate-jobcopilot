@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
-import { redactStreamEventPayload, redactStreamString, redactStreamValue } from "./stream-redaction"
+import { isPrivateNativeVerificationEventType, redactStreamEventPayload, redactStreamString, redactStreamValue } from "./stream-redaction"
 
 const turnId = "p3-task-graph-resume-turn-12345678-1234-4234-8234-123456789012"
 const rootTaskId = `root-${turnId}`
@@ -199,5 +199,29 @@ describe("agent stream redaction", () => {
 
   it("uses generic redaction for non-TaskGraph content even inside a TaskGraph event type", () => {
     expect(redactStreamEventPayload("item.delta", { content: "ordinary content" }, identity)).toEqual({ content: "[REDACTED]" })
+  })
+
+  it("fails closed for private native verification receipt events, including future namespace types", () => {
+    const receipt = {
+      controlTaskId: "PRIVATE_CONTROL_TASK_ID", controlOperationId: "PRIVATE_CONTROL_OPERATION_ID",
+      ownerDigest: "PRIVATE_OWNER_DIGEST", targetDigest: "PRIVATE_TARGET_DIGEST",
+      goalDigest: "PRIVATE_GOAL_DIGEST", criteriaDigest: "PRIVATE_CRITERIA_DIGEST",
+      evidencePacketDigest: "PRIVATE_PACKET_DIGEST", secret: "PRIVATE_RECEIPT_SECRET",
+    }
+    for (const type of ["native_verification.requested", "native_verification.result.v2"]) {
+      expect(isPrivateNativeVerificationEventType(type)).toBe(true)
+      expect(redactStreamEventPayload(type, receipt, identity)).toEqual({})
+    }
+    expect(JSON.stringify(redactStreamEventPayload("native_verification.requested", receipt, identity)))
+      .not.toMatch(/PRIVATE_|DIGEST|SECRET/)
+  })
+
+  it("does not hide ordinary lookalike event types or their existing payload redaction", () => {
+    const payload = { controlTaskId: "ordinary-value", text: "Review role; Bearer very-secret-token" }
+    expect(isPrivateNativeVerificationEventType("native_verificationish.requested")).toBe(false)
+    expect(isPrivateNativeVerificationEventType("agent.native_verification.requested")).toBe(false)
+    expect(redactStreamEventPayload("native_verificationish.requested", payload, identity)).toEqual({
+      controlTaskId: "ordinary-value", text: "Review role; Bearer [REDACTED]",
+    })
   })
 })
