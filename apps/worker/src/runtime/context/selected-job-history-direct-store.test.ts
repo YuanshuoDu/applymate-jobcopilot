@@ -98,7 +98,17 @@ describe("direct selected-job history PostgreSQL store", () => {
     expect(outcomes.every(value => value.jobId === "job-1" && value.nodes.length === 1)).toBe(true)
     expect(outcomes[0]).toMatchObject({ sourceTurnId: "turn-source-10", sourceRootTaskId: "root-source-10" })
     const candidateQuery = test.queries.find(query => query.sql.includes("WITH terminal AS"))
-    expect(candidateQuery?.sql).toContain("COUNT(*) OVER (PARTITION BY turn.\"id\", task.\"id\")")
+    expect(candidateQuery?.sql).toContain('COUNT(*) AS "terminalEventCount"')
+    expect(candidateQuery?.sql).toContain('MIN(event."id") AS "terminalEventId"')
+    expect(candidateQuery?.sql).toContain('counts."terminalEventCount" = 1')
+    expect(candidateQuery?.sql).toContain('event."id" = counts."terminalEventId"')
+    expect(candidateQuery?.sql).not.toContain("COUNT(*) OVER")
+    const countsStart = candidateQuery?.sql.indexOf("counts AS (") ?? -1
+    const countsEnd = candidateQuery?.sql.indexOf("), terminal_events AS") ?? -1
+    expect(countsStart).toBeGreaterThanOrEqual(0)
+    expect(countsEnd).toBeGreaterThan(countsStart)
+    expect(candidateQuery?.sql.slice(countsStart, countsEnd)).not.toContain('event."payload"')
+    expect(candidateQuery?.sql.indexOf('event."payload"')).toBeGreaterThan(countsEnd)
     expect(candidateQuery?.sql).toContain("ORDER BY \"sequence\" DESC LIMIT $6")
     expect(candidateQuery?.values?.[5]).toBe(8)
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(8)

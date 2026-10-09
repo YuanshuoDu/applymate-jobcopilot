@@ -84,25 +84,35 @@ async function candidates(client: Client, input: DirectSelectedJobHistoryLoadInp
   const result = await client.query<Row>(`WITH terminal AS (
       SELECT turn."id" AS "turnId", turn."sessionId", turn."userId", turn."rootTaskId", turn."status" AS "turnStatus", turn."input",
         task."id" AS "taskId", task."turnId" AS "taskTurnId", task."rootTaskId" AS "taskRootTaskId", task."parentTaskId",
-        task."role" AS "taskRole", task."taskType", task."status" AS "taskStatus",
-        event."turnId" AS "eventTurnId", event."taskId" AS "eventTaskId", event."itemId", event."sequence",
-        event."type", event."actor", event."correlationId", event."idempotencyKey", event."payload",
-        correlation_step."id" AS "correlationStepId", correlation_step."sessionId" AS "correlationStepSessionId",
-        correlation_step."turnId" AS "correlationStepTurnId", correlation_step."taskId" AS "correlationStepTaskId",
-        COUNT(*) OVER (PARTITION BY turn."id", task."id") AS "terminalEventCount"
+        task."role" AS "taskRole", task."taskType", task."status" AS "taskStatus"
       FROM "agent_turns" AS turn
       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = $2
       JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId" AND task."sessionId" = turn."sessionId"
         AND task."turnId" = turn."id" AND task."rootTaskId" = task."id"
-      JOIN "agent_events" AS event ON event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
-        AND event."taskId" = task."id" AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
-      LEFT JOIN "agent_steps" AS correlation_step ON event."type" = 'turn.completed' AND correlation_step."id" = event."correlationId"
       WHERE turn."sessionId" = $1 AND turn."userId" = $2 AND turn."id" <> $3
         AND turn."status" IN ('completed', 'failed', 'interrupted') AND task."status" = turn."status"
         AND task."parentTaskId" IS NULL AND task."role" = 'orchestrator' AND task."taskType" = 'root'
         AND turn."input"->'selectedJobPreparation' = jsonb_build_object('jobId', $4::text)
+    ), counts AS (
+      SELECT root."turnId", root."taskId", COUNT(*) AS "terminalEventCount", MIN(event."id") AS "terminalEventId"
+      FROM terminal AS root JOIN "agent_events" AS event ON event."sessionId" = root."sessionId"
+        AND event."turnId" = root."turnId" AND event."taskId" = root."taskId"
+        AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
+      GROUP BY root."turnId", root."taskId"
+    ), terminal_events AS (
+      SELECT root.*, event."turnId" AS "eventTurnId", event."taskId" AS "eventTaskId", event."itemId", event."sequence",
+        event."type", event."actor", event."correlationId", event."idempotencyKey", event."payload",
+        correlation_step."id" AS "correlationStepId", correlation_step."sessionId" AS "correlationStepSessionId",
+        correlation_step."turnId" AS "correlationStepTurnId", correlation_step."taskId" AS "correlationStepTaskId",
+        counts."terminalEventCount"
+      FROM terminal AS root
+      JOIN counts ON counts."turnId" = root."turnId" AND counts."taskId" = root."taskId"
+        AND counts."terminalEventCount" = 1
+      JOIN "agent_events" AS event ON event."id" = counts."terminalEventId" AND event."sessionId" = root."sessionId"
+        AND event."turnId" = root."turnId" AND event."taskId" = root."taskId"
+      LEFT JOIN "agent_steps" AS correlation_step ON event."type" = 'turn.completed' AND correlation_step."id" = event."correlationId"
     )
-    SELECT * FROM terminal WHERE "terminalEventCount" = 1 AND "sequence" < $5::bigint
+    SELECT * FROM terminal_events WHERE "terminalEventCount" = 1 AND "sequence" < $5::bigint
       AND jsonb_typeof("payload") = 'object' AND "payload"->>'turnId' = "turnId" AND "payload"->>'taskId' = "taskId"
       AND (
         ("turnStatus" = 'completed' AND "type" = 'turn.completed' AND "actor" = 'orchestrator'
