@@ -14,6 +14,7 @@ import { createMiniMaxM3Adapter, type MiniMaxAdapterOptions } from "@jobcopilot/
 import { createOpenAiCompatibleAdapter, type OpenAiCompatibleAdapterOptions } from "@jobcopilot/agent-model/adapters/openai-compatible"
 import { estimateSharedAiCost } from "@jobcopilot/shared"
 import { APPLYMATE_BACKING, type AiConfig, type Provider } from "@jobcopilot/shared/llm"
+import { preflightHarnessModelRequest, type HarnessRequestAdmissionDiagnostic } from "./harness-model-admission.js"
 
 const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5"
 const DEFAULT_OPENAI_MODEL = "gpt-5.5"
@@ -42,6 +43,9 @@ export type HarnessModelRuntimeOptions = {
   maxReroutes?: number
   irreversibleActionStarted?: boolean | (() => boolean)
   onSelectionEvent?: (event: ModelSelectionEvent) => void
+  onRequestAdmission?:
+    | ((diagnostic: HarnessRequestAdmissionDiagnostic) => void)
+    | ((diagnostic: HarnessRequestAdmissionDiagnostic) => PromiseLike<void>)
 }
 
 export type HarnessModelRuntime = {
@@ -94,9 +98,16 @@ async function* routeStream(
   credentialSources: ReadonlyMap<string, "platform" | "user">,
   options: HarnessModelRuntimeOptions,
 ): AsyncIterable<ModelStreamEvent> {
+  let anyCandidateStreamInvoked = false
   const result = await executeWithModelFallback(registry, candidates, async (candidate, attempt) => {
+    const adaptedRequest = requestForAdapter(request, candidate)
+    preflightHarnessModelRequest(adaptedRequest, candidate.profile, {
+      guaranteedNoProviderAttempt: !anyCandidateStreamInvoked,
+      onRequestAdmission: options.onRequestAdmission,
+    })
     const events: ModelStreamEvent[] = []
-    for await (const event of candidate.stream(requestForAdapter(request, candidate))) events.push(event)
+    anyCandidateStreamInvoked = true
+    for await (const event of candidate.stream(adaptedRequest)) events.push(event)
     const normalized = normalizeUsage(events, candidate, credentialSources)
     return { value: normalized, usage: usage(normalized) }
   }, {
