@@ -413,5 +413,15 @@ describe("TaskGraph terminal verification gate", () => {
     expect(decision.feedback).toContain("nodeOrdinal=2 status=unverified reasonCode=repair_target_unresolved")
     expect(decision.feedback).toMatch(/\d+ feedback items omitted; inspect TaskGraph before retrying/)
     expect(decision.feedback.length).toBeLessThanOrEqual(512)
+
+    const writer = gateWriter()
+    const gateResult = await assertCompletionAllowed(gateOptions(async () => decision), writer, step,
+      new AbortController().signal, () => nowValue, "candidate")
+    if (!gateResult || !("feedback" in gateResult)) throw new Error("expected truncated TaskGraph recovery")
+    const recovered = applyCompletionRecovery({ system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, "step-truncated", gateResult.feedback)
+    expect(recovered.system[0]?.content).toContain("at graph revision 1:")
+    expect(recovered.system[0]?.content).toContain("nodeOrdinal=1 criterionOrdinal=1")
+    expect(decision.feedback.match(/\(\d+ feedback items omitted; inspect TaskGraph before retrying\.\)/g)).toHaveLength(1)
+    expect(decision.feedback).toMatch(/\(\d+ feedback items omitted; inspect TaskGraph before retrying\.\)$/)
   })
 })

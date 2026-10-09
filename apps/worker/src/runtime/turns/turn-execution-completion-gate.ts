@@ -64,19 +64,15 @@ function feedbackText(code: GateFeedbackCode | undefined, details: readonly Gate
     return `nodeOrdinal=${item.nodeOrdinal}${criterion} status=${item.status} reasonCode=${item.reasonCode}${repair}`
   })
   const parts = [...(code ? [`issue=${code}`] : []), ...rendered]
-  let feedback = TASK_GRAPH_FEEDBACK
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index]!, remaining = parts.length - index - 1
-    const notice = remaining ? ` (${remaining} more feedback items omitted; inspect TaskGraph before retrying.)` : ""
-    const next = `${feedback} ${part}${notice}`
-    if (next.length > 512) {
-      const omitted = ` (${parts.length - index} feedback items omitted; inspect TaskGraph before retrying.)`
-      feedback += omitted
-      break
-    }
-    feedback += ` ${part}`
+  const render = (included: number) => `${TASK_GRAPH_FEEDBACK}${parts.slice(0, included).map(part => ` ${part}`).join("")}`
+  const complete = render(parts.length)
+  if (complete.length <= 512) return complete
+  for (let included = parts.length - 1; included >= 0; included -= 1) {
+    const omitted = ` (${parts.length - included} feedback items omitted; inspect TaskGraph before retrying.)`
+    const truncated = `${render(included)}${omitted}`
+    if (truncated.length <= 512) return truncated
   }
-  return feedback
+  return `${TASK_GRAPH_FEEDBACK} (${parts.length} feedback items omitted; inspect TaskGraph before retrying.)`
 }
 function row(value: unknown): Record<string, unknown> {
   let parsed = value
