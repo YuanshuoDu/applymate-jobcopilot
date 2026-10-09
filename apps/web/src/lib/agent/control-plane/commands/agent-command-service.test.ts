@@ -25,6 +25,9 @@ function makeDb(options: {
   activeInput?: unknown
   activeRootTaskId?: string | null
   activeStatus?: string
+  steeringRootTaskId?: string | null
+  steeringInputRows?: Row[]
+  initialInputs?: Row[]
   retryTarget?: Row & { revision: number }
 } = {}) {
   const ownerId = options.ownerId ?? "user_1"
@@ -41,7 +44,7 @@ function makeDb(options: {
   const rawQueries: unknown[] = []
   let rollbacks = 0
   let sequence = BigInt(0)
-  let inputs: Row[] = []
+  let inputs: Row[] = [...(options.initialInputs ?? [])]
   let items: Row[] = []
   let events: Row[] = []
   let outbox: Row[] = []
@@ -57,6 +60,11 @@ function makeDb(options: {
         const available = sessionExists && sessionOwnerId === ownerId && (!openFence || !["aborted", "archived"].includes(sessionStatus))
         return available ? [{ id: "session_1", status: sessionStatus }] : []
       }
+      if (sql.includes('SELECT "input", "rootTaskId" FROM "agent_turns"')) {
+        return [{ input: options.activeInput ?? {}, rootTaskId: options.steeringRootTaskId ?? null }]
+      }
+      if (sql.includes('FROM "agent_inputs" AS input')) return options.steeringInputRows ?? []
+      if (sql.includes("event.\"type\" = 'agent.plan.reconciliation'")) return []
       if (sql.includes("SELECT")) {
         return [{ id: "session_1" }]
       }
@@ -248,6 +256,20 @@ const content = [{ type: "text", text: "Find backend roles" }] as const
 
 function startCommand(clientMessageId: string, source: "user" | "automation" = "user") {
   return { sessionId: "session_1", userId: "user_1", clientMessageId, source, content: [...content] }
+}
+
+function acceptedSteeringRows(count: number): Row[] {
+  return Array.from({ length: count }, (_, index) => {
+    const id = `steer-${index}`, clientMessageId = `client-${index}`, acceptedSequence = BigInt(index + 1)
+    return {
+      id, clientMessageId, delivery: "steer", status: index % 2 ? "queued" : "accepted", acceptedSequence,
+      consumedByStepId: null, consumedAt: null, cancelledAt: null, acceptedType: "input.accepted", acceptedActor: "user",
+      acceptedTaskId: null, acceptedCorrelationId: "turn_1", acceptedItemId: `${id}-item`, acceptedEventSequence: acceptedSequence,
+      acceptedPayload: { inputId: id, clientMessageId, delivery: "steer", source: "user", disposition: "steered" },
+      acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
+      acceptedItemContent: { parts: [{ type: "text", text: "private" }], clientMessageId, source: "user", disposition: "steered" },
+    }
+  })
 }
 
 function retryTarget(status = "failed", input: unknown = { goal: "Find backend roles", content: [...content] }) {
@@ -596,6 +618,41 @@ describe("AgentCommandService", () => {
       content: [...content],
     })).rejects.toMatchObject({ code: "automation_cannot_steer_user_turn", status: 409 })
     expect(fake.state.inputs).toHaveLength(1)
+  })
+
+  it("checks the accepted-steer cap after the Session lock and before every acceptance write", async () => {
+    const fake = makeDb({ activeSource: "user", steeringInputRows: acceptedSteeringRows(128) })
+    const service = new AgentCommandService(fake.db)
+
+    await expect(service.steer({ ...startCommand("client_at_capacity"), expectedTurnId: "turn_1", expectedRevision: 0 }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409, details: { capacity: 128, unresolvedCount: 128 } })
+
+    expect(fake.state.transactionCount).toBe(1)
+    expect(fake.state.rawQueries).toHaveLength(4)
+    const firstQuery = (fake.state.rawQueries[0] as { strings?: readonly string[] }).strings?.join(" ") ?? ""
+    expect(firstQuery).toContain("FOR UPDATE")
+    expect(fake.state.rawQueries.slice(1).every(query => !((query as { strings?: readonly string[] }).strings?.join(" ") ?? "").includes("FOR UPDATE"))).toBe(true)
+    expect(fake.tx.agentInput.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("returns an accepted duplicate at capacity before running the capacity reader", async () => {
+    const duplicateInput = { id: "already-accepted", sessionId: "session_1", targetTurnId: "turn_1", clientMessageId: "client_duplicate_at_capacity",
+      delivery: "steer", acceptedSequence: BigInt(7) }
+    const fake = makeDb({ activeSource: "user", steeringInputRows: acceptedSteeringRows(128), initialInputs: [duplicateInput] })
+    const result = await new AgentCommandService(fake.db).steer({ ...startCommand(duplicateInput.clientMessageId), expectedTurnId: "turn_1" })
+
+    expect(result).toMatchObject({ disposition: "duplicate", inputId: duplicateInput.id, turnId: "turn_1" })
+    expect(fake.state.rawQueries).toHaveLength(1)
+    expect(fake.state.rawQueries[0]).toBeDefined()
+    expect(fake.tx.agentInput.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
   })
 
   it("rolls back Turn, Item, Event, Input and Outbox on transaction failure", async () => {
