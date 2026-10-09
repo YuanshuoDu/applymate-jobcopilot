@@ -343,7 +343,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
 
   it("rolls back Step completion when the restrictive role cannot insert its receipt", async () => {
     const rollbackCandidate = "The rollback-specific candidate does not satisfy the persisted objective."
-    await seedStep(stepIds[7]!, 8, "9")
+    await seedStep(stepIds[7]!, 15, "9")
     const identity = await ensureRejectedCandidate(rollbackCandidate, stepIds[7]!, "evidence_conflict")
     await adminPool!.query(`REVOKE INSERT ON "agent_native_semantic_rejections" FROM "${runtimeRole}"`)
     try {
@@ -385,7 +385,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await adminPool!.query(`INSERT INTO "agent_steps"
       ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode",
        "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "completedAt")
-      VALUES ($1, $2, $3, $4, 0, 1, 'completed', 'stop', NULL, 0, $5::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, $4, 16, 1, 'completed', 'stop', NULL, 0, $5::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
     [sourceStepId, sessionId, turnId, rootTaskId, JSON.stringify([rootInputId])])
     await adminPool!.query(`INSERT INTO "agent_inputs"
       ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
@@ -396,7 +396,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await adminPool!.query(`INSERT INTO "agent_steps"
       ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode",
        "inputTokens", "outputTokens", "estimatedCostUsd", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "completedAt")
-      VALUES ($1, $2, $3, $4, 9, 1, 'waiting_for_user', 'tool_calls', NULL, 47, 13, 0.007, 9, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, $4, 17, 1, 'waiting_for_user', 'tool_calls', NULL, 47, 13, 0.007, 9, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
     [questionStepId, sessionId, turnId, rootTaskId])
     await adminPool!.query(`INSERT INTO "agent_items"
       ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "completedAt", "updatedAt")
@@ -442,7 +442,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
       event.causationId, event.key, JSON.stringify(event.payload)])
     await adminPool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [sessionId, firstSequence + 4])
 
-    await seedStep(evidenceStepId, 10, "10", [steeringId])
+    await seedStep(evidenceStepId, 18, "10", [steeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
       ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
        "consumedByStepId", "consumedAt", "cancelledAt")
@@ -490,7 +490,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     expect(privateReceipt).not.toContain(originalTaskText)
     expect(privateReceipt).not.toContain(originalReference[0]!.referenceId)
 
-    await seedStep(supersedingStepId, 11, "10")
+    await seedStep(supersedingStepId, 19, "10")
     const persistedStepSnapshot = async (stepId: string) => {
       const result = await adminPool!.query<{ step: unknown; stepCount: number; receiptCount: number; receipts: unknown }>(
         `SELECT to_jsonb(step) AS "step", (SELECT COUNT(*)::int FROM "agent_steps" AS observed WHERE observed."turnId" = step."turnId") AS "stepCount",
@@ -506,7 +506,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await expect(complete(receiptInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 1 })
     expect(await persistedStepSnapshot(evidenceStepId)).toEqual(beforeReplay)
 
-    await seedStep(newEpochStepId, 12, "11", [newSteeringId])
+    await seedStep(newEpochStepId, 20, "11", [newSteeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
       ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
        "consumedByStepId", "consumedAt", "cancelledAt")
