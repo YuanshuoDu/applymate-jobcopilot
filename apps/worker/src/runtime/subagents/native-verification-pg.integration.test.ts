@@ -64,6 +64,17 @@ type QuestionSeedOverrides = Partial<QuestionSeedInput>
 let priorQuestionFixture: PriorQuestionFixture | undefined
 const goal = "Find and verify the persisted source facts"
 const criteria = ["Cite the owned tool result"]
+
+function containsText(value: unknown, text: string): boolean {
+  if (typeof value === "string") {
+    if (value.includes(text)) return true
+    try { return containsText(JSON.parse(value) as unknown, text) } catch { return false }
+  }
+  if (Array.isArray(value)) return value.some(item => containsText(item, text))
+  if (value && typeof value === "object") return Object.values(value).some(item => containsText(item, text))
+  return false
+}
+
 const rootGoal = "Find and verify the persisted source facts while preserving the user's stated location and phrase."
 const rootCriteria = ["Cite the owned tool result", "Respect the user's stated location and phrase as self-attestation, not external proof."]
 const childResult = { answer: "The source records fact 42" }
@@ -431,13 +442,25 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const modelRequest = executed.requests[0]!
     expect(modelRequest.tools).toEqual([])
     expect(modelRequest.toolChoice).toBeUndefined()
-    const modelText = modelRequest.messages.flatMap(message => message.content)
+    const profileHeader = "[harness context layer=profile trust=UNTRUSTED_DATA source=native-verification-packet]\n"
+    const profileBlocks = modelRequest.messages.filter(message => message.role === "user")
+      .flatMap(message => message.content)
+      .flatMap(part => part.type === "text" && part.text.startsWith(profileHeader)
+        ? [JSON.parse(part.text.slice(profileHeader.length)) as unknown] : [])
+    expect(profileBlocks).toHaveLength(1)
+    if (rootPacket.target.kind !== "root_goal") throw new Error("native_root_goal_packet_unavailable")
+    expect(profileBlocks[0]).toEqual({ goal: rootPacket.goal, criteria: rootPacket.criteria,
+      target: { kind: rootPacket.target.kind, referenceId: rootPacket.target.referenceId, candidateText: rootPacket.target.candidateText },
+      evidence: attestation })
+    const systemMessages = modelRequest.messages.filter(message => message.role === "system")
+    const systemText = systemMessages.flatMap(message => message.content)
       .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
       .map(part => part.text).join("\n")
-    expect(modelText.includes(JSON.stringify(answeredQuestion.answer))).toBe(true)
-    expect(modelText.includes(JSON.stringify(priorQuestion.answer))).toBe(true)
-    expect(modelText.includes("not independent proof of external facts")).toBe(true)
-    expect(modelText.includes("action, approval, consent, credential, or submission authority")).toBe(true)
+    expect(systemText).toContain("not independent proof of external facts")
+    expect(systemText).toContain("action, approval, consent, credential, or submission authority")
+    for (const secret of [answeredQuestion.question, answeredQuestion.answer, priorQuestion.question, priorQuestion.answer, ...privateReferenceIds]) {
+      expect(containsText(systemMessages, secret)).toBe(false)
+    }
     expect(executed.usageAuthorizations).toHaveLength(1)
     expect(executed.usageAuthorizations[0]?.executionOwner).toMatchObject({ kind: "task", taskId: rootTaskIds[0], rootTaskId: ids.root })
     expect(executed.usageSettlements).toEqual([{ status: "success", inputTokens: 173, outputTokens: 41, estimatedCostUsd: 0.013 }])
@@ -465,16 +488,15 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(reservation.rows[0]?.status).toBe("consumed")
 
     const publicResult = projectNativeVerificationResult(completedControl.rows[0]?.result)
-    const publicResultJson = JSON.stringify(publicResult)
     expect(publicResult).toMatchObject({ nativeVerificationFeedback: { disposition: "passed", criteria: [
       { criterionId: "criterion-1", disposition: "passed", evidenceReferenceIds: expect.arrayContaining([rootPacket.target.referenceId]) },
       { criterionId: "criterion-2", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: [] },
     ] } })
     expect(publicResult).not.toHaveProperty("nativeVerificationReport")
-    expect(publicResultJson.includes(answeredQuestion.answer)).toBe(false)
-    expect(publicResultJson.includes(priorQuestion.answer)).toBe(false)
-    for (const referenceId of privateReferenceIds) expect(publicResultJson.includes(referenceId)).toBe(false)
-    expect(publicResultJson.includes(rootPacket.target.referenceId)).toBe(true)
+    for (const secret of [answeredQuestion.answer, priorQuestion.answer, ...privateReferenceIds]) {
+      expect(containsText(publicResult, secret)).toBe(false)
+    }
+    expect(containsText(publicResult, rootPacket.target.referenceId)).toBe(true)
     const [publicItems, publicEvents, publicOutbox] = await Promise.all([
       pool!.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`,
         [ids.session, ids.turn, rootTaskIds[0]]),
@@ -487,10 +509,10 @@ describePg("native verification PostgreSQL producer and readback", () => {
     ])
     expect(publicEvents.rows.length).toBeGreaterThan(0)
     expect(publicOutbox.rows.length).toBeGreaterThan(0)
-    const publicRecords = JSON.stringify({ items: publicItems.rows, events: publicEvents.rows, outbox: publicOutbox.rows })
-    expect(publicRecords.includes(answeredQuestion.answer)).toBe(false)
-    expect(publicRecords.includes(priorQuestion.answer)).toBe(false)
-    for (const referenceId of privateReferenceIds) expect(publicRecords.includes(referenceId)).toBe(false)
+    const publicRecords = { items: publicItems.rows, events: publicEvents.rows, outbox: publicOutbox.rows }
+    for (const secret of [answeredQuestion.answer, priorQuestion.answer, ...privateReferenceIds]) {
+      expect(containsText(publicRecords, secret)).toBe(false)
+    }
 
     const recovered = await port.readRecoverableGoal(scope)
     expect(recovered).toMatchObject({ status: "passed", candidateText })
