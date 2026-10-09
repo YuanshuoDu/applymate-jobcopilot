@@ -49,6 +49,88 @@ describe("Worker AI usage bridge", () => {
     }
   })
 
+  it.each([
+    { status: 409, code: "usage_attempt_in_flight" },
+    { status: 409, code: "usage_attempt_settled" },
+    { status: 409, code: "usage_attempt_conflict" },
+    { status: 400, code: "invalid_usage_request" },
+  ])("does not compensate or retry authorization failure $code", async ({ status, code }) => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ code }, status))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+
+    await expect(authorizer(input)).rejects.toMatchObject({ code })
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ operation: "authorize", input })
+  })
+
+  it("does not retry malformed successful release responses", async () => {
+    const fetcher = vi.fn()
+      .mockRejectedValueOnce(new Error("authorization transport outage"))
+      .mockResolvedValueOnce(response("unexpected success payload"))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+
+    await expect(authorizer(input)).rejects.toMatchObject({ code: "usage_broker_unavailable" })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it("retries transient compensating releases with the identical operation identity", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ code: "usage_broker_unavailable" }, 503))
+      .mockRejectedValueOnce(new Error("temporary release transport outage"))
+      .mockResolvedValueOnce(response({ code: "usage_broker_unavailable" }, 503))
+      .mockResolvedValueOnce(response({ status: "released" }))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+
+    await expect(authorizer(input)).rejects.toMatchObject({ code: "usage_broker_unavailable" })
+    expect(fetcher).toHaveBeenCalledTimes(4)
+    const operations = fetcher.mock.calls.map(call => JSON.parse(String(call[1]?.body)) as { operation: string; input: unknown })
+    expect(operations.map(body => body.operation)).toEqual(["authorize", "release", "release", "release"])
+    for (const body of operations.slice(1)) expect(body).toEqual({ operation: "release", input })
+  })
+
+  it("preserves the original authorization denial after compensating release retries exhaust", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ code: "usage_broker_unavailable" }, 503))
+      .mockRejectedValueOnce(new Error("release transport outage 1"))
+      .mockRejectedValueOnce(new Error("release transport outage 2"))
+      .mockRejectedValueOnce(new Error("release transport outage 3"))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+
+    await expect(authorizer(input)).rejects.toMatchObject({ code: "usage_broker_unavailable" })
+    expect(fetcher).toHaveBeenCalledTimes(4)
+    expect(fetcher.mock.calls.slice(1).map(call => JSON.parse(String(call[1]?.body)))).toEqual(
+      Array.from({ length: 3 }, () => ({ operation: "release", input })),
+    )
+  })
+
+  it.each([
+    { status: 409, code: "usage_attempt_in_flight" },
+    { status: 409, code: "usage_attempt_settled" },
+    { status: 409, code: "usage_attempt_conflict" },
+    { status: 400, code: "invalid_usage_request" },
+    { status: 403, code: "usage_fence_rejected" },
+  ])("does not retry compensating release for $code", async ({ status, code }) => {
+    const fetcher = vi.fn()
+      .mockRejectedValueOnce(new Error("authorization transport outage"))
+      .mockResolvedValueOnce(response({ code }, status))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+
+    await expect(authorizer(input)).rejects.toMatchObject({ code: "usage_broker_unavailable" })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not release a provider-started attempt after terminal error settlement", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1" }))
+      .mockResolvedValueOnce(response({ status: "settled" }))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+    const reservation = await authorizer(input)
+
+    await reservation.settle({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_error" })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fetcher.mock.calls.map(call => JSON.parse(String(call[1]?.body)).operation)).toEqual(["authorize", "settle"])
+  })
+
   it("accepts a child Task owner envelope without retaining root lease fields", async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(response({ status: "authorized", operationId: "child-usage-1" }))
     const { leaseOwnerId: _leaseOwnerId, leaseVersion: _leaseVersion, ...common } = input
