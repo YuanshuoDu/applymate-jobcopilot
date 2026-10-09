@@ -219,8 +219,9 @@ export async function recoverAnsweredQuestionHistory(
     const starts = itemEvents.filter(event => event.type === "item.started")
     if (starts.length !== 1) throw new Error("question_recovery_start_event_ambiguous")
     for (const event of itemEvents) {
+      const brokerAnswer = event.type === "question.answered" && event.actor === "user" && event.taskId === null
       if (event.userId !== lease.userId || event.turnUserId !== lease.userId || event.sessionId !== lease.sessionId
-        || event.turnId !== lease.turnId || event.taskId !== item.taskId
+        || event.turnId !== lease.turnId || (event.taskId !== item.taskId && !brokerAnswer)
         || (event.taskId !== null && event.taskId !== rootTaskId)) throw new Error("question_recovery_event_scope_invalid")
     }
     const startedAt = validateStart(starts[0], item, questionId, callId)

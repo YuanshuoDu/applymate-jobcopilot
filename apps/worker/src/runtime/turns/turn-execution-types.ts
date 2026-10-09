@@ -57,6 +57,10 @@ export type TurnExecutionStore = {
   completeNativeSemanticRejectionStep?(input: Omit<Parameters<NonNullable<import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore["completeNativeSemanticRejectionStep"]>>[0], "owner">
     & { executionIdentity: TurnExecutionIdentity }): Promise<NativeSemanticRejectionCount>
   waitForUser?(input: StoreInput<"waitForUser">): Promise<void>
+  stageQuestionUsage?(input: StoreInput<"stageQuestionUsage">): Promise<void>
+  cancelPausedQuestion?(input: StoreInput<"cancelPausedQuestion">): ReturnType<NonNullable<TurnEngineStore["cancelPausedQuestion"]>>
+  waitForQuestion?(input: StoreInput<"waitForQuestion">): ReturnType<NonNullable<TurnEngineStore["waitForQuestion"]>>
+  readPendingQuestion?(input: StoreInput<"readPendingQuestion">): ReturnType<NonNullable<TurnEngineStore["readPendingQuestion"]>>
   createItem(input: StoreInput<"createItem">): Promise<TurnEngineItem>
   updateItem(input: StoreInput<"updateItem">): Promise<TurnEngineItem>
   appendEvent(input: StoreInput<"appendEvent">): Promise<{ id: string }>
@@ -121,6 +125,8 @@ export type TurnExecutionOptions = {
   readonly recoveredFinalCandidate?: string
   /** Canonical replay state used only for server-side marker hydration. */
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
+  /** Refresh the owner-scoped TaskGraph before building each planning-enabled Root Step. */
+  readonly refreshTaskGraphBeforeStep?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
   /** Re-read durable TaskGraph state before continuing after an inline-ready agent.wait. */
   readonly refreshTaskGraphAfterReadyWait?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
   /** Re-read durable TaskGraph state after an accepted agent.plan receipt. */

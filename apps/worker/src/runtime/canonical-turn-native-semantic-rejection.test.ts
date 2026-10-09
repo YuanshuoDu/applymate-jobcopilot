@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { createNativeSemanticProgressTracker } from "./native-semantic-progress.js"
-import { observeNativeSemanticRejection, resolveNativeSemanticProgressMode } from "./canonical-turn-native-semantic-rejection.js"
+import { configureNativeSemanticProgress, observeNativeSemanticRejection, resolveNativeSemanticProgressMode } from "./canonical-turn-native-semantic-rejection.js"
 import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
 import type { NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope } from "./subagents/task-graph-command-port.js"
@@ -26,6 +26,37 @@ describe("native semantic rejection runtime", () => {
     await expect(resolveNativeSemanticProgressMode({ store: { resolveNativeSemanticProgressMode: resolver }, owner,
       requestedEnabled: false, now: new Date(1) })).resolves.toBe("durable_v1")
     expect(resolver).toHaveBeenCalledWith({ owner, requestedEnabled: false, now: new Date(1) })
+  })
+
+  it("resolves and configures semantic mode for the current root before execution", async () => {
+    const now = new Date(2)
+    const lease = { turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId, userId: owner.userId,
+      leaseVersion: owner.leaseVersion, leaseStartedAt: new Date(0), leaseExpiresAt: owner.leaseExpiresAt }
+    const expectedOwner = { ...owner, taskId: "root-2", rootTaskId: "root-2" }
+    const resolver = vi.fn(async () => "durable_v1" as const)
+    const store = { resolveNativeSemanticProgressMode: resolver }
+    const configureSemanticProgress = vi.fn()
+    const nativeVerification = { configureSemanticProgress }
+    const result = await configureNativeSemanticProgress({ taskId: "root-2", lease, store, nativeVerification,
+      featureEnabled: true, taskGraphPlanningEnabled: false, now })
+    expect(resolver).toHaveBeenCalledWith({ owner: expectedOwner, requestedEnabled: false, now })
+    expect(configureSemanticProgress).toHaveBeenCalledWith({ mode: "durable_v1", store, owner: expectedOwner })
+    expect(result).toEqual({ owner: expectedOwner, mode: "durable_v1" })
+  })
+
+  it("enables the pinned mode only when both the feature and TaskGraph gates are on", async () => {
+    const now = new Date(3)
+    const lease = { turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId, userId: owner.userId,
+      leaseVersion: owner.leaseVersion, leaseStartedAt: new Date(0), leaseExpiresAt: owner.leaseExpiresAt }
+    const expectedOwner = { ...owner, taskId: "root-3", rootTaskId: "root-3" }
+    const resolver = vi.fn(async () => "durable_v1" as const)
+    const store = { resolveNativeSemanticProgressMode: resolver }
+    const configureSemanticProgress = vi.fn()
+    const result = await configureNativeSemanticProgress({ taskId: "root-3", lease, store,
+      nativeVerification: { configureSemanticProgress }, featureEnabled: true, taskGraphPlanningEnabled: true, now })
+    expect(resolver).toHaveBeenCalledWith({ owner: expectedOwner, requestedEnabled: true, now })
+    expect(configureSemanticProgress).toHaveBeenCalledWith({ mode: "durable_v1", store, owner: expectedOwner })
+    expect(result).toEqual({ owner: expectedOwner, mode: "durable_v1" })
   })
 
   it("keeps legacy observation in memory and returns only a strict durable identity", async () => {

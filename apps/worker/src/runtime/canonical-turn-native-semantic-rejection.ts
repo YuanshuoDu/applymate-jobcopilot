@@ -5,6 +5,8 @@ import { parseNativeSemanticRejectionIdentity, type NativeSemanticProgressMode, 
 import type { NativeSemanticProgressTracker } from "./native-semantic-progress.js"
 import type { TurnExecutionIdentity } from "./turns/turn-execution-types.js"
 import { TurnEngineError } from "./turns/turn-engine-types.js"
+import { executionOwnerFence, type TurnExecutionOwnerFence } from "./execution-owner.js"
+import type { TurnLease } from "./turns/lease.js"
 
 export async function resolveNativeSemanticProgressMode(input: Readonly<{
   store: NativeSemanticProgressStore
@@ -20,6 +22,23 @@ export async function resolveNativeSemanticProgressMode(input: Readonly<{
   const mode = await resolve.call(input.store, { owner: input.owner, requestedEnabled: input.requestedEnabled, now: input.now })
   if (mode !== "legacy_v1" && mode !== "durable_v1") throw new TurnEngineError("persistence_conflict", "Native semantic progress mode is invalid")
   return mode
+}
+
+export async function configureNativeSemanticProgress(input: Readonly<{
+  taskId: string
+  lease: TurnLease
+  store: NativeSemanticProgressStore
+  nativeVerification: { configureSemanticProgress(configuration: NativeSemanticProgressConfiguration): void }
+  featureEnabled: boolean
+  taskGraphPlanningEnabled: boolean
+  now: Date
+}>): Promise<{ owner: TurnExecutionOwnerFence; mode: NativeSemanticProgressMode }> {
+  const owner = executionOwnerFence({ kind: "turn", taskId: input.taskId, lease: input.lease })
+  if (owner.kind !== "turn") throw new Error("turn_owner_fence_invalid")
+  const mode = await resolveNativeSemanticProgressMode({ store: input.store, owner,
+    requestedEnabled: input.featureEnabled && input.taskGraphPlanningEnabled, now: input.now })
+  input.nativeVerification.configureSemanticProgress({ mode, store: input.store, owner })
+  return { owner, mode }
 }
 
 export async function observeNativeSemanticRejection(input: Readonly<{

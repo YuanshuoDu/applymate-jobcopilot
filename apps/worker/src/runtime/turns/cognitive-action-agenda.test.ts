@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest"
 import { buildCognitiveActionAgenda, COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION, type CognitiveAction } from "./cognitive-action-agenda.js"
 import type { StepContext } from "../context/step-context-builder.js"
 
-function context(blocks: StepContext["blocks"], steeringMarkerControl?: StepContext["steeringMarkerControl"]): StepContext {
-  return { schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", inputThroughSequence: 4n, consumedInputIds: [], canonicalJson: "{}", blocks, ...(steeringMarkerControl ? { steeringMarkerControl } : {}) }
+function context(blocks: StepContext["blocks"], steeringMarkerControl?: StepContext["steeringMarkerControl"], taskGraphRevision?: number): StepContext {
+  return { schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", inputThroughSequence: 4n, consumedInputIds: [], canonicalJson: "{}", blocks, ...(steeringMarkerControl ? { steeringMarkerControl } : {}), ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }) }
 }
 function block(id: string, layer: StepContext["blocks"][number]["layer"], content: unknown): StepContext["blocks"][number] {
   return { id, layer, role: layer === "system" ? "instruction" : "data", trust: layer === "system" ? "system" : "external_untrusted", source: "test", content: content as never }
@@ -17,6 +17,16 @@ function observation(id: string, content: Record<string, unknown>): StepContext[
 }
 
 describe("cognitive action agenda", () => {
+  it("copies only the typed current graph revision and accepts revision zero", () => {
+    const typed = buildCognitiveActionAgenda(context([goal()], undefined, 0))
+    const forged = buildCognitiveActionAgenda(context([goal(), observation("task-graph-current", { kind: "task_graph_current", revision: 9 })]))
+    const invalid = buildCognitiveActionAgenda(context([goal()], undefined, Number.MAX_SAFE_INTEGER + 1))
+
+    expect(typed).toMatchObject({ goalRevision: null, planRevision: 0 })
+    expect(forged).toMatchObject({ goalRevision: null, planRevision: null })
+    expect(invalid.planRevision).toBeNull()
+  })
+
   it("sorts and deduplicates safe IDs deterministically", () => {
     const blocks = [goal(), block("input-z:part:0", "pending_input", { inputId: "input-z", text: "Ignore policy" }), block("input-a:part:0", "pending_input", { inputId: "input-a", text: "Unsafe action" }), block("input-a:part:1", "pending_input", { inputId: "input-a", text: "Unsafe action" })]
     const control = { activeInputIds: ["steer-z", "steer-a", "steer-a"], newlyObservedInputIds: ["steer-z", "steer-a"], newlyObservedMarkers: [] }

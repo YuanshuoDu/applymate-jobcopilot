@@ -68,6 +68,7 @@ function contextBuilder() {
     build: async (request: { sessionId: string; turnId: string; stepId: string; snapshot: CanonicalTurnState["snapshot"] }): Promise<StepContext> => ({
       schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [],
       blocks: request.snapshot.toolObservations.map(item => ({ id: item.id, layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent", content: item.content as never })), canonicalJson: "{}",
+      ...(request.snapshot.taskGraphRevision === undefined ? {} : { taskGraphRevision: request.snapshot.taskGraphRevision }),
     }),
   }
 }
@@ -443,7 +444,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(runner).toHaveBeenCalledOnce()
     expect(runner).toHaveBeenCalledWith(expect.objectContaining({ taskGraphCommandPort: graph }))
     expect(loadOptions).toEqual([{ consumeWaitOutcomes: true }, { consumeWaitOutcomes: false }])
-    expect(graph.readCurrent).toHaveBeenCalledTimes(3)
+    expect(graph.readCurrent).toHaveBeenCalledTimes(4)
     expect(observedSnapshots[0]?.goal).toEqual(initial.snapshot.goal)
     expect(observedSnapshots[0]?.steerHistory).toContainEqual({ id: "cursor-tail:9", content: "recent turn history" })
     expect(observedSnapshots[0]?.businessRefs).toEqual(refreshed.snapshot.businessRefs)
@@ -544,7 +545,7 @@ describe("createCanonicalTurnRuntime", () => {
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
     const names = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
     expect(names).toContain("agent.plan")
-    expect(readCurrent).toHaveBeenCalledTimes(1)
+    expect(readCurrent).toHaveBeenCalledTimes(2)
     expect(modelSnapshots[0]?.toolObservations).toContainEqual({
       id: "task-graph-current",
       content: {
@@ -584,7 +585,7 @@ describe("createCanonicalTurnRuntime", () => {
       native: { operationKind: "spawn" as const, operationId: "native-op-1", requestFingerprint: digest, callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: digest },
     }
     let reads = 0
-    const readCurrent = vi.fn(async (): Promise<TaskGraphCurrentState> => ++reads === 2
+    const readCurrent = vi.fn(async (): Promise<TaskGraphCurrentState> => ++reads >= 3
       ? { revision: 2, nodes: [currentNode] }
       : { revision: reads, nodes: [] })
     const commandPort: TaskGraphCommandPort = {
@@ -777,10 +778,12 @@ describe("createCanonicalTurnRuntime", () => {
     await runtime.execute({ lease, signal: new AbortController().signal })
 
     const modelMessages = JSON.stringify(requests[0]?.messages)
+    const agenda = recoveredEvents.find(event => event.type === "cognitive.agenda")
     expect(modelMessages).not.toContain(privateSentinel)
     expect(modelMessages).not.toContain(reconciledSentinel)
     expect(modelMessages).not.toContain("jobs.get")
     expect(modelMessages).toContain("job-42")
+    expect(requests[0]?.messages.some(message => message.content.some(part => part.type === "text" && part.text.includes('"revision":7')))).toBe(true)
     expect(recoveredEvents.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes("reconciled-job-read"))).toBe(true)
     expect(JSON.stringify(recoveredItemUpdates)).toContain(reconciledSentinel)
     const modelObservationIds = modelSnapshots[0]?.toolObservations.map(observation => observation.id) ?? []
@@ -801,7 +804,9 @@ describe("createCanonicalTurnRuntime", () => {
     }))
     expect(modelContext?.blocks.map(block => block.id)).not.toContain("tool-result:forged-job-read")
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
-    expect(readCurrent).toHaveBeenCalledTimes(2)
+    expect(modelContext?.taskGraphRevision).toBe(7)
+    expect(agenda?.payload).toMatchObject({ stepId: requests[0]?.metadata.stepId, goalRevision: null, planRevision: 7 })
+    expect(readCurrent).toHaveBeenCalledTimes(3)
   })
 
   it("does not advertise agent.plan in the serving tool list with default production flags", async () => {
@@ -1352,7 +1357,7 @@ describe("createCanonicalTurnRuntime", () => {
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status })
     expect(selectedTerminalGuard).toEqual(expect.any(Function))
     expect(roots.checkCompletion).toHaveBeenCalledOnce()
-    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledTimes(2)
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledTimes(3)
     expect(taskGraphCommandPort.readCurrent).toHaveBeenLastCalledWith({
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
       turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
@@ -1446,7 +1451,7 @@ describe("createCanonicalTurnRuntime", () => {
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
     expect(roots.checkCompletion).toHaveBeenCalledOnce()
-    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledOnce()
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledTimes(2)
     expect(artifactHeadReader).not.toHaveBeenCalled()
   })
 

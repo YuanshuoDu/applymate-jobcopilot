@@ -5,14 +5,14 @@ import { restoreCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"
-import type { TurnResumeState } from "./turns/turn-engine-types.js"
-import type { PersistedToolCallRecovery } from "./turns/turn-engine-types.js"
+import type { TurnResumeState, PersistedToolCallRecovery } from "./turns/turn-engine-types.js"
 import { restoreToolCallState } from "./turns/persisted-tool-call-state.js"
 import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js"
 import { restoreCanonicalSteeringMarkers, priorConversation, type SteeringMarkerState } from "./canonical-steering-markers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type CognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
 import { recoverAnsweredQuestionHistory } from "./question-answer-recovery.js"
+import { hydrateNativeVerificationHistoricalAdvisories } from "./subagents/native-verification-historical-advisory.js"
 
 export type CanonicalTurnState = {
   readonly scope: TenantScope
@@ -110,7 +110,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
     const scope = { userId: lease.userId } satisfies TenantScope
     const turnResult = await client.query<Row>(
-      `SELECT "id", "sessionId", "userId", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt",
+      `SELECT "id", "sessionId", "userId", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "createdAt",
               "input", "rootTaskId", "contextSnapshotId", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot"
        FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
          AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > $6 AND "status" = 'in_progress'
@@ -201,11 +201,10 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : left.id.localeCompare(right.id)
       })
     const questionHistory = await recoverAnsweredQuestionHistory(client, { lease, rootTaskId, steps: stepsResult.rows, toolItems: itemsResult.rows, existingHistory: snapshot.steerHistory })
-    const seenHistory = new Set(snapshot.steerHistory.map(item => item.id))
     snapshot = {
       ...snapshot,
       goal: { id: `turn-goal:${lease.turnId}`, content: goal },
-      steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item), ...questionHistory],
+      steerHistory: await hydrateNativeVerificationHistoricalAdvisories(client, { lease, currentTurnCreatedAt: turn.createdAt as Date, currentInput: turn.input, currentRootTaskId: rootTaskId, existingHistory: snapshot.steerHistory, additionalHistory: [...history, ...questionHistory] }),
       toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }
     const steps = stepsResult.rows

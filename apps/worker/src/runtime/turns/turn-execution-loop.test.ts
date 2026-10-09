@@ -1,21 +1,28 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { TenantScope } from "@jobcopilot/agent-protocol"
-import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { AgentModelError, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "../context/input-claim-store.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import { createHarnessModelRuntime } from "../harness-model.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import { classifyTurnFailure } from "./dlq.js"
 import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
+import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
+import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
+import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tools.js"
+import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -98,6 +105,53 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
 }
 
+function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = "ask-1") {
+  const root = fixture(identity("turn", "root-1")), timeline: string[] = []
+  const baseStore = root.options.store
+  const usage = { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }
+  const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [] }
+  const waitForQuestion = vi.fn(async (input: { toolCallId: string }) => ({ status: "waiting_for_user" as const, disposition: "created" as const, waitId: "question-1", itemId: "agent-wait:question:question-1", turnId: "turn-1", toolCallId: input.toolCallId, nextTurnRevision: 2 }))
+  const stageQuestionUsage = vi.fn(async () => { timeline.push("stage") })
+  const cancelPausedQuestion = vi.fn(async () => "cancelled" as const)
+  const readPendingQuestion = vi.fn(async () => recovery as never)
+  const model: ModelAdapter = { id: "fixture-model", profile, async *stream(request: HarnessModelRequest) {
+    root.requests.push(request)
+    yield { type: "tool_call_completed", callId, name: "agent.ask_user", arguments: { question: "Which city?" } }
+    yield { type: "usage", ...usage }
+    yield { type: "completed", finishReason: "tool_calls" }
+  } }
+  root.options = {
+    ...root.options, model, tools: [{ name: "agent.ask_user", version: "1" }],
+    store: { ...baseStore,
+      appendEvent: async input => {
+        const suffix = input.itemId?.includes(":item:tool-result:") ? ":result" : input.itemId?.includes(":item:tool-call:") ? ":call" : ""
+        timeline.push(`${input.type}${suffix}`)
+        return baseStore.appendEvent(input)
+      },
+      stageQuestionUsage, cancelPausedQuestion, waitForQuestion: async input => { timeline.push("wait"); return waitForQuestion(input) }, readPendingQuestion,
+    },
+    executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: intent, errorCode: null }),
+  }
+  return { ...root, timeline, usage, waitForQuestion, stageQuestionUsage, cancelPausedQuestion, readPendingQuestion }
+}
+
+function replaceHarnessRoute(
+  runtime: ReturnType<typeof createHarnessModelRuntime>,
+  provider: string,
+  model: string,
+  maxContextTokens: number,
+  stream: ModelAdapter["stream"],
+): void {
+  const existing = runtime.registry.list().find(adapter => adapter.profile.provider === provider && adapter.profile.model === model)
+  if (!existing) throw new Error(`Missing fixture route ${provider}/${model}`)
+  runtime.registry.unregister(existing.id)
+  runtime.registry.register({
+    id: existing.id,
+    profile: { ...existing.profile, maxContextTokens, maxOutputTokens: 4_096, defaultMaxOutputTokens: 256 },
+    stream,
+  })
+}
+
 class LateSteerInputClaimStore implements InputClaimStore {
   readonly scope: TenantScope = { userId: "user-1" }
   readonly inputs: StoredAgentInput[] = []
@@ -165,6 +219,233 @@ function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("stages real model usage and commits the root question after its completed tool receipt", async () => {
+    const root = nativeQuestionFixture()
+    const result = await runTurnExecutionLoop(root.options)
+    const ordered = ["tool_call.started:call", "stage", "item.completed:call", "tool_call.completed:call", "item.completed:result", "wait"]
+    const positions = ordered.map(name => root.timeline.indexOf(name))
+
+    expect(result).toMatchObject({ status: "waiting_for_user", waitId: "question-1", stepCount: 1, toolCallCount: 1 })
+    expect(positions.every(position => position >= 0)).toBe(true)
+    expect(positions).toEqual([...positions].sort((a, b) => a - b))
+    expect(root.stageQuestionUsage).toHaveBeenCalledWith(expect.objectContaining({ finishReason: "tool_calls", usage: root.usage, toolCallId: "ask-1" }))
+    expect(root.waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "ask-1" }))
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "step.completed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+  })
+
+  it("commits a recovered prepared question before another provider call", async () => {
+    const root = nativeQuestionFixture({ status: "prepared", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old" })
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "waiting_for_user", waitId: "question-1", stepCount: 0, toolCallCount: 0 })
+    expect(root.requests).toHaveLength(0)
+    expect(root.waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: "old-step", toolCallId: "old-call" }))
+    expect(root.stageQuestionUsage).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+  })
+
+  it("leaves a prepared step open and sends uncertain question commits through the queue retry classification", async () => {
+    const root = nativeQuestionFixture()
+    root.waitForQuestion.mockRejectedValueOnce(new Error("temporary database failure"))
+    const error = await runTurnExecutionLoop(root.options).then(() => null, reason => reason as unknown)
+
+    expect(error).toMatchObject({ code: "prepared_question_wait_retry_required" })
+    expect(classifyTurnFailure(error, 0)).toEqual({ disposition: "retry", reasonCode: "execution_failed" })
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "step.completed" || event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+  })
+
+  it("reloads the same Turn after orphan usage recovery before replanning", async () => {
+    const root = nativeQuestionFixture()
+    root.readPendingQuestion.mockRejectedValueOnce(new OrphanPauseUsageRecoveredError())
+    const error = await runTurnExecutionLoop(root.options).then(() => null, reason => reason as unknown)
+
+    expect(error).toMatchObject({ code: "turn_state_refresh_retry_required" })
+    expect(classifyTurnFailure(error, 0)).toEqual({ disposition: "retry", reasonCode: "execution_failed" })
+    expect(root.requests).toHaveLength(0)
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+
+    const recoveredUsage = { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }
+    root.options = { ...root.options, resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [], usage: recoveredUsage },
+      budget: { maxInputTokens: 10, maxOutputTokens: 4, maxCostUsd: 0.02 } }
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+
+    expect(root.options.identity.turnId).toBe("turn-1")
+    expect(root.requests).toHaveLength(0)
+    const failure = root.events.find(event => event.type === "turn.failed")
+    expect(failure?.payload).toMatchObject({ final: { completed: false, terminalReason: "budget_exhausted", usage: recoveredUsage } })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
+  it("reloads canonical usage after partial paused ask recovery before replanning", async () => {
+    const root = nativeQuestionFixture()
+    const recoveredUsage = { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }
+    root.options = {
+      ...root.options,
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [],
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      budget: { maxInputTokens: 10, maxOutputTokens: 4, maxCostUsd: 0.02 },
+      toolCallRecovery: [{ action: "replay", stepId: "step-1", toolVersion: "1", call: {
+        id: "ask-1", name: "agent.ask_user", arguments: { question: "Which city?" },
+      }, callItem: { id: "call-item-1", revision: 1 } }],
+    }
+    root.readPendingQuestion.mockRejectedValueOnce(new OrphanPauseUsageRecoveredError())
+
+    const error = await runTurnExecutionLoop(root.options).then(() => null, reason => reason as unknown)
+
+    expect(error).toMatchObject({ code: "turn_state_refresh_retry_required" })
+    expect(classifyTurnFailure(error, 0)).toEqual({ disposition: "retry", reasonCode: "execution_failed" })
+    expect(root.readPendingQuestion).toHaveBeenCalledTimes(1)
+    expect(root.requests).toHaveLength(0)
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+
+    root.options = { ...root.options, resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n,
+      consumedInputIds: [], usage: recoveredUsage } }
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+
+    expect(root.requests).toHaveLength(0)
+    const failure = root.events.find(event => event.type === "turn.failed")
+    expect(failure?.payload).toMatchObject({ final: { completed: false, terminalReason: "budget_exhausted", usage: recoveredUsage } })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
+  it("halts at a committed unanswered question and continues after answer history is loaded", async () => {
+    const waiting = nativeQuestionFixture({ status: "waiting", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old", turnId: "turn-1" })
+    await expect(runTurnExecutionLoop(waiting.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId: "question-old" })
+    expect(waiting.requests).toHaveLength(0)
+    expect(waiting.waitForQuestion).not.toHaveBeenCalled()
+
+    const answered = nativeQuestionFixture({ status: "answered", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old", turnId: "turn-1" })
+    answered.options = {
+      ...answered.options,
+      expectedEvidence: ["question-answer"],
+      snapshot: { ...answered.options.snapshot, toolObservations: [{ id: "question-answer:question-old", content: { toolCallId: "question-answer", status: "completed", questionId: "question-old", answer: "Berlin" } }] },
+      model: { id: "answer-aware", profile, async *stream(request: HarnessModelRequest) {
+        answered.requests.push(request)
+        yield { type: "text_delta", text: "Thanks, I will use Berlin." }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+    await expect(runTurnExecutionLoop(answered.options)).resolves.toMatchObject({ status: "completed" })
+    expect(answered.requests).toHaveLength(1)
+    expect(JSON.stringify(answered.requests[0]?.messages)).toContain("Berlin")
+    expect(answered.waitForQuestion).not.toHaveBeenCalled()
+  })
+
+  it("lets a resumed Turn replace only a confirmed pre-intent paused ask call", async () => {
+    const root = nativeQuestionFixture({ status: "none" }, "ask-2")
+    const execute = vi.fn(root.options.executeTool)
+    root.options = {
+      ...root.options, executeTool: execute,
+      toolCallRecovery: [{ action: "replay", call: { id: "ask-1", name: "agent.ask_user", arguments: { question: "Old question?" } }, toolVersion: "1", stepId: "old-step", callItem: { id: "old-call-item", revision: 2 } }],
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId: "question-1" })
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(execute.mock.calls[0]?.[0].call.id).toBe("ask-2")
+    expect(root.waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "ask-2" }))
+  })
+
+  it("atomically finalizes actual usage when pause denies the question before staging", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    const base = root.options.store
+    root.options = {
+      ...root.options,
+      store: {
+        ...base,
+        appendEvent: async input => {
+          if (input.type === "tool_call.started") throw pause
+          return base.appendEvent(input)
+        },
+      },
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: "turn:turn-1:step:0", toolCallId: "ask-1", usage: root.usage, finishReason: "tool_calls" }))
+    expect(root.stageQuestionUsage).not.toHaveBeenCalled()
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
+  it("cancels a pause before the call row is created", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    const base = root.options.store
+    root.options = {
+      ...root.options,
+      store: { ...base, createItem: async input => {
+        if (input.type === "tool_call") throw pause
+        return base.createItem(input)
+      } },
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledTimes(1)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ usage: root.usage, callArguments: { question: "Which city?" } }))
+    expect(root.stageQuestionUsage).not.toHaveBeenCalled()
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+  })
+
+  it("cancels a typed pause raised by usage staging with the streamed absolute usage", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    root.stageQuestionUsage.mockRejectedValueOnce(pause)
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.stageQuestionUsage).toHaveBeenCalledTimes(1)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ usage: root.usage, finishReason: "tool_calls" }))
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
+  it("preserves the original pause when atomic question cleanup reports a transient failure", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    const cleanupFailure = Object.assign(new Error("question cancellation transaction failed"), { code: "40001" })
+    root.cancelPausedQuestion.mockRejectedValueOnce(cleanupFailure)
+    root.options = { ...root.options, executeTool: async () => { throw pause } }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+
+    expect(root.cancelPausedQuestion).toHaveBeenCalledTimes(1)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({
+      stepId: "turn:turn-1:step:0", toolCallId: "ask-1", callArguments: { question: "Which city?" }, usage: root.usage,
+    }))
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "step.completed" || event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+  })
+
+  it("cancels a tool interruption before any question receipt is written", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    root.options = { ...root.options, executeTool: async () => { throw pause } }
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "ask-1", usage: root.usage }))
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "item.completed" && event.itemId?.includes("tool-result"))).toBe(false)
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
+  it("preserves a complete intent when pause lands after the durable receipt", async () => {
+    const root = nativeQuestionFixture(), controller = new AbortController(), pause = new SessionPauseRequestedError()
+    root.options = { ...root.options, signal: controller.signal, signalError: () => pause,
+      executeTool: async ({ call }) => { controller.abort(); return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {
+        schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [],
+      }, errorCode: null } },
+      store: { ...root.options.store, cancelPausedQuestion: async () => "prepared" as const },
+    }
+    const result = await runTurnExecutionLoop(root.options).then(() => null, error => error as unknown)
+    expect(result).toMatchObject({ code: "prepared_question_wait_retry_required" })
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "item.completed" && event.itemId?.includes("tool-result"))).toBe(true)
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
   it("rethrows a pause rejected by startStep without terminalizing or invoking the model", async () => {
     const root = fixture(identity("turn", "root-1"))
     const pause = new SessionPauseRequestedError()
@@ -226,6 +507,150 @@ describe("owner-agnostic turn execution loop", () => {
     expect(saved.usage).toEqual(resume.usage)
   })
 
+  it("fails once when the full resumed Turn request outgrows every route after an earlier provider attempt", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const diagnostics: HarnessRequestAdmissionDiagnostic[] = []
+    const selections: string[] = []
+    const requestCaptures: HarnessModelRequest[] = []
+    const routeErrors: unknown[] = []
+    const primaryRequests: HarnessModelRequest[] = []
+    const settlements: WorkerUsageSettlementInput[] = []
+    const authorizations: WorkerUsageAuthorizationInput[] = []
+    const runtime = createHarnessModelRuntime({
+      primary: { provider: "minimax", model: "MiniMax-M3", apiKey: "fixture-minimax" },
+      fallbacks: [{ provider: "anthropic", model: "claude-sonnet-5", apiKey: "fixture-anthropic" }],
+      allowEnvironmentFallbacks: false,
+      maxReroutes: 1,
+      onRequestAdmission: diagnostic => diagnostics.push(diagnostic),
+      onSelectionEvent: event => selections.push(event.type),
+    })
+    let primaryCalls = 0
+    let fallbackCalls = 0
+    replaceHarnessRoute(runtime, "minimax", "MiniMax-M3", 100_000, async function* (request) {
+      primaryRequests.push(request)
+      primaryCalls += 1
+      if (primaryCalls === 1) {
+        yield { type: "tool_call_completed", callId: "call:large-search", name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "usage", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      throw new AgentModelError({
+        code: "provider_error", message: "fixture provider rejected the second request",
+        provider: request.provider, model: request.model, retryable: true, recoverable: true,
+      })
+    })
+    replaceHarnessRoute(runtime, "anthropic", "claude-sonnet-5", 4_096, async function* () {
+      fallbackCalls += 1
+      throw new Error("oversized fallback must not reach its provider adapter")
+    })
+
+    const capturedRouter: ModelAdapter = {
+      ...runtime.adapter,
+      async *stream(request) {
+        requestCaptures.push(request)
+        try { yield* runtime.adapter.stream(request) }
+        catch (error: unknown) { routeErrors.push(error); throw error }
+      },
+    }
+    const authorize = async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
+      authorizations.push(input)
+      return { settle: async settlement => { settlements.push(settlement) } }
+    }
+    const model = createUsageAwareModelAdapter(capturedRouter, { owner: root.options.identity, authorize })
+    const goal = "Find senior software engineering roles in Dublin while preserving the original candidate constraints."
+    const goalBlock: StepContext["blocks"][number] = {
+      id: "goal:original", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: goal,
+    }
+    const baseBuilder = root.options.contextBuilder
+    const searchOutput = `Dublin role result with the original search detail. `.repeat(2_000)
+    const tools = [{
+      name: "jobs.search", version: "1", description: "Search public job postings.",
+      inputSchema: { type: "object", properties: { location: { type: "string" } }, required: ["location"], additionalProperties: false },
+    }]
+    const outputSchema = {
+      type: "object", properties: { summary: { type: "string" }, sourceCount: { type: "integer" } },
+      required: ["summary", "sourceCount"], additionalProperties: false,
+    }
+    const resumedUsage = { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.011 }
+    root.options = {
+      ...root.options,
+      goal,
+      snapshot: { ...root.options.snapshot, goal: { id: "original", content: goal } },
+      contextBuilder: {
+        build: async request => {
+          const context = await baseBuilder.build(request)
+          return {
+            ...context,
+            blocks: [goalBlock, ...context.blocks],
+            canonicalJson: JSON.stringify({ goal, context: context.canonicalJson }),
+          }
+        },
+      },
+      model,
+      tools,
+      outputSchema,
+      executeTool: async ({ call }) => ({
+        id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+        output: { summary: searchOutput }, errorCode: null,
+      }),
+      resume: {
+        nextOrdinal: 0, stepCount: 0, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [], usage: resumedUsage,
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "context_estimate_exceeded", stepCount: 2, toolCallCount: 1 })
+    expect(primaryCalls).toBe(2)
+    expect(fallbackCalls).toBe(0)
+    expect(requestCaptures).toHaveLength(2)
+    expect(primaryRequests).toHaveLength(2)
+    expect(routeErrors).toHaveLength(1)
+    expect(routeErrors[0]).toMatchObject({
+      code: "context_estimate_exceeded", provider: "anthropic", model: "claude-sonnet-5", guaranteedNoProviderAttempt: false,
+    })
+    expect(selections).toContain("model.rerouted")
+    expect(diagnostics).toHaveLength(3)
+    expect(diagnostics.map(item => [item.provider, item.status, item.withinWindow])).toEqual([
+      ["minimax", "known", true], ["minimax", "known", true], ["anthropic", "known", false],
+    ])
+
+    const finalRequest = requestCaptures[1]!
+    expect(finalRequest.messages).toEqual(expect.arrayContaining([
+      { role: "user", content: expect.arrayContaining([expect.objectContaining({ type: "text", text: expect.stringContaining(goal) })]) },
+      { role: "tool", content: expect.arrayContaining([expect.objectContaining({ type: "tool_result", content: expect.stringContaining(searchOutput) })]) },
+    ]))
+    expect(finalRequest.tools).toEqual(tools)
+    expect(finalRequest.outputSchema).toEqual(outputSchema)
+    expect(finalRequest.toolChoice).toBe("auto")
+
+    expect(authorizations).toHaveLength(2)
+    expect(settlements).toEqual([
+      { status: "success", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 },
+      { status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "context_estimate_exceeded" },
+    ])
+    expect(root.stepStatuses).toEqual(["completed", "failed"])
+    expect(root.finalResponses).toHaveLength(1)
+    const finalResponse = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as {
+      completed: boolean; blocker: string; usage: { inputTokens: number; outputTokens: number; estimatedCostUsd: number }
+    }
+    expect(finalResponse).toMatchObject({
+      completed: false,
+      blocker: expect.stringMatching(/Approximate.*retained prompt\/tool context.*required content was not removed/),
+      usage: { inputTokens: 48, outputTokens: 16, estimatedCostUsd: 0.048 },
+    })
+    const persistedFailure = root.events.find(event => event.type === "turn.failed" && event.payload !== undefined)
+    expect(persistedFailure?.payload).toMatchObject({
+      errorCode: "context_estimate_exceeded", final: { completed: false, usage: finalResponse.usage },
+    })
+    const modelUsageEvents = root.events.filter(event => event.type === "model.usage" && event.payload !== undefined)
+    expect(modelUsageEvents).toHaveLength(1)
+    expect(modelUsageEvents[0]?.payload).toMatchObject({ usage: { inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 } })
+    expect(root.events.some(event => event.type === "model.failed" && event.payload !== undefined)).toBe(true)
+    expect(root.events.filter(event => event.type === "turn.failed" && event.payload !== undefined)).toHaveLength(1)
+  })
+
   it("replaces a recovered candidate when fresh steering arrives before the resumed step", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, [{ id: "evidence", content: { toolCallId: "fresh-evidence", toolName: "jobs.search", status: "completed", errorCode: null, input: {}, output: { jobs: [] } } }])
     addSteeringInput(root)
@@ -254,6 +679,119 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.finalResponses[0]).toContain("fresh answer for senior Dublin roles")
     expect(root.finalResponses[0]).not.toContain("stale answer from before steering")
     expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ candidateText: "fresh answer for senior Dublin roles" }))
+  })
+
+  it("retries a failed root read with its failure in context and verifies only the successful retry evidence", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const failedCallId = "root-read-failed"
+    const retryCallId = "root-read-retry"
+    const jobRecord = (id: string, company: string) => ({
+      id, company, role: "Software Engineer", location: "Dublin", status: "saved", score: 8,
+      url: `https://jobs.example.invalid/${id}`, source: "greenhouse", salary: "€70k-€90k",
+      description: "Build reliable software for European customers.", keywords: "TypeScript, Node.js",
+    })
+    let readCount = 0
+    const source: ReadToolDataSource = {
+      searchJobs: async () => ({ jobs: [], page: 1, hasMore: false }),
+      getJob: async (_userId, jobId) => {
+        readCount += 1
+        if (readCount === 1) throw new ToolExecutionError("upstream_unavailable", "Job source is temporarily unavailable", { job: jobRecord("job-failed", "Stale Source") })
+        return jobId === "job-fresh" ? jobRecord("job-fresh", "Fresh Source") : null
+      },
+      retrievePersona: async () => ({ facts: [] }),
+      getBaseResume: async () => ({ resume: null }),
+      getApplicationState: async () => ({ job: null, task: null, approvals: [] }),
+    }
+    const jobReadTool = createReadOnlyTools(source).find(tool => tool.name === "jobs.get")
+    if (!jobReadTool) throw new Error("jobs.get read tool is unavailable")
+    const completionGate = vi.fn(async () => ({ ok: true as const }))
+    let modelCalls = 0
+    const baseModel = root.options.model
+    root.options = {
+      ...root.options,
+      tools: [jobReadTool],
+      expectedEvidence: ["read:job:job-fresh"],
+      completionGate,
+      validateToolArguments: (toolName, input) => {
+        if (toolName !== "jobs.get" || !input || typeof input !== "object" || Array.isArray(input)) return "Only the allowlisted jobs.get read is available"
+        return typeof (input as Record<string, unknown>).jobId === "string" ? true : "jobs.get requires a job ID"
+      },
+      model: {
+        ...baseModel,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          modelCalls += 1
+          if (modelCalls === 1) {
+            yield { type: "tool_call_completed", callId: failedCallId, name: "jobs.get", arguments: { jobId: "job-stale" } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (modelCalls === 2) {
+            yield { type: "tool_call_completed", callId: retryCallId, name: "jobs.get", arguments: { jobId: "job-fresh" } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "Found the Fresh Source role using the successful retry." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+      executeTool: async input => {
+        const context: ToolExecutionContext = {
+          scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
+          toolCallId: input.call.id, taskId: input.taskId, rootTaskId: input.rootTaskId,
+          actorRole: input.actorRole, remainingTurnSteps: input.remainingTurnSteps,
+          signal: input.signal, capabilities: input.capabilities ?? [], reportProgress: async () => undefined,
+        }
+        try {
+          const output = await jobReadTool.execute(context, input.call.input as { jobId: string })
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "completed", output, errorCode: null }
+        } catch (error: unknown) {
+          return {
+            id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed",
+            ...(error instanceof ToolExecutionError && error.safeOutput !== undefined ? { output: error.safeOutput } : {}),
+            errorCode: error instanceof ToolExecutionError ? error.code : "tool_execution_failed",
+          }
+        }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 2, finalText: "Found the Fresh Source role using the successful retry." })
+    expect(root.requests).toHaveLength(3)
+    expect(root.requests[0]?.tools).toEqual([expect.objectContaining({ name: "jobs.get", risk: "read", capabilities: ["read"] })])
+    const retryContext = JSON.stringify(root.requests[1]?.messages)
+    expect(retryContext).toContain(`"toolUseId":"${failedCallId}"`)
+    expect(retryContext).toContain('"isError":true')
+    expect(retryContext).toContain("job-failed")
+    const finalContext = JSON.stringify(root.requests[2]?.messages)
+    expect(finalContext).toContain(`"toolUseId":"${failedCallId}"`)
+    expect(finalContext).toContain(`"toolUseId":"${retryCallId}"`)
+    expect(finalContext).toContain("job-fresh")
+
+    const failedEvent = root.events.find(event => event.type === "tool_call.failed" && (event.payload as Record<string, unknown> | undefined)?.toolCallId === failedCallId)
+    const retryEvent = root.events.find(event => event.type === "tool_call.completed" && (event.payload as Record<string, unknown> | undefined)?.toolCallId === retryCallId)
+    expect(failedEvent?.payload).toMatchObject({ toolCallId: failedCallId, status: "failed", errorCode: "upstream_unavailable" })
+    expect(root.events.indexOf(retryEvent!)).toBeGreaterThan(root.events.indexOf(failedEvent!))
+    const failedResultEvent = root.events.find(event => {
+      if (event.type !== "item.completed" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return false
+      const content = (event.payload as Record<string, unknown>).content
+      return Boolean(content && typeof content === "object" && !Array.isArray(content)
+        && (content as Record<string, unknown>).toolCallId === failedCallId
+        && Object.prototype.hasOwnProperty.call(content, "output"))
+    })
+    expect(failedResultEvent?.payload).toMatchObject({
+      status: "completed",
+      content: { toolCallId: failedCallId, errorCode: "upstream_unavailable", output: { job: { id: "job-failed" } } },
+    })
+
+    expect(completionGate).toHaveBeenCalledOnce()
+    expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", candidateText: "Found the Fresh Source role using the successful retry." }))
+    const finalResponse = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { evidenceRefs: string[] }
+    expect(finalResponse.evidenceRefs).toContain("read:job:job-fresh")
+    expect(finalResponse.evidenceRefs).not.toContain(failedCallId)
+    expect(finalResponse.evidenceRefs).not.toContain("read:job:job-failed")
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
   })
 
   it("finishes the Turn once after atomic terminal commit without a same-Turn follow-up step", async () => {
@@ -599,6 +1137,124 @@ describe("owner-agnostic turn execution loop", () => {
     ]))
     expect(JSON.stringify(secondRequest?.messages).split(lateSteerText)).toHaveLength(2)
     expect(JSON.stringify(secondRequest?.messages).match(/"type":"tool_result"/g)).toHaveLength(1)
+  })
+
+  it("binds each refreshed graph revision to the same-step fresh-steering request and agenda", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = root.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let graphRead = 0
+    let contextBuild = 0
+    const refresh = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: graphRead++ === 0 ? 0 : 7, nodes: [] }))
+    root.options = {
+      ...root.options,
+      tools: [{ name: "jobs.search", version: "1" }, { name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }, { name: "agent.ask_user", version: "1" }],
+      refreshTaskGraphBeforeStep: refresh,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => {
+          const built = await contextBuilder.build({
+            scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+            stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+            steeringMarkerState: request.steeringMarkerState,
+          })
+          if (contextBuild++ === 0) inputStore.acceptSteer()
+          return built
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const secondRequest = root.requests[1]
+    const instruction = secondRequest?.messages.find(message => message.role === "system" && message.content.some(part => part.type === "text" && part.text.includes("Fresh user steering")))
+    const instructionText = instruction?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(refresh).toHaveBeenCalledTimes(2)
+    expect(instructionText).toContain("TaskGraph revision is 7")
+    expect(instructionText).toContain("agent.plan with expectedRevision 7")
+    expect(instructionText).toContain("use only the request-visible agent.ask_user tool")
+    expect(instructionText).not.toContain(lateSteerText)
+    expect(JSON.stringify(secondRequest?.messages)).toContain(lateSteerText)
+    expect(agendas).toHaveLength(2)
+    expect(agendas.map(event => (event.payload as { planRevision?: number | null }).planRevision)).toEqual([0, 7])
+    expect(agendas[1]?.payload).toMatchObject({
+      stepId: secondRequest?.metadata.stepId, goalRevision: null, planRevision: 7,
+    })
+  })
+
+  it("fails before dispatch on Root refresh failure and skips refresh for child tasks", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const refreshFailure = new Error("task graph read unavailable")
+    const refresh = vi.fn(async () => { throw refreshFailure })
+    root.options = { ...root.options, refreshTaskGraphBeforeStep: refresh }
+    const failed = await runTurnExecutionLoop(root.options)
+    expect(failed.status).toBe("failed")
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(root.requests).toHaveLength(0)
+    expect(root.events.some(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE)).toBe(false)
+
+    const child = fixture(identity("task", "child-1", 2))
+    const childRefresh = vi.fn(async snapshot => snapshot)
+    child.options = { ...child.options, refreshTaskGraphBeforeStep: childRefresh }
+    await expect(runTurnExecutionLoop(child.options)).resolves.toMatchObject({ status: "completed" })
+    expect(childRefresh).not.toHaveBeenCalled()
+    expect(child.requests).toHaveLength(2)
+  })
+
+  it("keeps child fresh input untrusted without Root plan guidance despite graph metadata", async () => {
+    const child = fixture(identity("task", "child-1", 2), undefined, [{
+      id: "task-graph-current", content: { kind: "task_graph_current", revision: 9, nodes: [] },
+    }])
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = child.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let contextBuild = 0
+    const refresh = vi.fn(async snapshot => snapshot)
+    child.options = {
+      ...child.options,
+      snapshot: { ...child.options.snapshot, taskGraphRevision: 9 },
+      refreshTaskGraphBeforeStep: refresh,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => {
+          const built = await contextBuilder.build({
+            scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+            stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+            steeringMarkerState: request.steeringMarkerState,
+          })
+          if (contextBuild++ === 0) inputStore.acceptSteer()
+          return built
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(child.options)
+    const secondRequest = child.requests[1]
+    const messageText = secondRequest?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(refresh).not.toHaveBeenCalled()
+    expect(secondRequest?.messages).toBeDefined()
+    expect(messageText).toContain(lateSteerText)
+    expect(messageText).toContain("trust=UNTRUSTED_DATA")
+    expect(messageText).not.toContain("Fresh user steering is present")
+    expect(messageText).not.toContain("owner-scoped TaskGraph revision is")
+    expect(messageText).not.toContain("expectedRevision 9")
   })
 
   it("preserves the count of persisted calls when a later call in the batch exceeds budget", async () => {

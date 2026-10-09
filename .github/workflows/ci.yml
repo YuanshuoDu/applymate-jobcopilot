@@ -124,7 +124,7 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test -n "$AGENT_RUNTIME_PG_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/pg-task-graph-command-port.integration.test.ts
-      - name: Verify native delegation, independent verification, and terminal proof on disposable PostgreSQL/Redis
+      - name: Verify native delegation, independent proof, and durable questions on disposable PostgreSQL/Redis
         env:
           CI: "true"
           AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
@@ -146,7 +146,9 @@ jobs:
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
             src/runtime/subagents/task-graph-native-pg.integration.test.ts \
             src/runtime/subagents/native-verification-pg.integration.test.ts \
-            src/runtime/subagents/native-brain-pg.integration.test.ts
+            src/runtime/subagents/native-verification-history-pg.integration.test.ts \
+            src/runtime/subagents/native-brain-pg.integration.test.ts \
+            src/runtime/turns/turn-question-store-pg.integration.test.ts
       - name: Verify native semantic rejection memory on disposable PostgreSQL
         env:
           CI: "true"

@@ -9,6 +9,8 @@ import type { StepContext } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import { isDurableWaitId } from "../tools/redaction.js"
 import { nativeReceiptFromToolCall } from "../tools/task-graph-coordination-bridge.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
+import { executeNativeQuestionTool, nativeQuestionResultCall, PreparedQuestionRetryError, questionWaitResult, recoverableNativeQuestionCalls, rejectQuestionReplay } from "./turn-execution-question.js"
 
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
 type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState }
@@ -102,6 +104,7 @@ export async function executeTools(
     const replayed = findToolResultObservation(snapshot, call.id)
     if (replayed) {
       if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} does not match its persisted replay record`)
+      rejectQuestionReplay(call.name)
       if (sourceResultItemId) {
         if (!replayEntry || !replayEntry.content || typeof replayEntry.content !== "object" || Array.isArray(replayEntry.content)) {
           throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
@@ -114,8 +117,11 @@ export async function executeTools(
       continue
     }
     if (sourceResultItemId) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
-    const result = await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
+    const result = call.name === "agent.ask_user"
+      ? await executeNativeQuestionTool(options, writer, step, call, output, now, onToolCallPersisted)
+      : await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
     assertExecutionAlive(options, signal)
+    const questionCall = nativeQuestionResultCall(step.id, call, result)
     if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
     if (result.status === "failed" && (result.errorCode === "policy_requires_user_input" || result.errorCode === "gmail_oauth_required")) return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
     const failedWaitCall = result.status === "failed" && (call.name === "agent.wait" || call.name === "wait_subagents")
@@ -125,6 +131,7 @@ export async function executeTools(
       throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid")
     }
     snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, { id: `tool-result:${call.id}`, content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) }] }
+    if (questionCall) return { wait: await questionWaitResult(options, questionCall.stepId, questionCall.toolCallId, now, 0, 0), snapshot, steeringMarkerState: markerState }
     if (call.name === "agent.plan" && result.status === "completed" && hasAcceptedTaskGraphPlan(result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if (hasNativeCoordinationReceipt(call.name, result.status, result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if (call.name === "agent.wait" && result.status === "completed" && isInlineReadyWait(result.output)) snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
@@ -134,7 +141,7 @@ export async function executeTools(
   return { wait: null, snapshot, steeringMarkerState: markerState }
 }
 export async function recoverPersistedToolCalls(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, now: () => Date): Promise<readonly { id: string; content: ReturnType<typeof toRepositoryJson> }[]> {
-  const recovery = options.toolCallRecovery ?? []
+  const recovery = await recoverableNativeQuestionCalls(options, options.toolCallRecovery ?? [], now)
   if (recovery.length === 0) return []
   const mustFailTurn = recovery.some(item => item.action === "fail" || item.action === "terminal")
   const observations: Array<{ id: string; content: ReturnType<typeof toRepositoryJson> }> = []
@@ -150,7 +157,8 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
           call: { id: item.call.id, toolName: item.call.name, toolVersion: item.toolVersion, input: item.call.arguments },
         })
       } catch (error: unknown) {
-        if (options.signal?.aborted) throw error
+        if (options.signal?.aborted || item.call.name === "agent.ask_user" && isSessionPauseRequestedError(error)) throw error
+        if (item.call.name === "agent.ask_user") throw new PreparedQuestionRetryError()
         result = { id: item.call.id, toolName: item.call.name, toolVersion: item.toolVersion, status: "failed", errorCode: "tool_execution_failed" }
       }
     }

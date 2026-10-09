@@ -654,6 +654,52 @@ function stableJson(value) {
   return JSON.stringify(value)
 }
 
+const duplicateRedeliveryPredicateNames = new Set([
+  "read_tool_use_count",
+  "read_tool_assistant_role",
+  "read_tool_name",
+  "read_tool_input_shape_and_target",
+  "read_tool_result_count",
+  "read_tool_result_role",
+  "read_result_json_parseable",
+  "persisted_lifecycle_event_count",
+  "owned_job_row_count",
+  "owned_job_id",
+  "owned_job_user",
+  "owned_job_description",
+  "model_result_job_count",
+  "model_result_job_id_matches_owned_row",
+  "started_tool_name",
+  "started_tool_call_id",
+  "started_status",
+  "started_input",
+  "completed_tool_name",
+  "completed_tool_call_id",
+  "completed_status",
+  "completed_error_code",
+  "completed_output_matches_model_result",
+  "result_job_id",
+  "result_job_company",
+  "result_job_role",
+  "result_job_description_redacted",
+  "raw_description_absent",
+  "result_page",
+  "result_has_more",
+])
+
+function requireDuplicateRedeliveryPredicates(predicates) {
+  const entries = Object.entries(predicates)
+  const failed = entries.filter(([, passed]) => !passed).map(([name]) => name)
+  const hasUnknownPredicate = entries.some(([name]) => !duplicateRedeliveryPredicateNames.has(name))
+  if (failed.length > 0 || hasUnknownPredicate) {
+    const safeFailed = hasUnknownPredicate
+      ? ["fixture_predicate_diagnostic_unavailable"]
+      : failed
+    say(`DUPLICATE_REDELIVERY_PREDICATES ${JSON.stringify(safeFailed)}`)
+    throw new Error("duplicate_redelivery_evidence_failed")
+  }
+}
+
 async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJobId }) {
   const readJobDescription = `recruiter-${ids.suffix}@example.com +353 87 123 4567`
   const requestParts = request.messages.flatMap(message => Array.isArray(message.content)
@@ -661,15 +707,21 @@ async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJob
   const toolUses = requestParts.filter(entry => entry.part?.type === "tool_use" && entry.part.id === readCallId)
   const toolResults = requestParts.filter(entry => entry.part?.type === "tool_result" && entry.part.toolUseId === readCallId)
   const input = toolUses[0]?.part.input
-  const inputMatches = input && typeof input === "object" && !Array.isArray(input)
+  const inputMatches = Boolean(input && typeof input === "object" && !Array.isArray(input)
     && Object.keys(input).length === 2 && input.target === ids.suffix && input.limit === 1
-  if (toolUses.length !== 1 || toolUses[0].message.role !== "assistant"
-    || toolUses[0].part.name !== "jobs.search" || !inputMatches
-    || toolResults.length !== 1 || toolResults[0].message.role !== "tool") {
-    throw new Error("duplicate_redelivery_model_missing_read_tool_result")
-  }
+  )
+  requireDuplicateRedeliveryPredicates({
+    read_tool_use_count: toolUses.length === 1,
+    read_tool_assistant_role: toolUses[0]?.message.role === "assistant",
+    read_tool_name: toolUses[0]?.part.name === "jobs.search",
+    read_tool_input_shape_and_target: inputMatches,
+    read_tool_result_count: toolResults.length === 1,
+    read_tool_result_role: toolResults[0]?.message.role === "tool",
+  })
   let resultOutput
-  try { resultOutput = JSON.parse(toolResults[0].part.content) } catch { throw new Error("duplicate_redelivery_model_read_result_invalid_json") }
+  try { resultOutput = JSON.parse(toolResults[0].part.content) } catch {
+    requireDuplicateRedeliveryPredicates({ read_result_json_parseable: false })
+  }
   const [persisted, ownedJob] = await Promise.all([
     pool.query(
     `SELECT event."type", event."payload" FROM "agent_events" AS event
@@ -685,27 +737,39 @@ async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJob
       [readJobId, ids.userId],
     ),
   ])
-  if (persisted.rows.length !== 2) throw new Error("duplicate_redelivery_read_result_not_persisted_once")
-  if (ownedJob.rows.length !== 1 || ownedJob.rows[0].id !== readJobId || ownedJob.rows[0].userId !== ids.userId
-    || ownedJob.rows[0].description !== readJobDescription || resultOutput?.jobs?.length !== 1
-    || resultOutput.jobs[0]?.id !== ownedJob.rows[0].id) {
-    throw new Error("duplicate_redelivery_search_result_not_owned_job_row")
-  }
+  const ownedJobRow = ownedJob.rows[0]
+  const outputJobs = resultOutput && typeof resultOutput === "object" && Array.isArray(resultOutput.jobs)
+    ? resultOutput.jobs : []
+  const outputJob = outputJobs[0]
+  requireDuplicateRedeliveryPredicates({
+    persisted_lifecycle_event_count: persisted.rows.length === 2,
+    owned_job_row_count: ownedJob.rows.length === 1,
+    owned_job_id: ownedJobRow?.id === readJobId,
+    owned_job_user: ownedJobRow?.userId === ids.userId,
+    owned_job_description: ownedJobRow?.description === readJobDescription,
+    model_result_job_count: outputJobs.length === 1,
+    model_result_job_id_matches_owned_row: outputJob?.id === ownedJobRow?.id,
+  })
   const started = persisted.rows.find(row => row.type === "tool_call.started")?.payload
   const completed = persisted.rows.find(row => row.type === "tool_call.completed")?.payload
-  if (started?.toolName !== "jobs.search" || started?.toolCallId !== readCallId || started?.status !== "started"
-    || stableJson(started?.input) !== stableJson({ target: ids.suffix, limit: 1 })
-    || completed?.toolName !== "jobs.search" || completed?.toolCallId !== readCallId
-    || completed?.status !== "completed" || completed?.errorCode !== null
-    || stableJson(completed?.output) !== stableJson(resultOutput)
-    || resultOutput.jobs[0]?.id !== readJobId
-    || resultOutput.jobs[0]?.company !== `Fixture Employer ${ids.suffix}`
-    || resultOutput.jobs[0]?.role !== "Fixture Engineer"
-    || resultOutput.jobs[0]?.description !== "[REDACTED_EMAIL] [REDACTED_PHONE]"
-    || JSON.stringify(resultOutput).includes(readJobDescription)
-    || resultOutput.page !== 1 || resultOutput.hasMore !== false) {
-    throw new Error("duplicate_redelivery_persisted_read_result_invalid")
-  }
+  requireDuplicateRedeliveryPredicates({
+    started_tool_name: started?.toolName === "jobs.search",
+    started_tool_call_id: started?.toolCallId === readCallId,
+    started_status: started?.status === "started",
+    started_input: stableJson(started?.input) === stableJson({ target: ids.suffix, limit: 1 }),
+    completed_tool_name: completed?.toolName === "jobs.search",
+    completed_tool_call_id: completed?.toolCallId === readCallId,
+    completed_status: completed?.status === "completed",
+    completed_error_code: completed?.errorCode === null,
+    completed_output_matches_model_result: stableJson(completed?.output) === stableJson(resultOutput),
+    result_job_id: outputJob?.id === readJobId,
+    result_job_company: outputJob?.company === `Fixture Employer ${ids.suffix}`,
+    result_job_role: outputJob?.role === "Fixture Engineer",
+    result_job_description_redacted: outputJob?.description === "[REDACTED_EMAIL] [REDACTED_PHONE]",
+    raw_description_absent: !JSON.stringify(resultOutput).includes(readJobDescription),
+    result_page: resultOutput?.page === 1,
+    result_has_more: resultOutput?.hasMore === false,
+  })
   say(`DUPLICATE_READ_EVIDENCE_PERSISTED ${readCallId} read:job:${readJobId}`)
 }
 

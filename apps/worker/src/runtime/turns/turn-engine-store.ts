@@ -7,6 +7,7 @@ import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMa
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
+import { attachTurnQuestionStore } from "./turn-question-store-factory.js"
 import { resolveNativeSemanticProgressModeWithClient } from "./native-semantic-mode-store.js"
 import { completeNativeSemanticRejectionStepWithClient } from "./native-semantic-rejection-completion.js"
 import { nativeSemanticSchemaConflict, readNativeSemanticRejectionsWithClient } from "./native-semantic-rejection-ledger.js"
@@ -87,7 +88,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
   })
 }
 export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: TurnEngineTerminalGuard): TurnEngineStore {
-  return {
+  return attachTurnQuestionStore({
     async resolveNativeSemanticProgressMode(input) {
       try { return await tenantTransaction(pool, input.owner.userId, client => resolveNativeSemanticProgressModeWithClient(client, input)) }
       catch (error: unknown) { return nativeSemanticSchemaConflict(error) }
@@ -215,5 +216,5 @@ export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: Tu
         if (result.rowCount !== 1) throw conflict(`final response for turn ${input.owner.turnId}`)
       })
     },
-  }
+  }, pool)
 }
