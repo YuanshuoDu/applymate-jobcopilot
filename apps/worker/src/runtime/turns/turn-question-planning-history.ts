@@ -139,4 +139,3 @@ export async function readTurnQuestionPlanningHistory(client: Queryable, owner: 
   }
   return summaries
 }
-
