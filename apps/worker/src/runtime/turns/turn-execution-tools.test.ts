@@ -47,6 +47,35 @@ describe("recoverPersistedToolCalls", () => {
     expect(JSON.stringify(fixture.updates)).toContain("tool_result_replay_uncertain")
     expect(fixture.events.some(event => event.type === "tool_call.failed" && JSON.stringify(event.payload).includes("tool_result_replay_uncertain"))).toBe(true)
   })
+
+  it("does not replay a confirmed pre-intent paused ask call after the root wait store returns none", async () => {
+    const ask: ToolCallRecovery = { ...pending, call: { id: "ask-old", name: "agent.ask_user", arguments: { question: "Old question?" } } }
+    const execute = vi.fn()
+    const fixture = execution(ask, execute)
+    fixture.options = { ...fixture.options, store: { ...fixture.options.store, readPendingQuestion: async () => ({ status: "none" }) } }
+
+    await expect(recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date())).resolves.toEqual([])
+    expect(execute).not.toHaveBeenCalled()
+    expect(fixture.updates).toEqual([])
+    expect(fixture.events).toEqual([])
+  })
+
+  it("keeps a recoverable ask_user intent pending when its idempotent replay throws", async () => {
+    const arguments_ = { question: "Which city?", choices: [{ label: "Berlin", value: "berlin" }] }
+    const ask: ToolCallRecovery = { ...pending, action: "replay", stepId: "step-1", callItem: { id: "ask-item", revision: 0 },
+      call: { id: "ask-1", name: "agent.ask_user", arguments: arguments_ } }
+    const execute = vi.fn(async () => { throw new Error("transient tool failure") })
+    const fixture = execution(ask, execute as never)
+    fixture.options = { ...fixture.options, store: { ...fixture.options.store, readPendingQuestion: async () => ({
+      status: "replayable", stepId: "step-1", toolCallId: "ask-1", callItemId: "ask-item",
+      intent: { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [{ label: "Berlin", value: "berlin" }] },
+    }) } }
+
+    await expect(recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date())).rejects.toMatchObject({ code: "prepared_question_wait_retry_required" })
+    expect(execute).toHaveBeenCalledOnce()
+    expect(fixture.updates).toEqual([])
+    expect(fixture.events).toEqual([])
+  })
 })
 
 describe("executeTools persisted replay", () => {

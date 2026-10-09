@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
 
-import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink } from "./canonical-runtime-tool-recovery.js"
+import { assertCanonicalCoordinationSurface, assertCanonicalQuestionStore, assertCanonicalQuestionSurface, classifyToolCallRecovery, durableLifecycleSink, isNativeQuestionWaitEnabled } from "./canonical-runtime-tool-recovery.js"
 import type { PersistedToolCallRecovery } from "./turn-engine-types.js"
 
 const pending: PersistedToolCallRecovery = {
@@ -44,6 +44,22 @@ function lifecycleDigest(): string {
 }
 
 describe("canonical runtime tool recovery", () => {
+  it("requires the native question tool and wait store together when enabled", () => {
+    expect(() => assertCanonicalQuestionSurface({ list: () => [{ name: "agent.ask_user" }] }, [])).not.toThrow()
+    expect(() => assertCanonicalQuestionSurface({ list: () => [] }, [])).toThrow("canonical_question_tool_unconfigured")
+    expect(() => assertCanonicalQuestionStore({}, false)).not.toThrow()
+    expect(() => assertCanonicalQuestionStore({}, true)).toThrow("canonical_question_wait_unconfigured")
+    expect(() => assertCanonicalQuestionStore({ stageQuestionUsage() {}, cancelPausedQuestion() {}, waitForQuestion() {}, readPendingQuestion() {} }, true)).not.toThrow()
+  })
+
+  it("gates ask_user to the native root and fails closed for custom adapters by default", () => {
+    expect(isNativeQuestionWaitEnabled({ coordination: true, nativeRoot: false, customAdapters: false })).toBe(false)
+    expect(isNativeQuestionWaitEnabled({ coordination: false, nativeRoot: true, customAdapters: false })).toBe(false)
+    expect(isNativeQuestionWaitEnabled({ coordination: true, nativeRoot: true, customAdapters: false })).toBe(true)
+    expect(isNativeQuestionWaitEnabled({ coordination: true, nativeRoot: true, customAdapters: true })).toBe(false)
+    expect(isNativeQuestionWaitEnabled({ coordination: true, nativeRoot: true, requested: true, customAdapters: true })).toBe(true)
+  })
+
   it("replays only server-classified read-only or idempotent tools", () => {
     const resolve = vi.fn((name: string, _version: string) => ({ idempotency: name === "safe" ? "idempotent" as const : "non_repeatable" as const }))
     const result = classifyToolCallRecovery([

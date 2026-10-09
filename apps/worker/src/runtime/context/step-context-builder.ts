@@ -32,6 +32,7 @@ export type StepContextSnapshot = {
   readonly steerHistory: readonly ContextHistoryEntry[]
   readonly businessRefs: readonly BusinessReference[]
   readonly toolObservations: readonly ContextSeedBlock[]
+  readonly taskGraphRevision?: number
 }
 
 export type ContextBlock = {
@@ -52,6 +53,7 @@ export type StepContext = {
   readonly consumedInputIds: readonly string[]
   readonly blocks: readonly ContextBlock[]
   readonly canonicalJson: string
+  readonly taskGraphRevision?: number
   readonly steeringMarkerControl?: StepSteeringMarkerControl
 }
 
@@ -71,6 +73,10 @@ export class ContextOwnershipError extends Error {
     super(message)
     this.name = "ContextOwnershipError"
   }
+}
+
+function safeTaskGraphRevision(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 const defaultOwnerFence: ContextOwnerFence = {
@@ -220,6 +226,7 @@ export class StepContextBuilder {
       schemaVersion: "agent-harness.v2" as const, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
       inputThroughSequence: nextCheckpoint.inputThroughSequence, consumedInputIds: [...nextCheckpoint.consumedInputIds], blocks: ordered,
     }
+    const taskGraphRevision = safeTaskGraphRevision(request.snapshot.taskGraphRevision)
     const newlyObservedInputIds = request.steeringMarkerContext
       ? newlyClaimedSteerInputIds.filter((inputId) => inputId !== request.rootInputId)
       : []
@@ -228,6 +235,7 @@ export class StepContextBuilder {
       : []
     return {
       ...result,
+      ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }),
       canonicalJson: stableJson({ ...result, inputThroughSequence: result.inputThroughSequence.toString() }),
       steeringMarkerControl: { activeInputIds: hydrated.map((input) => input.id), newlyObservedInputIds, newlyObservedMarkers },
     }

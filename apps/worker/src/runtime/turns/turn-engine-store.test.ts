@@ -60,6 +60,15 @@ function turnStartBudgetFixture(input: {
 }
 
 describe("PostgreSQL TurnEngine store", () => {
+  it("composes the durable native question methods into the production store", () => {
+    const { pool } = turnStartBudgetFixture({ budgetSnapshot: {} })
+    const store = createPgTurnEngineStore(pool)
+    expect(store.stageQuestionUsage).toEqual(expect.any(Function))
+    expect(store.cancelPausedQuestion).toEqual(expect.any(Function))
+    expect(store.waitForQuestion).toEqual(expect.any(Function))
+    expect(store.readPendingQuestion).toEqual(expect.any(Function))
+  })
+
   it("linearizes tool start against pause on the locked Session before writing its started event", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {

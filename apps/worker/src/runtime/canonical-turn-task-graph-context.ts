@@ -11,7 +11,7 @@ import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
-const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents"])
+const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
   const name = record(definition)?.name
@@ -227,7 +227,7 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   const content = { kind: "task_graph_current", revision: Number(state.revision), nodes }
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
   return {
-    ...snapshot,
+    ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [
       ...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID),
       { id: OBSERVATION_ID, content },

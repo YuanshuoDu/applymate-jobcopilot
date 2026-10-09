@@ -29,6 +29,22 @@ function bindStore(store: TurnEngineOptions["store"]): TurnExecutionStore {
     startStep: (input) => store.startStep({ ...withoutIdentity(input), owner: input.identity }),
     updateStep: (input) => store.updateStep({ ...withoutIdentity(input), owner: input.identity }),
     waitForUser: store.waitForUser ? (input) => store.waitForUser!({ ...withoutIdentity(input), owner: input.identity }) : undefined,
+    stageQuestionUsage: store.stageQuestionUsage ? (input) => {
+      if (input.identity.kind !== "turn") throw new TurnLeaseError("lease_lost", "Child execution cannot stage a user question")
+      return store.stageQuestionUsage!({ ...withoutIdentity(input), owner: input.identity })
+    } : undefined,
+    cancelPausedQuestion: store.cancelPausedQuestion ? (input) => {
+      if (input.identity.kind !== "turn") throw new TurnLeaseError("lease_lost", "Child execution cannot cancel a user question")
+      return store.cancelPausedQuestion!({ ...withoutIdentity(input), owner: input.identity })
+    } : undefined,
+    waitForQuestion: store.waitForQuestion ? (input) => {
+      if (input.identity.kind !== "turn") throw new TurnLeaseError("lease_lost", "Child execution cannot wait for user input")
+      return store.waitForQuestion!({ ...withoutIdentity(input), owner: input.identity })
+    } : undefined,
+    readPendingQuestion: store.readPendingQuestion ? (input) => {
+      if (input.identity.kind !== "turn") throw new TurnLeaseError("lease_lost", "Child execution cannot recover a user question")
+      return store.readPendingQuestion!({ ...withoutIdentity(input), owner: input.identity })
+    } : undefined,
     createItem: (input) => store.createItem({ ...withoutIdentity(input), owner: input.identity }),
     updateItem: (input) => store.updateItem({ ...withoutIdentity(input), owner: input.identity }),
     appendEvent: (input) => store.appendEvent({ ...withoutIdentity(input), owner: input.identity }),

@@ -71,11 +71,14 @@ describe("TaskGraph turn observation", () => {
       toolObservations: [
         { id: "search-result", content: { toolName: "jobs.search" } },
         { id: "wait-result:wait-1", content: { toolName: "agent.wait", output: { status: "ready" } } },
+        { id: "question-result:ask-1", content: { toolName: "agent.ask_user", status: "completed", output: { kind: "user_question", stage: "user_input", question: "Which city?" } } },
         { id: "task-graph-current", content: { kind: "task_graph_current", revision: 1 } },
       ],
     }
-    expect(selectedJobSnapshot(original).toolObservations.map(item => item.id)).toEqual(["wait-result:wait-1", "task-graph-current"])
+    expect(selectedJobSnapshot(original).toolObservations.map(item => item.id)).toEqual(["wait-result:wait-1", "question-result:ask-1", "task-graph-current"])
     expect(isSelectedJobRootTool({ name: "agent.plan" })).toBe(true)
+    expect(isSelectedJobRootTool({ name: "agent.ask_user" })).toBe(true)
+    expect(selectedJobToolAllowed("agent.ask_user")).toBe(true)
     expect(selectedJobToolAllowed("jobs.search")).toBe(false)
   })
 
@@ -115,6 +118,7 @@ describe("TaskGraph turn observation", () => {
   it("refreshes the old graph observation while preserving other observations and live outcomes", () => {
     const result = mergeTaskGraphCurrentObservation(snapshot(), state)
 
+    expect(result.taskGraphRevision).toBe(3)
     expect(result.toolObservations).toEqual([
       { id: "existing", content: { kept: true } },
       { id: "task-graph-current", content: { kind: "task_graph_current", revision: 3, nodes: [{ ...state.nodes[0]!, resultSummary: null, failureReason: null }] } },
@@ -122,6 +126,13 @@ describe("TaskGraph turn observation", () => {
     const encoded = JSON.stringify(result.toolObservations.at(-1)?.content)
     expect(encoded).not.toContain("Alice Example")
     expect(encoded).not.toContain("private.example")
+  })
+
+  it("replaces stale revision metadata from the typed read, including graph revision zero", () => {
+    const result = mergeTaskGraphCurrentObservation({ ...snapshot(), taskGraphRevision: 8 }, { revision: 0, nodes: [] })
+
+    expect(result.taskGraphRevision).toBe(0)
+    expect(result.toolObservations.at(-1)?.content).toEqual({ kind: "task_graph_current", revision: 0, nodes: [] })
   })
 
   it("preserves safe native operation and structural result receipts in the current graph", () => {
