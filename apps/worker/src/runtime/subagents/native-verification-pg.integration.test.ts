@@ -64,6 +64,17 @@ type QuestionSeedOverrides = Partial<QuestionSeedInput>
 let priorQuestionFixture: PriorQuestionFixture | undefined
 const goal = "Find and verify the persisted source facts"
 const criteria = ["Cite the owned tool result"]
+
+function containsText(value: unknown, text: string): boolean {
+  if (typeof value === "string") {
+    if (value.includes(text)) return true
+    try { return containsText(JSON.parse(value) as unknown, text) } catch { return false }
+  }
+  if (Array.isArray(value)) return value.some(item => containsText(item, text))
+  if (value && typeof value === "object") return Object.values(value).some(item => containsText(item, text))
+  return false
+}
+
 const rootGoal = "Find and verify the persisted source facts while preserving the user's stated location and phrase."
 const rootCriteria = ["Cite the owned tool result", "Respect the user's stated location and phrase as self-attestation, not external proof."]
 const childResult = { answer: "The source records fact 42" }
@@ -221,6 +232,7 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
   const answeredEventId = `${eventPrefix}-answered-event-${suffix}`
   const answerPayload = { waitKind: "question", waitId, itemId, turnId: seed.turnId,
     toolCallId, status: "answered", nextTurnRevision: 3, answerAvailable: true }
+  const answerKey = "question-answer:" + seed.turnId + ":" + waitId
   const eventRows = [
     { id: `${eventPrefix}-step-event-${suffix}`, itemId: null, taskId: seed.rootTaskId, sequence: firstSequence + 1, type: "step.completed",
       actor: "orchestrator", correlationId: seed.stepId, causationId: previousRootEvent.rows[0]?.id ?? null,
@@ -230,10 +242,10 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
       actor: "orchestrator", correlationId: itemId, causationId: waitId, key: `agent-wait:${itemId}:started`,
       payload: { itemId, waitKind: "question", questionId: waitId, toolCallId }, topic: "agent.events" },
     { id: answeredEventId, itemId, taskId: null, sequence: firstSequence + 3, type: "question.answered",
-      actor: "user", correlationId: waitId, causationId: itemId, key: `question-answer:${suffix}`, payload: answerPayload, topic: "agent.session.event" },
+      actor: "user", correlationId: waitId, causationId: itemId, key: answerKey, payload: answerPayload, topic: "agent.session.event" },
     { id: `${eventPrefix}-wakeup-event-${suffix}`, itemId, taskId: null, sequence: firstSequence + 4, type: "turn.wakeup",
       actor: "user", correlationId: seed.turnId, causationId: answeredEventId,
-      key: `question-answer:${suffix}:wakeup`, payload: answerPayload, topic: "agent.turn.wakeup" },
+      key: answerKey + ":wakeup", payload: answerPayload, topic: "agent.turn.wakeup" },
   ]
   for (const event of eventRows) {
     const envelope = { eventId: event.id, sessionId: ids.session, turnId: seed.turnId, itemId: event.itemId,
@@ -414,10 +426,10 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const attestation = rootPacket?.evidence.filter(item => item.kind === "user_self_attestation") ?? []
     expect(attestation).toHaveLength(2)
     const privateSummaries = attestation.map(item => JSON.parse(item.summary) as Record<string, unknown>)
-    expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
-      question: answeredQuestion.question, options: [], answer: answeredQuestion.answer })
-    expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
-      question: priorQuestion.question, options: [], answer: priorQuestion.answer })
+    expect(privateSummaries).toContainEqual(expect.objectContaining({ kind: "user_self_attestation", stage: "user_input",
+      question: answeredQuestion.question, options: [], answer: answeredQuestion.answer }))
+    expect(privateSummaries).toContainEqual(expect.objectContaining({ kind: "user_self_attestation", stage: "user_input",
+      question: priorQuestion.question, options: [], answer: priorQuestion.answer }))
     const privateReferenceIds = attestation.map(item => item.referenceId)
     if (!rootControl || !rootPacket || privateReferenceIds.some(value => !value)) throw new Error("native_answer_evidence_packet_unavailable")
     for (const referenceId of privateReferenceIds) expect(referenceId).toMatch(/^user-self-attestation:[a-f0-9]{64}$/)
@@ -430,13 +442,25 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const modelRequest = executed.requests[0]!
     expect(modelRequest.tools).toEqual([])
     expect(modelRequest.toolChoice).toBeUndefined()
-    const modelText = modelRequest.messages.flatMap(message => message.content)
+    const profileHeader = "[harness context layer=profile trust=UNTRUSTED_DATA source=native-verification-packet]\n"
+    const profileBlocks = modelRequest.messages.filter(message => message.role === "user")
+      .flatMap(message => message.content)
+      .flatMap(part => part.type === "text" && part.text.startsWith(profileHeader)
+        ? [JSON.parse(part.text.slice(profileHeader.length)) as unknown] : [])
+    expect(profileBlocks).toHaveLength(1)
+    if (rootPacket.target.kind !== "root_goal") throw new Error("native_root_goal_packet_unavailable")
+    expect(profileBlocks[0]).toEqual({ goal: rootPacket.goal, criteria: rootPacket.criteria,
+      target: { kind: rootPacket.target.kind, referenceId: rootPacket.target.referenceId, candidateText: rootPacket.target.candidateText },
+      evidence: rootPacket.evidence })
+    const systemMessages = modelRequest.messages.filter(message => message.role === "system")
+    const systemText = systemMessages.flatMap(message => message.content)
       .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
       .map(part => part.text).join("\n")
-    expect(modelText.includes(JSON.stringify(answeredQuestion.answer))).toBe(true)
-    expect(modelText.includes(JSON.stringify(priorQuestion.answer))).toBe(true)
-    expect(modelText.includes("not independent proof of external facts")).toBe(true)
-    expect(modelText.includes("action, approval, consent, credential, or submission authority")).toBe(true)
+    expect(systemText).toContain("not independent proof of external facts")
+    expect(systemText).toContain("action, approval, consent, credential, or submission authority")
+    for (const secret of [answeredQuestion.question, answeredQuestion.answer, priorQuestion.question, priorQuestion.answer, ...privateReferenceIds]) {
+      expect(containsText(systemMessages, secret)).toBe(false)
+    }
     expect(executed.usageAuthorizations).toHaveLength(1)
     expect(executed.usageAuthorizations[0]?.executionOwner).toMatchObject({ kind: "task", taskId: rootTaskIds[0], rootTaskId: ids.root })
     expect(executed.usageSettlements).toEqual([{ status: "success", inputTokens: 173, outputTokens: 41, estimatedCostUsd: 0.013 }])
@@ -464,16 +488,15 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(reservation.rows[0]?.status).toBe("consumed")
 
     const publicResult = projectNativeVerificationResult(completedControl.rows[0]?.result)
-    const publicResultJson = JSON.stringify(publicResult)
     expect(publicResult).toMatchObject({ nativeVerificationFeedback: { disposition: "passed", criteria: [
       { criterionId: "criterion-1", disposition: "passed", evidenceReferenceIds: expect.arrayContaining([rootPacket.target.referenceId]) },
       { criterionId: "criterion-2", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: [] },
     ] } })
     expect(publicResult).not.toHaveProperty("nativeVerificationReport")
-    expect(publicResultJson.includes(answeredQuestion.answer)).toBe(false)
-    expect(publicResultJson.includes(priorQuestion.answer)).toBe(false)
-    for (const referenceId of privateReferenceIds) expect(publicResultJson.includes(referenceId)).toBe(false)
-    expect(publicResultJson.includes(rootPacket.target.referenceId)).toBe(true)
+    for (const secret of [answeredQuestion.answer, priorQuestion.answer, ...privateReferenceIds]) {
+      expect(containsText(publicResult, secret)).toBe(false)
+    }
+    expect(containsText(publicResult, rootPacket.target.referenceId)).toBe(true)
     const [publicItems, publicEvents, publicOutbox] = await Promise.all([
       pool!.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`,
         [ids.session, ids.turn, rootTaskIds[0]]),
@@ -486,10 +509,10 @@ describePg("native verification PostgreSQL producer and readback", () => {
     ])
     expect(publicEvents.rows.length).toBeGreaterThan(0)
     expect(publicOutbox.rows.length).toBeGreaterThan(0)
-    const publicRecords = JSON.stringify({ items: publicItems.rows, events: publicEvents.rows, outbox: publicOutbox.rows })
-    expect(publicRecords.includes(answeredQuestion.answer)).toBe(false)
-    expect(publicRecords.includes(priorQuestion.answer)).toBe(false)
-    for (const referenceId of privateReferenceIds) expect(publicRecords.includes(referenceId)).toBe(false)
+    const publicRecords = { items: publicItems.rows, events: publicEvents.rows, outbox: publicOutbox.rows }
+    for (const secret of [answeredQuestion.answer, priorQuestion.answer, ...privateReferenceIds]) {
+      expect(containsText(publicRecords, secret)).toBe(false)
+    }
 
     const recovered = await port.readRecoverableGoal(scope)
     expect(recovered).toMatchObject({ status: "passed", candidateText })

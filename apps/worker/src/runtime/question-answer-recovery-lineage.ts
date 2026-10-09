@@ -156,7 +156,7 @@ export async function recoverAnsweredQuestionLineage(
     item."status" = 'completed' OR item."content"->>'answerAvailable' = 'true' OR item."content"->>'answer' IS NOT NULL
     OR EXISTS (SELECT 1 FROM "agent_events" AS answer_event WHERE answer_event."sessionId" = item."sessionId"
       AND answer_event."turnId" = item."turnId" AND answer_event."itemId" = item."id"
-      AND answer_event."type" = 'question.answered' AND (answer_event."taskId" IS NULL OR answer_event."taskId" = item."taskId')))
+      AND answer_event."type" = 'question.answered' AND (answer_event."taskId" IS NULL OR answer_event."taskId" = item."taskId")))
     AND (item."content"->>'stage' = 'user_input' OR EXISTS (SELECT 1 FROM "agent_items" AS ask_call WHERE ask_call."sessionId" = item."sessionId"
       AND ask_call."turnId" = item."turnId" AND ask_call."taskId" = item."taskId" AND ask_call."type" = 'tool_call'
       AND ask_call."content"->>'toolName' = 'agent.ask_user' AND ask_call."content"->>'toolCallId' = item."content"->>'toolCallId'))`
