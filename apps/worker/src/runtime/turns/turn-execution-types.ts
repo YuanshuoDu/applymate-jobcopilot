@@ -21,15 +21,17 @@ import type {
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import type { NativeSemanticProgressMode, NativeSemanticRejectionCount, NativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
 export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
 export const RESET_NATIVE_SEMANTIC_PROGRESS: unique symbol = Symbol("reset-native-semantic-progress")
 
 export type TurnEngineCompletionGateResult =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string
+  | ({ readonly ok: true } & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
+  | ({ readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string
       readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: NativeSemanticRejectionIdentity }
+      & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
 
 export type TurnEngineCompletionGate = ((input: {
   readonly identity: TurnExecutionIdentity

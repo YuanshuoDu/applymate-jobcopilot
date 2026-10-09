@@ -2,9 +2,13 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
-import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
+import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
+import { createCanonicalTurnTerminalGuard } from "../canonical-turn-native-verification-runtime.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
+import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
 vi.mock("../subagents/steering-reconciliation-ledger.js", async importOriginal => ({
@@ -287,6 +291,29 @@ describe("atomic Turn terminal commit", () => {
     })).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
   })
 
+  it("keeps the private graph binding out of receipts and requires exact summary replay", async () => {
+    const fake = makePool()
+    const binding = { graphRevision: 1, summary: reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [] }) }
+    const final = { schemaVersion: "agent-harness.v2.final", response: "Final answer", summary: formatTaskGraphFinalSummary(binding.summary) }
+    const boundInput = { ...input, response: JSON.stringify(final), finalContent: { text: final.response, final }, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
+    const guard = vi.fn(async (_client: pg.PoolClient, terminal: Parameters<TurnEngineTerminalGuard>[1]) => {
+      expect(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
+      return { ok: true as const }
+    })
+
+    await expect(commitTurnTerminal(fake.pool, boundInput, guard)).resolves.toMatchObject({ status: "completed" })
+    await expect(commitTurnTerminal(fake.pool, boundInput, guard)).resolves.toMatchObject({ status: "completed" })
+    expect(guard).toHaveBeenCalledOnce()
+    expect(fake.state.turn.finalResponse).toBe(boundInput.response)
+    expect(JSON.stringify(fake.state.root.result)).not.toContain("task_graph_final_summary_binding")
+
+    const changedFinal = { ...final, summary: "Task-reported results: discovered jobs: 1 (complete)." }
+    await expect(commitTurnTerminal(fake.pool, {
+      ...boundInput, response: JSON.stringify(changedFinal), finalContent: { text: changedFinal.response, final: changedFinal },
+    }, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+    expect(guard).toHaveBeenCalledOnce()
+  })
+
   it("validates before terminal writes and bypasses the guard on committed replay after source changes", async () => {
     const fake = makePool()
     let sourceCurrent = true
@@ -331,6 +358,38 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.events.size).toBe(0)
     expect(fake.outboxes.size).toBe(0)
     expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("rolls back when the canonical terminal guard cannot rebind a graph summary", async () => {
+    const fake = makePool()
+    const binding = { graphRevision: 1, summary: reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [] }) }
+    const final = { schemaVersion: "agent-harness.v2.final", response: "Final answer", summary: formatTaskGraphFinalSummary(binding.summary) }
+    const boundInput = {
+      ...input, response: JSON.stringify(final), finalContent: { text: final.response, final },
+      [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding,
+    }
+    const checkRootGraph = vi.fn(async () => ({ ok: true as const }))
+    const guard = createCanonicalTurnTerminalGuard({
+      enabled: true,
+      nativeVerification: { checkTerminal: vi.fn(async () => ({ nativeVerificationPassed: true })) },
+      checkRootGraph,
+    })
+    if (!guard) throw new Error("terminal guard was not enabled")
+
+    await expect(commitTurnTerminal(fake.pool, boundInput, guard)).rejects.toMatchObject({
+      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified",
+    })
+
+    expect(checkRootGraph).toHaveBeenCalledOnce()
+    expect(fake.calls[0]?.sql).toBe("BEGIN ISOLATION LEVEL READ COMMITTED")
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+    expect(fake.state.root).toMatchObject({ status: "running", result: null })
+    expect(fake.state.turn).toMatchObject({ status: "in_progress", finalResponse: null })
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+    expect(fake.calls.some(({ sql }) => sql === "COMMIT")).toBe(false)
   })
 
   it("does not terminalize a Turn after durable pause admission is denied", async () => {

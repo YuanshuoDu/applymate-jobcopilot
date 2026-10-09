@@ -4,6 +4,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { createPgRootTaskStore } from "./root-task-store.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
 vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
@@ -57,7 +58,7 @@ function fakePool(existing: Record<string, unknown> | null = null, updateCount =
   return { pool: { connect: vi.fn(async () => client) } as never, calls, client }
 }
 
-function completionPool(descendants: Array<Record<string, unknown>>, owned = true, hasTaskGraphProposal = false) {
+function completionPool(descendants: Array<Record<string, unknown>>, owned = true, hasTaskGraphProposal = false, hasGraphSnapshot = false, beforeGraphRead?: () => Promise<void>) {
   const calls: string[] = []
   const client = {
     query: vi.fn(async (sql: string) => {
@@ -65,9 +66,15 @@ function completionPool(descendants: Array<Record<string, unknown>>, owned = tru
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return owned ? { rows: [{ id: "turn-1", rootTaskId: "root-turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
-      if (sql.includes('SELECT task."id", task."status"')) return { rows: descendants, rowCount: descendants.length }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('task."id" = ANY($1::text[])')) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT task."id", task."status"') && sql.includes('task."id" <> $3')) return { rows: descendants, rowCount: descendants.length }
       if (sql.includes('SELECT 1 FROM "agent_events" AS event') && sql.includes("'proposal'")) {
         return hasTaskGraphProposal ? { rows: [{}], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('FROM "agent_items" AS item')) {
+        if (!hasGraphSnapshot) return { rows: [], rowCount: 0 }
+        await beforeGraphRead?.()
+        return { rows: [{ id: "graph-item", revision: 3, content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, createdAt: new Date() }], rowCount: 1 }
       }
       return { rows: [], rowCount: 1 }
     }),
@@ -363,7 +370,7 @@ describe("createPgRootTaskStore", () => {
   it("forwards the independent native proof only for native nodes and keeps legacy nodes fail-closed", async () => {
     const nativeOnly = createPgRootTaskStore(verificationCompletionPool([nativeGraphNode()]).pool)
     await expect(nativeOnly.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: true }))
-      .resolves.toEqual({ ok: true })
+      .resolves.toMatchObject({ ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: { graphRevision: 1 } })
     await expect(nativeOnly.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: false }))
       .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified", feedback: expect.stringContaining("issue=legacy_unverified") })
 
@@ -561,13 +568,34 @@ describe("createPgRootTaskStore", () => {
   })
 
   it("checks durable graph proof on the caller transaction without opening a nested transaction", async () => {
-    const fake = completionPool([])
+    const fake = completionPool([], true, false, true)
     const store = createPgRootTaskStore(fake.pool)
-    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never })).resolves.toEqual({ ok: true })
+    const result = await store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never })
+    expect(result).toMatchObject({ ok: true })
+    expect(result[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toMatchObject({ graphRevision: 3, summary: { graphRevision: 3 } })
     expect(fake.calls).not.toContain("BEGIN")
     expect(fake.calls).not.toContain("COMMIT")
     expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('FROM "agent_items" AS item'))).toBe(true)
     expect(fake.client.query.mock.calls.some(([sql]) => sql.includes("payload"))).toBe(true)
+  })
+
+  it("holds its owned transaction until the asynchronous graph check resolves", async () => {
+    let markReadStarted!: () => void
+    let releaseRead!: () => void
+    const readStarted = new Promise<void>(resolve => { markReadStarted = resolve })
+    const readGate = new Promise<void>(resolve => { releaseRead = resolve })
+    const fake = completionPool([], true, false, true, async () => { markReadStarted(); await readGate })
+    const completion = createPgRootTaskStore(fake.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true })
+
+    await readStarted
+    expect(fake.calls).not.toContain("COMMIT")
+    expect(fake.client.release).not.toHaveBeenCalled()
+    releaseRead()
+    const result = await completion
+
+    expect(result).toMatchObject({ ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: { graphRevision: 3 } })
+    expect(fake.calls).toContain("COMMIT")
+    expect(fake.client.release).toHaveBeenCalledOnce()
   })
 
   it("surfaces the recoverable TaskGraph blocker before a pending descendant blocker", async () => {
@@ -581,10 +609,10 @@ describe("createPgRootTaskStore", () => {
     expect(fake.calls.some(sql => sql.includes("'proposal'"))).toBe(true)
   })
 
-  it("keeps the generic pending-descendant blocker when TaskGraph verification has no graph to block", async () => {
+  it.each([false, true])("keeps the pending-descendant blocker after successful graph verification (graph=%s)", async hasGraphSnapshot => {
     const fake = completionPool([{
       id: "child-1", sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status: "waiting",
-    }])
+    }], true, false, hasGraphSnapshot)
     const store = createPgRootTaskStore(fake.pool)
 
     await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never }))

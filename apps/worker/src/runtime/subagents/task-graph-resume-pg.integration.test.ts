@@ -9423,9 +9423,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           failures: Array.isArray(shortlist?.failures) ? shortlist.failures.filter((failure): failure is string => typeof failure === "string").slice(0, 12) : [],
         }
         const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
-        const finalShortlistText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
-        if (turn.rows[0]?.status !== "completed" || !finalShortlistText || JSON.stringify(JSON.parse(finalShortlistText)) !== JSON.stringify(safeShortlist)) {
-          throw new Error("Interactive discovery trace final outcome does not match its persisted shortlist")
+        const finalCandidateText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
+        if (turn.rows[0]?.status !== "completed" || finalCandidateText !== "p3-process-restart-discovery-shortlist-ready") {
+          throw new Error("Interactive discovery trace final outcome does not preserve its verified model candidate")
         }
         await writeFile(interactiveDiscoveryTraceArtifactPath, JSON.stringify({
           schemaVersion: "agent-harness.v2.interactive-discovery-trace",
@@ -9438,7 +9438,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           tasks: safeTasks,
           planLedger,
           interactiveDiscoveryShortlist: safeShortlist,
-          finalOutcome: { turnStatus: turn.rows[0].status, response: finalShortlistText },
+          finalOutcome: { turnStatus: turn.rows[0].status, response: finalCandidateText },
         }), "utf8")
       }
     } finally {
@@ -9798,7 +9798,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(waits.rows.every(wait => wait.consumedAt instanceof Date)).toBe(true)
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [discoveryOwner.turnId])
     const finalResponse = JSON.parse(final.rows[0]?.finalResponse ?? "null") as RecordValue
-    expect(finalResponse.response).toContain('"jobId":"' + jobId + '"')
+    expect(finalResponse.response).toBe("Shortlist ready")
+    expect(finalResponse.summary).toContain("discovered jobs: 1 (complete)")
   }, 90_000)
 
   it("fails an interactive shortlist when its Scout prerequisite fails and cancels dependent work", async () => {
