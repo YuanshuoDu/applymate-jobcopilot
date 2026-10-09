@@ -162,4 +162,3 @@ describe("selected-job history PostgreSQL store", () => {
     expect(test.queries.some(query => query.sql === "ROLLBACK")).toBe(true)
   })
 })
-

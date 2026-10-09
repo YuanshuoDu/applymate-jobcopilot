@@ -146,4 +146,3 @@ describePg("selected-job history PostgreSQL source revalidation", () => {
     expect(sequenceAfter.rows).toEqual(sequenceBefore.rows)
   })
 })
-
