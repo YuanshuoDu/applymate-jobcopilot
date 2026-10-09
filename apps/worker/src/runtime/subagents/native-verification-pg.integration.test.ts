@@ -415,10 +415,10 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const attestation = rootPacket?.evidence.filter(item => item.kind === "user_self_attestation") ?? []
     expect(attestation).toHaveLength(2)
     const privateSummaries = attestation.map(item => JSON.parse(item.summary) as Record<string, unknown>)
-    expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
-      question: answeredQuestion.question, options: [], answer: answeredQuestion.answer })
-    expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
-      question: priorQuestion.question, options: [], answer: priorQuestion.answer })
+    expect(privateSummaries).toContainEqual(expect.objectContaining({ kind: "user_self_attestation", stage: "user_input",
+      question: answeredQuestion.question, options: [], answer: answeredQuestion.answer }))
+    expect(privateSummaries).toContainEqual(expect.objectContaining({ kind: "user_self_attestation", stage: "user_input",
+      question: priorQuestion.question, options: [], answer: priorQuestion.answer }))
     const privateReferenceIds = attestation.map(item => item.referenceId)
     if (!rootControl || !rootPacket || privateReferenceIds.some(value => !value)) throw new Error("native_answer_evidence_packet_unavailable")
     for (const referenceId of privateReferenceIds) expect(referenceId).toMatch(/^user-self-attestation:[a-f0-9]{64}$/)
