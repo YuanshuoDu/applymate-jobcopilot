@@ -1,15 +1,17 @@
 import { randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
+import { EventEmitter } from "node:events"
 import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
 import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RESULT_MARKER = "durable-child-result-after-process-restart"
 const FINAL_MARKER = "parent-resumed-from-durable-child-result"
 const DUPLICATE_REDELIVERY_JOB_ID = "00000000-0000-4000-8000-000000000547"
+const DUPLICATE_REDELIVERY_SUFFIX = "duplicate-redelivery-fixture"
 
 function dedicatedDatabaseUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -70,6 +72,43 @@ type FixtureIds = {
 }
 type WorkerChild = ChildProcess & { output: string[]; errors: string[] }
 type ExitWaitContext = { stage: string; pid?: number; requestedSignal?: string; signalAccepted?: boolean; timeoutMs?: number }
+type CleanupFailurePredicate =
+  | "worker_cleanup_failed"
+  | "turn_queue_resume_failed"
+  | "turn_queue_still_paused_child_alive"
+  | "turn_fixture_discovery_failed"
+  | "turn_fixture_job_cleanup_failed"
+  | "turn_fixture_job_cleanup_skipped_child_alive"
+  | "fixture_job_cleanup_failed"
+  | "fixture_user_cleanup_failed"
+  | "auxiliary_user_cleanup_failed"
+  | "subagent_job_cleanup_failed"
+  | "turn_queue_close_failed"
+  | "subagent_queue_close_failed"
+  | "shared_redis_connections_cleanup_failed"
+  | "redis_client_cleanup_failed"
+  | "postgres_pool_cleanup_failed"
+  | "after_test_turn_queue_resume_failed"
+  | "after_test_turn_queue_still_paused_child_alive"
+  | "after_test_turn_discovery_failed"
+  | "after_test_turn_job_cleanup_failed"
+  | "after_test_fixture_session_cleanup_failed"
+  | "after_test_fixture_job_cleanup_failed"
+  | "after_test_auxiliary_user_cleanup_failed"
+  | "terminal_race_worker_cleanup_failed"
+  | "terminal_race_turn_discovery_failed"
+  | "terminal_race_turn_queue_resume_failed"
+  | "terminal_race_turn_queue_still_paused_child_alive"
+  | "terminal_race_fixture_session_cleanup_failed"
+type WorkerCleanupFailurePredicate =
+  | "shutdown_command_write_failed"
+  | "graceful_shutdown_wait_failed"
+  | "sigkill_request_failed"
+  | "sigkill_exit_wait_failed"
+  | "forced_exit_state_missing"
+type WorkerCleanupFailureDiagnostic =
+  `worker_cleanup_failed:${"" | "shutdown_command_write_failed,"}graceful_shutdown_wait_failed,${"" | "sigkill_request_failed,"}${"sigkill_exit_wait_failed" | "forced_exit_state_missing"}`
+type CleanupFailureDiagnostic = CleanupFailurePredicate | WorkerCleanupFailureDiagnostic
 type CommandAcceptanceResult = {
   inputId: string
   turnId: string
@@ -137,6 +176,110 @@ async function waitForQueueJob(queue: Queue, jobId: string, timeoutMs = 20_000) 
   throw new Error(`Timed out waiting for BullMQ job ${jobId}`)
 }
 
+type DuplicateRedeliveryWaitPredicate =
+  | "command_acceptance_line_received"
+  | "command_acceptance_process_exited"
+  | "duplicate_worker_ready"
+  | "initial_queue_job_available"
+  | "completed_queue_job_available"
+  | "replayed_queue_job_available"
+  | "replay_delivery_line_received"
+  | "replay_delivery_status_matches"
+  | "shutdown_completion_line_received"
+  | "worker_shutdown_process_exited"
+
+type DuplicateRedeliveryAssertionPredicate =
+  | "assertion_sentinel_matches"
+  | "fixture_job_inserted"
+  | "fixture_session_inserted"
+  | "command_acceptance_worker_started"
+  | "command_acceptance_output_parseable"
+  | "command_acceptance_exit_zero"
+  | "command_acceptance_disposition_started"
+  | "duplicate_command_matches_original"
+  | "turn_job_key_created"
+  | "pending_job_id_matches_turn_job"
+  | "pending_job_data_matches_turn"
+  | "queue_paused_before_first_delivery"
+  | "duplicate_worker_started"
+  | "queue_resumed_for_first_delivery"
+  | "completed_job_id_matches_turn_job"
+  | "completed_job_state_completed"
+  | "first_receipt_query_succeeded"
+  | "first_receipt_matches_redacted_search"
+  | "initial_step_snapshot_nonempty"
+  | "final_response_contains_fixture_marker"
+  | "final_response_json_parseable"
+  | "final_response_marks_completed"
+  | "final_response_evidence_refs_match"
+  | "persisted_items_present"
+  | "persisted_events_present"
+  | "first_model_calls_exact"
+  | "queue_paused_before_replay"
+  | "completed_job_retried"
+  | "replay_job_id_matches_turn_job"
+  | "replay_job_timestamp_unchanged"
+  | "replay_job_data_unchanged"
+  | "replay_job_state_waiting"
+  | "queue_resumed_for_replay"
+  | "final_receipt_query_succeeded"
+  | "persisted_step_snapshot_unchanged"
+  | "final_receipt_unchanged"
+  | "replayed_model_calls_unchanged"
+  | "delivery_history_exact"
+  | "shutdown_command_written"
+  | "worker_shutdown_exit_zero"
+
+type DuplicateRedeliveryScenarioPredicate = DuplicateRedeliveryWaitPredicate | DuplicateRedeliveryAssertionPredicate
+
+function duplicateRedeliveryScenarioFailure(predicate: DuplicateRedeliveryScenarioPredicate): Error {
+  return new Error(`duplicate_redelivery_evidence_failed:${predicate}`)
+}
+
+async function runDuplicateRedeliveryStep<T>(
+  predicate: DuplicateRedeliveryScenarioPredicate,
+  action: () => T | Promise<T>,
+): Promise<T> {
+  try {
+    return await action()
+  } catch {
+    throw duplicateRedeliveryScenarioFailure(predicate)
+  }
+}
+
+async function assertDuplicateRedelivery(
+  predicate: DuplicateRedeliveryAssertionPredicate,
+  assertion: () => unknown | Promise<unknown>,
+): Promise<void> {
+  await runDuplicateRedeliveryStep(predicate, assertion)
+}
+
+async function waitForDuplicateRedeliveryLine(
+  child: WorkerChild,
+  prefix: string,
+  predicate: DuplicateRedeliveryWaitPredicate,
+  timeoutMs = 20_000,
+): Promise<string> {
+  return runDuplicateRedeliveryStep(predicate, () => waitForLine(child, prefix, timeoutMs))
+}
+
+async function waitForDuplicateRedeliveryQueueJob(
+  queue: Queue,
+  jobId: string,
+  predicate: DuplicateRedeliveryWaitPredicate,
+  timeoutMs = 20_000,
+) {
+  return runDuplicateRedeliveryStep(predicate, () => waitForQueueJob(queue, jobId, timeoutMs))
+}
+
+async function waitForDuplicateRedeliveryExit(
+  child: WorkerChild,
+  context: ExitWaitContext,
+  predicate: DuplicateRedeliveryWaitPredicate,
+): Promise<void> {
+  return runDuplicateRedeliveryStep(predicate, () => waitForExit(child, context))
+}
+
 async function duplicateRedeliveryFailureSnapshot(
   pool: Pool,
   queue: Queue,
@@ -144,30 +287,278 @@ async function duplicateRedeliveryFailureSnapshot(
   sessionId: string,
   jobId: string,
   worker: WorkerChild,
-): Promise<string> {
-  const [turn, latestStep, failureEvent, job] = await Promise.all([
-    pool.query(`SELECT turn."status", turn."error", turn."leaseOwnerId", turn."leaseVersion", turn."rootTaskId",
-        root."status" AS "rootStatus", root."failureReason"
-      FROM "agent_turns" AS turn
-      LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
-      WHERE turn."id" = $1 AND turn."sessionId" = $2`, [turnId, sessionId]),
-    pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
-      FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 ORDER BY "ordinal" DESC LIMIT 1`, [turnId, sessionId]),
-    pool.query(`SELECT "type", "payload" FROM "agent_events"
-      WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'turn.failed'
-      ORDER BY "sequence" DESC LIMIT 1`, [turnId, sessionId]),
-    queue.getJob(jobId).then(async found => found
-      ? { id: found.id, state: await found.getState(), failedReason: found.failedReason }
-      : { id: null, state: "missing", failedReason: null }),
-  ])
-  return JSON.stringify({
-    turn: turn.rows[0] ?? null,
-    latestStep: latestStep.rows[0] ?? null,
-    failureEvent: failureEvent.rows[0] ?? null,
-    job,
-    workerStderr: worker.errors.slice(-20),
-  })
+): Promise<DuplicateRedeliveryFailurePredicate[]> {
+  try {
+    const [turn, latestStep, failureEvent, job] = await Promise.all([
+      pool.query<{ status: string | null; rootStatus: string | null }>(`SELECT turn."status", root."status" AS "rootStatus"
+        FROM "agent_turns" AS turn
+        LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2`, [turnId, sessionId]),
+      pool.query<{ status: string | null }>(`SELECT "status"
+        FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 ORDER BY "ordinal" DESC LIMIT 1`, [turnId, sessionId]),
+      pool.query(`SELECT 1 FROM "agent_events"
+        WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'turn.failed'
+        ORDER BY "sequence" DESC LIMIT 1`, [turnId, sessionId]),
+      queue.getJob(jobId).then(async found => found ? await found.getState() : "missing"),
+    ])
+    const failures: DuplicateRedeliveryFailurePredicate[] = []
+    if (turn.rows[0]?.status !== "completed") failures.push("turn_completed")
+    if (turn.rows[0]?.rootStatus !== "completed") failures.push("root_completed")
+    if (latestStep.rows[0]?.status !== "completed") failures.push("latest_step_completed")
+    if (failureEvent.rows.length !== 0) failures.push("no_turn_failed_event")
+    if (job !== "completed") failures.push("queue_job_completed")
+    if (worker.errors.length !== 0) failures.push("worker_stderr_empty")
+    return failures
+  } catch {
+    return ["runtime_diagnostics_unavailable"]
+  }
 }
+
+type DuplicateRedeliveryFailurePredicate =
+  | "turn_completed"
+  | "root_completed"
+  | "latest_step_completed"
+  | "no_turn_failed_event"
+  | "queue_job_completed"
+  | "worker_stderr_empty"
+  | "runtime_diagnostics_unavailable"
+  | "first_delivery_completion_line_matches"
+  | "turn_completion_wait_resolved"
+  | DuplicateRedeliveryFixturePredicate
+  | "fixture_predicate_diagnostic_unavailable"
+
+const DUPLICATE_REDELIVERY_PREDICATE_MARKER = "DUPLICATE_REDELIVERY_PREDICATES "
+const DUPLICATE_REDELIVERY_PREDICATE_FALLBACK = "fixture_predicate_diagnostic_unavailable"
+const DUPLICATE_REDELIVERY_FIXTURE_PREDICATES = [
+  "read_tool_use_count",
+  "read_tool_assistant_role",
+  "read_tool_name",
+  "read_tool_input_shape_and_target",
+  "read_tool_result_count",
+  "read_tool_result_role",
+  "read_result_json_parseable",
+  "persisted_lifecycle_event_count",
+  "owned_job_row_count",
+  "owned_job_id",
+  "owned_job_user",
+  "owned_job_description",
+  "model_result_job_count",
+  "model_result_job_id_matches_owned_row",
+  "started_tool_name",
+  "started_tool_call_id",
+  "started_status",
+  "started_input",
+  "completed_tool_name",
+  "completed_tool_call_id",
+  "completed_status",
+  "completed_error_code",
+  "completed_output_matches_model_result",
+  "result_job_id",
+  "result_job_company",
+  "result_job_role",
+  "result_job_description_redacted",
+  "raw_description_absent",
+  "result_page",
+  "result_has_more",
+] as const
+type DuplicateRedeliveryFixturePredicate = typeof DUPLICATE_REDELIVERY_FIXTURE_PREDICATES[number]
+const duplicateRedeliveryFixturePredicateNames: ReadonlySet<string> = new Set(DUPLICATE_REDELIVERY_FIXTURE_PREDICATES)
+
+function duplicateRedeliveryFixtureFailurePredicates(output: readonly string[]): Array<DuplicateRedeliveryFixturePredicate | typeof DUPLICATE_REDELIVERY_PREDICATE_FALLBACK> {
+  const markerLines = output.filter(line => line.startsWith(DUPLICATE_REDELIVERY_PREDICATE_MARKER))
+  if (markerLines.length !== 1) return [DUPLICATE_REDELIVERY_PREDICATE_FALLBACK]
+
+  try {
+    const parsed: unknown = JSON.parse(markerLines[0].slice(DUPLICATE_REDELIVERY_PREDICATE_MARKER.length))
+    if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > DUPLICATE_REDELIVERY_FIXTURE_PREDICATES.length) {
+      return [DUPLICATE_REDELIVERY_PREDICATE_FALLBACK]
+    }
+    const safeNames = parsed.filter((name: unknown): name is DuplicateRedeliveryFixturePredicate =>
+      typeof name === "string" && duplicateRedeliveryFixturePredicateNames.has(name),
+    )
+    if (safeNames.length !== parsed.length || new Set(safeNames).size !== safeNames.length) {
+      return [DUPLICATE_REDELIVERY_PREDICATE_FALLBACK]
+    }
+    return safeNames
+  } catch {
+    return [DUPLICATE_REDELIVERY_PREDICATE_FALLBACK]
+  }
+}
+
+function firstDeliveryFailureDiagnostic(
+  failures: readonly DuplicateRedeliveryFailurePredicate[],
+  output: readonly string[],
+): string {
+  const fixtureFailures = duplicateRedeliveryFixtureFailurePredicates(output)
+  return `First production Turn delivery failed [${[
+    "first_delivery_completion_line_matches",
+    ...fixtureFailures,
+    ...failures,
+  ].join(",")}]`
+}
+
+describe("duplicate redelivery failure diagnostics", () => {
+  it("includes recognized fixture predicates in the first-delivery diagnostic", () => {
+    const marker = `${DUPLICATE_REDELIVERY_PREDICATE_MARKER}${JSON.stringify(["read_tool_name", "owned_job_row_count"])}`
+    const diagnostic = firstDeliveryFailureDiagnostic(["turn_completed"], [marker])
+
+    expect(diagnostic).toBe("First production Turn delivery failed [first_delivery_completion_line_matches,read_tool_name,owned_job_row_count,turn_completed]")
+  })
+
+  it("collapses malformed or unrecognized fixture markers to a fixed safe predicate", () => {
+    const privateValue = "private-payload 5551234567 private-id"
+    const unsafeMarkers = [
+      `${DUPLICATE_REDELIVERY_PREDICATE_MARKER}${JSON.stringify(["read_tool_name", privateValue])}`,
+      `${DUPLICATE_REDELIVERY_PREDICATE_MARKER}${JSON.stringify(["unrecognized_predicate"])}`,
+      `${DUPLICATE_REDELIVERY_PREDICATE_MARKER}not-json ${privateValue}`,
+      `${DUPLICATE_REDELIVERY_PREDICATE_MARKER}${JSON.stringify(["read_tool_name"])} trailing ${privateValue}`,
+    ]
+    const unsafeOutputs: string[][] = [[], ...unsafeMarkers.map(marker => [marker])]
+    const validMarker = `${DUPLICATE_REDELIVERY_PREDICATE_MARKER}${JSON.stringify(["read_tool_name"])}`
+    unsafeOutputs.push([validMarker, validMarker])
+
+    for (const output of unsafeOutputs) {
+      const diagnostic = firstDeliveryFailureDiagnostic(["turn_completed"], output)
+      expect(diagnostic).toContain(DUPLICATE_REDELIVERY_PREDICATE_FALLBACK)
+      expect(diagnostic).not.toContain(privateValue)
+      expect(diagnostic).not.toContain("private-payload")
+      expect(diagnostic).not.toContain("5551234567")
+      expect(diagnostic).not.toContain("private-id")
+      expect(diagnostic).not.toContain("read_tool_name")
+      expect(diagnostic).not.toContain("unrecognized_predicate")
+    }
+  })
+
+  it("returns only fixed names for mismatched runtime predicates", async () => {
+    const privateValue = "private-payload 5551234567 private-id"
+    const pool = {
+      query: async (sql: string) => {
+        if (sql.includes('FROM "agent_turns"')) return { rows: [{ status: "failed", rootStatus: privateValue }] }
+        if (sql.includes('FROM "agent_steps"')) return { rows: [{ status: privateValue }] }
+        return { rows: [{ value: privateValue }] }
+      },
+    } as unknown as Pool
+    const queue = {
+      getJob: async () => ({ getState: async () => privateValue }),
+    } as unknown as Queue
+    const worker = { errors: [privateValue] } as WorkerChild
+
+    const failures = await duplicateRedeliveryFailureSnapshot(pool, queue, "private-turn", "private-session", "private-job", worker)
+
+    expect(failures).toEqual([
+      "turn_completed",
+      "root_completed",
+      "latest_step_completed",
+      "no_turn_failed_event",
+      "queue_job_completed",
+      "worker_stderr_empty",
+    ])
+    expect(failures.join(",")).not.toContain(privateValue)
+    expect(failures.join(",")).not.toContain("private-")
+  })
+
+  it("returns no failures when all expected runtime predicates hold", async () => {
+    const pool = {
+      query: async (sql: string) => {
+        if (sql.includes('FROM "agent_turns"')) return { rows: [{ status: "completed", rootStatus: "completed" }] }
+        if (sql.includes('FROM "agent_steps"')) return { rows: [{ status: "completed" }] }
+        return { rows: [] }
+      },
+    } as unknown as Pool
+    const queue = { getJob: async () => ({ getState: async () => "completed" }) } as unknown as Queue
+    const worker = { errors: [] } as unknown as WorkerChild
+
+    await expect(duplicateRedeliveryFailureSnapshot(pool, queue, "turn", "session", "job", worker)).resolves.toEqual([])
+  })
+
+  it("uses a fixed diagnostic when runtime queries fail", async () => {
+    const pool = { query: async () => { throw new Error("private-query-error") } } as unknown as Pool
+    const queue = { getJob: async () => null } as unknown as Queue
+    const worker = { errors: [] } as unknown as WorkerChild
+
+    await expect(duplicateRedeliveryFailureSnapshot(pool, queue, "turn", "session", "job", worker))
+      .resolves.toEqual(["runtime_diagnostics_unavailable"])
+  })
+
+  it("keeps redelivery worker and queue wait failures to fixed predicate names", async () => {
+    const privateValue = "private-payload private-id private-stderr"
+    const worker = {
+      output: [privateValue],
+      errors: [privateValue],
+      exitCode: 1,
+      signalCode: null,
+    } as unknown as WorkerChild
+    await expect(waitForDuplicateRedeliveryLine(worker, "READY", "duplicate_worker_ready"))
+      .rejects.toMatchObject({ message: "duplicate_redelivery_evidence_failed:duplicate_worker_ready" })
+
+    const queue = { getJob: async () => null } as unknown as Queue
+    await expect(waitForDuplicateRedeliveryQueueJob(queue, "private-job-id", "replayed_queue_job_available", 0))
+      .rejects.toMatchObject({ message: "duplicate_redelivery_evidence_failed:replayed_queue_job_available" })
+
+    const processChild = {
+      output: [privateValue],
+      errors: [privateValue],
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      pid: 123,
+      once() { return this },
+      off() { return this },
+    } as unknown as WorkerChild
+    await expect(waitForDuplicateRedeliveryExit(processChild, { stage: privateValue, pid: 123, timeoutMs: 0 }, "worker_shutdown_process_exited"))
+      .rejects.toMatchObject({ message: "duplicate_redelivery_evidence_failed:worker_shutdown_process_exited" })
+  })
+
+  it("keeps redelivery assertion failures to the fixed predicate name", async () => {
+    const privateValue = "private-payload 5551234567 private-id"
+    let diagnostic = ""
+    try {
+      await assertDuplicateRedelivery("assertion_sentinel_matches", () => {
+        expect(privateValue).toBe("different-private-value")
+      })
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : "unexpected_non_error_failure"
+    }
+
+    expect(diagnostic).toBe("duplicate_redelivery_evidence_failed:assertion_sentinel_matches")
+    expect(diagnostic).not.toContain(privateValue)
+    expect(diagnostic).not.toContain("private-id")
+  })
+
+  it("keeps worker cleanup diagnostics to fixed predicate names", async () => {
+    const privateValue = "private-session private-job private-payload 5551234567 private-stderr"
+    const discoveryFailures: CleanupFailureDiagnostic[] = []
+    await attemptCleanup(discoveryFailures, "turn_fixture_discovery_failed", async () => {
+      throw new Error(privateValue)
+    })
+    expect(discoveryFailures).toEqual(["turn_fixture_discovery_failed"])
+    expect(discoveryFailures.join(",")).not.toContain(privateValue)
+
+    const processChild = Object.assign(new EventEmitter(), {
+      output: [privateValue],
+      errors: [privateValue],
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      pid: 7654,
+      stdin: { write() { throw new Error(privateValue) } },
+      kill() { throw new Error(privateValue) },
+    }) as unknown as WorkerChild
+    vi.useFakeTimers()
+    try {
+      const cleanup = stopWorkerForCleanup(processChild)
+      await vi.advanceTimersByTimeAsync(3_000)
+      await vi.advanceTimersByTimeAsync(3_000)
+      const diagnostic = await cleanup
+
+      expect(diagnostic).toBe("worker_cleanup_failed:shutdown_command_write_failed,graceful_shutdown_wait_failed,sigkill_request_failed,sigkill_exit_wait_failed")
+      expect(diagnostic).not.toContain(privateValue)
+      expect(diagnostic).not.toContain("7654")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
 
 async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId: string, toolCallId: string) {
   return pool.query<{
@@ -176,11 +567,13 @@ async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId:
     leaseVersion: number
     finalResponse: string | null
     finalItemCount: string
+    stepCount: string
     toolCallStartedEventCount: string
     toolCallCompletedEventCount: string
     durableItemCount: string
     durableEventCount: string
     completionEventCount: string
+    durableSteps: unknown
     toolCallStarted: unknown
     toolResult: unknown
     durableItems: unknown
@@ -189,6 +582,11 @@ async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId:
     `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."finalResponse",
        (SELECT COUNT(*)::text FROM "agent_items" AS item
         WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message') AS "finalItemCount",
+       (SELECT COUNT(*)::text FROM "agent_steps" AS step
+        WHERE step."turnId" = turn."id" AND step."sessionId" = turn."sessionId") AS "stepCount",
+       COALESCE((SELECT jsonb_agg(to_jsonb(step) ORDER BY step."ordinal", step."attempt", step."id")
+        FROM "agent_steps" AS step
+        WHERE step."turnId" = turn."id" AND step."sessionId" = turn."sessionId"), '[]'::jsonb) AS "durableSteps",
        (SELECT COUNT(*)::text FROM "agent_events" AS event
         WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
           AND event."type" = 'tool_call.started' AND event."correlationId" = $3
@@ -712,34 +1110,47 @@ async function removeTurnFixtureJobAfterWorkersExit(queue: Queue, redis: Redis, 
   await queue.getJob(jobId)?.then(job => job?.remove())
 }
 
-async function stopWorkerForCleanup(child: WorkerChild, workerName: string): Promise<string | null> {
-  const gracefulContext: ExitWaitContext = { stage: `${workerName}-cleanup-after-shutdown`, pid: child.pid, timeoutMs: 3_000 }
+async function stopWorkerForCleanup(child: WorkerChild): Promise<CleanupFailureDiagnostic | null> {
+  const gracefulContext: ExitWaitContext = { stage: "worker-cleanup-after-shutdown", pid: child.pid, timeoutMs: 3_000 }
   const gracefulExit = waitForExit(child, gracefulContext)
-  let shutdownWriteError: string | null = null
-  try { child.stdin?.write("shutdown\n") } catch (error: unknown) { shutdownWriteError = cleanupError(error) }
+  let shutdownWriteFailed = false
+  try { child.stdin?.write("shutdown\n") } catch { shutdownWriteFailed = true }
   try {
     await gracefulExit
     return null
-  } catch (gracefulError: unknown) {
+  } catch {
     if (workerHasExited(child)) return null
-    const forcedContext: ExitWaitContext = { stage: `${workerName}-cleanup-after-SIGKILL`, pid: child.pid, requestedSignal: "SIGKILL", timeoutMs: 3_000 }
+    const forcedContext: ExitWaitContext = { stage: "worker-cleanup-after-SIGKILL", pid: child.pid, requestedSignal: "SIGKILL", timeoutMs: 3_000 }
     const forcedExit = waitForExit(child, forcedContext)
-    let killError: string | null = null
-    try { forcedContext.signalAccepted = child.kill("SIGKILL") } catch (error: unknown) {
+    let killFailed = false
+    try { forcedContext.signalAccepted = child.kill("SIGKILL") } catch {
       forcedContext.signalAccepted = false
-      killError = cleanupError(error)
+      killFailed = true
     }
     try {
       await forcedExit
-      return workerHasExited(child) ? null : `${workerName} cleanup wait ended without an exit state; ${exitWaitDiagnostics(child, forcedContext)}`
-    } catch (forcedError: unknown) {
-      return `${workerName} did not exit after graceful shutdown and SIGKILL; graceful=${cleanupError(gracefulError)}; shutdownWriteError=${shutdownWriteError ?? "none"}; killError=${killError ?? "none"}; forced=${cleanupError(forcedError)}; ${exitWaitDiagnostics(child, forcedContext)}`
+      return workerHasExited(child) ? null : workerCleanupFailure("forced_exit_state_missing", shutdownWriteFailed, killFailed)
+    } catch {
+      return workerCleanupFailure("sigkill_exit_wait_failed", shutdownWriteFailed, killFailed)
     }
   }
 }
 
-async function attemptCleanup(failures: string[], label: string, action: () => Promise<unknown>): Promise<void> {
-  try { await action() } catch (error: unknown) { failures.push(`${label}: ${cleanupError(error)}`) }
+function workerCleanupFailure(
+  finalPredicate: WorkerCleanupFailurePredicate,
+  shutdownWriteFailed: boolean,
+  killFailed: boolean,
+): WorkerCleanupFailureDiagnostic {
+  const predicates: WorkerCleanupFailurePredicate[] = []
+  if (shutdownWriteFailed) predicates.push("shutdown_command_write_failed")
+  predicates.push("graceful_shutdown_wait_failed")
+  if (killFailed) predicates.push("sigkill_request_failed")
+  predicates.push(finalPredicate)
+  return `worker_cleanup_failed:${predicates.join(",")}` as WorkerCleanupFailureDiagnostic
+}
+
+async function attemptCleanup(failures: CleanupFailureDiagnostic[], predicate: CleanupFailurePredicate, action: () => Promise<unknown>): Promise<void> {
+  try { await action() } catch { failures.push(predicate) }
 }
 
 async function waitForTurnStatus(pool: Pool, turnId: string, status: string, timeoutMs = 20_000, child?: WorkerChild): Promise<void> {
@@ -971,26 +1382,26 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   }, 20_000)
 
   afterAll(async () => {
-    const cleanupFailures: string[] = []
-    for (const [workerName, child] of [["command-acceptance", commandAcceptance], ["worker1", workerOne], ["worker2", workerTwo]] as const) {
+    const cleanupFailures: CleanupFailureDiagnostic[] = []
+    for (const child of [commandAcceptance, workerOne, workerTwo]) {
       if (!child || workerHasExited(child)) continue
       try {
-        const failure = await stopWorkerForCleanup(child, workerName)
+        const failure = await stopWorkerForCleanup(child)
         if (failure) cleanupFailures.push(failure)
-      } catch (error: unknown) {
-        cleanupFailures.push(`${workerName} cleanup threw: ${cleanupError(error)}; ${exitWaitDiagnostics(child, { stage: `${workerName}-cleanup`, pid: child.pid })}`)
+      } catch {
+        cleanupFailures.push("worker_cleanup_failed")
       }
     }
     const workersStopped = [commandAcceptance, workerOne, workerTwo].every(child => !child || workerHasExited(child))
     if (turnQueuePaused && turnQueue) {
       if (workersStopped) {
-        await attemptCleanup(cleanupFailures, "turn queue resume", async () => {
+        await attemptCleanup(cleanupFailures, "turn_queue_resume_failed", async () => {
           await turnQueue!.resume()
           turnQueuePaused = false
         })
-      } else cleanupFailures.push("Turn queue remains paused in disposable Redis DB 15 because a child Worker is still alive")
+      } else cleanupFailures.push("turn_queue_still_paused_child_alive")
     }
-    if (pool && workersStopped) for (const sessionId of fixtureSessionIds) await attemptCleanup(cleanupFailures, `turn fixture discovery for ${sessionId}`, async () => {
+    if (pool && workersStopped) for (const sessionId of fixtureSessionIds) await attemptCleanup(cleanupFailures, "turn_fixture_discovery_failed", async () => {
       const turns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [sessionId])
       for (const turn of turns.rows) turnFixtureIds.add(turn.id)
     })
@@ -998,75 +1409,79 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       turnFixtureIds.add(ids.turnId)
       for (const turnId of turnFixtureIds) {
         for (let generation = 0; generation <= Math.max(8, wakeupGeneration ?? 0); generation += 1) {
-          await attemptCleanup(cleanupFailures, `turn fixture job ${generation} cleanup`, async () => {
+          await attemptCleanup(cleanupFailures, "turn_fixture_job_cleanup_failed", async () => {
             await removeTurnFixtureJobAfterWorkersExit(turnQueue!, redis!, turnJobKey!(turnId, generation))
           })
         }
       }
     } else if (turnQueue && typeof ids !== "undefined") {
-      cleanupFailures.push("Turn fixture job cleanup skipped because a child Worker may still be running")
+      cleanupFailures.push("turn_fixture_job_cleanup_skipped_child_alive")
     }
-    if (pool && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "fixture job cleanup", async () => {
+    if (pool && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "fixture_job_cleanup_failed", async () => {
       await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...fixtureJobIds]])
       fixtureJobIds.clear()
     })
-    if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture database cleanup", async () => {
+    if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture_user_cleanup_failed", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
     })
-    if (pool) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `auxiliary user ${userId} cleanup`, async () => {
+    if (pool) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, "auxiliary_user_cleanup_failed", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
     })
-    if (childTaskId && childQueue && childJobKey) await attemptCleanup(cleanupFailures, "subagent job cleanup", async () => {
+    if (childTaskId && childQueue && childJobKey) await attemptCleanup(cleanupFailures, "subagent_job_cleanup_failed", async () => {
       await childQueue!.getJob(childJobKey!(childTaskId!))?.then(job => job?.remove())
     })
-    if (turnQueue) await attemptCleanup(cleanupFailures, "turn queue close", async () => { await turnQueue!.close() })
-    if (childQueue) await attemptCleanup(cleanupFailures, "subagent queue close", async () => { await childQueue!.close() })
-    await attemptCleanup(cleanupFailures, "shared Redis connection cleanup", async () => {
+    if (turnQueue) await attemptCleanup(cleanupFailures, "turn_queue_close_failed", async () => { await turnQueue!.close() })
+    if (childQueue) await attemptCleanup(cleanupFailures, "subagent_queue_close_failed", async () => { await childQueue!.close() })
+    await attemptCleanup(cleanupFailures, "shared_redis_connections_cleanup_failed", async () => {
       await import("../redis.js").then(module => module.closeSharedRedisConnections())
     })
-    if (redis && redis.status !== "end") await attemptCleanup(cleanupFailures, "Redis client cleanup", async () => {
+    if (redis && redis.status !== "end") await attemptCleanup(cleanupFailures, "redis_client_cleanup_failed", async () => {
       try { await redis!.quit() } catch (error: unknown) { redis!.disconnect(); throw error }
     })
-    if (pool) await attemptCleanup(cleanupFailures, "PostgreSQL pool cleanup", async () => { await pool!.end() })
+    if (pool) await attemptCleanup(cleanupFailures, "postgres_pool_cleanup_failed", async () => { await pool!.end() })
     if (cleanupFailures.length > 0) throw new Error(`Process-restart fixture cleanup failed:\n${cleanupFailures.join("\n")}`)
   })
 
   afterEach(async () => {
-    const cleanupFailures: string[] = []
+    const cleanupFailures: CleanupFailureDiagnostic[] = []
     const children = [...new Set([commandAcceptance, workerOne, workerTwo].filter((child): child is WorkerChild => child !== undefined))]
-    for (const [index, child] of children.entries()) {
+    for (const child of children) {
       if (workerHasExited(child)) continue
-      const failure = await stopWorkerForCleanup(child, `process-restart-after-test-${index + 1}`)
-      if (failure) cleanupFailures.push(failure)
+      try {
+        const failure = await stopWorkerForCleanup(child)
+        if (failure) cleanupFailures.push(failure)
+      } catch {
+        cleanupFailures.push("worker_cleanup_failed")
+      }
     }
     const workersStopped = children.every(workerHasExited)
     if (turnQueuePaused && turnQueue) {
       if (workersStopped) {
-        await attemptCleanup(cleanupFailures, "after-test Turn queue resume", async () => {
+        await attemptCleanup(cleanupFailures, "after_test_turn_queue_resume_failed", async () => {
           await turnQueue!.resume()
           turnQueuePaused = false
         })
-      } else cleanupFailures.push("after-test Turn queue remains paused because a child Worker is still alive")
+      } else cleanupFailures.push("after_test_turn_queue_still_paused_child_alive")
     }
-    if (pool && workersStopped) for (const sessionId of fixtureSessionIds) await attemptCleanup(cleanupFailures, `after-test Turn discovery for ${sessionId}`, async () => {
+    if (pool && workersStopped) for (const sessionId of fixtureSessionIds) await attemptCleanup(cleanupFailures, "after_test_turn_discovery_failed", async () => {
       const turns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [sessionId])
       for (const turn of turns.rows) turnFixtureIds.add(turn.id)
     })
     if (turnQueue && turnJobKey && redis && workersStopped) for (const turnId of turnFixtureIds) {
       for (let generation = 0; generation <= Math.max(8, wakeupGeneration ?? 0); generation += 1) {
-        await attemptCleanup(cleanupFailures, `after-test Turn job ${generation} cleanup`, async () => {
+        await attemptCleanup(cleanupFailures, "after_test_turn_job_cleanup_failed", async () => {
           await removeTurnFixtureJobAfterWorkersExit(turnQueue!, redis!, turnJobKey!(turnId, generation))
         })
       }
     }
-    if (pool && workersStopped && fixtureSessionIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture session cleanup", async () => {
+    if (pool && workersStopped && fixtureSessionIds.size > 0) await attemptCleanup(cleanupFailures, "after_test_fixture_session_cleanup_failed", async () => {
       await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [[...fixtureSessionIds]])
     })
-    if (pool && workersStopped && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture job cleanup", async () => {
+    if (pool && workersStopped && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "after_test_fixture_job_cleanup_failed", async () => {
       await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...fixtureJobIds]])
       fixtureJobIds.clear()
     })
-    if (pool && workersStopped) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `after-test auxiliary user ${userId} cleanup`, async () => {
+    if (pool && workersStopped) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, "after_test_auxiliary_user_cleanup_failed", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
     })
     if (cleanupFailures.length > 0) throw new Error(`Process-restart per-test cleanup failed:\n${cleanupFailures.join("\n")}`)
@@ -1280,65 +1695,80 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   )
 
   it("redelivers the retained completed BullMQ job ID without repeating persisted Turn work", async () => {
-    const suffix = randomUUID()
-    ids.suffix = suffix
-    ids.sessionId = `duplicate-redelivery-session-${suffix}`
+    const suffix = DUPLICATE_REDELIVERY_SUFFIX
+    const redeliveryIds: FixtureIds = {
+      ...ids,
+      suffix,
+      sessionId: `duplicate-redelivery-session-${ids.suffix}`,
+    }
     const readCallId = `duplicate-read:${suffix}`
     const readJobId = DUPLICATE_REDELIVERY_JOB_ID
     const readJobDescription = `recruiter-${suffix}@example.com +353 87 123 4567`
-    fixtureSessionIds.add(ids.sessionId)
+    fixtureSessionIds.add(redeliveryIds.sessionId)
     fixtureJobIds.add(readJobId)
-    await pool!.query(
+    await runDuplicateRedeliveryStep("fixture_job_inserted", () => pool!.query(
       `INSERT INTO "Job" ("id", "userId", "company", "role", "description", "updatedAt")
        VALUES ($1, $2, $3, 'Fixture Engineer', $4, CURRENT_TIMESTAMP)`,
-      [readJobId, ids.userId, `Fixture Employer ${suffix}`, readJobDescription],
-    )
-    await pool!.query(
+      [readJobId, redeliveryIds.userId, `Fixture Employer ${suffix}`, readJobDescription],
+    ))
+    await runDuplicateRedeliveryStep("fixture_session_inserted", () => pool!.query(
       `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
        VALUES ($1, $2, 'Exercise same-ID Turn redelivery', 'running', 'test', CURRENT_TIMESTAMP)`,
-      [ids.sessionId, ids.userId],
-    )
+      [redeliveryIds.sessionId, redeliveryIds.userId],
+    ))
 
-    commandAcceptance = startWorker("accept-message", ids)
-    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
-    await waitForExit(commandAcceptance, { stage: "duplicate-redelivery-command-acceptance", pid: commandAcceptance.pid })
-    expect(commandAcceptance.exitCode).toBe(0)
-    const accepted = parseCommandAcceptance(acceptedLine)
-    expect(accepted.accepted.disposition).toBe("started")
-    expect(accepted.duplicate).toMatchObject({
+    const acceptanceWorker = await runDuplicateRedeliveryStep("command_acceptance_worker_started", () => startWorker("accept-message", redeliveryIds))
+    commandAcceptance = acceptanceWorker
+    const acceptedLine = await waitForDuplicateRedeliveryLine(acceptanceWorker, "COMMAND_ACCEPTED ", "command_acceptance_line_received")
+    await waitForDuplicateRedeliveryExit(acceptanceWorker, { stage: "duplicate-redelivery-command-acceptance", pid: acceptanceWorker.pid }, "command_acceptance_process_exited")
+    await assertDuplicateRedelivery("command_acceptance_exit_zero", () => expect(acceptanceWorker.exitCode).toBe(0))
+    const accepted = await runDuplicateRedeliveryStep("command_acceptance_output_parseable", () => parseCommandAcceptance(acceptedLine))
+    await assertDuplicateRedelivery("command_acceptance_disposition_started", () => expect(accepted.accepted.disposition).toBe("started"))
+    await assertDuplicateRedelivery("duplicate_command_matches_original", () => expect(accepted.duplicate).toMatchObject({
       inputId: accepted.accepted.inputId,
       turnId: accepted.accepted.turnId,
       disposition: "duplicate",
       originalDisposition: "started",
-    })
-    ids.turnId = accepted.accepted.turnId
-    turnFixtureIds.add(ids.turnId)
+    }))
+    redeliveryIds.turnId = accepted.accepted.turnId
+    turnFixtureIds.add(redeliveryIds.turnId)
 
     // Hold recovery's real BullMQ dispatch until the production Worker has
     // attached its completion observer, so the first delivery is deterministic.
-    await turnQueue!.pause()
+    await runDuplicateRedeliveryStep("queue_paused_before_first_delivery", () => turnQueue!.pause())
     turnQueuePaused = true
-    workerOne = startWorker("duplicate-turn-redelivery", ids)
-    await waitForLine(workerOne, "DUPLICATE_WORKER_READY")
-    const jobId = turnJobKey!(ids.turnId)
-    const pendingJob = await waitForQueueJob(turnQueue!, jobId)
-    expect(pendingJob.id).toBe(jobId)
-    expect(pendingJob.data).toMatchObject({ turnId: ids.turnId, sessionId: ids.sessionId })
-    await turnQueue!.resume()
+    const redeliveryWorker = await runDuplicateRedeliveryStep("duplicate_worker_started", () => startWorker("duplicate-turn-redelivery", redeliveryIds))
+    workerOne = redeliveryWorker
+    await waitForDuplicateRedeliveryLine(redeliveryWorker, "DUPLICATE_WORKER_READY", "duplicate_worker_ready")
+    const jobId = await runDuplicateRedeliveryStep("turn_job_key_created", () => turnJobKey!(redeliveryIds.turnId))
+    const pendingJob = await waitForDuplicateRedeliveryQueueJob(turnQueue!, jobId, "initial_queue_job_available")
+    await assertDuplicateRedelivery("pending_job_id_matches_turn_job", () => expect(pendingJob.id).toBe(jobId))
+    await assertDuplicateRedelivery("pending_job_data_matches_turn", () => expect(pendingJob.data).toMatchObject({ turnId: redeliveryIds.turnId, sessionId: redeliveryIds.sessionId }))
+    await runDuplicateRedeliveryStep("queue_resumed_for_first_delivery", () => turnQueue!.resume())
     turnQueuePaused = false
 
-    const firstDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_1 ")
-    if (firstDelivery !== `DUPLICATE_DELIVERY_FINISHED_1 ${jobId} completed none`) {
-      const runtime = await duplicateRedeliveryFailureSnapshot(pool!, turnQueue!, ids.turnId, ids.sessionId, jobId, workerOne)
-      throw new Error(`First production Turn delivery did not complete: ${firstDelivery}; runtime=${runtime}`)
+    let firstDelivery: string | undefined
+    try { firstDelivery = await waitForLine(redeliveryWorker, "DUPLICATE_DELIVERY_FINISHED_1 ") } catch {
+      // Suppress the wait helper's child output and stderr; diagnostics below expose predicate names only.
     }
-    await waitForTurnStatus(pool!, ids.turnId, "completed", 20_000, workerOne)
-    const completedJob = await waitForQueueJob(turnQueue!, jobId)
-    expect(completedJob.id).toBe(jobId)
-    expect(await completedJob.getState()).toBe("completed")
+    if (firstDelivery !== `DUPLICATE_DELIVERY_FINISHED_1 ${jobId} completed none`) {
+      const failures = await duplicateRedeliveryFailureSnapshot(pool!, turnQueue!, redeliveryIds.turnId, redeliveryIds.sessionId, jobId, redeliveryWorker)
+      throw new Error(firstDeliveryFailureDiagnostic(failures, redeliveryWorker.output))
+    }
+    try {
+      await waitForTurnStatus(pool!, redeliveryIds.turnId, "completed", 20_000, redeliveryWorker)
+    } catch {
+      // Suppress the shared wait helper's error, which may include persisted values and stderr.
+      const failures = await duplicateRedeliveryFailureSnapshot(pool!, turnQueue!, redeliveryIds.turnId, redeliveryIds.sessionId, jobId, redeliveryWorker)
+      if (!failures.includes("turn_completed")) failures.unshift("turn_completion_wait_resolved")
+      throw new Error(`First production Turn delivery failed [${failures.join(",")}]`)
+    }
+    const completedJob = await waitForDuplicateRedeliveryQueueJob(turnQueue!, jobId, "completed_queue_job_available")
+    await assertDuplicateRedelivery("completed_job_id_matches_turn_job", () => expect(completedJob.id).toBe(jobId))
+    await assertDuplicateRedelivery("completed_job_state_completed", async () => expect(await completedJob.getState()).toBe("completed"))
     const originalTimestamp = completedJob.timestamp
-    const firstReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
-    expect(firstReceipt.rows[0]).toMatchObject({
+    const firstReceipt = await runDuplicateRedeliveryStep("first_receipt_query_succeeded", () => duplicateRedeliveryReceipt(pool!, redeliveryIds.turnId, redeliveryIds.sessionId, readCallId))
+    await assertDuplicateRedelivery("first_receipt_matches_redacted_search", () => expect(firstReceipt.rows[0]).toMatchObject({
       status: "completed",
       leaseOwnerId: null,
       leaseVersion: 1,
@@ -1368,43 +1798,57 @@ describeWithServices("production bootstrap recovery across a Worker process rest
           hasMore: false,
         },
       },
+    }))
+    await assertDuplicateRedelivery("initial_step_snapshot_nonempty", () => {
+      const stepCount = Number(firstReceipt.rows[0]?.stepCount)
+      const steps = firstReceipt.rows[0]?.durableSteps
+      expect(stepCount).toBeGreaterThan(0)
+      expect(Array.isArray(steps)).toBe(true)
+      if (!Array.isArray(steps)) throw new Error("step_snapshot_not_array")
+      expect(steps).toHaveLength(stepCount)
     })
-    expect(firstReceipt.rows[0]?.finalResponse).toContain(`single-side-effect-${suffix}`)
-    const verifiedFinal = JSON.parse(firstReceipt.rows[0]?.finalResponse ?? "null") as { completed?: boolean; evidenceRefs?: string[] }
-    expect(verifiedFinal).toMatchObject({ completed: true })
-    expect(verifiedFinal.evidenceRefs).toEqual(expect.arrayContaining([readCallId, `read:job:${readJobId}`]))
-    expect(Number(firstReceipt.rows[0]?.durableItemCount)).toBeGreaterThan(0)
-    expect(Number(firstReceipt.rows[0]?.durableEventCount)).toBeGreaterThan(0)
-    const firstModelCalls = workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))
-    expect(firstModelCalls).toEqual(["DUPLICATE_MODEL_CALL 1", "DUPLICATE_MODEL_CALL 2"])
+    await assertDuplicateRedelivery("final_response_contains_fixture_marker", () => expect(firstReceipt.rows[0]?.finalResponse).toContain(`single-side-effect-${suffix}`))
+    const verifiedFinal = await runDuplicateRedeliveryStep("final_response_json_parseable", () => JSON.parse(firstReceipt.rows[0]?.finalResponse ?? "null") as { completed?: boolean; evidenceRefs?: string[] })
+    await assertDuplicateRedelivery("final_response_marks_completed", () => expect(verifiedFinal).toMatchObject({ completed: true }))
+    await assertDuplicateRedelivery("final_response_evidence_refs_match", () => expect(verifiedFinal.evidenceRefs).toEqual(expect.arrayContaining([readCallId, `read:job:${readJobId}`])))
+    await assertDuplicateRedelivery("persisted_items_present", () => expect(Number(firstReceipt.rows[0]?.durableItemCount)).toBeGreaterThan(0))
+    await assertDuplicateRedelivery("persisted_events_present", () => expect(Number(firstReceipt.rows[0]?.durableEventCount)).toBeGreaterThan(0))
+    const firstModelCalls = redeliveryWorker.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))
+    await assertDuplicateRedelivery("first_model_calls_exact", () => expect(firstModelCalls).toEqual(["DUPLICATE_MODEL_CALL 1", "DUPLICATE_MODEL_CALL 2"]))
 
     // BullMQ's retry script requeues this retained completed record in place.
     // Pausing the queue keeps the same job hash observable before redelivery.
-    await turnQueue!.pause()
+    await runDuplicateRedeliveryStep("queue_paused_before_replay", () => turnQueue!.pause())
     turnQueuePaused = true
-    await completedJob.retry("completed")
-    const replayJob = await waitForQueueJob(turnQueue!, jobId)
-    expect(replayJob.id).toBe(jobId)
-    expect(replayJob.timestamp).toBe(originalTimestamp)
-    expect(replayJob.data).toEqual(completedJob.data)
-    expect(["paused", "wait", "waiting"]).toContain(await replayJob.getState())
-    await turnQueue!.resume()
+    await runDuplicateRedeliveryStep("completed_job_retried", () => completedJob.retry("completed"))
+    const replayJob = await waitForDuplicateRedeliveryQueueJob(turnQueue!, jobId, "replayed_queue_job_available")
+    await assertDuplicateRedelivery("replay_job_id_matches_turn_job", () => expect(replayJob.id).toBe(jobId))
+    await assertDuplicateRedelivery("replay_job_timestamp_unchanged", () => expect(replayJob.timestamp).toBe(originalTimestamp))
+    await assertDuplicateRedelivery("replay_job_data_unchanged", () => expect(replayJob.data).toEqual(completedJob.data))
+    await assertDuplicateRedelivery("replay_job_state_waiting", async () => expect(["paused", "wait", "waiting"]).toContain(await replayJob.getState()))
+    await runDuplicateRedeliveryStep("queue_resumed_for_replay", () => turnQueue!.resume())
     turnQueuePaused = false
 
-    const replayDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_2 ")
-    expect(replayDelivery).toBe(`DUPLICATE_DELIVERY_FINISHED_2 ${jobId} skipped lease_not_available`)
-    const finalReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
-    expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0])
-    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(firstModelCalls)
-    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([
+    const replayDelivery = await waitForDuplicateRedeliveryLine(redeliveryWorker, "DUPLICATE_DELIVERY_FINISHED_2 ", "replay_delivery_line_received")
+    if (replayDelivery !== `DUPLICATE_DELIVERY_FINISHED_2 ${jobId} skipped lease_not_available`) {
+      throw duplicateRedeliveryScenarioFailure("replay_delivery_status_matches")
+    }
+    const finalReceipt = await runDuplicateRedeliveryStep("final_receipt_query_succeeded", () => duplicateRedeliveryReceipt(pool!, redeliveryIds.turnId, redeliveryIds.sessionId, readCallId))
+    await assertDuplicateRedelivery("persisted_step_snapshot_unchanged", () => {
+      expect(finalReceipt.rows[0]?.stepCount).toBe(firstReceipt.rows[0]?.stepCount)
+      expect(finalReceipt.rows[0]?.durableSteps).toEqual(firstReceipt.rows[0]?.durableSteps)
+    })
+    await assertDuplicateRedelivery("final_receipt_unchanged", () => expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0]))
+    await assertDuplicateRedelivery("replayed_model_calls_unchanged", () => expect(redeliveryWorker.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(firstModelCalls))
+    await assertDuplicateRedelivery("delivery_history_exact", () => expect(redeliveryWorker.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([
       [jobId, "completed", "none"],
       [jobId, "skipped", "lease_not_available"],
-    ])
+    ]))
 
-    workerOne.stdin?.write("shutdown\n")
-    await waitForLine(workerOne, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
-    await waitForExit(workerOne, { stage: "duplicate-redelivery-worker-shutdown", pid: workerOne.pid })
-    expect(workerOne.exitCode).toBe(0)
+    await runDuplicateRedeliveryStep("shutdown_command_written", () => redeliveryWorker.stdin?.write("shutdown\n"))
+    await waitForDuplicateRedeliveryLine(redeliveryWorker, "SHUTDOWN_STAGE bootstrap_close:complete", "shutdown_completion_line_received", 10_000)
+    await waitForDuplicateRedeliveryExit(redeliveryWorker, { stage: "duplicate-redelivery-worker-shutdown", pid: redeliveryWorker.pid }, "worker_shutdown_process_exited")
+    await assertDuplicateRedelivery("worker_shutdown_exit_zero", () => expect(redeliveryWorker.exitCode).toBe(0))
   }, 60_000)
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
@@ -2011,21 +2455,21 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     } finally {
       if (lockTransactionOpen) await rootLock.query("ROLLBACK").catch(() => undefined)
       rootLock.release()
-      const cleanupFailures: string[] = []
-      for (const [workerName, child] of [["terminal-race-command-acceptance", commandAcceptance], ["terminal-race-worker", workerOne]] as const) {
+      const cleanupFailures: CleanupFailureDiagnostic[] = []
+      for (const child of [commandAcceptance, workerOne]) {
         if (!child || workerHasExited(child)) continue
         try {
-          const cleanupFailure = await stopWorkerForCleanup(child, workerName)
+          const cleanupFailure = await stopWorkerForCleanup(child)
           if (cleanupFailure) cleanupFailures.push(cleanupFailure)
-        } catch (error: unknown) {
-          cleanupFailures.push(`${workerName} cleanup threw: ${cleanupError(error)}`)
+        } catch {
+          cleanupFailures.push("terminal_race_worker_cleanup_failed")
         }
       }
       try {
         const sessionTurns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [raceIds.sessionId])
         for (const turn of sessionTurns.rows) turnFixtureIds.add(turn.id)
-      } catch (error: unknown) {
-        cleanupFailures.push(`terminal-race Turn cleanup discovery failed: ${cleanupError(error)}`)
+      } catch {
+        cleanupFailures.push("terminal_race_turn_discovery_failed")
       }
       const workersStopped = [commandAcceptance, workerOne, workerTwo].every(child => !child || workerHasExited(child))
       if (turnQueuePaused && turnQueue) {
@@ -2033,14 +2477,18 @@ describeWithServices("production bootstrap recovery across a Worker process rest
           try {
             await turnQueue.resume()
             turnQueuePaused = false
-          } catch (error: unknown) {
-            cleanupFailures.push(`terminal-race Turn queue resume failed: ${cleanupError(error)}`)
+          } catch {
+            cleanupFailures.push("terminal_race_turn_queue_resume_failed")
           }
-        } else cleanupFailures.push("terminal-race Turn queue left paused because a child Worker is still alive")
+        } else cleanupFailures.push("terminal_race_turn_queue_still_paused_child_alive")
       }
       if (cleanupFailures.length > 0) throw new Error(cleanupFailures.join("\n"))
     }
-    await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [raceIds.sessionId])
+    try {
+      await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [raceIds.sessionId])
+    } catch {
+      throw new Error("terminal_race_fixture_session_cleanup_failed")
+    }
   }, 60_000)
 
   it("repairs a published legacy Turn dispatch and rearms one deterministic retry generation", async () => {
