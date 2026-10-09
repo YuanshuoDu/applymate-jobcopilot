@@ -5,6 +5,7 @@ import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, in
 import { assertContent, dispositionFromEvent } from "./command-content"
 import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import { isRetryableTurnStatus, parsePersistedRetryContent } from "./retry-input"
+import { assertSteeringCapacity } from "./steering-capacity"
 import {
   acceptInputFacts,
   assertExpectedTurn,
@@ -171,6 +172,9 @@ export class AgentCommandService {
           .then((facts) => ({ ...facts, disposition: "started" as const }))
       }
 
+      if (command.delivery === "steer" && command.source === "user") {
+        await assertSteeringCapacity(tx, { sessionId: command.sessionId, userId: command.userId, turnId: active.id })
+      }
       const disposition = command.delivery === "steer" ? "steered" : "queued_follow_up"
       return acceptInputFacts(tx, command, command.content, active, command.delivery, disposition, false)
         .then((facts) => ({ ...facts, disposition }))
