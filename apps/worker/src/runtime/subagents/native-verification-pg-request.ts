@@ -1,7 +1,8 @@
 import type pg from "pg"
 import { randomUUID } from "node:crypto"
 import {
-  NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA,
+  NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA_V2,
+  NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
   canonicalNativeVerificationJson, digestNativeVerificationValue,
   nativeVerificationControlMatchesTask, parseNativeVerificationControl,
   type NativeVerificationControl, type NativeVerificationPacket,
@@ -51,7 +52,9 @@ function operationId(scope: TaskGraphExecutionScope, target: NativeVerificationC
 }
 function makePacket(opId: string, taskId: string, content: NativeVerificationPacketContent): NativeVerificationPacket {
   return {
-    schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA, controlOperationId: opId, controlTaskId: taskId,
+    schemaVersion: content.target.kind === "root_goal" && content.evidence.some(item => item.kind === NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND)
+      ? NATIVE_VERIFICATION_PACKET_SCHEMA_V2 : NATIVE_VERIFICATION_PACKET_SCHEMA,
+    controlOperationId: opId, controlTaskId: taskId,
     goal: content.goal, criteria: content.criteria, target: content.target, evidence: content.evidence,
   }
 }

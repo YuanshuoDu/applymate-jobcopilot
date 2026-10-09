@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from "vitest"
-import type { ModelAdapter } from "@jobcopilot/agent-model"
+import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import { executionOwnerFence } from "../execution-owner.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
-import { NATIVE_VERIFICATION_CONTROL_SCHEMA, type NativeVerificationControl } from "./native-verification-contract.js"
+import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
+  NATIVE_VERIFICATION_PACKET_SCHEMA_V2, NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
+  canonicalNativeVerificationJson, digestNativeVerificationValue,
+  type NativeVerificationControl, type NativeVerificationPacket } from "./native-verification-contract.js"
+import { createNativeVerificationContext } from "./native-verification-packet.js"
 import { dispatchNativeVerificationTask, hasNativeVerificationControlIntent } from "./native-verification-executor.js"
 
 const profile = {
@@ -75,5 +79,93 @@ describe("native verification dispatch classification", () => {
     expect(readRootLimits).not.toHaveBeenCalled()
     expect(resolveModel).not.toHaveBeenCalled()
     expect(control.controlTaskId).not.toBe("foreign-task")
+  })
+
+  it("limits v2 self-attestation guidance to the actual accounted tool-less request", async () => {
+    const base = fixture()
+    const answer = "I prefer Dublin roles."
+    const candidateText = "The response addresses the user's stated preference."
+    const target = { kind: "root_goal" as const, candidateDigest: digestNativeVerificationValue(candidateText), referenceId: "candidate", candidateText }
+    const answerReference = `user-self-attestation:${"8a".repeat(32)}`
+    const packet: NativeVerificationPacket = {
+      schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA_V2, controlOperationId: "verify-op", controlTaskId: base.lease.id,
+      goal: "Respond to the user's stated job-location preference.",
+      criteria: [{ criterionId: "criterion-1", requirement: "The answer reflects what the user stated." }],
+      target, evidence: [{ referenceId: answerReference, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
+        summary: JSON.stringify({ kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, stage: "user_input",
+          question: "Which location do you prefer?", options: [], answer }) }],
+    }
+    const control: NativeVerificationControl = {
+      schemaVersion: NATIVE_VERIFICATION_CONTROL_SCHEMA, controlOperationId: packet.controlOperationId, controlTaskId: packet.controlTaskId,
+      owner: { userId: base.lease.userId, sessionId: base.lease.sessionId, turnId: base.lease.turnId!, rootTaskId: base.lease.rootTaskId, parentTaskId: base.lease.parentTaskId },
+      target: { kind: "root_goal", candidateDigest: target.candidateDigest, childBindingSetDigest: "e".repeat(64) },
+      goalDigest: digestNativeVerificationValue(packet.goal), criteriaDigest: digestNativeVerificationValue(packet.criteria),
+      evidencePacketDigest: digestNativeVerificationValue(packet),
+    }
+    const modelReport = JSON.stringify({ schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, criteria: [
+      { criterionId: "criterion-1", disposition: "uncertain", reasonCode: "ambiguous", evidenceReferenceIds: [answerReference] },
+    ] })
+    const requests: HarnessModelRequest[] = []
+    const adapter: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        requests.push(request)
+        yield { type: "text_delta", text: modelReport }
+        yield { type: "usage", inputTokens: 12, outputTokens: 7, estimatedCostUsd: 0.001 }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const now = new Date("2026-10-06T12:00:00.000Z")
+    let reservationCount = 0
+    let settlementCount = 0
+    const treeBudget: TreeBudgetReservationStore = {
+      reserve: async input => {
+        reservationCount += 1
+        return { ...input, id: "reservation-1", units: 1, status: "reserved", createdAt: now, updatedAt: now, settledAt: null }
+      },
+      settle: async input => {
+        settlementCount += 1
+        return { ...input, units: 1, createdAt: now, updatedAt: now, settledAt: now }
+      },
+      readRootLimits: async () => undefined,
+    }
+    const persistedItems: unknown[] = [], persistedEvents: unknown[] = [], persistedResponses: string[] = []
+    const store: TurnExecutionStore = {
+      startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }),
+      updateStep: async () => undefined,
+      createItem: async input => { persistedItems.push(input); return { id: input.itemId, revision: 0 } },
+      updateItem: async input => { persistedItems.push(input); return { id: input.itemId, revision: input.expectedRevision + 1 } },
+      appendEvent: async input => { persistedEvents.push(input); return { id: input.id } },
+      recordFinalResponse: async input => { persistedResponses.push(input.response) },
+    }
+    const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
+    const result = await dispatchNativeVerificationTask({
+      ...base.input,
+      lease: { ...base.lease, context: createNativeVerificationContext(packet), expectedOutputSchema: control },
+      store, treeBudget, authorizeUsage, resolveModel: () => adapter,
+    })
+
+    expect(result?.status).toBe("completed")
+    expect(requests).toHaveLength(1)
+    const requestText = JSON.stringify(requests[0]?.messages)
+    expect(requests[0]?.tools).toEqual([])
+    expect(requestText).toContain(answer)
+    expect(requestText).toContain("self-attestation")
+    expect(requestText).toContain("not independent proof of external facts")
+    expect(requestText).toContain("consent")
+    expect(requestText).toContain("action, approval, consent, credential, or submission authority")
+    expect(reservationCount).toBe(1)
+    expect(settlementCount).toBe(1)
+    expect(authorizeUsage).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(result)).not.toContain(answer)
+    expect(JSON.stringify(result)).not.toContain(NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND)
+    const persisted = JSON.stringify({ items: persistedItems, events: persistedEvents, responses: persistedResponses })
+    expect(persistedItems.length).toBeGreaterThan(0)
+    expect(persistedEvents.length).toBeGreaterThan(0)
+    expect(persisted).toContain("private_output_captured")
+    expect(persisted).not.toContain(answer)
+    expect(persisted).not.toContain(NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND)
+    expect(JSON.stringify(packet)).toContain(answer)
+    expect(canonicalNativeVerificationJson(packet)).toContain(answer)
   })
 })

@@ -1,13 +1,15 @@
 import { Buffer } from "node:buffer"
 import {
   NATIVE_VERIFICATION_PACKET_CONTEXT_KEY, NATIVE_VERIFICATION_PACKET_SCHEMA,
+  NATIVE_VERIFICATION_PACKET_SCHEMA_V2, NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES,
+  NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
   canonicalNativeVerificationJson, digestNativeVerificationValue,
-  isNativeVerificationJsonArray,
+  isNativeVerificationJsonArray, isNativeVerificationUserSelfAttestationReference,
   parseNativeVerificationControl,
   type NativeVerificationControl, type NativeVerificationEvidence, type NativeVerificationPacket,
 } from "./native-verification-contract.js"
 
-const MAX_PACKET_BYTES = 32 * 1024
+const MAX_PACKET_V1_BYTES = 32 * 1024
 const MAX_GOAL_BYTES = 4 * 1024
 const MAX_TARGET_BYTES = 16 * 1024
 const MAX_EVIDENCE_SUMMARY_BYTES = 8 * 1024
@@ -64,13 +66,19 @@ function parseTarget(value: unknown, control: NativeVerificationControl): Native
   return target as NativeVerificationPacket["target"]
 }
 
-function parseEvidence(value: unknown, targetReferenceId: string): readonly NativeVerificationEvidence[] | null {
+function parseEvidence(value: unknown, targetReferenceId: string, schemaVersion: unknown): readonly NativeVerificationEvidence[] | null {
   if (!isNativeVerificationJsonArray(value, MAX_EVIDENCE)) return null
   const seen = new Set<string>([targetReferenceId])
   const evidence = value.map(item => {
     const row = exact(item, ["referenceId", "kind", "summary"])
+    const selfAttestation = row?.kind === NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND
+    const privateReference = isNativeVerificationUserSelfAttestationReference(row?.referenceId)
+    const maxSummaryBytes = selfAttestation && schemaVersion === NATIVE_VERIFICATION_PACKET_SCHEMA_V2
+      ? NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES : MAX_EVIDENCE_SUMMARY_BYTES
     if (!row || typeof row.referenceId !== "string" || !ID.test(row.referenceId) || seen.has(row.referenceId)
-      || typeof row.kind !== "string" || !/^[a-z][a-z0-9_]{0,39}$/.test(row.kind) || !text(row.summary, MAX_EVIDENCE_SUMMARY_BYTES)) return null
+      || typeof row.kind !== "string" || !/^[a-z][a-z0-9_]{0,39}$/.test(row.kind)
+      || (selfAttestation && (schemaVersion !== NATIVE_VERIFICATION_PACKET_SCHEMA_V2 || !privateReference))
+      || (privateReference && !selfAttestation) || !text(row.summary, maxSummaryBytes)) return null
     seen.add(row.referenceId)
     return { referenceId: row.referenceId, kind: row.kind, summary: row.summary }
   })
@@ -83,15 +91,20 @@ export function parseNativeVerificationPacket(value: unknown, rawControl: Native
   const context = exact(value, [NATIVE_VERIFICATION_PACKET_CONTEXT_KEY])
   if (!control || !context) return null
   const packet = exact(context[NATIVE_VERIFICATION_PACKET_CONTEXT_KEY], ["schemaVersion", "controlOperationId", "controlTaskId", "goal", "criteria", "target", "evidence"])
-  if (!packet || packet.schemaVersion !== NATIVE_VERIFICATION_PACKET_SCHEMA || packet.controlOperationId !== control.controlOperationId
+  if (!packet || (packet.schemaVersion !== NATIVE_VERIFICATION_PACKET_SCHEMA && packet.schemaVersion !== NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
+    || packet.controlOperationId !== control.controlOperationId
     || packet.controlTaskId !== control.controlTaskId || !text(packet.goal, MAX_GOAL_BYTES)) return null
   const criteria = parseCriteria(packet.criteria)
   const target = parseTarget(packet.target, control)
   if (!criteria || !target) return null
-  const evidence = parseEvidence(packet.evidence, target.referenceId)
+  const evidence = parseEvidence(packet.evidence, target.referenceId, packet.schemaVersion)
   if (!evidence) return null
+  const hasSelfAttestation = evidence.some(item => item.kind === NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND)
+  if (packet.schemaVersion === NATIVE_VERIFICATION_PACKET_SCHEMA_V2
+    ? target.kind !== "root_goal" || !hasSelfAttestation
+    : hasSelfAttestation) return null
   const parsed: NativeVerificationPacket = {
-    schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA,
+    schemaVersion: packet.schemaVersion,
     controlOperationId: control.controlOperationId,
     controlTaskId: control.controlTaskId,
     goal: packet.goal,
@@ -103,7 +116,8 @@ export function parseNativeVerificationPacket(value: unknown, rawControl: Native
     if (digestNativeVerificationValue(parsed.goal) !== control.goalDigest
       || digestNativeVerificationValue(parsed.criteria) !== control.criteriaDigest
       || digestNativeVerificationValue(parsed) !== control.evidencePacketDigest
-      || Buffer.byteLength(canonicalNativeVerificationJson(parsed), "utf8") > MAX_PACKET_BYTES) return null
+      || Buffer.byteLength(canonicalNativeVerificationJson(parsed), "utf8") > (parsed.schemaVersion === NATIVE_VERIFICATION_PACKET_SCHEMA_V2
+        ? NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES : MAX_PACKET_V1_BYTES)) return null
   } catch { return null }
   return parsed
 }

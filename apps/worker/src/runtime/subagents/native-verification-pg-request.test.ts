@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest"
-import { canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationPacket } from "./native-verification-contract.js"
+import {
+  NATIVE_VERIFICATION_PACKET_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA_V2,
+  NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, canonicalNativeVerificationJson,
+  digestNativeVerificationValue, type NativeVerificationPacket,
+} from "./native-verification-contract.js"
 import type { NativeVerificationPacketContent } from "./native-verification-pg-evidence.js"
 import { ensureNativeVerificationControl, nativeVerificationControlContentMatches } from "./native-verification-pg-request.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
@@ -37,7 +41,10 @@ describe("native verification durable request replay identity", () => {
       target: packet.target, evidence: [{ referenceId: "tool:1", kind: "tool_result", summary: "changed fact" }] })).toBe(false)
   })
 
-  it("clears inherited parent actions in the atomic control bind before dispatch", async () => {
+  it.each([
+    ["child", false, NATIVE_VERIFICATION_PACKET_SCHEMA],
+    ["root with a complete user statement", true, NATIVE_VERIFICATION_PACKET_SCHEMA_V2],
+  ] as const)("persists the expected private packet version for %s and clears inherited actions before dispatch", async (_name, withStatement, expectedSchema) => {
     const ids = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" }
     const parentActions = ["jobs.search", "agent.spawn", "agent.followup"]
     const parent: Row = {
@@ -54,15 +61,25 @@ describe("native verification durable request replay identity", () => {
     }
     const targetResult = { status: "completed", fact: "source fact" }
     const resultDigest = digestNativeVerificationValue(targetResult)
-    const content: NativeVerificationPacketContent = {
+    const candidateText = "A complete root answer"
+    const candidateDigest = digestNativeVerificationValue(candidateText)
+    const content: NativeVerificationPacketContent = withStatement ? {
+      goal: "Assess the root answer against the user's stated preference",
+      criteria: [{ criterionId: "criterion-1", requirement: "The answer reflects the user's stated preference" }],
+      target: { kind: "root_goal", candidateDigest, referenceId: "candidate:root", candidateText },
+      evidence: [{ referenceId: `user-self-attestation:${"a".repeat(64)}`, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
+        summary: canonicalNativeVerificationJson({ kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, stage: "user_input",
+          question: "Which city do you prefer?", options: [], answer: "Dublin" }) }],
+    } : {
       goal: "Independently review the child result",
       criteria: [{ criterionId: "criterion-1", requirement: "Use the exact persisted source fact" }],
       target: { kind: "child", taskId: "target-task", attempt: 1, resultDigest,
         referenceId: "target:target-task", resultText: canonicalNativeVerificationJson(targetResult) },
       evidence: [{ referenceId: "fact:1", kind: "tool_result", summary: "{\"fact\":\"source fact\"}" }],
     }
-    const target = { kind: "child" as const, nodeId: "node-1", nativeOperationId: "native-op-1",
-      fingerprint: "a".repeat(64), taskId: "target-task", attempt: 1, resultDigest }
+    const target = withStatement ? { kind: "root_goal" as const, candidateDigest, childBindingSetDigest: "e".repeat(64) }
+      : { kind: "child" as const, nodeId: "node-1", nativeOperationId: "native-op-1",
+        fingerprint: "a".repeat(64), taskId: "target-task", attempt: 1, resultDigest }
     const calls: Array<{ sql: string; values: unknown[] }> = []
     const outboxTopics: string[] = []
     const state: { taskRow: Row | null; allowedActionsBeforeBind: unknown } = { taskRow: null, allowedActionsBeforeBind: undefined }
@@ -119,6 +136,10 @@ describe("native verification durable request replay identity", () => {
     expect(parent.allowedActions).toEqual(parentActions)
     expect(state.allowedActionsBeforeBind).toEqual(parentActions)
     expect(state.taskRow?.allowedActions).toEqual([])
+    const persistedPacket = (state.taskRow?.context as { nativeVerificationPacket?: NativeVerificationPacket }).nativeVerificationPacket
+    const persistedControl = state.taskRow?.expectedOutputSchema as { evidencePacketDigest?: string }
+    expect(persistedPacket?.schemaVersion).toBe(expectedSchema)
+    expect(persistedControl.evidencePacketDigest).toBe(digestNativeVerificationValue(persistedPacket))
     const bindIndex = calls.findIndex(call => call.sql.startsWith('UPDATE "sub_agent_tasks" AS task SET'))
     const dispatchIndex = calls.findIndex(call => call.sql.startsWith('INSERT INTO "agent_outbox"') && call.sql.includes("'agent.subagent.dispatch'"))
     expect(calls[bindIndex]?.sql).toContain('\"allowedActions\" = \'[]\'::jsonb')
