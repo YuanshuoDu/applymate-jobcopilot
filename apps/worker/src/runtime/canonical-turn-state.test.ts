@@ -8,9 +8,13 @@ import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type Steering
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
+import type { InputContentPart } from "@jobcopilot/agent-protocol/input"
 import { StepContextBuilder } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
+import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./subagents/native-verification-contract.js"
+import { createNativeVerificationContext } from "./subagents/native-verification-packet.js"
+import { attachNativeVerificationReport, parseNativeVerificationModelReport } from "./subagents/native-verification-report.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -32,9 +36,13 @@ function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}, fence
   return { id: `agenda-${sequence}`, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, sequence, payload: { ...value, ...patch } }
 }
 
-function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
+function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[]; nativeRoots?: Record<string, unknown>[]; historyTurns?: Record<string, unknown>[]; nativeControls?: Record<string, unknown>[]; steerGuard?: unknown }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
-    if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, ...rows.turn }] : [], rowCount: rows.turn ? 1 : 0 }
+    if (sql.includes('SELECT EXISTS') && sql.includes('FROM "agent_inputs"')) return { rows: [{ hasSteer: Object.hasOwn(rows, "steerGuard") ? rows.steerGuard : false }], rowCount: 1 }
+    if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: rows.nativeRoots ?? [], rowCount: rows.nativeRoots?.length ?? 0 }
+    if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('JOIN "sub_agent_tasks" AS root')) return { rows: rows.historyTurns ?? [], rowCount: rows.historyTurns?.length ?? 0 }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: rows.nativeControls ?? [], rowCount: rows.nativeControls?.length ?? 0 }
+    if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, createdAt: new Date("2026-10-06T10:00:00.000Z"), ...rows.turn }] : [], rowCount: rows.turn ? 1 : 0 }
     if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...(rows.steps ?? []).map(step => Number(step.ordinal ?? -1)), -1) }], rowCount: 1 }
     if (sql.includes('FROM "agent_steps"')) return { rows: (rows.steps ?? []).filter(step => step.taskId === undefined || step.taskId === null || step.taskId === values?.[2]), rowCount: rows.steps?.length ?? 0 }
     if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) return { rows: rows.questionEvents ?? [], rowCount: rows.questionEvents?.length ?? 0 }
@@ -68,7 +76,94 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
   return { connect: vi.fn(async () => client), client } as unknown as Pick<import("pg").Pool, "connect"> & { client: typeof client }
 }
 
+function nativeHistoryControl(goal = "Find jobs", requirement = "Use verified job facts") {
+  const taskId = "private-control-task", turnId = "history-turn", rootTaskId = "history-root"
+  const packet: NativeVerificationPacket = {
+    schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA, controlOperationId: "private-operation", controlTaskId: taskId, goal,
+    criteria: [{ criterionId: "criterion-1", requirement }],
+    target: { kind: "root_goal", candidateDigest: digestNativeVerificationValue("PRIVATE_CANDIDATE"), referenceId: "private-candidate-ref", candidateText: "PRIVATE_CANDIDATE" },
+    evidence: [{ referenceId: "private-evidence-ref", kind: "artifact", summary: "PRIVATE_PACKET_SUMMARY" }],
+  }
+  const control: NativeVerificationControl = {
+    schemaVersion: NATIVE_VERIFICATION_CONTROL_SCHEMA, controlOperationId: packet.controlOperationId, controlTaskId: taskId,
+    owner: { userId: "user-1", sessionId: "session-1", turnId, rootTaskId, parentTaskId: rootTaskId },
+    target: { kind: "root_goal", candidateDigest: packet.target.kind === "root_goal" ? packet.target.candidateDigest : "", childBindingSetDigest: "a".repeat(64) },
+    goalDigest: digestNativeVerificationValue(packet.goal), criteriaDigest: digestNativeVerificationValue(packet.criteria), evidencePacketDigest: digestNativeVerificationValue(packet),
+  }
+  const modelReport = parseNativeVerificationModelReport({ schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, criteria: [
+    { criterionId: "criterion-1", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: ["private-candidate-ref"] },
+  ] }, packet)!
+  return {
+    id: taskId, userId: "user-1", sessionId: "session-1", turnId, rootTaskId, parentTaskId: rootTaskId,
+    role: "auditor", taskType: "native_verification", status: "completed", attemptCount: 1, failureReason: null,
+    expectedOutputSchema: control, context: createNativeVerificationContext(packet),
+    result: { nativeVerificationReport: attachNativeVerificationReport(control, 1, modelReport) },
+  }
+}
+
 describe("loadCanonicalTurnState", () => {
+  it("rehydrates exact-goal historical verifier advice on reload and sends it as untrusted request data", async () => {
+    const control = nativeHistoryControl()
+    const content: InputContentPart[] = [{ type: "text", text: "Find jobs" }]
+    const ordinary = { id: "history:user:prior-note", content: { role: "user", text: "Keep ordinary history" } }
+    const stale = { id: "native-verification-advisory:0", content: { type: "historical_native_verification_advisory", goal: "Old goal" } }
+    const snapshot = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "4", goal: "Find jobs",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: [ordinary, stale], toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const options = {
+      turn: { input: { goal: "Find jobs", content, clientMessageId: "command-1" }, rootTaskId: "current-root", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 1, content: snapshot }],
+      nativeRoots: [{ goal: "Find jobs", successCriteria: ["Use verified job facts"] }],
+      historyTurns: [{ id: "history-turn", rootTaskId: "history-root", startedSequence: "3", currentStartedSequence: "5", createdAt: new Date("2026-10-06T09:00:00.000Z") }], nativeControls: [control],
+    }
+    const first = await loadCanonicalTurnState(pool(options), lease)
+    expect(first.snapshot.steerHistory).toEqual([
+      ordinary,
+      expect.objectContaining({ id: "native-verification-advisory:0", content: expect.objectContaining({
+        type: "historical_native_verification_advisory", label: "Historical advisory only", goal: "Find jobs",
+        criterionId: "criterion-1", requirement: "Use verified job facts", disposition: "failed", reasonCode: "does_not_meet_criterion",
+      }) }),
+    ])
+    const persisted = { ...snapshot, context: { ...snapshot.context, steerHistory: [...first.snapshot.steerHistory, { ...first.snapshot.steerHistory[1]!, id: "native-verification-advisory:1" }] } }
+    const reloaded = await loadCanonicalTurnState(pool({ ...options, snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 2, content: persisted }] }), lease)
+    expect(reloaded.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toHaveLength(1)
+    expect(reloaded.snapshot.steerHistory[0]).toEqual(ordinary)
+    const claimStore: InputClaimStore = {
+      scope: { userId: "user-1" }, async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+        return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
+      },
+    }
+    const context = await new StepContextBuilder(claimStore).build({ scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", snapshot: reloaded.snapshot })
+    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
+    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(requestText).toContain("trust=UNTRUSTED_DATA")
+    expect(requestText).toContain("Historical advisory only")
+    expect(requestText).toContain("Use verified job facts")
+    expect(requestText).not.toMatch(/PRIVATE_CANDIDATE|PRIVATE_PACKET_SUMMARY|private-control-task|evidencePacketDigest|controlOperationId/)
+
+    const changed = await loadCanonicalTurnState(pool({
+      ...options, turn: { ...options.turn, input: { goal: "Different goal", content: [{ type: "text", text: "Different goal" }], clientMessageId: "command-2" } },
+      snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 3, content: persisted }],
+    }), lease)
+    expect(changed.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toEqual([])
+
+    const fresh = await loadCanonicalTurnState(pool({
+      ...options,
+      turn: { ...options.turn, rootTaskId: null, input: { goal: "Find jobs", content, clientMessageId: "command-3" } },
+      nativeRoots: [], nativeControls: [nativeHistoryControl("Find jobs", "Find jobs")],
+    }), lease)
+    expect(fresh.snapshot.steerHistory).toEqual([
+      ordinary,
+      expect.objectContaining({ id: "native-verification-advisory:0", content: expect.objectContaining({
+        goal: "Find jobs", criterionId: "criterion-1", requirement: "Find jobs", disposition: "failed",
+      }) }),
+    ])
+  })
+
   it("hydrates durable compaction state from the persisted snapshot after a Worker restart", async () => {
     const selectedJobMemories = [projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "turn-1", sourceRootTaskId: "root-1", throughSequence: "7",
       graph: { revision: 1, nodes: [{ templateId: "analyst", status: "completed", readiness: "terminal" }] } })!]
