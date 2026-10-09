@@ -1,9 +1,9 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionStore, type TurnQuestionUsageInput, type TurnQuestionWaitInput, type TurnQuestionWaitReceipt } from "./turn-question-contract.js"
 import { admitQuestionWork, assertQuestionOwner, assertQuestionUsage, completedQuestionResult, lockQuestionStep, persistedUsage, questionConflict, questionId, questionItemId, withQuestionTransaction, type TurnQuestionPool, type TurnQuestionQueryClient, type TurnQuestionStepRow } from "./turn-question-store-guards.js"
-import { appendQuestionStartedEvents } from "./turn-question-store-events.js"
+import { appendQuestionStartedEvents, OrphanPauseUsageRecoveredError, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
-import { cancelPausedQuestion, hasQuestionPauseEvents } from "./turn-question-store-cancellation.js"
+import { cancelPausedQuestion, hasQuestionPauseEvents, recoverPausedPartialQuestion } from "./turn-question-store-cancellation.js"
 
 type Row = Record<string, unknown>
 function record(value: unknown): Row | null {
@@ -130,7 +130,23 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
     async readPendingQuestion(input): Promise<TurnQuestionRecovery> {
       assertQuestionOwner(input.owner)
       if (!Number.isFinite(input.now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Question recovery time is invalid")
-      return withQuestionTransaction(pool, input.owner, async (client, turn) => readPending(client, input.owner, turn.status, input.now))
+      const read = () => withQuestionTransaction(pool, input.owner, async (client, turn) => readPending(client, input.owner, turn.status, input.now))
+      try {
+        const pending = await read()
+        if (pending.status === "none" && await recoverPausedOrphanUsage(pool, input.owner, input.now)) {
+          throw new OrphanPauseUsageRecoveredError()
+        }
+        return pending
+      }
+      catch (error: unknown) {
+        if (!(error instanceof TurnQuestionStoreError) || error.code !== "question_receipt_missing"
+          || !await recoverPausedPartialQuestion(pool, input.owner, input.now)) throw error
+        const pending = await read()
+        if (pending.status === "none" && await recoverPausedOrphanUsage(pool, input.owner, input.now)) {
+          throw new OrphanPauseUsageRecoveredError()
+        }
+        return pending
+      }
     },
   }
 }

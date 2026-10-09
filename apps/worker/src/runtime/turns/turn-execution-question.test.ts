@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest"
 
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { TurnQuestionStoreError, type TurnQuestionStore } from "./turn-question-contract.js"
-import { nativeQuestionCallId, nativeQuestionResultMatches, questionWaitResult, recoverableNativeQuestionCalls, recoverPendingNativeQuestion } from "./turn-execution-question.js"
+import { isTurnStateRefreshRetryError, nativeQuestionCallId, nativeQuestionResultMatches, questionWaitResult, readPendingNativeQuestion, recoverableNativeQuestionCalls, recoverPendingNativeQuestion } from "./turn-execution-question.js"
+import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 
 const identity = { kind: "turn" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-1", leaseVersion: 3, leaseExpiresAt: new Date("2026-10-06T12:00:00.000Z") }
@@ -67,5 +68,12 @@ describe("native question runtime decisions", () => {
     await expect(questionWaitResult(options({ waitForQuestion: async () => { throw pause } }), "step-1", "call-1", () => new Date(), 1, 1)).rejects.toBe(pause)
     const lost = new Error("lost lease")
     await expect(questionWaitResult({ ...options({ waitForQuestion: async () => { throw lost } }), isOwnershipLost: () => true }, "step-1", "call-1", () => new Date(), 1, 1)).rejects.toBe(lost)
+  })
+
+  it("requests a canonical state refresh after orphan usage is durably repaired", async () => {
+    const retry = await readPendingNativeQuestion(options({ readPendingQuestion: async () => { throw new OrphanPauseUsageRecoveredError() } }), () => new Date())
+      .then(() => null, error => error as unknown)
+    expect(isTurnStateRefreshRetryError(retry)).toBe(true)
+    expect(retry).toMatchObject({ code: "turn_state_refresh_retry_required" })
   })
 })

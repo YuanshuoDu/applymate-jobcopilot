@@ -7,6 +7,7 @@ import type { ModelStepResult } from "./turn-engine-model.js"
 import { executionId, type TurnExecutionIdentity, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
+import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 
 export class PreparedQuestionRetryError extends Error {
   readonly code = "prepared_question_wait_retry_required"
@@ -15,6 +16,15 @@ export class PreparedQuestionRetryError extends Error {
 
 export function isPreparedQuestionRetryError(error: unknown): error is PreparedQuestionRetryError {
   return error instanceof PreparedQuestionRetryError
+}
+
+export class TurnStateRefreshRetryError extends Error {
+  readonly code = "turn_state_refresh_retry_required"
+  constructor() { super("Durable Turn state changed; reload it before replanning"); this.name = "TurnStateRefreshRetryError" }
+}
+
+export function isTurnStateRefreshRetryError(error: unknown): error is TurnStateRefreshRetryError {
+  return error instanceof TurnStateRefreshRetryError
 }
 
 export function nativeQuestionCallId(output: ModelStepResult, identity: TurnExecutionIdentity): string | null {
@@ -106,6 +116,7 @@ export async function readPendingNativeQuestion(options: TurnExecutionOptions, n
   if (options.identity.kind !== "turn" || !options.store.readPendingQuestion) return null
   try { return await options.store.readPendingQuestion({ identity: options.identity, now: now() }) }
   catch (error: unknown) {
+    if (error instanceof OrphanPauseUsageRecoveredError) throw new TurnStateRefreshRetryError()
     if (!retryableStoreFailure(options, error)) throw error
     throw new PreparedQuestionRetryError()
   }

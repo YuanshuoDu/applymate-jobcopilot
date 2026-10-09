@@ -22,6 +22,7 @@ import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
 import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tools.js"
+import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -257,6 +258,30 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.finalResponses).toHaveLength(0)
   })
 
+  it("reloads the same Turn after orphan usage recovery before replanning", async () => {
+    const root = nativeQuestionFixture()
+    root.readPendingQuestion.mockRejectedValueOnce(new OrphanPauseUsageRecoveredError())
+    const error = await runTurnExecutionLoop(root.options).then(() => null, reason => reason as unknown)
+
+    expect(error).toMatchObject({ code: "turn_state_refresh_retry_required" })
+    expect(classifyTurnFailure(error, 0)).toEqual({ disposition: "retry", reasonCode: "execution_failed" })
+    expect(root.requests).toHaveLength(0)
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+
+    const recoveredUsage = { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }
+    root.options = { ...root.options, resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [], usage: recoveredUsage },
+      budget: { maxInputTokens: 10, maxOutputTokens: 4, maxCostUsd: 0.02 } }
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+
+    expect(root.options.identity.turnId).toBe("turn-1")
+    expect(root.requests).toHaveLength(0)
+    const failure = root.events.find(event => event.type === "turn.failed")
+    expect(failure?.payload).toMatchObject({ final: { completed: false, terminalReason: "budget_exhausted", usage: recoveredUsage } })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
   it("halts at a committed unanswered question and continues after answer history is loaded", async () => {
     const waiting = nativeQuestionFixture({ status: "waiting", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old", turnId: "turn-1" })
     await expect(runTurnExecutionLoop(waiting.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId: "question-old" })
@@ -343,6 +368,23 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ usage: root.usage, finishReason: "tool_calls" }))
     expect(root.waitForQuestion).not.toHaveBeenCalled()
     expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
+  it("preserves the original pause when atomic question cleanup reports a transient failure", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    const cleanupFailure = Object.assign(new Error("question cancellation transaction failed"), { code: "40001" })
+    root.cancelPausedQuestion.mockRejectedValueOnce(cleanupFailure)
+    root.options = { ...root.options, executeTool: async () => { throw pause } }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+
+    expect(root.cancelPausedQuestion).toHaveBeenCalledTimes(1)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({
+      stepId: "turn:turn-1:step:0", toolCallId: "ask-1", callArguments: { question: "Which city?" }, usage: root.usage,
+    }))
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "step.completed" || event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
   })
 
   it("cancels a tool interruption before any question receipt is written", async () => {

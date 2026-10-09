@@ -31,12 +31,15 @@ const suffix = randomUUID(), role = `agent_runtime_question_${suffix.replaceAll(
 const callId = `question-call-${suffix}`
 const ids = { user: `question-user-${suffix}`, session: `question-session-${suffix}`, turn: `question-turn-${suffix}`, root: `question-root-${suffix}`, step: `question-step-${suffix}` }
 const pausedIds = { session: `question-paused-session-${suffix}`, turn: `question-paused-turn-${suffix}`, root: `question-paused-root-${suffix}`, step: `question-paused-step-${suffix}`, call: `question-paused-call-${suffix}`, item: `question-paused-item-${suffix}` }
+const orphanIds = { session: `question-orphan-session-${suffix}`, turn: `question-orphan-turn-${suffix}`, root: `question-orphan-root-${suffix}`, step: `question-orphan-step-${suffix}` }
 const owner: TurnExecutionOwnerFence = {
   kind: "turn", userId: ids.user, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, rootTaskId: ids.root,
   ownerId: `question-lease-${suffix}`, leaseVersion: 1, leaseExpiresAt: new Date(Date.now() + 5 * 60_000),
 }
 const pausedOwner: TurnExecutionOwnerFence = { ...owner, sessionId: pausedIds.session, turnId: pausedIds.turn, taskId: pausedIds.root, rootTaskId: pausedIds.root,
   ownerId: `question-paused-lease-${suffix}` }
+const orphanOwner: TurnExecutionOwnerFence = { ...owner, sessionId: orphanIds.session, turnId: orphanIds.turn, taskId: orphanIds.root, rootTaskId: orphanIds.root,
+  ownerId: `question-orphan-lease-${suffix}` }
 const intent: TurnQuestionIntentEnvelope = {
   schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
   question: "Which region should I prioritize?", options: [{ label: "Berlin", value: "berlin" }],
@@ -97,6 +100,54 @@ async function seedPausedCase(pool: PgPool): Promise<void> {
   [pausedIds.item, pausedIds.session, pausedIds.turn, pausedIds.step, pausedIds.root, JSON.stringify({ toolCallId: pausedIds.call, toolName: "agent.ask_user", toolVersion: "1", input: { question: intent.question, choices: intent.options } })])
 }
 
+async function seedOrphanPauseCase(pool: PgPool): Promise<void> {
+  await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+    VALUES ($1, $2, 'orphan pause recovery integration', 'running', 'test', CURRENT_TIMESTAMP)`, [orphanIds.session, ids.user])
+  await pool.query(`INSERT INTO "agent_turns"
+    ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+     "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+    VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, NULL, $4,
+      $5, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`, [orphanIds.turn, orphanIds.session, ids.user, orphanOwner.ownerId, orphanOwner.leaseExpiresAt])
+  await pool.query(`INSERT INTO "sub_agent_tasks"
+    ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+     "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+    VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'orphan pause recovery integration',
+      '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+      1, 1, $4, $5, CURRENT_TIMESTAMP)`, [orphanIds.root, orphanIds.session, orphanIds.turn, orphanOwner.ownerId, orphanOwner.leaseExpiresAt])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [orphanIds.root])
+  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [orphanIds.root, orphanIds.turn])
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds",
+     "modelProfileSnapshot", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "startedAt")
+    VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, NULL, 0, 0, 0, CURRENT_TIMESTAMP)`,
+  [orphanIds.step, orphanIds.session, orphanIds.turn, orphanIds.root])
+
+  const startedKey = `turn:${orphanIds.turn}:event:model-started:${orphanIds.step}`
+  const completedKey = `turn:${orphanIds.turn}:event:model-completed:${orphanIds.step}`
+  const usageKey = `turn:${orphanIds.turn}:event:model-usage:${orphanIds.step}`
+  const startedId = `${startedKey}:${suffix}`, completedId = `${completedKey}:${suffix}`, usageId = `${usageKey}:${suffix}`
+  const pauseId = `orphan-pause-${suffix}`, requestedAt = new Date().toISOString()
+  const events = [
+    { id: startedId, sequence: 1, taskId: orphanIds.root, type: "model.started", actor: "orchestrator", correlationId: orphanIds.step,
+      causationId: null, idempotencyKey: startedKey, payload: { provider: "fixture", model: "fixture", taskId: orphanIds.root } },
+    { id: completedId, sequence: 2, taskId: orphanIds.root, type: "model.completed", actor: "orchestrator", correlationId: orphanIds.step,
+      causationId: startedId, idempotencyKey: completedKey, payload: { taskId: orphanIds.root, provider: "fixture", model: "fixture" } },
+    { id: usageId, sequence: 3, taskId: orphanIds.root, type: "model.usage", actor: "orchestrator", correlationId: orphanIds.step,
+      causationId: completedId, idempotencyKey: usageKey, payload: { provider: "fixture", model: "fixture", usage: { inputTokens: 13, outputTokens: 5, estimatedCostUsd: 0.024 }, taskId: orphanIds.root } },
+    { id: pauseId, sequence: 4, taskId: null, type: "session.pause_requested", actor: "user", correlationId: orphanIds.turn,
+      causationId: null, idempotencyKey: "agent-session-control:pause-orphan-recovery",
+      payload: { turnId: orphanIds.turn, expectedRevision: 0, requestedAt } },
+  ] as const
+  for (const event of events) {
+    await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+      VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)`,
+    [event.id, orphanIds.session, orphanIds.turn, event.taskId, event.sequence, event.type, event.actor, event.correlationId,
+      event.causationId, event.idempotencyKey, JSON.stringify(event.payload)])
+  }
+  await pool.query(`UPDATE "agent_sessions" SET "eventSequence" = 4 WHERE "id" = $1`, [orphanIds.session])
+}
+
 async function appendBrokerEvent(client: PoolClient, input: {
   type: "question.answered" | "turn.wakeup"; correlationId: string; causationId: string; key: string
   payload: Record<string, unknown>; topic: "agent.session.event" | "agent.turn.wakeup"
@@ -149,7 +200,7 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
   afterAll(async () => {
     await writer?.end()
     if (!admin) return
-    await admin.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [[ids.session, pausedIds.session]])
+    await admin.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [[ids.session, pausedIds.session, orphanIds.session]])
     await admin.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.user])
     await admin.query(`DROP OWNED BY "${role}"`)
     await admin.query(`DROP ROLE "${role}"`)
@@ -177,6 +228,55 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
     expect(rows.rows[0]?.events).toBe("3")
     expect(rows.rows[0]?.outboxes).toBe("3")
   })
+
+  it("restores only exact usage for a paused orphan streaming Step with restricted-role readback", async () => {
+    await seedOrphanPauseCase(admin!)
+    const now = new Date()
+    const startedKey = `turn:${orphanIds.turn}:event:model-started:${orphanIds.step}`
+    const completedKey = `turn:${orphanIds.turn}:event:model-completed:${orphanIds.step}`
+    const usageEventKey = `turn:${orphanIds.turn}:event:model-usage:${orphanIds.step}`
+    const startedEventId = `${startedKey}:${suffix}`, completedEventId = `${completedKey}:${suffix}`, usageEventId = `${usageEventKey}:${suffix}`
+    const chain = await admin!.query<{ id: string; sequence: string; type: string; actor: string; correlationId: string; causationId: string | null;
+      idempotencyKey: string; payload: Record<string, unknown> }>(
+      `SELECT "id", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" IN ('model.started', 'model.completed', 'model.usage') ORDER BY "sequence"`,
+      [orphanIds.session, orphanIds.turn])
+    expect(chain.rows).toMatchObject([
+      { id: startedEventId, sequence: "1", type: "model.started", actor: "orchestrator", correlationId: orphanIds.step, causationId: null,
+        idempotencyKey: startedKey, payload: { taskId: orphanIds.root, provider: "fixture", model: "fixture" } },
+      { id: completedEventId, sequence: "2", type: "model.completed", actor: "orchestrator", correlationId: orphanIds.step, causationId: startedEventId,
+        idempotencyKey: completedKey, payload: { taskId: orphanIds.root, provider: "fixture", model: "fixture" } },
+      { id: usageEventId, sequence: "3", type: "model.usage", actor: "orchestrator", correlationId: orphanIds.step, causationId: completedEventId,
+        idempotencyKey: usageEventKey, payload: { taskId: orphanIds.root, provider: "fixture", model: "fixture", usage: { inputTokens: 13, outputTokens: 5, estimatedCostUsd: 0.024 } } },
+    ])
+    await expect(store.readPendingQuestion({ owner: orphanOwner, now })).rejects.toMatchObject({ code: "orphan_pause_usage_recovered_reload_required" })
+    await expect(store.readPendingQuestion({ owner: orphanOwner, now })).resolves.toEqual({ status: "none" })
+
+    const rows = await admin!.query<{ status: string; errorCode: string; finishReason: string | null; inputTokens: number; outputTokens: number; cost: string;
+      eventCount: string; recoveredCount: string; outboxCount: string; toolItems: string; questionItems: string; finalEvents: string;
+      recoveredId: string; causationId: string; idempotencyKey: string; eventPayload: Record<string, unknown>; outboxPayload: Record<string, unknown> }>(
+      `SELECT step."status", step."errorCode", step."finishReason", step."inputTokens", step."outputTokens", step."estimatedCostUsd" AS "cost",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2) AS "eventCount",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'step.completed'
+          AND "idempotencyKey" LIKE 'turn:' || $2 || ':event:question-pause-orphan:%:step') AS "recoveredCount",
+        (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.events') AS "outboxCount",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "stepId" = $3
+          AND "type" IN ('tool_call', 'tool_result')) AS "toolItems",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question') AS "questionItems",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" IN ('turn.completed', 'turn.failed')) AS "finalEvents",
+        event."id" AS "recoveredId", event."causationId", event."idempotencyKey", event."payload" AS "eventPayload", outbox."payload" AS "outboxPayload"
+       FROM "agent_steps" AS step JOIN "agent_events" AS event ON event."sessionId" = step."sessionId" AND event."turnId" = step."turnId"
+         AND event."type" = 'step.completed' AND event."correlationId" = step."id"
+       JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+       WHERE step."id" = $3`, [orphanIds.session, orphanIds.turn, orphanIds.step])
+    expect(rows.rows).toHaveLength(1)
+    expect(rows.rows[0]).toMatchObject({ status: "interrupted", errorCode: "session_pause_requested", finishReason: null, inputTokens: 13, outputTokens: 5,
+      eventCount: "5", recoveredCount: "1", outboxCount: "1", toolItems: "0", questionItems: "0", finalEvents: "0",
+      causationId: usageEventId, eventPayload: { stepId: orphanIds.step, status: "interrupted", errorCode: "session_pause_requested", toolCallCount: 0, taskId: orphanIds.root } })
+    expect(Number(rows.rows[0]?.cost)).toBeCloseTo(0.024)
+    expect(rows.rows[0]?.idempotencyKey).toMatch(new RegExp(`^turn:${orphanIds.turn}:event:question-pause-orphan:[a-f0-9]{64}:step$`))
+    expect(rows.rows[0]?.outboxPayload).toMatchObject({ eventId: rows.rows[0]?.recoveredId, type: "step.completed", causationId: usageEventId })
+  }, 30_000)
 
   it("serializes concurrent waits, preserves the safe broker item, and reads the same-Turn answer projection", async () => {
     const now = new Date()
