@@ -225,7 +225,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await expect(readAfterReconstruction({ owner, stepId: stepIds[1]!, identity: identityA })).resolves.toMatchObject({
       inputThroughSequence: 0n, stepIds: [stepIds[0]],
     })
-    await expect(finish(stepIds[0]!, identityA)).rejects.toThrow()
+    await expect(finish(stepIds[0]!, identityA)).resolves.toMatchObject({ distinctStepCount: 1 })
     await expect(finish(stepIds[1]!, identityA)).resolves.toMatchObject({ distinctStepCount: 2 })
     await expect(finish(stepIds[1]!, identityA)).resolves.toMatchObject({ distinctStepCount: 2 })
 
@@ -242,8 +242,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
       ...usage, now: new Date(), identity: identityA }
     await expect(completeAfterTwo(thirdReplay)).resolves.toMatchObject({ distinctStepCount: 3 })
     await expect(completeAfterTwo(thirdReplay)).resolves.toMatchObject({ distinctStepCount: 3 })
-    // A completed older checkpoint is stale once a newer Step exists.
-    await expect(completeAfterTwo(firstReplay)).rejects.toThrow()
+    await expect(completeAfterTwo(firstReplay)).resolves.toMatchObject({ distinctStepCount: 3 })
     const ledger = await adminPool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_native_semantic_rejections"
       WHERE "turnId" = $1 AND "candidateDigest" = $2 AND "controlTaskId" = $3 AND "controlOperationId" = $4
         AND "controlAttempt" = $5 AND "controlReportDigest" = $6 AND "inputThroughSequence" = 0`,
@@ -442,7 +441,20 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     expect(privateReceipt).not.toContain(originalReference[0]!.referenceId)
 
     await seedStep(supersedingStepId, 11, "10")
-    await expect(complete(receiptInput)).rejects.toThrow()
+    const persistedStepSnapshot = async (stepId: string) => {
+      const result = await adminPool!.query<{ step: unknown; stepCount: number; receiptCount: number; receipts: unknown }>(
+        `SELECT to_jsonb(step) AS "step", (SELECT COUNT(*)::int FROM "agent_steps" AS observed WHERE observed."turnId" = step."turnId") AS "stepCount",
+          (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS exact WHERE exact."turnId" = step."turnId" AND exact."stepId" = step."id") AS "receiptCount",
+          (SELECT COALESCE(jsonb_agg(to_jsonb(rejection)), '[]'::jsonb) FROM "agent_native_semantic_rejections" AS rejection
+            WHERE rejection."turnId" = step."turnId") AS "receipts"
+         FROM "agent_steps" AS step WHERE step."id" = $1`,
+        [stepId])
+      if (!result.rows[0]) throw new Error("native_semantic_fixture_step_missing")
+      return result.rows[0]
+    }
+    const beforeReplay = await persistedStepSnapshot(evidenceStepId)
+    await expect(complete(receiptInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 1 })
+    expect(await persistedStepSnapshot(evidenceStepId)).toEqual(beforeReplay)
 
     await seedStep(newEpochStepId, 12, "11", [newSteeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
@@ -450,6 +462,12 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
        "consumedByStepId", "consumedAt", "cancelledAt")
       VALUES ($1, $2, $3, $4, $5, 'steer', 'consumed', $6::jsonb, 11, $7, CURRENT_TIMESTAMP, NULL)`,
     [newSteeringId, sessionId, turnId, userId, `native-semantic-steer-next-${suffix}`, JSON.stringify([{ type: "text", text: nextSteering }]), newEpochStepId])
+    const beforeStaleAttempt = await persistedStepSnapshot(newEpochStepId)
+    expect(beforeStaleAttempt.step).toMatchObject({ status: "streaming" })
+    expect(beforeStaleAttempt.receiptCount).toBe(0)
+    await expect(complete({ ...receiptInput, stepId: newEpochStepId })).rejects.toThrow()
+    expect(await persistedStepSnapshot(newEpochStepId)).toEqual(beforeStaleAttempt)
+
     const newIdentity = await ensureRejectedCandidate(candidateA, newEpochStepId)
     expect(newIdentity.candidateDigest).toBe(identity.candidateDigest)
     expect(newIdentity.controlOperationId).not.toBe(identity.controlOperationId)
