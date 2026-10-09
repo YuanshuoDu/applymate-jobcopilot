@@ -4,13 +4,25 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { ToolExecutionError, type RuntimeToolDefinition } from "./types.js"
 import { TURN_QUESTION_INTENT_SCHEMA, parseTurnQuestionArguments, type TurnQuestionIntentEnvelope } from "../turns/turn-question-contract.js"
 
+const ChoiceTextSchema = Type.String({
+  minLength: 1,
+  maxLength: 200,
+  description: "Maximum 200 UTF-8 bytes. JSON Schema maxLength caps characters at 200; server-side validation enforces the exact UTF-8 byte limit.",
+})
+
 const ChoiceSchema = Type.Object({
-  label: Type.String({ minLength: 1, maxLength: 200 }),
-  value: Type.String({ minLength: 1, maxLength: 200 }),
+  label: ChoiceTextSchema,
+  value: ChoiceTextSchema,
 }, { additionalProperties: false })
 
+const QuestionTextSchema = Type.String({
+  minLength: 1,
+  maxLength: 2_000,
+  description: "Maximum 2,000 UTF-8 bytes. JSON Schema maxLength caps characters at 2,000; server-side validation enforces the exact UTF-8 byte limit.",
+})
+
 export const AskUserInputSchema = Type.Object({
-  question: Type.String({ minLength: 1, maxLength: 8_000 }),
+  question: QuestionTextSchema,
   choices: Type.Optional(Type.Array(ChoiceSchema, { maxItems: 6 })),
 }, { additionalProperties: false })
 
@@ -19,7 +31,7 @@ export const AskUserOutputSchema = Type.Object({
   schemaVersion: Type.Literal(TURN_QUESTION_INTENT_SCHEMA),
   kind: Type.Literal("user_question"),
   stage: Type.Literal("user_input"),
-  question: Type.String({ minLength: 1, maxLength: 8_000 }),
+  question: QuestionTextSchema,
   options: IntentOptionsSchema,
 }, { additionalProperties: false })
 
