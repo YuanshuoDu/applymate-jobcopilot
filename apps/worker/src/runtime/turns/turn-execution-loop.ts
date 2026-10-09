@@ -9,15 +9,25 @@ import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
-import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import { RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
+import type { StepContext } from "../context/step-context-builder.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 const DEFAULT_MAX_STEPS = 32
 function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
+function hasNewlyAcceptedInput(context: StepContext, previouslyConsumedIds: readonly string[]): boolean {
+  const previous = new Set(previouslyConsumedIds)
+  if (context.consumedInputIds.some(id => !previous.has(id))) return true
+  const markers = context.steeringMarkerControl
+  return Boolean(markers && (
+    markers.newlyObservedInputIds.some(id => !previous.has(id)) ||
+    markers.newlyObservedMarkers.some(marker => !previous.has(marker.inputId))
+  ))
+}
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
   const now = options.now ?? (() => new Date())
@@ -65,6 +75,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           steeringMarkerState,
         })
         const freshSteering = hasFreshSteering(context, consumedInputIds)
+        if (hasNewlyAcceptedInput(context, consumedInputIds)) options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
         const newlyObservedMarkers = context.steeringMarkerControl?.newlyObservedMarkers ?? []
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
@@ -146,7 +157,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
         snapshot = taskGraphRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
       } catch (error: unknown) {
-        if (closedSteps.has(step.id) && isSessionPauseRequestedError(error)) throw error
+        if (closedSteps.has(step.id) && (isSessionPauseRequestedError(error) || error instanceof NoProgressError)) throw error
         const status = signalWasInterrupted(signal) || isSessionPauseRequestedError(error) ? "interrupted" : "failed"
         await updateExecutionStep(options, {
           stepId: step.id, status, finishReason: stepOutput?.finishReason ?? null, errorCode: turnErrorCode(error),

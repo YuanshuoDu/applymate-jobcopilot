@@ -12,6 +12,7 @@ import {
   parseNativeVerificationControl,
 } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
+import { parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import type { SubagentJobPayload } from "./types.js"
 
@@ -132,6 +133,7 @@ type JudgeDiagnostic = Readonly<{
   ownedReceiptToolStatus: boolean
   exactJobIdMatch: boolean
   descriptionMatch: boolean
+  failedPredecessorHistoryRetained: boolean
   passed: boolean
 }>
 
@@ -143,6 +145,7 @@ function reportFor(
   packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>,
   ownedJobId = ids.job,
   recordDiagnostic?: (value: JudgeDiagnostic) => void,
+  expectedFailedChildTaskId?: string,
 ) {
   const targetText = packet.target.kind === "child" ? packet.target.resultText : packet.target.candidateText
   const requirements = packet.criteria.map(item => item.requirement)
@@ -168,6 +171,7 @@ function reportFor(
   let ownedReceiptToolStatus = false
   let exactJobIdMatch = false
   let descriptionMatch = false
+  let failedPredecessorHistoryRetained = false
   let candidateSummary = ""
   if (expectedFact && packet.target.kind === "child") {
     let candidate: Record<string, unknown> | undefined
@@ -217,6 +221,14 @@ function reportFor(
   }
   let hasCurrentOwnedFact = false
   if (expectedFact && packet.target.kind === "root_goal") {
+    if (expectedFailedChildTaskId) failedPredecessorHistoryRetained = packet.evidence.some(item => {
+      if (item.kind !== "graph_history") return false
+      try {
+        const row = JSON.parse(item.summary) as { taskId?: unknown; status?: unknown; failureReason?: unknown; activeNative?: unknown }
+        return row.taskId === expectedFailedChildTaskId && row.status === "failed"
+          && row.failureReason === "turn_execution_failed" && row.activeNative === false
+      } catch { return false }
+    })
     const activeNodes = packet.evidence.flatMap(item => {
       if (item.kind !== "graph_history") return []
       try {
@@ -251,7 +263,7 @@ function reportFor(
   recordDiagnostic?.({
     targetKind: packet.target.kind, goalMatch, criteriaMatch, candidatePositive, candidateNegative,
     persistedStructuredResult, opaqueCandidateShape, structuredFindingMatch, citedEvidenceMatch, toolResultCount,
-    ownedReceiptToolStatus, exactJobIdMatch, descriptionMatch, passed,
+    ownedReceiptToolStatus, exactJobIdMatch, descriptionMatch, failedPredecessorHistoryRetained, passed,
   })
   return verificationReport(packet, passed, sourceReference)
 }
@@ -632,6 +644,78 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       sameTurnPrefix: boolean; resumePrefix: boolean; targetMatch: boolean; failedCriterion: boolean; exactFeedbackRoles: string[]
     }>> = []
     const canonicalJudgeDiagnostics: JudgeDiagnostic[] = []
+    let failedChildTaskId: string | undefined
+    let originalChildTaskId: string | undefined
+    let latestWait: { readonly taskId: string; readonly callId: string } | undefined
+    let waitSequence = 0
+    let lastWaitDisposition: string | null = null
+    let targetChildModelRequests = 0
+    let targetChildRequestsWithSearch = 0
+    let targetChildSearchCalls = 0
+    let targetChildProviderFailures = 0
+    const childRecoveryDiagnostics: Array<Readonly<{
+      phase: "original" | "replacement"; status: string; attemptCount: number; maxAttempts: number
+      modelStreamFailure: boolean; waitDisposition: string | null; action: "wait" | "followup" | "candidate"
+    }>> = []
+    const nextWait = (taskId: string, phase: string) => {
+      const callId = `canonical-wait-${phase}:${canonicalSuffix}:${++waitSequence}`
+      latestWait = { taskId, callId }
+      return { callId, arguments: { idempotencyKey: callId, taskIds: [taskId], mode: "all" as const, timeoutMs: 30_000 } }
+    }
+    const noteRecovery = (phase: "original" | "replacement", task: { status: string; attemptCount: number; maxAttempts: number; failureReason: string | null }, action: "wait" | "followup" | "candidate") => {
+      childRecoveryDiagnostics.push({ phase, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts,
+        modelStreamFailure: task.failureReason === "turn_execution_failed", waitDisposition: lastWaitDisposition, action })
+      if (childRecoveryDiagnostics.length > 8) childRecoveryDiagnostics.shift()
+    }
+    const readWaitDisposition = async (rootTaskId: string, callId: string, taskId: string): Promise<string | null> => {
+      const result = await pool!.query<{ output: unknown }>(`SELECT result."content"->'output' AS "output" FROM "agent_items" AS result
+        JOIN "agent_items" AS call ON call."sessionId" = result."sessionId" AND call."turnId" = result."turnId"
+          AND call."taskId" = result."taskId" AND call."stepId" = result."stepId" AND call."type" = 'tool_call'
+        WHERE result."sessionId" = $1 AND result."turnId" = $2 AND result."taskId" = $3 AND result."type" = 'tool_result'
+          AND result."status" = 'completed' AND result."content"->>'toolCallId' = $4
+          AND result."content"->'errorCode' = 'null'::jsonb
+          AND call."status" = 'completed' AND call."content"->>'toolCallId' = $4
+          AND call."content"->>'toolName' = 'agent.wait' AND call."content"->>'toolVersion' = '1'
+          AND call."content"->>'status' = 'completed' AND call."content"->'errorCode' = 'null'::jsonb
+          AND call."content"->'input'->>'idempotencyKey' = $4
+          AND call."content"->'input'->'taskIds' = jsonb_build_array($5::text) AND call."content"->'input'->>'mode' = 'all'
+        LIMIT 2`, [canonical.sessionId, canonical.turnId, rootTaskId, callId, taskId])
+      if (result.rows.length !== 1) return null
+      const output = result.rows[0]?.output
+      if (!isRecord(output) || typeof output.waitId !== "string"
+        || !["waiting", "ready", "timed_out"].includes(String(output.status))) return null
+      const wait = await pool!.query<{ status: string }>(`SELECT "status" FROM "agent_wait_conditions"
+        WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "parentTaskId" = $5
+          AND "idempotencyKey" = $6 AND "mode" = 'all' AND "targetTaskIds" = $7::jsonb
+        LIMIT 2`, [output.waitId, canonical.userId, canonical.sessionId, canonical.turnId, rootTaskId, callId, JSON.stringify([taskId])])
+      return wait.rows.length === 1 ? wait.rows[0]!.status : null
+    }
+    const readChildRecoveryDiagnostics = async () => {
+      const taskIds = [...new Set([originalChildTaskId, failedChildTaskId].filter((id): id is string => typeof id === "string"))]
+      if (taskIds.length === 0) return []
+      const rootTaskId = (await pool!.query<{ rootTaskId: string | null }>(
+        `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [canonical.turnId, canonical.sessionId])).rows[0]?.rootTaskId
+      if (!rootTaskId) return []
+      const result = await pool!.query<{
+        phase: string; status: string; attemptCount: number; maxAttempts: number; modelStreamFailure: boolean; failureReason: string | null
+        dispatchPresent: boolean; dispatchPublished: boolean; dispatchAttempts: number | null; dispatchHasError: boolean
+      }>(`SELECT CASE WHEN task."id" = $4 THEN 'original' ELSE 'replacement' END AS "phase",
+          task."status", task."attemptCount", task."maxAttempts",
+          task."failureReason" = 'turn_execution_failed' AS "modelStreamFailure",
+          task."failureReason" AS "failureReason",
+          dispatch."id" IS NOT NULL AS "dispatchPresent", dispatch."publishedAt" IS NOT NULL AS "dispatchPublished",
+          dispatch."attemptCount" AS "dispatchAttempts", dispatch."lastError" IS NOT NULL AS "dispatchHasError"
+        FROM "sub_agent_tasks" AS task
+        LEFT JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = task."sessionId"
+          AND dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+        WHERE task."id" = ANY($5::text[]) AND task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $3
+        ORDER BY task."createdAt" LIMIT 2`, [canonical.sessionId, canonical.turnId, rootTaskId, originalChildTaskId ?? null, taskIds])
+      return result.rows.map(({ failureReason, ...row }) => ({
+        ...row,
+        failureCategory: failureReason === null ? "none" : failureReason === "turn_execution_failed" ? failureReason : "other",
+      }))
+    }
+    const activeChildStatus = (status: string) => status === "queued" || status === "retrying" || status === "running"
     let queuePauseGate: Queue<SubagentJobPayload, unknown, string> | undefined
     let acceptedCandidateReady!: () => void
     let releaseAcceptedCandidate!: () => void
@@ -652,7 +736,8 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           expect(toolNames).toContain("agent.spawn")
           yield { type: "tool_call_completed", callId: `canonical-spawn:${canonicalSuffix}`, name: "agent.spawn", arguments: {
             idempotencyKey: `canonical-spawn:${canonicalSuffix}`, role: "analyst", taskType: "research",
-            goal: childGoal, successCriteria: turnCriteria, allowedActions: ["jobs.search"], context: { fixture: "canonical-default-path" },
+            goal: childGoal, constraints: ["Inspect the owned job description only."], successCriteria: childCriteria,
+            allowedActions: ["jobs.search"], context: { fixture: "canonical-native-recovery" },
           } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
@@ -666,21 +751,83 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             `SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3
               AND "role" = 'analyst' AND "taskType" = 'research' AND "goal" = $4 ORDER BY "createdAt" LIMIT 1`,
             [canonical.sessionId, canonical.turnId, root, childGoal])).rows[0]?.id, value => typeof value === "string")
-          yield { type: "tool_call_completed", callId: `canonical-wait-target:${canonicalSuffix}`, name: "agent.wait", arguments: {
-            idempotencyKey: `canonical-wait-target:${canonicalSuffix}`, taskIds: [targetId], mode: "all", timeoutMs: 30_000,
-          } }
+          originalChildTaskId = targetId
+          const wait = nextWait(targetId, "target")
+          yield { type: "tool_call_completed", callId: wait.callId, name: "agent.wait", arguments: wait.arguments }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        if (call === 3) {
-          expect(toolNames).toContain("jobs.search")
-          yield { type: "tool_call_completed", callId: `canonical-search:${canonicalSuffix}`, name: "jobs.search", arguments: {
-            target: "Fact 42", location: "Dublin", limit: 10,
+        const rootTaskId = request.metadata.taskId
+        if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("canonical root request omitted its task binding")
+        if (!failedChildTaskId) {
+          if (!originalChildTaskId) throw new Error("canonical root did not bind the spawned source task")
+          const original = (await pool!.query<{ id: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null }>(
+            `SELECT "id", "status", "attemptCount", "maxAttempts", "failureReason" FROM "sub_agent_tasks"
+             WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4`,
+            [originalChildTaskId, canonical.sessionId, canonical.turnId, rootTaskId])).rows[0]
+          if (!original) throw new Error("canonical spawned source task lost its Turn binding")
+          lastWaitDisposition = latestWait?.taskId === original.id
+            ? await readWaitDisposition(rootTaskId, latestWait.callId, original.id) : null
+          if (activeChildStatus(original.status)) {
+            if (lastWaitDisposition !== "timed_out") throw new Error("canonical active child resumed without a timed-out wait receipt")
+            noteRecovery("original", original, "wait")
+            expect(toolNames).toContain("agent.wait")
+            const wait = nextWait(original.id, "target-retry")
+            yield { type: "tool_call_completed", callId: wait.callId, name: "agent.wait", arguments: wait.arguments }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (original.status !== "failed") throw new Error(`canonical source child ended as ${original.status}`)
+          expect(lastWaitDisposition === "ready" || lastWaitDisposition === "timed_out").toBe(true)
+          expect(original.attemptCount).toBe(original.maxAttempts)
+          expect(original.failureReason).toBe("turn_execution_failed")
+          failedChildTaskId = original.id
+          noteRecovery("original", original, "followup")
+          const requestText = request.messages.flatMap(message => message.content)
+            .flatMap(part => part.type === "text" ? [part.text] : [])
+          const graphObservation = requestText.find(value => value.includes('"kind":"task_graph_current"'))
+          if (!graphObservation) throw new Error("canonical recovery request omitted current task graph observation")
+          expect(graphObservation).toContain(original.id)
+          expect(graphObservation).toContain('"status":"failed"')
+          expect(graphObservation).toContain('"taskStatus":"failed"')
+          expect(toolNames).toContain("agent.followup")
+          yield { type: "tool_call_completed", callId: `canonical-followup:${canonicalSuffix}`, name: "agent.followup", arguments: {
+            idempotencyKey: `canonical-followup:${canonicalSuffix}`, taskId: original.id,
+            goal: followupChildGoal, successCriteria: turnCriteria, context: { fixture: "recover-terminal-child-failure" },
           } }
+          latestWait = undefined
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        if (call >= 4) {
+        const replacement = (await pool!.query<{ id: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null }>(
+          `SELECT "id", "status", "attemptCount", "maxAttempts", "failureReason" FROM "sub_agent_tasks"
+           WHERE "sessionId" = $1 AND "turnId" = $2 AND "rootTaskId" = $3 AND "role" = 'analyst'
+              AND "taskType" = 'research' AND "goal" = $4 AND "context"->'provenance'->>'sourceTaskId' = $5
+           ORDER BY "createdAt" DESC LIMIT 1`, [canonical.sessionId, canonical.turnId, rootTaskId, followupChildGoal, failedChildTaskId])).rows[0]
+        if (!replacement) throw new Error("canonical follow-up child was not persisted for the failed source")
+        lastWaitDisposition = latestWait?.taskId === replacement.id
+          ? await readWaitDisposition(rootTaskId, latestWait.callId, replacement.id) : null
+        if (activeChildStatus(replacement.status)) {
+          if (latestWait?.taskId === replacement.id && lastWaitDisposition !== "timed_out") {
+            throw new Error("canonical active replacement resumed without a timed-out wait receipt")
+          }
+          noteRecovery("replacement", replacement, "wait")
+          expect(toolNames).toContain("agent.wait")
+          const wait = nextWait(replacement.id, "replacement")
+          yield { type: "tool_call_completed", callId: wait.callId, name: "agent.wait", arguments: wait.arguments }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (replacement.status !== "completed") throw new Error(`canonical replacement child ended as ${replacement.status}`)
+        noteRecovery("replacement", replacement, "candidate")
+        const requestText = request.messages.flatMap(message => message.content)
+          .flatMap(part => part.type === "text" ? [part.text] : [])
+        const graphObservation = requestText.find(value => value.includes('"kind":"task_graph_current"'))
+        if (!graphObservation) throw new Error("canonical replacement request omitted current task graph observation")
+        expect(graphObservation).toContain(replacement.id)
+        expect(graphObservation).toContain('"status":"completed"')
+        expect(graphObservation).toContain('"taskStatus":"completed"')
+        {
           const rejectedCandidateDigest = digestNativeVerificationValue(rejectedCandidate)
           const rejectedControl = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
             WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'auditor' AND "taskType" = 'native_verification'
@@ -732,11 +879,19 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       },
     }
 
-    const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; taskType: string; goal: string; expectedOutputSchema: unknown; context: unknown } }): ModelAdapter => {
+    const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; taskType: string; goal: string; attemptCount: number; expectedOutputSchema: unknown; context: unknown } }): ModelAdapter => {
       let targetRounds = 0
       return {
         id: `native-canonical-${task.role}-${task.taskType}`, profile,
         async *stream(request: HarnessModelRequest) {
+          if (task.role === "analyst" && task.goal === childGoal) {
+            targetChildModelRequests += 1
+            if (request.tools.some(tool => (tool as { name?: unknown }).name === "jobs.search")) targetChildRequestsWithSearch += 1
+            if (targetRounds > 0) {
+              targetChildProviderFailures += 1
+              throw new Error("fixture model stream failed")
+            }
+          }
           yield emitUsage()
           if (task.role === "auditor" && task.taskType === "native_verification") {
             expect(request.tools).toHaveLength(0)
@@ -746,14 +901,15 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             yield { type: "text_delta", text: JSON.stringify(reportFor(packet, canonical.jobId, diagnostic => {
               canonicalJudgeDiagnostics.push(diagnostic)
               if (canonicalJudgeDiagnostics.length > 8) canonicalJudgeDiagnostics.shift()
-            })) }
+            }, failedChildTaskId)) }
             yield { type: "completed", finishReason: "stop" }
             return
           }
           targetRounds += 1
           if (targetRounds === 1) {
             expect(request.tools.map(tool => (tool as { name?: unknown }).name)).toContain("jobs.search")
-            yield { type: "tool_call_completed", callId: `canonical-search:${task.id}`, name: "jobs.search", arguments: {
+            if (task.role === "analyst" && task.goal === childGoal) targetChildSearchCalls += 1
+            yield { type: "tool_call_completed", callId: `canonical-search:${task.id}:${task.attemptCount}`, name: "jobs.search", arguments: {
               target: "Fact 42", location: "Dublin", limit: 10,
             } }
             yield { type: "completed", finishReason: "tool_calls" }
@@ -822,7 +978,8 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       value => value?.turnStatus === "waiting_for_dependency" && value.childStatus === "queued" && value.waitStatus === "waiting")
       await bootstrap.subagents.queue.worker.resume()
       await Promise.race([acceptedCandidateEntered, delay(90_000).then(() => {
-        return pool!.query<{ turnStatus: string | null; rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
+        return Promise.all([
+          pool!.query<{ turnStatus: string | null; rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
           `SELECT turn."status" AS "turnStatus",
              COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal')::int AS "rootControls",
              COUNT(*) FILTER (WHERE task."result"->'nativeVerificationReport'->>'disposition' = 'failed')::int AS "failedReports",
@@ -835,9 +992,11 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
              ON task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
              AND task."role" = 'auditor' AND task."taskType" = 'native_verification'
            WHERE turn."id" = $1 AND turn."sessionId" = $2 GROUP BY turn."status"`,
-          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate)]).then(result => {
-          const state = result.rows[0] ?? null
-          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}`)
+          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate)]),
+          readChildRecoveryDiagnostics(),
+        ]).then(([stateResult, childState]) => {
+          const state = stateResult.rows[0] ?? null
+          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}; childFixture=${JSON.stringify({ modelRequests: targetChildModelRequests, requestsWithSearch: targetChildRequestsWithSearch, searchCalls: targetChildSearchCalls, providerFailures: targetChildProviderFailures })}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
         })
       })])
       const { SUBAGENT_QUEUE_NAME } = await import("../../queue/subagent-queue.js")
@@ -895,18 +1054,49 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.completed'`, [canonical.sessionId, canonical.turnId])
       expect(completedEvents.rows[0]?.count).toBe(1)
 
-      const taskRows = await pool!.query<{ id: string; role: string; taskType: string; goal: string; status: string; attemptCount: number; result: Record<string, unknown> | null; expectedOutputSchema: unknown }>(
-        `SELECT "id", "role", "taskType", "goal", "status", "attemptCount", "result", "expectedOutputSchema"
+      const taskRows = await pool!.query<{ id: string; role: string; taskType: string; goal: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null; sourceTaskId: string | null; result: Record<string, unknown> | null; context: unknown; expectedOutputSchema: unknown }>(
+        `SELECT "id", "role", "taskType", "goal", "status", "attemptCount", "maxAttempts", "failureReason",
+          "context"->'provenance'->>'sourceTaskId' AS "sourceTaskId", "result", "context", "expectedOutputSchema"
          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt", "id"`, [canonical.sessionId, canonical.turnId])
       const target = taskRows.rows.find(row => row.role === "analyst" && row.goal === childGoal)
-      expect(target).toMatchObject({ status: "completed", attemptCount: 1 })
-      expect(JSON.stringify(target?.result)).toContain("Fact 42 is present")
+      const replacement = taskRows.rows.find(row => row.role === "analyst" && row.goal === followupChildGoal && row.sourceTaskId === target?.id)
+      expect(target).toMatchObject({ role: "analyst", taskType: "research", status: "failed", failureReason: "turn_execution_failed" })
+      expect(target?.attemptCount).toBe(target?.maxAttempts)
+      expect(target?.attemptCount).toBe(3)
+      expect(targetChildModelRequests).toBe(6)
+      expect(targetChildRequestsWithSearch).toBe(6)
+      expect(targetChildSearchCalls).toBe(3)
+      expect(targetChildProviderFailures).toBe(3)
+      expect(failedChildTaskId).toBe(target?.id)
+      expect(replacement).toMatchObject({ role: "analyst", taskType: "research", status: "completed", attemptCount: 1, sourceTaskId: target?.id })
+      expect(replacement?.expectedOutputSchema).toEqual(target?.expectedOutputSchema)
+      expect(replacement?.context).toMatchObject({
+        sourceContext: { fixture: "canonical-native-recovery" },
+        provenance: {
+          kind: "agent.followup", sourceTaskId: target?.id, sourceStatus: "failed", sourceAttemptCount: 3,
+          source: { taskId: target?.id, rootTaskId, role: "analyst", taskType: "research", status: "failed", attemptCount: 3, origin: "task_graph" },
+        },
+      })
+      const graphRows = await pool!.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'task_graph' ORDER BY "revision" DESC LIMIT 1`,
+      [canonical.sessionId, canonical.turnId])
+      const graph = parseTaskGraphSnapshot(graphRows.rows[0]?.content)
+      const originalNode = graph.nodes.find(node => node.taskId === target?.id)
+      const replacementNode = graph.nodes.find(node => node.taskId === replacement?.id)
+      expect(originalNode).toMatchObject({ templateId: "native", nativeDelegation: {
+        operationKind: "spawn", callerTaskId: rootTaskId, role: "analyst", taskType: "research",
+      } })
+      expect(replacementNode).toMatchObject({ templateId: "native", nativeDelegation: {
+        operationKind: "followup", callerTaskId: rootTaskId, role: "analyst", taskType: "research",
+        source: { taskId: target?.id, rootTaskId, role: "analyst", taskType: "research", status: "failed", attemptCount: 3, origin: "task_graph" },
+      } })
+      expect(JSON.stringify(replacement?.result)).toContain("Fact 42 is present")
       const reports = taskRows.rows.filter(row => row.role === "auditor" && row.taskType === "native_verification").map(row => {
         const control = parseNativeVerificationControl(row.expectedOutputSchema)
         const result = row.result && typeof row.result === "object" ? row.result.nativeVerificationReport as Record<string, unknown> | undefined : undefined
         return { id: row.id, status: row.status, control, report: result }
       })
-      const passedChild = reports.find(row => row.control?.target.kind === "child" && row.control.target.taskId === target?.id)
+      const passedChild = reports.find(row => row.control?.target.kind === "child" && row.control.target.taskId === replacement?.id)
       const failedRejectedRoot = reports.find(row => row.control?.target.kind === "root_goal" && row.control.target.candidateDigest === digestNativeVerificationValue(rejectedCandidate))
       const passedAcceptedRoot = reports.find(row => row.control?.target.kind === "root_goal" && row.control.target.candidateDigest === digestNativeVerificationValue(acceptedCandidate))
       if (!passedChild || !failedRejectedRoot || !passedAcceptedRoot) throw new Error("canonical child/rejected-root/accepted-root controls were not all persisted")
@@ -914,6 +1104,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       expect(failedRejectedRoot.report).toMatchObject({ disposition: "failed", controlTaskId: failedRejectedRoot.id })
       expect(passedAcceptedRoot.report).toMatchObject({ disposition: "passed", controlTaskId: passedAcceptedRoot.id })
       expect(reports.every(row => row.status === "completed")).toBe(true)
+      expect(canonicalJudgeDiagnostics.some(row => row.targetKind === "root_goal" && row.failedPredecessorHistoryRetained)).toBe(true)
 
       const usage = await pool!.query<{ inputTokens: string | number; outputTokens: string | number; estimatedCostUsd: string | number }>(
         `SELECT COALESCE(SUM("inputTokens"), 0) AS "inputTokens", COALESCE(SUM("outputTokens"), 0) AS "outputTokens",

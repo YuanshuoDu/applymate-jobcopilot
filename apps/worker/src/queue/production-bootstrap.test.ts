@@ -1045,7 +1045,7 @@ describe("production Worker bootstrap", () => {
         expect(durableFixture.state.wait?.consumedAt).toEqual(recoveryNow)
         expect(durableFixture.state.calls.filter(sql => sql.includes('SET "result" = jsonb_set'))).toHaveLength(1)
         expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE"))).toBe(true)
-        expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('"parentTaskId" = $4') && sql.includes('"status" IN (\'ready\', \'timed_out\')'))).toBe(true)
+        expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('"parentTaskId" = $4') && sql.includes('"status" IN (\'ready\', \'timed_out\', \'interrupted\')'))).toBe(true)
         expect(durableFixture.state.turn).toMatchObject({ status: "completed", leaseOwnerId: null, leaseVersion: 2 })
         const resumedMessages = JSON.stringify(resumeRequests[0]?.messages).replaceAll('\\"', '"')
         expect(resumedMessages).toContain(String(durableFixture.state.wait?.id))

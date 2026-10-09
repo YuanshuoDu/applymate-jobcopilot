@@ -244,6 +244,7 @@ type CheckpointResumeDiagnostics = {
 type QuestionWakeupOutboxRow = { topic: string; aggregateId: string; payload: unknown }
 type QuestionWakeupEventRow = { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown }
 type QuestionWaitDiagnosticRow = {
+  id: string
   sessionId: string
   turnId: string
   type: string
@@ -310,16 +311,53 @@ function questionWakeupLineage(
       status: eventPayload.status === outboxPayload.status,
       nextTurnRevision: eventPayload.nextTurnRevision === outboxPayload.nextTurnRevision,
     },
-    outboxPayloadMatchesWait: {
-      waitKind: outboxPayload.waitKind === "question" && waitItem?.waitKind === "question" && waitItem.type === "question",
-      waitId: outboxPayload.waitId === expected.waitId && waitItem?.waitId === expected.waitId,
-      itemId: outboxPayload.itemId === expected.itemId && waitItem !== null,
-      turnId: outboxPayload.turnId === expected.turnId && waitItem?.turnId === expected.turnId,
-      toolCallId: outboxPayload.toolCallId === expected.toolCallId && waitItem?.toolCallId === expected.toolCallId,
-      status: outboxPayload.status === "answered" && expected.turnStatus === "waiting_for_user"
-        && waitItem?.status === "completed" && waitItem.answerAvailable === "true",
+    eventPayloadMatchesExpected: {
+      waitKind: eventPayload.waitKind === "question",
+      waitId: eventPayload.waitId === expected.waitId,
+      itemId: eventPayload.itemId === expected.itemId,
+      turnId: eventPayload.turnId === expected.turnId,
+      toolCallId: eventPayload.toolCallId === expected.toolCallId,
+      status: eventPayload.status === "answered",
+      nextTurnRevision: expected.turnRevision !== null && eventPayload.nextTurnRevision === expected.turnRevision,
+    },
+    outboxPayloadMatchesExpected: {
+      waitKind: outboxPayload.waitKind === "question",
+      waitId: outboxPayload.waitId === expected.waitId,
+      itemId: outboxPayload.itemId === expected.itemId,
+      turnId: outboxPayload.turnId === expected.turnId,
+      toolCallId: outboxPayload.toolCallId === expected.toolCallId,
+      status: outboxPayload.status === "answered",
       nextTurnRevision: expected.turnRevision !== null && outboxPayload.nextTurnRevision === expected.turnRevision,
     },
+    waitItemMatchesExpected: {
+      itemId: waitItem?.id === expected.itemId,
+      waitKind: waitItem?.waitKind === "question" && waitItem.type === "question",
+      waitId: waitItem?.waitId === expected.waitId,
+      session: waitItem?.sessionId === expected.sessionId,
+      turn: waitItem?.turnId === expected.turnId,
+      toolCallId: waitItem?.toolCallId === expected.toolCallId,
+      completed: waitItem?.status === "completed" && waitItem.answerAvailable === "true",
+    },
+    eventPayloadMatchesWaitItem: {
+      waitKind: eventPayload.waitKind === waitItem?.waitKind,
+      waitId: eventPayload.waitId === waitItem?.waitId,
+      itemId: eventPayload.itemId === waitItem?.id,
+      turnId: eventPayload.turnId === waitItem?.turnId,
+      toolCallId: eventPayload.toolCallId === waitItem?.toolCallId,
+    },
+    outboxPayloadMatchesWaitItem: {
+      waitKind: outboxPayload.waitKind === waitItem?.waitKind,
+      waitId: outboxPayload.waitId === waitItem?.waitId,
+      itemId: outboxPayload.itemId === waitItem?.id,
+      turnId: outboxPayload.turnId === waitItem?.turnId,
+      toolCallId: outboxPayload.toolCallId === waitItem?.toolCallId,
+    },
+    nestedItemIdMatchesEnvelope: {
+      outbox: outboxPayload.itemId === envelope.itemId,
+      event: eventPayload.itemId === event?.itemId,
+      eventOutbox: event?.itemId === envelope.itemId,
+    },
+    answeredWaitStatus: outboxPayload.status === "answered" && expected.turnStatus === "waiting_for_user",
   }
 }
 
@@ -328,7 +366,7 @@ describe("question wakeup timeout diagnostic", () => {
     const expected = {
       sessionId: "private-session", turnId: "private-turn", itemId: "private-item", waitId: "private-wait",
       toolCallId: "private-tool-call", turnStatus: "waiting_for_user", turnRevision: 8,
-      waitItem: { sessionId: "private-session", turnId: "private-turn", type: "question", status: "completed", answerAvailable: "true", waitKind: "question", waitId: "private-wait", toolCallId: "private-tool-call" },
+      waitItem: { id: "private-item", sessionId: "private-session", turnId: "private-turn", type: "question", status: "completed", answerAvailable: "true", waitKind: "question", waitId: "private-wait", toolCallId: "private-tool-call" },
     }
     const privateAnswer = "private-answer-content"
     const payload = {
@@ -347,13 +385,29 @@ describe("question wakeup timeout diagnostic", () => {
     expect(matching.outboxFound).toBe(true)
     expect(matching.eventFound).toBe(true)
     expect(Object.values(matching.eventPayloadMatchesOutbox).every(Boolean)).toBe(true)
-    expect(Object.values(matching.outboxPayloadMatchesWait).every(Boolean)).toBe(true)
+    expect(Object.values(matching.eventPayloadMatchesExpected).every(Boolean)).toBe(true)
+    expect(Object.values(matching.outboxPayloadMatchesExpected).every(Boolean)).toBe(true)
+    expect(Object.values(matching.waitItemMatchesExpected).every(Boolean)).toBe(true)
+    expect(Object.values(matching.eventPayloadMatchesWaitItem).every(Boolean)).toBe(true)
+    expect(Object.values(matching.outboxPayloadMatchesWaitItem).every(Boolean)).toBe(true)
+    expect(Object.values(matching.nestedItemIdMatchesEnvelope).every(Boolean)).toBe(true)
+    expect(matching.answeredWaitStatus).toBe(true)
+    expect(JSON.stringify({ questionWakeup: matching }).length).toBeLessThan(1_400)
 
     const mismatched = questionWakeupLineage(expected, [{
       ...outbox[0]!, payload: { ...outbox[0]!.payload, payload: { ...payload, toolCallId: "different" } },
     }], event)
     expect(mismatched.eventPayloadMatchesOutbox.toolCallId).toBe(false)
-    expect(mismatched.outboxPayloadMatchesWait.toolCallId).toBe(false)
+    expect(mismatched.outboxPayloadMatchesExpected.toolCallId).toBe(false)
+    expect(mismatched.outboxPayloadMatchesWaitItem.toolCallId).toBe(false)
+    const nestedMismatch = questionWakeupLineage(expected, [{ ...outbox[0]!, payload: {
+      ...outbox[0]!.payload, payload: { ...payload, itemId: "foreign-item" },
+    } }], event)
+    expect(nestedMismatch.nestedItemIdMatchesEnvelope.outbox).toBe(false)
+    expect(nestedMismatch.outboxPayloadMatchesExpected.itemId).toBe(false)
+    expect(nestedMismatch.outboxPayloadMatchesWaitItem.itemId).toBe(false)
+    const eventNestedMismatch = questionWakeupLineage(expected, outbox, { ...event, payload: { ...payload, itemId: "foreign-item" } })
+    expect(eventNestedMismatch.nestedItemIdMatchesEnvelope.event).toBe(false)
     const wrongScope = questionWakeupLineage(expected, outbox, { ...event, sessionId: "foreign-session" })
     expect(wrongScope.eventScope.session).toBe(false)
     expect(JSON.stringify([matching, mismatched, wrongScope])).not.toContain("private-")
@@ -433,7 +487,7 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
         "content"->>'status' AS "contentStatus", "content"->>'errorCode' AS "errorCode"
       FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2
         AND "type" IN ('tool_call', 'tool_result') ORDER BY "id"`, [input.turnId, input.toolCallId]),
-    input.pool.query<QuestionWaitDiagnosticRow>(`SELECT "sessionId", "turnId", "type", "status", "content"->>'answerAvailable' AS "answerAvailable",
+    input.pool.query<QuestionWaitDiagnosticRow>(`SELECT "id", "sessionId", "turnId", "type", "status", "content"->>'answerAvailable' AS "answerAvailable",
         "content"->>'waitKind' AS "waitKind", "content"->>'questionId' AS "waitId", "content"->>'toolCallId' AS "toolCallId"
       FROM "agent_items" WHERE "id" = $1`, [waitItemId]),
     input.pool.query(`SELECT "sequence", "type", "payload"->>'reasonCode' AS "reasonCode",

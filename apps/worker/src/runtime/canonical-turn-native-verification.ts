@@ -3,7 +3,7 @@ import { digestNativeVerificationValue, type NativeVerificationDisposition, type
 import type { NativeVerificationEnsureResult, NativeVerificationFeedback, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitResult } from "./tools/coordination-types.js"
-import type { TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
 
 const HASH = /^[a-f0-9]{64}$/
 const REASONS: readonly NativeVerificationReasonCode[] = ["meets_criterion", "does_not_meet_criterion", "evidence_missing", "evidence_conflict", "ambiguous", "unsupported_claim"]
@@ -11,7 +11,7 @@ const DISPOSITIONS: readonly NativeVerificationDisposition[] = ["passed", "faile
 export type NativeVerificationDecision =
   | Readonly<{ kind: "passed"; witness: NativeVerificationRootGoalWitness }>
   | Readonly<{ kind: "pending"; waitId: string }>
-  | Readonly<{ kind: "blocked"; feedback: string }>
+  | Readonly<{ kind: "blocked"; feedback: string; semanticRejectionControlTaskId?: string }>
 export type NativeVerificationWaiter = (scope: TaskGraphExecutionScope, targetTaskIds: readonly string[]) => Promise<DurableWaitResult>
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -78,14 +78,55 @@ function ensureResult(value: unknown, candidateText: string, isRoot: boolean): N
     pendingControlTaskIds: [...pendingControlTaskIds], pendingTaskIds: [...pendingTaskIds], feedback: reports,
     ...(parsedWitness ? { rootGoalWitness: parsedWitness } : {}) }
 }
-export function nativeVerificationFeedbackText(status: string, value: readonly NativeVerificationFeedback[] = []): string {
-  const parts = value.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item =>
+type RepairReason = Exclude<NativeVerificationReasonCode, "meets_criterion">
+const REPAIR_ORDER: readonly RepairReason[] = ["evidence_missing", "evidence_conflict", "does_not_meet_criterion", "unsupported_claim", "ambiguous"]
+const REPAIR_ACTION: Readonly<Record<RepairReason, string>> = {
+  evidence_missing: "gather current owned evidence",
+  evidence_conflict: "reconcile current owned sources and resolve contradictions",
+  does_not_meet_criterion: "revise the answer against the criterion",
+  unsupported_claim: "remove the claim or support it with current owned evidence",
+  ambiguous: "Resolve ambiguity from available evidence and seek user clarification when user-dependent, otherwise keep the uncertainty explicit.",
+}
+const VALID_REASON_DISPOSITIONS: Readonly<Record<NativeVerificationDisposition, readonly NativeVerificationReasonCode[]>> = {
+  passed: ["meets_criterion"],
+  failed: ["does_not_meet_criterion", "evidence_conflict", "unsupported_claim"],
+  uncertain: ["evidence_missing", "evidence_conflict", "unsupported_claim", "ambiguous"],
+}
+const GENERIC_REPAIR_GUIDANCE = "Revise the candidate or obtain new current owned evidence before retrying."
+const VERIFICATION_STATUSES = ["passed", "failed", "uncertain", "pending", "unavailable"] as const
+export function nativeVerificationFeedbackText(status: string, value: unknown = []): string {
+  const parsed = parseNativeVerificationFeedback(value)
+  const knownStatus = (VERIFICATION_STATUSES as readonly string[]).includes(status)
+  const safeStatus = knownStatus ? status : "unavailable"
+  let output = `Independent native verification is ${safeStatus}.`
+  if (!parsed || !knownStatus || safeStatus === "pending" || safeStatus === "unavailable") return output
+  if (parsed.some(report => report.criteria.some(item => !VALID_REASON_DISPOSITIONS[item.disposition].includes(item.reasonCode)))) return output
+  const hasNonPassedCriterion = parsed.some(report => report.criteria.some(item => item.disposition !== "passed"))
+  if (safeStatus === "passed" && (hasNonPassedCriterion || parsed.some(report => report.disposition !== "passed"))) return output
+  if (parsed.some(report => report.disposition === "passed" && report.criteria.some(item => item.disposition !== "passed"))) return output
+  const rows = parsed.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item =>
     `target=${report.targetTaskId} criterion=${item.criterionId} status=${item.disposition} reason=${item.reasonCode}`))
-  let output = `Independent native verification is ${status}.`
-  for (const part of parts) { if (`${output} ${part}`.length > 512) break; output += ` ${part}` }
-  return output.slice(0, 512)
+  const reasons = new Set(parsed.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item => item.reasonCode)))
+  const actions = REPAIR_ORDER.filter(reason => reasons.has(reason)).map(reason => {
+    const action = REPAIR_ACTION[reason]
+    return `${reason}: ${action}${action.endsWith(".") ? "" : "."}`
+  })
+  const actionBlock = actions.length ? ` Actions: ${actions.join(" ")}` : ""
+  if (actions.length) {
+    if (output.length + actionBlock.length > 512) return output
+    output += actionBlock
+  } else if (safeStatus === "failed" && rows.length > 0) output += ` ${GENERIC_REPAIR_GUIDANCE}`
+  for (const row of rows) if (output.length + row.length + 1 <= 512) output += ` ${row}`
+  return output
 }
 
+function matchingFailedRootControl(result: NativeVerificationEnsureResult, rootTaskId: string): string | undefined {
+  const matching = result.feedback.filter(report => report.targetTaskId === rootTaskId)
+  if (matching.length !== 1) return undefined
+  const report = matching[0]
+  return report.disposition === "failed" && result.controlTaskIds.includes(report.controlTaskId)
+    && report.criteria.some(item => item.disposition === "failed") ? report.controlTaskId : undefined
+}
 /** Runs child proof before root-candidate proof and durably waits on producer-owned controls. */
 export async function verifyNativeRootCandidate(input: Readonly<{
   port: NativeVerificationPort
@@ -112,7 +153,12 @@ export async function verifyNativeRootCandidate(input: Readonly<{
       if (waited.status !== "ready") return { kind: "blocked", feedback: `Root-goal verification wait ended as ${waited.status}.` }
       continue
     }
-    if (goal.status !== "passed" || !goal.rootGoalWitness) return { kind: "blocked", feedback: nativeVerificationFeedbackText(goal.status, goal.feedback) }
+    if (goal.status !== "passed" || !goal.rootGoalWitness) {
+      const semanticRejectionControlTaskId = goal.status === "failed" ? matchingFailedRootControl(goal, input.scope.rootTaskId) : undefined
+      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback)
+      return { kind: "blocked", feedback,
+        ...(semanticRejectionControlTaskId ? { semanticRejectionControlTaskId } : {}) }
+    }
     return { kind: "passed", witness: goal.rootGoalWitness }
   }
   return { kind: "blocked", feedback: "Independent native verification remained pending after immediate wake; resume through the durable wait." }
@@ -126,6 +172,7 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   hasNativeTasks(): Promise<boolean>
   checkReceipt(): Promise<TurnEngineCompletionGateResult | null>
   wait: NativeVerificationWaiter
+  observeRootSemanticRejection?(controlTaskId: string): boolean
   accept(witness: NativeVerificationRootGoalWitness, candidateText: string): void
 }>): Promise<TurnEngineCompletionGateResult | null> {
   const receipt = await input.checkReceipt()
@@ -134,7 +181,13 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   if (!input.port) return { ok: false, blocker: "task_graph_verification_unverified", feedback: "Native TaskGraph work has no independent verification runtime." }
   const scope = typeof input.scope === "function" ? input.scope() : input.scope
   const result = await verifyNativeRootCandidate({ port: input.port, scope, candidateText: input.candidateText, wait: input.wait })
-  if (result.kind === "blocked") return { ok: false, blocker: "task_graph_verification_unverified", feedback: result.feedback }
+  if (result.kind === "blocked") {
+    const stop = result.semanticRejectionControlTaskId
+      ? input.observeRootSemanticRejection?.(result.semanticRejectionControlTaskId) === true
+      : false
+    return { ok: false, blocker: "task_graph_verification_unverified", feedback: result.feedback,
+      ...(stop ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}) }
+  }
   if (result.kind === "pending") return { ok: false, blocker: "native_verification_pending", feedback: "Independent native verification is waiting on durable child work.", waitId: result.waitId }
   input.accept(result.witness, input.candidateText)
   return null

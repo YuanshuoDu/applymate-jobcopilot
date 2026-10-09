@@ -98,4 +98,19 @@ function validateProfile(profile: ModelCapabilityProfile): void {
       message: `Model adapter profile has invalid token limits: ${profile.provider}/${profile.model}`,
     })
   }
+  const defaultOutput = profile.defaultMaxOutputTokens
+  if (defaultOutput !== undefined && defaultOutput !== null && (!Number.isSafeInteger(defaultOutput) || defaultOutput <= 0)) {
+    throw new AgentModelError({
+      code: "configuration_error",
+      message: `Model adapter profile has invalid default output limit: ${profile.provider}/${profile.model}`,
+    })
+  }
+  if (defaultOutput !== undefined && defaultOutput !== null &&
+    ((profile.maxOutputTokens !== null && defaultOutput > profile.maxOutputTokens) ||
+      (profile.maxContextTokens !== null && defaultOutput > profile.maxContextTokens))) {
+    throw new AgentModelError({
+      code: "configuration_error",
+      message: `Model adapter profile default output limit exceeds a known token limit: ${profile.provider}/${profile.model}`,
+    })
+  }
 }

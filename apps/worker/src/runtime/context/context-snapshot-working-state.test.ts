@@ -4,7 +4,7 @@ import type { ModelAdapter } from "@jobcopilot/agent-model"
 
 import { sha256Hex } from "./context-compaction-canonical.js"
 import { validateSnapshotContent } from "./context-snapshot-validation.js"
-import type { ContextSnapshotCompactionState } from "./context-snapshot-types.js"
+import { ContextSnapshotError, type ContextSnapshotCompactionState } from "./context-snapshot-types.js"
 import { stepContextSnapshotFromContent } from "./context-snapshot-working-state.js"
 import { StepContextBuilder, type StepContextSnapshot } from "./step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./input-claim-store.js"
@@ -104,7 +104,8 @@ describe("durable context snapshot working state", () => {
     const second = stepContextSnapshotFromContent(loaded)
     const memory = first.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
     expect(second).toEqual(first)
-    expect(memory).toMatchObject({ goal: "Search EU roles", userConstraints: ["Dublin only"], openWork: [{ taskId: "task-open", status: "running" }] })
+    expect(memory).toMatchObject({ kind: "durable_context_snapshot", status: "available", goal: "Search EU roles", userConstraints: ["Dublin only"], openWork: [{ taskId: "task-open", status: "running" }] })
+    expect(memory).not.toHaveProperty("omissions")
     expect(memory).toMatchObject({
       legacySnapshotFields: {
         freshness: "may_be_stale_after_compaction",
@@ -154,16 +155,96 @@ describe("durable context snapshot working state", () => {
     await expect(requestFor(stepContextSnapshotFromContent(foreign))).rejects.toMatchObject({ code: "reference_owner_mismatch" })
   })
 
-  it("marks an over-budget projection unavailable instead of truncating evidence", () => {
+  it("keeps an exact fitting goal when protected answers still exceed the projection bound", () => {
     const answers = Array.from({ length: 24 }, (_, index) => ({
       id: `answer-${index.toString().padStart(2, "0")}`, question: "Question", answer: "x".repeat(1000), answerHash: `hash-${index}`,
     }))
-    const compacted = content({ compaction: extension(state({ answers })) })
+    const compacted = content({ compaction: extension(state({ answers })), completedWork: [] })
     const snapshot = stepContextSnapshotFromContent(compacted)
     const projected = snapshot.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
     expect(projected).toMatchObject({ status: "unavailable", reason: "projection_limit_exceeded", authority: "informational_only" })
     expect(projected).not.toHaveProperty("answers")
-    expect(snapshot.goal?.content).toBe("Durable context snapshot unavailable (projection limit exceeded).")
+    expect(snapshot.goal).toEqual({ id: "snapshot-goal", content: "Search EU roles" })
+  })
+
+  it("drops only whole completed-work rows for a bounded compacted partial projection", async () => {
+    const completedWork = Array.from({ length: 10 }, (_, index) => ({
+      taskId: `task-done-${index.toString().padStart(2, "0")}`, resultRef: `result-${index}`, summary: "x".repeat(2000), sequence: String(index + 2),
+    }))
+    const compacted = content({
+      completedWork,
+      context: { ...content().context, goal: { id: "current-goal", content: "Stale context goal" } },
+    })
+    const original = JSON.stringify(compacted)
+    const snapshot = stepContextSnapshotFromContent(compacted)
+    const projected = snapshot.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
+    expect(projected).toMatchObject({
+      status: "partial", authority: "informational_only", goal: "Search EU roles", userConstraints: ["Dublin only"],
+      answers: compacted.compaction?.state.answers,
+      openWork: compacted.compaction?.state.openTasks,
+      legacySnapshotFields: {
+        freshness: "may_be_stale_after_compaction",
+        confirmedDecisions: compacted.confirmedDecisions,
+        failedAttempts: compacted.failedAttempts,
+      },
+      approvalState: {
+        source: "compaction_state", entries: compacted.compaction?.state.approvals,
+        freshness: "compaction_state", grantsActionAuthority: false,
+      },
+      artifacts: compacted.compaction?.state.artifacts,
+      doNotRepeat: compacted.compaction?.state.doNotRepeat,
+      facts: compacted.compaction?.state.facts,
+      omissions: [{ field: "legacySnapshotFields.completedWork", count: 10 }],
+    })
+    expect(projected.legacySnapshotFields).not.toHaveProperty("completedWork")
+    expect(projected).not.toHaveProperty("actionAuthority")
+    expect(JSON.stringify(projected).length).toBeLessThanOrEqual(16_000)
+    expect(snapshot.goal).toEqual({ id: "current-goal", content: "Search EU roles" })
+    expect(JSON.stringify(compacted)).toBe(original)
+    const request = await requestFor(snapshot)
+    expect(request.messages.some(message => message.content.some(part => part.type === "text" && part.text.includes("Search EU roles")))).toBe(true)
+  })
+
+  it("drops only whole completed-work rows for a bounded legacy partial projection", () => {
+    const completedWork = Array.from({ length: 10 }, (_, index) => ({
+      taskId: `task-done-${index.toString().padStart(2, "0")}`, resultRef: `result-${index}`, summary: "x".repeat(2000), sequence: String(index + 2),
+    }))
+    const legacy = content({ compaction: undefined, completedWork })
+    const original = JSON.stringify(legacy)
+    const snapshot = stepContextSnapshotFromContent(legacy)
+    const projected = snapshot.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
+    expect(projected).toMatchObject({
+      status: "partial", authority: "informational_only", goal: "Legacy goal", userConstraints: ["legacy constraint"],
+      legacySnapshotFields: {
+        freshness: "snapshot_scoped", confirmedDecisions: legacy.confirmedDecisions, failedAttempts: legacy.failedAttempts,
+      }, omissions: [{ field: "legacySnapshotFields.completedWork", count: 10 }],
+    })
+    expect(projected.legacySnapshotFields).not.toHaveProperty("completedWork")
+    expect(projected.openWork).toEqual(legacy.openWork)
+    expect(projected.approvalState).toMatchObject({ entries: legacy.pendingApprovals, freshness: "snapshot_scoped", grantsActionAuthority: false })
+    expect(projected.artifacts).toEqual(legacy.artifacts)
+    expect(projected.facts).toEqual(legacy.facts)
+    expect(JSON.stringify(projected).length).toBeLessThanOrEqual(16_000)
+    expect(snapshot.goal).toEqual({ id: "snapshot-goal", content: "Legacy goal" })
+    expect(JSON.stringify(legacy)).toBe(original)
+  })
+
+  it("preserves the exact selected goal at the model-memory boundary and rejects an over-cap selected goal", () => {
+    const boundaryGoal = "g".repeat(15_998)
+    const compacted = content({
+      compaction: extension(state({ goal: boundaryGoal })),
+      context: { ...content().context, goal: { id: "current-goal", content: "Stale context goal" } },
+    })
+    const snapshot = stepContextSnapshotFromContent(compacted)
+    expect(snapshot.goal).toEqual({ id: "current-goal", content: boundaryGoal })
+
+    const oversized = content({
+      compaction: undefined,
+      context: { ...content().context, goal: { id: "current-goal", content: "g".repeat(15_999) } },
+      goal: "Short stale legacy goal",
+    })
+    expect(() => stepContextSnapshotFromContent(oversized)).toThrow(ContextSnapshotError)
+    expect(() => stepContextSnapshotFromContent(oversized)).toThrow("Selected model goal exceeds the projection limit")
   })
 
   it("keeps large valid persisted state loadable and marks only its model projection unavailable", () => {
@@ -172,9 +253,11 @@ describe("durable context snapshot working state", () => {
     }))
     const compacted = content({ compaction: extension(state({ answers })) })
     expect(compacted.compaction?.state.answers).toHaveLength(132)
-    const projected = stepContextSnapshotFromContent(compacted).toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
+    const snapshot = stepContextSnapshotFromContent(compacted)
+    const projected = snapshot.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
     expect(projected).toMatchObject({ status: "unavailable", reason: "projection_limit_exceeded", authority: "informational_only" })
     expect(projected).not.toHaveProperty("answers")
+    expect(snapshot.goal).toEqual({ id: "snapshot-goal", content: "Search EU roles" })
   })
 
   it("preserves the ordinary legacy goal when a legacy memory projection is over budget", () => {
