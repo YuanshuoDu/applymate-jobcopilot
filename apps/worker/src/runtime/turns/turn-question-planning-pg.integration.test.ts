@@ -836,4 +836,3 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     expect(after.rows).toHaveLength(0)
   })
 })
-
