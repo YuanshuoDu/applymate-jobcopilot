@@ -360,7 +360,21 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const modelText = modelRequest.messages.flatMap(message => message.content)
       .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
       .map(part => part.text).join("\n")
-    expect(modelText.includes(JSON.stringify(answeredQuestion.answer))).toBe(true)
+    const profileHeader = "[harness context layer=profile trust=UNTRUSTED_DATA source=native-verification-packet]\n"
+    const profileBlock = modelRequest.messages.flatMap(message => message.content)
+      .find((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> =>
+        part.type === "text" && part.text.startsWith(profileHeader))
+    if (!profileBlock) throw new Error("native_verification_model_profile_unavailable")
+    const modelPacket = JSON.parse(profileBlock.text.slice(profileHeader.length)) as Record<string, unknown>
+    const requestEvidence = (Array.isArray(modelPacket.evidence) ? modelPacket.evidence : []).flatMap((value: unknown) =>
+      value && typeof value === "object" && !Array.isArray(value) ? [value as Record<string, unknown>] : [])
+    const requestAttestation = requestEvidence.find(item => item.kind === "user_self_attestation")
+    if (!requestAttestation || typeof requestAttestation.summary !== "string") {
+      throw new Error("native_verification_model_self_attestation_unavailable")
+    }
+    const requestSummary = JSON.parse(requestAttestation.summary) as Record<string, unknown>
+    expect(requestAttestation.referenceId).toBe(privateReferenceId)
+    expect(requestSummary.answer).toBe(answeredQuestion.answer)
     expect(modelText.includes("not independent proof of external facts")).toBe(true)
     expect(modelText.includes("action, approval, consent, credential, or submission authority")).toBe(true)
     expect(executed.usageAuthorizations).toHaveLength(1)
