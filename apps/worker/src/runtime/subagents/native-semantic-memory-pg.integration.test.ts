@@ -266,24 +266,27 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
       ...usage, now: times.get(stepIds[0]!)!, identity: identityB })).rejects.toThrow()
 
     await seedStep(stepIds[4]!, 5, "9")
-    await expect(readAfterReconstruction({ owner, stepId: stepIds[4]!, identity: identityB })).resolves.toMatchObject({
+    await expect(readAfterReconstruction({ owner, stepId: stepIds[4]!, identity: identityB })).rejects.toThrow()
+    const identityBAtCheckpoint9 = await ensureRejectedCandidate(candidateB, stepIds[4]!)
+    expect(Reflect.get(identityBAtCheckpoint9, "inputThroughSequence")).toBe(9n)
+    await expect(readAfterReconstruction({ owner, stepId: stepIds[4]!, identity: identityBAtCheckpoint9 })).resolves.toMatchObject({
       inputThroughSequence: 9n, stepIds: [],
     })
-    await expect(finish(stepIds[4]!, identityB)).resolves.toMatchObject({ distinctStepCount: 1 })
+    await expect(finish(stepIds[4]!, identityBAtCheckpoint9)).resolves.toMatchObject({ distinctStepCount: 1 })
 
     await seedStep(stepIds[5]!, 6, "9")
-    const staleIdentityB = { ...identityB, controlAttempt: identityB.controlAttempt + 1 }
+    const staleIdentityB = { ...identityBAtCheckpoint9, controlAttempt: identityBAtCheckpoint9.controlAttempt + 1 }
     await expect(complete({ owner, stepId: stepIds[5]!, finishReason: "stop", errorCode: null,
       ...usage, now: new Date(), identity: staleIdentityB })).rejects.toThrow()
     const foreignOwner = { ...owner, userId: `native-semantic-foreign-${suffix}` }
     await expect(complete({ owner: foreignOwner, stepId: stepIds[5]!, finishReason: "stop", errorCode: null,
-      ...usage, now: new Date(), identity: identityB })).rejects.toThrow()
+      ...usage, now: new Date(), identity: identityBAtCheckpoint9 })).rejects.toThrow()
     const otherOwner = { ...owner, ownerId: `${turnOwnerId}-stale`, leaseVersion: 2 }
     await expect(complete({ owner: otherOwner, stepId: stepIds[5]!, finishReason: "stop", errorCode: null,
-      ...usage, now: new Date(), identity: identityB })).rejects.toThrow()
+      ...usage, now: new Date(), identity: identityBAtCheckpoint9 })).rejects.toThrow()
     const untouched = await adminPool!.query<{ status: string }>(`SELECT "status" FROM "agent_steps" WHERE "id" = $1`, [stepIds[5]])
     expect(untouched.rows[0]?.status).toBe("streaming")
-    await expect(finish(stepIds[5]!, identityB)).resolves.toMatchObject({ distinctStepCount: 2 })
+    await expect(finish(stepIds[5]!, identityBAtCheckpoint9)).resolves.toMatchObject({ distinctStepCount: 2 })
 
     const privileges = await adminPool!.query<{ canSelect: boolean; canInsert: boolean; canUpdate: boolean; canDelete: boolean }>(
       `SELECT has_table_privilege($1, 'public.agent_native_semantic_rejections', 'SELECT') AS "canSelect",
@@ -293,9 +296,55 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     expect(privileges.rows[0]).toEqual({ canSelect: true, canInsert: true, canUpdate: false, canDelete: false })
   }, 60_000)
 
+  it("binds a failed-root identity to the persisted BIGINT checkpoint through Step completion", async () => {
+    const checkpointX = 9_007_199_254_740_993n
+    const checkpointY = checkpointX + 1n
+    const checkpointCandidate = "The checkpoint-specific candidate does not satisfy the persisted objective."
+    const staleStepId = `native-semantic-stale-checkpoint-${suffix}`
+    const controlStepId = `native-semantic-equal-checkpoint-${suffix}`
+    const usage = { inputTokens: 23, outputTokens: 8, estimatedCostUsd: 0.0023 }
+    const complete = requiredStoreMethod(store!, "completeNativeSemanticRejectionStep")
+
+    await seedStep(staleStepId, 13, checkpointX.toString())
+    const persistedBeforeRead = await adminPool!.query<{ inputThroughSequence: string }>(
+      `SELECT "inputThroughSequence" FROM "agent_steps" WHERE "id" = $1`, [staleStepId])
+    expect(persistedBeforeRead.rows[0]?.inputThroughSequence).toBe(checkpointX.toString())
+    const staleIdentity = await ensureRejectedCandidate(checkpointCandidate, staleStepId)
+    expect(Reflect.get(staleIdentity, "inputThroughSequence")).toBe(checkpointX)
+    expect(checkpointCandidate).not.toContain(checkpointX.toString())
+
+    await adminPool!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2::bigint WHERE "id" = $1`,
+      [staleStepId, checkpointY.toString()])
+    const completion = { owner, stepId: staleStepId, finishReason: "stop", errorCode: null as null,
+      ...usage, now: new Date(), identity: staleIdentity }
+    await expect(complete(completion)).rejects.toThrow()
+
+    const rejectedState = await adminPool!.query<{
+      status: string; finishReason: string | null; errorCode: string | null; inputTokens: number; outputTokens: number
+      estimatedCostUsd: string; inputThroughSequence: string; completedAt: Date | null; receipts: number
+    }>(`SELECT step."status", step."finishReason", step."errorCode", step."inputTokens", step."outputTokens",
+        step."estimatedCostUsd", step."inputThroughSequence", step."completedAt",
+        (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS rejection WHERE rejection."stepId" = step."id") AS "receipts"
+      FROM "agent_steps" AS step WHERE step."id" = $1`, [staleStepId])
+    expect(rejectedState.rows[0]).toEqual({ status: "streaming", finishReason: null, errorCode: null, inputTokens: 0,
+      outputTokens: 0, estimatedCostUsd: "0.00000000", inputThroughSequence: checkpointY.toString(), completedAt: null, receipts: 0 })
+
+    await seedStep(controlStepId, 14, checkpointX.toString())
+    const controlIdentity = await ensureRejectedCandidate(checkpointCandidate, controlStepId)
+    expect(Reflect.get(controlIdentity, "inputThroughSequence")).toBe(checkpointX)
+    const controlCompletion = { ...completion, stepId: controlStepId, identity: controlIdentity, now: new Date() }
+    await expect(complete(controlCompletion)).resolves.toMatchObject({ inputThroughSequence: checkpointX, distinctStepCount: 1 })
+    await expect(complete(controlCompletion)).resolves.toMatchObject({ inputThroughSequence: checkpointX, distinctStepCount: 1 })
+    const controlReceipt = await adminPool!.query<{ inputThroughSequence: string; count: number }>(
+      `SELECT "inputThroughSequence", COUNT(*) OVER()::int AS "count" FROM "agent_native_semantic_rejections"
+        WHERE "turnId" = $1 AND "stepId" = $2`, [turnId, controlStepId])
+    expect(controlReceipt.rows[0]).toEqual({ inputThroughSequence: checkpointX.toString(), count: 1 })
+  }, 60_000)
+
   it("rolls back Step completion when the restrictive role cannot insert its receipt", async () => {
-    await seedStep(stepIds[7]!, 8, "9")
-    const identity = await ensureRejectedCandidate(candidateB, stepIds[7]!, "evidence_conflict")
+    const rollbackCandidate = "The rollback-specific candidate does not satisfy the persisted objective."
+    await seedStep(stepIds[7]!, 15, "9")
+    const identity = await ensureRejectedCandidate(rollbackCandidate, stepIds[7]!, "evidence_conflict")
     await adminPool!.query(`REVOKE INSERT ON "agent_native_semantic_rejections" FROM "${runtimeRole}"`)
     try {
       const complete = requiredStoreMethod(store!, "completeNativeSemanticRejectionStep")
@@ -309,6 +358,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
   }, 30_000)
 
   it("revalidates failed receipts with exact-Step question and steering evidence", async () => {
+    const evidenceCandidate = "The question and steering candidate does not satisfy the persisted objective."
     const rootInputId = `native-semantic-root-input-${suffix}`
     const originalMessageId = `native-semantic-root-message-${suffix}`
     const sourceStepId = `native-semantic-source-step-${suffix}`
@@ -346,7 +396,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await adminPool!.query(`INSERT INTO "agent_steps"
       ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode",
        "inputTokens", "outputTokens", "estimatedCostUsd", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "completedAt")
-      VALUES ($1, $2, $3, $4, 9, 1, 'waiting_for_user', 'tool_calls', NULL, 47, 13, 0.007, 9, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, $4, 17, 1, 'waiting_for_user', 'tool_calls', NULL, 47, 13, 0.007, 9, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
     [questionStepId, sessionId, turnId, rootTaskId])
     await adminPool!.query(`INSERT INTO "agent_items"
       ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "completedAt", "updatedAt")
@@ -392,14 +442,14 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
       event.causationId, event.key, JSON.stringify(event.payload)])
     await adminPool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [sessionId, firstSequence + 4])
 
-    await seedStep(evidenceStepId, 10, "10", [steeringId])
+    await seedStep(evidenceStepId, 18, "10", [steeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
       ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
        "consumedByStepId", "consumedAt", "cancelledAt")
       VALUES ($1, $2, $3, $4, $5, 'steer', 'consumed', $6::jsonb, 10, $7, CURRENT_TIMESTAMP, NULL)`,
     [steeringId, sessionId, turnId, userId, `native-semantic-steer-${suffix}`, JSON.stringify([{ type: "text", text: steering }]), evidenceStepId])
 
-    const identity = await ensureRejectedCandidate(candidateA, evidenceStepId)
+    const identity = await ensureRejectedCandidate(evidenceCandidate, evidenceStepId)
     const controlRow = await adminPool!.query<{ context: unknown }>(`SELECT "context" FROM "sub_agent_tasks" WHERE "id" = $1`, [identity.controlTaskId])
     const controlData = controlRow.rows[0] && parseNativeVerificationControl((await adminPool!.query<{ expectedOutputSchema: unknown }>(
       `SELECT "expectedOutputSchema" FROM "sub_agent_tasks" WHERE "id" = $1`, [identity.controlTaskId])).rows[0]?.expectedOutputSchema)
@@ -440,7 +490,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     expect(privateReceipt).not.toContain(originalTaskText)
     expect(privateReceipt).not.toContain(originalReference[0]!.referenceId)
 
-    await seedStep(supersedingStepId, 11, "10")
+    await seedStep(supersedingStepId, 19, "10")
     const persistedStepSnapshot = async (stepId: string) => {
       const result = await adminPool!.query<{ step: unknown; stepCount: number; receiptCount: number; receipts: unknown }>(
         `SELECT to_jsonb(step) AS "step", (SELECT COUNT(*)::int FROM "agent_steps" AS observed WHERE observed."turnId" = step."turnId") AS "stepCount",
@@ -456,7 +506,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await expect(complete(receiptInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 1 })
     expect(await persistedStepSnapshot(evidenceStepId)).toEqual(beforeReplay)
 
-    await seedStep(newEpochStepId, 12, "11", [newSteeringId])
+    await seedStep(newEpochStepId, 20, "11", [newSteeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
       ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
        "consumedByStepId", "consumedAt", "cancelledAt")
@@ -468,7 +518,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await expect(complete({ ...receiptInput, stepId: newEpochStepId })).rejects.toThrow()
     expect(await persistedStepSnapshot(newEpochStepId)).toEqual(beforeStaleAttempt)
 
-    const newIdentity = await ensureRejectedCandidate(candidateA, newEpochStepId)
+    const newIdentity = await ensureRejectedCandidate(evidenceCandidate, newEpochStepId)
     expect(newIdentity.candidateDigest).toBe(identity.candidateDigest)
     expect(newIdentity.controlOperationId).not.toBe(identity.controlOperationId)
     const read = requiredStoreMethod(store!, "readNativeSemanticRejections")

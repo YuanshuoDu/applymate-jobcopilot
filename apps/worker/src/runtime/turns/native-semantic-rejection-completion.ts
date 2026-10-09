@@ -40,6 +40,7 @@ function identityMatches(actual: NativeSemanticRejectionIdentity | null, expecte
   return actual !== null && actual.candidateDigest === expected.candidateDigest && actual.controlTaskId === expected.controlTaskId
     && actual.controlOperationId === expected.controlOperationId && actual.controlAttempt === expected.controlAttempt
     && actual.controlReportDigest === expected.controlReportDigest
+    && actual.inputThroughSequence === expected.inputThroughSequence
 }
 async function currentOwnedRootAttempt(client: TurnEngineQueryClient, owner: Extract<ExecutionOwnerFence, { kind: "turn" }>, clock: "CURRENT_TIMESTAMP" | "clock_timestamp()", lock: boolean): Promise<number | null> {
   const root = await client.query<TurnEngineRow>(`SELECT task."attemptCount", task."status" FROM "sub_agent_tasks" AS task
@@ -127,6 +128,7 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
   await assertCurrentRootLease(client, owner, rootScope.parentAttemptCount)
   let checkpoint: bigint
   try { checkpoint = nativeSemanticCheckpoint(step.inputThroughSequence) } catch { throw conflict("step checkpoint") }
+  if (checkpoint !== identity.inputThroughSequence) throw conflict("proof input checkpoint changed")
   try {
     if (step.status === "completed") {
       if (!sameStep(step, input, checkpoint) || !await samePersistedCost(client, step, input)) throw conflict(`step ${input.stepId} replay`)

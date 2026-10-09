@@ -960,7 +960,7 @@ describe("owner-agnostic turn execution loop", () => {
       return appendEvent(input)
     })
     const rejection = { candidateDigest: "a".repeat(64), controlTaskId: "control-root", controlOperationId: "operation-root",
-      controlAttempt: 1, controlReportDigest: "b".repeat(64) }
+      controlAttempt: 1, controlReportDigest: "b".repeat(64), inputThroughSequence: 0n }
     const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ({
       ok: false, blocker: "task_graph_verification_unverified", feedback: "Independent proof rejected the candidate.",
       [NATIVE_SEMANTIC_REJECTION]: rejection,

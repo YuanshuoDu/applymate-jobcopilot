@@ -14,7 +14,7 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 
 const owner: TurnExecutionOwnerFence = { kind: "turn", userId: "u", sessionId: "s", turnId: "t", taskId: "root", rootTaskId: "root",
   ownerId: "lease", leaseVersion: 2, leaseExpiresAt: new Date("2030-01-01T00:00:00Z") }
-const identity = { candidateDigest: "a".repeat(64), controlTaskId: "control", controlOperationId: "operation", controlAttempt: 2, controlReportDigest: "b".repeat(64) }
+const identity = { candidateDigest: "a".repeat(64), inputThroughSequence: 8n, controlTaskId: "control", controlOperationId: "operation", controlAttempt: 2, controlReportDigest: "b".repeat(64) }
 const input = { owner, stepId: "step-4", finishReason: "stop", errorCode: null, inputTokens: 12, outputTokens: 7,
   estimatedCostUsd: 0.00012345, now: new Date("2026-10-07T00:00:00Z"), identity }
 const packetText = "Whole final candidate\n"
@@ -122,6 +122,19 @@ describe("atomic native semantic rejection completion", () => {
     const mock = client()
     await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
     expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"'))).toBe(false)
+  })
+
+  it("rejects a proof identity checkpoint that differs from the expected checkpoint before mutation", async () => {
+    readers.proof.mockResolvedValue({ ...identity, inputThroughSequence: 9n })
+    const mock = client()
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+  })
+
+  it("rejects when the proof identity checkpoint differs from the locked Step before mutation", async () => {
+    const mock = client({ checkpoint: "9" })
+    await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
   })
 
   it("rejects the fresh completion when the statement-time root lease fence expires after recheck", async () => {
@@ -316,4 +329,3 @@ describe("atomic native semantic rejection completion", () => {
     await expect(completeNativeSemanticRejectionStepWithClient(conflictInsert.client, input)).rejects.toMatchObject({ code: "persistence_conflict" })
   })
 })
-

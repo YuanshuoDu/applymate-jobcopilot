@@ -13,7 +13,7 @@ import {
   nativeVerificationTarget, type NativeVerificationOwnedState,
 } from "./native-verification-pg-bindings.js"
 import { currentTaskGraph, loadTaskGraph, type LoadedGraph } from "./task-graph-pg-state.js"
-import type { NativeSemanticRejectionIdentity } from "../turns/native-semantic-rejection-ledger.js"
+import { nativeSemanticCheckpoint, type NativeSemanticRejectionIdentity } from "../turns/native-semantic-rejection-ledger.js"
 import type { NativeVerificationRootGoalWitness, NativeVerificationTerminalProofReader } from "./native-verification-port.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 import { appendNativeUserSelfAttestations } from "./native-verification-user-evidence.js"
@@ -38,6 +38,8 @@ export async function readNativeVerificationFailedRootRejectionWithClient(client
   const { scope, graph, state, candidateText, controlTaskId, stepId } = input
   if (scope.parentTaskId !== scope.rootTaskId || !candidateText.trim() || Buffer.byteLength(candidateText, "utf8") > 16 * 1024
     || !state.criteriaValid || state.turnGoalConflict || !state.goal || !state.nativeSourcesValid || !nativeVerificationTypedCriteriaReady(graph)) return null
+  const inputThroughSequence = await failedRootStepCheckpoint(client, scope, stepId)
+  if (inputThroughSequence === null) return null
   const proofs = await readNativeVerificationControlProofs(client, scope)
   if (!await currentNativeChildrenMatch(client, graph, state, proofs)) return null
   const history = nativeVerificationHistory(proofs), candidateDigest = digestNativeVerificationValue(candidateText)
@@ -52,8 +54,17 @@ export async function readNativeVerificationFailedRootRejectionWithClient(client
     history: nativeVerificationRootPacketHistory(history, historyTargets(proofs), candidateDigest, childBindingSetDigest) })
   const withUserEvidence = content ? await appendNativeUserSelfAttestations(client, scope, content, { kind: "exact", stepId }) : null
   if (!withUserEvidence || !nativeVerificationControlContentMatches(proof.task.packet, withUserEvidence)) return null
-  return { candidateDigest, controlTaskId: proof.task.taskId, controlOperationId: proof.task.control.controlOperationId,
+  return { candidateDigest, inputThroughSequence, controlTaskId: proof.task.taskId, controlOperationId: proof.task.control.controlOperationId,
     controlAttempt: proof.task.attemptCount, controlReportDigest: proof.reportDigest }
+}
+
+async function failedRootStepCheckpoint(client: Queryable, scope: TaskGraphReadScope, stepId: string): Promise<bigint | null> {
+  const result = await client.query<{ taskId: unknown; attempt: unknown; status: unknown; inputThroughSequence: unknown }>(`SELECT "taskId", "attempt", "status", "inputThroughSequence"
+    FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4
+      AND "attempt" = $5 AND "status" IN ('streaming', 'completed') FOR SHARE`,
+  [stepId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentAttemptCount])
+  if (result.rows.length !== 1) return null
+  try { return nativeSemanticCheckpoint(result.rows[0]?.inputThroughSequence) } catch { return null }
 }
 
 function record(value: unknown): Record<string, unknown> | null {
