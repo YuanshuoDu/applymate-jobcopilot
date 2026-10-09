@@ -4,10 +4,12 @@ import type { TaskGraphCurrentState } from "../subagents/task-graph-command-port
 import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { readRootTaskHistoryCandidates, type RootTaskHistoryCandidate } from "./root-task-history-source-store.js"
 import { readRootTaskHistoryFence, validateRootTaskHistoryFenceInput, withRootTaskHistoryTransaction, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { deriveRootTaskHistoryLessonFacts, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
 const GRAPH_LOAD_LIMIT = 8
+type CandidateGraph = Readonly<{ taskGraph: TaskGraphCurrentState; nodeLessons?: readonly (RootTaskHistoryNodeLesson | undefined)[] }>
 
 export type DirectRootTaskHistoryLoadInput = RootTaskHistoryFenceInput
 
@@ -33,7 +35,7 @@ async function lockEligibleSourceSession(client: Client, sessionId: string, user
   return result.rows.length === 1 && result.rows[0]?.id === sessionId
 }
 
-async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInput, source: RootTaskHistoryCandidate): Promise<TaskGraphCurrentState | undefined> {
+async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInput, source: RootTaskHistoryCandidate): Promise<CandidateGraph | undefined> {
   if (input.crossSessionRootTaskHistoryEnabled === true && source.sessionId !== input.lease.sessionId
     && !await lockEligibleSourceSession(client, source.sessionId, input.lease.userId)) return undefined
   const scope: GraphIdentityScope = { userId: input.lease.userId, sessionId: source.sessionId,
@@ -42,7 +44,9 @@ async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInpu
     const loaded = await loadTaskGraph(client, scope, false)
     if (!loaded.item || !loaded.snapshot || !loaded.state) return undefined
     const graph = currentTaskGraph(loaded)
-    return graph.nodes.length ? graph : undefined
+    const nodeLessons = deriveRootTaskHistoryLessonFacts(loaded, graph)
+    return graph.nodes.length ? { taskGraph: graph,
+      ...(nodeLessons.length === graph.nodes.length && nodeLessons.some(Boolean) ? { nodeLessons } : {}) } : undefined
   } catch (error: unknown) {
     if (graphEvidenceError(error)) return undefined
     throw error
@@ -62,9 +66,10 @@ export function createPgDirectRootTaskHistoryStore(pool: Pool) {
         for (const source of sources) {
           if (graphLoads >= GRAPH_LOAD_LIMIT) break
           graphLoads += 1
-          const taskGraph = await graphForCandidate(client, input, source)
-          if (taskGraph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
-            terminalSequence: source.terminalSequence, ...(source.terminalAt ? { terminalAt: source.terminalAt } : {}), taskGraph })
+          const loadedGraph = await graphForCandidate(client, input, source)
+          if (loadedGraph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
+            terminalSequence: source.terminalSequence, ...(source.terminalAt ? { terminalAt: source.terminalAt } : {}),
+            taskGraph: loadedGraph.taskGraph, ...(loadedGraph.nodeLessons ? { nodeLessons: loadedGraph.nodeLessons } : {}) })
         }
         return outcomes
       })
