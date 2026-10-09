@@ -4,6 +4,7 @@ import { TaskGraphCommandError } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { transaction, type Queryable } from "./pg-store-persistence.js"
 import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph } from "./task-graph-pg-state.js"
+import { buildTaskGraphPlanningFacts } from "./task-graph-planning-facts.js"
 import { createGraphTasks } from "./task-graph-pg-create.js"
 import { writePlanReceipt } from "./task-graph-pg-events.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
@@ -103,7 +104,9 @@ async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: T
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }
-  return currentTaskGraph(loaded)
+  const current = currentTaskGraph(loaded)
+  const planningFacts = buildTaskGraphPlanningFacts(loaded)
+  return planningFacts ? { ...current, planningFacts } : current
 }
 
 async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {
