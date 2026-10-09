@@ -41,7 +41,7 @@ function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decis
   const toolName = options.decision === "revise" ? "agent.plan" : "agent.reconcile"
   const executionIdentity = { kind: "turn" as const, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner, leaseVersion: scope.turnLeaseVersion, leaseExpiresAt: new Date(0) }
-  const toolCall = { type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item",
+  const toolCall = { eventId: "tool-event", eventSequence: "20", type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item",
     correlationId: "call-1", idempotencyKey: `${executionKey(executionIdentity)}:event:tool-started:call-1`,
     payload: { toolCallId: "call-1", toolName, taskId: scope.rootTaskId }, callItemId: "call-item", stepId: scope.stepId,
     itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: "call-1", toolName,
@@ -55,24 +55,43 @@ function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decis
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: scope.rootTaskId }], rowCount: 1 }
     if (sql.includes("WITH wall_clock")) return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
     if (sql.includes('SELECT turn."input"')) return { rows: [{ input: { goal: "Find jobs", clientMessageId: "root-client-message" } }], rowCount: 1 }
-    if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) return { rows: [original, ...(options.pending === false ? [] : [steer])], rowCount: options.pending === false ? 1 : 2 }
-    if (sql.includes('FROM "agent_inputs" AS input')) return { rows: options.pending === false ? [] : [accepted(steer)], rowCount: options.pending === false ? 0 : 1 }
+    if (sql.includes('FROM "agent_inputs"') && sql.includes('"clientMessageId" = $4')) return { rows: [original], rowCount: 1 }
+    if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) {
+      const inputs = [original, ...(options.pending === false ? [] : [steer])].filter(row => values?.[3] == null
+        || BigInt(row.acceptedSequence) > BigInt(String(values[3])) || BigInt(row.acceptedSequence) === BigInt(String(values[3])) && row.id > String(values?.[4]))
+      return { rows: inputs.slice(0, 64), rowCount: Math.min(inputs.length, 64) }
+    }
+    if (sql.includes('FROM "agent_inputs" AS input')) {
+      const ids = values?.[3] as string[]
+      const rows = options.pending === false || !ids.includes(steer.id) ? [] : [accepted(steer)]
+      return { rows, rowCount: rows.length }
+    }
     if (sql.includes('FROM "agent_steps"') && sql.includes('ANY($4::text[])')) {
       const rows = (values?.[3] as string[] | undefined)?.includes(scope.stepId) ? [decisionStep] : [originStep]
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('FROM "agent_steps"') && values?.[0] === scope.stepId) return { rows: [decisionStep], rowCount: 1 }
-    if (sql.includes("tool_call.started")) return { rows: [toolCall], rowCount: 1 }
+    if (sql.includes("tool_call.started")) {
+      const isHistoryPage = Array.isArray(values?.[3]), rows = isHistoryPage && values?.[4] != null ? [] : [toolCall]
+      return { rows, rowCount: rows.length }
+    }
     if (sql.includes("cognitive.agenda")) return { rows: [{ actor: "subagent", itemId: null, taskId: scope.rootTaskId, correlationId: scope.stepId, payload: agenda() }], rowCount: 1 }
     if (sql.includes('event."idempotencyKey" = $2')) {
       const found = events.filter(event => event.idempotencyKey === values?.[1])
       return { rows: found.map(event => ({ ...event, hasOutbox: false })), rowCount: found.length }
     }
-    if (sql.includes('event."type" = $3') && values?.[2] === "agent.plan.reconciliation") return { rows: events.map(event => ({ ...event, hasOutbox: false })), rowCount: events.length }
+    if (sql.includes('event."type" = $3') && values?.[2] === "agent.plan.reconciliation") {
+      const afterSequence = values?.[3] == null ? null : BigInt(String(values[3])), afterId = String(values?.[4] ?? "")
+      const page = events.filter(event => {
+        const sequence = BigInt(String(event.sequence))
+        return afterSequence === null || sequence > afterSequence || sequence === afterSequence && String(event.id) > afterId
+      }).slice(0, 64).map(event => ({ ...event, hasOutbox: false }))
+      return { rows: page, rowCount: page.length }
+    }
     if (sql.includes('FROM "agent_items"')) return { rows: [{ revision: graphRevision }], rowCount: 1 }
     if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: String(++nextSequence) }], rowCount: 1 }
     if (sql.startsWith('INSERT INTO "agent_events"')) {
-      const row = { itemId: values?.[3] ?? null, taskId: values?.[4] ?? null, type: values?.[6], actor: values?.[7], correlationId: scope.turnId,
+      const row = { id: `receipt-${events.length}`, turnId: scope.turnId, itemId: values?.[3] ?? null, taskId: values?.[4] ?? null, type: values?.[6], actor: values?.[7], correlationId: scope.turnId,
         causationId: values?.[8] ?? null, idempotencyKey: values?.[9], payload: JSON.parse(String(values?.[10])), sequence: values?.[5] }
       events.push(row)
       return { rows: [], rowCount: 1 }
@@ -106,6 +125,7 @@ describe("durable steering reconciliation ledger", () => {
     expect(fixture.events).toHaveLength(1)
     expect(fixture.events[0]).toMatchObject({ itemId: null, taskId: scope.rootTaskId, type: "agent.plan.reconciliation", actor: "orchestrator",
       causationId: scope.stepId, payload: { decision: "revise", observedRevision: 1, resultingRevision: 2, steerInputIds: ["steer-1"] } })
+    expect(fixture.events[0]?.idempotencyKey).toBe(prepared.idempotencyKey)
     expect(fixture.calls.some(call => call.sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
     await writeSteeringReconciliationReceipt(fixture.client, prepared, 2)
     expect(fixture.events).toHaveLength(1)

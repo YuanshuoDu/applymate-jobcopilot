@@ -80,11 +80,21 @@ function steeringLedgerPool(pendingSteer = false, planningRoot = true): pg.Pool 
     if (sql.includes("WITH wall_clock AS MATERIALIZED")) return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
     if (sql.includes('SELECT "id" FROM "agent_steps"')) return { rows: [{ id: params[0] }], rowCount: 1 }
     if (sql.includes('SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "turnId"')) return { rows: [{ id: params[0] }], rowCount: 1 }
-    if (sql.includes('SELECT "id", "clientMessageId", "delivery"') && sql.includes('FROM "agent_inputs" WHERE')) {
-      const rows = pendingSteer ? [
-        { id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed", acceptedSequence: "1", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
-        { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+    if (sql.includes('SELECT "id", "clientMessageId", "delivery"') && sql.includes('FROM "agent_inputs" WHERE') && sql.includes('"clientMessageId" = $4')) {
+      const rows = pendingSteer && params[3] === "original-message" ? [{ id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed",
+        acceptedSequence: "1", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null }] : []
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) {
+      const inputs = pendingSteer ? [
+        { id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed", acceptedSequence: "1",
+          consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+        { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2",
+          consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
       ] : []
+      const after = params[3] == null ? null : BigInt(String(params[3])), afterId = String(params[4] ?? "")
+      const rows = inputs.filter(row => after === null || BigInt(row.acceptedSequence) > after
+        || BigInt(row.acceptedSequence) === after && row.id > afterId).slice(0, 64)
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('SELECT input."id"') && sql.includes('LEFT JOIN "agent_events"')) {
