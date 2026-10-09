@@ -74,6 +74,7 @@ function clonePauseState(state: FakePauseState): FakePauseState {
 
 function cancellationDatabase(options: { readonly withCallRow?: boolean; readonly withResultRow?: boolean; readonly ambiguousCommit?: boolean; readonly recoverPaused?: boolean;
   readonly orphanStarted?: boolean; readonly orphanCompleted?: boolean; readonly orphanUsage?: boolean; readonly orphanPause?: boolean; readonly malformedOrphanUsage?: boolean;
+  readonly nullOrphanUsage?: boolean;
   readonly malformedOrphanPause?: boolean; readonly orphanCompletedCausation?: string | null; readonly orphanUsageCausation?: string | null;
   readonly orphanCompletedSequence?: string; readonly orphanUsageSequence?: string; readonly stepStatus?: string; readonly transientStepUpdates?: number } = {}) {
   const modelUsageKey = orphanModelUsageKey, modelStartedKey = orphanModelStartedKey, modelCompletedKey = orphanModelCompletedKey
@@ -102,7 +103,7 @@ function cancellationDatabase(options: { readonly withCallRow?: boolean; readonl
     events.set(key, { id: orphanModelUsageId, sessionId: owner.sessionId, turnId: owner.turnId, itemId: null, taskId: owner.taskId,
       sequence: options.orphanUsageSequence ?? "11", type: "model.usage", actor: "orchestrator", correlationId: "step-1",
       causationId: options.orphanUsageCausation === undefined ? orphanModelCompletedId : options.orphanUsageCausation, idempotencyKey: key,
-      payload: { provider: "fixture", model: "fixture", usage: { inputTokens: options.malformedOrphanUsage ? "10" : 10, outputTokens: 4, estimatedCostUsd: 0.02 }, taskId: owner.taskId } })
+      payload: { provider: "fixture", model: "fixture", usage: options.nullOrphanUsage ? null : { inputTokens: options.malformedOrphanUsage ? "10" : 10, outputTokens: 4, estimatedCostUsd: 0.02 }, taskId: owner.taskId } })
   }
   if (options.orphanPause) events.set("pause-after-orphan-model-usage", { id: "pause-after-orphan-model-usage", sessionId: owner.sessionId, turnId: owner.turnId, itemId: null, taskId: null,
     sequence: "12", type: "session.pause_requested", actor: "user", correlationId: owner.turnId, causationId: null,
@@ -369,13 +370,14 @@ describe("native question pause cancellation readback", () => {
     for (const database of [
       cancellationDatabase({ withCallRow: false, orphanStarted: true, orphanPause: true }),
       cancellationDatabase({ withCallRow: false, orphanStarted: true, orphanCompleted: true, orphanUsage: true, orphanPause: true, malformedOrphanUsage: true }),
+      cancellationDatabase({ withCallRow: false, orphanStarted: true, orphanCompleted: true, orphanUsage: true, orphanPause: true, nullOrphanUsage: true }),
     ]) {
       const store = createPgTurnQuestionStore(database.pool as never)
       await expect(store.readPendingQuestion({ owner, now })).rejects.toMatchObject({ code: "question_usage_unavailable" })
       expect(database.metrics()).toMatchObject({ stepUpdates: 0, eventSequenceUpdates: 0, eventInserts: 0, outboxInserts: 0 })
       expect(database.state().step.status).toBe("streaming")
     }
-    const noPause = cancellationDatabase({ withCallRow: false, orphanStarted: true, orphanCompleted: true, orphanUsage: true })
+    const noPause = cancellationDatabase({ withCallRow: false, orphanStarted: true, orphanCompleted: true, orphanUsage: true, nullOrphanUsage: true })
     await expect(createPgTurnQuestionStore(noPause.pool as never).readPendingQuestion({ owner, now })).resolves.toEqual({ status: "none" })
     expect(noPause.metrics()).toMatchObject({ stepUpdates: 0, eventSequenceUpdates: 0, eventInserts: 0, outboxInserts: 0 })
 

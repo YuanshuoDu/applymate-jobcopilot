@@ -166,21 +166,6 @@ export async function recoverPausedOrphanUsage(pool: TurnQuestionPool, owner: Tu
       if (started.length > 1 || completed.length > 1 || usageRows.length > 1) throw questionConflict(`orphan model event ${step.id}`)
       const start = started[0], completion = completed[0], usageEvent = usageRows[0]
       if (!start && !completion && !usageEvent) continue
-      const startReceipt = modelReceipt(start, owner, step.id, "model.started", startKey)
-      const completionReceipt = modelReceipt(completion, owner, step.id, "model.completed", completeKey)
-      const usageReceipt = modelReceipt(usageEvent, owner, step.id, "model.usage", usageKey)
-      if ((start && !startReceipt) || (completion && !completionReceipt) || (usageEvent && !usageReceipt)) {
-        throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model receipt is malformed")
-      }
-      if (!startReceipt && (completion || usageEvent)) throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model receipt has no start event")
-      if (completionReceipt && (!startReceipt || completion?.causationId !== start?.id || completionReceipt.sequence <= startReceipt.sequence
-        || completionReceipt.payload.provider !== startReceipt.payload.provider || completionReceipt.payload.model !== startReceipt.payload.model)) {
-        throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model completion does not follow its start")
-      }
-      if (usageReceipt && (!completionReceipt || usageEvent?.causationId !== completion?.id || usageReceipt.sequence <= completionReceipt.sequence
-        || usageReceipt.payload.provider !== completionReceipt.payload.provider || usageReceipt.payload.model !== completionReceipt.payload.model)) {
-        throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model usage does not follow its completion")
-      }
       const pauseAfter = async (after: bigint): Promise<Record<string, unknown> | null> => {
         const pauses = await client.query<Record<string, unknown>>(`SELECT "id", "sequence", "itemId", "taskId", "actor", "correlationId", "causationId", "idempotencyKey", "payload"
           FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'session.pause_requested' AND "sequence" > $3
@@ -196,8 +181,27 @@ export async function recoverPausedOrphanUsage(pool: TurnQuestionPool, owner: Tu
           || typeof payload.requestedAt !== "string" || !Number.isFinite(Date.parse(payload.requestedAt))) throw questionConflict(`orphan pause evidence ${step.id}`)
         return pause
       }
+      const rawRecoverySequence = usageEvent ? sequence(usageEvent.sequence)
+        : completion ? sequence(completion.sequence) : sequence(start?.sequence)
+      if (rawRecoverySequence === null) throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model event sequence is invalid")
+      if (!await pauseAfter(rawRecoverySequence)) continue
+      const startReceipt = modelReceipt(start, owner, step.id, "model.started", startKey)
+      const completionReceipt = modelReceipt(completion, owner, step.id, "model.completed", completeKey)
+      const usageReceipt = modelReceipt(usageEvent, owner, step.id, "model.usage", usageKey)
+      if ((start && !startReceipt) || (completion && !completionReceipt) || (usageEvent && !usageReceipt)) {
+        throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model receipt is malformed")
+      }
+      if (!startReceipt && (completion || usageEvent)) throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model receipt has no start event")
+      if (completionReceipt && (!startReceipt || completion?.causationId !== start?.id || completionReceipt.sequence <= startReceipt.sequence
+        || completionReceipt.payload.provider !== startReceipt.payload.provider || completionReceipt.payload.model !== startReceipt.payload.model)) {
+        throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model completion does not follow its start")
+      }
+      if (usageReceipt && (!completionReceipt || usageEvent?.causationId !== completion?.id || usageReceipt.sequence <= completionReceipt.sequence
+        || usageReceipt.payload.provider !== completionReceipt.payload.provider || usageReceipt.payload.model !== completionReceipt.payload.model)) {
+        throw new TurnQuestionStoreError("question_receipt_malformed", "Orphan model usage does not follow its completion")
+      }
       if (!usageEvent) {
-        if (startReceipt && await pauseAfter(completionReceipt?.sequence ?? startReceipt.sequence)) throw new TurnQuestionStoreError("question_usage_unavailable", "Paused model step has no durable usage")
+        if (startReceipt) throw new TurnQuestionStoreError("question_usage_unavailable", "Paused model step has no durable usage")
         continue
       }
       const usage = record(usageReceipt?.payload.usage), usageSequence = usageReceipt?.sequence ?? null
@@ -206,8 +210,6 @@ export async function recoverPausedOrphanUsage(pool: TurnQuestionPool, owner: Tu
         || typeof usage.outputTokens !== "number" || !Number.isSafeInteger(usage.outputTokens) || usage.outputTokens < 0
         || typeof usage.estimatedCostUsd !== "number" || !Number.isFinite(usage.estimatedCostUsd) || usage.estimatedCostUsd < 0
         || usageSequence === null) throw new TurnQuestionStoreError("question_usage_unavailable", "Paused model usage receipt is malformed")
-      const pause = await pauseAfter(usageSequence)
-      if (!pause) continue
       const items = await client.query<Record<string, unknown>>(`SELECT "id", "type" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
         AND "stepId" = $3 AND "type" IN ('tool_call', 'tool_result') FOR UPDATE`, [owner.sessionId, owner.turnId, step.id])
       if (items.rows.length) throw questionConflict(`orphan model step ${step.id} has tool items`)
