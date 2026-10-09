@@ -246,4 +246,108 @@ describe("TaskGraph turn observation", () => {
     expect(JSON.stringify(observation)).not.toContain("private.example")
     expect(JSON.stringify(observation)).not.toContain("Jane Doe")
   })
+
+  it("adds only fresh counts to the top-level Root observation", () => {
+    const counts = {
+      discoveredJobs: { knownCount: 12, coverage: "partial" },
+      analyzedJobs: { knownCount: 7, coverage: "complete" },
+      artifactReferences: { knownCount: null, coverage: "not_requested" },
+      reviewOutcomes: { knownCount: null, coverage: "unavailable" },
+    }
+    const result = mergeTaskGraphCurrentObservation(snapshot(), {
+      ...state, planningFacts: { graphRevision: 3, counts },
+    } as unknown as TaskGraphCurrentState)
+    const observation = result.toolObservations.at(-1)?.content as Record<string, unknown>
+
+    expect(observation.taskReportedCounts).toEqual(counts)
+    expect(JSON.stringify(observation.taskReportedCounts).length).toBeLessThanOrEqual(1_000)
+    expect(JSON.stringify(observation.taskReportedCounts)).not.toContain("taskId")
+    expect(JSON.stringify(observation.taskReportedCounts)).not.toContain("private-hash")
+  })
+
+  it.each([
+    ["stale revision", { graphRevision: 2, counts: {
+      discoveredJobs: { knownCount: 1, coverage: "complete" },
+      analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      artifactReferences: { knownCount: null, coverage: "not_requested" },
+      reviewOutcomes: { knownCount: null, coverage: "not_requested" },
+    } }],
+    ["augmented facts", { graphRevision: 3, taskIds: ["private-task"], counts: {
+      discoveredJobs: { knownCount: 1, coverage: "complete" },
+      analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      artifactReferences: { knownCount: null, coverage: "not_requested" },
+      reviewOutcomes: { knownCount: null, coverage: "not_requested" },
+    } }],
+    ["invalid count combination", { graphRevision: 3, counts: {
+      discoveredJobs: { knownCount: 0, coverage: "unavailable" },
+      analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      artifactReferences: { knownCount: null, coverage: "not_requested" },
+      reviewOutcomes: { knownCount: null, coverage: "not_requested" },
+    } }],
+  ])("omits %s from the model observation", (_label, planningFacts) => {
+    const result = mergeTaskGraphCurrentObservation(snapshot(), {
+      ...state, planningFacts,
+    } as unknown as TaskGraphCurrentState)
+    const observation = result.toolObservations.at(-1)?.content as Record<string, unknown>
+
+    expect(Object.hasOwn(observation, "taskReportedCounts")).toBe(false)
+    expect(observation.nodes).toEqual((mergeTaskGraphCurrentObservation(snapshot(), state)
+      .toolObservations.at(-1)?.content as { nodes: unknown[] }).nodes)
+  })
+
+  it("does not evaluate a planning-facts accessor on the current-state object", () => {
+    let getterRead = false
+    const unsafeState = { ...state }
+    Object.defineProperty(unsafeState, "planningFacts", {
+      enumerable: true,
+      get() {
+        getterRead = true
+        return { graphRevision: 3, counts: {} }
+      },
+    })
+
+    const result = mergeTaskGraphCurrentObservation(snapshot(), unsafeState as unknown as TaskGraphCurrentState)
+    const observation = result.toolObservations.at(-1)?.content as Record<string, unknown>
+
+    expect(getterRead).toBe(false)
+    expect(Object.hasOwn(observation, "taskReportedCounts")).toBe(false)
+  })
+
+  it("keeps fresh counts when node result projections exceed the item budget", () => {
+    const counts = {
+      discoveredJobs: { knownCount: 27, coverage: "complete" },
+      analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      artifactReferences: { knownCount: null, coverage: "not_requested" },
+      reviewOutcomes: { knownCount: null, coverage: "not_requested" },
+    }
+    const nodes = Array.from({ length: 9 }, (_, index) => ({
+      ...state.nodes[0]!,
+      key: "research-" + index,
+      taskId: "child-" + index,
+      resultProjection: {
+        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
+        trust: "untrusted" as const,
+        availability: "available" as const,
+        role: "scout" as const,
+        status: "completed" as const,
+        candidateCount: 3,
+        evidenceCount: 3,
+        candidates: Array.from({ length: 3 }, (_, item) => ({
+          jobId: "job-" + index + "-" + item, source: "greenhouse" as const, evidenceKinds: ["job" as const],
+        })),
+      },
+    } as never))
+    const result = mergeTaskGraphCurrentObservation(snapshot(), {
+      ...state, nodes, planningFacts: { graphRevision: 3, counts },
+    } as unknown as TaskGraphCurrentState)
+    const observation = result.toolObservations.at(-1)?.content as {
+      taskReportedCounts?: unknown
+      nodes: Array<{ resultProjection: { availability: string } }>
+    }
+
+    expect(observation.taskReportedCounts).toEqual(counts)
+    expect(observation.nodes.slice(0, 8).every(node => node.resultProjection.availability === "available")).toBe(true)
+    expect(observation.nodes[8]?.resultProjection.availability).toBe("unavailable")
+    expect(JSON.stringify(observation).length).toBeLessThan(160_000)
+  })
 })

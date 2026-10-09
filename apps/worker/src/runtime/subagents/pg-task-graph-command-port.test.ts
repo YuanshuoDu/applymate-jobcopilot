@@ -4,6 +4,7 @@ import type pg from "pg"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { PgSubagentPool } from "./types.js"
 
 const reconciliationMocks = vi.hoisted(() => ({
@@ -23,6 +24,16 @@ vi.mock("./task-graph-pg-events.js", () => ({
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
 type Fence = "session" | "turn" | "parent"
+type FakePoolOptions = {
+  failFence?: Fence
+  includeReplay?: boolean
+  missingGraph?: boolean
+  persistedPlanReceipt?: boolean
+  allowedActions?: unknown
+  graphContent?: unknown
+  graphRevision?: number
+  taskRows?: Array<Record<string, unknown>>
+}
 
 const empty: QueryResult = { rows: [], rowCount: 0 }
 
@@ -40,7 +51,7 @@ function scheduleInput(expectedRevision = 1): TaskGraphScheduleInput {
   }
 }
 
-function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; includeReplay?: boolean; missingGraph?: boolean; persistedPlanReceipt?: boolean; allowedActions?: unknown } = {}) {
+function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) {
   const calls: QueryCall[] = []
   const itemId = taskGraphItemId(input.scope.parentTaskId)
   const snapshot = {
@@ -50,6 +61,9 @@ function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; i
       dependsOn: [], depth: 1, taskId: "child-1",
     }],
   }
+  const graphContent = options.graphContent ?? snapshot
+  const graphRevision = options.graphRevision ?? 2
+  const taskRows = options.taskRows ?? [{ id: "child-1", status: "queued", role: "analyst", taskType: "research", failureReason: null, result: null }]
   const replayPayload = {
     kind: "proposal",
     fingerprint: taskGraphFingerprint(input.proposal),
@@ -80,9 +94,9 @@ function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; i
       }
       if (sql.startsWith('SELECT item."id"')) return options.missingGraph
         ? empty
-        : { rows: [{ id: itemId, revision: 2, content: snapshot, createdAt: new Date("2026-09-20T12:00:00.000Z") }], rowCount: 1 }
+        : { rows: [{ id: itemId, revision: graphRevision, content: graphContent, createdAt: new Date("2026-09-20T12:00:00.000Z") }], rowCount: 1 }
       if (sql.startsWith('SELECT task."id", task."status"')) {
-        return { rows: [{ id: "child-1", status: "queued", failureReason: null, result: null }], rowCount: 1 }
+        return { rows: taskRows, rowCount: taskRows.length }
       }
       if (sql.startsWith('SELECT event."payload"')) {
         if (values.length === 5 && options.includeReplay !== false) return { rows: [{ payload: replayPayload }], rowCount: 1 }
@@ -123,6 +137,93 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.find(call => call.sql.startsWith("SELECT set_config"))?.values).toEqual([input.scope.userId])
     expect(fake.calls.some(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toBe(true)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(true)
+  })
+
+  it("derives counts from the same owner-scoped LoadedGraph without another SELECT", async () => {
+    const input = scheduleInput()
+    const nodes = [
+      ["scout-a", "scout", "scout"], ["scout-b", "scout", "scout"],
+      ["analyst-a", "analyst", "analyst"], ["analyst-b", "analyst", "analyst"],
+    ] as const
+    const graphContent = {
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: nodes.map(([key, role, templateId]) => ({
+        key, templateId, goal: `Run ${role}`, successCriteria: ["Persist facts"], dependsOn: [], depth: 1, taskId: key,
+      })),
+    }
+    const envelope = (structuredResult: unknown) => ({ status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult })
+    const scout = (jobIds: readonly string[]) => ({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: jobIds.map(jobId => ({ jobId, source: "greenhouse", url: `https://private.example/${jobId}`, evidenceIds: [`evidence:${jobId}`] })),
+      evidence: jobIds.map(jobId => ({ id: `evidence:${jobId}`, kind: "job", ref: jobId, source: "private-source" })),
+      summary: "PRIVATE_SCOUT_SUMMARY",
+    })
+    const analyst = (findings: readonly Readonly<{ jobId: string; score: number }>[]) => {
+      const jobIds = [...new Set(findings.map(finding => finding.jobId))]
+      return {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+        findings: findings.map(finding => ({ ...finding, evidenceIds: [`analysis:${finding.jobId}`] })),
+        evidence: jobIds.map(jobId => ({ id: `analysis:${jobId}`, kind: "job", ref: jobId, source: "private-source" })),
+        summary: "PRIVATE_ANALYST_SUMMARY",
+      }
+    }
+    const taskRows = [
+      { id: "scout-a", role: "scout", taskType: "job_discovery", candidates: ["job-1", "job-2", "job-3", "job-4", "job-5"] },
+      { id: "scout-b", role: "scout", taskType: "job_discovery", candidates: ["job-4", "job-5", "job-6"] },
+      { id: "analyst-a", role: "analyst", taskType: "job_analysis", findings: [
+        { jobId: "job-1", score: 7 }, { jobId: "job-2", score: 8 }, { jobId: "job-3", score: 6 },
+        { jobId: "job-2", score: 8 }, { jobId: "job-4", score: 5 },
+      ] },
+      { id: "analyst-b", role: "analyst", taskType: "job_analysis", findings: [
+        { jobId: "job-2", score: 9 }, { jobId: "job-5", score: 4 }, { jobId: "job-6", score: 3 },
+      ] },
+    ].map(task => ({
+      id: task.id, role: task.role, taskType: task.taskType, status: "completed", failureReason: null,
+      result: envelope(task.role === "scout" ? scout(task.candidates!) : analyst(task.findings!)),
+    }))
+    const fake = fakePool(input, { includeReplay: false, graphContent, graphRevision: 8, taskRows })
+    const { stepId: _stepId, ...scope } = input.scope
+
+    const current = await createPgTaskGraphCommandPort(fake.pool).readCurrentWithClient!(fake.client as unknown as pg.PoolClient, scope)
+
+    expect(current.revision).toBe(8)
+    expect(current.planningFacts).toEqual({
+      graphRevision: 8,
+      counts: {
+        discoveredJobs: { knownCount: 6, coverage: "complete" },
+        analyzedJobs: { knownCount: 6, coverage: "complete" },
+        artifactReferences: { knownCount: null, coverage: "not_requested" },
+        reviewOutcomes: { knownCount: null, coverage: "not_requested" },
+      },
+    })
+    expect(JSON.stringify(current.planningFacts)).not.toContain("job-1")
+    expect(JSON.stringify(current.planningFacts)).not.toContain("private.example")
+    expect(JSON.stringify(current.planningFacts)).not.toContain("PRIVATE_")
+    expect(fake.pool.connect).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => ["BEGIN", "COMMIT", "ROLLBACK"].includes(call.sql))).toBe(false)
+    const itemRead = fake.calls.filter(call => call.sql.startsWith('SELECT item."id"'))
+    const taskRead = fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))
+    const eventRead = fake.calls.filter(call => call.sql.startsWith('SELECT event."type"'))
+    expect(itemRead).toHaveLength(1)
+    expect(itemRead[0]?.values).toEqual([taskGraphItemId(input.scope.parentTaskId), input.scope.sessionId,
+      input.scope.turnId, input.scope.parentTaskId, input.scope.userId])
+    expect(taskRead).toHaveLength(1)
+    expect(taskRead[0]?.values).toEqual([nodes.map(([key]) => key), input.scope.sessionId, input.scope.turnId,
+      input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId])
+    expect(eventRead).toHaveLength(1)
+  })
+
+  it.each([
+    ["session", "task_graph_session_fenced"], ["turn", "task_graph_turn_fenced"], ["parent", "task_graph_parent_fenced"],
+  ] as const)("does not produce planning facts after a %s owner-scope fence", async (fence, error) => {
+    const input = scheduleInput()
+    const fake = fakePool(input, { includeReplay: false, failFence: fence })
+    const { stepId: _stepId, ...scope } = input.scope
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentWithClient!(fake.client as unknown as pg.PoolClient, scope))
+      .rejects.toThrow(error)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
   })
 
   it("fails closed when the graph item is missing after a durable proposal receipt", async () => {

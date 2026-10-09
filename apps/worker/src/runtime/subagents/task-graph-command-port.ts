@@ -148,7 +148,6 @@ export type TaskGraphScheduleInput = Readonly<{
 
 /** Ownership fence for reads; it is never populated from model-controlled input. */
 export type TaskGraphReadScope = Omit<TaskGraphExecutionScope, "stepId">
-
 export type TaskGraphProjectionSource = "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" | "other"
 export type TaskGraphProjectionEvidenceKind = "job" | "persona" | "resume" | "source"
 export const TASK_GRAPH_RESULT_PROJECTION_SCHEMA = "agent-harness.v2.task-graph.result-projection" as const
@@ -230,6 +229,7 @@ export type TaskGraphCurrentNode = Readonly<{
 export type TaskGraphCurrentState = Readonly<{
   revision: number
   nodes: readonly TaskGraphCurrentNode[]
+  planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
 }>
 export class TaskGraphCommandError extends Error {
   constructor(readonly code: string, message: string, readonly currentRevision?: number) {
