@@ -16,6 +16,7 @@ import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } fro
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
 import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
+import { copyTaskGraphSourceCheckpointMetadata } from "./task-graph-source-intent-context.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -94,7 +95,7 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   }
   if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
-  const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []))
+  const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []), loaded.sourceInputRelations)
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
   await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot: created.snapshot, expectedRevision: revision,
     now: new Date(), idempotencyKey: key, fingerprint, receipt })
@@ -106,7 +107,10 @@ async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: T
   const loaded = await loadCurrentWithClient(client, scope)
   const current = currentTaskGraph(loaded)
   const planningFacts = buildTaskGraphPlanningFacts(loaded)
-  return planningFacts ? { ...current, planningFacts } : current
+  if (!planningFacts) return current
+  const state = { ...current, planningFacts }
+  copyTaskGraphSourceCheckpointMetadata(current, state)
+  return state
 }
 
 async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, request: TaskGraphResultPageRequest) {

@@ -8,6 +8,8 @@ import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-comman
 import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { taskGraphNativeCurrentView } from "./task-graph-native-result.js"
+import { loadTaskGraphSourceInputRelations, parsePersistedTaskGraphProposalNodes, type PersistedTaskGraphProposalSource } from "./task-graph-pg-source-provenance.js"
+import { copyTaskGraphSourceCheckpointMetadata, type TaskGraphInputRelation } from "./task-graph-source-intent-context.js"
 import {
   projectTaskGraphResult,
   taskGraphResultProjectionBytes,
@@ -28,6 +30,7 @@ export type LoadedGraph = Readonly<{
   item: GraphItem | null
   state: ReturnType<typeof taskGraphState> | null
   tasks: ReadonlyMap<string, GraphTaskRow>
+  sourceInputRelations?: ReadonlyMap<string, TaskGraphInputRelation>
 }>
 type Queryable = Pick<pg.PoolClient, "query">
 function nonEmpty(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
@@ -90,14 +93,14 @@ export async function lockTaskGraphScope(client: Queryable, scope: GraphScope, r
   if (leaseState.parentLeaseValid !== true) throw new Error("task_graph_parent_fenced")
   return parent.rows[0] as GraphParent
 }
-export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope, forUpdate = true): Promise<LoadedGraph> {
+export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope & Readonly<{ stepId?: string }>, forUpdate = true): Promise<LoadedGraph> {
   const item = await client.query(`SELECT item."id", item."revision", item."content", item."createdAt"
     FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
     WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
       AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5${forUpdate ? " FOR UPDATE OF item" : ""}`,
   [taskGraphItemId(scope.parentTaskId), scope.sessionId, scope.turnId, scope.parentTaskId, scope.userId])
-  if (!item.rows[0]) return { rootTaskId: scope.rootTaskId, item: null, snapshot: null, state: null, tasks: new Map() }
+  if (!item.rows[0]) return { rootTaskId: scope.rootTaskId, item: null, snapshot: null, state: null, tasks: new Map(), sourceInputRelations: new Map() }
   const stored = item.rows[0] as Record<string, unknown>
   const snapshot = parseTaskGraphSnapshot(stored.content)
   const revision = Number(stored.revision)
@@ -117,22 +120,25 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
       failureReason: nonEmpty(row.failureReason) ? String(row.failureReason) : null, result: row.result ?? null,
     }]
   }))
-  const events = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload" FROM "agent_events" AS event
+  const events = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload", event."causationId" FROM "agent_events" AS event
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3
       AND event."type" IN ('task_graph.lifecycle', 'item.started', 'item.delta') AND session."userId" = $4 AND turn."userId" = $4 ORDER BY event."sequence" ASC`,
   [scope.sessionId, scope.turnId, taskGraphItemId(scope.parentTaskId), scope.userId])
   const appliedEvents: TaskGraphEvent[] = []
+  const proposalSources: PersistedTaskGraphProposalSource[] = []
   for (const raw of events.rows) {
     const row = raw as Record<string, unknown>
     const event = parsePersistedTaskGraphReceipt(row.type, row.payload, { id: String(stored.id), revision }, snapshot, scope, { itemId: row.itemId, taskId: row.taskId, idempotencyKey: row.idempotencyKey })
     if (event) appliedEvents.push(event)
+    else if (parseObject(row.payload)?.kind === "proposal") proposalSources.push({ payload: row.payload, causationId: row.causationId })
   }
+  const sourceInputRelations = await loadTaskGraphSourceInputRelations(client, scope, snapshot, proposalSources, scope.stepId)
   const baseState = taskGraphState(snapshot, revision, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), appliedEvents)
   const repairs = resolveTaskGraphRepairDependencies(snapshot, tasks, scope.rootTaskId)
   const state = { ...baseState, repairSatisfiedNodeKeys: repairs.satisfied, repairPendingNodeKeys: repairs.pending }
-  return { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks }
+  return { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks, sourceInputRelations }
 }
 /** Uses the durable proposal receipt to distinguish graph children from legacy tasks sharing a root. */
 export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
@@ -155,17 +161,7 @@ export async function hasPersistedTaskGraphMembership(client: Queryable, scope: 
       if (receipt.child.taskId === taskId) member = true
       continue
     }
-    const receipt = parseObject(payload?.receipt)
-    if (payload?.kind !== "proposal" || !receipt || !Number.isSafeInteger(receipt.revision) || Number(receipt.revision) < 1
-      || !Array.isArray(receipt.nodes) || receipt.nodes.length === 0 || !Array.isArray(receipt.readyTaskIds)
-      || receipt.readyTaskIds.some(id => typeof id !== "string")) throw new Error("task_graph_receipt_invalid")
-    const taskIds: string[] = []
-    for (const value of receipt.nodes) {
-      const node = parseObject(value)
-      if (!node || typeof node.key !== "string" || !node.key.trim() || typeof node.taskId !== "string" || !node.taskId.trim()
-        || (node.status !== "queued" && node.status !== "waiting")) throw new Error("task_graph_receipt_invalid")
-      taskIds.push(node.taskId)
-    }
+    const taskIds = parsePersistedTaskGraphProposalNodes(payload).map(node => node.taskId)
     if (taskIds.includes(taskId)) member = true
   }
   return member
@@ -210,6 +206,7 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
       dependsOn: node.dependsOn, taskId: stored.taskId,
       status: task.status, readiness: node.readiness, resultSummary: resultSummary(task.result),
+      inputRelation: loaded.sourceInputRelations?.get(stored.key) ?? "unknown",
       resultProjection,
       ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
       ...(verificationReport ? { verificationReport } : {}),
@@ -218,7 +215,9 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       failureReason: safeText(task.failureReason, 500),
     }
   })
-  return { revision: loaded.state.revision, nodes }
+  const current = { revision: loaded.state.revision, nodes }
+  copyTaskGraphSourceCheckpointMetadata(loaded.sourceInputRelations, current)
+  return current
 }
 function taskGraphProjectionSource(
   original: unknown,

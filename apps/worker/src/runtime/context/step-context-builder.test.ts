@@ -8,6 +8,7 @@ import { ContextOwnershipError, createPgContextOwnerFence, StepContextBuilder, t
 import type { HydrationScope } from "./steering-reconciliation-context.js"
 import { buildModelRequest } from "../turns/turn-engine-messages.js"
 import { parseSteeringMarkerPayload, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./steering-marker.js"
+import { rememberTaskGraphSourceCheckpointMetadata } from "../subagents/task-graph-source-intent-context.js"
 
 const scope: TenantScope = { userId: "user-a" }
 const now = new Date("2026-09-01T16:00:00.000Z")
@@ -134,6 +135,52 @@ const reconciliationScope: HydrationScope = {
 }
 
 describe("StepContextBuilder", () => {
+  it("finalizes Root source intent only after this Step's accepted checkpoint is persisted", async () => {
+    const steer = input("fresh-steer", 2n, [{ type: "text", text: "Keep Dublin." }])
+    const store = new FakeInputClaimStore([steer])
+    const content = { kind: "task_graph_current", revision: 1, nodes: [{ key: "scout", inputRelation: "unknown" }] }
+    rememberTaskGraphSourceCheckpointMetadata(content, {
+      currentStepId: "step-a", sourceStepIds: new Map([["scout", "causal-source-step-secret"]]),
+      sourceInputCursors: new Map([["scout", 1n]]),
+    })
+
+    const context = await new StepContextBuilder(store).build(request(store, {
+      ...emptySnapshot, toolObservations: [{ id: "task-graph-current", content }],
+    }))
+    const observation = context.blocks.find(item => item.id === "observation:task-graph-current")
+    expect(observation?.content).toMatchObject({ nodes: [{ inputRelation: "predates_current_inputs" }] })
+    expect(store.checkpoints.get("step-a")).toEqual(checkpoint(2n, [steer.id]))
+    const serializedBlock = JSON.stringify(observation?.content)
+    const serializedContext = context.canonicalJson
+    for (const secret of ["causal-source-step-secret", "source-input-secret", "sourceInputCursors", "sourceStepIds"]) {
+      expect(serializedBlock).not.toContain(secret)
+      expect(serializedContext).not.toContain(secret)
+    }
+    expect(serializedBlock).not.toContain("inputThroughSequence")
+
+    const fallbackStore = new FakeInputClaimStore([input("fallback-steer", 2n, [{ type: "text", text: "Dublin." }])])
+    const cloned = { ...content, nodes: content.nodes.map(node => ({ ...node, inputRelation: "predates_current_inputs" })) }
+    const fallback = await new StepContextBuilder(fallbackStore).build(request(fallbackStore, {
+      ...emptySnapshot, toolObservations: [{ id: "task-graph-current", content: cloned }],
+    }))
+    expect(fallback.blocks.find(item => item.id === "observation:task-graph-current")?.content)
+      .toMatchObject({ nodes: [{ inputRelation: "unknown" }] })
+
+    const carriedCursorStore = new FakeInputClaimStore([], { "step-a": checkpoint(2n, []) })
+    const carriedCursorContent = { kind: "task_graph_current", revision: 1, nodes: [{ key: "scout", inputRelation: "unknown" }] }
+    rememberTaskGraphSourceCheckpointMetadata(carriedCursorContent, {
+      currentStepId: "step-a", sourceStepIds: new Map([["scout", "prior-source-step"]]),
+      sourceInputCursors: new Map([["scout", 1n]]),
+    })
+    const carriedCursor = await new StepContextBuilder(carriedCursorStore).build(request(carriedCursorStore, {
+      ...emptySnapshot, toolObservations: [{ id: "task-graph-current", content: carriedCursorContent }],
+    }))
+    expect(carriedCursor.blocks.find(item => item.id === "observation:task-graph-current")?.content)
+      .toMatchObject({ nodes: [{ inputRelation: "predates_current_inputs" }] })
+    expect(carriedCursor.inputThroughSequence).toBe(2n)
+    expect(carriedCursor.consumedInputIds).toEqual([])
+  })
+
   it("publishes newly claimed input checkpoints before unresolved steering hydration", async () => {
     const steer = input("fresh-steer", 2n, [{ type: "text", text: "Keep Dublin." }])
     const store = new FakeInputClaimStore([steer])

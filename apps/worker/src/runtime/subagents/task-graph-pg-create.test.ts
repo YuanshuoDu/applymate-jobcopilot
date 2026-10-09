@@ -109,13 +109,14 @@ describe("createGraphTasks", () => {
       revision: 1, nodes: [{ key: "source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "typed", verification: scoutVerification }], appliedEvents: [],
     }
 
-    const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]]))
+    const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]]), new Map([["source", "predates_current_inputs"]]))
 
     const stored = createdContext as Record<string, unknown>
     const dependencyEvidence = stored.taskGraphDependencyResults as Record<string, unknown>
     expect(receipt.readyTaskIds).toEqual(["child-2"])
     expect(dependencyEvidence.items).toMatchObject([{
       dependencyKey: "source", role: "scout", taskStatus: "completed",
+      sourceIntent: { trust: "untrusted", goal: "Find source", successCriteria: ["done"], inputRelation: "predates_current_inputs" },
       result: {
         availability: "available", trust: "untrusted", role: "scout", status: "completed",
         candidateCount: 1, evidenceCount: 1,

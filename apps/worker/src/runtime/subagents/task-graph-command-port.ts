@@ -7,6 +7,7 @@ import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphN
 import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
 import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import type { TaskGraphInputRelation } from "./task-graph-source-intent-context.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -170,6 +171,7 @@ export type TaskGraphCurrentNode = Readonly<{
   readiness: TaskGraphReadiness
   resultSummary: string | null
   resultProjection?: TaskGraphResultProjection
+  inputRelation?: TaskGraphInputRelation
   verificationCriterionIds?: readonly string[]
   verificationReport?: TaskGraphVerificationReport
   repairOf?: TaskGraphRepairOf

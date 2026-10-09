@@ -12,12 +12,13 @@ import type { TurnLease } from "./turns/lease.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
+import { TASK_GRAPH_CURRENT_CONTEXT_MAX_TEXT } from "./subagents/task-graph-source-intent-context.js"
 
 const state: TaskGraphCurrentState = {
   revision: 3,
   nodes: [{
     key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return links"], dependsOn: [],
-    taskId: "child-1", status: "completed", readiness: "terminal",
+    taskId: "child-1", status: "completed", readiness: "terminal", inputRelation: "predates_current_inputs",
     resultSummary: "Alice Example found two roles", failureReason: "Alice Example failed at https://private.example/apply",
     resultProjection: {
       schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "scout", status: "completed",
@@ -158,11 +159,17 @@ describe("TaskGraph turn observation", () => {
   it("preserves safe native operation and structural result receipts in the current graph", () => {
     const native = { operationKind: "spawn" as const, operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: "c".repeat(64) }
     const nativeResult = { schemaVersion: "agent-harness.v2.task-graph.native-result.v1" as const, role: "scout", taskStatus: "completed" as const, disposition: "opaque" as const, resultDigest: "d".repeat(64) }
-    const result = mergeTaskGraphCurrentObservation(snapshot(), { ...state, nodes: [{ ...state.nodes[0]!, native, nativeResult, context: { secret: true }, result: { secret: true } } as never] })
+    const result = mergeTaskGraphCurrentObservation(snapshot(), { ...state, nodes: [{
+      ...state.nodes[0]!, native, nativeResult, context: { secret: true }, result: { secret: true },
+      causationId: "private-step", sourceStepId: "private-step", inputThroughSequence: "42", consumedInputIds: ["private-input"],
+    } as never] })
     const node = (result.toolObservations.at(-1)?.content as { nodes: Array<Record<string, unknown>> }).nodes[0]!
 
-    expect(node).toMatchObject({ native, nativeResult })
+    expect(node).toMatchObject({ native, nativeResult, inputRelation: "predates_current_inputs" })
     expect(JSON.stringify(node)).not.toContain("secret")
+    expect(JSON.stringify(node)).not.toContain("private-step")
+    expect(JSON.stringify(node)).not.toContain("private-input")
+    expect(JSON.stringify(node)).not.toContain("inputThroughSequence")
   })
 
   it("fails closed instead of giving the model a partial or unbounded graph", () => {
@@ -349,5 +356,96 @@ describe("TaskGraph turn observation", () => {
     expect(observation.nodes.slice(0, 8).every(node => node.resultProjection.availability === "available")).toBe(true)
     expect(observation.nodes[8]?.resultProjection.availability).toBe("unavailable")
     expect(JSON.stringify(observation).length).toBeLessThan(160_000)
+  })
+
+  it("drops only optional relations when they alone overflow the Root observation cap", () => {
+    const counts = {
+      discoveredJobs: { knownCount: 12, coverage: "partial" as const },
+      analyzedJobs: { knownCount: 7, coverage: "complete" as const },
+      artifactReferences: { knownCount: null, coverage: "not_requested" as const },
+      reviewOutcomes: { knownCount: null, coverage: "unavailable" as const },
+    }
+    const native = {
+      operationKind: "spawn", operationId: "o".repeat(256), requestFingerprint: "f".repeat(64),
+      callerTaskId: "c".repeat(128), role: "r".repeat(64), taskType: "t".repeat(128), contextDigest: "d".repeat(64),
+      source: {
+        taskId: "t".repeat(128), rootTaskId: "r".repeat(128), parentTaskId: "p".repeat(128), turnId: "u".repeat(128),
+        role: "s".repeat(64), taskType: "y".repeat(128), status: "completed", attemptCount: 1,
+        resultDigest: "a".repeat(64), graphNodeKey: "g".repeat(128), origin: "task_graph",
+      },
+    }
+    const nativeResult = {
+      schemaVersion: "agent-harness.v2.task-graph.native-result.v1", role: native.role,
+      taskStatus: "completed", disposition: "opaque", resultDigest: "e".repeat(64),
+    }
+    const graphKeys = Array.from({ length: 16 }, (_, index) => `node-${index}-` + "k".repeat(118))
+    const buildState = (goalLength: number): TaskGraphCurrentState => {
+      const nodes = Array.from({ length: 16 }, (_, index) => {
+        const key = graphKeys[index]!
+        const taskId = `task-${index}-` + "i".repeat(120)
+        const criterionIds = Array.from({ length: 8 }, (_, criterion) => `c${criterion}` + "x".repeat(62))
+        const evidenceDigest = "b".repeat(64)
+        const verificationReport = {
+          verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+          criteria: criterionIds.map(criterionId => ({ criterionId, status: "passed", reasonCode: "criteria_met" })),
+          evidenceDigest, resultDigest: "e".repeat(64),
+        }
+        const repairOf = {
+          graphRootTaskId: "g".repeat(128), nodeKey: "n".repeat(128), taskId: "t".repeat(128), criterionIds,
+        }
+        const repairReceipt = {
+          schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: repairOf.graphRootTaskId,
+          targetNodeKey: repairOf.nodeKey, targetTaskId: repairOf.taskId, criterionIds,
+          repairNodeKey: key, repairTaskId: taskId, verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest,
+        }
+        return {
+          key, templateId: "template-" + "m".repeat(119), goal: "g".repeat(goalLength),
+          successCriteria: Array(8).fill("s".repeat(320)), dependsOn: graphKeys, taskId,
+          status: "completed", readiness: "terminal", inputRelation: "unknown", native, nativeResult,
+          resultProjection: {
+            schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+            role: "scout", status: "completed", candidateCount: 3, evidenceCount: 12,
+            candidates: Array.from({ length: 3 }, (_, candidate) => ({
+              jobId: `job-${index}-${candidate}-` + "j".repeat(65), source: "greenhouse", evidenceKinds: ["job", "persona", "resume", "source"],
+            })),
+          },
+          ...(index < 7 ? { verificationCriterionIds: criterionIds, verificationReport, repairOf, repairReceipt } : {}),
+        }
+      })
+      return { revision: 3, nodes, planningFacts: { graphRevision: 3, counts } } as unknown as TaskGraphCurrentState
+    }
+
+    let lower = 0
+    let upper = 1200
+    let relationFreeWithCounts: Record<string, unknown> | undefined
+    while (lower <= upper) {
+      const goalLength = Math.floor((lower + upper) / 2)
+      try {
+        const result = mergeTaskGraphCurrentObservation(snapshot(), buildState(goalLength))
+        const content = result.toolObservations.at(-1)?.content as Record<string, unknown>
+        const nodes = content.nodes as Array<Record<string, unknown>>
+        if (Object.hasOwn(nodes[0]!, "inputRelation")) lower = goalLength + 1
+        else {
+          if (Object.hasOwn(content, "taskReportedCounts")) relationFreeWithCounts = content
+          lower = goalLength + 1
+        }
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "task_graph_current_state_too_large") throw error
+        upper = goalLength - 1
+      }
+    }
+
+    expect(relationFreeWithCounts).toBeDefined()
+    const content = relationFreeWithCounts!
+    const nodes = content.nodes as Array<Record<string, unknown>>
+    expect(nodes).toHaveLength(16)
+    expect(nodes.every(node => !Object.hasOwn(node, "inputRelation"))).toBe(true)
+    expect(nodes[0]).toMatchObject({ native, nativeResult, resultProjection: { availability: "available" } })
+    expect(nodes[0]?.verificationReport).toMatchObject({ status: "passed", reasonCode: "criteria_met" })
+    expect(content.taskReportedCounts).toEqual(counts)
+    expect(JSON.stringify(content).length).toBeLessThanOrEqual(TASK_GRAPH_CURRENT_CONTEXT_MAX_TEXT)
+    expect(JSON.stringify({
+      ...content, nodes: nodes.map(node => ({ ...node, inputRelation: "unknown" })),
+    }).length).toBeGreaterThan(TASK_GRAPH_CURRENT_CONTEXT_MAX_TEXT)
   })
 })

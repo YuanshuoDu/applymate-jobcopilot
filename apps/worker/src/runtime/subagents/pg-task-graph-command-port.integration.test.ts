@@ -654,6 +654,22 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(freshlyRead.nodes).toHaveLength(8)
     expect(freshlyRead.nodes[0]).toMatchObject({ key: "task-1", taskId: accepted.nodes[0]!.taskId, status: "queued", readiness: "ready" })
     expect(freshlyRead.nodes[7]).toMatchObject({ key: "task-8", taskId: accepted.nodes[7]!.taskId, dependsOn: ["task-7"], status: "waiting", readiness: "waiting_for_dependencies" })
+    await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed', "inputThroughSequence" = 1,
+      "consumedInputIds" = $2::jsonb WHERE "id" = $1`, [owner.stepId, JSON.stringify([owner.originalInputId])])
+    await seedReconciliationStep(adminPool!, owner, {
+      id: owner.laterStepId, ordinal: 2, status: "streaming", cursor: 2n,
+      consumedInputIds: [owner.originalInputId, owner.firstSteerInputId],
+    })
+    const checkpointRead = await reopened.readCurrent(readScope(owner))
+    expect(checkpointRead.nodes.every(node => node.inputRelation === "predates_current_inputs")).toBe(true)
+    expect(checkpointRead.nodes.map(({ key, status, readiness }) => ({ key, status, readiness })))
+      .toEqual(freshlyRead.nodes.map(({ key, status, readiness }) => ({ key, status, readiness })))
+    const checkpointContext = JSON.stringify(checkpointRead.nodes)
+    expect(checkpointContext).not.toContain(owner.stepId)
+    expect(checkpointContext).not.toContain(owner.laterStepId)
+    expect(checkpointContext).not.toContain(owner.originalInputId)
+    expect(checkpointContext).not.toContain(owner.firstSteerInputId)
+    expect(checkpointContext).not.toContain("inputThroughSequence")
     const snapshotRow = await adminPool!.query<{ content: unknown }>(
       `SELECT "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "type" = 'task_graph'`,
       [taskGraphItemId(owner.rootTaskId), owner.sessionId],
@@ -665,11 +681,12 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const duplicate = await reopened.appendAndSchedule(input)
     expect(duplicate).toEqual({ ...accepted, status: "duplicate" })
     expect(await graphRows(adminPool!, owner)).toEqual(beforeReplay)
-    const planEvents = await adminPool!.query(
-      `SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`,
+    const planEvents = await adminPool!.query<{ id: string; causationId: string | null }>(
+      `SELECT "id", "causationId" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`,
       [owner.sessionId, taskGraphProposalKey(owner.rootTaskId, 0)],
     )
     expect(planEvents.rows).toHaveLength(1)
+    expect(planEvents.rows[0]?.causationId).toBe(owner.stepId)
     expect(beforeReplay.item).toEqual([{ id: taskGraphItemId(owner.rootTaskId), revision: 1 }])
   }, 60_000)
 

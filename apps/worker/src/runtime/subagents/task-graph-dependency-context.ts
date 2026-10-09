@@ -6,6 +6,7 @@ import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import type { TaskGraphRepairReceipt, TaskGraphVerificationReport } from "./task-graph-command-port.js"
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope, GraphTaskRow } from "./task-graph-pg-state.js"
+import { isTaskGraphPlainRecord, projectTaskGraphSourceIntent, type TaskGraphSourceIntentData } from "./task-graph-source-intent-context.js"
 
 export const TASK_GRAPH_DEPENDENCY_RESULT_BYTE_LIMIT = 4 * 1024
 export const TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT = 8 * 1024
@@ -17,7 +18,7 @@ export function resolveTaskGraphRepairDependencies(snapshot: TaskGraphSnapshot, 
   const unresolved = new Map<string, Set<string>>(), coverage = new Map<string, Map<string, number>>(), byKey = new Map(snapshot.nodes.map(node => [node.key, node] as const))
   for (const node of snapshot.nodes) {
     const task = tasks.get(node.taskId), ids = node.verification?.criteria.map(item => item.id) ?? [], result = parseResult(task?.result)
-    const report = node.verificationDisposition === "typed" ? parseTaskGraphVerificationReport(isPlainRecord(result) ? result.taskGraphVerificationReport : undefined, ids) : undefined
+    const report = node.verificationDisposition === "typed" ? parseTaskGraphVerificationReport(isTaskGraphPlainRecord(result) ? result.taskGraphVerificationReport : undefined, ids) : undefined
     const evidenceBound = typeof report?.evidenceDigest === "string" && /^[a-f0-9]{64}$/.test(report.evidenceDigest)
     const unresolvedCriteria = report?.criteria.filter(item => item.status !== "passed").map(item => item.criterionId) ?? []
     const recoverableGap = evidenceBound || (report?.status === "unverified" && report.evidenceDigest === null)
@@ -28,8 +29,8 @@ export function resolveTaskGraphRepairDependencies(snapshot: TaskGraphSnapshot, 
   }
   for (const repair of snapshot.nodes) {
     const relation = repair.repairOf, target = relation && byKey.get(relation.nodeKey), task = tasks.get(repair.taskId), ids = repair.verification?.criteria.map(item => item.id) ?? [], result = parseResult(task?.result)
-    const report = repair.verificationDisposition === "typed" ? parseTaskGraphVerificationReport(isPlainRecord(result) ? result.taskGraphVerificationReport : undefined, ids) : undefined
-    const receipt = parseTaskGraphRepairReceipt(isPlainRecord(result) ? result.taskGraphRepairReceipt : undefined, { repairOf: relation, repairNodeKey: repair.key, repairTaskId: repair.taskId, report })
+    const report = repair.verificationDisposition === "typed" ? parseTaskGraphVerificationReport(isTaskGraphPlainRecord(result) ? result.taskGraphVerificationReport : undefined, ids) : undefined
+    const receipt = parseTaskGraphRepairReceipt(isTaskGraphPlainRecord(result) ? result.taskGraphRepairReceipt : undefined, { repairOf: relation, repairNodeKey: repair.key, repairTaskId: repair.taskId, report })
     const missing = relation && unresolved.get(relation.nodeKey), counts = relation && coverage.get(relation.nodeKey)
     if (!relation || !target || relation.graphRootTaskId !== rootTaskId || target.taskId !== relation.taskId || task?.status !== "completed"
       || task.failureReason !== null || !report || !taskGraphVerificationReportMatchesStatus(report, "completed")
@@ -60,24 +61,25 @@ export type ScopedDependencyResult = GraphIdentityScope & Readonly<{
   verification?: TaskGraphSnapshot["nodes"][number]["verification"]
   repairOf?: TaskGraphSnapshot["nodes"][number]["repairOf"]
   repairComposite?: true
+  sourceIntent?: TaskGraphSourceIntentData
   verificationReport?: TaskGraphVerificationReport
   repairLineage?: readonly (Pick<TaskGraphRepairReceipt, "criterionIds" | "evidenceDigest" | "verifierVersion"> & { resultDigest: string })[]
 }>
 
 /** Resolve the one direct Writer dependency from server-materialized Reviewer context. */
 export function writerArtifactReferenceFromTaskContext(value: unknown, expectedJobId: string): ArtifactVersionReference {
-  const context = isPlainRecord(value) ? value : null
-  const selected = context && isPlainRecord(context.selectedJobPreparation) ? context.selectedJobPreparation : null
-  const dependencyContext = context && isPlainRecord(context[DEPENDENCY_CONTEXT_KEY]) ? context[DEPENDENCY_CONTEXT_KEY] : null
+  const context = isTaskGraphPlainRecord(value) ? value : null
+  const selected = context && isTaskGraphPlainRecord(context.selectedJobPreparation) ? context.selectedJobPreparation : null
+  const dependencyContext = context && isTaskGraphPlainRecord(context[DEPENDENCY_CONTEXT_KEY]) ? context[DEPENDENCY_CONTEXT_KEY] : null
   if (!selected || Object.keys(selected).sort().join(",") !== "jobId" || selected.jobId !== expectedJobId
     || !dependencyContext || dependencyContext.schemaVersion !== "agent-harness.v2.task-graph.dependency-evidence"
     || !Array.isArray(dependencyContext.items) || dependencyContext.items.length > 8) {
     throw new Error("task_graph_reviewer_writer_dependency_missing")
   }
-  const writers = dependencyContext.items.filter(item => isPlainRecord(item) && item.role === "writer")
+  const writers = dependencyContext.items.filter(item => isTaskGraphPlainRecord(item) && item.role === "writer")
   if (writers.length !== 1) throw new Error("task_graph_reviewer_writer_dependency_missing")
   const item = writers[0]
-  if (!isPlainRecord(item) || item.taskStatus !== "completed" || !isPlainRecord(item.result)) {
+  if (!isTaskGraphPlainRecord(item) || item.taskStatus !== "completed" || !isTaskGraphPlainRecord(item.result)) {
     throw new Error("task_graph_reviewer_writer_dependency_invalid")
   }
   const result = item.result
@@ -101,7 +103,7 @@ export function materializeTaskGraphDependencyContext(
   dependencyKeys: readonly string[],
   dependencies: readonly ScopedDependencyResult[],
 ): unknown {
-  if (!isPlainRecord(scope) || !scope.userId || !scope.sessionId || !scope.turnId
+  if (!isTaskGraphPlainRecord(scope) || !scope.userId || !scope.sessionId || !scope.turnId
     || !scope.rootTaskId || !scope.parentTaskId || scope.parentTaskId !== scope.rootTaskId) {
     throw new Error("task_graph_dependency_scope_invalid")
   }
@@ -145,14 +147,18 @@ export function materializeTaskGraphDependencyContext(
       reasonCode: dependency.verificationReport.reasonCode, criteria: dependency.verificationReport.criteria,
       evidenceDigest: dependency.verificationReport.evidenceDigest, resultDigest: dependency.verificationReport.resultDigest,
     } : undefined
+    const sourceIntent = projectTaskGraphSourceIntent(dependency.sourceIntent)
     return { dependencyKey: safeDependencyKey(dependency.key), role: dependency.role, taskStatus: "completed", result: projected,
+      ...(sourceIntent ? { sourceIntent } : {}),
       ...(verification ? { verification } : {}), ...(dependency.repairLineage ? { repairLineage: dependency.repairLineage } : {}) }
   })
-  const evidence = { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items }
+  const fullEvidence = { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items }
+  const withoutIntent = { schemaVersion: fullEvidence.schemaVersion, items: items.map(({ sourceIntent: _sourceIntent, ...item }) => item) }
+  const evidence = encodedBytes(fullEvidence) <= TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT ? fullEvidence : withoutIntent
   if (encodedBytes(evidence) > TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT) {
     throw new Error("task_graph_dependency_context_too_large")
   }
-  const base = isPlainRecord(templateContext)
+  const base = isTaskGraphPlainRecord(templateContext)
     ? { ...templateContext }
     : { templateContext: templateContext ?? {} }
   if (Object.prototype.hasOwnProperty.call(base, DEPENDENCY_CONTEXT_KEY)) {
@@ -162,7 +168,7 @@ export function materializeTaskGraphDependencyContext(
 }
 
 function expectedSchema(value: unknown, role: StructuredRole): boolean {
-  if (!isPlainRecord(value)) return false
+  if (!isTaskGraphPlainRecord(value)) return false
   return Object.keys(value).sort().join(",") === "role,schemaVersion"
     && value.schemaVersion === ROLE_RESULT_SCHEMA && value.role === role
 }
@@ -181,7 +187,7 @@ function parseCompletedResultEnvelope(dependency: ScopedDependencyResult): {
   repairLineage?: readonly (Pick<TaskGraphRepairReceipt, "criterionIds" | "evidenceDigest" | "verifierVersion"> & { resultDigest: string })[]
 } {
   const parsed = parseResult(dependency.result)
-  if (!isPlainRecord(parsed)) throw new Error("task_graph_dependency_result_envelope_invalid")
+  if (!isTaskGraphPlainRecord(parsed)) throw new Error("task_graph_dependency_result_envelope_invalid")
   const keys = Object.keys(parsed).sort().join(",")
   const base = "finalItemId,finalText,status,stepCount,structuredResult,toolCallCount"
   if (parsed.status !== "completed" || typeof parsed.stepCount !== "number" || !Number.isSafeInteger(parsed.stepCount) || parsed.stepCount < 0
@@ -237,10 +243,4 @@ function encodedBytes(value: unknown): number {
 function safeDependencyKey(value: string): string {
   if (!PROJECTED_ID.test(value)) throw new Error("task_graph_dependency_key_unsafe")
   return value
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  const prototype = Object.getPrototypeOf(value)
-  return prototype === Object.prototype || prototype === null
 }
