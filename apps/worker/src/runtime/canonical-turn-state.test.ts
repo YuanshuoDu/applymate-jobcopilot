@@ -117,7 +117,7 @@ describe("loadCanonicalTurnState", () => {
       turn: { input: { goal: "Find jobs", content, clientMessageId: "command-1" }, rootTaskId: "current-root", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 1, content: snapshot }],
       nativeRoots: [{ goal: "Find jobs", successCriteria: ["Use verified job facts"] }],
-      historyTurns: [{ id: "history-turn", rootTaskId: "history-root", createdAt: new Date("2026-10-06T09:00:00.000Z") }], nativeControls: [control],
+      historyTurns: [{ id: "history-turn", rootTaskId: "history-root", startedSequence: "3", currentStartedSequence: "5", createdAt: new Date("2026-10-06T09:00:00.000Z") }], nativeControls: [control],
     }
     const first = await loadCanonicalTurnState(pool(options), lease)
     expect(first.snapshot.steerHistory).toEqual([
