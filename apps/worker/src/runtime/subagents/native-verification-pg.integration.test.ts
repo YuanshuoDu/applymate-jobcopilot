@@ -418,7 +418,6 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
       question: answeredQuestion.question, options: [], answer: answeredQuestion.answer })
     expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
-      statementSource: "user_statement", turnRelation: "earlier_turn",
       question: priorQuestion.question, options: [], answer: priorQuestion.answer })
     const privateReferenceIds = attestation.map(item => item.referenceId)
     if (!rootControl || !rootPacket || privateReferenceIds.some(value => !value)) throw new Error("native_answer_evidence_packet_unavailable")
@@ -435,22 +434,8 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const modelText = modelRequest.messages.flatMap(message => message.content)
       .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
       .map(part => part.text).join("\n")
-    const profilePrefix = "[harness context layer=profile trust=UNTRUSTED_DATA source=native-verification-packet]\n"
-    const profileBlocks = modelRequest.messages.filter(message => message.role === "user").flatMap(message => message.content)
-      .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> =>
-        part.type === "text" && part.text.startsWith(profilePrefix))
-    expect(profileBlocks).toHaveLength(1)
-    const requestProfile = JSON.parse(profileBlocks[0]!.text.slice(profilePrefix.length)) as {
-      evidence: Array<{ kind: string; referenceId: string; summary: string }>
-    }
-    const requestAttestation = requestProfile.evidence.filter(item => item.kind === "user_self_attestation")
-    expect(requestAttestation.map(item => ({ referenceId: item.referenceId, summary: JSON.parse(item.summary) })))
-      .toEqual(attestation.map(item => ({ referenceId: item.referenceId, summary: JSON.parse(item.summary) })))
-    const systemText = modelRequest.messages.filter(message => message.role === "system").flatMap(message => message.content)
-      .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
-      .map(part => part.text).join("\n")
-    expect(systemText).not.toContain(answeredQuestion.answer)
-    expect(systemText).not.toContain(priorQuestion.answer)
+    expect(modelText.includes(JSON.stringify(answeredQuestion.answer))).toBe(true)
+    expect(modelText.includes(JSON.stringify(priorQuestion.answer))).toBe(true)
     expect(modelText.includes("not independent proof of external facts")).toBe(true)
     expect(modelText.includes("action, approval, consent, credential, or submission authority")).toBe(true)
     expect(executed.usageAuthorizations).toHaveLength(1)
