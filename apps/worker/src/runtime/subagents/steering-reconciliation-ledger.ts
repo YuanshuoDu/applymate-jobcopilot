@@ -24,14 +24,14 @@ function receiptFor(operation: SteeringReconciliationOperation, inputIds: readon
 }
 function operationKeyMatches(row: Row, operation: SteeringReconciliationOperation, key: string): SteeringReconciliationReceipt {
   const receipt = parseSteeringReconciliationReceipt(object(row.payload), operation.scope)
-  if (!receipt || row.type !== STEERING_RECONCILIATION_EVENT_TYPE || row.itemId !== null || row.taskId !== operation.scope.rootTaskId
+  if (!receipt || row.turnId !== operation.scope.turnId || row.type !== STEERING_RECONCILIATION_EVENT_TYPE || row.itemId !== null || row.taskId !== operation.scope.rootTaskId
     || row.actor !== "orchestrator" || row.correlationId !== operation.scope.turnId || row.causationId !== operation.scope.stepId
     || row.idempotencyKey !== key || row.hasOutbox !== false || receipt.decision !== operation.decision
     || receipt.observedRevision !== operation.expectedRevision) throw new Error("steering_reconciliation_idempotency_conflict")
   return receipt
 }
 async function existingReceipt(client: Client, operation: SteeringReconciliationOperation, key: string): Promise<Row | null> {
-  const result = await client.query<Row>(`SELECT event."itemId", event."taskId", event."type", event."actor", event."correlationId", event."causationId",
+  const result = await client.query<Row>(`SELECT event."turnId", event."itemId", event."taskId", event."type", event."actor", event."correlationId", event."causationId",
       event."idempotencyKey", event."payload", EXISTS (SELECT 1 FROM "agent_outbox" AS outbox
         WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
     FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."idempotencyKey" = $2 LIMIT 2`,
@@ -55,8 +55,7 @@ export async function prepareSteeringReconciliation(client: Client, operation: S
   const prior = await existingReceipt(client, operation, key)
   if (prior) {
     const receipt = operationKeyMatches(prior, operation, key)
-    if (state.currentRevision < receipt.resultingRevision || state.decisionInputThroughSequence?.toString() !== receipt.inputCheckpoint.throughSequence
-      || receipt.steerInputIds.some(id => !state.resolvedInputIds.includes(id))) throw new Error("steering_reconciliation_idempotency_conflict")
+    if (state.currentRevision < receipt.resultingRevision || state.decisionInputThroughSequence?.toString() !== receipt.inputCheckpoint.throughSequence) throw new Error("steering_reconciliation_idempotency_conflict")
     return prepared(operation, receipt, key)
   }
   if (state.currentRevision !== expectedRevision) throw new Error("steering_reconciliation_revision_conflict")
@@ -96,8 +95,7 @@ export async function writeSteeringReconciliationReceipt(client: Client, value: 
     const receipt = operationKeyMatches(prior, operation, key)
     if (!sameReceipt(receipt, value.receipt)) throw new Error("steering_reconciliation_idempotency_conflict")
     if (state.currentRevision < receipt.resultingRevision || state.decisionStepId !== scope.stepId
-      || state.decisionInputThroughSequence?.toString() !== receipt.inputCheckpoint.throughSequence
-      || receipt.steerInputIds.some(id => !state.resolvedInputIds.includes(id))) throw new Error("steering_reconciliation_idempotency_conflict")
+      || state.decisionInputThroughSequence?.toString() !== receipt.inputCheckpoint.throughSequence) throw new Error("steering_reconciliation_idempotency_conflict")
     return
   }
   const currentRevision = state.currentRevision

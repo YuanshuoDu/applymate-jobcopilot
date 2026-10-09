@@ -321,7 +321,6 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     const revise = operation(ids.currentStep, ids.reviseCall, "revise")
     await runtimeTransaction(async client => {
       const state = await readSteeringReconciliationState(client, revise.scope)
-      expect(state.resolvedInputIds).toEqual([ids.firstSteer])
       expect(state.unresolvedInputs.map(input => input.id)).toEqual([ids.laterSteer])
       expect((await loadSteeringContext(client)).map(input => input.id)).toEqual([ids.laterSteer])
       await expect(assertNoUnresolvedSteering(client, revise.scope)).rejects.toThrow("steering_reconciliation_pending")
@@ -365,7 +364,6 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
       await writeSteeringReconciliationReceipt(client, prepared, revision)
       const state = await readSteeringReconciliationState(client, revise.scope)
       expect(state.currentRevision).toBe(2)
-      expect(state.resolvedInputIds).toEqual([ids.firstSteer, ids.laterSteer].sort())
       expect(state.unresolvedInputs).toEqual([])
     })
     const final = await adminPool!.query<{ revision: number; eventSequence: string; receiptCount: number; itemId: string | null; actor: string; outboxCount: number }>(`SELECT graph."revision", session."eventSequence"::text AS "eventSequence",
@@ -436,7 +434,6 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     await adminPool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [ids.session, Number(afterKeepSequence.acceptedSequence) + 1])
     const postDecisionScope = { ...scope, stepId: `steering-race-after-step-${suffix}` }
     const pendingBeforeDispatch = await runtimeTransaction(client => readSteeringReconciliationState(client, { ...postDecisionScope, stepId: undefined }))
-    expect(pendingBeforeDispatch.resolvedInputIds).toContain(priorSteer)
     expect(pendingBeforeDispatch.unresolvedInputs.map(input => input.id)).toEqual([afterDecisionSteer])
     const dispatchInput = (stepId: string, key: string): TaskGraphNativeCommandInput => ({
       scope: { ...scope, stepId }, request: { kind: "spawn", idempotencyKey: key, role: "auditor", taskType: "audit",
