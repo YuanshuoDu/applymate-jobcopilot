@@ -73,6 +73,18 @@ describe("Worker AI usage bridge", () => {
     expect(fetcher).toHaveBeenCalledTimes(2)
   })
 
+  it("rejects an unexpected successful release status without retrying", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(response({ status: "authorized", operationId: "agent-usage-1" }))
+      .mockResolvedValueOnce(response({ status: "still_reserved" }))
+    const authorizer = createWorkerUsageAuthorizer({ endpointUrl: "https://applymate.example/api/internal/agent-runtime/usage", secret: "secret", fetch: fetcher })
+    const reservation = await authorizer(input)
+
+    await expect(reservation.release?.()).rejects.toMatchObject({ code: "usage_broker_unavailable" })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ operation: "release", input })
+  })
+
   it("retries transient compensating releases with the identical operation identity", async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(response({ code: "usage_broker_unavailable" }, 503))
