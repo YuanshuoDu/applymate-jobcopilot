@@ -201,6 +201,16 @@ describe("canonical turn runtime usage model", () => {
     expect(settlement).toHaveBeenCalledWith({ status: "success", inputTokens: 11, outputTokens: 5, estimatedCostUsd: 0.03 })
   })
 
+  it("does not admit a complete request when cancellation already happened", async () => {
+    const controller = new AbortController(), complete = vi.fn(async () => response(null)), authorize = vi.fn()
+    controller.abort(new Error("already cancelled"))
+    const wrapped = modelWithUsage(runtime(adapter(async function* () { yield { type: "completed", finishReason: "stop" } }, complete)), lease, authorize)
+
+    await expect(wrapped.complete?.({ ...request(), signal: controller.signal })).rejects.toThrow("already cancelled")
+    expect(authorize).not.toHaveBeenCalled()
+    expect(complete).not.toHaveBeenCalled()
+  })
+
   it("settles complete provider errors once with a stable error code", async () => {
     const settlement = vi.fn()
     const failure = Object.assign(new Error("provider detail"), { code: "complete_provider_error" })
@@ -254,8 +264,8 @@ describe("canonical turn runtime usage model", () => {
     expect(settlement).toHaveBeenCalledOnce()
   })
 
-  it("keeps one authorization when a started Harness route fails and its fallback succeeds", async () => {
-    const order: string[] = [], urls: string[] = [], settlement = vi.fn()
+  it("authorizes and settles each started Harness route independently", async () => {
+    const order: string[] = [], urls: string[] = [], settlements = new Map<string, ReturnType<typeof vi.fn>>()
     const fetcher: HarnessFetch = vi.fn(async url => {
       const provider = url.includes("anthropic") ? "anthropic" : "minimax"
       urls.push(provider)
@@ -265,7 +275,9 @@ describe("canonical turn runtime usage model", () => {
     const runtime = harnessRuntime(fetcher, [5000, 5000], () => { order.push("preflight") })
     const authorize = vi.fn(async input => {
       order.push(`authorize:${input.provider}`)
-      return { settle: settlement }
+      const settle = vi.fn(), release = vi.fn()
+      settlements.set(input.provider, settle)
+      return { settle, release }
     })
     const wrapped = modelWithUsage(runtime, lease, authorize)
 
@@ -273,12 +285,15 @@ describe("canonical turn runtime usage model", () => {
     expect(events).toContainEqual({ type: "text_delta", text: "Fitting fallback" })
     expect(urls).toEqual(["minimax", "anthropic"])
     expect(order).toEqual([
-      "preflight", "authorize:minimax", "fetch:minimax", "preflight", "fetch:anthropic",
+      "preflight", "authorize:minimax", "fetch:minimax", "preflight", "authorize:anthropic", "fetch:anthropic",
     ])
-    expect(authorize).toHaveBeenCalledOnce()
-    expect(authorize.mock.calls.map(([input]) => `${input.provider}/${input.model}`)).toEqual(["minimax/MiniMax-M3"])
-    expect(settlement).toHaveBeenCalledOnce()
-    expect(settlement).toHaveBeenCalledWith(expect.objectContaining({
+    expect(authorize.mock.calls.map(([input]) => `${input.provider}/${input.model}`)).toEqual([
+      "minimax/MiniMax-M3", "anthropic/claude-sonnet-5",
+    ])
+    expect(settlements.get("minimax")).toHaveBeenCalledOnce()
+    expect(settlements.get("minimax")).toHaveBeenCalledWith(expect.objectContaining({ status: "error", errorCode: "provider_rerouted" }))
+    expect(settlements.get("anthropic")).toHaveBeenCalledOnce()
+    expect(settlements.get("anthropic")).toHaveBeenCalledWith(expect.objectContaining({
       status: "success", inputTokens: 3, outputTokens: 4, estimatedCostUsd: expect.any(Number),
     }))
   })
@@ -296,15 +311,55 @@ describe("canonical turn runtime usage model", () => {
   })
 
   it("settles a Harness provider error after authorization and never calls the provider first", async () => {
-    const order: string[] = [], settlement = vi.fn()
+    const order: string[] = [], settlement = vi.fn(), release = vi.fn()
     const fetcher = vi.fn(async () => { order.push("fetch"); return new Response("unavailable", { status: 503 }) })
     const runtime = harnessRuntime(fetcher, [5000], () => { order.push("preflight") })
-    const authorize = vi.fn(async () => { order.push("authorize"); return { settle: settlement } })
+    const authorize = vi.fn(async () => { order.push("authorize"); return { settle: settlement, release } })
     const wrapped = modelWithUsage(runtime, lease, authorize)
 
     await expect(collect(wrapped.stream(request()))).rejects.toMatchObject({ code: "provider_error" })
     expect(order).toEqual(["preflight", "authorize", "fetch"])
     expect(settlement).toHaveBeenCalledOnce()
     expect(settlement).toHaveBeenCalledWith(expect.objectContaining({ status: "error" }))
+    expect(release).not.toHaveBeenCalled()
+  })
+
+  it("releases the same authorization once when cancellation arrives during async authorization", async () => {
+    const controller = new AbortController(), fetcher = vi.fn(async () => { throw new Error("cancelled request reached provider") })
+    let beginAuthorization!: () => void, finishAuthorization!: (value: { settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
+    const authorizationStarted = new Promise<void>(resolve => { beginAuthorization = resolve })
+    const authorization = new Promise<{ settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
+    const settlement = vi.fn(), release = vi.fn()
+    const wrapped = modelWithUsage(harnessRuntime(fetcher, [5000]), lease, vi.fn(() => {
+      beginAuthorization()
+      return authorization
+    }))
+    const pending = collect(wrapped.stream({ ...request(), signal: controller.signal }))
+    await authorizationStarted
+    controller.abort(new Error("cancelled during authorization"))
+    finishAuthorization({ settle: settlement, release })
+
+    await expect(pending).rejects.toThrow("cancelled during authorization")
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(settlement).not.toHaveBeenCalled()
+    expect(release).toHaveBeenCalledOnce()
+  })
+
+  it("releases eager non-Harness authorization once when cancellation arrives during authorization", async () => {
+    const controller = new AbortController(), provider = vi.fn(async function* () { yield { type: "completed", finishReason: "stop" } satisfies ModelStreamEvent })
+    let beginAuthorization!: () => void, finishAuthorization!: (value: { settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
+    const authorizationStarted = new Promise<void>(resolve => { beginAuthorization = resolve })
+    const authorization = new Promise<{ settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
+    const settlement = vi.fn(), release = vi.fn()
+    const wrapped = modelWithUsage(runtime(adapter(provider)), lease, vi.fn(() => { beginAuthorization(); return authorization }))
+    const pending = collect(wrapped.stream({ ...request(), signal: controller.signal }))
+    await authorizationStarted
+    controller.abort(new Error("cancelled during eager authorization"))
+    finishAuthorization({ settle: settlement, release })
+
+    await expect(pending).rejects.toThrow("cancelled during eager authorization")
+    expect(provider).not.toHaveBeenCalled()
+    expect(settlement).not.toHaveBeenCalled()
+    expect(release).toHaveBeenCalledOnce()
   })
 })

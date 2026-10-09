@@ -10,11 +10,19 @@ const input: UsageAdmissionInput = {
   featureKey: "agent", provider: "minimax", model: "MiniMax-M3", attemptId: "provider-attempt-1", credentialSource: "user",
 }
 
-function database(query: (...args: unknown[]) => Promise<unknown>) {
+function database(query: (...args: unknown[]) => Promise<unknown>, serialize = false) {
   const tx = { $queryRaw: vi.fn(query) }
   const typedTx = tx as unknown as UsageBrokerQuery
+  let tail = Promise.resolve()
   const db: UsageBrokerDatabase = {
-    $transaction: async <T>(work: (value: UsageBrokerQuery) => Promise<T>) => work(typedTx),
+    $transaction: async <T>(work: (value: UsageBrokerQuery) => Promise<T>) => {
+      if (!serialize) return work(typedTx)
+      const previous = tail
+      let unlock!: () => void
+      tail = new Promise<void>(resolve => { unlock = resolve })
+      await previous
+      try { return await work(typedTx) } finally { unlock() }
+    },
   }
   return { tx, db }
 }
@@ -28,6 +36,7 @@ describe("AI usage broker", () => {
     const { db, tx } = database(async () => {
       step += 1
       if (step === 2) return [{ id: input.stepId }]
+      if (step === 4) return [{ id: "agent-usage-inserted" }]
       if (step === 6) return [{ used: 1 }]
       return []
     })
@@ -67,6 +76,7 @@ describe("AI usage broker", () => {
       const { db, tx } = database(async () => {
         const count = tx.$queryRaw.mock.calls.length
         if (count === 2) return [{ id: child.stepId }]
+        if (count === 4) return [{ id: "agent-usage-inserted" }]
         if (count === 6) return [{ used: 1 }]
         return []
       })
@@ -108,5 +118,76 @@ describe("AI usage broker", () => {
     const settlement = { operationId: "agent-usage-test-2", userId: input.userId, provider: input.provider, model: input.model, status: "success" as const, inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0.01 }
     const { db } = database(async () => [{ userId: input.userId, provider: input.provider, model: input.model, status: "success", inputTokens: 9, outputTokens: 9, estimatedCostUsd: 0.09, errorCode: null }])
     await expect(settleAiUsage(db, settlement)).rejects.toMatchObject({ code: "usage_settlement_conflict", status: 409 })
+  })
+
+  it("refunds a finite-credit reservation once across concurrent and replayed releases", async () => {
+    mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
+    const release = { ...input, status: "released" as const }
+    let status = "reserved", refunds = 0
+    const { db, tx } = database(async () => {
+      const count = tx.$queryRaw.mock.calls.length
+      if (count === 2 || count === 6 || count === 8) return [{ userId: input.userId, provider: input.provider, model: input.model, status,
+        errorCode: status === "reserved" ? "credit_reserved_2026-09" : "cancelled_before_provider" }]
+      if (count === 3) refunds += 1
+      if (count === 4) status = "released"
+      return []
+    }, true)
+
+    await Promise.all([settleAiUsage(db, release), settleAiUsage(db, release)])
+    await settleAiUsage(db, release)
+    expect(status).toBe("released")
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(8)
+    expect(refunds).toBe(1)
+  })
+
+  it("does not decrement finite credits for an unlimited-budget reservation", async () => {
+    const release = { ...input, status: "released" as const }
+    const { db, tx } = database(async () => tx.$queryRaw.mock.calls.length === 2
+      ? [{ userId: input.userId, provider: input.provider, model: input.model, status: "reserved", errorCode: null }]
+      : [])
+
+    await settleAiUsage(db, release)
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(3)
+  })
+
+  it("does not refund a provider-started or terminal operation", async () => {
+    const release = { ...input, status: "released" as const }
+    const { db, tx } = database(async () => {
+      if (tx.$queryRaw.mock.calls.length === 2) return [{ userId: input.userId, provider: input.provider, model: input.model, status: "success", errorCode: null }]
+      return []
+    })
+    await expect(settleAiUsage(db, release)).rejects.toMatchObject({ code: "usage_attempt_settled", status: 409 })
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
+  })
+
+  it("leaves a deterministic release tombstone when release beats admission", async () => {
+    mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
+    let row: { id: string; userId: string; provider: string; model: string; status: string } | null = null
+    const { db, tx } = database(async () => {
+      const count = tx.$queryRaw.mock.calls.length
+      if (count === 2) return row ? [{ ...row, errorCode: null }] : []
+      if (count === 3) { row = { id: "released-tombstone", userId: input.userId, provider: input.provider, model: input.model, status: "released" }; return [{ id: row.id }] }
+      if (count === 5) return [{ id: input.stepId }]
+      if (count === 6 && row) return [{ ...row, errorCode: "cancelled_before_provider" }]
+      return []
+    })
+
+    await settleAiUsage(db, { ...input, status: "released" })
+    await expect(admitAiUsage(db, input)).rejects.toMatchObject({ code: "usage_attempt_released", status: 409 })
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(6)
+  })
+
+  it("classifies an insert race against a release tombstone without reserving another credit", async () => {
+    mocked.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 2 } })
+    let count = 0
+    const { db, tx } = database(async () => {
+      count += 1
+      if (count === 2) return [{ id: input.stepId }]
+      if (count === 4) return []
+      if (count === 5) return [{ id: "released-tombstone", userId: input.userId, provider: input.provider, model: input.model, status: "released" }]
+      return []
+    })
+    await expect(admitAiUsage(db, input)).rejects.toMatchObject({ code: "usage_attempt_released", status: 409 })
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(5)
   })
 })
