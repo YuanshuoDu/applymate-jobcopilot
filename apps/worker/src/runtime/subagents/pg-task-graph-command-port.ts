@@ -14,6 +14,8 @@ import { replaceUnstartedNativeFollowup } from "./task-graph-native-pending-repl
 import { assertPlanningRootHasNoUnresolvedSteering } from "./pg-store-create.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
+import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -62,6 +64,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
       return transaction(pool, client => readCurrentWithClient(client, scope))
     },
+    async readCurrentResultPage(scope, request) {
+      return transaction(pool, client => readCurrentResultPageWithClient(client, scope, request))
+    },
     readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
   }
 }
@@ -98,15 +103,26 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
 }
 
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
+  const loaded = await loadCurrentWithClient(client, scope)
+  const current = currentTaskGraph(loaded)
+  const planningFacts = buildTaskGraphPlanningFacts(loaded)
+  return planningFacts ? { ...current, planningFacts } : current
+}
+
+async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, request: TaskGraphResultPageRequest) {
+  const loaded = await loadCurrentWithClient(client, scope)
+  currentTaskGraph(loaded)
+  return projectTaskGraphResultPage(loaded, request)
+}
+
+async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   await lockTaskGraphScope(client, scope)
   const loaded = await loadTaskGraph(client, scope, false)
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }
-  const current = currentTaskGraph(loaded)
-  const planningFacts = buildTaskGraphPlanningFacts(loaded)
-  return planningFacts ? { ...current, planningFacts } : current
+  return loaded
 }
 
 async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {

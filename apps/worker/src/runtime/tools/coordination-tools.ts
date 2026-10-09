@@ -12,6 +12,8 @@ import {
   executeWaitSubagents,
   type CoordinationExecutorOptions,
 } from "./coordination-executors.js"
+import { executeAgentList } from "./task-graph-result-page-executor.js"
+import { TaskGraphResultPageRequestSchema, TaskGraphResultPageSchema } from "../subagents/task-graph-result-page-contract.js"
 import type { RuntimeToolDefinition } from "./types.js"
 
 const IdSchema = Type.String({ minLength: 1, maxLength: 256 })
@@ -130,6 +132,8 @@ const TaskOutputSchema = Type.Object({
   result: Type.Unknown(), failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
 const ListOutputSchema = Type.Object({ tasks: Type.Array(TaskOutputSchema, { maxItems: 50 }) }, { additionalProperties: false })
+const AgentListInputSchema = Type.Union([ListSubagentsInputSchema, TaskGraphResultPageRequestSchema])
+const AgentListOutputSchema = Type.Union([ListOutputSchema, TaskGraphResultPageSchema])
 const InterruptOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, status: Type.Literal("interrupt_requested"),
   affectedCount: Type.Integer({ minimum: 0 }), reason: Type.Union([Type.String(), Type.Null()]),
@@ -196,8 +200,8 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
     },
     {
       ...metadata("agent.list", "List visible tasks in the current session and task tree", "read", "read_only"),
-      inputSchema: ListSubagentsInputSchema, outputSchema: ListOutputSchema,
-      execute: listExecutor,
+      inputSchema: AgentListInputSchema, outputSchema: AgentListOutputSchema,
+      execute: (context, input) => executeAgentList(context, input, options),
     },
     {
       ...metadata("interrupt_subagent", "Request interruption of a visible task tree", "internal_write", "idempotent"),

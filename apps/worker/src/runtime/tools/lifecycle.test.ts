@@ -16,6 +16,7 @@ import type { RuntimeToolDefinition, ToolExecutionContext } from "./types.js"
 import type { ToolResultChunk, ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
 import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_RESULT_PAGE_SCHEMA } from "../subagents/task-graph-result-page-contract.js"
 
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
 const ordinaryCall: LifecycleCall = { ...call, toolName: "notes.read" }
@@ -608,5 +609,61 @@ describe("ToolLifecycle", () => {
       await expect(lifecycle.completed(planCall, receipt)).rejects.toMatchObject({ code: "task_graph_receipt_invalid" })
       expect(sink.events).toHaveLength(0)
     }
+  })
+
+  it("preserves canonical numeric UUID job IDs only for a validated agent.list page", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const pageCall = { ...call, id: "call-result-page", toolName: "agent.list" }
+    const request = { nodeKey: "node-1", expectedRevision: 5, offset: 0 }
+    const page = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 5,
+      role: "analyst", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
+      offset: 0, nextOffset: null,
+      items: [{ jobId: "00000000-0000-4000-8000-000000000000", score: 8, evidenceKinds: ["job"] }],
+    }
+    await lifecycle.started(pageCall, request)
+    const output = await lifecycle.completed(pageCall, page)
+    expect(output).toMatchObject({ items: [{ jobId: "00000000-0000-4000-8000-000000000000" }] })
+    expect(sink.events.at(-1)?.item).toMatchObject({ type: "tool_result", output })
+  })
+
+  it("previews only validated agent.list inputs without reading hostile invalid values", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const legacyCall = { ...call, id: "call-list-legacy-input", toolName: "agent.list" }
+    await lifecycle.started(legacyCall, { includeTerminal: true })
+    expect(sink.events.at(-1)?.item).toMatchObject({ input: { includeTerminal: true } })
+
+    const getter = vi.fn(() => "candidate@example.com")
+    const malformed = { expectedRevision: 1, offset: 0 }
+    Object.defineProperty(malformed, "nodeKey", { enumerable: true, get: getter })
+    await lifecycle.started({ ...legacyCall, id: "call-list-getter" }, malformed)
+    expect(getter).not.toHaveBeenCalled()
+    expect(sink.events.at(-1)?.item).toMatchObject({ input: "[invalid agent.list input]" })
+
+    const trap = vi.fn(() => { throw new Error("proxy trap executed") })
+    const hostile = new Proxy({}, { ownKeys: trap, get: trap, getOwnPropertyDescriptor: trap })
+    await lifecycle.started({ ...legacyCall, id: "call-list-proxy" }, hostile)
+    expect(trap).not.toHaveBeenCalled()
+    expect(sink.events.at(-1)?.item).toMatchObject({ input: "[invalid agent.list input]" })
+  })
+
+  it("fails closed for malformed page mode and page-like legacy output", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const pageCall = { ...call, id: "call-result-page-malformed", toolName: "agent.list" }
+    await lifecycle.started(pageCall, { nodeKey: "node-1", expectedRevision: 1, offset: 0 })
+    await expect(lifecycle.completed(pageCall, { tasks: [] })).rejects.toMatchObject({ code: "task_graph_result_page_invalid" })
+    await expect(lifecycle.completed({ ...pageCall, id: "call-page-marker" }, {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, availability: "available", email: "secret@example.com",
+    })).rejects.toMatchObject({ code: "task_graph_result_page_invalid" })
+    expect(sink.events).toHaveLength(1)
+  })
+
+  it("keeps generic redaction for legacy agent.list task IDs", async () => {
+    const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
+    const output = await lifecycle.completed({ ...call, toolName: "agent.list" }, { tasks: [{ taskId: "+353 87 123 4567" }] })
+    expect(output).toEqual({ tasks: [{ taskId: "[REDACTED_PHONE]" }] })
   })
 })
