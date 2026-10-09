@@ -27,6 +27,7 @@ export type WorkerUsageSettlementInput = {
 
 export type WorkerUsageAuthorization = {
   settle(input: WorkerUsageSettlementInput): Promise<void>
+  release?(): Promise<void>
 }
 
 type UsageBridgeFetch = typeof fetch
@@ -39,13 +40,14 @@ export type WorkerUsageBridgeOptions = {
 }
 
 export class UsageBridgeError extends Error {
-  constructor(readonly code: string, message = code) {
+  constructor(readonly code: string, message = code, readonly retryable = false) {
     super(message)
     this.name = "UsageBridgeError"
   }
 }
 
 const USAGE_PATH = "/api/internal/agent-runtime/usage"
+const RELEASE_RETRY_DELAYS_MS = [50, 100] as const
 
 function endpointFromEnvironment(): string | undefined {
   // AGENT_RUNTIME_USAGE_URL is the complete internal endpoint. The other
@@ -98,12 +100,13 @@ async function post(
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch {
-    throw new UsageBridgeError("usage_broker_unavailable")
+    throw new UsageBridgeError("usage_broker_unavailable", undefined, true)
   }
   const payload = await response.json().catch(() => null) as unknown
   if (!response.ok) {
     const row = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : {}
-    throw new UsageBridgeError(response.status >= 500 ? "usage_broker_unavailable" : safeCode(row.code, "usage_denied"))
+    const transient = response.status >= 500
+    throw new UsageBridgeError(transient ? "usage_broker_unavailable" : safeCode(row.code, "usage_denied"), undefined, transient)
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new UsageBridgeError("usage_broker_unavailable")
   return payload as Record<string, unknown>
@@ -117,12 +120,35 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
   const timeoutMs = options.timeoutMs ?? 15_000
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new RangeError("Usage bridge timeout must be positive")
 
+  const release = async (input: WorkerUsageAuthorizationInput): Promise<void> => {
+    requiredContext(input)
+    if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await post(endpoint, secret, { operation: "release", input }, fetcher, timeoutMs)
+        return
+      } catch (error: unknown) {
+        const delay = RELEASE_RETRY_DELAYS_MS[attempt]
+        if (!(error instanceof UsageBridgeError) || !error.retryable || delay === undefined) throw error
+        await new Promise<void>(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
   return async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
     requiredContext(input)
     if (!endpoint || !secret || typeof fetcher !== "function") throw new UsageBridgeError("usage_authorization_unavailable")
-    const response = await post(endpoint, secret, { operation: "authorize", input }, fetcher, timeoutMs)
+    let response: Record<string, unknown>
+    try {
+      response = await post(endpoint, secret, { operation: "authorize", input }, fetcher, timeoutMs)
+    } catch (error: unknown) {
+      if (error instanceof UsageBridgeError && error.code === "usage_broker_unavailable") await release(input).catch(() => undefined)
+      throw error
+    }
     const operationId = response.operationId
-    if (typeof operationId !== "string" || operationId.length < 1) throw new UsageBridgeError("usage_broker_unavailable")
+    if (typeof operationId !== "string" || operationId.length < 1) {
+      await release(input).catch(() => undefined)
+      throw new UsageBridgeError("usage_broker_unavailable")
+    }
     return {
       settle: async (settlement) => {
         await post(endpoint, secret, {
@@ -130,6 +156,7 @@ export function createWorkerUsageAuthorizer(options: WorkerUsageBridgeOptions = 
           input: { operationId, userId: input.userId, provider: input.provider, model: input.model, ...settlement },
         }, fetcher, timeoutMs)
       },
+      release: () => release(input),
     }
   }
 }
