@@ -11,6 +11,7 @@ import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import type { TurnLease } from "./turns/lease.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
+import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
 
 const state: TaskGraphCurrentState = {
   revision: 3,
@@ -139,9 +140,13 @@ describe("TaskGraph turn observation", () => {
   })
 
   it("retires stale ordinal recovery after a trusted refresh and keeps unrelated seeds", () => {
+    const currentRepair = applyCompletionRecovery(snapshot(), "step-current", tagTaskGraphRepairRecovery(
+      "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing. issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing",
+      5,
+    )).system[0]!
     const input = { ...snapshot(), system: [
       { id: "completion-recovery:task-graph:4", content: "old ordinal repair" },
-      { id: "completion-recovery:task-graph:5", content: "current ordinal repair" },
+      currentRepair,
       { id: "completion-recovery:task-graph:unversioned", content: "generic repair" },
       { id: "completion-recovery:old-step", content: "Durable TaskGraph verification blocked completion: legacy" },
       { id: "policy:task-graph", content: "Durable TaskGraph verification blocked completion: policy" },
