@@ -47,7 +47,7 @@ const privateEvidence = (name: string) => `Private evidence sentinel ${name}`
 let pool: PgPool | undefined
 
 type TurnFixture = Readonly<{ name: string; sessionId: string; turnId: string; rootTaskId: string; stepId: string; createdAt: Date; scope: TaskGraphExecutionScope }>
-type TurnSpec = Readonly<{ name: string; sessionId?: string; createdAt: Date; goal?: string; criteria?: readonly string[] }>
+type TurnSpec = Readonly<{ name: string; sessionId?: string; createdAt: Date; goal?: string; criteria?: readonly string[]; deferStartedEvent?: boolean }>
 
 function commandTurnInput(turnGoal: string): Readonly<{ goal: string; content: InputContentPart[]; clientMessageId: string }> {
   return { goal: turnGoal, content: [{ type: "text", text: turnGoal }], clientMessageId: randomUUID() }
@@ -78,15 +78,28 @@ async function createTurn(spec: TurnSpec): Promise<TurnFixture> {
   await pool!.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
     VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, sessionId, turnId, rootTaskId])
-  return {
+  const fixture = {
     name: spec.name, sessionId, turnId, rootTaskId, stepId, createdAt: spec.createdAt,
     scope: { userId: ids.user, sessionId, turnId, rootTaskId, parentTaskId: rootTaskId,
       stepId, turnLeaseOwner: turnOwner, turnLeaseVersion: 1, parentLeaseOwner: taskOwner, parentAttemptCount: 1 },
   }
+  if (!spec.deferStartedEvent) await appendTurnStarted(fixture)
+  return fixture
+}
+
+async function appendTurnStarted(turn: Pick<TurnFixture, "sessionId" | "turnId">): Promise<void> {
+  const sequence = await pool!.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+    WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [turn.sessionId, ids.user])
+  const eventSequence = sequence.rows[0]?.eventSequence
+  if (eventSequence === undefined) throw new Error("historical_fixture_event_sequence_missing")
+  await pool!.query(`INSERT INTO "agent_events"
+    ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+    VALUES ($1, $2, $3, NULL, NULL, $4, 'turn.started', 'orchestrator', $3, NULL, $5, '{}'::jsonb)`,
+  [randomUUID(), turn.sessionId, turn.turnId, String(eventSequence), `native-history-fixture:${turn.turnId}:turn-started`])
 }
 
 async function createControl(turn: TurnFixture, spec: TurnSpec & Readonly<{
-  badReport?: boolean; persistedAttempt?: number; reportAttempt?: number; dispositions?: readonly ("failed" | "uncertain")[];
+  badReport?: boolean; persistedAttempt?: number; reportAttempt?: number; dispositions?: readonly ("failed" | "uncertain")[]; passCriteria?: readonly number[];
 }>): Promise<void> {
   const packetGoal = spec.goal ?? goal, packetCriteria = spec.criteria ?? criteria
   const candidateText = privateCandidate(turn.name)
@@ -110,12 +123,15 @@ async function createControl(turn: TurnFixture, spec: TurnSpec & Readonly<{
   if (!packet || !control) throw new Error("historical_fixture_packet_invalid")
   const modelReport = {
     schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
-    criteria: packet.criteria.map((criterion, index) => ({
-      criterionId: criterion.criterionId,
-      disposition: spec.dispositions?.[index] ?? "failed",
-      reasonCode: index === 1 && spec.dispositions?.[index] === "uncertain" ? "ambiguous" as const : "does_not_meet_criterion" as const,
-      evidenceReferenceIds: [packet.evidence[0]!.referenceId],
-    })),
+    criteria: packet.criteria.map((criterion, index) => {
+      const disposition = spec.passCriteria?.includes(index) ? "passed" as const : spec.dispositions?.[index] ?? "failed" as const
+      return {
+        criterionId: criterion.criterionId, disposition,
+        reasonCode: disposition === "passed" ? "meets_criterion" as const
+          : index === 1 && disposition === "uncertain" ? "ambiguous" as const : "does_not_meet_criterion" as const,
+        evidenceReferenceIds: [packet.evidence[0]!.referenceId],
+      }
+    }),
   }
   const report = attachNativeVerificationReport(control, spec.reportAttempt ?? 1, modelReport)
   if (!report) throw new Error("historical_fixture_report_invalid")
@@ -134,7 +150,7 @@ async function finishTurn(turn: TurnFixture): Promise<void> {
 
 describePg("historical native verification advisory PostgreSQL fixture", () => {
   const base = new Date(Date.now() - 60 * 60 * 1000)
-  let current: TurnFixture
+  let current: TurnFixture, future: TurnFixture, futureEarlier: TurnFixture
   beforeAll(async () => {
     pool = new PgPool({ connectionString: databaseUrl!, max: 8 })
     await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.user, `${ids.user}@example.invalid`])
@@ -150,19 +166,36 @@ describePg("historical native verification advisory PostgreSQL fixture", () => {
     }
     await seedTerminal({ name: "valid-old", createdAt: new Date(base.getTime() + 10_000), dispositions: ["failed", "uncertain"] })
     await seedTerminal({ name: "valid-new", createdAt: new Date(base.getTime() + 20_000), dispositions: ["failed", "uncertain"] })
+    await seedTerminal({ name: "equal-created-at", createdAt: new Date(base.getTime() + 90_000), passCriteria: [0] })
     await seedTerminal({ name: "wrong-goal", createdAt: new Date(base.getTime() + 30_000), goal: "A different objective" })
     await seedTerminal({ name: "wrong-criteria", createdAt: new Date(base.getTime() + 40_000), criteria: [criteria[0]!, "A different criterion"] })
     await seedTerminal({ name: "bad-report", createdAt: new Date(base.getTime() + 50_000), badReport: true })
     await seedTerminal({ name: "wrong-attempt", createdAt: new Date(base.getTime() + 60_000), persistedAttempt: 2, reportAttempt: 1 })
     await seedTerminal({ name: "foreign", sessionId: ids.foreignSession, createdAt: new Date(base.getTime() + 70_000) })
-    await seedTerminal({ name: "future", createdAt: new Date(base.getTime() + 120_000) })
+    future = await seedTerminal({ name: "future", createdAt: new Date(base.getTime() + 90_000), deferStartedEvent: true })
+    futureEarlier = await seedTerminal({ name: "future-earlier-created", createdAt: new Date(base.getTime() + 80_000), deferStartedEvent: true })
     current = await createTurn({ name: "current", createdAt: new Date(base.getTime() + 90_000) })
     await createControl(current, { name: current.name, createdAt: current.createdAt, dispositions: ["failed", "uncertain"] })
-    const persisted = await pool.query<{ id: string; input: unknown }>(`SELECT "id", "input" FROM "agent_turns" WHERE "id" = ANY($1::text[])`, [[ids.turn("valid-old"), current.turnId]])
-    expect(persisted.rows).toHaveLength(2)
+    await appendTurnStarted(future)
+    await appendTurnStarted(futureEarlier)
+    const persisted = await pool.query<{ id: string; input: unknown; createdAt: Date }>(`SELECT "id", "input", "createdAt" FROM "agent_turns" WHERE "id" = ANY($1::text[])`, [[ids.turn("valid-old"), ids.turn("equal-created-at"), current.turnId, future.turnId, futureEarlier.turnId]])
+    expect(persisted.rows).toHaveLength(5)
     for (const row of persisted.rows) expect(row.input).toMatchObject({
       goal, content: [{ type: "text", text: goal }], clientMessageId: expect.any(String),
     })
+    const equalTimestamp = persisted.rows.find(row => row.id === ids.turn("equal-created-at"))?.createdAt
+    expect(equalTimestamp?.getTime()).toBe(current.createdAt.getTime())
+    const futureTimestamp = persisted.rows.find(row => row.id === future.turnId)?.createdAt
+    expect(futureTimestamp?.getTime()).toBe(current.createdAt.getTime())
+    const futureEarlierTimestamp = persisted.rows.find(row => row.id === futureEarlier.turnId)?.createdAt
+    expect(futureEarlierTimestamp?.getTime()).toBeLessThan(current.createdAt.getTime())
+    const startEvents = await pool.query<{ turnId: string; sequence: string | bigint }>(`SELECT "turnId", "sequence" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "type" = 'turn.started' AND "turnId" = ANY($2::text[]) ORDER BY "sequence"`,
+    [ids.session, [ids.turn("equal-created-at"), current.turnId, future.turnId, futureEarlier.turnId]])
+    expect(startEvents.rows.map(row => row.turnId)).toEqual([ids.turn("equal-created-at"), current.turnId, future.turnId, futureEarlier.turnId])
+    expect(BigInt(String(startEvents.rows[0]?.sequence))).toBeLessThan(BigInt(String(startEvents.rows[1]?.sequence)))
+    expect(BigInt(String(startEvents.rows[1]?.sequence))).toBeLessThan(BigInt(String(startEvents.rows[2]?.sequence)))
+    expect(BigInt(String(startEvents.rows[2]?.sequence))).toBeLessThan(BigInt(String(startEvents.rows[3]?.sequence)))
   })
 
   afterAll(async () => {
@@ -193,16 +226,18 @@ describePg("historical native verification advisory PostgreSQL fixture", () => {
     }
     const advisories = await read()
     expect(await read()).toEqual(advisories)
-    expect(advisories).toHaveLength(2)
-    expect(advisories.map(item => item.id)).toEqual(["native-verification-advisory:0", "native-verification-advisory:1"])
+    expect(advisories).toHaveLength(3)
+    expect(advisories.map(item => item.id)).toEqual(["native-verification-advisory:0", "native-verification-advisory:1", "native-verification-advisory:2"])
     expect(advisories.map(item => item.content)).toEqual([
+      { type: "historical_native_verification_advisory", label: "Historical advisory only", goal,
+        criterionId: "criterion-2", requirement: criteria[1], disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: ["prior-evidence-1"] },
       { type: "historical_native_verification_advisory", label: "Historical advisory only", goal,
         criterionId: "criterion-1", requirement: criteria[0], disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: ["prior-evidence-1"] },
       { type: "historical_native_verification_advisory", label: "Historical advisory only", goal,
         criterionId: "criterion-2", requirement: criteria[1], disposition: "uncertain", reasonCode: "ambiguous", evidenceReferenceIds: ["prior-evidence-1"] },
     ])
     const publicText = JSON.stringify(advisories)
-    for (const name of ["valid-old", "valid-new", "wrong-goal", "wrong-criteria", "bad-report", "wrong-attempt", "foreign", "future", "current"]) {
+    for (const name of ["valid-old", "valid-new", "equal-created-at", "wrong-goal", "wrong-criteria", "bad-report", "wrong-attempt", "foreign", "future", "future-earlier-created", "current"]) {
       expect(publicText).not.toContain(name)
       expect(publicText).not.toContain(privateCandidate(name))
       expect(publicText).not.toContain(privateEvidence(name))

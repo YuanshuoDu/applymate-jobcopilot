@@ -42,15 +42,25 @@ function proof(input: { turnId?: string; rootTaskId?: string; taskId?: string; g
   }
 }
 
-function fakeClient(options: { roots?: Record<string, unknown>[]; turns?: Record<string, unknown>[]; controls?: Record<string, unknown>[]; hasSteer?: unknown } = {}) {
+function fakeClient(options: { roots?: Record<string, unknown>[]; turns?: Record<string, unknown>[]; controls?: Record<string, unknown>[]; hasSteer?: unknown; currentStartedSequence?: unknown } = {}) {
   const query = vi.fn(async (sql: string) => {
     if (sql.includes('SELECT EXISTS') && sql.includes('FROM "agent_inputs"')) return { rows: [{ hasSteer: Object.hasOwn(options, "hasSteer") ? options.hasSteer : false }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: options.roots ?? [], rowCount: options.roots?.length ?? 0 }
-    if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('JOIN "sub_agent_tasks" AS root')) return { rows: options.turns ?? [], rowCount: options.turns?.length ?? 0 }
+    if (sql.includes('WITH current_start AS')) {
+      const currentStartedSequence = Object.hasOwn(options, "currentStartedSequence") ? options.currentStartedSequence : "100"
+      const rows = (options.turns ?? []).map((turn, index) => ({
+        ...turn, currentStartedSequence: Array.isArray(currentStartedSequence) ? currentStartedSequence[index] : currentStartedSequence,
+      }))
+      return { rows, rowCount: rows.length }
+    }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: options.controls ?? [], rowCount: options.controls?.length ?? 0 }
     return { rows: [], rowCount: 0 }
   })
   return { query } as unknown as Pick<pg.PoolClient, "query"> & { query: typeof query }
+}
+
+function turnRow(task: ReturnType<typeof proof>, startedSequence: unknown = "10", rowCreatedAt = task.createdAt) {
+  return { id: task.turnId, rootTaskId: task.rootTaskId, createdAt: rowCreatedAt, startedSequence }
 }
 
 function call(client: Pick<pg.PoolClient, "query">, patch: Record<string, unknown> = {}) {
@@ -63,7 +73,7 @@ function call(client: Pick<pg.PoolClient, "query">, patch: Record<string, unknow
 describe("historical native verification advisories", () => {
   it("hydrates only parser-validated failed criteria for an exact objective as bounded untrusted notes", async () => {
     const task = proof({ disposition: "uncertain" })
-    const client = fakeClient({ turns: [{ id: task.turnId, rootTaskId: task.rootTaskId, createdAt: task.createdAt }], controls: [task] })
+    const client = fakeClient({ turns: [turnRow(task)], controls: [task] })
     const notes = await call(client)
     expect(notes).toHaveLength(1)
     expect(notes[0]).toEqual({ id: "native-verification-advisory:0", content: {
@@ -75,13 +85,13 @@ describe("historical native verification advisories", () => {
     expect(JSON.stringify(notes)).not.toMatch(/private candidate|private packet|private-evidence|control-prior|evidencePacketDigest|controlOperationId/)
     const queries = client.query.mock.calls.map(([sql]) => sql)
     expect(queries.every(sql => !sql.includes("FOR UPDATE") && !sql.startsWith("UPDATE") && !sql.startsWith("INSERT"))).toBe(true)
-    expect(queries.some(sql => sql.includes('"createdAt" < $4') && sql.includes("LIMIT 8"))).toBe(true)
+    expect(queries.some(sql => sql.includes('prior_start."sequence" < current_start."sequence"') && sql.includes("LIMIT 8"))).toBe(true)
     expect(queries.some(sql => sql.includes("LIMIT 64"))).toBe(true)
   })
 
   it("omits changed goal or any changed/invalid criterion list without truncation", async () => {
     const task = proof({})
-    const client = fakeClient({ turns: [{ id: task.turnId, rootTaskId: task.rootTaskId, createdAt: task.createdAt }], controls: [task] })
+    const client = fakeClient({ turns: [turnRow(task)], controls: [task] })
     expect(await call(client, { currentInput: { goal: "Changed goal", successCriteria: ["Use verified job facts", "Explain relevance"] } })).toEqual([])
     expect(await call(client, { currentInput: { goal: "Find suitable roles", successCriteria: ["Explain relevance", "Use verified job facts"] } })).toEqual([])
     expect(await call(client, { currentInput: { goal: "Find suitable roles", content: "Other goal", successCriteria: ["Use verified job facts", "Explain relevance"] } })).toEqual([])
@@ -89,7 +99,7 @@ describe("historical native verification advisories", () => {
 
   it("omits history when accepted, queued, or consumed non-cancelled steer exists without reading its content", async () => {
     const task = proof({})
-    const options = { turns: [{ id: task.turnId, rootTaskId: task.rootTaskId, createdAt: task.createdAt }], controls: [task] }
+    const options = { turns: [turnRow(task)], controls: [task] }
     for (const hasSteer of [true, "false", null]) {
       const client = fakeClient({ ...options, hasSteer })
       expect(await call(client)).toEqual([])
@@ -104,29 +114,42 @@ describe("historical native verification advisories", () => {
 
   it("requires terminal same-owner root/parent/task lineage and a successful runtime attempt", async () => {
     const valid = proof({})
-    const turns = [{ id: valid.turnId, rootTaskId: valid.rootTaskId, createdAt: valid.createdAt }]
+    const turns = [turnRow(valid)]
     for (const changed of [
       { ...valid, userId: "foreign-user" }, { ...valid, sessionId: "foreign-session" }, { ...valid, parentTaskId: "foreign-root" },
       { ...valid, rootTaskId: "foreign-root" }, { ...valid, status: "failed" }, { ...valid, failureReason: "worker crashed" },
       { ...valid, attemptCount: 0 }, { ...valid, result: { nativeVerificationReport: { schemaVersion: "forged" } } },
     ]) expect(await call(fakeClient({ turns, controls: [changed] }))).toEqual([])
-    expect(await call(fakeClient({ turns: [{ ...turns[0], createdAt }], controls: [valid] }))).toEqual([])
+    const equalPrior = proof({ turnId: "equal-prior" })
+    const current = proof({ turnId: "current-turn" })
+    const equalFuture = proof({ turnId: "equal-future" })
+    const unsequenced = proof({ turnId: "unsequenced" })
+    const chronology = await call(fakeClient({
+      turns: [turnRow(equalPrior, "99", createdAt), turnRow(current, "100", createdAt),
+        turnRow(equalFuture, "101", createdAt), turnRow(unsequenced, null, createdAt)],
+      controls: [equalPrior, current, equalFuture, unsequenced],
+    }))
+    expect(chronology).toHaveLength(1)
+    expect(chronology[0]?.content).toMatchObject({ criterionId: "criterion-1", disposition: "failed" })
+    expect(await call(fakeClient({ currentStartedSequence: null, turns: [turnRow(equalPrior, "99", createdAt)], controls: [equalPrior] }))).toEqual([])
+    expect(await call(fakeClient({ currentStartedSequence: "ambiguous", turns: [turnRow(equalPrior, "99", createdAt)], controls: [equalPrior] }))).toEqual([])
+    expect(await call(fakeClient({ currentStartedSequence: ["100", "101"], turns: [turnRow(equalPrior, "99", createdAt), turnRow(equalFuture, "98", createdAt)], controls: [equalPrior, equalFuture] }))).toEqual([])
     const futureTask = proof({ turnId: "future", rootTaskId: "future-root", taskId: "future-control" })
-    expect(await call(fakeClient({ turns: [{ id: "future", rootTaskId: "future-root", createdAt: new Date(createdAt.getTime() + 1) }], controls: [futureTask] }))).toEqual([])
+    expect(await call(fakeClient({ turns: [turnRow(futureTask, "101", new Date(createdAt.getTime() + 1))], controls: [futureTask] }))).toEqual([])
   })
 
   it("uses the current owned root criteria and caps unique notes at three", async () => {
     const task = proof({ criteria: ["Use verified job facts", "Explain relevance", "Keep concise", "Avoid assumptions"], disposition: "failed" })
     const client = fakeClient({
       roots: [{ goal: "Find suitable roles", successCriteria: ["Use verified job facts", "Explain relevance"] }],
-      turns: [{ id: task.turnId, rootTaskId: task.rootTaskId, createdAt: task.createdAt }], controls: [task],
+      turns: [turnRow(task)], controls: [task],
     })
     const notes = await call(client, { currentRootTaskId: "current-root" })
     expect(notes).toHaveLength(0)
     const currentCriteria = ["Use verified job facts", "Explain relevance", "Keep concise", "Avoid assumptions"]
     const same = fakeClient({
       roots: [{ goal: "Find suitable roles", successCriteria: currentCriteria }],
-      turns: [task, proof({ turnId: "prior-2", criteria: currentCriteria }), proof({ turnId: "prior-3", criteria: currentCriteria })].map(item => ({ id: item.turnId, rootTaskId: item.rootTaskId, createdAt: item.createdAt })),
+      turns: [task, proof({ turnId: "prior-2", criteria: currentCriteria }), proof({ turnId: "prior-3", criteria: currentCriteria })].map((item, index) => turnRow(item, String(10 + index))),
       controls: [task, proof({ turnId: "prior-2", criteria: currentCriteria, failedCriterion: 1 }), proof({ turnId: "prior-3", criteria: currentCriteria, failedCriterion: 2 })],
     })
     const bounded = await call(same, { currentRootTaskId: "current-root", currentInput: { goal: "Find suitable roles", successCriteria: currentCriteria } })
@@ -137,8 +160,8 @@ describe("historical native verification advisories", () => {
   it("omits whole oversize notes and rejects a missing current root binding", async () => {
     const longGoal = '"'.repeat(4_000), requirement = '"'.repeat(2_000)
     const task = proof({ goal: longGoal, criteria: [requirement] })
-    const client = fakeClient({ turns: [{ id: task.turnId, rootTaskId: task.rootTaskId, createdAt: task.createdAt }], controls: [task] })
+    const client = fakeClient({ turns: [turnRow(task)], controls: [task] })
     expect(await call(client, { currentInput: { goal: longGoal, successCriteria: [requirement] } })).toEqual([])
-    expect(await call(fakeClient({ roots: [], turns: [{ id: task.turnId, rootTaskId: task.rootTaskId, createdAt: task.createdAt }], controls: [task] }), { currentRootTaskId: "missing-root" })).toEqual([])
+    expect(await call(fakeClient({ roots: [], turns: [turnRow(task)], controls: [task] }), { currentRootTaskId: "missing-root" })).toEqual([])
   })
 })
