@@ -67,7 +67,8 @@ function validTerminal(row: Row, turnId: string, rootTaskId: string, status: str
     return row.terminalType === "turn.completed" && text(payload.finalItemId) && row.terminalItemId === payload.finalItemId
       && text(row.terminalCorrelationId) && row.terminalStepId === row.terminalCorrelationId
       && row.terminalStepSessionId === row.sessionId && row.terminalStepTurnId === turnId
-      && row.terminalStepTaskId === rootTaskId && row.terminalIdempotencyKey === `${prefix}turn-completed` ? value : undefined
+      && row.terminalStepTaskId === rootTaskId && row.terminalStepStatus === "completed"
+      && row.terminalIdempotencyKey === `${prefix}turn-completed` ? value : undefined
   }
   if (status === "failed") {
     return row.terminalType === "turn.failed" && text(payload.errorCode)
@@ -127,7 +128,8 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
       terminal."correlationId" AS "terminalCorrelationId", terminal."idempotencyKey" AS "terminalIdempotencyKey",
       terminal."payload" AS "terminalPayload", terminal."terminalEventCount",
       terminal_step."id" AS "terminalStepId", terminal_step."sessionId" AS "terminalStepSessionId",
-      terminal_step."turnId" AS "terminalStepTurnId", terminal_step."taskId" AS "terminalStepTaskId"
+      terminal_step."turnId" AS "terminalStepTurnId", terminal_step."taskId" AS "terminalStepTaskId",
+      terminal_step."status" AS "terminalStepStatus"
     FROM roots
     JOIN LATERAL (
       SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
@@ -137,7 +139,7 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
       ORDER BY event."sequence" DESC LIMIT 1
     ) AS terminal ON true
     LEFT JOIN LATERAL (
-      SELECT step."id", step."sessionId", step."turnId", step."taskId"
+      SELECT step."id", step."sessionId", step."turnId", step."taskId", step."status"
       FROM "agent_steps" AS step
       WHERE terminal."type" = 'turn.completed'
         AND step."id" = terminal."correlationId"

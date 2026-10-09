@@ -25,7 +25,7 @@ type Source = Readonly<{
   turnId: string; rootTaskId: string; childId: string; finalItemId: string; sessionId: string; userId: string
   goal: string; criteria: readonly string[]; input: unknown; startSequence: number
   status?: "completed" | "failed" | "interrupted"; rootStatus?: "completed" | "failed" | "interrupted"
-  correlationTargetId?: string
+  correlationTargetId?: string; stepStatus?: "completed" | "streaming" | "failed"
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
@@ -69,6 +69,12 @@ const inconsistentTerminal: Source = { turnId: `root-history-terminal-mismatch-t
   childId: `root-history-terminal-mismatch-child-${suffix}`, finalItemId: `root-history-terminal-mismatch-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 11,
   status: "completed", rootStatus: "failed" }
+const streamingTerminalStep: Source = { turnId: `root-history-streaming-step-turn-${suffix}`, rootTaskId: `root-history-streaming-step-root-${suffix}`,
+  childId: `root-history-streaming-step-child-${suffix}`, finalItemId: `root-history-streaming-step-final-${suffix}`, sessionId, userId,
+  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 15, stepStatus: "streaming" }
+const failedTerminalStep: Source = { turnId: `root-history-failed-step-turn-${suffix}`, rootTaskId: `root-history-failed-step-root-${suffix}`,
+  childId: `root-history-failed-step-child-${suffix}`, finalItemId: `root-history-failed-step-final-${suffix}`, sessionId, userId,
+  goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 17, stepStatus: "failed" }
 let pool: PgPool | undefined
 let lease: TurnLease
 
@@ -110,8 +116,8 @@ async function insertSource(source: Source): Promise<void> {
   const sourceStepId = `source-step-${source.turnId}`
   if (status === "completed") {
     await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-      VALUES ($1, $2, $3, $4, 1, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [sourceStepId, source.sessionId, source.turnId, source.rootTaskId])
+      VALUES ($1, $2, $3, $4, 1, 1, $5, 0, '[]'::jsonb, '{}'::jsonb)`,
+    [sourceStepId, source.sessionId, source.turnId, source.rootTaskId, source.stepStatus ?? "completed"])
   }
   const correlationId = status === "completed" ? (source.correlationTargetId ?? sourceStepId) : source.turnId
   const errorCode = status === "failed" ? "task_failed" : status === "interrupted" ? "interrupted" : undefined
@@ -148,6 +154,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(otherUser)
     await insertSource(future)
     await insertSource(inconsistentTerminal)
+    await insertSource(streamingTerminalStep)
+    await insertSource(failedTerminalStep)
     const input = { goal: objective, successCriteria: criteria }
     await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
       "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
@@ -186,6 +194,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     expect(history.every(item => item.taskGraph.nodes.length === 1)).toBe(true)
     expect(history.some(item => item.sourceTurnId === matching[0]!.turnId)).toBe(true)
     expect(history.some(item => [mismatched.turnId, changedCriteria.turnId, selectedJob.turnId,
-      otherSession.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId, inconsistentTerminal.turnId].includes(item.sourceTurnId))).toBe(false)
+      otherSession.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId, inconsistentTerminal.turnId,
+      streamingTerminalStep.turnId, failedTerminalStep.turnId].includes(item.sourceTurnId))).toBe(false)
   })
 })

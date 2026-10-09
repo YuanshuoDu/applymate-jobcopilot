@@ -33,7 +33,7 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     ...common, terminalTurnId: turnId, terminalTaskId: rootTaskId, terminalItemId: `final-${index}`,
     terminalSequence, terminalType: "turn.completed", terminalActor: "orchestrator", terminalCorrelationId: `step-${index}`,
     terminalStepId: `step-${index}`, terminalStepSessionId: "session-1",
-    terminalStepTurnId: turnId, terminalStepTaskId: rootTaskId,
+    terminalStepTurnId: turnId, terminalStepTaskId: rootTaskId, terminalStepStatus: "completed",
     terminalIdempotencyKey: `turn:${turnId}:event:turn-completed`,
     terminalPayload: { turnId, taskId: rootTaskId, finalItemId: `final-${index}` }, terminalEventCount: 1,
   }
@@ -180,7 +180,9 @@ describe("direct Root-task history PostgreSQL store", () => {
     const otherTurn = { ...candidate(14), terminalStepTurnId: "turn-elsewhere" }
     const otherRoot = { ...candidate(15), terminalStepTaskId: "root-elsewhere" }
     const otherSession = { ...candidate(16), terminalStepSessionId: "session-elsewhere" }
-    const test = fixture({ candidates: [valid, missingStep, otherTurn, otherRoot, otherSession] })
+    const streamingStep = { ...candidate(17), terminalStepStatus: "streaming" }
+    const failedStep = { ...candidate(18), terminalStepStatus: "failed" }
+    const test = fixture({ candidates: [valid, missingStep, otherTurn, otherRoot, otherSession, streamingStep, failedStep] })
 
     const outcomes = await test.store.load(test.input)
 
@@ -194,6 +196,7 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(scan?.sql).toContain('step."sessionId" = roots."sessionId"')
     expect(scan?.sql).toContain('step."turnId" = roots."turnId"')
     expect(scan?.sql).toContain('step."taskId" = roots."rootTaskId"')
+    expect(scan?.sql).toContain('terminal_step."status" AS "terminalStepStatus"')
     expect(scan?.sql).toContain('terminal_step."id" = terminal."correlationId"')
   })
 
