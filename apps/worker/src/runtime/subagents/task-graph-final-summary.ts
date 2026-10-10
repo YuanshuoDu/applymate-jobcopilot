@@ -107,10 +107,18 @@ function summarizeTask(node: SummaryNode): SummaryTask {
   if (!isTerminalSubagentStatus(node.taskStatus)) return { node, resultState: "not_terminal" }
   if (node.structuredResult === undefined || node.structuredResult === null) return { node, resultState: "missing" }
   try {
+    if (!hasDenseJsonArrays(node.structuredResult)) return { node, resultState: "invalid" }
     const result = validateRoleResult(node.structuredResult, node.role)
     return safeResultIdentifiers(result) ? { node, result, resultState: "valid" } : { node, resultState: "invalid" }
   }
   catch { return { node, resultState: "invalid" } }
+}
+
+function hasDenseJsonArrays(value: unknown, seen = new WeakSet<object>()): boolean {
+  if (!value || typeof value !== "object" || seen.has(value)) return true
+  seen.add(value)
+  if (Array.isArray(value) && !denseArray(value)) return false
+  return Object.values(value).every(child => hasDenseJsonArrays(child, seen))
 }
 
 function safeResultIdentifiers(result: StructuredRoleResult): boolean {

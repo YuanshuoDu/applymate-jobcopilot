@@ -111,6 +111,34 @@ describe("TaskGraph final-summary reducer", () => {
     expect(summary.taskOutcomes.map(item => item.resultState)).toEqual(["valid", "valid", "valid", "not_terminal"])
   })
 
+  it("marks sparse Scout candidates invalid instead of iterating a hole", () => {
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
+      node("sparse-scout", "scout", "completed", { ...scoutResult([]), candidates: new Array(1) }),
+    ] })
+    expect(summary.discoveredJobs).toEqual([])
+    expect(summary.counts.discoveredJobs).toEqual({ knownCount: null, coverage: "unavailable" })
+    expect(summary.taskOutcomes).toEqual([{ taskId: "sparse-scout", role: "scout", taskStatus: "completed", resultState: "invalid" }])
+  })
+
+  it("marks sparse Analyst findings invalid instead of iterating a hole", () => {
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
+      node("sparse-analyst", "analyst", "completed", { ...analystResult([]), findings: new Array(1) }),
+    ] })
+    expect(summary.analyzedJobs).toEqual([])
+    expect(summary.counts.analyzedJobs).toEqual({ knownCount: null, coverage: "unavailable" })
+    expect(summary.taskOutcomes).toEqual([{ taskId: "sparse-analyst", role: "analyst", taskStatus: "completed", resultState: "invalid" }])
+  })
+
+  it("marks sparse arrays nested in an Analyst finding invalid", () => {
+    const result = analystResult([{ jobId: "nested-job", score: 7 }])
+    const findings = result.findings.map(finding => ({ ...finding, evidenceIds: new Array(1) }))
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
+      node("nested-sparse-analyst", "analyst", "completed", { ...result, findings }),
+    ] })
+    expect(summary.analyzedJobs).toEqual([])
+    expect(summary.taskOutcomes).toEqual([{ taskId: "nested-sparse-analyst", role: "analyst", taskStatus: "completed", resultState: "invalid" }])
+  })
+
   it("excludes internal controls and omits prose, URLs, evidence, and review receipt hashes", () => {
     const secretReviewHash = hash("e")
     const summary = reduceTaskGraphFinalSummary({ graphRevision: 2, nodes: [
