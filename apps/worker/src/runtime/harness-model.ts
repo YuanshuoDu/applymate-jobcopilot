@@ -107,10 +107,18 @@ async function* routeStream(
       guaranteedNoProviderAttempt: !anyCandidateStreamInvoked,
       onRequestAdmission: options.onRequestAdmission,
     })
-    await runHarnessPreProviderHooks(adaptedRequest, candidate.profile, () => { preProviderHookFailed = true })
+    const observeUsage = await runHarnessPreProviderHooks(adaptedRequest, candidate.profile, () => { preProviderHookFailed = true })
     const events: ModelStreamEvent[] = []
     anyCandidateStreamInvoked = true
-    for await (const event of candidate.stream(adaptedRequest)) events.push(event)
+    for await (const event of candidate.stream(adaptedRequest)) {
+      events.push(event)
+      if (event.type === "usage") {
+        const normalized = normalizeUsage([event], candidate, credentialSources)[0]
+        if (normalized?.type === "usage") observeUsage({
+          inputTokens: normalized.inputTokens, outputTokens: normalized.outputTokens, estimatedCostUsd: normalized.estimatedCostUsd ?? 0,
+        })
+      }
+    }
     const normalized = normalizeUsage(events, candidate, credentialSources)
     return { value: normalized, usage: usage(normalized) }
   }, {
