@@ -20,13 +20,16 @@ import type {
 } from "./turn-engine-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
+import type { NativeSemanticProgressMode, NativeSemanticRejectionCount, NativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
+export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
 export const RESET_NATIVE_SEMANTIC_PROGRESS: unique symbol = Symbol("reset-native-semantic-progress")
 
 export type TurnEngineCompletionGateResult =
   | { readonly ok: true }
-  | { readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true }
+  | { readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string
+      readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: NativeSemanticRejectionIdentity }
 
 export type TurnEngineCompletionGate = ((input: {
   readonly identity: TurnExecutionIdentity
@@ -51,6 +54,8 @@ type StoreInput<K extends keyof TurnEngineStore> = Omit<Parameters<NonNullable<T
 export type TurnExecutionStore = {
   startStep(input: StoreInput<"startStep">): Promise<TurnEngineStep>
   updateStep(input: StoreInput<"updateStep">): Promise<void>
+  completeNativeSemanticRejectionStep?(input: Omit<Parameters<NonNullable<import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore["completeNativeSemanticRejectionStep"]>>[0], "owner">
+    & { executionIdentity: TurnExecutionIdentity }): Promise<NativeSemanticRejectionCount>
   waitForUser?(input: StoreInput<"waitForUser">): Promise<void>
   stageQuestionUsage?(input: StoreInput<"stageQuestionUsage">): Promise<void>
   cancelPausedQuestion?(input: StoreInput<"cancelPausedQuestion">): ReturnType<NonNullable<TurnEngineStore["cancelPausedQuestion"]>>
@@ -115,6 +120,7 @@ export type TurnExecutionOptions = {
   /** Allows a root or child adapter to classify a lost owner without coupling the loop to a lease type. */
   readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
   readonly completionGate?: TurnEngineCompletionGate
+  readonly nativeSemanticProgressMode?: NativeSemanticProgressMode
   /** Server-restored exact candidate; it is never added to a model request. */
   readonly recoveredFinalCandidate?: string
   /** Canonical replay state used only for server-side marker hydration. */

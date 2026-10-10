@@ -9,7 +9,7 @@ import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-c
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
@@ -1416,6 +1416,51 @@ describe("owner-agnostic turn execution loop", () => {
     expect(diagnostic).toMatchObject({ reasonCode: "repeated_signature", signature: "native_semantic_rejection", stateFingerprint: "root_candidate" })
     expect(JSON.stringify(diagnostic)).not.toContain(candidate)
     expect(JSON.stringify(root.finalResponses)).not.toContain(candidate)
+  })
+
+  it("keeps a committed semantic-receipt Step completed when its separate completion event fails", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    let receiptStepStatus = "streaming"
+    const updateStep = vi.fn(root.options.store.updateStep)
+    const complete = vi.fn(async () => {
+      receiptStepStatus = "completed"
+      return { inputThroughSequence: 0n, distinctStepCount: 1 }
+    })
+    const appendEvent = root.options.store.appendEvent
+    const persistEvent = vi.fn(async (input: Parameters<typeof appendEvent>[0]) => {
+      if (input.type === "step.completed") throw new Error("fixture step event failure")
+      return appendEvent(input)
+    })
+    const rejection = { candidateDigest: "a".repeat(64), controlTaskId: "control-root", controlOperationId: "operation-root",
+      controlAttempt: 1, controlReportDigest: "b".repeat(64) }
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ({
+      ok: false, blocker: "task_graph_verification_unverified", feedback: "Independent proof rejected the candidate.",
+      [NATIVE_SEMANTIC_REJECTION]: rejection,
+    })
+    root.options = {
+      ...root.options,
+      nativeSemanticProgressMode: "durable_v1",
+      completionGate,
+      snapshot: { ...root.options.snapshot, businessRefs: [{ id: "owned-source", kind: "job", ownerId: "user-1" }] },
+      store: { ...root.options.store, updateStep, appendEvent: persistEvent, completeNativeSemanticRejectionStep: complete },
+      model: {
+        ...root.options.model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          yield { type: "text_delta", text: "A complete candidate." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result.status).toBe("failed")
+    expect(receiptStepStatus).toBe("completed")
+    expect(complete).toHaveBeenCalledOnce()
+    expect(persistEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "step.completed" }))
+    expect(updateStep).not.toHaveBeenCalled()
+    expect(root.stepStatuses).toEqual([])
   })
 
   it("keeps progress across a persistent active marker and resets once for a newly claimed input", async () => {

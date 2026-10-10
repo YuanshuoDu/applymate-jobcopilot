@@ -28,6 +28,11 @@ function bindStore(store: TurnEngineOptions["store"]): TurnExecutionStore {
   return {
     startStep: (input) => store.startStep({ ...withoutIdentity(input), owner: input.identity }),
     updateStep: (input) => store.updateStep({ ...withoutIdentity(input), owner: input.identity }),
+    completeNativeSemanticRejectionStep: store.completeNativeSemanticRejectionStep ? input => {
+      const { executionIdentity, ...receipt } = input
+      if (executionIdentity.kind !== "turn" || executionIdentity.taskId !== executionIdentity.rootTaskId) throw new TurnLeaseError("lease_lost", "Semantic rejection receipts are root-only")
+      return store.completeNativeSemanticRejectionStep!({ ...receipt, owner: executionIdentity })
+    } : undefined,
     waitForUser: store.waitForUser ? (input) => store.waitForUser!({ ...withoutIdentity(input), owner: input.identity }) : undefined,
     stageQuestionUsage: store.stageQuestionUsage ? (input) => {
       if (input.identity.kind !== "turn") throw new TurnLeaseError("lease_lost", "Child execution cannot stage a user question")
