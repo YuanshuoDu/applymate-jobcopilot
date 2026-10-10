@@ -12,6 +12,11 @@ export function ensureClaimTenant(inputs: readonly StoredAgentInput[], request: 
 type BlockFactory = (layer: ContextLayer, role: ContextRole, trust: ContextTrust, source: string, blockId: string, content: unknown) => ContextBlock
 type AttachmentError = (message: string) => Error
 
+export function rootInputTextMatchesGoal(input: StoredAgentInput, rootInputId: string | undefined, goal: unknown): boolean {
+  if (input.id !== rootInputId || typeof goal !== "string") return false
+  return input.content.filter(part => part.type === "text").map(part => part.text).join("\n").trim() === goal
+}
+
 export function pendingInputBlocks(input: StoredAgentInput, ownerFence: ContextOwnerFence, scope: TenantScope, createBlock: BlockFactory, attachmentError?: AttachmentError): Promise<ContextBlock[]> {
   return Promise.all(input.content.map(async (part, partIndex) => {
     if (part.type === "attachment_ref") {
