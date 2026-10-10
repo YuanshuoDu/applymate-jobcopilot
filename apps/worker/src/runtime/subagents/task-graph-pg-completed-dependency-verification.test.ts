@@ -67,6 +67,7 @@ describe("verifyCompletedScoutDependencies", () => {
 
   it.each([
     ["failed source", { sourceTask: { status: "failed" } }],
+    ["foreign turn", { sourceTask: { turnId: "turn-foreign" } }],
     ["foreign role", { sourceTask: { role: "analyst" } }],
     ["unsupported task type", { sourceTask: { taskType: "research" } }],
     ["tampered tools", { sourceTask: { allowedActions: ["jobs.search", "application.submit"] } }],
