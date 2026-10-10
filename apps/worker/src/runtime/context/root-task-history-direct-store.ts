@@ -27,7 +27,15 @@ function graphEvidenceError(value: unknown): boolean {
     && /^task_graph_[a-z0-9_]+$/.test(value.message)
 }
 
+async function lockEligibleSourceSession(client: Client, sessionId: string, userId: string): Promise<boolean> {
+  const result = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions"
+    WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR SHARE SKIP LOCKED`, [sessionId, userId])
+  return result.rows.length === 1 && result.rows[0]?.id === sessionId
+}
+
 async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInput, source: RootTaskHistoryCandidate): Promise<TaskGraphCurrentState | undefined> {
+  if (input.crossSessionRootTaskHistoryEnabled === true && source.sessionId !== input.lease.sessionId
+    && !await lockEligibleSourceSession(client, source.sessionId, input.lease.userId)) return undefined
   const scope: GraphIdentityScope = { userId: input.lease.userId, sessionId: source.sessionId,
     turnId: source.turnId, rootTaskId: source.rootTaskId, parentTaskId: source.rootTaskId }
   try {

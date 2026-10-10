@@ -15,6 +15,8 @@ type Options = Readonly<{
   candidateError?: Error
   graphError?: Error
   badGraph?: boolean
+  sourceSessionStatusAtGraphLoad?: "archived" | "aborted"
+  sourceSessionLockedAtGraphLoad?: boolean
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -70,6 +72,7 @@ function fixture(options: Options = {}) {
     async query(sql: string, values?: readonly unknown[]) {
       queries.push({ sql, values })
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes("FOR SHARE")) return { rows: options.sourceSessionStatusAtGraphLoad || options.sourceSessionLockedAtGraphLoad ? [] : [{ id: values?.[0] }] }
       if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: "turn-current" }] }
       if (sql.includes("FOR UPDATE OF task")) return { rows: [{
@@ -192,6 +195,40 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(scan?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
     const graphReads = test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))
     expect(graphReads.map(query => query.values?.[1])).toEqual(["session-other", "session-third"])
+    const sourceLocks = test.queries.filter(query => query.sql.includes("FOR SHARE"))
+    expect(sourceLocks.map(query => query.values)).toEqual([["session-other", "user-1"], ["session-third", "user-1"]])
+    expect(sourceLocks.every(query => query.sql.includes("FOR SHARE SKIP LOCKED"))).toBe(true)
+  })
+
+  it.each(["archived", "aborted"] as const)("omits a source session that becomes %s after candidate selection", async status => {
+    const source = { ...candidate(1), sessionId: "session-other", terminalStepSessionId: "session-other",
+      terminalStepEventSessionId: "session-other", turnSource: "user", sourceSessionUserId: "user-1", sourceSessionStatus: "running" }
+    const test = fixture({ candidates: [source], sourceSessionStatusAtGraphLoad: status })
+    test.input = { ...test.input, crossSessionRootTaskHistoryEnabled: true }
+
+    const outcomes = await test.store.load(test.input)
+
+    expect(outcomes).toEqual([])
+    const sourceLock = test.queries.find(query => query.sql.includes("FOR SHARE"))
+    expect(sourceLock?.sql).toContain('"userId" = $2')
+    expect(sourceLock?.sql).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    expect(sourceLock?.values).toEqual(["session-other", "user-1"])
+    expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(0)
+  })
+
+  it("omits a source session already locked by another transaction without reading its graph", async () => {
+    const source = { ...candidate(1), sessionId: "session-other", terminalStepSessionId: "session-other",
+      terminalStepEventSessionId: "session-other", turnSource: "user", sourceSessionUserId: "user-1", sourceSessionStatus: "running" }
+    const test = fixture({ candidates: [source], sourceSessionLockedAtGraphLoad: true })
+    test.input = { ...test.input, crossSessionRootTaskHistoryEnabled: true }
+
+    const outcomes = await test.store.load(test.input)
+
+    expect(outcomes).toEqual([])
+    const sourceLock = test.queries.find(query => query.sql.includes("FOR SHARE"))
+    expect(sourceLock?.sql).toContain("FOR SHARE SKIP LOCKED")
+    expect(sourceLock?.values).toEqual(["session-other", "user-1"])
+    expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(0)
   })
 
   it("omits candidates with mismatched status, duplicate receipts, or nonprior sequence ordering", async () => {

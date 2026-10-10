@@ -21,6 +21,37 @@ function disposableUrl(): string | null {
   return value
 }
 
+function gate() {
+  let open!: () => void
+  const promise = new Promise<void>(resolve => { open = resolve })
+  return { open, promise }
+}
+
+function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonly unknown[]) => Promise<void>): Pick<PgPool, "connect"> {
+  return {
+    connect: async () => {
+      const client = await pool.connect()
+      const originalQuery = client.query.bind(client)
+      const query = async (sql: string, values?: readonly unknown[]) => {
+        const result = await originalQuery(sql, values ? [...values] : undefined)
+        await afterQuery(sql, values)
+        return result
+      }
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") return query
+          const value = Reflect.get(target, property, target)
+          return typeof value === "function" ? value.bind(target) : value
+        },
+      })
+    },
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : undefined
+}
+
 type Source = Readonly<{
   turnId: string; rootTaskId: string; childId: string; finalItemId: string; sessionId: string; userId: string
   goal: string; criteria: readonly string[]; input: unknown; startSequence: number
@@ -266,4 +297,101 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       inconsistentTerminal.turnId, streamingTerminalStep.turnId, failedTerminalStep.turnId, missingStepReceipt.turnId,
       mismatchedStepReceipt.turnId, duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
   })
+
+  it.each(["archived", "aborted"] as const)("omits a source session changed to %s after candidate selection", async status => {
+    const candidatesSelected = gate(), continueRead = gate()
+    let historyPromise: ReturnType<ReturnType<typeof createPgDirectRootTaskHistoryStore>["load"]> | undefined
+    const interleavedPool = observeQueries(pool!, async sql => {
+      if (sql.includes("WITH terminal_window AS MATERIALIZED")) {
+        candidatesSelected.open()
+        await continueRead.promise
+      }
+    })
+    const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+      rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+    try {
+      historyPromise = createPgDirectRootTaskHistoryStore(interleavedPool).load(input)
+      await candidatesSelected.promise
+      await pool!.query(`UPDATE "agent_sessions" SET "status" = $2 WHERE "id" = $1`, [otherSessionId, status])
+      continueRead.open()
+      const history = await historyPromise
+      expect(history.some(item => item.sourceTurnId === otherSession.turnId)).toBe(false)
+    } finally {
+      continueRead.open()
+      if (historyPromise) await historyPromise.catch(() => [])
+      await pool!.query(`UPDATE "agent_sessions" SET "status" = 'running' WHERE "id" = $1`, [otherSessionId])
+    }
+  })
+
+  it("holds the eligible source-session row lock through graph reads", async () => {
+    const graphReadFinished = gate(), continueGraphRead = gate()
+    let sourceLocked = false
+    let historyPromise: ReturnType<ReturnType<typeof createPgDirectRootTaskHistoryStore>["load"]> | undefined
+    const interleavedPool = observeQueries(pool!, async (sql, values) => {
+      if (sql.includes("FOR SHARE") && values?.[0] === otherSessionId) sourceLocked = true
+      if (sql.includes('FROM "agent_events" AS event') && values?.[0] === otherSessionId
+        && values?.[2] === taskGraphItemId(otherSession.rootTaskId)) {
+        graphReadFinished.open()
+        await continueGraphRead.promise
+      }
+    })
+    const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+      rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+    try {
+      historyPromise = createPgDirectRootTaskHistoryStore(interleavedPool).load(input)
+      await graphReadFinished.promise
+      expect(sourceLocked).toBe(true)
+
+      const contender = await pool!.connect()
+      let lockError: string | undefined
+      try {
+        await contender.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE NOWAIT`, [otherSessionId])
+      } catch (error: unknown) {
+        lockError = errorCode(error)
+      } finally {
+        contender.release()
+      }
+      expect(lockError).toBe("55P03")
+
+      continueGraphRead.open()
+      const history = await historyPromise
+      expect(history.some(item => item.sourceTurnId === otherSession.turnId)).toBe(true)
+      const archived = await pool!.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [otherSessionId])
+      expect(archived.rowCount).toBe(1)
+    } finally {
+      continueGraphRead.open()
+      if (historyPromise) await historyPromise.catch(() => [])
+      await pool!.query(`UPDATE "agent_sessions" SET "status" = 'running' WHERE "id" = $1`, [otherSessionId])
+    }
+  })
+
+  it("skips a source session locked by another transaction without waiting", async () => {
+    const sourceCheckReturned = gate()
+    const locker = await pool!.connect()
+    let historyPromise: ReturnType<ReturnType<typeof createPgDirectRootTaskHistoryStore>["load"]> | undefined
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await locker.query("BEGIN")
+      await locker.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [otherSessionId])
+      const interleavedPool = observeQueries(pool!, async (sql, values) => {
+        if (sql.includes("FOR SHARE") && values?.[0] === otherSessionId) sourceCheckReturned.open()
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+      historyPromise = createPgDirectRootTaskHistoryStore(interleavedPool).load(input)
+      const completedBeforeUnlock = await Promise.race([
+        Promise.all([sourceCheckReturned.promise, historyPromise]).then(() => true),
+        new Promise<boolean>(resolve => { timeout = setTimeout(() => resolve(false), 3_000) }),
+      ])
+      if (timeout) clearTimeout(timeout)
+      expect(completedBeforeUnlock).toBe(true)
+      const history = await historyPromise
+      expect(history.some(item => item.sourceTurnId === otherSession.turnId)).toBe(false)
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      await locker.query("ROLLBACK").catch(() => undefined)
+      locker.release()
+      if (historyPromise) await historyPromise.catch(() => [])
+    }
+  }, 10_000)
 })
