@@ -31,19 +31,29 @@ export function buildScoutAnalystAggregate(tasks: readonly CoordinationTaskView[
   for (const task of tasks) if (isMigratedRole(task.role)) latestByRole.set(task.role, task)
   const latestTasks = [...latestByRole.values()]
   const terminalRoles = latestTasks.filter(task => TERMINAL.has(task.status))
-  if (terminalRoles.some(task => !projectableStructuredResult(task))) return undefined
-  const hasStructured = terminalRoles.some(task => validatedStructuredResult(task).result || validatedStructuredResult(task).invalid)
+  const checkedRoles = terminalRoles.map(task => {
+    if (task.status !== "completed") return { task, projectable: true, checked: { result: null, invalid: false } }
+    const projectable = projectableStructuredResult(task)
+    return {
+      task,
+      projectable,
+      checked: projectable ? validatedStructuredResult(task) : { result: null, invalid: false },
+    }
+  })
+  const hasOversizedStructuredResult = checkedRoles.some(({ task, projectable }) => !projectable && hasStructuredResult(task))
+  const hasReadableValidatedResult = checkedRoles.some(({ projectable, checked }) => projectable && checked.result !== null)
+  if (hasOversizedStructuredResult && !hasReadableValidatedResult) return undefined
+  const readableRoles = checkedRoles.filter(entry => entry.projectable)
+  const hasStructured = readableRoles.some(({ checked }) => checked.result || checked.invalid)
   if (!hasStructured) return undefined
-  const outcomes: RoleExecutionOutcome[] = terminalRoles.map(task => ({
-    task, checked: validatedStructuredResult(task),
-  })).map(({ task, checked }) => ({
+  const outcomes: RoleExecutionOutcome[] = readableRoles.map(({ task, checked }) => ({
     role: task.role as MigratedRole, taskId: task.id, status: checked.invalid ? "failed" : task.status as RoleExecutionOutcome["status"],
     result: checked.result ?? undefined, failureReason: checked.invalid ? "invalid_structured_result" : task.failureReason ?? "structured_result_unavailable",
   }))
   const reduced = reduceScoutAnalystOutcomes(outcomes)
   const pendingRoles = MIGRATED_ROLES.filter(role => latestByRole.get(role) !== undefined && !TERMINAL.has(latestByRole.get(role)!.status))
   const aggregate: WaitAggregate = {
-    status: pendingRoles.length > 0 ? "pending" : reduced.status,
+    status: pendingRoles.length > 0 ? "pending" : hasOversizedStructuredResult ? "partial" : reduced.status,
     successfulRoles: reduced.successfulRoles,
     failedRoles: reduced.failedRoles,
     ...(pendingRoles.length > 0 ? { pendingRoles } : {}),
@@ -57,8 +67,12 @@ export function buildScoutAnalystAggregate(tasks: readonly CoordinationTaskView[
 }
 
 function isMigratedRole(value: unknown): value is MigratedRole { return value === "scout" || value === "analyst" }
+function hasStructuredResult(task: CoordinationTaskView): boolean {
+  const value = task.result
+  return !!value && typeof value === "object" && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "structuredResult")
+}
 function projectableStructuredResult(task: CoordinationTaskView): boolean {
-  if (!task.result || typeof task.result !== "object" || Array.isArray(task.result) || !Object.prototype.hasOwnProperty.call(task.result, "structuredResult")) return true
+  if (!hasStructuredResult(task)) return true
   try {
     const preview = sanitizeLifecyclePreview(task.result, MAX_WAIT_RESULT_BYTES)
     return !(preview && typeof preview === "object" && !Array.isArray(preview) && preview.$truncated === true)
