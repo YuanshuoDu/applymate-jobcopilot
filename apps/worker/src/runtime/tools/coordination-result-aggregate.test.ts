@@ -79,11 +79,17 @@ describe("coordination result aggregate", () => {
       findings: [{ ...analystResult.findings[0], jobId: "analyst-job" }],
       evidence: [{ ...analystResult.evidence[0], ref: "analyst-job" }],
     }
+    const failedScoutTask = task({ id: "scout", status: "failed", failureReason: "source_unavailable" })
+    let failedResultReads = 0
+    Object.defineProperty(failedScoutTask, "result", {
+      get() { failedResultReads += 1; return { structuredResult: largeFailedScout } },
+    })
     const result = buildScoutAnalystAggregate([
-      task({ id: "scout", status: "failed", failureReason: "source_unavailable", result: { structuredResult: largeFailedScout } }),
+      failedScoutTask,
       task({ id: "analyst", role: "analyst", result: { structuredResult: readableAnalyst } }),
     ])
     const encoded = JSON.stringify(result ?? null)
+    expect(failedResultReads).toBe(0)
     expect(result).toMatchObject({
       status: "partial", successfulRoles: ["analyst"], failedRoles: ["scout"], jobIds: ["analyst-job"],
       failures: [{ role: "scout", taskId: "scout", reason: "source_unavailable" }],
