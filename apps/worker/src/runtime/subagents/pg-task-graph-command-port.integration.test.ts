@@ -663,10 +663,12 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       id: owner.laterStepId, ordinal: 2, status: "streaming", cursor: 2n,
       consumedInputIds: [owner.originalInputId, owner.firstSteerInputId],
     })
-    const checkpointRead = await reopened.readCurrent(readScope(owner))
-    expect(checkpointRead.nodes.every(node => node.inputRelation === "predates_current_inputs")).toBe(true)
-    expect(checkpointRead.nodes.map(({ key, status, readiness }) => ({ key, status, readiness })))
+    const genericCheckpointRead = await reopened.readCurrent(readScope(owner))
+    expect(genericCheckpointRead.nodes.every(node => !("inputRelation" in node))).toBe(true)
+    expect(genericCheckpointRead.nodes.map(({ key, status, readiness }) => ({ key, status, readiness })))
       .toEqual(freshlyRead.nodes.map(({ key, status, readiness }) => ({ key, status, readiness })))
+    const checkpointRead = await reopened.readCurrentForPlanning!(readScope(owner))
+    expect(checkpointRead.nodes.every(node => node.inputRelation === "predates_current_inputs")).toBe(true)
     const checkpointContext = JSON.stringify(checkpointRead.nodes)
     expect(checkpointContext).not.toContain(owner.stepId)
     expect(checkpointContext).not.toContain(owner.laterStepId)

@@ -70,6 +70,17 @@ describe("canonical Turn native coordination", () => {
     expect(current.readCurrent).toHaveBeenCalledOnce()
   })
 
+  it("reuses the planner refresh for the internal native-task check without another graph read", async () => {
+    const plannerState = graph([{ ...graph().nodes[0]!, inputRelation: "covers_current_inputs" }])
+    const current = makeCoordination(vi.fn(async () => graph()), vi.fn(async () => plannerState))
+
+    await current.coordination.refresh(snapshot as never)
+
+    await expect(current.coordination.hasNativeTasks()).resolves.toBe(true)
+    expect(current.readCurrentForPlanning).toHaveBeenCalledOnce()
+    expect(current.readCurrent).not.toHaveBeenCalled()
+  })
+
   it("keeps a recovered native receipt as a completion requirement when the graph is absent", async () => {
     const current = makeCoordination(vi.fn(async () => graph([])))
     await expect(current.coordination.refresh(snapshot as never)).rejects.toThrow("task_graph_native_coordination_missing")

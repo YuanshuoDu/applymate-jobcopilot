@@ -61,9 +61,10 @@ export function createCanonicalTurnCoordination(input: Readonly<{
   async function planningGraph() {
     if (!input.commandPort) throw new Error("task_graph_runtime_dependencies_unavailable")
     const scope = readScope()
-    return input.commandPort.readCurrentForPlanning
-      ? input.commandPort.readCurrentForPlanning(scope)
-      : input.commandPort.readCurrent(scope)
+    currentState = input.commandPort.readCurrentForPlanning
+      ? await input.commandPort.readCurrentForPlanning(scope)
+      : await input.commandPort.readCurrent(scope)
+    return currentState
   }
   return {
     nativeOptions,
