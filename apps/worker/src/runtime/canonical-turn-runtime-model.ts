@@ -1,4 +1,4 @@
-import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
+import type { HarnessModelRequest, ModelAdapter, ModelUsage } from "@jobcopilot/agent-model"
 import type { HarnessModelRuntime } from "./harness-model.js"
 import type { TurnLease } from "./turns/lease.js"
 
@@ -25,6 +25,7 @@ export type HarnessPreProviderRoute = Pick<ModelAdapter["profile"], "provider" |
 export type HarnessPreProviderHooks = {
   beforeProviderInvocation(route: HarnessPreProviderRoute): Promise<void> | void
   providerInvocationStarted(): void
+  providerUsageObserved(route: HarnessPreProviderRoute, usage: ModelUsage): void
 }
 
 const HARNESS_ROUTED_ADAPTER: unique symbol = Symbol("harness-routed-adapter")
@@ -49,13 +50,14 @@ export async function runHarnessPreProviderHooks(
   request: HarnessModelRequest,
   route: HarnessPreProviderRoute,
   onFailure: () => void,
-): Promise<void> {
+): Promise<(usage: ModelUsage) => void> {
   const hooks = (request as HarnessHookedRequest)[HARNESS_PRE_PROVIDER_HOOKS]
-  if (!hooks) return
+  if (!hooks) return () => undefined
   try {
     await hooks.beforeProviderInvocation(route)
     if (request.signal.aborted) throw request.signal.reason ?? Object.assign(new Error("model_cancelled"), { code: "model_cancelled" })
     hooks.providerInvocationStarted()
+    return usage => hooks.providerUsageObserved(route, usage)
   } catch (error: unknown) {
     onFailure()
     throw error
@@ -81,13 +83,15 @@ export function modelWithUsage(runtime: HarnessModelRuntime, lease: TurnLease, a
         authorization?: UsageAuthorization
         authorizationPromise?: Promise<UsageAuthorization>
         providerStarted: boolean
+        inputTokens: number
+        outputTokens: number
+        estimatedCostUsd: number
         settlementStarted: boolean
         releaseStarted: boolean
         settlementUnknown: boolean
       }
       const attempts = new Map<string, Attempt>()
       let active: Attempt | undefined
-      let inputTokens = 0, outputTokens = 0, estimatedCostUsd = 0
       const routeKey = (route: HarnessPreProviderRoute) => `${route.provider}\u001f${route.model}`
       const interrupted = () => request.signal.reason ?? Object.assign(new Error("model_cancelled"), { code: "model_cancelled" })
       const settle = async (attempt: Attempt, input: Parameters<UsageAuthorization["settle"]>[0]): Promise<void> => {
@@ -104,7 +108,7 @@ export function modelWithUsage(runtime: HarnessModelRuntime, lease: TurnLease, a
       const finishAttempts = async (errorCode: string): Promise<void> => {
         for (const attempt of attempts.values()) {
           if (attempt.providerStarted && !attempt.settlementStarted) {
-            await settle(attempt, { status: "error", inputTokens, outputTokens, estimatedCostUsd, errorCode })
+            await settle(attempt, { status: "error", inputTokens: attempt.inputTokens, outputTokens: attempt.outputTokens, estimatedCostUsd: attempt.estimatedCostUsd, errorCode })
           } else if (!attempt.providerStarted) await release(attempt)
         }
       }
@@ -113,11 +117,11 @@ export function modelWithUsage(runtime: HarnessModelRuntime, lease: TurnLease, a
         const key = routeKey(route)
         let attempt = attempts.get(key)
         if (!attempt) {
-          attempt = { route, providerStarted: false, settlementStarted: false, releaseStarted: false, settlementUnknown: false }
+          attempt = { route, providerStarted: false, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, settlementStarted: false, releaseStarted: false, settlementUnknown: false }
           attempts.set(key, attempt)
         }
         if (active && active !== attempt && active.providerStarted && !active.settlementStarted) {
-          await settle(active, { status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_rerouted" })
+          await settle(active, { status: "error", inputTokens: active.inputTokens, outputTokens: active.outputTokens, estimatedCostUsd: active.estimatedCostUsd, errorCode: "provider_rerouted" })
         }
         active = attempt
         attempt.authorizationPromise ??= Promise.resolve().then(() => authorize({
@@ -134,6 +138,13 @@ export function modelWithUsage(runtime: HarnessModelRuntime, lease: TurnLease, a
         ? withHarnessPreProviderHooks(request, {
           beforeProviderInvocation: route => authorizeRoute(route).then(() => undefined),
           providerInvocationStarted: () => { if (active) active.providerStarted = true },
+          providerUsageObserved: (route, usage) => {
+            const attempt = attempts.get(routeKey(route))
+            if (!attempt) return
+            attempt.inputTokens = usage.inputTokens
+            attempt.outputTokens = usage.outputTokens
+            attempt.estimatedCostUsd = usage.estimatedCostUsd ?? 0
+          },
         })
         : request
       try {
@@ -141,14 +152,14 @@ export function modelWithUsage(runtime: HarnessModelRuntime, lease: TurnLease, a
         if (request.signal.aborted) throw interrupted()
         if (!deferAuthorization && active) active.providerStarted = true
         for await (const event of adapter.stream(streamRequest)) {
-          if (event.type === "usage") {
-            inputTokens = event.inputTokens
-            outputTokens = event.outputTokens
-            estimatedCostUsd = event.estimatedCostUsd ?? 0
+          if (event.type === "usage" && active) {
+            active.inputTokens = event.inputTokens
+            active.outputTokens = event.outputTokens
+            active.estimatedCostUsd = event.estimatedCostUsd ?? 0
           }
           yield event
         }
-        if (active) await settle(active, { status: "success", inputTokens, outputTokens, estimatedCostUsd })
+        if (active) await settle(active, { status: "success", inputTokens: active.inputTokens, outputTokens: active.outputTokens, estimatedCostUsd: active.estimatedCostUsd })
       } catch (error: unknown) {
         await finishAttempts(modelErrorCode(error))
         throw error
