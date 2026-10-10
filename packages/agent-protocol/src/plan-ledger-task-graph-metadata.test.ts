@@ -14,6 +14,10 @@ const report = {
   criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
   evidenceDigest: digest, resultDigest: "b".repeat(64),
 }
+const dependencyBinding = {
+  nodeKey: "scout-a", taskId: "task-scout-a", attemptCount: 1,
+  nodeDigest: digest, resultDigest: digest, evidenceDigest: digest, reportDigest: digest,
+}
 const result = {
   status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: null, finalText: "private", structuredResult: {},
 }
@@ -165,6 +169,45 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
       },
       taskGraphRepairReceipt: { ...receipt, evidenceDigest: "c".repeat(64) },
     })).toBe(true)
+  })
+
+  it("accepts only the exact Analyst Scout-selector check and strict private report bindings", () => {
+    const analyst = {
+      ...base, key: "analyst", templateId: "analyst", verificationDisposition: "typed",
+      verification: {
+        schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "analyst",
+        criteria: [{ id: "from-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-a" } }],
+      },
+    }
+    expect(parsePersistedTaskGraphNode(analyst)).toMatchObject({ key: "analyst", templateId: "analyst" })
+    expect(parsePersistedTaskGraphNode({
+      ...analyst, verification: { ...analyst.verification, criteria: [{
+        id: "from-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-a", taskId: "foreign" },
+      }] },
+    })).toBeNull()
+    expect(parsePersistedTaskGraphNode({
+      ...base, verificationDisposition: "typed",
+      verification: { ...analyst.verification, role: "scout" },
+    })).toBeNull()
+
+    const passing = { ...result, taskGraphVerificationReport: { ...report, dependencyBindings: [dependencyBinding] } }
+    expect(validTaskGraphResultEnvelopeKeys(passing)).toBe(true)
+    expect(validTaskGraphResultEnvelopeKeys({
+      ...result, taskGraphVerificationReport: { ...report, dependencyBindings: [{ ...dependencyBinding, nodeDigest: "A".repeat(64) }] },
+    })).toBe(false)
+    expect(validTaskGraphResultEnvelopeKeys({
+      ...result, taskGraphVerificationReport: { ...report, dependencyBindings: [{ ...dependencyBinding, attemptCount: 0 }] },
+    })).toBe(false)
+    expect(validTaskGraphResultEnvelopeKeys({
+      ...result, taskGraphVerificationReport: { ...report, dependencyBindings: [dependencyBinding, dependencyBinding] },
+    })).toBe(false)
+    expect(validTaskGraphResultEnvelopeKeys({
+      ...result, taskGraphVerificationReport: {
+        ...report, status: "unverified", reasonCode: "canonical_evidence_missing",
+        criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "canonical_evidence_missing" }],
+        evidenceDigest: null, resultDigest: null, dependencyBindings: [dependencyBinding],
+      },
+    })).toBe(false)
   })
 
   it("accepts Worker repair identifier order and partial criterion sets without deciding their lineage", () => {

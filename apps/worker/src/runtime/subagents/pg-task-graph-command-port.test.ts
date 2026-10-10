@@ -8,6 +8,7 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import type { PgSubagentPool } from "./types.js"
+import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 
 const reconciliationMocks = vi.hoisted(() => ({
   prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
@@ -116,8 +117,48 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
   return { pool, calls, client }
 }
 
+function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template" | "native"): { input: TaskGraphScheduleInput; graphContent: unknown; taskRows?: Array<Record<string, unknown>> } {
+  const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate_count", check: { kind: "candidate_count_gte", minimum: 1 } }] } as const
+  const analystVerification = (dependencyNodeKey: string) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey } }] } as const)
+  const unaryAnalyst = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "finding_count", check: { kind: "finding_count_gte", minimum: 1 } }] } as const
+  const scout: TaskGraphNodeProposal = { key: "scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find jobs"], dependsOn: [], verification: scoutVerification }
+  const analyst = (key: string, dependency: string, selector: string): TaskGraphNodeProposal => ({
+    key, templateId: "analyst", goal: "Check findings", successCriteria: ["Findings checked"], dependsOn: [dependency], verification: analystVerification(selector),
+  })
+  let nodes: readonly TaskGraphNodeProposal[]
+  let graphContent: unknown = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }
+  let taskRows: Array<Record<string, unknown>> = []
+  if (kind === "unknown") nodes = [scout, analyst("analyst", "scout", "missing")]
+  else if (kind === "indirect") nodes = [scout, { key: "middle", templateId: "analyst", goal: "Intermediate", successCriteria: ["Intermediate"], dependsOn: ["scout"], verification: unaryAnalyst }, analyst("analyst", "middle", "scout")]
+  else if (kind === "wrong-template") nodes = [{ key: "other-analyst", templateId: "analyst", goal: "Other analyst", successCriteria: ["Other"], dependsOn: [], verification: unaryAnalyst }, analyst("analyst", "other-analyst", "other-analyst")]
+  else {
+    const nativeMetadata = { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "native-operation", requestFingerprint: "a".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "job_discovery", contextDigest: "b".repeat(64), contextBytes: 0 }
+    graphContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "native-source", taskId: "native-task", templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID,
+      goal: "Native child", successCriteria: [], dependsOn: [], depth: 1, verificationDisposition: "legacy_unverified", nativeDelegation: nativeMetadata }] }
+    taskRows = [{ id: "native-task", status: "queued", role: "scout", taskType: "job_discovery", failureReason: null, result: null }]
+    nodes = [analyst("analyst", "native-source", "native-source")]
+  }
+  const base = scheduleInput(1)
+  return { graphContent, taskRows, input: { ...base, proposal: { expectedRevision: 1, nodes }, templates: {
+    scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+    analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search"] },
+  } } }
+}
+
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it.each(["unknown", "indirect", "wrong-template", "native"] as const)("rejects a %s cross-node selector before creating tasks or writing receipts", async kind => {
+    const invalid = invalidSelectorProposal(kind)
+    const fake = fakePool(invalid.input, { includeReplay: false, graphRevision: 1, graphContent: invalid.graphContent, taskRows: invalid.taskRows })
+    const { createGraphTasks } = await vi.importActual<typeof import("./task-graph-pg-create.js")>("./task-graph-pg-create.js")
+    reconciliationMocks.create.mockImplementationOnce(createGraphTasks)
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(invalid.input)).rejects.toThrow("task_graph_snapshot_verification_dependency_invalid")
+    expect(reconciliationMocks.create).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+  })
+
   it("keeps a missing graph pristine when no durable proposal receipt exists", async () => {
     const input = scheduleInput()
     const fake = fakePool(input, { missingGraph: true })

@@ -1,8 +1,12 @@
 import type { PoolClient } from "pg"
 import type { TaskGraphProposal, TaskGraphReadiness, TaskGraphRepairOf } from "../planning/task-graph.js"
-import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
-import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
+import {
+  TASK_GRAPH_VERIFIER_VERSION,
+  parseStoredTaskGraphVerificationReport,
+  publicTaskGraphVerificationReport,
+  type TaskGraphVerificationReport,
+} from "./task-graph-verification-report.js"
 import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphNativeResultReceipt } from "./task-graph-native-command.js"
 import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
 import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
@@ -16,6 +20,8 @@ export type {
   TaskGraphNativeSpawnRequest,
 } from "./task-graph-native-command.js"
 export type { TaskGraphNativeCommandInput, TaskGraphNativeFollowupRequest, TaskGraphNativeRequest, TaskGraphNativeReplacementRequest } from "./task-graph-native-request.js"
+export { TASK_GRAPH_VERIFIER_VERSION, parseStoredTaskGraphVerificationReport, publicTaskGraphVerificationReport } from "./task-graph-verification-report.js"
+export type { TaskGraphVerificationReport } from "./task-graph-verification-report.js"
 export { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-result-projection-contract.js"
 export type {
   TaskGraphProjectionSource,
@@ -26,11 +32,6 @@ export type {
   TaskGraphResultProjection,
 } from "./task-graph-result-projection-contract.js"
 export const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION = "agent-harness.v2.task-graph-repair-receipt.v1" as const
-const VERIFICATION_REASONS = new Set<TaskGraphVerificationReasonCode>([
-  "criteria_met", "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid",
-  "role_mismatch", "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous",
-  "result_invalid", "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved",
-])
 const CRITERION_ID = /^[a-z][a-z0-9._-]{0,63}$/
 function boundedString(value: unknown, limit: number): value is string { return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= limit }
 function exactRecord(value: unknown, keys: string): value is Record<string, unknown> {
@@ -41,11 +42,6 @@ function denseArray(value: unknown, max: number): value is unknown[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > max || Reflect.ownKeys(value).length !== value.length + 1) return false
   return Reflect.ownKeys(value).every(key => key === "length" || (typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < value.length))
 }
-export type TaskGraphVerificationReport = Readonly<{
-  verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode
-  criteria: Array<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>
-  evidenceDigest: string | null; resultDigest: string | null
-}>
 export type TaskGraphRepairReceipt = Readonly<{
   schemaVersion: typeof TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION; graphRootTaskId: string; targetNodeKey: string; targetTaskId: string; criterionIds: string[]
   repairNodeKey: string; repairTaskId: string; verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION; evidenceDigest: string
@@ -57,31 +53,8 @@ export function parseTaskGraphVerificationCriterionIds(value: unknown): string[]
 }
 
 export function parseTaskGraphVerificationReport(value: unknown, criterionIds: readonly string[]): TaskGraphVerificationReport | undefined {
-  if (!exactRecord(value, "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion") || value.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION
-    || !["passed", "failed", "unverified"].includes(String(value.status)) || !VERIFICATION_REASONS.has(value.reasonCode as TaskGraphVerificationReasonCode)
-    || !denseArray(value.criteria, 8) || value.criteria.length !== criterionIds.length
-    || !(value.status === "unverified" && (value.evidenceDigest === null || typeof value.evidenceDigest === "string" && /^[a-f0-9]{64}$/.test(value.evidenceDigest))
-      || (value.status !== "unverified" && typeof value.evidenceDigest === "string" && /^[a-f0-9]{64}$/.test(value.evidenceDigest)))
-    || !(value.resultDigest === null || typeof value.resultDigest === "string" && /^[a-f0-9]{64}$/.test(value.resultDigest))) return undefined
-  const criteria: NonNullable<TaskGraphVerificationReport["criteria"]>[number][] = []
-  for (let index = 0; index < value.criteria.length; index += 1) {
-    const item = value.criteria[index]
-    if (!exactRecord(item, "criterionId,reasonCode,status") || item.criterionId !== criterionIds[index]
-      || !["passed", "failed", "unverified"].includes(String(item.status)) || !VERIFICATION_REASONS.has(item.reasonCode as TaskGraphVerificationReasonCode)) return undefined
-    if (item.status === "passed" && item.reasonCode !== "criteria_met"
-      || item.status === "failed" && item.reasonCode !== "criterion_not_met" && item.reasonCode !== "reported_score_below_minimum"
-      || item.status === "unverified" && ["criteria_met", "criterion_not_met", "reported_score_below_minimum", "repair_target_unresolved"].includes(String(item.reasonCode))) return undefined
-    criteria.push({ criterionId: item.criterionId as string, status: item.status as "passed" | "failed" | "unverified", reasonCode: item.reasonCode as TaskGraphVerificationReasonCode })
-  }
-  const status = value.status as TaskGraphVerificationReport["status"], reasonCode = value.reasonCode as TaskGraphVerificationReasonCode
-  const repairUnresolved = status === "unverified" && reasonCode === "repair_target_unresolved" && value.evidenceDigest === null
-    && typeof value.resultDigest === "string" && /^[a-f0-9]{64}$/.test(value.resultDigest)
-    && criteria.every(item => item.status === "passed" && item.reasonCode === "criteria_met")
-  const coherent = repairUnresolved || (status === "passed" ? reasonCode === "criteria_met" && typeof value.resultDigest === "string" && criteria.every(item => item.status === "passed")
-    : status === "failed" ? typeof value.resultDigest === "string" && criteria.some(item => item.status === "failed") && reasonCode === criteria.find(item => item.status === "failed")?.reasonCode && criteria.every(item => item.status !== "unverified")
-      : criteria.every(item => item.status === "unverified" && item.reasonCode === reasonCode) && (value.evidenceDigest === null ? value.resultDigest === null : typeof value.resultDigest === "string"))
-  if (!coherent) return undefined
-  return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status, reasonCode, criteria, evidenceDigest: value.evidenceDigest as string | null, resultDigest: value.resultDigest as string | null }
+  const stored = parseStoredTaskGraphVerificationReport(value, criterionIds)
+  return stored ? publicTaskGraphVerificationReport(stored) : undefined
 }
 
 export function parseTaskGraphRepairOf(value: unknown): TaskGraphRepairOf | undefined {

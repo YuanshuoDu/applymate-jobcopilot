@@ -38,6 +38,9 @@ import { createPgContextOwnerFence, StepContextBuilder } from "../context/step-c
 import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
+import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "./native-verification-contract.js"
+import { parseNativeVerificationPacket } from "./native-verification-packet.js"
+import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA, RoleResultValidationError, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
@@ -51,6 +54,7 @@ import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } fr
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
+import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
@@ -102,6 +106,14 @@ const ANALYST_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "analyst",
   criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} as const
+const DISCOVERY_ANALYST_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [
+    { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    { id: "findings-from-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
+  ],
 } as const
 
 function expectVerifiedDependencyProjectionItems(
@@ -3000,12 +3012,13 @@ async function collectPlanReceiptFailureDiagnostics(
   }
 }
 
-function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number): RecordValue & { tasks: unknown[] } {
+function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number, requiredRole?: "scout" | "analyst"): RecordValue & { tasks: unknown[] } {
   const outcomes = request.messages.flatMap(message => message.content.flatMap(part => {
     if (part.type !== "tool_result" || !part.toolUseId.startsWith("wait:") || typeof part.content !== "string") return []
     try {
       const outcome = record(JSON.parse(part.content) as unknown)
-      return outcome && Array.isArray(outcome.tasks) && outcome.tasks.length === taskCount ? [outcome] : []
+      return outcome && Array.isArray(outcome.tasks) && outcome.tasks.length === taskCount
+        && (!requiredRole || outcome.tasks.some(task => record(task)?.role === requiredRole)) ? [outcome] : []
     } catch { return [] }
   }))
   const outcome = outcomes[0]
@@ -3027,13 +3040,13 @@ function currentGraphFromRequest(request: HarnessModelRequest): RecordValue | nu
   return null
 }
 
-function expectPassedVerificationReport(value: unknown, criterionId: string): void {
+function expectPassedVerificationReport(value: unknown, ...criterionIds: string[]): void {
   const report = record(value)
   expect(report).toMatchObject({
     verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
     status: "passed",
     reasonCode: "criteria_met",
-    criteria: [{ criterionId, status: "passed", reasonCode: "criteria_met" }],
+    criteria: criterionIds.map(criterionId => ({ criterionId, status: "passed", reasonCode: "criteria_met" })),
   })
   expect(typeof report?.evidenceDigest).toBe("string")
   expect(String(report?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
@@ -9489,6 +9502,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     let rootExecution = 0
     let discoveryRootModelFailure: string | null = null
+    let discoveryScoutGraphRevision = -1
     let discoveryRootStage: "not_started" | "initial_plan" | "scout_wait" | "replan" | "analyst_plan_receipt" | "analyst_wait" | "final" = "not_started"
     let discoveryChildStage: "not_started" | "search_visibility" | "search_call_emitted" | "parent_wait" | "result_emitted" = "not_started"
     let discoveryJobsSearchAppeared = false
@@ -9547,9 +9561,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
               const revision = graph?.revision
               if (typeof revision !== "number") throw new Error("Discovery replan did not receive the durable graph revision")
+              discoveryScoutGraphRevision = revision
               yield { type: "tool_call_completed", callId: "p3-discovery-plan-analyst", name: "agent.plan", arguments: {
                 expectedRevision: revision,
-                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION }],
+                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION }],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
@@ -9571,9 +9586,338 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(nodes.map(node => node?.key)).toEqual(["scout", "analyst"])
               expect(nodes.map(node => node?.status)).toEqual(["completed", "completed"])
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
-              expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count")
-              const wait = waitOutcomeFromRequest(request, 1)
+              expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count", "findings-from-scout")
+              expect(typeof graph?.revision).toBe("number")
+              expect(graph?.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              const publicReportKeys = ["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"]
+              const publicGraphReport = record(nodes[1]?.verificationReport)
+              expect(Object.keys(publicGraphReport ?? {}).sort()).toEqual(publicReportKeys)
+              expect(JSON.stringify(publicGraphReport)).not.toContain("dependencyBindings")
+              const wait = waitOutcomeFromRequest(request, 1, "analyst")
               expect(wait.status).toBe("ready")
+              const waitedAnalyst = record(wait.tasks[0])
+              const publicWaitReport = record(waitedAnalyst?.verificationReport)
+              expect(waitedAnalyst?.role).toBe("analyst")
+              expectPassedVerificationReport(publicWaitReport, "finding-count", "findings-from-scout")
+              expect(Object.keys(publicWaitReport ?? {}).sort()).toEqual(publicReportKeys)
+              expect(JSON.stringify(publicWaitReport)).not.toContain("dependencyBindings")
+
+              const ownerRows = await pool!.query<{
+                rootTaskId: string; turnLeaseOwner: string; turnLeaseVersion: number
+                turnLeaseStartedAt: Date; turnLeaseExpiresAt: Date; stepId: string
+                parentLeaseOwner: string; parentAttemptCount: number
+              }>(`SELECT turn."rootTaskId", turn."leaseOwnerId" AS "turnLeaseOwner", turn."leaseVersion" AS "turnLeaseVersion",
+                    turn."leaseStartedAt" AS "turnLeaseStartedAt", turn."leaseExpiresAt" AS "turnLeaseExpiresAt",
+                    (SELECT step."id" FROM "agent_steps" AS step WHERE step."sessionId" = turn."sessionId"
+                      AND step."turnId" = turn."id" AND step."taskId" = root."id" AND step."status" = 'streaming'
+                      ORDER BY step."ordinal" DESC LIMIT 1) AS "stepId",
+                    root."leaseOwner" AS "parentLeaseOwner", root."attemptCount" AS "parentAttemptCount"
+                 FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root
+                   ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+                 WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND root."status" = 'running'`,
+              [discoveryOwner.turnId, discoveryOwner.sessionId, discoveryOwner.userId])
+              const currentOwner = ownerRows.rows[0]
+              if (!currentOwner?.stepId) throw new Error("Discovery root lease or streaming step was unavailable for current graph readback")
+              const terminalGateLease: TurnLease = {
+                turnId: discoveryOwner.turnId, sessionId: discoveryOwner.sessionId, ownerId: currentOwner.turnLeaseOwner,
+                userId: discoveryOwner.userId, leaseVersion: currentOwner.turnLeaseVersion,
+                leaseStartedAt: currentOwner.turnLeaseStartedAt, leaseExpiresAt: currentOwner.turnLeaseExpiresAt,
+              }
+              const readScope = {
+                userId: discoveryOwner.userId, sessionId: discoveryOwner.sessionId, turnId: discoveryOwner.turnId,
+                rootTaskId: currentOwner.rootTaskId, parentTaskId: currentOwner.rootTaskId,
+                turnLeaseOwner: currentOwner.turnLeaseOwner, turnLeaseVersion: currentOwner.turnLeaseVersion,
+                parentLeaseOwner: currentOwner.parentLeaseOwner, parentAttemptCount: currentOwner.parentAttemptCount,
+              }
+              const nativeVerificationScope = { ...readScope, stepId: currentOwner.stepId }
+              const nativeVerificationPort = createPgNativeVerificationPort(pool!)
+              const currentGraphState = await discoveryCommandPort.readCurrent(readScope)
+              expect(currentGraphState.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              const currentScout = currentGraphState.nodes.find(node => node.key === "scout")
+              const currentAnalyst = currentGraphState.nodes.find(node => node.key === "analyst")
+              expectPassedVerificationReport(currentScout?.verificationReport, "candidate-count")
+              expectPassedVerificationReport(currentAnalyst?.verificationReport, "finding-count", "findings-from-scout")
+              await expect(checkTerminalTaskGraph(pool!, terminalGateLease, currentOwner.rootTaskId))
+                .resolves.toMatchObject({ ok: true })
+              const nativeCandidateText = "The verified shortlist remains current."
+              const acceptedNativeRoot = await nativeVerificationPort.ensureRootGoal({
+                scope: nativeVerificationScope, candidateText: nativeCandidateText,
+              })
+              expect(["pending", "passed"]).toContain(acceptedNativeRoot.status)
+              expect(acceptedNativeRoot.controlTaskIds).toHaveLength(1)
+              const acceptedNativeRootControlId = acceptedNativeRoot.controlTaskIds[0]
+              expect(acceptedNativeRootControlId).toBeTruthy()
+              if (acceptedNativeRoot.status === "pending") {
+                expect(acceptedNativeRoot.pendingControlTaskIds).toContain(acceptedNativeRootControlId)
+                expect(acceptedNativeRoot.pendingTaskIds).toContain(acceptedNativeRootControlId)
+              } else {
+                expect(acceptedNativeRoot.rootGoalWitness?.controlTaskId).toBe(acceptedNativeRootControlId)
+                expect(acceptedNativeRoot.rootGoalWitness?.candidateDigest).toMatch(/^[a-f0-9]{64}$/)
+              }
+              const nativeRootControl = await pool!.query<{
+                role: string; taskType: string; rootTaskId: string; parentTaskId: string; status: string; expectedOutputSchema: unknown
+              }>(`SELECT "role", "taskType", "rootTaskId", "parentTaskId", "status", "expectedOutputSchema"
+                  FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+              [acceptedNativeRootControlId, discoveryOwner.sessionId, discoveryOwner.turnId])
+              expect(nativeRootControl.rows).toHaveLength(1)
+              expect(nativeRootControl.rows[0]).toMatchObject({
+                role: "auditor", taskType: "native_verification", rootTaskId: currentOwner.rootTaskId,
+                parentTaskId: currentOwner.rootTaskId,
+              })
+              expect(parseNativeVerificationControl(nativeRootControl.rows[0]?.expectedOutputSchema)?.target.kind).toBe("root_goal")
+              const recoveredNativeRoot = await nativeVerificationPort.readRecoverableGoal(readScope)
+              expect(recoveredNativeRoot).toMatchObject({ controlTaskId: acceptedNativeRootControlId, candidateText: nativeCandidateText })
+              expect(["pending", "passed"]).toContain(recoveredNativeRoot?.status)
+              if (recoveredNativeRoot?.status === "passed") {
+                expect(recoveredNativeRoot.witness?.controlTaskId).toBe(acceptedNativeRootControlId)
+              }
+              const nativeControlDeadline = Date.now() + 30_000
+              let completedNativeRootControl: { status: string; attemptCount: number; failureReason: string | null } | undefined
+              while (Date.now() < nativeControlDeadline) {
+                const controlState = await pool!.query<{
+                  status: string; attemptCount: number; failureReason: string | null
+                }>(`SELECT "status", "attemptCount", "failureReason" FROM "sub_agent_tasks"
+                    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+                [acceptedNativeRootControlId, discoveryOwner.sessionId, discoveryOwner.turnId])
+                const currentControl = controlState.rows[0]
+                if (currentControl?.status === "completed") {
+                  completedNativeRootControl = currentControl
+                  break
+                }
+                if (currentControl && ["failed", "interrupted", "cancelled", "closed"].includes(currentControl.status)) {
+                  throw new Error(`Discovery native root control terminated as ${currentControl.status}`)
+                }
+                await new Promise(resolve => setTimeout(resolve, 25))
+              }
+              expect(completedNativeRootControl).toMatchObject({ status: "completed", failureReason: null })
+              expect(completedNativeRootControl?.attemptCount).toBeGreaterThan(0)
+              const passedNativeRoot = await nativeVerificationPort.readRecoverableGoal(readScope)
+              expect(passedNativeRoot).toMatchObject({ controlTaskId: acceptedNativeRootControlId,
+                candidateText: nativeCandidateText, status: "passed" })
+              expect(passedNativeRoot?.status === "passed" ? passedNativeRoot.witness?.controlTaskId : undefined)
+                .toBe(acceptedNativeRootControlId)
+
+              const childRows = await pool!.query<{ id: string; role: string; result: unknown }>(
+                `SELECT "id", "role", "result" FROM "sub_agent_tasks"
+                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "rootTaskId" = $3 AND "parentTaskId" = $3
+                   AND "role" = ANY($4::text[])`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId, ["analyst", "scout"]],
+              )
+              const scoutTask = childRows.rows.find(task => task.role === "scout")
+              const analystTask = childRows.rows.find(task => task.role === "analyst")
+              const scoutResult = record(scoutTask?.result)
+              const scoutStructured = record(scoutResult?.structuredResult)
+              const sourceCandidates = Array.isArray(scoutStructured?.candidates)
+                ? scoutStructured.candidates.map(record).filter((candidate): candidate is RecordValue => candidate !== null) : []
+              const analystResult = record(analystTask?.result)
+              const storedReport = record(analystResult?.taskGraphVerificationReport)
+              if (!scoutTask || !analystTask || !scoutResult || !scoutStructured || !sourceCandidates.length || !analystResult || !storedReport) {
+                throw new Error("Discovery source or Analyst verification result was missing")
+              }
+              expect(Object.keys(storedReport).sort()).toEqual([
+                "criteria", "dependencyBindings", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion",
+              ])
+              const parsedStoredReport = parseStoredTaskGraphVerificationReport(
+                storedReport, ["finding-count", "findings-from-scout"], ["scout"],
+              )
+              expect(parsedStoredReport?.status).toBe("passed")
+              const bindings = Array.isArray(parsedStoredReport?.dependencyBindings)
+                ? parsedStoredReport.dependencyBindings.map(record) : []
+              expect(bindings).toHaveLength(1)
+              const sourceBinding = bindings[0]
+              if (!sourceBinding) throw new Error("Discovery Analyst private dependency binding was invalid")
+              expect(Object.keys(sourceBinding ?? {}).sort()).toEqual([
+                "attemptCount", "evidenceDigest", "nodeDigest", "nodeKey", "reportDigest", "resultDigest", "taskId",
+              ])
+              expect(sourceBinding).toMatchObject({ nodeKey: "scout", taskId: scoutTask.id, attemptCount: 1 })
+              for (const key of ["nodeDigest", "resultDigest", "evidenceDigest", "reportDigest"] as const) {
+                expect(sourceBinding?.[key]).toMatch(/^[a-f0-9]{64}$/)
+              }
+              expect(JSON.stringify(sourceBinding)).not.toContain(jobId)
+
+              const expectReadbackRejectsMutation = async (taskId: string, original: RecordValue, changed: RecordValue) => {
+                const update = async (value: RecordValue) => pool!.query(
+                  `UPDATE "sub_agent_tasks" SET "result" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+                  [JSON.stringify(value), taskId, discoveryOwner.sessionId, discoveryOwner.turnId],
+                )
+                expect((await update(changed)).rowCount).toBe(1)
+                try {
+                  await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+                  await expect(checkTerminalTaskGraph(pool!, terminalGateLease, currentOwner.rootTaskId))
+                    .resolves.toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+                  await expect(nativeVerificationPort.ensureRootGoal({
+                    scope: nativeVerificationScope, candidateText: "The verified shortlist remains current.",
+                  })).resolves.toMatchObject({ status: "unavailable" })
+                  await expect(nativeVerificationPort.readRecoverableGoal(readScope)).resolves.toBeNull()
+                } finally {
+                  expect((await update(original)).rowCount).toBe(1)
+                }
+              }
+              const changedCandidates = sourceCandidates.map(candidate => ({ ...candidate, jobId: `${jobId}-changed` }))
+              await expectReadbackRejectsMutation(scoutTask.id, scoutResult, {
+                ...scoutResult, structuredResult: { ...scoutStructured, candidates: changedCandidates },
+              })
+              const missingBindingReport = { ...storedReport }
+              delete missingBindingReport.dependencyBindings
+              await expectReadbackRejectsMutation(analystTask.id, analystResult, {
+                ...analystResult, taskGraphVerificationReport: missingBindingReport,
+              })
+              await expectReadbackRejectsMutation(analystTask.id, analystResult, {
+                ...analystResult, taskGraphVerificationReport: {
+                  ...storedReport, dependencyBindings: [{ ...sourceBinding, taskId: `replaced-${scoutTask.id}` }],
+                },
+              })
+              const scoutReport = record(scoutResult.taskGraphVerificationReport)
+              if (!scoutReport) throw new Error("Discovery Scout report was unavailable for the private report mutation")
+              await expectReadbackRejectsMutation(scoutTask.id, scoutResult, {
+                ...scoutResult, taskGraphVerificationReport: { ...scoutReport, resultDigest: "0".repeat(64) },
+              })
+
+              const graphSnapshotRows = await pool!.query<{ revision: number; content: unknown }>(
+                `SELECT "revision", "content" FROM "agent_items"
+                 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
+                [taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId],
+              )
+              const graphSnapshotRevision = graphSnapshotRows.rows[0]?.revision
+              const graphSnapshot = record(graphSnapshotRows.rows[0]?.content)
+              const graphReceiptRows = await pool!.query<{ id: string; type: string; taskId: string | null; payload: unknown }>(
+                `SELECT "id", "type", "taskId", "payload" FROM "agent_events"
+                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
+                   AND "type" IN ('task_graph.lifecycle', 'item.started', 'item.delta')
+                   AND "payload"->>'kind' IN ('proposal', 'lifecycle')
+                   AND "payload"->>'revision' = $4::text`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, taskGraphItemId(currentOwner.rootTaskId), graphSnapshotRevision],
+              )
+              const graphReceiptRow = graphReceiptRows.rows[0]
+              const graphReceiptPayload = record(graphReceiptRow?.payload)
+              const graphReceiptItem = record(graphReceiptPayload?.item)
+              expect(graphSnapshotRows.rows, "Discovery TaskGraph snapshot row was missing").toHaveLength(1)
+              expect(Number.isSafeInteger(graphSnapshotRevision), "Discovery TaskGraph snapshot revision was invalid").toBe(true)
+              expect(graphReceiptRows.rows, "Discovery current-revision TaskGraph receipt was missing or ambiguous").toHaveLength(1)
+              if (!graphSnapshot || !graphReceiptRow || !graphReceiptPayload || !graphReceiptItem) {
+                throw new Error("Discovery current-revision TaskGraph receipt payload was invalid")
+              }
+              const graphNodes: unknown[] = Array.isArray(graphSnapshot.nodes) ? graphSnapshot.nodes : []
+              const graphTaskIds = new Set(graphNodes.map(value => record(value)?.taskId)
+                .filter((taskId): taskId is string => typeof taskId === "string"))
+              expect(graphReceiptPayload.revision, "Discovery receipt revision did not match the graph snapshot").toBe(graphSnapshotRevision)
+              expect(graphReceiptItem.revision, "Discovery receipt item revision did not match the graph snapshot").toBe(graphSnapshotRevision)
+              expect(graphReceiptItem.content, "Discovery receipt item content did not match the graph snapshot").toEqual(graphSnapshot)
+              if (graphReceiptPayload.kind === "proposal") {
+                expect(["item.started", "item.delta"]).toContain(graphReceiptRow.type)
+                expect(graphReceiptRow.taskId, "Discovery proposal receipt did not belong to the graph owner").toBe(currentOwner.rootTaskId)
+                if (Object.hasOwn(graphReceiptPayload, "content")) {
+                  expect(graphReceiptPayload.content, "Discovery proposal content did not match the graph snapshot").toEqual(graphSnapshot)
+                }
+                if (graphReceiptRow.type === "item.delta") expect(Object.hasOwn(graphReceiptPayload, "content")).toBe(true)
+              } else if (graphReceiptPayload.kind === "lifecycle") {
+                expect(["item.delta", "task_graph.lifecycle"]).toContain(graphReceiptRow.type)
+                expect(typeof graphReceiptRow.taskId, "Discovery lifecycle receipt task was missing").toBe("string")
+                expect(graphTaskIds, "Discovery lifecycle receipt task was outside the current graph").toContain(graphReceiptRow.taskId)
+              } else {
+                throw new Error("Discovery current-revision TaskGraph receipt kind was unsupported")
+              }
+              const scoutNode = graphNodes.map(record).find(node => node?.key === "scout")
+              const scoutVerification = record(scoutNode?.verification)
+              const scoutCriteria: RecordValue[] = Array.isArray(scoutVerification?.criteria)
+                ? scoutVerification.criteria.map(record).filter((criterion): criterion is RecordValue => criterion !== null) : []
+              const candidateCriterion = scoutCriteria.find(criterion => criterion.id === "candidate-count")
+              const candidateCheck = record(candidateCriterion?.check)
+              if (!scoutNode || !scoutVerification) {
+                throw new Error("Discovery Scout verification contract was unavailable for the persisted mutation")
+              }
+              if (candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
+                throw new Error("Discovery Scout snapshot contract was unavailable for the persisted mutation")
+              }
+              const changedGraphSnapshot: RecordValue = {
+                ...graphSnapshot,
+                nodes: graphNodes.map(value => {
+                  const node = record(value)
+                  return node?.key === "scout" ? {
+                    ...node,
+                    verification: {
+                      ...scoutVerification,
+                      criteria: scoutCriteria.map(criterion => criterion.id === "candidate-count"
+                        ? { ...criterion, check: { kind: "all_candidates_have_evidence", minimumItems: 1 } }
+                        : criterion),
+                    },
+                  } : value
+                }),
+              }
+              const changedGraphReceiptPayload: RecordValue = {
+                ...graphReceiptPayload,
+                ...(Object.hasOwn(graphReceiptPayload, "content") ? { content: changedGraphSnapshot } : {}),
+                item: { ...graphReceiptItem, content: changedGraphSnapshot },
+              }
+              const updateGraphSnapshot = async (content: RecordValue) => pool!.query(
+                `UPDATE "agent_items" SET "content" = $1::jsonb
+                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "type" = 'task_graph' AND "revision" = $6`,
+                [JSON.stringify(content), taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId, graphSnapshotRevision],
+              )
+              const updateGraphReceipt = async (payload: RecordValue) => pool!.query(
+                `UPDATE "agent_events" SET "payload" = $1::jsonb
+                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "itemId" = $5 AND "taskId" = $6
+                   AND "type" = $7 AND "payload"->>'kind' = $8 AND "payload"->>'revision' = $9::text`,
+                [JSON.stringify(payload), graphReceiptRow.id, discoveryOwner.sessionId, discoveryOwner.turnId,
+                  taskGraphItemId(currentOwner.rootTaskId), graphReceiptRow.taskId, graphReceiptRow.type,
+                  graphReceiptPayload.kind, graphSnapshotRevision],
+              )
+              try {
+                expect((await updateGraphReceipt(changedGraphReceiptPayload)).rowCount).toBe(1)
+                expect((await updateGraphSnapshot(changedGraphSnapshot)).rowCount).toBe(1)
+                await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+              } finally {
+                try {
+                  expect((await updateGraphReceipt(graphReceiptPayload)).rowCount).toBe(1)
+                } finally {
+                  expect((await updateGraphSnapshot(graphSnapshot)).rowCount).toBe(1)
+                }
+              }
+
+              const sourceReceiptRows = await pool!.query<{ id: string; content: unknown }>(
+                `SELECT result."id", result."content" FROM "agent_items" AS call
+                 JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+                   AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+                   AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+                 WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3
+                   AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'jobs.search'`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, scoutTask.id],
+              )
+              const sourceReceipt = sourceReceiptRows.rows[0]
+              const sourceReceiptContent = record(sourceReceipt?.content)
+              const sourceReceiptOutput = record(sourceReceiptContent?.output)
+              const sourceReceiptJobs = Array.isArray(sourceReceiptOutput?.jobs)
+                ? sourceReceiptOutput.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
+              if (sourceReceiptRows.rows.length !== 1 || !sourceReceipt || !sourceReceiptContent || !sourceReceiptOutput || !sourceReceiptJobs.length) {
+                throw new Error("Discovery Scout read receipt was unavailable for the persisted receipt mutation")
+              }
+              const receiptUpdate = async (content: RecordValue) => pool!.query(
+                `UPDATE "agent_items" SET "content" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+                [JSON.stringify(content), sourceReceipt.id, discoveryOwner.sessionId, discoveryOwner.turnId],
+              )
+              const changedReceipt: RecordValue = {
+                ...sourceReceiptContent,
+                output: { ...sourceReceiptOutput, jobs: sourceReceiptJobs.map((job, index) => ({
+                  ...job, ...(index === 0 ? { id: `${String(job.id)}-receipt-changed` } : {}),
+                })) },
+              }
+              expect((await receiptUpdate(changedReceipt)).rowCount).toBe(1)
+              try {
+                await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+                await expect(checkTerminalTaskGraph(pool!, terminalGateLease, currentOwner.rootTaskId))
+                  .resolves.toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+                await expect(nativeVerificationPort.ensureRootGoal({
+                  scope: nativeVerificationScope, candidateText: "The verified shortlist remains current.",
+                })).resolves.toMatchObject({ status: "unavailable" })
+                await expect(nativeVerificationPort.readRecoverableGoal(readScope)).resolves.toBeNull()
+              } finally {
+                expect((await receiptUpdate(sourceReceiptContent)).rowCount).toBe(1)
+              }
+              const restoredGraphState = await discoveryCommandPort.readCurrent(readScope)
+              expect(restoredGraphState.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              expectPassedVerificationReport(restoredGraphState.nodes.find(node => node.key === "scout")?.verificationReport, "candidate-count")
+              expectPassedVerificationReport(restoredGraphState.nodes.find(node => node.key === "analyst")?.verificationReport,
+                "finding-count", "findings-from-scout")
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }) }
               yield { type: "completed", finishReason: "stop" }
               return
@@ -9593,6 +9937,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const productionChildExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
+        if (task.role === "auditor" && task.taskType === "native_verification") {
+          const control = parseNativeVerificationControl(task.expectedOutputSchema)
+          const packet = control ? parseNativeVerificationPacket(task.context, control) : null
+          if (!control || !packet) throw new Error("p3_discovery_native_control_unreadable")
+          const report = {
+            schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
+            criteria: packet.criteria.map(item => ({
+              criterionId: item.criterionId,
+              disposition: "passed" as const,
+              reasonCode: "meets_criterion" as const,
+              evidenceReferenceIds: item.requirement.includes("self-attestation")
+                ? packet.evidence.filter(evidence => evidence.kind === "user_self_attestation").map(evidence => evidence.referenceId)
+                : [packet.target.referenceId, ...packet.evidence.filter(evidence => evidence.kind === "tool_result").map(evidence => evidence.referenceId)],
+            })),
+          }
+          return {
+            id: "p3-interactive-discovery-native-verifier-fixture", profile,
+            async *stream() {
+              yield { type: "text_delta", text: JSON.stringify(report) }
+              yield { type: "completed", finishReason: "stop" }
+            },
+          } satisfies ModelAdapter
+        }
         let round = 0
         const adapter: ModelAdapter = {
           id: `p3-interactive-discovery-${task.role}-fixture`, profile,
@@ -9785,7 +10152,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "completed"], ["scout", "completed"]])
     expect(children.rows.map(child => record(record(child.result)?.structuredResult)?.role)).toEqual(["analyst", "scout"])
     expectPassedVerificationReport(record(children.rows.find(child => child.role === "scout")?.result)?.taskGraphVerificationReport, "candidate-count")
-    expectPassedVerificationReport(record(children.rows.find(child => child.role === "analyst")?.result)?.taskGraphVerificationReport, "finding-count")
+    expectPassedVerificationReport(record(children.rows.find(child => child.role === "analyst")?.result)?.taskGraphVerificationReport, "finding-count", "findings-from-scout")
     const dispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null }>(
       `SELECT "idempotencyKey", "publishedAt" FROM "agent_outbox"
        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,

@@ -27,6 +27,10 @@ function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
         minimumFindings: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }),
         aggregation: Type.Union([Type.Literal("any"), Type.Literal("all")]),
       }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_from_scout_dependency"),
+        dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+      }, { additionalProperties: false }),
     ]
   return Type.Union([evidence, ...roleChecks] as [TSchema, ...TSchema[]])
 }
@@ -177,7 +181,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     schemaVersion,
     name: "agent.plan",
     version: "1",
-    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte. Use only checks allowed for that role. A repair uses repairOf={graphRootTaskId,nodeKey,taskId,criterionIds} for a prior typed same-template node, repeats exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
+    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency. Use only checks allowed for that role. findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. A repair uses repairOf={graphRootTaskId,nodeKey,taskId,criterionIds} for a prior typed same-template node, repeats exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
     capabilities: ["coordination"],
     inputSchema: proposalInputSchema(templateIdSchema, templates),
     outputSchema: ReceiptSchema,

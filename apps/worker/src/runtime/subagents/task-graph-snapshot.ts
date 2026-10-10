@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { isValidTaskGraphRepairRelation, TASK_GRAPH_LIMITS, type TaskGraphEvent, type TaskGraphNodeProposal, type TaskGraphRepairOf, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
-import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
+import { taskGraphVerificationRole, validateTaskGraphVerificationContract, validateTaskGraphVerificationDependencySelectors, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 
@@ -145,6 +145,7 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
       children.get(dependency)!.push(node.key)
     }
   }
+  if (!validateTaskGraphVerificationDependencySelectors(nodes)) throw new Error("task_graph_snapshot_verification_dependency_invalid")
   const ready = nodes.filter(node => indegree.get(node.key) === 0).map(node => node.key)
   let visited = 0
   for (let cursor = 0; cursor < ready.length; cursor++) {

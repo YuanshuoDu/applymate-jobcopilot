@@ -8,6 +8,7 @@ import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-comman
 import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { taskGraphNativeCurrentView } from "./task-graph-native-result.js"
+import { revalidateTaskGraphDependencyBindings } from "./task-graph-pg-dependency-binding-readback.js"
 import {
   projectTaskGraphResult,
   taskGraphResultProjectionBytes,
@@ -132,10 +133,9 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
   const baseState = taskGraphState(snapshot, revision, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), appliedEvents)
   const repairs = resolveTaskGraphRepairDependencies(snapshot, tasks, scope.rootTaskId)
   const state = { ...baseState, repairSatisfiedNodeKeys: repairs.satisfied, repairPendingNodeKeys: repairs.pending }
-  return { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks }
+  return revalidateTaskGraphDependencyBindings(client, scope, { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks })
 }
-/** Uses the durable proposal receipt to distinguish graph children from legacy tasks sharing a root. */
-export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
+/** Uses the durable proposal receipt to distinguish graph children from legacy tasks sharing a root. */ export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
   const result = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload" FROM "agent_events" AS event
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
