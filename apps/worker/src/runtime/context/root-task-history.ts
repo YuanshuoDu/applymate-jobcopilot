@@ -9,6 +9,7 @@ import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-ver
 import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { ContextSeedBlock } from "./step-context-builder.js"
 import { filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
+import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
 
 export type ValidatedRootTaskHistoryOutcome = Readonly<{
   sourceTurnId: string
@@ -25,10 +26,11 @@ type SafeNode = Readonly<{
   status: SubagentTaskStatus
   negativeReasonHints?: readonly TaskGraphVerificationReasonCode[]
   lesson?: RootTaskHistoryNodeLesson
+  reportedOutput?: RootTaskHistoryReportedOutput
 }>
-type CandidateNode = Readonly<{ nodeOrdinal: number; projection: Omit<SafeNode, "lesson">; lesson?: RootTaskHistoryNodeLesson }>
+type CandidateNode = Readonly<{ nodeOrdinal: number; projection: Omit<SafeNode, "lesson" | "reportedOutput">; lesson?: RootTaskHistoryNodeLesson; reportedOutput?: RootTaskHistoryReportedOutput }>
 type Candidate = ValidatedRootTaskHistoryOutcome & Readonly<{ safeNodes: readonly CandidateNode[]; identity: string }>
-type SelectedTurn = { label: string; candidate: Candidate; nodes: CandidateNode[]; lessonOrdinals: Set<number> }
+type SelectedTurn = { label: string; candidate: Candidate; nodes: CandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number> }
 type Row = Record<string, unknown>
 
 const MAX_CANDIDATES = 64
@@ -90,7 +92,9 @@ function projectNode(value: unknown): Omit<SafeNode, "lesson"> | null {
   if (!node || typeof node.templateId !== "string" || typeof node.status !== "string" || !STATUSES.has(node.status as SubagentTaskStatus)) return null
   const taskKind = TASK_KINDS.get(node.templateId) ?? "other"
   const hints = safeReasonHints(node)
-  return { taskKind, status: node.status as SubagentTaskStatus, ...(hints ? { negativeReasonHints: hints } : {}) }
+  const reportedOutput = node.status === "completed" && (taskKind === "scout" || taskKind === "analyst")
+    ? parseRootTaskHistoryReportedOutput(node.resultProjection, taskKind) : undefined
+  return { taskKind, status: node.status as SubagentTaskStatus, ...(hints ? { negativeReasonHints: hints } : {}), ...(reportedOutput ? { reportedOutput } : {}) }
 }
 function nodeLessons(value: unknown, count: number): readonly (RootTaskHistoryNodeLesson | undefined)[] | undefined {
   if (!Array.isArray(value) || value.length !== count || !dense(value)) return undefined
@@ -109,8 +113,10 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
     || !Array.isArray(graph.nodes) || graph.nodes.length < 1 || graph.nodes.length > MAX_NODES || !dense(graph.nodes)) return null
   const lessons = Object.hasOwn(item, "nodeLessons") ? nodeLessons(item.nodeLessons, graph.nodes.length) : undefined
   const nodes = graph.nodes.map((value, index) => {
-    const projection = projectNode(value), lesson = lessons?.[index]
-    return projection ? { nodeOrdinal: index + 1, projection, ...(lesson ? { lesson } : {}) } : null
+    const parsed = projectNode(value), lesson = lessons?.[index]
+    if (!parsed) return null
+    const { reportedOutput, ...projection } = parsed
+    return { nodeOrdinal: index + 1, projection, ...(reportedOutput ? { reportedOutput } : {}), ...(lesson ? { lesson } : {}) }
   })
   if (nodes.some(node => node === null)) return null
   const safeNodes = (nodes as CandidateNode[]).sort((left, right) =>
@@ -133,21 +139,22 @@ function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeN
     turns,
   }
 }
-function emittedNodes(turn: SelectedTurn, withLessons: boolean): SafeNode[] {
-  if (!withLessons || !turn.candidate.nodeLessons) return turn.nodes.map(node => node.projection)
-  const facts = filterRootTaskHistoryLessonsForEmittedNodes(turn.candidate.nodeLessons, [...turn.lessonOrdinals])
+function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutputs: boolean): SafeNode[] {
+  const facts = withLessons && turn.candidate.nodeLessons
+    ? filterRootTaskHistoryLessonsForEmittedNodes(turn.candidate.nodeLessons, [...turn.lessonOrdinals]) : []
   const byOrdinal = new Map<number, RootTaskHistoryNodeLesson>()
   for (const fact of facts) if (fact) byOrdinal.set(fact.nodeOrdinal, fact)
   return turn.nodes.map(node => {
     const lesson = byOrdinal.get(node.nodeOrdinal)
-    return lesson ? { ...node.projection, lesson } : node.projection
+    const reportedOutput = withReportedOutputs && turn.reportedOutputOrdinals.has(node.nodeOrdinal) ? node.reportedOutput : undefined
+    return { ...node.projection, ...(reportedOutput ? { reportedOutput } : {}), ...(lesson ? { lesson } : {}) }
   })
 }
-function emittedTurns(turns: readonly SelectedTurn[], withLessons: boolean) {
-  return turns.map(turn => ({ label: turn.label, nodes: emittedNodes(turn, withLessons) }))
+function emittedTurns(turns: readonly SelectedTurn[], withLessons: boolean, withReportedOutputs: boolean) {
+  return turns.map(turn => ({ label: turn.label, nodes: emittedNodes(turn, withLessons, withReportedOutputs) }))
 }
-function withinContentLimit(turns: readonly SelectedTurn[], withLessons = false): boolean {
-  const serialized = JSON.stringify({ id: "root-task-history", content: content(emittedTurns(turns, withLessons)) })
+function withinContentLimit(turns: readonly SelectedTurn[], withLessons = false, withReportedOutputs = false): boolean {
+  const serialized = JSON.stringify({ id: "root-task-history", content: content(emittedTurns(turns, withLessons, withReportedOutputs)) })
   return typeof serialized === "string" && Buffer.byteLength(serialized, "utf8") <= MAX_CONTENT_BYTES
 }
 function projectCandidates(values: readonly Candidate[], crossSession: boolean): ContextSeedBlock | undefined {
@@ -176,14 +183,16 @@ function projectCandidates(values: readonly Candidate[], crossSession: boolean):
   let overflow = false
   for (const value of ordered) {
     if (turns.length >= MAX_TURNS || nodeCount >= MAX_NODES || overflow) break
-    const entry: SelectedTurn = { label: "earlier terminal attempt", candidate: value, nodes: [], lessonOrdinals: new Set() }
+    const entry: SelectedTurn = { label: "earlier terminal attempt", candidate: value, nodes: [], lessonOrdinals: new Set(), reportedOutputOrdinals: new Set() }
     for (const node of value.safeNodes) {
       if (nodeCount >= MAX_NODES) break
       entry.nodes.push(node)
       if (node.lesson) entry.lessonOrdinals.add(node.nodeOrdinal)
+      if (node.reportedOutput) entry.reportedOutputOrdinals.add(node.nodeOrdinal)
       if (!withinContentLimit([...turns, entry])) {
         entry.nodes.pop()
         entry.lessonOrdinals.delete(node.nodeOrdinal)
+        entry.reportedOutputOrdinals.delete(node.nodeOrdinal)
         overflow = true
         break
       }
@@ -192,13 +201,19 @@ function projectCandidates(values: readonly Candidate[], crossSession: boolean):
     if (entry.nodes.length) turns.push(entry)
   }
   if (!turns.length) return undefined
+  while (!withinContentLimit(turns, true, true)) {
+    const turn = [...turns].reverse().find(value => value.reportedOutputOrdinals.size > 0)
+    const node = turn && [...turn.nodes].reverse().find(value => turn.reportedOutputOrdinals.has(value.nodeOrdinal))
+    if (!turn || !node) break
+    turn.reportedOutputOrdinals.delete(node.nodeOrdinal)
+  }
   while (!withinContentLimit(turns, true)) {
     const turn = [...turns].reverse().find(value => value.lessonOrdinals.size > 0)
     const node = turn && [...turn.nodes].reverse().find(value => turn.lessonOrdinals.has(value.nodeOrdinal))
     if (!turn || !node) return undefined
     turn.lessonOrdinals.delete(node.nodeOrdinal)
   }
-  return { id: "root-task-history", content: content(emittedTurns(turns, true)) }
+  return { id: "root-task-history", content: content(emittedTurns(turns, true, true)) }
 }
 
 /** Projects bounded typed historical outcomes; private source identity is used only for ordering and deduplication. */

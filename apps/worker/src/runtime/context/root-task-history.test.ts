@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCurrentNode, type TaskGraphCurrentState, type TaskGraphResultProjection } from "../subagents/task-graph-command-port.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { projectRootTaskHistory } from "./root-task-history.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
@@ -19,6 +19,16 @@ function node(overrides: Partial<TaskGraphCurrentNode> = {}): TaskGraphCurrentNo
 }
 function graph(nodes: readonly TaskGraphCurrentNode[]): TaskGraphCurrentState {
   return { revision: 9, nodes }
+}
+function resultProjection(role: "scout" | "analyst", count: number, status: "completed" | "partial" = "completed"): TaskGraphResultProjection {
+  const sample = { jobId: "private-job-id", evidenceKinds: ["job"] as const }
+  return role === "scout"
+    ? { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "available" as const,
+      role, status, candidateCount: count, evidenceCount: 1,
+      candidates: Array.from({ length: Math.min(count, 3) }, () => ({ ...sample, source: "other" as const })) }
+    : { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "available" as const,
+      role, status, findingCount: count, evidenceCount: 1,
+      findings: Array.from({ length: Math.min(count, 3) }, () => ({ ...sample, score: 8 })) }
 }
 function outcome(id: string, sequence: bigint, nodes: readonly TaskGraphCurrentNode[] = [node()]): ValidatedRootTaskHistoryOutcome {
   return { sourceTurnId: "turn-" + id, sourceRootTaskId: "root-" + id, terminalSequence: sequence, taskGraph: graph(nodes) }
@@ -155,6 +165,70 @@ describe("root task history projection", () => {
     for (const forbidden of ["lesson-source", "PRIVATE_", "criterion-a", "verificationReport", "evidenceDigest", "resultDigest"]) {
       expect(serialized).not.toContain(forbidden)
     }
+  })
+
+  it("emits bounded reported Scout and Analyst counts beside their lessons", () => {
+    const scout = node({ templateId: "scout", status: "completed", resultProjection: resultProjection("scout", 9, "partial") })
+    const analyst = node({ templateId: "analyst", status: "completed", resultProjection: resultProjection("analyst", 5) })
+    const source = { ...outcome("count-sibling", 13n, [scout, analyst]), nodeLessons: [lesson(1, [1]), lesson(2, [2])] }
+    const emitted = (projectRootTaskHistory([source])?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }).turns[0]?.nodes ?? []
+
+    expect(emitted.map(value => value.taskKind)).toEqual(["analyst", "scout"])
+    expect(emitted[0]?.reportedOutput).toEqual({ role: "analyst", findingCount: 5, resultStatus: "completed" })
+    expect(emitted[0]?.lesson).toMatchObject({ nodeOrdinal: 2 })
+    expect(emitted[1]?.reportedOutput).toEqual({ role: "scout", candidateCount: 9, resultStatus: "partial" })
+    expect(emitted[1]?.lesson).toMatchObject({ nodeOrdinal: 1 })
+    const serialized = JSON.stringify(emitted)
+    for (const forbidden of ["private-job-id", "candidates", "findings", "evidenceKinds", "score"]) expect(serialized).not.toContain(forbidden)
+  })
+
+  it("omits invalid, unavailable, role-mismatched, and non-completed graph projections", () => {
+    const cases = [
+      node({ status: "completed", resultProjection: undefined }),
+      node({ status: "completed", resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" } }),
+      node({ status: "completed", resultProjection: resultProjection("analyst", 2) }),
+      node({ status: "failed", resultProjection: resultProjection("scout", 2) }),
+    ]
+    const projected = projectRootTaskHistory([outcome("bad-counts", 14n, cases)])
+    const nodes = (projected?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }).turns[0]?.nodes ?? []
+    expect(nodes).toHaveLength(4)
+    expect(nodes.every(value => !Object.hasOwn(value, "reportedOutput"))).toBe(true)
+  })
+
+  it("omits counts first when they would breach the byte cap while retaining every lesson", () => {
+    const manyFailures = Array.from({ length: 8 }, (_, index) => ({
+      criterionOrdinal: index + 1, status: "unverified" as const, reasonCode: "canonical_evidence_ambiguous" as const,
+    }))
+    const nodes: TaskGraphCurrentNode[] = Array.from({ length: 8 }, (_, index) => {
+      const role = index < 4 ? "scout" : "analyst"
+      return node({ key: `byte-${index}`, templateId: role, status: "completed", resultProjection: resultProjection(role, 9) })
+    })
+    const nodeLessons = nodes.map((_, index) => ({
+      ordinalScope: "source_graph_local" as const, advisoryOnly: true as const, notCurrentEvidence: true as const,
+      nodeOrdinal: index + 1, criterionFailures: manyFailures,
+      ...(index > 0 ? { successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: manyFailures.map(failure => failure.criterionOrdinal), status: "passed" as const }] } : {}),
+    }))
+    const source = { ...outcome("count-byte-cap", 15n, nodes), nodeLessons }
+    const result = projectRootTaskHistory([source])
+    const turns = (result?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }).turns
+    const emitted = turns.flatMap(turn => turn.nodes)
+    const noCounts = JSON.stringify({ ...result!, content: {
+      ...(result!.content as Record<string, unknown>),
+      turns: turns.map(turn => ({ ...turn, nodes: turn.nodes.map(({ reportedOutput: _reportedOutput, ...value }) => value) })),
+    } })
+    const allCounts = JSON.stringify({ ...result!, content: {
+      ...(result!.content as Record<string, unknown>),
+      turns: turns.map(turn => ({ ...turn, nodes: turn.nodes.map(value => ({ ...value, reportedOutput: value.taskKind === "scout"
+        ? { role: "scout", candidateCount: 9, resultStatus: "completed" }
+        : { role: "analyst", findingCount: 9, resultStatus: "completed" } })) })),
+    } })
+
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(Buffer.byteLength(noCounts, "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(Buffer.byteLength(allCounts, "utf8")).toBeGreaterThan(8 * 1024)
+    expect(emitted).toHaveLength(8)
+    expect(emitted.every(value => Object.hasOwn(value, "lesson"))).toBe(true)
+    expect(emitted.some(value => !Object.hasOwn(value, "reportedOutput"))).toBe(true)
   })
 
   it("ignores malformed optional lesson facts while preserving the exact legacy projection", () => {
