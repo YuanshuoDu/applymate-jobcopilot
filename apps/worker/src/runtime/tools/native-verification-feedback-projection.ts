@@ -114,7 +114,26 @@ export function projectNativeVerificationResult(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value
   let reportDescriptor: PropertyDescriptor | undefined
   try { reportDescriptor = Object.getOwnPropertyDescriptor(value, REPORT_KEY) } catch { return null }
-  if (!reportDescriptor) return value
+  if (!reportDescriptor) {
+    let feedbackDescriptor: PropertyDescriptor | undefined
+    let hasFeedback = false
+    try {
+      feedbackDescriptor = Object.getOwnPropertyDescriptor(value, FEEDBACK_KEY)
+      hasFeedback = Boolean(feedbackDescriptor) || FEEDBACK_KEY in value
+    } catch { return null }
+    if (!hasFeedback) return value
+    const stripped: Record<string, unknown> = {}
+    try {
+      for (const key of Reflect.ownKeys(value)) {
+        if (typeof key !== "string" || key === FEEDBACK_KEY) continue
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (descriptor?.enumerable && "value" in descriptor) {
+          Object.defineProperty(stripped, key, { value: descriptor.value, enumerable: true, configurable: true, writable: true })
+        }
+      }
+      return stripped
+    } catch { return null }
+  }
 
   const projected: Record<string, unknown> = {}
   try {

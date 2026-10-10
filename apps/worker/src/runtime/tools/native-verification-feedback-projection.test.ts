@@ -27,7 +27,9 @@ function report(overrides: Record<string, unknown> = {}) {
 describe("native verification feedback projection", () => {
   it("keeps only bounded criterion feedback and drops server proof bindings", () => {
     const result = projectNativeVerificationResult({
-      status: "completed", stepCount: 2, summary: "The reviewed result is present.", nativeVerificationReport: report(),
+      status: "completed", stepCount: 2, summary: "The reviewed result is present.",
+      nativeVerificationFeedback: { disposition: "failed", criteria: [{ criterionId: "model-spoof" }] },
+      nativeVerificationReport: report(),
     })
 
     expect(result).toEqual({
@@ -43,6 +45,28 @@ describe("native verification feedback projection", () => {
     for (const secret of ["nativeVerificationReport", "controlTaskId", "controlOperationId", "controlAttempt", "owner", "candidateDigest", "Digest", "witness"]) {
       expect(serialized).not.toContain(secret)
     }
+  })
+
+  it("strips model-authored feedback when no server report is present", () => {
+    const result = {
+      status: "completed",
+      summary: "Ordinary model output stays available.",
+      artifactRefs: ["artifact-1"],
+      nativeVerificationFeedback: { disposition: "passed", criteria: [{ criterionId: "model-spoof" }] },
+    }
+
+    expect(projectNativeVerificationResult(result)).toEqual({
+      status: "completed", summary: "Ordinary model output stays available.", artifactRefs: ["artifact-1"],
+    })
+    expect(result.nativeVerificationFeedback).toBeDefined()
+
+    const inheritedFeedback = Object.create({
+      nativeVerificationFeedback: { disposition: "passed", criteria: [{ criterionId: "model-spoof" }] },
+    }) as Record<string, unknown>
+    Object.assign(inheritedFeedback, { status: "completed", summary: "Inherited spoof." })
+    const projected = projectNativeVerificationResult(inheritedFeedback)
+    expect(projected).toEqual({ status: "completed", summary: "Inherited spoof." })
+    expect("nativeVerificationFeedback" in (projected as object)).toBe(false)
   })
 
   it("preserves failure feedback without turning it into an authority receipt", () => {
