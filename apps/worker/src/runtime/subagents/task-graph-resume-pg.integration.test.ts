@@ -9780,13 +9780,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               )
               const graphSnapshotRevision = graphSnapshotRows.rows[0]?.revision
               const graphSnapshot = record(graphSnapshotRows.rows[0]?.content)
-              const graphReceiptRows = await pool!.query<{ id: string; type: string; payload: unknown }>(
-                `SELECT "id", "type", "payload" FROM "agent_events"
-                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+              const graphReceiptRows = await pool!.query<{ id: string; type: string; taskId: string | null; payload: unknown }>(
+                `SELECT "id", "type", "taskId", "payload" FROM "agent_events"
+                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
                    AND "type" IN ('task_graph.lifecycle', 'item.started', 'item.delta')
                    AND "payload"->>'kind' IN ('proposal', 'lifecycle')
-                   AND "payload"->>'revision' = $5::text`,
-                [discoveryOwner.sessionId, discoveryOwner.turnId, taskGraphItemId(currentOwner.rootTaskId), currentOwner.rootTaskId, graphSnapshotRevision],
+                   AND "payload"->>'revision' = $4::text`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, taskGraphItemId(currentOwner.rootTaskId), graphSnapshotRevision],
               )
               const graphReceiptRow = graphReceiptRows.rows[0]
               const graphReceiptPayload = record(graphReceiptRow?.payload)
@@ -9797,21 +9797,26 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               if (!graphSnapshot || !graphReceiptRow || !graphReceiptPayload || !graphReceiptItem) {
                 throw new Error("Discovery current-revision TaskGraph receipt payload was invalid")
               }
+              const graphNodes: unknown[] = Array.isArray(graphSnapshot.nodes) ? graphSnapshot.nodes : []
+              const graphTaskIds = new Set(graphNodes.map(value => record(value)?.taskId)
+                .filter((taskId): taskId is string => typeof taskId === "string"))
               expect(graphReceiptPayload.revision, "Discovery receipt revision did not match the graph snapshot").toBe(graphSnapshotRevision)
               expect(graphReceiptItem.revision, "Discovery receipt item revision did not match the graph snapshot").toBe(graphSnapshotRevision)
               expect(graphReceiptItem.content, "Discovery receipt item content did not match the graph snapshot").toEqual(graphSnapshot)
               if (graphReceiptPayload.kind === "proposal") {
                 expect(["item.started", "item.delta"]).toContain(graphReceiptRow.type)
+                expect(graphReceiptRow.taskId, "Discovery proposal receipt did not belong to the graph owner").toBe(currentOwner.rootTaskId)
                 if (Object.hasOwn(graphReceiptPayload, "content")) {
                   expect(graphReceiptPayload.content, "Discovery proposal content did not match the graph snapshot").toEqual(graphSnapshot)
                 }
                 if (graphReceiptRow.type === "item.delta") expect(Object.hasOwn(graphReceiptPayload, "content")).toBe(true)
               } else if (graphReceiptPayload.kind === "lifecycle") {
                 expect(["item.delta", "task_graph.lifecycle"]).toContain(graphReceiptRow.type)
+                expect(typeof graphReceiptRow.taskId, "Discovery lifecycle receipt task was missing").toBe("string")
+                expect(graphTaskIds, "Discovery lifecycle receipt task was outside the current graph").toContain(graphReceiptRow.taskId)
               } else {
                 throw new Error("Discovery current-revision TaskGraph receipt kind was unsupported")
               }
-              const graphNodes: unknown[] = Array.isArray(graphSnapshot?.nodes) ? graphSnapshot.nodes : []
               const scoutNode = graphNodes.map(record).find(node => node?.key === "scout")
               const scoutVerification = record(scoutNode?.verification)
               const scoutCriteria: RecordValue[] = Array.isArray(scoutVerification?.criteria)
@@ -9854,7 +9859,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                  WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "itemId" = $5 AND "taskId" = $6
                    AND "type" = $7 AND "payload"->>'kind' = $8 AND "payload"->>'revision' = $9::text`,
                 [JSON.stringify(payload), graphReceiptRow.id, discoveryOwner.sessionId, discoveryOwner.turnId,
-                  taskGraphItemId(currentOwner.rootTaskId), currentOwner.rootTaskId, graphReceiptRow.type,
+                  taskGraphItemId(currentOwner.rootTaskId), graphReceiptRow.taskId, graphReceiptRow.type,
                   graphReceiptPayload.kind, graphSnapshotRevision],
               )
               try {
