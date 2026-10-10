@@ -4,6 +4,7 @@ import { getSubagentRolePolicy } from "./role-policy.js"
 import { prepareGraphTransition, persistGraphTransition } from "./task-graph-pg-lifecycle.js"
 import { loadTaskGraph, type GraphParent, type LoadedGraph } from "./task-graph-pg-state.js"
 import { TaskGraphCommandError, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt } from "./task-graph-command-port.js"
+import { assertPlanningRootHasNoUnresolvedSteering } from "./pg-store-create.js"
 import { appendNativeGraphCommand } from "./task-graph-native-pg.js"
 import { nativeContextMetrics, type NormalizedNativeCommand } from "./task-graph-native-request.js"
 import { TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
@@ -18,6 +19,9 @@ export async function replaceUnstartedNativeFollowup(
 ): Promise<TaskGraphNativeCommandReceipt> {
   const request = command.request
   if (request.kind !== "followup" || !("mode" in request) || request.mode !== "replace_unstarted") reject("task_graph_native_input_invalid")
+  if (input.scope.parentTaskId === input.scope.rootTaskId) {
+    await assertPlanningRootHasNoUnresolvedSteering(client, parent.allowedActions, input.scope)
+  }
   const revision = loaded.state?.revision
   if (!loaded.snapshot || !loaded.state || !loaded.item || typeof revision !== "number" || !Number.isSafeInteger(revision)) reject("task_graph_state_missing")
   if (revision > MAX_REPLACE_REVISION) reject("revision_limit")

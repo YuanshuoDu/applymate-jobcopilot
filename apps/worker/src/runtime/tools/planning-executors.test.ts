@@ -26,7 +26,7 @@ const receipt: TaskGraphScheduleReceipt = {
 function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContext {
   return {
     scope: { userId: "runtime-user" }, sessionId: "runtime-session", turnId: "runtime-turn", stepId: "runtime-step",
-    taskId: "runtime-root", rootTaskId: "runtime-root", signal: new AbortController().signal,
+    toolCallId: "server-call-1", taskId: "runtime-root", rootTaskId: "runtime-root", signal: new AbortController().signal,
     remainingTurnSteps: 2, capabilities: ["canManageChildren"], reportProgress: async () => undefined,
     ...overrides,
   }
@@ -36,8 +36,12 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
   scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
 }) {
   let received: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0] | undefined
+  let operation: Parameters<NonNullable<TaskGraphCommandPort["appendAndScheduleWithReconciliation"]>>[1] | undefined
+  const appendAndSchedule = vi.fn(async (input: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0]) => { received = input; return receipt })
   const commandPort: TaskGraphCommandPort = {
-    appendAndSchedule: vi.fn(async input => { received = input; return receipt }),
+    appendAndSchedule,
+    appendAndScheduleWithReconciliation: vi.fn(async (input, value) => { operation = value; return appendAndSchedule(input) }),
+    reconcileSteering: vi.fn(async () => ({ decision: "keep" as const, revision: 0, reconciledInputCount: 0 })),
     readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
   }
   const tool = createTaskGraphPlanningTool({
@@ -48,7 +52,7 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
     parentLeaseOwner: "server-worker",
     parentAttemptCount: () => 1,
   })
-  return { tool, commandPort, getReceived: () => received }
+  return { tool, commandPort, getReceived: () => received, getOperation: () => operation }
 }
 
 describe("agent.plan tool executor", () => {
@@ -255,7 +259,7 @@ describe("agent.plan tool executor", () => {
   })
 
   it("sources tenant, turn, and parent fence identity from runtime context", async () => {
-    const { tool, getReceived } = setup()
+    const { tool, getReceived, getOperation } = setup()
 
     await tool.execute(context(), proposal)
 
@@ -267,6 +271,7 @@ describe("agent.plan tool executor", () => {
         parentLeaseOwner: "server-worker", parentAttemptCount: 1,
       },
     })
+    expect(getOperation()).toMatchObject({ decision: "revise", expectedRevision: 0, callId: "server-call-1", scope: getReceived()?.scope })
     expect(Object.keys(proposal)).toEqual(["expectedRevision", "nodes"])
   })
 
@@ -275,6 +280,7 @@ describe("agent.plan tool executor", () => {
 
     await expect(tool.execute(context(), proposal)).resolves.toEqual(receipt)
     expect(commandPort.appendAndSchedule).toHaveBeenCalledTimes(1)
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledTimes(1)
   })
 
   it("requires two remaining root steps before persisting a plan", async () => {

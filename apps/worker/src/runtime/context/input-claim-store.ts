@@ -1,12 +1,14 @@
 import type pg from "pg"
-import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
+import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { persistObservedSteeringMarker, type SteeringMarkerWrite } from "./steering-marker-store.js"
 import { readRootInputContext, type RootInputContextRow } from "./root-input-context-reader.js"
 import type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
+import { createStoredAgentInputMapper, loadUnresolvedSteeringContext, type HydrationScope } from "./steering-reconciliation-context.js"
 export type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
 export interface InputClaimTransaction {
   getCheckpoint(input: { sessionId: string; turnId: string; stepId: string; lease?: TurnExecutionFence }): Promise<StepCheckpoint>; claimInputs(input: ClaimInputsRequest & { readonly rootInputId?: string }): Promise<ClaimedInputs>
   loadActiveSteeringInputs?(input: { sessionId: string; turnId: string; inputIds: readonly string[]; lease?: TurnExecutionFence }): Promise<readonly StoredAgentInput[]>; persistCheckpoint(input: { sessionId: string; turnId: string; stepId: string; checkpoint: StepCheckpoint; lease?: TurnExecutionFence }): Promise<void>
+  loadUnresolvedSteeringInputs?(input: HydrationScope & { lease?: TurnExecutionFence }): Promise<readonly StoredAgentInput[]>
   loadRootInputContext?(input: { sessionId: string; turnId: string; inputId: string; lease?: TurnExecutionFence }): Promise<StoredAgentInput | null>
   appendObservedSteeringMarker?(input: SteeringMarkerWrite): Promise<void>
 }
@@ -19,54 +21,7 @@ export class InputClaimStoreError extends Error {
 }
 type CheckpointRow = { inputThroughSequence: bigint | string; consumedInputIds: unknown }; type QueryClient = Pick<pg.PoolClient, "query">
 type InputRow = RootInputContextRow
-function nonEmpty(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) throw new InputClaimStoreError("store_conflict", `Invalid ${field}`)
-  return value
-}
-function inputContent(value: unknown): InputContentPart[] {
-  if (!Array.isArray(value) || value.length === 0) throw new InputClaimStoreError("store_conflict", "Invalid AgentInput content")
-  return value.map((part) => {
-    if (!part || typeof part !== "object" || Array.isArray(part)) throw new InputClaimStoreError("store_conflict", "Invalid AgentInput content part")
-    const record = part as Record<string, unknown>
-    if (record.type === "text") return { type: "text", text: nonEmpty(record.text, "text part") }
-    if (record.type === "attachment_ref") {
-      return {
-        type: "attachment_ref",
-        attachmentId: nonEmpty(record.attachmentId, "attachmentId"),
-        mediaType: nonEmpty(record.mediaType, "mediaType"),
-        ...(record.filename === undefined ? {} : { filename: nonEmpty(record.filename, "filename") }),
-      }
-    }
-    throw new InputClaimStoreError("store_conflict", "Unknown AgentInput content part")
-  })
-}
-function date(value: Date | string | null, field: string): Date | null {
-  if (value === null) return null
-  const result = value instanceof Date ? new Date(value) : new Date(value)
-  if (Number.isNaN(result.getTime())) throw new InputClaimStoreError("store_conflict", `Invalid ${field}`)
-  return result
-}
-function mapInput(row: InputRow): StoredAgentInput {
-  const delivery = row.delivery === "steer" || row.delivery === "follow_up" ? row.delivery : null
-  const status = ["accepted", "queued", "consumed", "cancelled", "rejected"].includes(row.status) ? row.status as StoredAgentInput["status"] : null
-  if (!delivery || !status) throw new InputClaimStoreError("store_conflict", "Invalid AgentInput state")
-  const createdAt = date(row.createdAt, "createdAt")
-  if (!createdAt) throw new InputClaimStoreError("store_conflict", "Invalid createdAt")
-  return {
-    id: nonEmpty(row.id, "id"),
-    sessionId: nonEmpty(row.sessionId, "sessionId"),
-    targetTurnId: row.targetTurnId,
-    userId: nonEmpty(row.userId, "userId"),
-    clientMessageId: nonEmpty(row.clientMessageId, "clientMessageId"),
-    delivery,
-    status,
-    content: inputContent(row.content),
-    acceptedSequence: BigInt(row.acceptedSequence),
-    consumedByStepId: row.consumedByStepId,
-    consumedAt: date(row.consumedAt, "consumedAt"),
-    createdAt,
-  }
-}
+const mapInput = createStoredAgentInputMapper(message => new InputClaimStoreError("store_conflict", message))
 function checkpoint(row: CheckpointRow): StepCheckpoint {
   if (!Array.isArray(row.consumedInputIds) || !row.consumedInputIds.every((id) => typeof id === "string" && id.length > 0)) {
     throw new InputClaimStoreError("store_conflict", "Invalid consumedInputIds checkpoint")
@@ -200,6 +155,12 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
         throw new InputClaimStoreError("owner_conflict", "Active steering marker input is outside the tenant Turn")
       }
       return inputs
+    },
+    async loadUnresolvedSteeringInputs(input) {
+      await assertOwner(client, scope, input, input.lease)
+      if (input.userId !== scope.userId) throw new InputClaimStoreError("owner_conflict", "Steering read is outside the tenant scope")
+      const { lease, ...readScope } = input
+      return loadUnresolvedSteeringContext(client, readScope, mapInput, message => new InputClaimStoreError("store_conflict", message))
     },
     loadRootInputContext: input => readRootInputContext(client, scope, input, () => assertOwner(client, scope, input, input.lease), mapInput),
     async persistCheckpoint(input) {

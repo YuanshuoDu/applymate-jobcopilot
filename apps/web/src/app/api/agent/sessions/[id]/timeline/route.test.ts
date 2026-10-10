@@ -143,6 +143,37 @@ describe("agent timeline query API", () => {
     expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
   })
 
+  it("omits private reconciliation receipt rows from timeline projections", async () => {
+    const privateMarker = "private-steering-reconciliation-marker"
+    const row = {
+      id: "private-reconciliation-event", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "root_1",
+      sequence: BigInt(12), type: "agent.plan.reconciliation", actor: "system", correlationId: "step_2",
+      causationId: null, idempotencyKey: "private-receipt-key",
+      payload: { receiptVersion: privateMarker, steerInputIds: [privateMarker], rationale: privateMarker },
+    }
+    mocks.agendaFindMany.mockResolvedValueOnce([row]).mockResolvedValueOnce([row]).mockResolvedValueOnce([row])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+    const serialized = JSON.stringify(body)
+
+    expect(response.status).toBe(200)
+    expect(serialized).not.toContain("agent.plan.reconciliation")
+    expect(serialized).not.toContain("private-reconciliation-event")
+    expect(serialized).not.toContain("private-receipt-key")
+    expect(serialized).not.toContain(privateMarker)
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      where: { sessionId: "session_1", type: "cognitive.agenda" },
+    }))
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: { sessionId: "session_1", type: "agent.steering.marker" },
+    }))
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      where: { sessionId: "session_1", type: { in: ["approval.requested", "approval.resolved", "approval.consumed", "approval.expired"] } },
+    }))
+  })
+
   it("returns the latest legal agenda only on the first page and redacts its payload", async () => {
     mocks.agendaFindMany.mockResolvedValueOnce([
       agendaRow(BigInt(9), { payload: agendaPayload({ unexpected: "reject this" }) }),

@@ -5,6 +5,12 @@ import { createPgRootTaskStore } from "./root-task-store.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 
+const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./steering-reconciliation-ledger.js")>(),
+  assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
+}))
+
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 3,
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
@@ -278,6 +284,20 @@ describe("createPgRootTaskStore", () => {
     expect(taskUpdate).not.toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
     const serialized = fake.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))?.[1]?.[1]
     expect(serialized).toBe(JSON.stringify({ status: "completed", stepCount: 1, toolCallCount: 0, finalItemId: null, waitId: null }))
+  })
+
+  it("blocks successful fallback Root settlement while planning steering is unresolved", async () => {
+    const fake = fakePool(row({ status: "running", leaseOwner: "worker-1", allowedActions: ["agent.plan"] }))
+    assertNoUnresolvedSteeringMock.mockReset().mockRejectedValueOnce(new Error("steering_reconciliation_pending"))
+    await expect(createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 1, toolCallCount: 0 },
+    })).rejects.toThrow("steering_reconciliation_pending")
+    expect(assertNoUnresolvedSteeringMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", parentTaskId: "root-turn-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+    }))
+    expect(fake.calls.some(sql => sql.includes('UPDATE "sub_agent_tasks" SET'))).toBe(false)
+    expect(fake.calls).toContain("ROLLBACK")
   })
 
   it.each(["completed", "failed"] as const)("settles a %s result only for the exact linked root", async status => {

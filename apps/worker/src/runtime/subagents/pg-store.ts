@@ -5,7 +5,7 @@ import { isTerminalSubagentStatus, PAUSE_DEFERRED_MARKER, type AtomicSubagentSpa
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import { assertSessionWorkAdmission, RUNNABLE_SESSION } from "../session-gate.js"
-import { createSubagentTask, lockSubagentSession, lockSubagentTurn, readSubagentTask } from "./pg-store-create.js"
+import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentSession, lockSubagentTurn, lockSubagentTurnForWork, readSubagentTask } from "./pg-store-create.js"
 import { claimSubagentTask } from "./pg-store-claim.js"
 import { dateValue, json, rowToTask, SELECT_TASK, spawnKey, transaction, uniqueMessageIds } from "./pg-store-persistence.js"
 import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
@@ -21,7 +21,15 @@ export class PgSubagentTaskStore implements SubagentStore {
     try { const result = await client.query(SELECT_TASK, [taskId, sessionId]); return result.rows[0] ? rowToTask(result.rows[0] as Record<string, unknown>) : null }
     finally { client.release() }
   }
-  async create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord> { return transaction(this.pool, client => createSubagentTask(client, input)) }
+  async create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord> {
+    return transaction(this.pool, async client => {
+      await lockSubagentSession(client, input)
+      if (input.turnId) await lockSubagentTurnForWork(client, { sessionId: input.sessionId, userId: input.userId, turnId: input.turnId })
+      else if (input.parentTaskId) throw new Error("Subagent child requires an owning Turn")
+      await assertFallbackPlannerRootCanDispatch(client, input)
+      return createSubagentTask(client, input, true)
+    })
+  }
   async createWithSpawn(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult> {
     try {
       return await transaction(this.pool, async client => {
@@ -38,6 +46,7 @@ export class PgSubagentTaskStore implements SubagentStore {
         }
         if (input.turnId) await assertSessionWorkAdmission(client, { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId })
         else if (input.parentTaskId) throw new Error("Subagent child requires an owning Turn")
+        await assertFallbackPlannerRootCanDispatch(client, input)
         const task = await createSubagentTask(client, input, true)
         const operation = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.subagent.spawn', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
           [`spawn-operation-${randomUUID()}`, input.sessionId, key, JSON.stringify({ taskId: task.id })])

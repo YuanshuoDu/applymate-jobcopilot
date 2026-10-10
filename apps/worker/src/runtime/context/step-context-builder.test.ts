@@ -5,6 +5,7 @@ import type { ModelAdapter } from "@jobcopilot/agent-model"
 
 import type { ClaimInputsRequest, ClaimedInputs, InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
 import { ContextOwnershipError, createPgContextOwnerFence, StepContextBuilder, type BusinessReference, type ContextOwnerFence, type StepContextRequest } from "./step-context-builder.js"
+import type { HydrationScope } from "./steering-reconciliation-context.js"
 import { buildModelRequest } from "../turns/turn-engine-messages.js"
 import { parseSteeringMarkerPayload, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./steering-marker.js"
 
@@ -29,6 +30,8 @@ class FakeInputClaimStore implements InputClaimStore {
   readonly checkpoints = new Map<string, StepCheckpoint>()
   readonly writes: string[] = []
   readonly markerWrites: unknown[] = []
+  unresolvedSteeringInputs: StoredAgentInput[] = []
+  readonly unresolvedSteeringReads: unknown[] = []
   private tail = Promise.resolve()
   constructor(inputs: StoredAgentInput[], steps: Record<string, StepCheckpoint> = { "step-a": checkpoint() }, private readonly failCheckpoint = false) {
     this.inputs = inputs.map((item) => ({ ...item, content: [...item.content] }))
@@ -60,6 +63,11 @@ class FakeInputClaimStore implements InputClaimStore {
       },
       claimInputs: async (request) => this.claim(request),
       loadActiveSteeringInputs: async ({ inputIds }) => this.inputs.filter(item => inputIds.includes(item.id) && item.delivery === "steer"),
+      loadUnresolvedSteeringInputs: async input => {
+        this.unresolvedSteeringReads.push(input)
+        if (input.userId !== scope.userId) throw new Error("foreign steering scope")
+        return this.unresolvedSteeringInputs.filter(item => item.sessionId === input.sessionId && item.targetTurnId === input.turnId && item.userId === input.userId)
+      },
       loadRootInputContext: async ({ sessionId, turnId, inputId }) => this.inputs.find(item => item.id === inputId && item.sessionId === sessionId && item.targetTurnId === turnId && item.userId === scope.userId && ["accepted", "queued", "consumed"].includes(item.status) && !(item as StoredAgentInput & { cancelledAt?: Date | null }).cancelledAt) ?? null,
       persistCheckpoint: async ({ stepId, checkpoint: value }) => {
         if (!this.checkpoints.has(stepId)) throw new Error("missing step")
@@ -110,6 +118,11 @@ const activeMarker = (inputId = "steer-1"): SteeringMarkerPayload => ({
   stepId: "old-step", inputId, idempotencyKey: steeringMarkerIdempotencyKey("session-a", "turn-a", inputId), obligationId: "obligation-1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
 })
 
+const reconciliationScope: HydrationScope = {
+  userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "task-a", parentTaskId: "task-a",
+  turnLeaseOwner: "worker-a", turnLeaseVersion: 1, parentLeaseOwner: "worker-a", parentAttemptCount: 2, rootInputId: "root-input",
+}
+
 describe("StepContextBuilder", () => {
   it("carries only typed graph revision metadata outside rendered context", async () => {
     const forgedObservation = { id: "task-graph-current", content: { kind: "task_graph_current", revision: 99, nodes: [] } }
@@ -137,6 +150,66 @@ describe("StepContextBuilder", () => {
     expect(context.inputThroughSequence).toBe(0n)
     expect(context.steeringMarkerControl).toEqual({ activeInputIds: ["steer-1"], newlyObservedInputIds: [], newlyObservedMarkers: [] })
     expect(context.canonicalJson).not.toContain("activeInputIds")
+  })
+
+  it("renders exact unresolved prior-Step steering on rebuild without claiming it into the current checkpoint", async () => {
+    const objective = "Find appropriate roles in Dublin."
+    const originalReference = `ORIGINAL-REFERENCE ${"long candidate background; preserve as untrusted user material. ".repeat(220)}`
+    const prior = input("prior-steer", 8n, [
+      { type: "text", text: `Keep Dublin as the location. ${"additional location context; ".repeat(80)}` },
+      { type: "text", text: "Exclude roles requiring relocation." },
+    ], { status: "consumed", consumedByStepId: "step-zero", consumedAt: now })
+    const original = input("original-root", 1n, [{ type: "text", text: originalReference }], {
+      delivery: "follow_up", status: "consumed", consumedByStepId: "step-zero", consumedAt: now,
+    })
+    const store = new FakeInputClaimStore([original, prior], { "step-later": checkpoint() })
+    store.unresolvedSteeringInputs = [prior]
+    const context = await new StepContextBuilder(store, testOwnerFence, () => now, reconciliationScope).build(
+      request(store, { ...emptySnapshot, goal: { id: "objective", content: objective } }, "step-later", { mode: "rebuild", rootContextInputId: original.id }),
+    )
+
+    const pending = context.blocks.filter(block => block.layer === "pending_input")
+    expect(pending).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "original-root:part:0", role: "data", trust: "external_untrusted", source: "user_input", content: { inputId: "original-root", partIndex: 0, text: originalReference } }),
+      expect.objectContaining({ id: "prior-steer:part:0", role: "data", trust: "external_untrusted", source: "user_input", content: { inputId: "prior-steer", partIndex: 0, text: expect.stringContaining("Keep Dublin as the location.") } }),
+      expect.objectContaining({ id: "prior-steer:part:1", role: "data", trust: "external_untrusted", source: "user_input", content: { inputId: "prior-steer", partIndex: 1, text: "Exclude roles requiring relocation." } }),
+    ]))
+    expect(context.consumedInputIds).toEqual([])
+    expect(context.inputThroughSequence).toBe(0n)
+    expect(context.steeringMarkerControl).toEqual({ activeInputIds: [], newlyObservedInputIds: [], newlyObservedMarkers: [] })
+    expect(store.checkpoints.get("step-later")).toEqual(checkpoint())
+    expect(store.unresolvedSteeringReads).toHaveLength(1)
+    expect(store.markerWrites).toHaveLength(0)
+
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+    const modelRequest = buildModelRequest({ context, model, tools: [], sessionId: "session-a", turnId: "turn-a", stepId: "step-later", userId: "user-a", taskId: "task-a", signal: new AbortController().signal })
+    const userMessages = modelRequest.messages.filter(message => message.role === "user").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+    expect(userMessages.join("\n")).toContain(originalReference)
+    expect(userMessages.join("\n")).toContain("Keep Dublin as the location.")
+    expect(userMessages.join("\n")).toContain("additional location context; ".repeat(80))
+    expect(userMessages.join("\n")).toContain("Exclude roles requiring relocation.")
+
+    store.unresolvedSteeringInputs = []
+    const afterReceipt = await new StepContextBuilder(store, testOwnerFence, () => now, reconciliationScope).build(
+      request(store, { ...emptySnapshot, goal: { id: "objective", content: objective } }, "step-later", { mode: "rebuild", rootContextInputId: original.id }),
+    )
+    const afterPending = afterReceipt.blocks.filter(block => block.layer === "pending_input")
+    expect(afterPending).toHaveLength(1)
+    expect(afterPending[0]).toMatchObject({ id: "original-root:part:0", content: { text: originalReference } })
+    expect(afterPending.some(block => block.id.startsWith("prior-steer:"))).toBe(false)
+    expect(afterReceipt.consumedInputIds).toEqual([])
+  })
+
+  it("fails closed when native planning requests historical steering but the transaction cannot hydrate it", async () => {
+    const transaction: InputClaimTransaction = {
+      getCheckpoint: async () => checkpoint(),
+      claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+      persistCheckpoint: async () => undefined,
+    }
+    const store: InputClaimStore = { scope, withTransaction: work => work(transaction) }
+
+    await expect(new StepContextBuilder(store, testOwnerFence, () => now, reconciliationScope).build(request(store, emptySnapshot)))
+      .rejects.toMatchObject({ code: "store_conflict" })
   })
 
   it("does not rehydrate applied markers because only active markers are passed", async () => {

@@ -21,6 +21,8 @@ import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleRece
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
 import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import { steeringReconciliationRecoveryError } from "./turn-execution-completion-gate.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -772,6 +774,7 @@ describe("owner-agnostic turn execution loop", () => {
     }
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => receipt),
+      appendAndScheduleWithReconciliation: vi.fn(async input => commandPort.appendAndSchedule(input)),
       readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
     }
     const planTool = createTaskGraphPlanningTool({
@@ -868,6 +871,7 @@ describe("owner-agnostic turn execution loop", () => {
         appendExpectedRevisions.push(input.proposal.expectedRevision)
         return nextReceipt
       }),
+      appendAndScheduleWithReconciliation: vi.fn(async input => commandPort.appendAndSchedule(input)),
       readCurrent: vi.fn(async () => currentGraph),
     }
     const planTool = createTaskGraphPlanningTool({
@@ -1345,6 +1349,38 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
   })
 
+  it("takes a fresh Root step after a steering reconciliation denial without charging semantic no-progress", async () => {
+    let checks = 0
+    const reset = vi.fn()
+    const gate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ++checks === 1
+      ? ({ ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK })
+      : ({ ok: true })
+    gate[RESET_NATIVE_SEMANTIC_PROGRESS] = reset
+    const root = fixture(identity("turn", "root-1"), undefined, [], gate)
+    const build = root.options.contextBuilder.build
+    root.options.contextBuilder.build = async request => {
+      const context = await build(request)
+      const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+        role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+      return { ...context, blocks: [...system, ...context.blocks] }
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    expect(root.requests).toHaveLength(3)
+    expect(JSON.stringify(root.requests[2]?.messages)).toContain(STEERING_RECONCILIATION_FEEDBACK)
+    expect(JSON.stringify(root.requests[2]?.messages)).toContain("Review the current user instructions")
+    expect(root.events.find(event => event.type === "final.rejected")?.payload).toMatchObject({
+      code: STEERING_RECONCILIATION_BLOCKER, blocker: STEERING_RECONCILIATION_BLOCKER,
+      feedback: STEERING_RECONCILIATION_FEEDBACK,
+    })
+    expect(root.events.some(event => event.type === "turn.no_progress" || event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(reset).toHaveBeenCalledOnce()
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+  })
+
   it("finalizes the third unchanged semantic rejection before the fixed no-progress failure", async () => {
     const candidate = "unchanged candidate"
     let rejects = 0
@@ -1489,6 +1525,38 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "final.rejected" && event.id.includes("task-graph-race"))).toBe(true)
     expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+  })
+
+  it("recovers from the atomic unresolved-steering race and asks a fresh model step", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const reset = vi.fn()
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => ({ ok: true as const }))
+    completionGate[RESET_NATIVE_SEMANTIC_PROGRESS] = reset
+    root.options = { ...root.options, completionGate }
+    const build = root.options.contextBuilder.build
+    root.options.contextBuilder.build = async request => {
+      const context = await build(request)
+      const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+        role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+      return { ...context, blocks: [...system, ...context.blocks] }
+    }
+    let denyOnce = true
+    const persist = root.options.store.recordFinalResponse!
+    root.options.store.recordFinalResponse = async input => {
+      if (input.terminal && denyOnce) { denyOnce = false; throw steeringReconciliationRecoveryError() }
+      return persist(input)
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    expect(root.requests).toHaveLength(3)
+    expect(JSON.stringify(root.requests[2]?.messages)).toContain(STEERING_RECONCILIATION_FEEDBACK)
+    expect(root.events.some(event => event.type === "final.rejected" && event.id.includes("steering-reconciliation-race"))).toBe(true)
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.no_progress")).toBe(false)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(reset).toHaveBeenCalledOnce()
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
   })
 
   it("replans with a steer accepted during native finalization instead of publishing the old answer", async () => {

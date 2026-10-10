@@ -1,10 +1,27 @@
 import { describe, expect, it, vi } from "vitest"
+import { assertPlanningRootHasNoUnresolvedSteering, createSubagentTask } from "./pg-store-create.js"
 
-import { createSubagentTask } from "./pg-store-create.js"
+const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./steering-reconciliation-ledger.js")>(),
+  assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
+}))
 import { normalizeSubagentPolicy } from "./types.js"
 import type { Queryable } from "./pg-store-persistence.js"
 
 describe("pg-store task creation helpers", () => {
+  it("gates only a server-confirmed planning Root and rejects malformed action metadata", async () => {
+    const client = { query: vi.fn() } as unknown as Queryable
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 2, parentLeaseOwner: "worker-1", parentAttemptCount: 1 }
+    assertNoUnresolvedSteeringMock.mockReset().mockResolvedValue(undefined)
+    await assertPlanningRootHasNoUnresolvedSteering(client, ["jobs.search"], scope)
+    expect(assertNoUnresolvedSteeringMock).not.toHaveBeenCalled()
+    await assertPlanningRootHasNoUnresolvedSteering(client, ["agent.plan"], scope)
+    expect(assertNoUnresolvedSteeringMock).toHaveBeenCalledWith(client, scope)
+    await expect(assertPlanningRootHasNoUnresolvedSteering(client, undefined, scope)).rejects.toThrow("steering_reconciliation_root_policy_invalid")
+  })
+
   it("inherits parent route and action bounds without relocking an already locked session", async () => {
     const calls: Array<[string, unknown[]?]> = []
     const parent = {

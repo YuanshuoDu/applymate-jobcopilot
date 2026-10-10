@@ -5,12 +5,12 @@ import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-grap
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
 import type {
   TaskGraphCommandPort,
-  TaskGraphExecutionScope,
   TaskGraphScheduleReceipt,
   TaskGraphTaskTemplate,
 } from "../subagents/task-graph-command-port.js"
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
+import { createSteeringReconciliationTool, steeringReconciliationOperation, type ReconciliationFenceOptions } from "./steering-reconciliation.js"
 
 function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
   const evidence = Type.Object({ kind: Type.Literal("evidence_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false })
@@ -84,20 +84,12 @@ export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ mi
 
 export type TaskGraphProposalInput = TaskGraphProposal
 
-export type PlanningExecutorOptions = Readonly<{
+export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
-  turnLeaseOwner: string
-  turnLeaseVersion: number
-  parentLeaseOwner: string
-  parentAttemptCount: () => number | null | undefined
 }>
 
-export type PlanningRegistrationOptions = Readonly<{
-  turnLeaseOwner: string
-  turnLeaseVersion: number
-  parentLeaseOwner: string
-  parentAttemptCount: () => number | null | undefined
+export type PlanningRegistrationOptions = ReconciliationFenceOptions & Readonly<{
   commandPort?: TaskGraphCommandPort
   templates?: Readonly<Record<string, TaskGraphTaskTemplate>>
 }>
@@ -115,30 +107,6 @@ const ReceiptSchema = Type.Object({
   nodes: Type.Array(Type.Object({ key: Id, taskId: Id, status: TaskStatusSchema }, { additionalProperties: false })),
   readyTaskIds: Type.Array(Id),
 }, { additionalProperties: false })
-
-function executionScope(context: ToolExecutionContext, options: PlanningExecutorOptions): TaskGraphExecutionScope {
-  const { rootTaskId, taskId } = context
-  const parentAttemptCount = options.parentAttemptCount()
-  if ([context.scope.userId, context.sessionId, context.turnId, context.stepId, options.parentLeaseOwner]
-    .some(value => !value.trim()) || typeof rootTaskId !== "string" || !rootTaskId.trim() ||
-    typeof taskId !== "string" || !taskId.trim() ||
-    taskId !== rootTaskId || !options.turnLeaseOwner.trim() || !Number.isSafeInteger(options.turnLeaseVersion) || options.turnLeaseVersion < 1 ||
-    typeof parentAttemptCount !== "number" || !Number.isSafeInteger(parentAttemptCount) || parentAttemptCount < 1) {
-    throw new ToolExecutionError("task_graph_scope_unavailable", "The server could not establish the active root task fence")
-  }
-  return {
-    userId: context.scope.userId,
-    sessionId: context.sessionId,
-    turnId: context.turnId,
-    stepId: context.stepId,
-    rootTaskId,
-    parentTaskId: taskId,
-    turnLeaseOwner: options.turnLeaseOwner,
-    turnLeaseVersion: options.turnLeaseVersion,
-    parentLeaseOwner: options.parentLeaseOwner,
-    parentAttemptCount: Number(parentAttemptCount),
-  }
-}
 
 function scheduleErrorCode(error: unknown): string {
   if (error && typeof error === "object" && "code" in error && typeof error.code === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(error.code)) {
@@ -179,9 +147,13 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
-    const scope = executionScope(context, options)
+    const operation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
+    const scope = operation.scope
     try {
-      const receipt = await options.commandPort.appendAndSchedule({
+      if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {
+        throw new ToolExecutionError("steering_reconciliation_unavailable", "TaskGraph revision requires an atomic reconciliation-capable port")
+      }
+      const receipt = await options.commandPort.appendAndScheduleWithReconciliation({
         scope,
         proposal: {
           expectedRevision: input.expectedRevision,
@@ -193,9 +165,10 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
           })),
         },
         templates: options.templates,
-      })
+      }, operation)
       return receipt
     } catch (error: unknown) {
+      if (error instanceof ToolExecutionError) throw error
       const code = scheduleErrorCode(error)
       throw new ToolExecutionError(code, "TaskGraph proposal could not be durably scheduled", safeScheduleError(error, code))
     }
@@ -225,4 +198,7 @@ export function registerTaskGraphPlanningTool(
   if (!enabled) return
   if (!options.commandPort || !options.templates || Object.keys(options.templates).length === 0 || !registry.register) throw new Error("task_graph_runtime_dependencies_unavailable")
   registry.register(createTaskGraphPlanningTool({ ...options, commandPort: options.commandPort, templates: options.templates }))
+  if (typeof options.commandPort.reconcileSteering === "function") {
+    registry.register(createSteeringReconciliationTool(options.commandPort, options))
+  }
 }

@@ -1,6 +1,6 @@
 import { TurnEngineError, type TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { parseNativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
 import type pg from "pg"
 import type { TurnLease } from "./lease.js"
@@ -12,11 +12,19 @@ import { taskGraphItemId, type StoredTaskGraphNode } from "../subagents/task-gra
 import { parseTaskGraphVerificationReport } from "../subagents/task-graph-command-port.js"
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { validateRoleResult } from "../subagents/role-results.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 type CompletionGateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate" | "isOwnershipLost">
 type CompletionGateWriter = Pick<TurnExecutionEventWriter, "append">
 export const TASK_GRAPH_VERIFICATION_BLOCKER = "task_graph_verification_unverified"
 export const NATIVE_VERIFICATION_PENDING_BLOCKER = "native_verification_pending"
+export function completionRecoverySnapshot(snapshot: StepContextSnapshot, stepId: string, feedback: string): StepContextSnapshot {
+  const system = feedback === STEERING_RECONCILIATION_FEEDBACK
+    ? `A server-owned completion requirement blocked this answer: ${feedback} Review the current user instructions and use available tools to resolve the stated blocker before answering again.`
+    : `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.`
+  return { ...snapshot, system: [...snapshot.system, { id: `completion-recovery:${stepId}`, content: system }] }
+}
 const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const REPAIR_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1"
 type GateCriterion = Readonly<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>
@@ -194,10 +202,19 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
     return { waitId: decision.waitId }
   }
   if (decision.blocker === NATIVE_VERIFICATION_PENDING_BLOCKER) throw new TurnEngineError("invalid_output", "Completion gate omitted a durable wait receipt")
-  await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: decision.blocker, feedback: decision.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
+  if (decision.blocker === STEERING_RECONCILIATION_BLOCKER && decision.feedback !== STEERING_RECONCILIATION_FEEDBACK) {
+    throw new TurnEngineError("invalid_output", "Completion gate returned invalid steering reconciliation feedback")
+  }
+  const feedback = decision.blocker === STEERING_RECONCILIATION_BLOCKER ? STEERING_RECONCILIATION_FEEDBACK : decision.feedback
+  const code = decision.blocker === STEERING_RECONCILIATION_BLOCKER ? STEERING_RECONCILIATION_BLOCKER : "business_precondition_failed"
+  await writer.append("final.rejected", step.id, null, { code, blocker: decision.blocker, feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
   if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) return {
-    feedback: decision.feedback, ...(stopForSemanticNoProgress ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
+    feedback, ...(stopForSemanticNoProgress ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
     ...(rejection ? { [NATIVE_SEMANTIC_REJECTION]: rejection } : {}),
+  }
+  if (decision.blocker === STEERING_RECONCILIATION_BLOCKER) {
+    options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
+    return { feedback }
   }
   throw new TurnEngineError("business_precondition_failed", decision.blocker)
 }
@@ -207,4 +224,18 @@ export function taskGraphGateRecovery(error: unknown): { feedback: string } | un
   const value = error as Record<string, unknown>
   return value.name === "TaskGraphVerificationRecovery" && value.blocker === TASK_GRAPH_VERIFICATION_BLOCKER
     && typeof value.feedback === "string" && value.feedback.length > 0 && value.feedback.length <= 512 ? { feedback: value.feedback } : undefined
+}
+
+export function steeringReconciliationRecoveryError(): Error & Readonly<{ code: string; blocker: string; feedback: string }> {
+  return Object.assign(new Error(STEERING_RECONCILIATION_BLOCKER), {
+    name: "SteeringReconciliationRecovery", code: STEERING_RECONCILIATION_BLOCKER,
+    blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK,
+  })
+}
+
+export function steeringReconciliationGateRecovery(error: unknown): { feedback: string } | undefined {
+  if (!(error instanceof Error) || error.name !== "SteeringReconciliationRecovery" || error.message !== STEERING_RECONCILIATION_BLOCKER) return undefined
+  const value = error as Error & { code?: unknown; blocker?: unknown; feedback?: unknown }
+  return value.code === STEERING_RECONCILIATION_BLOCKER && value.blocker === STEERING_RECONCILIATION_BLOCKER
+    && value.feedback === STEERING_RECONCILIATION_FEEDBACK ? { feedback: STEERING_RECONCILIATION_FEEDBACK } : undefined
 }

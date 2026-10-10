@@ -2,10 +2,10 @@ import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
 import { createPgContextOwnerFence as createPgContextOwnerFenceImpl } from "./step-context-owner-fence.js"
 import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type TurnExecutionFence } from "./input-claim-store.js"
-import { appendNewObservedSteeringMarkers, buildObservedSteeringMarker, type SteeringMarkerContext } from "./steering-marker-store.js"
+import { appendNewObservedSteeringMarkers, type SteeringMarkerContext } from "./steering-marker-store.js"
 import type { SteeringMarkerPayload } from "./steering-marker.js"
-import { activeMarkerInputIds, assertHydratedSteeringInputs, mergeSteeringInputs } from "./steering-marker-hydration.js"
-import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal, safeTaskGraphRevision } from "./step-context-support.js"
+import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, loadStepSteeringContext, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal, safeTaskGraphRevision, stepSteeringMarkerControl } from "./step-context-support.js"
+import type { HydrationScope } from "./steering-reconciliation-context.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -159,6 +159,7 @@ export class StepContextBuilder {
     private readonly store: InputClaimStore,
     private readonly ownerFence: ContextOwnerFence = defaultOwnerFence,
     private readonly clock: () => Date = () => new Date(),
+    private readonly reconciliationScope?: HydrationScope,
   ) {}
 
   async build(request: StepContextRequest): Promise<StepContext> {
@@ -176,19 +177,21 @@ export class StepContextBuilder {
       mode, lease: request.lease, now: request.now ?? this.clock(), rootInputId: request.rootInputId,
     })
     ensureTurnInputsImpl(claimed.inputs, request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
-    const activeIds = activeMarkerInputIds(request.steeringMarkerState?.active, request.rootInputId, request.steeringMarkerState?.active.length ? {
-      sessionId: request.sessionId, turnId: request.turnId, taskId: request.taskId ?? "",
-      ...(request.steeringMarkerContext ? {
-        obligationId: request.steeringMarkerContext.obligationId,
-        goalRevision: request.steeringMarkerContext.goalRevision,
-        planRevision: request.steeringMarkerContext.planRevision,
-      } : {}),
-    } : undefined)
-    const loader = transaction.loadActiveSteeringInputs
-    if (activeIds.length > 0 && !loader) throw new InputClaimStoreError("store_conflict", "Active steering marker hydration is unavailable")
-    const hydrated = activeIds.length > 0 ? [...await loader!({ sessionId: request.sessionId, turnId: request.turnId, inputIds: activeIds, lease: request.lease })] : []
-    assertHydratedSteeringInputs(activeIds, hydrated)
-    const contextInputs = mergeSteeringInputs(claimed.inputs, hydrated)
+    const sequences = new Map<bigint, string>()
+    for (const input of claimed.inputs) {
+      const previous = sequences.get(input.acceptedSequence)
+      if (previous && previous !== input.id) throw new InputClaimStoreError("checkpoint_conflict", `Duplicate accepted sequence ${input.acceptedSequence}`)
+      sequences.set(input.acceptedSequence, input.id)
+    }
+    const newlyClaimedSteerInputIds = claimed.newlyClaimedInputIds.filter(inputId => claimed.inputs.some(input => input.id === inputId && input.delivery === "steer"))
+    const nextCheckpoint = checkpointWithInputs(persisted, claimed.inputs)
+    if (request.steeringMarkerContext) await appendNewObservedSteeringMarkers({ transaction, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, context: request.steeringMarkerContext, inputs: claimed.inputs.filter(input => input.delivery === "steer"), newlyClaimedInputIds: newlyClaimedSteerInputIds, rootInputId: request.rootInputId, lease: request.lease })
+    // Hydration validates each consumed steer against its consuming Step checkpoint.
+    // This write stays inside the claim transaction, so any later failure rolls both back.
+    await transaction.persistCheckpoint({ ...request, checkpoint: nextCheckpoint, lease: request.lease })
+    const steering = await loadStepSteeringContext(transaction, request, claimed, this.reconciliationScope,
+      message => new InputClaimStoreError("store_conflict", message))
+    const contextInputs = steering.renderInputs
     ensureTurnInputsImpl(contextInputs, request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
     const readRoot = transaction.loadRootInputContext
     if (request.rootContextInputId && !readRoot) throw new InputClaimStoreError("store_conflict", "Durable root context reader is unavailable")
@@ -197,21 +200,11 @@ export class StepContextBuilder {
       : null
     if (rootContextInput) ensureTurnInputsImpl([rootContextInput], request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
     const renderInputs = mergeRootContextInput(contextInputs, rootContextInput)
-    const sequences = new Map<bigint, string>()
-    for (const input of claimed.inputs) {
-      const previous = sequences.get(input.acceptedSequence)
-      if (previous && previous !== input.id) throw new InputClaimStoreError("checkpoint_conflict", `Duplicate accepted sequence ${input.acceptedSequence}`)
-      sequences.set(input.acceptedSequence, input.id)
-    }
-    const newlyClaimedSteerInputIds = claimed.newlyClaimedInputIds.filter(inputId => claimed.inputs.some(input => input.id === inputId && input.delivery === "steer"))
-    if (request.steeringMarkerContext) await appendNewObservedSteeringMarkers({ transaction, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, context: request.steeringMarkerContext, inputs: claimed.inputs.filter(input => input.delivery === "steer"), newlyClaimedInputIds: newlyClaimedSteerInputIds, rootInputId: request.rootInputId, lease: request.lease })
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) {
       id(reference.id, "business reference id")
       if (reference.ownerId !== request.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", `Reference ${reference.id} is outside the tenant scope`)
       await this.ownerFence.assertReferenceOwned(reference, request.scope)
     }
-    const nextCheckpoint = checkpointWithInputs(persisted, claimed.inputs)
-    await transaction.persistCheckpoint({ ...request, checkpoint: nextCheckpoint, lease: request.lease })
     const blocks: ContextBlock[] = []
     for (const seed of request.snapshot.system) blocks.push(block("system", "instruction", "system", "harness", `system:${seed.id}`, seed.content))
     for (const seed of request.snapshot.profile) blocks.push(block("profile", "data", "internal_record", "profile", `profile:${seed.id}`, seed.content))
@@ -230,17 +223,12 @@ export class StepContextBuilder {
       inputThroughSequence: nextCheckpoint.inputThroughSequence, consumedInputIds: [...nextCheckpoint.consumedInputIds], blocks: ordered,
     }
     const taskGraphRevision = safeTaskGraphRevision(request.snapshot.taskGraphRevision)
-    const newlyObservedInputIds = request.steeringMarkerContext
-      ? newlyClaimedSteerInputIds.filter((inputId) => inputId !== request.rootInputId)
-      : []
-    const newlyObservedMarkers = request.steeringMarkerContext
-      ? claimed.inputs.filter(input => newlyObservedInputIds.includes(input.id)).map(markerInput => buildObservedSteeringMarker({ sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, context: request.steeringMarkerContext!, markerInput }))
-      : []
     return {
       ...result,
       ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }),
       canonicalJson: stableJson({ ...result, inputThroughSequence: result.inputThroughSequence.toString() }),
-      steeringMarkerControl: { activeInputIds: hydrated.map((input) => input.id), newlyObservedInputIds, newlyObservedMarkers },
+      steeringMarkerControl: stepSteeringMarkerControl(request, claimed, steering, newlyClaimedSteerInputIds),
     }
   }
 }
+
