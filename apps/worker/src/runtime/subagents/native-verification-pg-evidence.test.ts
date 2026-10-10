@@ -9,6 +9,7 @@ import {
   type NativeVerificationHistoryEntry,
 } from "./native-verification-pg-evidence.js"
 import { nativeVerificationControlContentMatches } from "./native-verification-pg-request.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 
 const scope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -161,6 +162,106 @@ describe("native verification private evidence", () => {
     expect(summaries).toContain("Earlier failed research")
     expect(summaries).toContain("earlier failure")
     expect(summaries).toContain("original failed fact")
+  })
+
+  it("projects private TaskGraph bindings out of the native Root-verifier packet without changing storage", () => {
+    const node = { key: "analyst", taskId: "analyst-task", goal: "Analyze Scout findings", successCriteria: ["Check every finding"], dependsOn: [], depth: 1 }
+    const storedReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "findings-from-scout", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+      dependencyBindings: [{ nodeKey: "scout-private", taskId: "scout-task-private", attemptCount: 1,
+        nodeDigest: "c".repeat(64), resultDigest: "d".repeat(64), evidenceDigest: "e".repeat(64), reportDigest: "f".repeat(64) }],
+    }
+    const storedResult = { structuredResult: { status: "completed", summary: "Findings checked" }, taskGraphVerificationReport: storedReport }
+    const task = { id: node.taskId, parentTaskId: "root-1", rootTaskId: "root-1", turnId: "turn-1", role: "analyst", taskType: "research",
+      status: "completed", attemptCount: 1, result: storedResult, failureReason: null, goal: node.goal,
+      successCriteria: node.successCriteria, expectedOutputSchema: {}, context: {}, outputArtifactIds: [] }
+    const state = { scope, snapshot: { nodes: [node] }, tasks: new Map([[task.id, task]]), sourceTasks: new Map(), goal: "Original user goal",
+      criteria: ["Satisfy original user goal"], criteriaValid: true, nativeSourcesValid: true, turnGoalConflict: false,
+      turnInputDigest: "a".repeat(64) } as unknown as NativeVerificationOwnedState
+
+    const content = buildNativeRootPacketContent({ state, candidateText: "candidate", childBindingSetDigest: "b".repeat(64), history: [] })
+    const graphEvidence = content?.evidence.find(item => item.kind === "graph_history")
+    const graphSummary = JSON.parse(graphEvidence?.summary ?? "{}") as Record<string, unknown>
+    const persistedResult = graphSummary.persistedResult as Record<string, unknown>
+    const publicReport = persistedResult.taskGraphVerificationReport as Record<string, unknown>
+    expect(Object.keys(publicReport).sort()).toEqual([
+      "criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion",
+    ])
+    expect(JSON.stringify(content)).not.toContain("scout-task-private")
+    expect(JSON.stringify(content)).not.toContain("dependencyBindings")
+    for (const digest of ["c", "d", "e", "f"]) expect(JSON.stringify(content)).not.toContain(digest.repeat(64))
+    const storedResultDigest = digestNativeVerificationValue(storedResult)
+    const publicResultDigest = digestNativeVerificationValue(persistedResult)
+    expect(graphSummary.resultDigest).toBe(publicResultDigest)
+    expect(publicResultDigest).not.toBe(storedResultDigest)
+    expect(JSON.stringify(content)).not.toContain(storedResultDigest)
+    expect(task.result).toEqual(storedResult)
+    expect(storedReport.dependencyBindings).toHaveLength(1)
+  })
+
+  it("strips malformed private TaskGraph report envelopes from native Root evidence", () => {
+    const node = { key: "analyst", taskId: "analyst-task", goal: "Analyze Scout findings", successCriteria: ["Check every finding"], dependsOn: [], depth: 1 }
+    const storedResult = { summary: "Findings checked", taskGraphVerificationReport: {
+      dependencyBindings: [{ nodeKey: "scout-private", taskId: "scout-task-private", nodeDigest: "c".repeat(64) }],
+    } }
+    const task = { id: node.taskId, parentTaskId: "root-1", rootTaskId: "root-1", turnId: "turn-1", role: "analyst", taskType: "research",
+      status: "completed", attemptCount: 1, result: storedResult, failureReason: null, goal: node.goal,
+      successCriteria: node.successCriteria, expectedOutputSchema: {}, context: {}, outputArtifactIds: [] }
+    const sourceTask = { ...task, id: "legacy-task", status: "failed", goal: "Earlier research", successCriteria: ["Preserve source"], failureReason: "earlier failure" }
+    const state = { scope, snapshot: { nodes: [node] }, tasks: new Map([[task.id, task]]), sourceTasks: new Map([[sourceTask.id, sourceTask]]), goal: "Original user goal",
+      criteria: ["Satisfy original user goal"], criteriaValid: true, nativeSourcesValid: true, turnGoalConflict: false,
+      turnInputDigest: "a".repeat(64) } as unknown as NativeVerificationOwnedState
+
+    const content = buildNativeRootPacketContent({ state, candidateText: "candidate", childBindingSetDigest: "b".repeat(64), history: [] })
+    const graphEvidence = content?.evidence.find(item => item.kind === "graph_history")
+    const graphSummary = JSON.parse(graphEvidence?.summary ?? "{}") as Record<string, unknown>
+    expect(graphSummary.persistedResult).toEqual({ summary: "Findings checked" })
+    const sourceEvidence = content?.evidence.find(item => item.kind === "source_history")
+    const sourceSummary = JSON.parse(sourceEvidence?.summary ?? "{}") as Record<string, unknown>
+    expect(sourceSummary.result).toEqual({ summary: "Findings checked" })
+    expect(sourceSummary.resultDigest).toBe(digestNativeVerificationValue(sourceSummary.result))
+    expect(JSON.stringify(content)).not.toContain("scout-task-private")
+    expect(JSON.stringify(content)).not.toContain("dependencyBindings")
+    expect(JSON.stringify(content)).not.toContain("c".repeat(64))
+    expect(task.result).toEqual(storedResult)
+  })
+
+  it("omits malformed serialized private TaskGraph results from graph and legacy Root history", () => {
+    const node = { key: "analyst", taskId: "analyst-task", goal: "Analyze Scout findings", successCriteria: ["Check every finding"], dependsOn: [], depth: 1 }
+    const rawResult = String.raw`  {"taskGraph\u0056erificationReport":{"dependency\u0042indings":[{"taskId":"private-source","digest":"${"d".repeat(64)}"}]}`
+    const rawDigest = digestNativeVerificationValue(rawResult)
+    const task = { id: node.taskId, parentTaskId: "root-1", rootTaskId: "root-1", turnId: "turn-1", role: "analyst", taskType: "research",
+      status: "completed", attemptCount: 1, result: rawResult, failureReason: null, goal: node.goal,
+      successCriteria: node.successCriteria, expectedOutputSchema: {}, context: {}, outputArtifactIds: [] }
+    const sourceTask = { ...task, id: "legacy-task", status: "failed", goal: "Earlier research", successCriteria: ["Preserve source"], failureReason: "earlier failure" }
+    const state = { scope, snapshot: { nodes: [node] }, tasks: new Map([[task.id, task]]), sourceTasks: new Map([[sourceTask.id, sourceTask]]), goal: "Original user goal",
+      criteria: ["Satisfy original user goal"], criteriaValid: true, nativeSourcesValid: true, turnGoalConflict: false,
+      turnInputDigest: "a".repeat(64) } as unknown as NativeVerificationOwnedState
+
+    const content = buildNativeRootPacketContent({ state, candidateText: "candidate", childBindingSetDigest: "b".repeat(64), history: [] })
+    const graphSummary = JSON.parse(content?.evidence.find(item => item.kind === "graph_history")?.summary ?? "{}") as Record<string, unknown>
+    const sourceSummary = JSON.parse(content?.evidence.find(item => item.kind === "source_history")?.summary ?? "{}") as Record<string, unknown>
+    expect(graphSummary.persistedResult).toBeNull()
+    expect(graphSummary.resultDigest).toBe(digestNativeVerificationValue(null))
+    expect(sourceSummary.result).toBeNull()
+    expect(sourceSummary.resultDigest).toBe(digestNativeVerificationValue(null))
+    expect(JSON.stringify(content)).not.toContain("taskGraphVerificationReport")
+    expect(JSON.stringify(content)).not.toContain("dependencyBindings")
+    expect(JSON.stringify(content)).not.toContain("private-source")
+    expect(JSON.stringify(content)).not.toContain("d".repeat(64))
+    expect(JSON.stringify(content)).not.toContain(rawResult)
+    expect(JSON.stringify(content)).not.toContain(rawDigest)
+    expect(task.result).toBe(rawResult)
+    expect(sourceTask.result).toBe(rawResult)
+
+    const plainTask = { ...task, result: "ordinary graph result" }
+    const plainSourceTask = { ...sourceTask, result: "ordinary source result" }
+    const plainState = { ...state, tasks: new Map([[plainTask.id, plainTask]]), sourceTasks: new Map([[plainSourceTask.id, plainSourceTask]]) }
+    const plainContent = buildNativeRootPacketContent({ state: plainState, candidateText: "candidate", childBindingSetDigest: "b".repeat(64), history: [] })
+    expect(JSON.parse(plainContent?.evidence.find(item => item.kind === "graph_history")?.summary ?? "{}").persistedResult).toBe("ordinary graph result")
+    expect(JSON.parse(plainContent?.evidence.find(item => item.kind === "source_history")?.summary ?? "{}").result).toBe("ordinary source result")
   })
 
   it("excludes only the current root judge while retaining same-candidate reviews from another binding", () => {
