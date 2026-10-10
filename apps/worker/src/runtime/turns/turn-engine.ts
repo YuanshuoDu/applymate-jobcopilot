@@ -15,6 +15,7 @@ export class TurnEngine {
     const identity = executionOwnerFence({ kind: "turn", taskId, lease: this.options.lease })
     return runTurnExecutionLoop({
       ...this.options,
+      rootContextInputId: this.options.rootInputId,
       identity,
       store: bindStore(this.options.store),
       contextBuilder: bindContextBuilder(this.options, identity),
@@ -58,13 +59,14 @@ function bindStore(store: TurnEngineOptions["store"]): TurnExecutionStore {
 
 function bindContextBuilder(options: TurnEngineOptions, identity: TurnExecutionIdentity): TurnExecutionOptions["contextBuilder"] {
   return {
-    build: ({ scope, stepId, snapshot, rootInputId, taskId, now, steeringMarkerContext, steeringMarkerState }) => options.contextBuilder.build({
+    build: ({ scope, stepId, snapshot, rootInputId, rootContextInputId, taskId, now, steeringMarkerContext, steeringMarkerState }) => options.contextBuilder.build({
       scope,
       sessionId: identity.sessionId,
       turnId: identity.turnId,
       stepId,
       snapshot,
       rootInputId,
+      rootContextInputId,
       taskId,
       lease: { ownerId: options.lease.ownerId, leaseVersion: options.lease.leaseVersion, now },
       now,
