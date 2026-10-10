@@ -31,19 +31,29 @@ export function buildScoutAnalystAggregate(tasks: readonly CoordinationTaskView[
   for (const task of tasks) if (isMigratedRole(task.role)) latestByRole.set(task.role, task)
   const latestTasks = [...latestByRole.values()]
   const terminalRoles = latestTasks.filter(task => TERMINAL.has(task.status))
-  if (terminalRoles.some(task => !projectableStructuredResult(task))) return undefined
-  const hasStructured = terminalRoles.some(task => validatedStructuredResult(task).result || validatedStructuredResult(task).invalid)
-  if (!hasStructured) return undefined
-  const outcomes: RoleExecutionOutcome[] = terminalRoles.map(task => ({
-    task, checked: validatedStructuredResult(task),
-  })).map(({ task, checked }) => ({
-    role: task.role as MigratedRole, taskId: task.id, status: checked.invalid ? "failed" : task.status as RoleExecutionOutcome["status"],
-    result: checked.result ?? undefined, failureReason: checked.invalid ? "invalid_structured_result" : task.failureReason ?? "structured_result_unavailable",
-  }))
+  const outcomes: RoleExecutionOutcome[] = []
+  let hasStructured = false
+  let hasReadableValidatedResult = false
+  let omittedCompletedResult = false
+  for (const task of terminalRoles) {
+    if (task.status !== "completed") {
+      outcomes.push({ role: task.role as MigratedRole, taskId: task.id, status: task.status as RoleExecutionOutcome["status"], failureReason: task.failureReason ?? "structured_result_unavailable" })
+      continue
+    }
+    if (!projectableStructuredResult(task)) { omittedCompletedResult = true; continue }
+    const checked = validatedStructuredResult(task)
+    if (checked.result || checked.invalid) hasStructured = true
+    if (checked.result) hasReadableValidatedResult = true
+    outcomes.push({
+      role: task.role as MigratedRole, taskId: task.id, status: checked.invalid ? "failed" : "completed",
+      result: checked.result ?? undefined, failureReason: checked.invalid ? "invalid_structured_result" : task.failureReason ?? "structured_result_unavailable",
+    })
+  }
+  if (!hasStructured || (omittedCompletedResult && !hasReadableValidatedResult)) return undefined
   const reduced = reduceScoutAnalystOutcomes(outcomes)
   const pendingRoles = MIGRATED_ROLES.filter(role => latestByRole.get(role) !== undefined && !TERMINAL.has(latestByRole.get(role)!.status))
   const aggregate: WaitAggregate = {
-    status: pendingRoles.length > 0 ? "pending" : reduced.status,
+    status: pendingRoles.length > 0 ? "pending" : omittedCompletedResult ? "partial" : reduced.status,
     successfulRoles: reduced.successfulRoles,
     failedRoles: reduced.failedRoles,
     ...(pendingRoles.length > 0 ? { pendingRoles } : {}),
