@@ -109,7 +109,7 @@ describe("TaskGraph planning facts producer", () => {
     }
   })
 
-  it("distinguishes completed-empty from missing and omits absent or inconsistent graphs", () => {
+  it("distinguishes completed-empty from missing and omits an absent graph", () => {
     const empty = buildTaskGraphPlanningFacts(loadedGraph(4, ["empty"], [
       row("empty", "scout", "research", "completed", scoutResult([])),
     ]))
@@ -117,11 +117,27 @@ describe("TaskGraph planning facts producer", () => {
       row("missing", "scout", "research", "completed"),
     ]))
     const absent = { rootTaskId: "root-task", item: null, snapshot: null, state: null, tasks: new Map() } as LoadedGraph
-    const inconsistent = loadedGraph(6, [], [], 5)
 
     expect(empty?.counts.discoveredJobs).toEqual({ knownCount: 0, coverage: "complete" })
     expect(missing?.counts.discoveredJobs).toEqual({ knownCount: null, coverage: "unavailable" })
     expect(buildTaskGraphPlanningFacts(absent)).toBeNull()
-    expect(buildTaskGraphPlanningFacts(inconsistent)).toBeNull()
+  })
+
+  it("retains unavailable coverage for malformed role results", () => {
+    const malformed = buildTaskGraphPlanningFacts(loadedGraph(7, ["unsafe"], [
+      row("unsafe", "scout", "research", "completed", scoutResult(["job/with/slash"])),
+    ]))
+
+    expect(malformed?.counts.discoveredJobs).toEqual({ knownCount: null, coverage: "unavailable" })
+  })
+
+  it("propagates graph and reducer invariant errors", () => {
+    const inconsistent = loadedGraph(6, [], [], 5)
+    const duplicateNodes = loadedGraph(7, ["duplicate", "duplicate"], [
+      row("duplicate", "scout", "research", "completed", scoutResult(["job-1"])),
+    ])
+
+    expect(() => buildTaskGraphPlanningFacts(inconsistent)).toThrow("task_graph_final_summary_graph_invalid")
+    expect(() => buildTaskGraphPlanningFacts(duplicateNodes)).toThrow("task_graph_final_summary_task_identity_conflict")
   })
 })
