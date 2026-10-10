@@ -1,7 +1,7 @@
 import { getPool } from "../db/apply-results.js";
 import { measureWorkerResponseBytes, recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
 import { getWorkerRuntimeState } from "../admin/worker-state.js";
-import { getSchedulerTaskState, markSchedulerTaskFailure, markSchedulerTaskSuccess, type SchedulerTaskState } from "./scheduler-retry.js";
+import { getSchedulerTaskState, markSchedulerTaskFailure, markSchedulerTaskSuccess, parseRetryAfterAt, type SchedulerTaskState } from "./scheduler-retry.js";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const MINIMUM_INTERVAL_MS = 60_000;
@@ -113,6 +113,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
         signal: AbortSignal.timeout(30_000),
       });
       const failure = response.ok ? undefined : `${task.name} returned ${response.status} (${httpErrorCode(response.status)})`;
+      const retryAfterObservedAt = response.status === 429 || response.status === 503 ? now() : undefined, retryAfterAt = retryAfterObservedAt === undefined ? undefined : parseRetryAfterAt(response.headers.get("retry-after"), retryAfterObservedAt, config.retryMaxDelayMs ?? MAX_RETRY_DELAY_MS);
       await recordUsageSafely({
         operation: `scheduler_${task.name}`,
         status: response.ok ? "success" : "error",
@@ -122,7 +123,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
         latencyMs: now() - startedAt,
       });
       if (failure) {
-        markSchedulerTaskFailure(current, failure, now(), task.intervalMs ?? config.intervalMs, config.retryBaseDelayMs ?? config.intervalMs, config.retryMaxDelayMs ?? MAX_RETRY_DELAY_MS);
+        markSchedulerTaskFailure(current, failure, now(), task.intervalMs ?? config.intervalMs, config.retryBaseDelayMs ?? config.intervalMs, config.retryMaxDelayMs ?? MAX_RETRY_DELAY_MS, retryAfterAt, retryAfterAt === undefined ? undefined : retryAfterObservedAt);
         console.error(`[automation-scheduler] ${failure}; retry backoff engaged`);
         return failure;
       }
