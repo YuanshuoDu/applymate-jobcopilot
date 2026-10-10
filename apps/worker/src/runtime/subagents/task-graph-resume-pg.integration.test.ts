@@ -9773,12 +9773,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 ...scoutResult, taskGraphVerificationReport: { ...scoutReport, resultDigest: "0".repeat(64) },
               })
 
-              const graphSnapshotRows = await pool!.query<{ content: unknown }>(
-                `SELECT "content" FROM "agent_items"
+              const graphSnapshotRows = await pool!.query<{ revision: number; content: unknown }>(
+                `SELECT "revision", "content" FROM "agent_items"
                  WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
                 [taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId],
               )
+              const graphSnapshotRevision = graphSnapshotRows.rows[0]?.revision
               const graphSnapshot = record(graphSnapshotRows.rows[0]?.content)
+              const graphReceiptRows = await pool!.query<{ id: string; type: string; payload: unknown }>(
+                `SELECT "id", "type", "payload" FROM "agent_events"
+                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
+                   AND "type" IN ('item.started', 'item.delta') AND "payload"->>'kind' = 'proposal'
+                   AND "payload"->>'revision' = $5::text`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, taskGraphItemId(currentOwner.rootTaskId), currentOwner.rootTaskId, graphSnapshotRevision],
+              )
+              const graphReceiptRow = graphReceiptRows.rows[0]
+              const graphReceiptPayload = record(graphReceiptRow?.payload)
+              const graphReceiptItem = record(graphReceiptPayload?.item)
               const graphNodes: unknown[] = Array.isArray(graphSnapshot?.nodes) ? graphSnapshot.nodes : []
               const scoutNode = graphNodes.map(record).find(node => node?.key === "scout")
               const scoutVerification = record(scoutNode?.verification)
@@ -9786,9 +9797,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 ? scoutVerification.criteria.map(record).filter((criterion): criterion is RecordValue => criterion !== null) : []
               const candidateCriterion = scoutCriteria.find(criterion => criterion.id === "candidate-count")
               const candidateCheck = record(candidateCriterion?.check)
-              if (!graphSnapshot || !scoutNode || !scoutVerification || candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
+              if (!graphSnapshot || !Number.isSafeInteger(graphSnapshotRevision) || graphReceiptRows.rows.length !== 1
+                || !graphReceiptRow || !graphReceiptPayload || !graphReceiptItem
+                || graphReceiptPayload.revision !== graphSnapshotRevision || graphReceiptItem.revision !== graphSnapshotRevision
+                || !Object.hasOwn(graphReceiptPayload, "content")
+                || !scoutNode || !scoutVerification || candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
                 throw new Error("Discovery Scout snapshot contract was unavailable for the persisted mutation")
               }
+              expect(graphReceiptItem.content).toEqual(graphSnapshot)
+              expect(graphReceiptPayload.content).toEqual(graphSnapshot)
               const changedGraphSnapshot: RecordValue = {
                 ...graphSnapshot,
                 nodes: graphNodes.map(value => {
@@ -9804,16 +9821,33 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   } : value
                 }),
               }
+              const changedGraphReceiptPayload: RecordValue = {
+                ...graphReceiptPayload,
+                content: changedGraphSnapshot,
+                item: { ...graphReceiptItem, content: changedGraphSnapshot },
+              }
               const updateGraphSnapshot = async (content: RecordValue) => pool!.query(
                 `UPDATE "agent_items" SET "content" = $1::jsonb
-                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "type" = 'task_graph'`,
-                [JSON.stringify(content), taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId],
+                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "type" = 'task_graph' AND "revision" = $6`,
+                [JSON.stringify(content), taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId, graphSnapshotRevision],
+              )
+              const updateGraphReceipt = async (payload: RecordValue) => pool!.query(
+                `UPDATE "agent_events" SET "payload" = $1::jsonb
+                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "itemId" = $5 AND "taskId" = $6
+                   AND "type" = $7 AND "payload"->>'kind' = 'proposal' AND "payload"->>'revision' = $8::text`,
+                [JSON.stringify(payload), graphReceiptRow.id, discoveryOwner.sessionId, discoveryOwner.turnId,
+                  taskGraphItemId(currentOwner.rootTaskId), currentOwner.rootTaskId, graphReceiptRow.type, graphSnapshotRevision],
               )
               try {
+                expect((await updateGraphReceipt(changedGraphReceiptPayload)).rowCount).toBe(1)
                 expect((await updateGraphSnapshot(changedGraphSnapshot)).rowCount).toBe(1)
                 await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
               } finally {
-                expect((await updateGraphSnapshot(graphSnapshot)).rowCount).toBe(1)
+                try {
+                  expect((await updateGraphReceipt(graphReceiptPayload)).rowCount).toBe(1)
+                } finally {
+                  expect((await updateGraphSnapshot(graphSnapshot)).rowCount).toBe(1)
+                }
               }
 
               const sourceReceiptRows = await pool!.query<{ id: string; content: unknown }>(
