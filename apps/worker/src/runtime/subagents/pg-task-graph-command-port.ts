@@ -16,6 +16,7 @@ import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } fro
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
 import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
+import { copyTaskGraphSourceCheckpointMetadata } from "./task-graph-source-intent-context.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -64,6 +65,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
       return transaction(pool, client => readCurrentWithClient(client, scope))
     },
+    async readCurrentForPlanning(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
+      return transaction(pool, client => readCurrentForPlanningWithClient(client, scope))
+    },
     async readCurrentResultPage(scope, request) {
       return transaction(pool, client => readCurrentResultPageWithClient(client, scope, request))
     },
@@ -81,7 +85,7 @@ function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: Steeri
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
-  const loaded = await loadTaskGraph(client, input.scope)
+  const loaded = await loadTaskGraph(client, input.scope, true, true)
   const current = loaded.state, revision = current?.revision ?? 0
   const key = taskGraphProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
   const fingerprint = taskGraphFingerprint(input.proposal)
@@ -94,7 +98,7 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   }
   if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
-  const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []))
+  const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []), loaded.sourceInputRelations)
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
   await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot: created.snapshot, expectedRevision: revision,
     now: new Date(), idempotencyKey: key, fingerprint, receipt })
@@ -103,10 +107,25 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
 }
 
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
-  const loaded = await loadCurrentWithClient(client, scope)
+  return readCurrentStateWithClient(client, scope, false)
+}
+
+async function readCurrentForPlanningWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
+  return readCurrentStateWithClient(client, scope, true)
+}
+
+async function readCurrentStateWithClient(
+  client: Pick<PoolClient, "query">,
+  scope: TaskGraphReadScope,
+  includeSourceInputRelations: boolean,
+): Promise<TaskGraphCurrentState> {
+  const loaded = await loadCurrentWithClient(client, scope, includeSourceInputRelations)
   const current = currentTaskGraph(loaded)
   const planningFacts = buildTaskGraphPlanningFacts(loaded)
-  return planningFacts ? { ...current, planningFacts } : current
+  if (!planningFacts) return current
+  const state = { ...current, planningFacts }
+  copyTaskGraphSourceCheckpointMetadata(current, state)
+  return state
 }
 
 async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, request: TaskGraphResultPageRequest) {
@@ -115,10 +134,10 @@ async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">
   return projectTaskGraphResultPage(loaded, request)
 }
 
-async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {
+async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, includeSourceInputRelations = false) {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   await lockTaskGraphScope(client, scope)
-  const loaded = await loadTaskGraph(client, scope, false)
+  const loaded = await loadTaskGraph(client, scope, false, includeSourceInputRelations)
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }

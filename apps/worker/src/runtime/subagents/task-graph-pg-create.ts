@@ -11,6 +11,7 @@ import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGr
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
+import type { TaskGraphInputRelation } from "./task-graph-source-intent-context.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 
@@ -35,7 +36,7 @@ function safeProposalSize(proposal: TaskGraphProposal): void {
   }
 }
 
-export async function createGraphTasks(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>): Promise<CreatedGraphTasks> {
+export async function createGraphTasks(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>, sourceInputRelations: ReadonlyMap<string, TaskGraphInputRelation> = new Map()): Promise<CreatedGraphTasks> {
   const parentTask = { budgetSnapshot: parent.budgetSnapshot } as Pick<SubagentTaskRecord, "budgetSnapshot">
   const policy = policyFromTask(parentTask)
   safeProposalSize(input.proposal)
@@ -71,6 +72,7 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     throw new Error("task_graph_dependency_unverified")
   }
   const statuses = new Map(current.nodes.map(node => [node.key, node.status] as const))
+  const currentNodesByKey = new Map(current.nodes.map(node => [node.key, node] as const))
   const logicalStatuses = new Map(statuses)
   for (const key of current.repairSatisfiedNodeKeys ?? []) logicalStatuses.set(key, "completed")
   const dependencies = new Map([...current.nodes, ...input.proposal.nodes].map(node => [node.key, node] as const))
@@ -101,9 +103,17 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     const dependenciesDone = node.dependsOn.every(key => satisfiedDependencies.has(key))
     const status = dependenciesDone ? "queued" : "waiting"
     const childPolicy = inheritSubagentPolicy(policy, template.maxAttempts === undefined ? {} : { maxAttempts: template.maxAttempts })
+    const dependencyResults = node.dependsOn.map(key => {
+      const dependency = completedDependencies.get(key), source = currentNodesByKey.get(key)
+      if (!dependency || template.role !== "analyst" || dependency.verificationDisposition !== "typed"
+        || !source || priorTaskIds.get(key) !== dependency.taskId || source.verificationDisposition !== "typed") return dependency
+      return { ...dependency, sourceIntent: {
+        goal: source.goal, successCriteria: source.successCriteria, inputRelation: sourceInputRelations.get(key) ?? "unknown",
+      } }
+    }).filter((dependency): dependency is ScopedDependencyResult => dependency !== undefined)
     const context = status === "queued" && node.dependsOn.length > 0
       ? materializeTaskGraphDependencyContext(template.context ?? {}, input.scope, node.dependsOn,
-        node.dependsOn.map(key => completedDependencies.get(key)).filter((value): value is ScopedDependencyResult => value !== undefined))
+        dependencyResults)
       : template.context ?? {}
     const child = await createSubagentTask(client, {
       userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,

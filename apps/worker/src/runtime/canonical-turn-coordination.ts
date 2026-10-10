@@ -58,6 +58,14 @@ export function createCanonicalTurnCoordination(input: Readonly<{
     currentState = await input.commandPort.readCurrent(readScope())
     return currentState
   }
+  async function planningGraph() {
+    if (!input.commandPort) throw new Error("task_graph_runtime_dependencies_unavailable")
+    const scope = readScope()
+    currentState = input.commandPort.readCurrentForPlanning
+      ? await input.commandPort.readCurrentForPlanning(scope)
+      : await input.commandPort.readCurrent(scope)
+    return currentState
+  }
   return {
     nativeOptions,
     bindRoot(value) { root = value },
@@ -72,7 +80,7 @@ export function createCanonicalTurnCoordination(input: Readonly<{
     },
     async refresh(snapshot) {
       remember(snapshot)
-      const state = await currentGraph()
+      const state = await planningGraph()
       const required = [...receipts.values()]
       if (!root || !nativeReceiptsMatchGraph(required, state, root.id)) throw new Error("task_graph_native_coordination_missing")
       return mergeTaskGraphCurrentObservation(snapshot, state)

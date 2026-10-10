@@ -7,6 +7,7 @@ import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphN
 import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
 import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import type { TaskGraphInputRelation } from "./task-graph-source-intent-context.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -170,6 +171,7 @@ export type TaskGraphCurrentNode = Readonly<{
   readiness: TaskGraphReadiness
   resultSummary: string | null
   resultProjection?: TaskGraphResultProjection
+  inputRelation?: TaskGraphInputRelation
   verificationCriterionIds?: readonly string[]
   verificationReport?: TaskGraphVerificationReport
   repairOf?: TaskGraphRepairOf
@@ -197,6 +199,8 @@ export type TaskGraphCommandPort = Readonly<{
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */
   appendNativeCoordination?(input: TaskGraphNativeCommandInput): Promise<TaskGraphNativeCommandReceipt>
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
+  /** Reads advisory source-intent context for Root planning refreshes only. */
+  readCurrentForPlanning?(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads current graph state using a caller-owned transaction and client. */
   readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads one bounded advisory page from the current owner-fenced graph. */
