@@ -32,10 +32,11 @@ function client(events: readonly Record<string, unknown>[], answered = true) {
     if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
     if (sql.includes('FROM "agent_events"')) {
       const keys = values?.[1] as readonly string[] | undefined, waitIds = values?.[3] as readonly string[] | undefined
+      const questionItemIds = values?.[8] as readonly string[] | undefined
       const rows = events.filter(row => {
         const payload = row.payload as Record<string, unknown> | undefined
         return keys?.includes(String(row.idempotencyKey)) || (row.turnId === owner.turnId
-          && waitIds?.includes(String(payload?.waitId))
+          && (waitIds?.includes(String(payload?.waitId)) || questionItemIds?.includes(String(payload?.questionItemId)))
           && (row.type === TURN_QUESTION_PLANNING_EVENT_TYPE || payload?.schemaVersion === TURN_QUESTION_PLANNING_SCHEMA_VERSION))
       })
       return { rows, rowCount: rows.length }
@@ -146,9 +147,20 @@ describe("turn question planning clarification history", () => {
     expect(eventQuery).toContain('event."type" = $7')
   })
 
-  it.each(["question.answered", "item.started"])("ignores ordinary public %s events that reuse the waitId without a private marker", async type => {
+  it("fails closed when a present receipt keeps its question item ID but rewrites its wait ID and key", async () => {
+    const row = event(first)
+    row.idempotencyKey = "rewritten-key"
+    row.payload = { ...(row.payload as Record<string, unknown>), waitId: second.waitId }
+    const db = client([row])
+    await expect(readTurnQuestionPlanningHistory(db, owner, [first])).rejects.toMatchObject({ code: "question_conflict" })
+    const eventQueryIndex = db.queries.findIndex(sql => sql.includes('SELECT event."id"'))
+    expect(db.queries[eventQueryIndex]).toContain('event."payload"->>\'questionItemId\' = ANY($9::text[])')
+    expect(db.parameters[eventQueryIndex]?.[8]).toEqual([first.questionItemId])
+  })
+
+  it.each(["question.answered", "item.started"])("ignores ordinary public %s events that reuse the wait identity without a private marker", async type => {
     const row = event(first, { id: "public-event", type, actor: "user", itemId: "question-item", idempotencyKey: "public-key",
-      payload: { waitId: first.waitId, status: "answered" } })
+      payload: { waitId: first.waitId, questionItemId: first.questionItemId, status: "answered" } })
     const db = client([row])
     await expect(readTurnQuestionPlanningHistory(db, owner, [first])).resolves.toEqual([])
   })

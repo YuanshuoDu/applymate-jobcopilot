@@ -43,15 +43,17 @@ async function eventRows(client: Queryable, owner: TurnQuestionPlanningReadOwner
   if (!waits.length) return []
   const keys = waits.map(wait => turnQuestionPlanningEventKey(owner.turnId, wait.waitId))
   const ids = waits.map(wait => wait.waitId)
+  const itemIds = waits.map(wait => wait.questionItemId)
   const result = await client.query<EventRow>(`SELECT event."id", event."sessionId", event."turnId", event."itemId", event."taskId", event."sequence", event."type", event."actor", event."correlationId", event."causationId", event."idempotencyKey", event."payload"
     FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" AND session."userId" = $5
       JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
         AND turn."userId" = $5 AND turn."rootTaskId" = $6
     WHERE event."sessionId" = $1 AND (event."idempotencyKey" = ANY($2::text[])
-      OR (event."turnId" = $3 AND event."payload"->>'waitId' = ANY($4::text[])
+      OR (event."turnId" = $3 AND (event."payload"->>'waitId' = ANY($4::text[])
+        OR event."payload"->>'questionItemId' = ANY($9::text[]))
         AND (event."type" = $7 OR event."payload"->>'schemaVersion' = $8)))`,
   [owner.sessionId, keys, owner.turnId, ids, owner.userId, owner.rootTaskId,
-    TURN_QUESTION_PLANNING_EVENT_TYPE, TURN_QUESTION_PLANNING_SCHEMA_VERSION])
+    TURN_QUESTION_PLANNING_EVENT_TYPE, TURN_QUESTION_PLANNING_SCHEMA_VERSION, itemIds])
   return result.rows
 }
 
@@ -97,7 +99,8 @@ async function readOne(client: Queryable, owner: TurnQuestionPlanningReadOwner, 
   const expectedKey = turnQuestionPlanningEventKey(owner.turnId, wait.waitId)
   const matching = rows.filter(row => {
     const payload = object(row.payload)
-    return row.idempotencyKey === expectedKey || (row.turnId === owner.turnId && payload?.waitId === wait.waitId
+    return row.idempotencyKey === expectedKey || (row.turnId === owner.turnId
+      && (payload?.waitId === wait.waitId || payload?.questionItemId === wait.questionItemId)
       && (row.type === TURN_QUESTION_PLANNING_EVENT_TYPE || payload.schemaVersion === TURN_QUESTION_PLANNING_SCHEMA_VERSION))
   })
   if (!matching.length) return null
