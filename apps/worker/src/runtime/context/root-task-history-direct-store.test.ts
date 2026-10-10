@@ -15,6 +15,8 @@ type Options = Readonly<{
   candidateError?: Error
   graphError?: Error
   badGraph?: boolean
+  sourceSessionStatusAtGraphLoad?: "archived" | "aborted"
+  sourceSessionLockedAtGraphLoad?: boolean
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -28,6 +30,7 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     startTurnId: turnId, startTaskId: rootTaskId, startItemId: null, startSequence, startType: "turn.started",
     startActor: "orchestrator", startCorrelationId: turnId, startIdempotencyKey: `turn:${turnId}:event:turn-started`,
     startPayload: { taskId: rootTaskId, rootTaskId }, startEventCount: 1,
+    terminalCreatedAt: new Date(`2026-10-07T11:${String(index).padStart(2, "0")}:00.000Z`),
   }
   if (status === "completed") return {
     ...common, terminalTurnId: turnId, terminalTaskId: rootTaskId, terminalItemId: `final-${index}`,
@@ -57,7 +60,8 @@ function currentStart(sequence = "1000"): Row {
   return {
     sessionId: "session-1", turnId: "turn-current", taskId: "root-current", itemId: null, sequence,
     type: "turn.started", actor: "orchestrator", correlationId: "turn-current",
-    idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" }, startEventCount: 1,
+    idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" },
+    createdAt: new Date("2026-10-07T12:00:00.000Z"), startEventCount: 1,
   }
 }
 
@@ -68,6 +72,7 @@ function fixture(options: Options = {}) {
     async query(sql: string, values?: readonly unknown[]) {
       queries.push({ sql, values })
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes("FOR SHARE")) return { rows: options.sourceSessionStatusAtGraphLoad || options.sourceSessionLockedAtGraphLoad ? [] : [{ id: values?.[0] }] }
       if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: "turn-current" }] }
       if (sql.includes("FOR UPDATE OF task")) return { rows: [{
@@ -81,14 +86,18 @@ function fixture(options: Options = {}) {
       if (sql.includes('SELECT "id", "sessionId", "turnId", "taskId", "attempt", "status"')) return { rows: [{
         id: "step-current", sessionId: "session-1", turnId: "turn-current", taskId: "root-current", attempt: 1, status: "streaming",
       }] }
-      if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "input"')) return { rows: [{
+      if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "source", "input"')) return { rows: [{
         id: "turn-current", sessionId: "session-1", userId: "user-1", rootTaskId: "root-current", status: "in_progress",
-        input: options.currentInput ?? { goal: " Explore roles ", successCriteria: ["Respect location"] },
+        source: "user", input: options.currentInput ?? { goal: " Explore roles ", successCriteria: ["Respect location"] },
       }] }
       if (sql.includes("WITH terminal_window AS MATERIALIZED")) {
         if (options.candidateError) throw options.candidateError
         const limit = Number(values?.[4] ?? 0)
-        return { rows: [...sourceRows].sort((left, right) => Number(BigInt(String(right.terminalSequence)) - BigInt(String(left.terminalSequence)))).slice(0, limit) }
+        const rows = [...sourceRows].sort((left, right) => sql.includes('ORDER BY terminal."createdAt" DESC')
+          ? (right.terminalCreatedAt instanceof Date && left.terminalCreatedAt instanceof Date
+            ? right.terminalCreatedAt.getTime() - left.terminalCreatedAt.getTime() : 0) || String(right.turnId).localeCompare(String(left.turnId))
+          : Number(BigInt(String(right.terminalSequence)) - BigInt(String(left.terminalSequence))))
+        return { rows: rows.slice(0, limit) }
       }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [currentStart()] }
       if (sql.includes('FROM "agent_items" AS item')) {
@@ -162,6 +171,64 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(windowLimit).toBeGreaterThanOrEqual(0)
     expect(windowLimit).toBeLessThan(rootsJoin)
     expect(scan?.sql.slice(rootsJoin)).not.toContain("LIMIT $5")
+  })
+
+  it("uses DB-time order and source-session graph scope only under the server opt-in", async () => {
+    const newer = { ...candidate(3, "2000"), sessionId: "session-other", terminalStepSessionId: "session-other",
+      terminalStepEventSessionId: "session-other", terminalCreatedAt: new Date("2026-10-07T11:50:00.000Z"), turnSource: "user",
+      sourceSessionUserId: "user-1", sourceSessionStatus: "completed" }
+    const older = { ...candidate(4, "3000"), sessionId: "session-third", terminalStepSessionId: "session-third",
+      terminalStepEventSessionId: "session-third", terminalCreatedAt: new Date("2026-10-07T11:40:00.000Z"), turnSource: "user",
+      sourceSessionUserId: "user-1", sourceSessionStatus: "running" }
+    const wrongOrigin = { ...candidate(5, "3000"), sessionId: "session-fourth", terminalStepSessionId: "session-fourth",
+      terminalStepEventSessionId: "session-fourth", terminalCreatedAt: new Date("2026-10-07T11:55:00.000Z"), turnSource: "automation",
+      sourceSessionUserId: "user-1", sourceSessionStatus: "completed" }
+    const test = fixture({ candidates: [older, newer, wrongOrigin] })
+    test.input = { ...test.input, crossSessionRootTaskHistoryEnabled: true }
+
+    const outcomes = await test.store.load(test.input)
+
+    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-3", "turn-source-4"])
+    const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
+    expect(scan?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(scan?.sql).toContain('event."createdAt" < $4::timestamptz')
+    expect(scan?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
+    const graphReads = test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))
+    expect(graphReads.map(query => query.values?.[1])).toEqual(["session-other", "session-third"])
+    const sourceLocks = test.queries.filter(query => query.sql.includes("FOR SHARE"))
+    expect(sourceLocks.map(query => query.values)).toEqual([["session-other", "user-1"], ["session-third", "user-1"]])
+    expect(sourceLocks.every(query => query.sql.includes("FOR SHARE SKIP LOCKED"))).toBe(true)
+  })
+
+  it.each(["archived", "aborted"] as const)("omits a source session that becomes %s after candidate selection", async status => {
+    const source = { ...candidate(1), sessionId: "session-other", terminalStepSessionId: "session-other",
+      terminalStepEventSessionId: "session-other", turnSource: "user", sourceSessionUserId: "user-1", sourceSessionStatus: "running" }
+    const test = fixture({ candidates: [source], sourceSessionStatusAtGraphLoad: status })
+    test.input = { ...test.input, crossSessionRootTaskHistoryEnabled: true }
+
+    const outcomes = await test.store.load(test.input)
+
+    expect(outcomes).toEqual([])
+    const sourceLock = test.queries.find(query => query.sql.includes("FOR SHARE"))
+    expect(sourceLock?.sql).toContain('"userId" = $2')
+    expect(sourceLock?.sql).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    expect(sourceLock?.values).toEqual(["session-other", "user-1"])
+    expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(0)
+  })
+
+  it("omits a source session already locked by another transaction without reading its graph", async () => {
+    const source = { ...candidate(1), sessionId: "session-other", terminalStepSessionId: "session-other",
+      terminalStepEventSessionId: "session-other", turnSource: "user", sourceSessionUserId: "user-1", sourceSessionStatus: "running" }
+    const test = fixture({ candidates: [source], sourceSessionLockedAtGraphLoad: true })
+    test.input = { ...test.input, crossSessionRootTaskHistoryEnabled: true }
+
+    const outcomes = await test.store.load(test.input)
+
+    expect(outcomes).toEqual([])
+    const sourceLock = test.queries.find(query => query.sql.includes("FOR SHARE"))
+    expect(sourceLock?.sql).toContain("FOR SHARE SKIP LOCKED")
+    expect(sourceLock?.values).toEqual(["session-other", "user-1"])
+    expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(0)
   })
 
   it("omits candidates with mismatched status, duplicate receipts, or nonprior sequence ordering", async () => {

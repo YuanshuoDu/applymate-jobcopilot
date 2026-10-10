@@ -13,6 +13,7 @@ export type ValidatedRootTaskHistoryOutcome = Readonly<{
   sourceTurnId: string
   sourceRootTaskId: string
   terminalSequence: bigint
+  terminalAt?: Date
   taskGraph: TaskGraphCurrentState
 }>
 
@@ -86,11 +87,13 @@ function projectNode(value: unknown): SafeNode | null {
   const hints = safeReasonHints(node)
   return { taskKind, status: node.status as SubagentTaskStatus, ...(hints ? { negativeReasonHints: hints } : {}) }
 }
-function candidate(value: unknown): Candidate | null {
+function candidate(value: unknown, crossSession: boolean): Candidate | null {
   const item = record(value)
-  if (!item || !exact(item, "sourceRootTaskId,sourceTurnId,taskGraph,terminalSequence")
+  const keys = crossSession ? "sourceRootTaskId,sourceTurnId,taskGraph,terminalAt,terminalSequence" : "sourceRootTaskId,sourceTurnId,taskGraph,terminalSequence"
+  if (!item || !exact(item, keys)
     || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
-    || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n) return null
+    || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n
+    || (crossSession && (!(item.terminalAt instanceof Date) || !Number.isFinite(item.terminalAt.getTime())))) return null
   const graph = record(item.taskGraph)
   if (!graph || !exact(graph, "nodes,revision") || !Number.isSafeInteger(graph.revision) || Number(graph.revision) < 0
     || !Array.isArray(graph.nodes) || graph.nodes.length < 1 || graph.nodes.length > MAX_NODES || !dense(graph.nodes)) return null
@@ -101,7 +104,7 @@ function candidate(value: unknown): Candidate | null {
       || compare(JSON.stringify(left), JSON.stringify(right)))
   return {
     sourceTurnId: item.sourceTurnId, sourceRootTaskId: item.sourceRootTaskId,
-    terminalSequence: item.terminalSequence, taskGraph: item.taskGraph as TaskGraphCurrentState,
+    terminalSequence: item.terminalSequence, ...(crossSession ? { terminalAt: item.terminalAt as Date } : {}), taskGraph: item.taskGraph as TaskGraphCurrentState,
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }
@@ -119,22 +122,27 @@ function withinContentLimit(turns: readonly Readonly<{ label: string; nodes: rea
   const serialized = JSON.stringify({ id: "root-task-history", content: content(turns) })
   return typeof serialized === "string" && Buffer.byteLength(serialized, "utf8") <= MAX_CONTENT_BYTES
 }
-function projectCandidates(values: readonly Candidate[]): ContextSeedBlock | undefined {
+function projectCandidates(values: readonly Candidate[], crossSession: boolean): ContextSeedBlock | undefined {
   const byIdentity = new Map<string, Candidate>()
   const conflicts = new Set<string>()
   for (const value of values) {
     if (conflicts.has(value.identity)) continue
     const previous = byIdentity.get(value.identity)
     if (!previous) byIdentity.set(value.identity, value)
-    else if (previous.terminalSequence !== value.terminalSequence || JSON.stringify(previous.safeNodes) !== JSON.stringify(value.safeNodes)) {
+    else if (previous.terminalSequence !== value.terminalSequence
+      || previous.terminalAt?.getTime() !== value.terminalAt?.getTime()
+      || JSON.stringify(previous.safeNodes) !== JSON.stringify(value.safeNodes)) {
       byIdentity.delete(value.identity)
       conflicts.add(value.identity)
     }
   }
-  const ordered = [...byIdentity.values()].sort((left, right) =>
-    left.terminalSequence > right.terminalSequence ? -1
+  const ordered = [...byIdentity.values()].sort((left, right) => {
+    if (crossSession) return (right.terminalAt as Date).getTime() - (left.terminalAt as Date).getTime()
+      || compare(right.sourceTurnId, left.sourceTurnId) || compare(right.sourceRootTaskId, left.sourceRootTaskId)
+    return left.terminalSequence > right.terminalSequence ? -1
       : left.terminalSequence < right.terminalSequence ? 1
-        : compare(left.identity, right.identity))
+        : compare(left.identity, right.identity)
+  })
   const turns: Array<{ label: string; nodes: SafeNode[] }> = []
   let nodeCount = 0
   let overflow = false
@@ -161,9 +169,10 @@ function projectCandidates(values: readonly Candidate[]): ContextSeedBlock | und
 /** Projects bounded typed historical outcomes; private source identity is used only for ordering and deduplication. */
 export function projectRootTaskHistory(
   outcomes: readonly ValidatedRootTaskHistoryOutcome[],
+  crossSession = false,
 ): ContextSeedBlock | undefined {
   if (!Array.isArray(outcomes) || outcomes.length === 0 || outcomes.length > MAX_CANDIDATES || !dense(outcomes)) return undefined
-  const candidates = outcomes.map(candidate)
+  const candidates = outcomes.map(value => candidate(value, crossSession))
   if (candidates.some(value => value === null)) return undefined
-  return projectCandidates(candidates as Candidate[])
+  return projectCandidates(candidates as Candidate[], crossSession)
 }

@@ -48,6 +48,16 @@ describe("canonical Root task history context", () => {
     expect(built.toolObservations).toEqual([{ id: "keep", content: { safe: true } }])
   })
 
+  it("uses cross-session timestamps only when the internal server option is present", async () => {
+    const crossRequest = { ...request, crossSessionRootTaskHistoryEnabled: true }
+    const crossOutcomes = [{ ...outcomes[0]!, terminalAt: new Date("2026-10-07T10:00:00.000Z") }]
+    const load = vi.fn(async (_input: DirectRootTaskHistoryLoadInput) => crossOutcomes)
+    const built = await appendCanonicalRootTaskHistory({ snapshot, reader: { load }, request: crossRequest })
+
+    expect(load).toHaveBeenCalledWith(crossRequest)
+    expect(built.toolObservations[1]?.content).toMatchObject({ advisoryOnly: true, notCurrentEvidence: true })
+  })
+
   it("propagates owner/database read failures instead of turning them into accepted history", async () => {
     const reader: DirectRootTaskHistoryReader = { load: async () => { throw new Error("root_task_history_scope_invalid") } }
     await expect(appendCanonicalRootTaskHistory({ snapshot, reader, request })).rejects.toThrow("root_task_history_scope_invalid")

@@ -78,6 +78,20 @@ describe("canonical Turn context builder", () => {
     expect(calls).toEqual([])
   })
 
+  it("passes cross-session history scope only from the server-configured builder input", async () => {
+    const reader: DirectRootTaskHistoryReader = { load: vi.fn(async () => []) }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected history reader avoids a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2, planningEnabled: true,
+      selectedJobMode: false, crossSessionRootTaskHistoryEnabled: true, rootTaskHistoryDirectReader: reader,
+    })
+
+    await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-a",
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, now })
+
+    expect(reader.load).toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: true }))
+  })
+
   it("adds bounded Root-task history as untrusted advisory context without changing current graph evidence", async () => {
     const outcomes: readonly ValidatedRootTaskHistoryOutcome[] = [{
       sourceTurnId: "private-earlier-turn", sourceRootTaskId: "private-earlier-root", terminalSequence: 12n,

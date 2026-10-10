@@ -211,6 +211,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       pool, store: inputStore, baseBuilder: options.contextBuilderFactory?.({ pool, scope: state.scope }), scope: state.scope, lease,
       rootTaskId: root.id, rootAttemptCount: root.attemptCount, rootInputId: state.rootInputId,
       planningEnabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,
+      crossSessionRootTaskHistoryEnabled: options.productionFlags?.crossSessionRootTaskHistoryEnabled === true && taskGraphPlanningEnabled && !selectedJobMode,
     })
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const engine = new TurnEngine({

@@ -30,6 +30,7 @@ type Input = Readonly<{
   rootInputId?: string
   planningEnabled: boolean
   selectedJobMode: boolean
+  crossSessionRootTaskHistoryEnabled?: boolean
   selectedJobMemories?: readonly SelectedJobMemoryRecord[]
   selectedJobId?: string
   selectedJobDirectHistoryReader?: DirectSelectedJobHistoryReader
@@ -81,7 +82,8 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       }
       if (rootTaskHistoryReader) snapshot = await appendCanonicalRootTaskHistory({
         snapshot, reader: rootTaskHistoryReader,
-        request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date() },
+        request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date(),
+          ...(input.crossSessionRootTaskHistoryEnabled && input.planningEnabled && !input.selectedJobMode ? { crossSessionRootTaskHistoryEnabled: true } : {}) },
       })
       return base.build({ ...request, snapshot, taskId: input.rootTaskId })
     },
