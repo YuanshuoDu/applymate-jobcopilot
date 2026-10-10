@@ -9783,13 +9783,34 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const graphReceiptRows = await pool!.query<{ id: string; type: string; payload: unknown }>(
                 `SELECT "id", "type", "payload" FROM "agent_events"
                  WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4
-                   AND "type" IN ('item.started', 'item.delta') AND "payload"->>'kind' = 'proposal'
+                   AND "type" IN ('task_graph.lifecycle', 'item.started', 'item.delta')
+                   AND "payload"->>'kind' IN ('proposal', 'lifecycle')
                    AND "payload"->>'revision' = $5::text`,
                 [discoveryOwner.sessionId, discoveryOwner.turnId, taskGraphItemId(currentOwner.rootTaskId), currentOwner.rootTaskId, graphSnapshotRevision],
               )
               const graphReceiptRow = graphReceiptRows.rows[0]
               const graphReceiptPayload = record(graphReceiptRow?.payload)
               const graphReceiptItem = record(graphReceiptPayload?.item)
+              expect(graphSnapshotRows.rows, "Discovery TaskGraph snapshot row was missing").toHaveLength(1)
+              expect(Number.isSafeInteger(graphSnapshotRevision), "Discovery TaskGraph snapshot revision was invalid").toBe(true)
+              expect(graphReceiptRows.rows, "Discovery current-revision TaskGraph receipt was missing or ambiguous").toHaveLength(1)
+              if (!graphSnapshot || !graphReceiptRow || !graphReceiptPayload || !graphReceiptItem) {
+                throw new Error("Discovery current-revision TaskGraph receipt payload was invalid")
+              }
+              expect(graphReceiptPayload.revision, "Discovery receipt revision did not match the graph snapshot").toBe(graphSnapshotRevision)
+              expect(graphReceiptItem.revision, "Discovery receipt item revision did not match the graph snapshot").toBe(graphSnapshotRevision)
+              expect(graphReceiptItem.content, "Discovery receipt item content did not match the graph snapshot").toEqual(graphSnapshot)
+              if (graphReceiptPayload.kind === "proposal") {
+                expect(["item.started", "item.delta"]).toContain(graphReceiptRow.type)
+                if (Object.hasOwn(graphReceiptPayload, "content")) {
+                  expect(graphReceiptPayload.content, "Discovery proposal content did not match the graph snapshot").toEqual(graphSnapshot)
+                }
+                if (graphReceiptRow.type === "item.delta") expect(Object.hasOwn(graphReceiptPayload, "content")).toBe(true)
+              } else if (graphReceiptPayload.kind === "lifecycle") {
+                expect(["item.delta", "task_graph.lifecycle"]).toContain(graphReceiptRow.type)
+              } else {
+                throw new Error("Discovery current-revision TaskGraph receipt kind was unsupported")
+              }
               const graphNodes: unknown[] = Array.isArray(graphSnapshot?.nodes) ? graphSnapshot.nodes : []
               const scoutNode = graphNodes.map(record).find(node => node?.key === "scout")
               const scoutVerification = record(scoutNode?.verification)
@@ -9797,15 +9818,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 ? scoutVerification.criteria.map(record).filter((criterion): criterion is RecordValue => criterion !== null) : []
               const candidateCriterion = scoutCriteria.find(criterion => criterion.id === "candidate-count")
               const candidateCheck = record(candidateCriterion?.check)
-              if (!graphSnapshot || !Number.isSafeInteger(graphSnapshotRevision) || graphReceiptRows.rows.length !== 1
-                || !graphReceiptRow || !graphReceiptPayload || !graphReceiptItem
-                || graphReceiptPayload.revision !== graphSnapshotRevision || graphReceiptItem.revision !== graphSnapshotRevision
-                || !Object.hasOwn(graphReceiptPayload, "content")
-                || !scoutNode || !scoutVerification || candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
+              if (!scoutNode || !scoutVerification) {
+                throw new Error("Discovery Scout verification contract was unavailable for the persisted mutation")
+              }
+              if (candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
                 throw new Error("Discovery Scout snapshot contract was unavailable for the persisted mutation")
               }
-              expect(graphReceiptItem.content).toEqual(graphSnapshot)
-              expect(graphReceiptPayload.content).toEqual(graphSnapshot)
               const changedGraphSnapshot: RecordValue = {
                 ...graphSnapshot,
                 nodes: graphNodes.map(value => {
@@ -9823,7 +9841,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               const changedGraphReceiptPayload: RecordValue = {
                 ...graphReceiptPayload,
-                content: changedGraphSnapshot,
+                ...(Object.hasOwn(graphReceiptPayload, "content") ? { content: changedGraphSnapshot } : {}),
                 item: { ...graphReceiptItem, content: changedGraphSnapshot },
               }
               const updateGraphSnapshot = async (content: RecordValue) => pool!.query(
@@ -9834,9 +9852,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const updateGraphReceipt = async (payload: RecordValue) => pool!.query(
                 `UPDATE "agent_events" SET "payload" = $1::jsonb
                  WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "itemId" = $5 AND "taskId" = $6
-                   AND "type" = $7 AND "payload"->>'kind' = 'proposal' AND "payload"->>'revision' = $8::text`,
+                   AND "type" = $7 AND "payload"->>'kind' = $8 AND "payload"->>'revision' = $9::text`,
                 [JSON.stringify(payload), graphReceiptRow.id, discoveryOwner.sessionId, discoveryOwner.turnId,
-                  taskGraphItemId(currentOwner.rootTaskId), currentOwner.rootTaskId, graphReceiptRow.type, graphSnapshotRevision],
+                  taskGraphItemId(currentOwner.rootTaskId), currentOwner.rootTaskId, graphReceiptRow.type,
+                  graphReceiptPayload.kind, graphSnapshotRevision],
               )
               try {
                 expect((await updateGraphReceipt(changedGraphReceiptPayload)).rowCount).toBe(1)
