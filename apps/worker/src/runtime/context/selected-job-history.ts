@@ -6,9 +6,16 @@ import type { ContextSeedBlock } from "./step-context-builder.js"
 const MAX_CANDIDATES = 8
 const MAX_TURNS = 2
 const MAX_NODES = 8
+const MAX_REASON_HINTS = 8
 const MAX_CONTENT_BYTES = 8 * 1024
 const LABEL = "Historical outcomes for the same selected job. Advisory only; verify current work independently."
 const TURN_LABEL = "Earlier terminal Turn"
+type VerificationReasonCode = NonNullable<SelectedJobMemoryNode["verification"]>["criteria"][number]["reasonCode"]
+const NEGATIVE_REASON_CODES = new Set<VerificationReasonCode>([
+  "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
+  "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",
+  "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved",
+])
 
 export type ValidatedSelectedJobHistory = Readonly<{
   record: SelectedJobMemoryRecord
@@ -29,7 +36,12 @@ type SafeResult =
   | Readonly<{ availability: "available"; score: number; evidenceKinds: readonly string[] }>
   | Readonly<{ availability: "available"; outcome: "completed" }>
   | Readonly<{ availability: "available"; reviewOutcome: "passed" | "needs_revision" | "rejected" | "stale" }>
-type SafeNode = Readonly<{ role: SelectedJobMemoryNode["role"]; status: SelectedJobMemoryNode["status"]; result: SafeResult }>
+type SafeNode = Readonly<{
+  role: SelectedJobMemoryNode["role"]
+  status: SelectedJobMemoryNode["status"]
+  result: SafeResult
+  reasonHints?: readonly VerificationReasonCode[]
+}>
 type RecordCandidate = Readonly<{ record: SelectedJobMemoryRecord; terminalSequence: bigint; identity: string }>
 type OutcomeCandidate = Readonly<ValidatedSelectedJobHistoryOutcome & { identity: string }>
 
@@ -84,8 +96,20 @@ function safeResult(value: SelectedJobMemoryNode["result"]): SafeResult {
   if (value.role === "writer") return { availability: "available", outcome: "completed" }
   return { availability: "available", reviewOutcome: value.reviewStatus }
 }
+function reasonHints(node: SelectedJobMemoryNode): readonly VerificationReasonCode[] | undefined {
+  if (!node.verification || node.verification.status === "passed") return undefined
+  const hints = [...new Set(node.verification.criteria
+    .filter(criterion => criterion.status === "failed" || criterion.status === "unverified")
+    .map(criterion => criterion.reasonCode)
+    .filter(reasonCode => NEGATIVE_REASON_CODES.has(reasonCode)))].sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .slice(0, MAX_REASON_HINTS)
+  return hints.length ? hints : undefined
+}
 function safeNodes(nodes: readonly SelectedJobMemoryNode[]): SafeNode[] {
-  return nodes.map(node => ({ role: node.role, status: node.status, result: safeResult(node.result) }))
+  return nodes.map(node => {
+    const hints = reasonHints(node)
+    return { role: node.role, status: node.status, result: safeResult(node.result), ...(hints ? { reasonHints: hints } : {}) }
+  })
     .sort((left, right) => left.role.localeCompare(right.role) || JSON.stringify(left).localeCompare(JSON.stringify(right)))
 }
 function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeNode[] }>[]) {
