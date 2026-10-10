@@ -7,6 +7,7 @@ import {
   type ModelResponse,
   type ModelStreamEvent,
 } from "@jobcopilot/agent-model"
+import { estimateSharedAiCost } from "@jobcopilot/shared"
 import type { HarnessModelRuntime } from "./harness-model.js"
 import { defaultAuthorization, modelWithUsage } from "./canonical-turn-runtime-model.js"
 import { createHarnessModelRuntime, type HarnessFetch } from "./harness-model.js"
@@ -112,6 +113,29 @@ function fittingFallbackResponse(): Response {
     'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}',
     'event: message_stop\ndata: {"type":"message_stop"}',
   ].join("\n\n"), { headers: { "Content-Type": "text/event-stream" } })
+}
+
+function failedMinimaxStreamResponse(): Response {
+  const data = JSON.stringify({
+    choices: [{ delta: {
+      content: "Primary partial text",
+      tool_calls: [{ index: 0, id: "primary-call", type: "function", function: { name: "jobs.search", arguments: '{"query":"hidden"}' } }],
+    } }],
+    usage: { prompt_tokens: 29, completion_tokens: 31 },
+  })
+  let emitted = false
+  return new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!emitted) {
+        emitted = true
+        controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`))
+      } else controller.error(new Error("provider stream interrupted"))
+    },
+  }), { headers: { "Content-Type": "text/event-stream" } })
+}
+
+function expectedCost(provider: string, model: string, inputTokens: number, outputTokens: number): number {
+  return estimateSharedAiCost({ provider, model, credentialSource: "user", inputTokens, outputTokens, latencyMs: 0, status: "success" })
 }
 
 describe("canonical turn runtime usage model", () => {
@@ -298,6 +322,57 @@ describe("canonical turn runtime usage model", () => {
     }))
   })
 
+  it("settles failed-route usage before rerouting and keeps its buffered output private", async () => {
+    const order: string[] = [], settlements = new Map<string, ReturnType<typeof vi.fn>>()
+    const fetcher: HarnessFetch = vi.fn(async url => {
+      const provider = url.includes("anthropic") ? "anthropic" : "minimax"
+      order.push(`fetch:${provider}`)
+      return provider === "minimax" ? failedMinimaxStreamResponse() : fittingFallbackResponse()
+    })
+    const modelRuntime = harnessRuntime(fetcher, [5000, 5000])
+    const authorize = vi.fn(async input => {
+      order.push(`authorize:${input.provider}`)
+      const settle = vi.fn(async () => { order.push(`settle:${input.provider}`) })
+      settlements.set(input.provider, settle)
+      return { settle, release: vi.fn() }
+    })
+    const wrapped = modelWithUsage(modelRuntime, lease, authorize)
+
+    const events = await collect(wrapped.stream(request()))
+    const minimaxCost = expectedCost("minimax", "MiniMax-M3", 29, 31)
+    const anthropicCost = expectedCost("anthropic", "claude-sonnet-5", 3, 4)
+    expect(events).toContainEqual({ type: "text_delta", text: "Fitting fallback" })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "text_delta", text: "Primary partial text" }))
+    expect(events.some(event => event.type.startsWith("tool_") && "callId" in event && event.callId === "primary-call")).toBe(false)
+    expect(order).toEqual([
+      "authorize:minimax", "fetch:minimax", "settle:minimax",
+      "authorize:anthropic", "fetch:anthropic", "settle:anthropic",
+    ])
+    expect(settlements.get("minimax")).toHaveBeenCalledOnce()
+    expect(settlements.get("minimax")).toHaveBeenCalledWith({
+      status: "error", inputTokens: 29, outputTokens: 31, estimatedCostUsd: minimaxCost, errorCode: "provider_rerouted",
+    })
+    expect(settlements.get("anthropic")).toHaveBeenCalledOnce()
+    expect(settlements.get("anthropic")).toHaveBeenCalledWith({
+      status: "success", inputTokens: 3, outputTokens: 4, estimatedCostUsd: anthropicCost,
+    })
+    expect(minimaxCost).not.toBe(anthropicCost)
+  })
+
+  it("settles final Harness failure with observed usage exactly once", async () => {
+    const settle = vi.fn(), release = vi.fn()
+    const modelRuntime = harnessRuntime(vi.fn(async () => failedMinimaxStreamResponse()), [5000])
+    const wrapped = modelWithUsage(modelRuntime, lease, async () => ({ settle, release }))
+
+    await expect(collect(wrapped.stream(request()))).rejects.toMatchObject({ code: "provider_error" })
+    expect(settle).toHaveBeenCalledTimes(1)
+    expect(settle).toHaveBeenCalledWith({
+      status: "error", inputTokens: 29, outputTokens: 31,
+      estimatedCostUsd: expectedCost("minimax", "MiniMax-M3", 29, 31), errorCode: "provider_error",
+    })
+    expect(release).not.toHaveBeenCalled()
+  })
+
   it("does not reroute a Harness stream when authorization fails", async () => {
     const diagnostics: string[] = [], fetcher = vi.fn(async () => { throw new Error("authorization reached fetch") })
     const runtime = harnessRuntime(fetcher, [5000, 5000], () => { diagnostics.push("preflight") })
@@ -320,7 +395,7 @@ describe("canonical turn runtime usage model", () => {
     await expect(collect(wrapped.stream(request()))).rejects.toMatchObject({ code: "provider_error" })
     expect(order).toEqual(["preflight", "authorize", "fetch"])
     expect(settlement).toHaveBeenCalledOnce()
-    expect(settlement).toHaveBeenCalledWith(expect.objectContaining({ status: "error" }))
+    expect(settlement).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_error" })
     expect(release).not.toHaveBeenCalled()
   })
 
