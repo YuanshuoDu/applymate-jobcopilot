@@ -45,16 +45,21 @@ export function markSchedulerTaskFailure(
   retryBaseDelayMs: number,
   retryMaxDelayMs: number,
   retryAfterAt?: number,
+  retryAfterObservedAt?: number,
 ): void {
   state.consecutiveFailures += 1
   const baseDelay = Math.max(taskIntervalMs, retryBaseDelayMs)
   const maxDelay = Math.max(baseDelay, retryMaxDelayMs)
   const exponent = Math.min(state.consecutiveFailures - 1, 30)
   const exponentialDelay = Math.min(maxDelay, baseDelay * 2 ** exponent)
-  const boundedHint = typeof retryAfterAt === "number" && Number.isFinite(retryAfterAt)
-    ? Math.min(Math.max(0, retryAfterAt - now), Math.max(0, retryMaxDelayMs))
+  const retryAfterDeadline = typeof retryAfterAt === "number" && Number.isFinite(retryAfterAt) ? retryAfterAt : undefined
+  const retryAnchorAt = retryAfterDeadline !== undefined && typeof retryAfterObservedAt === "number" && Number.isFinite(retryAfterObservedAt)
+    ? retryAfterObservedAt
+    : now
+  const boundedHint = retryAfterDeadline !== undefined
+    ? Math.min(Math.max(0, retryAfterDeadline - retryAnchorAt), Math.max(0, retryMaxDelayMs))
     : 0
-  state.nextAttemptAt = now + Math.min(maxDelay, Math.max(exponentialDelay, boundedHint))
+  state.nextAttemptAt = (retryAfterDeadline !== undefined ? retryAnchorAt : now) + Math.min(maxDelay, Math.max(exponentialDelay, boundedHint))
   state.lastFailure = failure
 }
 
