@@ -1361,27 +1361,30 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
   it("redelivers the retained completed BullMQ job ID without repeating persisted Turn work", async () => {
     const uuidNonce = randomUUID()
-    const suffix = alphaOnlyUuidSuffix(uuidNonce)
-    ids.suffix = suffix
-    ids.sessionId = `duplicate-redelivery-session-${uuidNonce}`
+    const redeliveryIds: FixtureIds = {
+      ...ids,
+      suffix: alphaOnlyUuidSuffix(uuidNonce),
+      sessionId: `duplicate-redelivery-session-${uuidNonce}`,
+    }
+    const suffix = redeliveryIds.suffix
     const readCallId = `duplicate-read:${suffix}`
     const readJobId = DUPLICATE_REDELIVERY_JOB_ID
     const readJobRole = `Fixture Engineer ${suffix}`
     const readJobDescription = `recruiter-${suffix}@example.com +353 87 123 4567`
-    fixtureSessionIds.add(ids.sessionId)
+    fixtureSessionIds.add(redeliveryIds.sessionId)
     fixtureJobIds.add(readJobId)
     await pool!.query(
       `INSERT INTO "Job" ("id", "userId", "company", "role", "description", "updatedAt")
        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
-      [readJobId, ids.userId, `Fixture Employer ${suffix}`, readJobRole, readJobDescription],
+      [readJobId, redeliveryIds.userId, `Fixture Employer ${suffix}`, readJobRole, readJobDescription],
     )
     await pool!.query(
       `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
        VALUES ($1, $2, 'Exercise same-ID Turn redelivery', 'running', 'test', CURRENT_TIMESTAMP)`,
-      [ids.sessionId, ids.userId],
+      [redeliveryIds.sessionId, redeliveryIds.userId],
     )
 
-    commandAcceptance = startWorker("accept-message", ids)
+    commandAcceptance = startWorker("accept-message", redeliveryIds)
     const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
     await waitForExit(commandAcceptance, { stage: "duplicate-redelivery-command-acceptance", pid: commandAcceptance.pid })
     expect(commandAcceptance.exitCode).toBe(0)
@@ -1393,33 +1396,33 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       disposition: "duplicate",
       originalDisposition: "started",
     })
-    ids.turnId = accepted.accepted.turnId
-    turnFixtureIds.add(ids.turnId)
+    redeliveryIds.turnId = accepted.accepted.turnId
+    turnFixtureIds.add(redeliveryIds.turnId)
 
     // Hold recovery's real BullMQ dispatch until the production Worker has
     // attached its completion observer, so the first delivery is deterministic.
     await turnQueue!.pause()
     turnQueuePaused = true
-    workerOne = startWorker("duplicate-turn-redelivery", ids)
+    workerOne = startWorker("duplicate-turn-redelivery", redeliveryIds)
     await waitForLine(workerOne, "DUPLICATE_WORKER_READY")
-    const jobId = turnJobKey!(ids.turnId)
+    const jobId = turnJobKey!(redeliveryIds.turnId)
     const pendingJob = await waitForQueueJob(turnQueue!, jobId)
     expect(pendingJob.id).toBe(jobId)
-    expect(pendingJob.data).toMatchObject({ turnId: ids.turnId, sessionId: ids.sessionId })
+    expect(pendingJob.data).toMatchObject({ turnId: redeliveryIds.turnId, sessionId: redeliveryIds.sessionId })
     await turnQueue!.resume()
     turnQueuePaused = false
 
     const firstDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_1 ")
     if (firstDelivery !== `DUPLICATE_DELIVERY_FINISHED_1 ${jobId} completed none`) {
-      const runtime = await duplicateRedeliveryFailureSnapshot(pool!, turnQueue!, ids.turnId, ids.sessionId, jobId, workerOne)
+      const runtime = await duplicateRedeliveryFailureSnapshot(pool!, turnQueue!, redeliveryIds.turnId, redeliveryIds.sessionId, jobId, workerOne)
       throw new Error(`First production Turn delivery did not complete: ${firstDelivery}; runtime=${runtime}`)
     }
-    await waitForTurnStatus(pool!, ids.turnId, "completed", 20_000, workerOne)
+    await waitForTurnStatus(pool!, redeliveryIds.turnId, "completed", 20_000, workerOne)
     const completedJob = await waitForQueueJob(turnQueue!, jobId)
     expect(completedJob.id).toBe(jobId)
     expect(await completedJob.getState()).toBe("completed")
     const originalTimestamp = completedJob.timestamp
-    const firstReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
+    const firstReceipt = await duplicateRedeliveryReceipt(pool!, redeliveryIds.turnId, redeliveryIds.sessionId, readCallId)
     expect(firstReceipt.rows[0]).toMatchObject({
       status: "completed",
       leaseOwnerId: null,
@@ -1475,7 +1478,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
     const replayDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_2 ")
     expect(replayDelivery).toBe(`DUPLICATE_DELIVERY_FINISHED_2 ${jobId} skipped lease_not_available`)
-    const finalReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
+    const finalReceipt = await duplicateRedeliveryReceipt(pool!, redeliveryIds.turnId, redeliveryIds.sessionId, readCallId)
     expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0])
     expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(firstModelCalls)
     expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([
