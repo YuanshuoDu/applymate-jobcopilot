@@ -227,6 +227,202 @@ describe("automation scheduler", () => {
     expect(request).toHaveBeenCalledTimes(3);
   });
 
+  it.each([429, 503])("honors delay-seconds on HTTP %i responses", async (status) => {
+    let currentTime = 0;
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("retry later", { status, headers: { "Retry-After": "3" } }))
+      .mockResolvedValue(new Response("ok"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs: 5_000,
+      now: () => currentTime,
+      request,
+      recordUsage: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await scheduler.run();
+    currentTime = 2_999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = 3_000;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(scheduler.status().lastError).toBeNull();
+  });
+
+  it.each([429, 503])("honors HTTP-date on HTTP %i responses", async (status) => {
+    const startTime = Date.parse("Mon, 01 Jan 2024 00:00:00 GMT");
+    let currentTime = startTime;
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("retry later", {
+        status,
+        headers: { "Retry-After": new Date(startTime + 5_000).toUTCString() },
+      }))
+      .mockResolvedValue(new Response("ok"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs: 10_000,
+      now: () => currentTime,
+      request,
+      recordUsage: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await scheduler.run();
+    currentTime = startTime + 4_999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = startTime + 5_000;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(scheduler.status().lastError).toBeNull();
+  });
+
+  it.each([
+    ["RFC850", "Sunday, 06-Nov-94 08:49:35 GMT"],
+    ["asctime", "Sun Nov  6 08:49:35 1994"],
+  ])("honors %s Retry-After values through the scheduler", async (_format, retryAfter) => {
+    const startTime = Date.parse("Sun, 06 Nov 1994 08:49:30 GMT");
+    let currentTime = startTime;
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("retry later", { status: 429, headers: { "Retry-After": retryAfter } }))
+      .mockResolvedValue(new Response("ok"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs: 10_000,
+      now: () => currentTime,
+      request,
+      recordUsage: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await scheduler.run();
+    currentTime = startTime + 4_999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = startTime + 5_000;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors leap-second Retry-After as the next representable UTC second", async () => {
+    const startTime = Date.parse("Sun, 06 Nov 1994 08:49:59 GMT");
+    let currentTime = startTime;
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("retry later", { status: 429, headers: { "Retry-After": "Sun Nov  6 08:49:60 1994" } }))
+      .mockResolvedValue(new Response("ok"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs: 10_000,
+      now: () => currentTime,
+      request,
+      recordUsage: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await scheduler.run();
+    currentTime = startTime + 999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = startTime + 1_000;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { retryAfter: "3", telemetryDelayMs: 1_000, retryMaxDelayMs: 5_000, expectedDueAt: 3_000 },
+    { retryAfter: "60", telemetryDelayMs: 2_000, retryMaxDelayMs: 4_000, expectedDueAt: 4_000 },
+  ])("anchors Retry-After to response time across telemetry delay (%#)", async ({ retryAfter, telemetryDelayMs, retryMaxDelayMs, expectedDueAt }) => {
+    let currentTime = 0;
+    let advancedClock = false;
+    const recordUsage = vi.fn().mockImplementation(async () => {
+      if (!advancedClock) {
+        currentTime += telemetryDelayMs;
+        advancedClock = true;
+      }
+    });
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("retry later", { status: 429, headers: { "Retry-After": retryAfter } }))
+      .mockResolvedValue(new Response("ok"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs,
+      now: () => currentTime,
+      request,
+      recordUsage,
+    });
+
+    await scheduler.run();
+    currentTime = expectedDueAt - 1;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = expectedDueAt;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("caps Retry-After at the configured maximum delay", async () => {
+    let currentTime = 0;
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("retry later", { status: 429, headers: { "Retry-After": "60" } }))
+      .mockResolvedValue(new Response("ok"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs: 4_000,
+      now: () => currentTime,
+      request,
+      recordUsage: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await scheduler.run();
+    currentTime = 3_999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = 4_000;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores Retry-After for statuses other than 429 and 503", async () => {
+    let currentTime = 0;
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("server error", { status: 500, headers: { "Retry-After": "60" } }))
+      .mockResolvedValue(new Response("ok"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs: 4_000,
+      now: () => currentTime,
+      request,
+      recordUsage: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await scheduler.run();
+    currentTime = 999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = 1_000;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it("does not turn usage telemetry failures into scheduler failures", async () => {
     const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
     const recordUsage = vi.fn().mockRejectedValue(new Error("telemetry database unavailable"));
