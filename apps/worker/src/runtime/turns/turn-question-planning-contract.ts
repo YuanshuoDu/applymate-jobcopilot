@@ -1,3 +1,5 @@
+import { STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS } from "../subagents/steering-reconciliation-contract.js"
+
 const EVENT_TYPE = "agent.plan.clarification" as const
 const SCHEMA_VERSION = "agent-harness.v2.plan-clarification.v1" as const
 const MAX_CHECKPOINT_IDS = 256
@@ -80,7 +82,7 @@ export function parseTurnQuestionPlanningReceipt(value: unknown): TurnQuestionPl
     || typeof row.waitId !== "string" || !/^[a-f0-9]{64}$/.test(row.waitId)
     || row.questionItemId !== `agent-wait:question:${row.waitId}`
     || !(row.observedPlanRevision === null || revision(row.observedPlanRevision)) || !revision(row.graphRevisionAtAsk)
-    || !dense(row.pendingSteers)) return undefined
+    || !dense(row.pendingSteers, STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS)) return undefined
   const pendingSteers: TurnQuestionPlanningPendingSteer[] = []
   const seen = new Set<string>(), sequences = new Set<string>()
   for (const raw of row.pendingSteers) {
