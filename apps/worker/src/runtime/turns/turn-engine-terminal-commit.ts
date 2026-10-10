@@ -7,6 +7,7 @@ import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
 import { steeringReconciliationRecoveryError, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
+import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { assertPlanningRootHasNoUnresolvedSteering } from "../subagents/pg-store-create.js"
 
@@ -181,7 +182,11 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       const decision = await finalizationGuard(client, input)
       if (!decision || typeof decision !== "object" || decision.ok !== true) {
         if (decision && decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER && typeof decision.feedback === "string" && decision.feedback.length <= 512) {
-          throw Object.assign(new Error(decision.blocker), { name: "TaskGraphVerificationRecovery", blocker: decision.blocker, feedback: decision.feedback })
+          const stamped: unknown = Reflect.get(decision, TASK_GRAPH_RECOVERY_REVISION)
+          const graphRevision = typeof stamped === "number" && Number.isSafeInteger(stamped) && stamped >= 0 ? stamped : null
+          const recovery = Object.assign(new Error(decision.blocker), { name: "TaskGraphVerificationRecovery", blocker: decision.blocker, feedback: decision.feedback })
+          Object.defineProperty(recovery, "recoveryFeedback", { value: tagTaskGraphRepairRecovery(decision.feedback, graphRevision) })
+          throw recovery
         }
         if (decision && decision.blocker === STEERING_RECONCILIATION_BLOCKER && decision.feedback === STEERING_RECONCILIATION_FEEDBACK) {
           throw steeringReconciliationRecoveryError()

@@ -18,11 +18,13 @@ import { classifyTurnFailure } from "./dlq.js"
 import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
 import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { steeringReconciliationRecoveryError } from "./turn-execution-completion-gate.js"
+import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -30,6 +32,7 @@ const profile = {
   supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" as const,
 }
 const lateSteerText = "Prioritize senior engineering roles in Dublin."
+const taskGraphFeedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCount = 1): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
@@ -1404,9 +1407,13 @@ describe("owner-agnostic turn execution loop", () => {
 
   it("replans in the same root loop after a TaskGraph evidence denial", async () => {
     let checks = 0
-    const gate = vi.fn(async () => ++checks === 1
-      ? ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "node=scout criterion=candidate-present status=unverified reasonCode=canonical_evidence_missing repair=missing" })
-      : ({ ok: true as const }))
+    const denialFeedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`
+    const gate = vi.fn(async () => {
+      if (++checks > 1) return { ok: true as const }
+      const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: denialFeedback }
+      Object.defineProperty(denial, TASK_GRAPH_RECOVERY_REVISION, { value: 1, enumerable: true })
+      return denial
+    })
     const root = fixture(identity("turn", "root-1"), undefined, [], gate)
     const snapshots: TurnExecutionOptions["snapshot"][] = []
     const build = root.options.contextBuilder.build
@@ -1419,8 +1426,9 @@ describe("owner-agnostic turn execution loop", () => {
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "completed", stepCount: 3 })
     expect(root.requests).toHaveLength(3)
-    expect(snapshots[2]?.system.at(-1)?.content).toContain("node=scout criterion=candidate-present status=unverified reasonCode=canonical_evidence_missing repair=missing")
-    expect(root.requests[2]?.messages.some(message => message.role === "system" && JSON.stringify(message.content).includes("node=scout criterion=candidate-present status=unverified reasonCode=canonical_evidence_missing repair=missing"))).toBe(true)
+    expect(snapshots[2]?.system.at(-1)?.content).toContain("at graph revision 1:")
+    expect(snapshots[2]?.system.at(-1)?.content).toContain("nodeOrdinal=1 criterionOrdinal=1")
+    expect(root.requests[2]?.messages.some(message => message.role === "system" && JSON.stringify(message.content).includes("nodeOrdinal=1 criterionOrdinal=1"))).toBe(true)
     expect(root.events.some(event => event.type === "final.rejected")).toBe(true)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
@@ -1588,20 +1596,54 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
-  it("recovers inside the loop when atomic TaskGraph finalization loses a race", async () => {
+  it.each([
+    { label: "validated revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, 23), expectedRevision: 23 },
+    { label: "missing revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, null), expectedRevision: null },
+    { label: "invalid revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, null).replace('"graphRevision":null', '"graphRevision":-1'), expectedRevision: null },
+  ])("recovers inside the loop when atomic TaskGraph finalization loses a race with a $label", async ({ recoveryFeedback, expectedRevision }) => {
     const root = fixture(identity("turn", "root-1"))
+    const feedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`
     let denyOnce = true
     const persist = root.options.store.recordFinalResponse!
     root.options.store.recordFinalResponse = async input => {
-      if (input.terminal && denyOnce) { denyOnce = false; throw Object.assign(new Error("race"), { name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback: "scout:candidate-present" }) }
+      if (input.terminal && denyOnce) {
+        denyOnce = false
+        const recovery = Object.assign(new Error("race"), { name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback })
+        Object.defineProperty(recovery, "recoveryFeedback", { value: recoveryFeedback })
+        throw recovery
+      }
       return persist(input)
     }
+    const build = root.options.contextBuilder.build
+    root.options.contextBuilder.build = async request => {
+      const context = await build(request)
+      const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+        role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+      return { ...context, blocks: [...system, ...context.blocks] }
+    }
+
     const result = await runTurnExecutionLoop(root.options)
+
     expect(result).toMatchObject({ status: "completed", stepCount: 3 })
     expect(root.requests).toHaveLength(3)
-    expect(root.events.some(event => event.type === "final.rejected" && event.id.includes("task-graph-race"))).toBe(true)
+    const nextRequest = JSON.stringify(root.requests[2]?.messages)
+    if (expectedRevision === null) {
+      expect(nextRequest).toContain("no validated graph revision is available")
+      expect(nextRequest).toContain("no node or criterion ordinal from this denial is actionable")
+      expect(nextRequest).not.toContain("nodeOrdinal=1")
+    } else {
+      expect(nextRequest).toContain(`at graph revision ${expectedRevision}:`)
+      expect(nextRequest).toContain("These ordinals apply only to this graph revision.")
+      expect(nextRequest).toContain("nodeOrdinal=1 criterionOrdinal=1")
+    }
+    const rejection = root.events.find(event => event.type === "final.rejected" && event.id.includes("task-graph-race"))
+    expect(rejection?.payload).toEqual({ code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback, taskId: "root-1" })
+    expect(JSON.stringify(rejection)).not.toContain("task-graph-repair-recovery.v1:")
+    expect(JSON.stringify(rejection)).not.toContain("graphRevision")
     expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "turn.no_progress")).toBe(false)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
   })
 
   it("recovers from the atomic unresolved-steering race and asks a fresh model step", async () => {
@@ -1765,6 +1807,149 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(1)
     expect(root.stepStatuses).toEqual(["failed"])
     expect(root.events.some(event => event.type === "turn.failed")).toBe(true)
+  })
+
+  it("retires old denial guidance on an accepted plan and stops unchanged repeats after observing its revision", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "seed-search", content: {
+      toolCallId: "seed-search", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed",
+      output: { jobs: [{ id: "job-1" }] }, errorCode: null,
+    } }]), inputStore = new LateSteerInputClaimStore()
+    const feedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met`
+    const humanHistory = "The user clarified that Dublin remains the preferred location for senior engineering roles."
+    const verifiedNode: TaskGraphCurrentState["nodes"][number] = {
+      key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return verified links"], dependsOn: [],
+      taskId: "child-research", status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      verificationCriterionIds: ["candidate-count"], verificationReport: {
+        verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+        criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
+      },
+    }
+    let graph: TaskGraphCurrentState = { revision: 5, nodes: [verifiedNode] }, calls = 0, denials = 0, contextBuilds = 0
+    const builtRevisions: Array<number | undefined> = [], dispatchedCalls: string[] = []
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => {
+      denials += 1
+      if (denials > 1) return { ok: true }
+      const decision = { ok: false as const, blocker: "task_graph_verification_unverified", feedback }
+      Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: 5, enumerable: true })
+      return decision
+    }
+    const turnStore = root.options.store, baseBuilder = new StepContextBuilder(inputStore)
+    const baseModel = root.options.model
+    const beforeStep = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, graph))
+    const afterPlan = vi.fn(async snapshot => {
+      graph = { revision: 6, nodes: [verifiedNode] }
+      return mergeTaskGraphCurrentObservation(snapshot, graph)
+    })
+    root.options = {
+      ...root.options,
+      completionGate,
+      snapshot: {
+        ...root.options.snapshot,
+        steerHistory: [{ id: "human-clarification", content: humanHistory }],
+      },
+      tools: [{ name: "agent.plan", version: "1" }, { name: "jobs.search", version: "1" }],
+      refreshTaskGraphBeforeStep: beforeStep,
+      refreshTaskGraphAfterPlan: afterPlan,
+      store: { ...turnStore, startStep: async input => {
+        inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+        return turnStore.startStep(input)
+      } },
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build({
+          scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+          stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+          steeringMarkerState: request.steeringMarkerState,
+        })
+        builtRevisions.push(context.taskGraphRevision)
+        if (++contextBuilds === 1) inputStore.acceptSteer()
+        return context
+      } },
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        calls += 1
+        if (calls === 1) {
+          yield { type: "text_delta", text: "candidate-before-replan" }
+          yield { type: "completed", finishReason: "stop" }
+          return
+        }
+        if (calls === 2) {
+          yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan", arguments: { expectedRevision: 5, nodes: [] } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "tool_call_completed", callId: `search-call-${calls}`, name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } },
+      executeTool: async ({ call }) => {
+        dispatchedCalls.push(call.toolName)
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+          output: call.toolName === "agent.plan" ? { status: "accepted", revision: 6 } : { job: "job-1" }, errorCode: null }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 5, toolCallCount: 3 })
+    const second = JSON.stringify(root.requests[1]?.messages).replaceAll("\\\"", "\"")
+    const third = JSON.stringify(root.requests[2]?.messages).replaceAll("\\\"", "\"")
+    const last = JSON.stringify(root.requests[4]?.messages).replaceAll("\\\"", "\"")
+    const rejection = root.events.find(event => event.type === "final.rejected")?.payload
+    const noProgress = root.events.find(event => event.type === "turn.no_progress")?.payload
+
+    expect(root.requests).toHaveLength(5)
+    expect(builtRevisions).toEqual([5, 5, 6, 6, 6])
+    expect(beforeStep).toHaveBeenCalledTimes(5)
+    expect(afterPlan).toHaveBeenCalledOnce()
+    expect(dispatchedCalls).toEqual(["agent.plan", "jobs.search", "jobs.search"])
+    expect(second).toContain(lateSteerText)
+    expect(second).toContain("at graph revision 5")
+    expect(second).toContain("nodeOrdinal=1")
+    expect(third).toContain('"revision":6')
+    expect(third).not.toContain("at graph revision 5")
+    expect(third).not.toContain("nodeOrdinal=1")
+    expect(third).toContain(humanHistory)
+    expect(third).toContain('"verificationReport"')
+    expect(third).toContain("a".repeat(64))
+    expect(last).not.toContain("at graph revision 5")
+    expect(last).not.toContain("nodeOrdinal=1")
+    expect(rejection).toMatchObject({ feedback })
+    expect(JSON.stringify(rejection)).not.toContain("task-graph-repair-recovery.v1")
+    expect(JSON.stringify(noProgress)).not.toContain("task-graph-repair-recovery.v1")
+    expect(JSON.stringify(root.finalResponses)).not.toContain("task-graph-repair-recovery.v1")
+  })
+
+  it("shows fixed generic recovery on the next request when the denial revision is unknown", async () => {
+    const feedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=8 criterionOrdinal=8 status=unverified reasonCode=canonical_evidence_missing`
+    let checks = 0
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ++checks === 1
+      ? ({ ok: false, blocker: "task_graph_verification_unverified", feedback })
+      : ({ ok: true })
+    const root = fixture(identity("turn", "root-1"), undefined, [], completionGate)
+    const baseBuilder = root.options.contextBuilder
+    root.options = {
+      ...root.options,
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: 4, nodes: [] }),
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build(request)
+        const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+          role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+        return { ...context, blocks: [...system, ...context.blocks] }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const nextRequest = JSON.stringify(root.requests[2]?.messages).replaceAll("\\", "")
+    const rejection = root.events.find(event => event.type === "final.rejected")?.payload
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(3)
+    expect(nextRequest).toContain("no validated graph revision is available")
+    expect(nextRequest).toContain('"revision":4')
+    expect(nextRequest).not.toContain("nodeOrdinal=")
+    expect(nextRequest).not.toContain("criterionOrdinal=")
+    expect(nextRequest).not.toContain("private-criterion")
+    expect(nextRequest).not.toContain("task-graph-repair-recovery.v1")
+    expect(rejection).toMatchObject({ feedback })
   })
 
 

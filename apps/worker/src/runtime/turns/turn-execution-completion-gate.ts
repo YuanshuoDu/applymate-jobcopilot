@@ -14,16 +14,14 @@ import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-ver
 import { validateRoleResult } from "../subagents/role-results.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 
 type CompletionGateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate" | "isOwnershipLost">
 type CompletionGateWriter = Pick<TurnExecutionEventWriter, "append">
 export const TASK_GRAPH_VERIFICATION_BLOCKER = "task_graph_verification_unverified"
 export const NATIVE_VERIFICATION_PENDING_BLOCKER = "native_verification_pending"
 export function completionRecoverySnapshot(snapshot: StepContextSnapshot, stepId: string, feedback: string): StepContextSnapshot {
-  const system = feedback === STEERING_RECONCILIATION_FEEDBACK
-    ? `A server-owned completion requirement blocked this answer: ${feedback} Review the current user instructions and use available tools to resolve the stated blocker before answering again.`
-    : `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.`
-  return { ...snapshot, system: [...snapshot.system, { id: `completion-recovery:${stepId}`, content: system }] }
+  return applyCompletionRecovery(snapshot, stepId, feedback)
 }
 const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const REPAIR_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1"
@@ -66,19 +64,15 @@ function feedbackText(code: GateFeedbackCode | undefined, details: readonly Gate
     return `nodeOrdinal=${item.nodeOrdinal}${criterion} status=${item.status} reasonCode=${item.reasonCode}${repair}`
   })
   const parts = [...(code ? [`issue=${code}`] : []), ...rendered]
-  let feedback = TASK_GRAPH_FEEDBACK
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index]!, remaining = parts.length - index - 1
-    const notice = remaining ? ` (${remaining} more feedback items omitted; inspect TaskGraph before retrying.)` : ""
-    const next = `${feedback} ${part}${notice}`
-    if (next.length > 512) {
-      const omitted = ` (${parts.length - index} feedback items omitted; inspect TaskGraph before retrying.)`
-      feedback += omitted
-      break
-    }
-    feedback += ` ${part}`
+  const render = (included: number) => `${TASK_GRAPH_FEEDBACK}${parts.slice(0, included).map(part => ` ${part}`).join("")}`
+  const complete = render(parts.length)
+  if (complete.length <= 512) return complete
+  for (let included = parts.length - 1; included >= 0; included -= 1) {
+    const omitted = ` (${parts.length - included} feedback items omitted; inspect TaskGraph before retrying.)`
+    const truncated = `${render(included)}${omitted}`
+    if (truncated.length <= 512) return truncated
   }
-  return feedback
+  return `${TASK_GRAPH_FEEDBACK} (${parts.length} feedback items omitted; inspect TaskGraph before retrying.)`
 }
 function row(value: unknown): Record<string, unknown> {
   let parsed = value
@@ -109,7 +103,12 @@ function repairIds(node: StoredTaskGraphNode, result: unknown, target: StoredTas
 }
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
 export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
-  const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => ({ ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: feedbackText(code, details) })
+  let graphRevision: number | null = null
+  const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => {
+    const decision = { ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: feedbackText(code, details) }
+    if (graphRevision !== null) Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: graphRevision, enumerable: true })
+    return decision
+  }
   const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId, parentTaskId: rootTaskId }
   try {
     const loaded = await loadTaskGraph(client, scope, true)
@@ -117,6 +116,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
       const plans = await client.query(`SELECT 1 FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId" WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4 AND event."payload"->>'kind' IN ('proposal', 'native_command') AND session."userId" = $5 AND turn."userId" = $5 LIMIT 1`, [lease.sessionId, lease.turnId, taskGraphItemId(rootTaskId), rootTaskId, lease.userId])
       return plans.rows.length ? deny() : { ok: true }
     }
+    graphRevision = loaded.item && Number.isSafeInteger(loaded.item.revision) && loaded.item.revision >= 1 ? loaded.item.revision : null
     const { nodes } = loaded.snapshot, reports = new Map<string, GateReport>()
     for (const node of nodes) {
       if (node.verificationDisposition === "legacy_unverified" && !(nativeVerificationPassed && node.nativeDelegation)) return deny("legacy_unverified")
@@ -165,7 +165,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
       }
     }
     return { ok: true }
-  } catch { return deny() }
+  } catch { graphRevision = null; return deny() }
 }
 
 export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<{ feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity } | { waitId: string } | undefined> {
@@ -208,9 +208,13 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
   const feedback = decision.blocker === STEERING_RECONCILIATION_BLOCKER ? STEERING_RECONCILIATION_FEEDBACK : decision.feedback
   const code = decision.blocker === STEERING_RECONCILIATION_BLOCKER ? STEERING_RECONCILIATION_BLOCKER : "business_precondition_failed"
   await writer.append("final.rejected", step.id, null, { code, blocker: decision.blocker, feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
-  if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) return {
-    feedback, ...(stopForSemanticNoProgress ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
+  if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) {
+    const stamped: unknown = Reflect.get(decision, TASK_GRAPH_RECOVERY_REVISION)
+    const revision = typeof stamped === "number" && Number.isSafeInteger(stamped) && stamped >= 0 ? stamped : null
+    return { feedback: tagTaskGraphRepairRecovery(feedback, revision),
+    ...(stopForSemanticNoProgress ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
     ...(rejection ? { [NATIVE_SEMANTIC_REJECTION]: rejection } : {}),
+    }
   }
   if (decision.blocker === STEERING_RECONCILIATION_BLOCKER) {
     options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()

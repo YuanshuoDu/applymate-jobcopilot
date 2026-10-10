@@ -11,6 +11,7 @@ import { publishFinalResponse } from "./turn-execution-events.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
 import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
+import { tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string }>
@@ -103,8 +104,12 @@ export async function completeTurnCandidate(input: Readonly<{
       }
       const recovery = taskGraphGateRecovery(error)
       if (!recovery) throw error
+      const stampedRecovery = error && typeof error === "object" ? Reflect.get(error, "recoveryFeedback") : undefined
+      const recoveryFeedback = typeof stampedRecovery === "string" && stampedRecovery.length <= 2_048
+        ? stampedRecovery
+        : tagTaskGraphRepairRecovery(recovery.feedback, null)
       await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback: recovery.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}:task-graph-race`)
-      return { kind: "replan", feedback: recovery.feedback }
+      return { kind: "replan", feedback: recoveryFeedback }
     }
     if (!terminal) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned no receipt")
     for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)
