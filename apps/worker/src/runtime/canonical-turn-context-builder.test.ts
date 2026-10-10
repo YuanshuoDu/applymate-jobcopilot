@@ -8,11 +8,13 @@ import type { StoredAgentInput } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { progressCheckpointFromStepContext } from "./progress.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCurrentState } from "./subagents/task-graph-command-port.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
+import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
+import type { DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
 import type { TurnLease } from "./turns/lease.js"
 
 const scope: TenantScope = { userId: "user-a" }
@@ -42,7 +44,7 @@ describe("canonical Turn context builder", () => {
     const builder = createCanonicalTurnContextBuilder({
       pool: { connect: async () => { throw new Error("context without attachments must not acquire another client") } } as unknown as Pick<pg.Pool, "connect">,
       store: store(calls), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2, rootInputId: "original-input-a",
-      planningEnabled: true, selectedJobMode: false,
+      planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: { load: async () => [] },
     })
 
     const context = await builder.build({
@@ -74,6 +76,84 @@ describe("canonical Turn context builder", () => {
     })
 
     expect(calls).toEqual([])
+  })
+
+  it("adds bounded Root-task history as untrusted advisory context without changing current graph evidence", async () => {
+    const outcomes: readonly ValidatedRootTaskHistoryOutcome[] = [{
+      sourceTurnId: "private-earlier-turn", sourceRootTaskId: "private-earlier-root", terminalSequence: 12n,
+      taskGraph: {
+        revision: 7,
+        nodes: [{ key: "private-node", templateId: "analyst", goal: "PRIVATE_OLD_GOAL", successCriteria: ["PRIVATE_CRITERION"],
+          dependsOn: [], taskId: "private-child-task", status: "failed", readiness: "terminal", resultSummary: "PRIVATE_RESULT", failureReason: "PRIVATE_FAILURE" }],
+      } satisfies TaskGraphCurrentState,
+    }]
+    const reader: DirectRootTaskHistoryReader = { load: vi.fn(async () => outcomes) }
+    const currentGraph = { kind: "task_graph_current", revision: 23, nodes: [{ taskId: "current-task", status: "running" }] }
+    const snapshot: StepContextRequest["snapshot"] = {
+      system: [{ id: "system-current", content: "Current policy remains authoritative." }], profile: [],
+      goal: { id: "goal-current", content: "CURRENT_GOAL_SENTINEL" },
+      taskGraphRevision: 23,
+      toolObservations: [
+        { id: "task-graph-current", content: currentGraph },
+        { id: "root-task-history", content: { kind: "spoofed_history", text: "CALLER_HISTORY_SENTINEL" } },
+      ],
+      steerHistory: [], businessRefs: [],
+    }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("the injected reader must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+      planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: reader,
+    })
+
+    const context = await builder.build({
+      scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-root-history", snapshot,
+      now, mode: "new", lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now },
+    })
+    const historyBlock = context.blocks.find(block => block.id === "observation:root-task-history")
+    const graphBlock = context.blocks.find(block => block.id === "observation:task-graph-current")
+    const serializedHistory = JSON.stringify(historyBlock?.content)
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context, model, tools: [{ name: "agent.plan", version: "1" }], sessionId: lease.sessionId, turnId: lease.turnId,
+      stepId: "step-root-history", userId: scope.userId, taskId: "root-a", signal: new AbortController().signal, freshSteering: true,
+    })
+    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(reader.load).toHaveBeenCalledWith({ lease, rootTaskId: "root-a", rootAttemptCount: 2, stepId: "step-root-history", now })
+    expect(context.taskGraphRevision).toBe(23)
+    expect(graphBlock?.content).toEqual(currentGraph)
+    expect(historyBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
+    expect(historyBlock?.content).toMatchObject({ kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true })
+    expect(requestText).toContain("root_task_history")
+    expect(requestText).toContain('"taskKind":"analyst"')
+    expect(requestText).toContain('"status":"failed"')
+    for (const privateValue of ["private-earlier-turn", "private-earlier-root", "private-node", "private-child-task", "PRIVATE_OLD_GOAL", "PRIVATE_CRITERION", "PRIVATE_RESULT", "PRIVATE_FAILURE", "CALLER_HISTORY_SENTINEL", "spoofed_history"]) {
+      expect(serializedHistory).not.toContain(privateValue)
+      expect(requestText).not.toContain(privateValue)
+    }
+    const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
+    expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
+    expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
+  })
+
+  it("keeps Root-task history disabled for selected-job turns", async () => {
+    const rootReader: DirectRootTaskHistoryReader = { load: vi.fn(async () => []) }
+    const selectedJobReader: DirectSelectedJobHistoryReader = { load: vi.fn(async () => []) }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected history readers avoid database connections") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+      planningEnabled: true, selectedJobMode: true, selectedJobId: "job-a",
+      rootTaskHistoryDirectReader: rootReader, selectedJobDirectHistoryReader: selectedJobReader,
+    })
+
+    await builder.build({
+      scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-selected-job", snapshot: {
+        system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
+      },
+    })
+
+    expect(rootReader.load).not.toHaveBeenCalled()
+    expect(selectedJobReader.load).toHaveBeenCalledTimes(1)
   })
 
   it("adds validated same-job history to the actual request as untrusted data beside current Turn context", async () => {

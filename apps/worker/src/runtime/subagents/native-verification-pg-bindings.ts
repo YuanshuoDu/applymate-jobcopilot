@@ -1,11 +1,10 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
-import { Value } from "@sinclair/typebox/value"
-import { InputContentPartSchema } from "@jobcopilot/agent-protocol"
 import { digestNativeVerificationValue, canonicalNativeVerificationJson } from "./native-verification-contract.js"
 import { parseTaskGraphSnapshot, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { TaskGraphNativeSourceProvenance, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { loadNativeVerificationSourceTasks, nativeVerificationSourceIsCurrent } from "./native-verification-pg-sources.js"
+import { resolveRootTaskObjective } from "../context/root-task-objective.js"
 
 export type NativeVerificationTask = Readonly<{
   id: string; parentTaskId: string | null; rootTaskId: string; turnId: string | null
@@ -37,9 +36,6 @@ export type NativeVerificationTarget = Readonly<{
 
 type Row = Record<string, unknown>
 type Queryable = Pick<pg.PoolClient, "query">
-const MAX_GOAL_BYTES = 4 * 1024
-const MAX_CRITERIA = 32
-const MAX_CRITERION_BYTES = 2_000
 const MAX_RESULT_BYTES = 16 * 1024
 
 function record(value: unknown): Row | null {
@@ -47,20 +43,6 @@ function record(value: unknown): Row | null {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
   try { const prototype = Object.getPrototypeOf(parsed); return prototype === Object.prototype || prototype === null ? parsed as Row : null } catch { return null }
 }
-function cleanText(value: unknown, maxBytes: number): value is string {
-  return typeof value === "string" && value.trim() === value && value.length > 0 && Buffer.byteLength(value, "utf8") <= maxBytes
-}
-function validInputContentParts(value: unknown): value is unknown[] {
-  return Array.isArray(value) && value.length > 0 && Reflect.ownKeys(value).length === value.length + 1
-    && value.every((part, index) => Object.hasOwn(value, index) && Value.Check(InputContentPartSchema, part))
-}
-function criterionList(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length > MAX_CRITERIA || Reflect.ownKeys(value).length !== value.length + 1) return null
-  const output: string[] = []
-  for (const item of value) if (!cleanText(item, MAX_CRITERION_BYTES)) return null; else output.push(item)
-  return output
-}
-
 /** Loads only graph-owned tasks under the caller's locked root and Turn. */
 export async function loadNativeVerificationOwnedState(
   client: Queryable, scope: TaskGraphReadScope, snapshotValue: unknown, lockTargets = true,
@@ -73,17 +55,8 @@ export async function loadNativeVerificationOwnedState(
       AND turn."rootTaskId" = $1 AND session."userId" = $4 AND turn."userId" = $4`,
   [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])
   if (rootTurn.rows.length !== 1) throw new Error("native_verification_root_scope_invalid")
-  const root = rootTurn.rows[0] as Row, input = record(root.input)
-  const nestedInput = record(input?.input)
-  const canonicalInput = nestedInput && Object.keys(nestedInput).length > 0 ? nestedInput : input
-  const turnGoal = canonicalTurnGoal(root.input)
-  const rootGoal = typeof root.goal === "string" && root.goal.trim() ? root.goal.trim() : null
-  const goal = turnGoal.value
-  const turnGoalConflict = !turnGoal.valid || !goal || !rootGoal || goal !== rootGoal
-  const turnCriteria = criteriaField(canonicalInput, "successCriteria")
-  const rootCriteria = criteriaField(root, "successCriteria")
-  const criteriaValid = turnCriteria.valid && rootCriteria.valid
-  const criteria = criteriaValid ? mergeCriteria(turnCriteria.value, rootCriteria.value, goal) : []
+  const root = rootTurn.rows[0] as Row
+  const { goal, criteria, criteriaValid, turnGoalConflict } = resolveRootTaskObjective(root.input, root)
   let turnInputDigest: string | null = null
   try { turnInputDigest = digestNativeVerificationValue(root.input) } catch { /* unavailable input is carried as a failed binding */ }
 
@@ -122,37 +95,9 @@ export async function loadNativeVerificationOwnedState(
   }
   const nativeSourcesValid = sources.every(source => nativeVerificationSourceIsCurrent(snapshot, source, sourceTasks.get(source.taskId), scope))
   return { snapshot, tasks, sourceTasks, goal, criteria,
-    criteriaValid: criteriaValid && criteria.length > 0 && criteria.every(item => Buffer.byteLength(item, "utf8") <= MAX_CRITERION_BYTES),
+    criteriaValid,
     nativeSourcesValid,
     turnGoalConflict, turnInputDigest, scope }
-}
-
-function canonicalTurnGoal(value: unknown): Readonly<{ value: string | null; valid: boolean }> {
-  const envelope = record(value)
-  if (!envelope) return { value: null, valid: false }
-  const nested = record(envelope.input)
-  const source = nested && Object.keys(nested).length > 0 ? nested : envelope
-  const hasGoal = Object.hasOwn(source, "goal"), hasContent = Object.hasOwn(source, "content")
-  const goal = source.goal, content = source.content
-  if (hasGoal && (typeof goal !== "string" || !goal.trim() || !cleanText(goal.trim(), MAX_GOAL_BYTES))) return { value: null, valid: false }
-  if (hasContent && (typeof content === "string"
-    ? !content.trim() || !cleanText(content.trim(), MAX_GOAL_BYTES)
-    : !validInputContentParts(content))) return { value: null, valid: false }
-  if (hasGoal && typeof content === "string" && (goal as string).trim() !== content.trim()) return { value: null, valid: false }
-  const selected = hasGoal ? goal : typeof content === "string" ? content : undefined
-  return typeof selected === "string" ? { value: selected.trim(), valid: true } : { value: null, valid: false }
-}
-
-function criteriaField(row: Row | null, key: string): Readonly<{ value: readonly string[]; valid: boolean }> {
-  if (!row || !Object.hasOwn(row, key)) return { value: [], valid: true }
-  const parsed = criterionList(row[key])
-  return parsed ? { value: parsed, valid: true } : { value: [], valid: false }
-}
-
-function mergeCriteria(turnCriteria: readonly string[], rootCriteria: readonly string[], goal: string | null): readonly string[] {
-  const merged = [...new Set([...turnCriteria, ...rootCriteria])]
-  if (merged.length > MAX_CRITERIA) return []
-  return merged.length ? merged : goal ? [goal] : []
 }
 
 /** A predecessor leaves the active frontier only when an owned followup still proves its exact source. */

@@ -1226,6 +1226,7 @@ draft
 |---|---|
 | [#560](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/560) — durable context hydration | [#563](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/563) |
 | [#561](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/561) — typed TaskGraph repair feedback | [#562](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/562) |
+| [#685](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/685) — bounded Root TaskGraph outcome recall | [#686](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/686) |
 
 ---
 
