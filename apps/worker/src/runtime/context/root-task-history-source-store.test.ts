@@ -87,6 +87,17 @@ describe("Root history source scan", () => {
     expect(queries[0]?.sql).not.toContain('event."sequence" < $4::bigint')
   })
 
+  it("requires an existing source AgentSession row, so deleted sessions cannot supply history", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const results = await readRootTaskHistoryCandidates(
+      client([row({ sourceSessionUserId: null, sourceSessionStatus: null })], queries) as unknown as pg.PoolClient, input, fence,
+    )
+
+    expect(results).toEqual([])
+    expect(queries[0]?.sql).toMatch(/^\s*(?:INNER\s+)?JOIN "agent_sessions" AS source_session ON source_session\."id" = event\."sessionId"/m)
+    expect(queries[0]?.sql).toContain('source_session."userId" = $2')
+  })
+
   it("rejects cross-session outcomes when saved discovery role or location filters differ", async () => {
     const current = discoveryTurnInput(["Software Engineer"], ["Berlin"])
     const changedRole = discoveryTurnInput(["Data Scientist"], ["Berlin"])
