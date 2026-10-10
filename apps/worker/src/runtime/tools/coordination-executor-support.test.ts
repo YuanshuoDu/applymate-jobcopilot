@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { DurableWaitStoreError } from "../subagents/durable-wait-store.js"
+import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "./coordination-types.js"
 import { createWorkerToolRuntime } from "./index.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
@@ -61,6 +62,26 @@ describe("coordination executor support", () => {
   it("removes foreign identity keys from bounded wait results", () => {
     expect(waitResult({ taskId: "private-task", sessionId: "private-session", result: { safe: true } })).toEqual({ result: { safe: true } })
     expect(waitResult(null)).toBeNull()
+  })
+
+  it("projects native proof receipts to bounded feedback before exposing task results", () => {
+    const nativeVerificationReport = {
+      schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA, controlOperationId: "verify-op", controlTaskId: "verify-task", controlAttempt: 1,
+      owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null },
+      target: { kind: "root_goal", candidateDigest: "a".repeat(64), childBindingSetDigest: "b".repeat(64) },
+      goalDigest: "c".repeat(64), criteriaDigest: "d".repeat(64), evidencePacketDigest: "e".repeat(64), disposition: "passed",
+      criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+    }
+    const result = waitResult({ status: "completed", nativeVerificationReport })
+    expect(result).toEqual({
+      status: "completed",
+      nativeVerificationFeedback: {
+        disposition: "passed",
+        criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+      },
+    })
+    expect(JSON.stringify(result)).not.toContain("controlOperationId")
+    expect(JSON.stringify(result)).not.toContain("candidateDigest")
   })
 
   it("bounds failure previews by UTF-8 bytes", () => {

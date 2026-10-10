@@ -1,5 +1,5 @@
 import type { PoolClient } from "pg"
-import type { TaskGraphCommandPort, TaskGraphScheduleInput, TaskGraphScheduleReceipt, TaskGraphReadScope, TaskGraphCurrentState } from "./task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphScheduleInput, TaskGraphScheduleReceipt, TaskGraphReadScope, TaskGraphCurrentState, TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "./task-graph-command-port.js"
 import { TaskGraphCommandError } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { transaction, type Queryable } from "./pg-store-persistence.js"
@@ -7,6 +7,8 @@ import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph } from "./task-grap
 import { createGraphTasks } from "./task-graph-pg-create.js"
 import { writePlanReceipt } from "./task-graph-pg-events.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { normalizeNativeCommand } from "./task-graph-native-request.js"
+import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -16,7 +18,7 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
       return transaction(pool, async client => {
         await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
-        const parent = await lockTaskGraphScope(client, input.scope)
+        const parent = await lockTaskGraphScope(client, input.scope, true)
         const loaded = await loadTaskGraph(client, input.scope)
         const current = loaded.state
         const revision = current?.revision ?? 0
@@ -38,6 +40,24 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
           now: new Date(), idempotencyKey: key, fingerprint, receipt,
         })
         return receipt
+      })
+    },
+    async appendNativeCoordination(input: TaskGraphNativeCommandInput): Promise<TaskGraphNativeCommandReceipt> {
+      const command = normalizeNativeCommand(input)
+      return transaction(pool, async client => {
+        await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
+        const parent = await lockTaskGraphScope(client, input.scope, true)
+        if (await hasPersistedPlanReceipt(client, input.scope) && !await hasCurrentGraphItem(client, input.scope)) {
+          throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
+        }
+        const replay = await findNativeCommandReplay(client, input, command)
+        if (replay) return replay
+        const loaded = await loadTaskGraph(client, input.scope)
+        if (!loaded.item && await hasPersistedPlanReceipt(client, input.scope)) {
+          throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
+        }
+        currentTaskGraph(loaded)
+        return appendNativeGraphCommand(client, input, command, parent, loaded)
       })
     },
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
@@ -63,9 +83,20 @@ async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadSc
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3
-      AND event."type" IN ('item.started', 'item.delta') AND event."payload"->>'kind' = 'proposal'
+      AND event."type" IN ('item.started', 'item.delta') AND event."payload"->>'kind' IN ('proposal', 'native_command')
       AND session."userId" = $4 AND turn."userId" = $4
   ) AS "exists"`, [scope.sessionId, scope.turnId, taskGraphItemId(scope.parentTaskId), scope.userId])
+  return (result.rows[0] as Row | undefined)?.exists === true
+}
+
+async function hasCurrentGraphItem(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {
+  const result = await client.query(`SELECT EXISTS (
+    SELECT 1 FROM "agent_items" AS item
+    JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+    JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+    WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+      AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5
+  ) AS "exists"`, [taskGraphItemId(scope.parentTaskId), scope.sessionId, scope.turnId, scope.parentTaskId, scope.userId])
   return (result.rows[0] as Row | undefined)?.exists === true
 }
 

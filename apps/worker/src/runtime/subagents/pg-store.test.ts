@@ -4,6 +4,7 @@ import { deriveTaskGraphReadModel } from "../planning/task-graph.js"
 
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { normalizeSubagentPolicy, SubagentLimitError, type SubagentPolicy } from "./types.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
@@ -32,7 +33,20 @@ function taskRow(overrides: Record<string, unknown> = {}): Record<string, unknow
   }
 }
 
-function fakePool(handler: (sql: string, params?: unknown[]) => { rows?: unknown[]; rowCount?: number }) {
+function fakePool(
+  handler: (sql: string, params?: unknown[]) => { rows?: unknown[]; rowCount?: number },
+  options: {
+    owner?: { sessionId: string; userId: string }
+    taskBindings?: Record<string, { turnId: string; rootTaskId: string }>
+  } = {},
+) {
+  const owner = options.owner ?? { sessionId: "session-1", userId: "user-1" }
+  const bindings: Record<string, { turnId: string; rootTaskId: string }> = {
+    "task-1": { turnId: "turn-1", rootTaskId: "task-1" },
+    ...options.taskBindings,
+  }
+  const ownsTurn = (turnId: string, sessionId: string, userId: string) => sessionId === owner.sessionId
+    && userId === owner.userId && Object.values(bindings).some(binding => binding.turnId === turnId)
   const calls: Array<[string, unknown[]?]> = []
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -44,8 +58,53 @@ function fakePool(handler: (sql: string, params?: unknown[]) => { rows?: unknown
       if (sql.startsWith("SELECT clock_timestamp()") && result.rows === undefined) {
         return { rows: [{ checkedAt: now }], rowCount: 1, ...result }
       }
+      if (sql.startsWith('SELECT "turnId", "rootTaskId" FROM "sub_agent_tasks"') && result.rows === undefined) {
+        const taskId = String(params?.[0] ?? "task-1")
+        const binding = bindings[taskId]
+        const owned = binding && String(params?.[1] ?? "") === owner.sessionId
+        return { rows: owned ? [binding] : [], rowCount: owned ? 1 : 0, ...result }
+      }
+      if (sql.startsWith('SELECT "rootTaskId", "turnId" FROM "sub_agent_tasks"') && result.rows === undefined) {
+        const taskId = String(params?.[0] ?? "")
+        const binding = bindings[taskId]
+        const owned = binding && String(params?.[1] ?? "") === owner.sessionId
+        return { rows: owned ? [{ rootTaskId: binding.rootTaskId, turnId: binding.turnId }] : [], rowCount: owned ? 1 : 0, ...result }
+      }
+      if (sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR UPDATE") && result.rows === undefined) {
+        const turnId = String(params?.[0] ?? "")
+        const owned = ownsTurn(turnId, String(params?.[1] ?? ""), String(params?.[2] ?? ""))
+        return { rows: owned ? [{ id: turnId }] : [], rowCount: owned ? 1 : 0, ...result }
+      }
+      if (sql.includes('SELECT session."id" FROM "agent_sessions"') && result.rows === undefined) {
+        const sessionId = String(params?.[0] ?? "")
+        const userId = String(params?.[1] ?? "")
+        const turnId = String(params?.[2] ?? "")
+        const owned = ownsTurn(turnId, sessionId, userId)
+        return { rows: owned ? [{ id: sessionId }] : [], rowCount: owned ? 1 : 0, ...result }
+      }
+      if (sql.startsWith('SELECT "id", "turnId", "status", "interruptRequestedAt"') && result.rows === undefined) {
+        const rootTaskId = String(params?.[0] ?? "")
+        const turnId = String(params?.[2] ?? "")
+        const ownedRoot = String(params?.[1] ?? "") === owner.sessionId
+          && Object.values(bindings).some(binding => binding.rootTaskId === rootTaskId && binding.turnId === turnId)
+        return { rows: ownedRoot ? [{ id: rootTaskId, turnId, status: "running", interruptRequestedAt: null }] : [], rowCount: ownedRoot ? 1 : 0, ...result }
+      }
+      if (sql.startsWith('SELECT root."id", root."turnId", root."status", root."interruptRequestedAt"') && result.rows === undefined) {
+        const rootTaskId = String(params?.[0] ?? "")
+        const binding = Object.values(bindings).find(candidate => candidate.rootTaskId === rootTaskId)
+        const ownedRoot = String(params?.[1] ?? "") === owner.sessionId && binding
+        return { rows: ownedRoot ? [{ id: rootTaskId, turnId: binding.turnId, status: "running", interruptRequestedAt: null }] : [], rowCount: ownedRoot ? 1 : 0, ...result }
+      }
+      if (sql.startsWith('SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt"') && result.rows === undefined) {
+        const taskId = String(params?.[0] ?? "task-1")
+        const binding = bindings[taskId]
+        const owned = binding && String(params?.[1] ?? "") === owner.sessionId
+        return { rows: owned ? [{ id: taskId, ...binding, status: "queued", interruptRequestedAt: null }] : [], rowCount: owned ? 1 : 0, ...result }
+      }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE") && result.rows === undefined) {
-        return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1, ...result }
+        const sessionId = String(params?.[0] ?? "")
+        const owned = sessionId === owner.sessionId && (params?.[1] === undefined || params[1] === owner.userId)
+        return { rows: owned ? [{ id: sessionId, userId: owner.userId, status: "running" }] : [], rowCount: owned ? 1 : 0, ...result }
       }
       if (sql.includes('SELECT task."id", task."status", task."attemptCount"') && result.rows === undefined) {
         const count = sql.includes('task."turnId" = $2') ? 2 : 3
@@ -568,7 +627,7 @@ describe("PgSubagentTaskStore", () => {
   it("claims with a session lock and a conditional lease update", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
-      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
       if (sql.includes("COUNT(*)")) return { rows: [{ count: 0 }], rowCount: 1 }
       if (sql.startsWith("UPDATE")) return { rows: [{ id: "task-1" }], rowCount: 1 }
       return {}
@@ -599,7 +658,7 @@ describe("PgSubagentTaskStore", () => {
         ? { rows: [], rowCount: 0 }
         : { rows: [{ id: taskGraphItemId("root-1"), revision: 1, content: { schemaVersion: "invalid", nodes: [] }, createdAt: now }], rowCount: 1 }
       return {}
-    })
+    }, { taskBindings: { "child-1": { turnId: "turn-1", rootTaskId: "root-1" } } })
     const store = new PgSubagentTaskStore(fake.pool)
 
     await expect(store.claim({ taskId: "child-1", sessionId: "session-1", ownerId: "worker-1", policy, now }))
@@ -624,7 +683,7 @@ describe("PgSubagentTaskStore", () => {
       if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: 1 }
       if (sql.startsWith('SELECT task.*, session."userId" AS "userId"')) return { rows: [claimed], rowCount: 1 }
       return {}
-    })
+    }, { taskBindings: { "legacy-child": { turnId: "turn-1", rootTaskId: "root-1" } } })
     const store = new PgSubagentTaskStore(fake.pool)
 
     await expect(store.claim({ taskId: "legacy-child", sessionId: "session-1", ownerId: "worker-1", policy, now }))
@@ -645,18 +704,26 @@ describe("PgSubagentTaskStore", () => {
     expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
   })
 
-  it.each(["running", "paused", "waiting_for_user"] as const)("keeps queued child claims compatible with a %s session", async status => {
+  it.each(["running", "paused", "waiting_for_user"] as const)("enforces new-work admission for a %s session", async status => {
     const fake = fakePool(sql => {
-      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", status }], rowCount: 1 }
+      if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return status === "running"
+        ? { rows: [{ id: "session-1" }], rowCount: 1 }
+        : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
       if (sql.includes("COUNT(*)")) return { rows: [{ count: 0 }], rowCount: 1 }
       if (sql.startsWith("UPDATE")) return { rows: [{ id: "task-1" }], rowCount: 1 }
       return {}
     })
     const store = new PgSubagentTaskStore(fake.pool)
-    await expect(store.claim({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", policy, now })).resolves.toMatchObject({ status: "running" })
+    const claim = store.claim({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", policy, now })
+    if (status === "running") await expect(claim).resolves.toMatchObject({ status: "running" })
+    else await expect(claim).rejects.toBeInstanceOf(SessionPauseRequestedError)
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
-    expect(update).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    const admission = fake.calls.find(([sql]) => sql.includes('SELECT session."id" FROM "agent_sessions"'))?.[0] ?? ""
+    expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(status === "running")
+    expect(admission).toContain('session."status" = \'running\'')
+    expect(admission).toContain("session.pause_requested")
     expect(update).not.toContain("controlGate")
   })
 
@@ -668,7 +735,7 @@ describe("PgSubagentTaskStore", () => {
       if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('FOR UPDATE')) return { rows: [parent], rowCount: 1 }
       if (sql.startsWith("INSERT INTO")) return { rows: [{ id: "child-1" }], rowCount: 1 }
       return {}
-    })
+    }, { taskBindings: { "parent-1": { turnId: "turn-1", rootTaskId: "parent-1" } } })
     const store = new PgSubagentTaskStore(fake.pool)
     await store.create({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", role: "analyst", taskType: "research", goal: "inspect", allowedActions: ["jobs.search"], modelProfileSnapshot: { provider: "fixture", model: "override" }, policy })
     const insert = fake.calls.find(([sql]) => sql.startsWith("INSERT INTO"))?.[1] ?? []
@@ -685,12 +752,12 @@ describe("PgSubagentTaskStore", () => {
       if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('FOR UPDATE')) return { rows: [parent], rowCount: 1 }
       if (sql.startsWith("INSERT INTO")) return { rows: [{ id: "child-1" }], rowCount: 1 }
       return {}
-    })
+    }, { taskBindings: { "parent-1": { turnId: "turn-1", rootTaskId: "parent-1" } } })
     const store = new PgSubagentTaskStore(fake.pool)
-    await store.create({ userId: "user-1", sessionId: "session-1", parentTaskId: "parent-1", role: "scout", taskType: "research", goal: "inspect", allowedActions: [], policy })
+    await store.create({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", role: "scout", taskType: "research", goal: "inspect", allowedActions: [], policy })
     const insert = fake.calls.find(([sql]) => sql.startsWith("INSERT INTO"))?.[1] ?? []
     expect(insert[12]).toBe(JSON.stringify(["jobs.search"]))
-    await expect(store.create({ userId: "user-1", sessionId: "session-1", parentTaskId: "parent-1", role: "scout", taskType: "research", goal: "inspect", allowedActions: ["gmail.send"], policy })).rejects.toThrow("exceed parent")
+    await expect(store.create({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", role: "scout", taskType: "research", goal: "inspect", allowedActions: ["gmail.send"], policy })).rejects.toThrow("exceed parent")
   })
 
   it("rejects a child that would exceed the inherited depth or fan-out", async () => {
@@ -699,18 +766,18 @@ describe("PgSubagentTaskStore", () => {
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [parent], rowCount: 1 }
       return {}
-    })
+    }, { taskBindings: { "parent-1": { turnId: "turn-1", rootTaskId: "parent-1" } } })
     const depthStore = new PgSubagentTaskStore(depthFake.pool)
-    await expect(depthStore.create({ userId: "user-1", sessionId: "session-1", parentTaskId: "parent-1", role: "analyst", taskType: "test", goal: "inspect", policy: normalizeSubagentPolicy({ maxDepth: 2 }) })).rejects.toMatchObject({ code: "depth" })
+    await expect(depthStore.create({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", role: "analyst", taskType: "test", goal: "inspect", policy: normalizeSubagentPolicy({ maxDepth: 2 }) })).rejects.toMatchObject({ code: "depth" })
 
     const fanOutFake = fakePool(sql => {
       if (sql.includes("COUNT(*)")) return { rows: [{ count: 2 }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [taskRow({ id: "parent-1", status: "running" })], rowCount: 1 }
       return {}
-    })
+    }, { taskBindings: { "parent-1": { turnId: "turn-1", rootTaskId: "parent-1" } } })
     const fanOutStore = new PgSubagentTaskStore(fanOutFake.pool)
-    await expect(fanOutStore.create({ userId: "user-1", sessionId: "session-1", parentTaskId: "parent-1", role: "analyst", taskType: "test", goal: "inspect", policy: normalizeSubagentPolicy({ maxFanOut: 2 }) })).rejects.toMatchObject({ code: "fan_out" })
+    await expect(fanOutStore.create({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", role: "analyst", taskType: "test", goal: "inspect", policy: normalizeSubagentPolicy({ maxFanOut: 2 }) })).rejects.toMatchObject({ code: "fan_out" })
   })
 
   it("returns retrying while putting a transient failure back in queued state", async () => {
@@ -1154,7 +1221,7 @@ describe("PgSubagentTaskStore", () => {
 
   it.each(["running", "paused", "waiting_for_user"] as const)("reclaims stale leases from an open %s session", async sessionStatus => {
     const fake = fakePool(sql => {
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: sessionStatus }], rowCount: 1 }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [taskRow({ status: "running", sessionStatus, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
       if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE OF task")) return { rows: [taskRow({ status: "running", sessionStatus, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
@@ -1174,6 +1241,7 @@ describe("PgSubagentTaskStore", () => {
 
   it.each(["aborted", "archived"] as const)("reclaims a stale child from a %s session as interrupted", async status => {
     const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status }], rowCount: 1 }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [taskRow({ status: "running", sessionStatus: status, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
       if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE OF task")) return { rows: [taskRow({ status: "running", sessionStatus: status, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }

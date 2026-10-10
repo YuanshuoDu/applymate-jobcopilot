@@ -10,6 +10,7 @@ import type {
   ToolExecutionContext,
 } from "./types.js"
 import { ToolExecutionError } from "./types.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
 
 export type ToolRouterErrorCode = "runtime_scope_error" | "capability_denied" | "idempotency_conflict" | "timeout" | "cancelled" | "tool_execution_failed" | "policy_denied" | "policy_requires_approval" | "policy_requires_user_input" | "policy_version_unknown" | "policy_rewrite_expands_permissions"
 
@@ -89,6 +90,10 @@ export class ToolRouter {
       const safeOutput = await this.lifecycle.completed(call, output)
       return { ...request, status: "completed", output: safeOutput, errorCode: null }
     } catch (error: unknown) {
+      if (isSessionPauseRequestedError(error)) {
+        await this.lifecycle.failed(call, "failed", error.code, { message: "Session work is fenced by a durable pause request" })
+        throw error
+      }
       const code = this.errorCode(error)
       const phase = code === "cancelled" || code === "timeout" ? "cancelled" : "failed"
       const structuredOutput = error instanceof ToolExecutionError ? error.safeOutput : undefined

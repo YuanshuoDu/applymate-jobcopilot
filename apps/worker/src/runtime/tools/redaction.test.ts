@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest"
 
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
+import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
+import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
 
 const turnId = "c123456789012345678901234"
 const rootTaskId = `root-${turnId}`
@@ -15,6 +18,23 @@ const spawnReceipt = {
   status: "queued",
   replay: false,
 } as const
+const nativeCommandReceipt: TaskGraphNativeCommandReceipt = {
+  status: "accepted", replay: false, operationId: "native-operation-1", requestFingerprint: "a".repeat(64),
+  graphRevision: 2, nodeKey: "native-node-1", dispatchDisposition: "pending",
+  child: { taskId, rootTaskId, parentTaskId: rootTaskId, path: spawnReceipt.path, depth: 1, role: "scout", taskType: "research", status: "queued" },
+}
+const nativeSpawnReceipt = nativeCoordinationOutput("spawn", rootTaskId, nativeCommandReceipt)
+const nativeSourceTaskId = "subagent-12345678-1234-4abc-8def-123456789012"
+const nativeFollowupChildId = "subagent-87654321-4321-4abc-8def-210987654321"
+const nativeFollowupReceipt = {
+  ...nativeCoordinationOutput("followup", rootTaskId, {
+    ...nativeCommandReceipt,
+    operationId: "native-followup-1",
+    child: { ...nativeCommandReceipt.child, taskId: nativeFollowupChildId, path: `/${rootTaskId}/${nativeFollowupChildId}` },
+    source: { taskId: nativeSourceTaskId, rootTaskId, parentTaskId: rootTaskId, turnId, role: "scout", taskType: "research", status: "cancelled", attemptCount: 0, resultDigest: "b".repeat(64), graphNodeKey: null, origin: "native_legacy" },
+  }),
+  sourceTaskId: nativeSourceTaskId,
+}
 
 const durableWaitId = "wait-12345678-1234-4234-9234-123456789012"
 const durableWaitTaskId = "subagent-12345678-1234-4234-9234-123456789012"
@@ -87,6 +107,31 @@ describe("tool lifecycle redaction", () => {
     })
   })
 
+  it("applies the native feedback projection in prepareDurableWaitOutput", () => {
+    const output = durableWaitOutput()
+    Object.assign(output.tasks[0]!.result, { nativeVerificationReport: {
+      schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA,
+      controlOperationId: "verify-op",
+      controlTaskId: durableWaitTaskId,
+      controlAttempt: 1,
+      owner: { userId: "user-1", sessionId: "session-1", turnId, rootTaskId, parentTaskId: null },
+      target: { kind: "root_goal", candidateDigest: "a".repeat(64), childBindingSetDigest: "b".repeat(64) },
+      goalDigest: "c".repeat(64), criteriaDigest: "d".repeat(64), evidencePacketDigest: "e".repeat(64), disposition: "passed",
+      criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+    } })
+
+    const safe = prepareDurableWaitOutput(output).safe as Record<string, unknown>
+    const tasks = safe.tasks as Array<Record<string, unknown>>
+    expect(tasks[0]?.result).toMatchObject({
+      nativeVerificationFeedback: {
+        disposition: "passed",
+        criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+      },
+    })
+    expect(JSON.stringify(safe)).not.toContain("nativeVerificationReport")
+    expect(JSON.stringify(safe)).not.toContain("evidencePacketDigest")
+  })
+
   it("rejects malformed, incomplete, and accessor-shaped durable wait receipts", () => {
     expect(() => prepareDurableWaitOutput({
       ...durableWaitOutput(),
@@ -109,6 +154,24 @@ describe("tool lifecycle redaction", () => {
   it("preserves generated spawn lineage after generic redaction would alter a phone-like UUID", () => {
     expect(prepareLifecycleValue(spawnReceipt).safe).not.toEqual(spawnReceipt)
     expect(prepareSubagentSpawnReceipt(spawnReceipt, { turnId, taskId: rootTaskId, rootTaskId }).safe).toEqual(spawnReceipt)
+  })
+
+  it("preserves only strict native spawn and follow-up envelopes bound to their child and root", () => {
+    expect(prepareSubagentSpawnReceipt(nativeSpawnReceipt, { turnId, taskId: rootTaskId, rootTaskId, toolName: "agent.spawn" }).safe).toEqual(nativeSpawnReceipt)
+    expect(prepareSubagentSpawnReceipt(nativeSpawnReceipt, { turnId, taskId: rootTaskId, rootTaskId, toolName: "spawn_subagent" }).safe).toEqual(nativeSpawnReceipt)
+    expect(prepareSubagentSpawnReceipt(nativeFollowupReceipt, { turnId, taskId: rootTaskId, rootTaskId, toolName: "agent.followup" }).safe).toEqual(nativeFollowupReceipt)
+
+    const malformed = [
+      { ...nativeSpawnReceipt, taskId: "subagent-99999999-9999-4999-8999-999999999999" },
+      { ...nativeSpawnReceipt, rootTaskId: "root-foreign" },
+      { ...nativeSpawnReceipt, nativeCoordination: { ...nativeSpawnReceipt.nativeCoordination, rootTaskId: "root-foreign", child: { ...nativeSpawnReceipt.nativeCoordination.child, rootTaskId: "root-foreign", parentTaskId: "root-foreign" } } },
+      { ...nativeSpawnReceipt, nativeCoordination: { ...nativeSpawnReceipt.nativeCoordination, extra: "untrusted" } },
+      { ...nativeFollowupReceipt, nativeCoordination: { ...nativeFollowupReceipt.nativeCoordination, operationKind: "spawn" } },
+    ]
+    for (const receipt of malformed) {
+      const toolName = Object.hasOwn(receipt, "sourceTaskId") ? "agent.followup" : "agent.spawn"
+      expect(() => prepareSubagentSpawnReceipt(receipt, { turnId, taskId: rootTaskId, rootTaskId, toolName })).toThrow("subagent_spawn_receipt_invalid")
+    }
   })
 
   it("accepts a depth-zero self-root spawn and rejects malformed lineage or extra fields", () => {

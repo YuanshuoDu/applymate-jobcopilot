@@ -19,7 +19,7 @@ function fixture(options: { status?: string; turn?: typeof activeTurn | null; ex
   const tx = {
     $queryRaw: vi.fn(async () => {
       rawQuery += 1
-      return rawQuery === 1 ? (options.owned === false ? [] : [{ id: command.sessionId }]) : [{ eventSequence: 9n }]
+      return rawQuery === 1 ? (options.owned === false ? [] : [{ id: command.sessionId }]) : [{ eventSequence: BigInt("9") }]
     }),
     agentSession: {
       findFirst: vi.fn(async () => ({ status })),
@@ -71,7 +71,7 @@ describe("AgentSessionControlService", () => {
     ["pause", "pausing", "session.pause_requested"],
     ["resume", "resuming", "session.resume_requested"],
   ] as const)("returns a stable %s duplicate without changing the session again", async (action, status, eventType) => {
-    const existing = { type: eventType, sequence: 12n,
+    const existing = { type: eventType, sequence: BigInt("12"),
       payload: { turnId: command.expectedTurnId, expectedRevision: command.expectedRevision, requestedAt } }
     const { service, tx, order } = fixture({ status, existing })
     await expect(service.control({ ...command, action })).resolves.toEqual({
@@ -83,7 +83,7 @@ describe("AgentSessionControlService", () => {
   })
 
   it("rejects idempotency-key reuse for a different action or Turn revision", async () => {
-    const existing = { type: "session.pause_requested", sequence: 12n,
+    const existing = { type: "session.pause_requested", sequence: BigInt("12"),
       payload: { turnId: command.expectedTurnId, expectedRevision: command.expectedRevision, requestedAt } }
     const mismatchedAction = fixture({ existing })
     await expect(mismatchedAction.service.control({ ...command, action: "resume" })).rejects.toMatchObject({ code: "session_control_idempotency_conflict" })

@@ -8,12 +8,12 @@ import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import { isDurableWaitId } from "../tools/redaction.js"
+import { nativeReceiptFromToolCall } from "../tools/task-graph-coordination-bridge.js"
 
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
 type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState }
 const CHILD_RESUME_ID_PREFIX = "child-resume:"
 const REPLAY_TOOL_CALL_ID_PREFIX = "task-graph-replay-v1:"
-
 function childResumeSourceId(id: string): string | null {
   if (!id.startsWith("child-resume")) return null
   if (!id.startsWith(CHILD_RESUME_ID_PREFIX)) throw new TurnEngineError("invalid_output", "Child resume receipt ID is invalid")
@@ -21,16 +21,18 @@ function childResumeSourceId(id: string): string | null {
   if (!sourceId || sourceId.trim() !== sourceId) throw new TurnEngineError("invalid_output", "Child resume receipt ID is invalid")
   return sourceId
 }
-
 function replayCallId(stepId: string, modelCallId: string): string {
   return `${REPLAY_TOOL_CALL_ID_PREFIX}${createHash("sha256").update(JSON.stringify([stepId, modelCallId])).digest("hex")}`
 }
-
 function replayItemId(options: TurnExecutionOptions, step: TurnEngineStep, type: "call" | "result", toolCallId: string): string {
   const scoped = executionId(options.identity, `item:tool-${type}:${step.id}:${toolCallId}`)
   return options.idFactory?.(scoped) ?? scoped
 }
-
+function hasNativeCoordinationReceipt(toolName: string, status: unknown, output: unknown): boolean {
+  const receipt = nativeReceiptFromToolCall(toolName, status, output)
+  if (receipt === false) throw new TurnEngineError("invalid_output", "Native coordination receipt is invalid")
+  return receipt !== null
+}
 async function persistChildResumeReplay(
   options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, call: ModelStepResult["toolCalls"][number],
   source: Record<string, unknown>, sourceResultItemId: string, now: () => Date, onCallPersisted: () => void,
@@ -62,7 +64,6 @@ async function persistChildResumeReplay(
   })
   await writer.completeItem(resultItem, resultContent, now(), `tool-result-completed:${toolCallId}`)
 }
-
 export function hasFreshSteering(context: StepContext, consumedInputIds: readonly string[]): boolean {
   if (context.steeringMarkerControl && (context.steeringMarkerControl.activeInputIds.length > 0 || context.steeringMarkerControl.newlyObservedInputIds.length > 0)) return true
   const consumedBeforeBuild = new Set(consumedInputIds)
@@ -75,13 +76,11 @@ export function hasFreshSteering(context: StepContext, consumedInputIds: readonl
     return typeof inputId === "string" && inputId.trim().length > 0 && newlyConsumed.has(inputId)
   })
 }
-
 export function rememberSteeringMarkers(current: MarkerState, additions: readonly SteeringMarkerPayload[]): MarkerState {
   const byKey = new Map<string, SteeringMarkerPayload>()
   for (const marker of [...current?.active ?? [], ...additions]) byKey.set(marker.idempotencyKey, marker)
   return { active: [...byKey.values()].sort((left, right) => left.idempotencyKey.localeCompare(right.idempotencyKey)) }
 }
-
 export async function executeTools(
   options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult,
   initial: TurnExecutionOptions["snapshot"], seen: Set<string>, signal: AbortSignal, now: () => Date, markerState: MarkerState,
@@ -111,6 +110,7 @@ export async function executeTools(
       }
       const wait = dependencyWaitReceipt(replayed.status === "completed" ? replayed.output : null)
       if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId, replayed.input)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
+      if (hasNativeCoordinationReceipt(call.name, replayed.status, replayed.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
       continue
     }
     if (sourceResultItemId) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
@@ -126,13 +126,13 @@ export async function executeTools(
     }
     snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, { id: `tool-result:${call.id}`, content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) }] }
     if (call.name === "agent.plan" && result.status === "completed" && hasAcceptedTaskGraphPlan(result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
+    else if (hasNativeCoordinationReceipt(call.name, result.status, result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if (call.name === "agent.wait" && result.status === "completed" && isInlineReadyWait(result.output)) snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
     const wait = dependencyWaitReceipt(result.status === "completed" ? result.output : null)
     if (wait) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
   }
   return { wait: null, snapshot, steeringMarkerState: markerState }
 }
-
 export async function recoverPersistedToolCalls(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, now: () => Date): Promise<readonly { id: string; content: ReturnType<typeof toRepositoryJson> }[]> {
   const recovery = options.toolCallRecovery ?? []
   if (recovery.length === 0) return []
@@ -167,14 +167,12 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
   }
   return observations
 }
-
 type DependencyWaitReceipt = { readonly waitId: string; readonly deadlineAt: string; readonly matchedTaskIds: readonly string[] }
 function hasAcceptedTaskGraphPlan(value: unknown): boolean {
   const status = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).status : null
   return status === "accepted" || status === "duplicate"
 }
 function isInlineReadyWait(value: unknown): boolean { return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).status === "ready") }
-
 function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
@@ -185,10 +183,8 @@ function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
   }
   return { waitId: record.waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
 }
-
 type WaitMode = "any" | "all"
 type WaitRequest = { readonly taskIds: readonly string[]; readonly mode: WaitMode }
-
 function waitRequest(value: unknown): WaitRequest | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
@@ -196,7 +192,6 @@ function waitRequest(value: unknown): WaitRequest | null {
   if (!taskIds || (record.mode !== "any" && record.mode !== "all")) return null
   return { taskIds, mode: record.mode }
 }
-
 function normalizedWaitIds(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length < 1 || value.length > 8) return null
   const ids: string[] = []
@@ -207,7 +202,6 @@ function normalizedWaitIds(value: unknown): string[] | null {
   if (new Set(ids).size !== ids.length) return null
   return [...ids].sort()
 }
-
 function hasResolvedWaitOutcome(snapshot: TurnExecutionOptions["snapshot"], waitId: string, expectedInput: unknown): boolean {
   const expected = waitRequest(expectedInput)
   if (!expected) return false

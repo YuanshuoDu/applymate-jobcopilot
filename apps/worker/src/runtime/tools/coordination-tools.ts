@@ -1,5 +1,6 @@
 import { Type, type Static } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { NATIVE_COORDINATION_RECEIPT_SCHEMA } from "./task-graph-coordination-bridge.js"
 
 import {
   executeCloseSubagent,
@@ -22,9 +23,20 @@ const StatusSchema = Type.Union([
   Type.Literal("waiting_for_user"), Type.Literal("completed"), Type.Literal("failed"),
   Type.Literal("interrupted"), Type.Literal("cancelled"), Type.Literal("closed"),
 ])
+const NativeCoordinationOutputSchema = Type.Object({
+  schemaVersion: Type.Literal(NATIVE_COORDINATION_RECEIPT_SCHEMA), operationKind: Type.Union([Type.Literal("spawn"), Type.Literal("followup")]),
+  status: Type.Union([Type.Literal("accepted"), Type.Literal("duplicate")]), replay: Type.Boolean(), operationId: IdSchema,
+  requestFingerprint: Type.String({ pattern: "^[a-f0-9]{64}$" }), graphRevision: Type.Integer({ minimum: 0 }), nodeKey: IdSchema,
+  dispatchDisposition: Type.Union([Type.Literal("pending"), Type.Literal("not_ready")]), rootTaskId: IdSchema,
+  child: Type.Object({
+    taskId: IdSchema, rootTaskId: IdSchema, parentTaskId: IdSchema, path: Type.String({ minLength: 1, maxLength: 2_048 }),
+    depth: Type.Integer({ minimum: 1 }), role: Type.String({ minLength: 1, maxLength: 64 }), taskType: Type.String({ minLength: 1, maxLength: 128 }),
+    status: Type.Union([Type.Literal("queued"), Type.Literal("waiting")]),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false })
 
 export const SpawnSubagentInputSchema = Type.Object({
-  idempotencyKey: KeySchema,
+  idempotencyKey: Type.Optional(KeySchema),
   role: Type.String({ minLength: 1, maxLength: 64 }),
   taskType: Type.String({ minLength: 1, maxLength: 128 }),
   goal: TextSchema,
@@ -37,7 +49,7 @@ export const SpawnSubagentInputSchema = Type.Object({
 export type SpawnSubagentInput = Static<typeof SpawnSubagentInputSchema>
 
 export const FollowupInputSchema = Type.Object({
-  idempotencyKey: KeySchema,
+  idempotencyKey: Type.Optional(KeySchema),
   taskId: IdSchema,
   goal: TextSchema,
   constraints: Type.Optional(StringListSchema),
@@ -79,7 +91,7 @@ export type CloseSubagentInput = Static<typeof CloseSubagentInputSchema>
 const SpawnOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),
   path: Type.String({ minLength: 1, maxLength: 2_048 }), depth: Type.Integer({ minimum: 0 }),
-  status: StatusSchema, replay: Type.Boolean(),
+  status: StatusSchema, replay: Type.Boolean(), nativeCoordination: Type.Optional(NativeCoordinationOutputSchema),
 }, { additionalProperties: false })
 const SendOutputSchema = Type.Object({ taskId: IdSchema, messageId: IdSchema, status: Type.Union([Type.Literal("queued"), Type.Literal("duplicate")]) }, { additionalProperties: false })
 const WaitTaskOutputSchema = Type.Object({
@@ -97,7 +109,7 @@ const WaitAggregateSchema = Type.Object({
 const FollowupOutputSchema = Type.Object({
   taskId: IdSchema, sourceTaskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),
   path: Type.String({ minLength: 1, maxLength: 2_048 }), depth: Type.Integer({ minimum: 0 }),
-  status: StatusSchema, replay: Type.Boolean(),
+  status: StatusSchema, replay: Type.Boolean(), nativeCoordination: Type.Optional(NativeCoordinationOutputSchema),
 }, { additionalProperties: false })
 const WaitOutputSchema = Type.Object({
   waitId: IdSchema, status: Type.Union([Type.Literal("waiting"), Type.Literal("ready"), Type.Literal("timed_out"), Type.Literal("interrupted"), Type.Literal("closed")]),

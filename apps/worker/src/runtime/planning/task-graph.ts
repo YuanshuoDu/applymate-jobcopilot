@@ -1,4 +1,5 @@
 import type { SubagentTaskStatus } from "../subagents/types.js"
+import type { TaskGraphNativeDelegationMetadata } from "../subagents/task-graph-native-state.js"
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "./task-graph-verification.js"
 export type TaskGraphNodeStatus = SubagentTaskStatus
 export type TaskGraphVerificationDisposition = "typed" | "legacy_unverified" | "specialized"
@@ -7,13 +8,12 @@ export type TaskGraphNodeProposal = Readonly<{
   key: string; templateId: string; goal: string
   /** Explanatory instructions only; these strings are never treated as verification proof. */
   successCriteria: readonly string[]; dependsOn: readonly string[]
-  verification?: TaskGraphVerificationContract; repairOf?: TaskGraphRepairOf
+  verification?: TaskGraphVerificationContract; repairOf?: TaskGraphRepairOf; nativeDelegation?: TaskGraphNativeDelegationMetadata
 }>
 export type TaskGraphProposal = Readonly<{ expectedRevision: number; nodes: readonly TaskGraphNodeProposal[] }>
 export type TaskGraphNode = TaskGraphNodeProposal & Readonly<{ depth: number; status: TaskGraphNodeStatus; taskId?: string; failureReason?: string; verificationDisposition?: TaskGraphVerificationDisposition }>
 export type TaskGraphState = Readonly<{ revision: number; nodes: readonly TaskGraphNode[]; appliedEvents: readonly TaskGraphEvent[]; repairSatisfiedNodeKeys?: readonly string[]; repairPendingNodeKeys?: readonly string[] }>
 export type TaskGraphValidationOptions = Readonly<{ registeredTemplateIds: ReadonlySet<string>; maxNodes: number; maxDepth: number }>
-
 /** Hard persisted-shape limits shared by model validation and snapshot parsing. */
 export const TASK_GRAPH_LIMITS = {
   maxProposalBytes: 32_000,

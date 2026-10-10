@@ -124,6 +124,16 @@ describe("TaskGraph turn observation", () => {
     expect(encoded).not.toContain("private.example")
   })
 
+  it("preserves safe native operation and structural result receipts in the current graph", () => {
+    const native = { operationKind: "spawn" as const, operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: "c".repeat(64) }
+    const nativeResult = { schemaVersion: "agent-harness.v2.task-graph.native-result.v1" as const, role: "scout", taskStatus: "completed" as const, disposition: "opaque" as const, resultDigest: "d".repeat(64) }
+    const result = mergeTaskGraphCurrentObservation(snapshot(), { ...state, nodes: [{ ...state.nodes[0]!, native, nativeResult, context: { secret: true }, result: { secret: true } } as never] })
+    const node = (result.toolObservations.at(-1)?.content as { nodes: Array<Record<string, unknown>> }).nodes[0]!
+
+    expect(node).toMatchObject({ native, nativeResult })
+    expect(JSON.stringify(node)).not.toContain("secret")
+  })
+
   it("fails closed instead of giving the model a partial or unbounded graph", () => {
     expect(() => mergeTaskGraphCurrentObservation(snapshot(), { ...state, nodes: Array.from({ length: 17 }, () => state.nodes[0]!) })).toThrow("task_graph_current_state_invalid")
     const bounded = mergeTaskGraphCurrentObservation(snapshot(), { ...state, nodes: [{ ...state.nodes[0]!, resultSummary: "x".repeat(30_000) }] })

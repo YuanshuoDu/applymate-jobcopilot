@@ -3,7 +3,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
-import { MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES, type ToolResultChunk } from "./tool-result-reference-types.js"
+import { nativeCoordinationLifecycleOutput } from "./task-graph-coordination-bridge.js"
 export const DEFAULT_MAX_LIFECYCLE_BYTES = 8 * 1024
 
 export interface ToolResultReference {
@@ -53,7 +53,6 @@ const SPAWN_RECEIPT_FIELDS = ["taskId", "rootTaskId", "parentTaskId", "path", "d
 const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_SUBAGENT_DEPTH = 8
 const DURABLE_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const TOOL_RESULT_REF = /^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 export function isDurableWaitId(value: unknown): value is string {
   return typeof value === "string" && DURABLE_WAIT_ID.test(value)
@@ -110,9 +109,10 @@ export function prepareTaskGraphPlanReceipt(value: unknown): PreparedLifecycleVa
  */
 export function prepareSubagentSpawnReceipt(
   value: unknown,
-  identity: { readonly turnId: string; readonly taskId?: string; readonly rootTaskId?: string },
+  identity: { readonly turnId: string; readonly taskId?: string; readonly rootTaskId?: string; readonly toolName?: string },
 ): PreparedLifecycleValue {
-  const receipt = exactObject(value, SPAWN_RECEIPT_FIELDS, invalidSpawnReceipt)
+  const followup = identity.toolName === "agent.followup"
+  const receipt = exactObject(value, [...SPAWN_RECEIPT_FIELDS, ...(followup ? ["sourceTaskId"] : [])], invalidSpawnReceipt, ["nativeCoordination"])
   const { taskId, rootTaskId, parentTaskId, path, depth, status, replay } = receipt
   if (typeof identity.turnId !== "string" || !identity.turnId.trim() || identity.turnId.length > 256
     || (identity.taskId !== undefined && !isGeneratedTaskId(identity.taskId, identity.turnId))
@@ -136,39 +136,28 @@ export function prepareSubagentSpawnReceipt(
     || (segments.length > 1 && segments.slice(1).some(segment => !isSubagentTaskId(segment)))
     || path !== `/${segments.join("/")}`) throw invalidSpawnReceipt()
 
-  return prepareSafeValue({ taskId, rootTaskId, parentTaskId, path, depth, status, replay })
+  const hasNativeCoordination = Object.hasOwn(receipt, "nativeCoordination")
+  let sourceTaskId: string | undefined
+  if (followup) {
+    const source = receipt.sourceTaskId
+    if (!isGeneratedTaskId(source, identity.turnId) || source === rootTaskId) throw invalidSpawnReceipt()
+    sourceTaskId = source
+  }
+  if (hasNativeCoordination) {
+    const safe = nativeCoordinationLifecycleOutput(value, {
+      operationKind: followup ? "followup" : "spawn", taskId, rootTaskId, parentTaskId, path, depth, status, replay, sourceTaskId,
+    })
+    if (!safe) throw invalidSpawnReceipt()
+    return prepareSafeValue(safe)
+  }
+  const safeOutput: { [key: string]: RepositoryJsonValue } = { taskId, rootTaskId, parentTaskId, path, depth, status, replay }
+  if (sourceTaskId !== undefined) safeOutput.sourceTaskId = sourceTaskId
+  return prepareSafeValue(safeOutput)
 }
 
 /** Validates and redacts a durable wait result before computing its canonical receipt. */
 export function prepareDurableWaitOutput(value: unknown): PreparedLifecycleValue {
   return prepareSafeValue(redactDurableWaitOutput(value))
-}
-
-export function prepareVerifiedToolResultChunk(value: ToolResultChunk): PreparedLifecycleValue | null {
-  const fields = ["ref", "sha256", "byteCount", "chunk", "nextCursor"] as const
-  try {
-    if (Object.getPrototypeOf(value) !== Object.prototype || !Object.isFrozen(value)
-      || Reflect.ownKeys(value).length !== fields.length) return null
-    for (const field of fields) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, field)
-      if (!descriptor?.enumerable || !("value" in descriptor)) return null
-    }
-    if (!TOOL_RESULT_REF.test(value.ref) || !/^[0-9a-f]{64}$/.test(value.sha256)
-      || !Number.isSafeInteger(value.byteCount) || value.byteCount < 0 || value.byteCount > MAX_TOOL_RESULT_BYTES
-      || typeof value.chunk !== "string" || Buffer.byteLength(value.chunk, "utf8") > MAX_TOOL_RESULT_READ_BYTES
-      || Buffer.from(value.chunk, "utf8").toString("utf8") !== value.chunk
-      || (value.nextCursor !== null && (!/^(0|[1-9]\d*)$/.test(value.nextCursor) || Number(value.nextCursor) > value.byteCount))) return null
-    if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_TOOL_RESULT_READ_BYTES) return null
-    return prepareSafeValue({
-      ref: value.ref,
-      sha256: value.sha256,
-      byteCount: value.byteCount,
-      chunk: value.chunk,
-      nextCursor: value.nextCursor,
-    })
-  } catch {
-    return null
-  }
 }
 
 export function sanitizeLifecyclePreview(value: unknown, maxBytes = DEFAULT_MAX_LIFECYCLE_BYTES): RepositoryJsonValue {
@@ -200,13 +189,15 @@ export function prepareSafeValue(safe: RepositoryJsonValue): PreparedLifecycleVa
   }
 }
 
-function exactObject(value: unknown, fields: readonly string[], invalid = invalidPlanReceipt): Record<string, unknown> {
+function exactObject(value: unknown, fields: readonly string[], invalid = invalidPlanReceipt, optionalFields: readonly string[] = []): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw invalid()
   const prototype = Object.getPrototypeOf(value)
   if (prototype !== Object.prototype && prototype !== null) throw invalid()
   const keys = Reflect.ownKeys(value)
-  if (keys.length !== fields.length || keys.some(key => typeof key !== "string" || !fields.includes(key))) throw invalid()
-  for (const field of fields) {
+  const allowed = [...fields, ...optionalFields]
+  if (keys.length < fields.length || keys.length > allowed.length || keys.some(key => typeof key !== "string" || !allowed.includes(key))
+    || fields.some(field => !Object.hasOwn(value, field))) throw invalid()
+  for (const field of keys) {
     const descriptor = Object.getOwnPropertyDescriptor(value, field)
     if (!descriptor?.enumerable || !("value" in descriptor)) throw invalid()
   }

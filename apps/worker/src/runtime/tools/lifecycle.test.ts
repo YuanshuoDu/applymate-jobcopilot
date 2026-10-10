@@ -14,6 +14,8 @@ import { ToolRegistry } from "./registry.js"
 import { ToolRouter } from "./router.js"
 import type { RuntimeToolDefinition, ToolExecutionContext } from "./types.js"
 import type { ToolResultChunk, ToolResultReferenceRepository } from "./tool-result-reference-types.js"
+import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
+import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
 
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
 const ordinaryCall: LifecycleCall = { ...call, toolName: "notes.read" }
@@ -43,6 +45,21 @@ const spawnReceipt = {
   taskId: spawnTaskId, rootTaskId: spawnRootTaskId, parentTaskId: spawnRootTaskId,
   path: `/${spawnRootTaskId}/${spawnTaskId}`, depth: 1, status: "queued", replay: false,
 } as const
+const nativeCoordinationCommandReceipt: TaskGraphNativeCommandReceipt = {
+  status: "accepted", replay: false, operationId: "native-operation-1", requestFingerprint: "a".repeat(64),
+  graphRevision: 2, nodeKey: "native-node-1", dispatchDisposition: "pending",
+  child: { taskId: spawnTaskId, rootTaskId: spawnRootTaskId, parentTaskId: spawnRootTaskId, path: `/${spawnRootTaskId}/${spawnTaskId}`, depth: 1, role: "scout", taskType: "research", status: "queued" },
+}
+const nativeSpawnOutput = nativeCoordinationOutput("spawn", spawnRootTaskId, nativeCoordinationCommandReceipt)
+const followupTaskId = "subagent-87654321-4321-4abc-8def-210987654321"
+const nativeFollowupOutput = {
+  ...nativeCoordinationOutput("followup", spawnRootTaskId, {
+    ...nativeCoordinationCommandReceipt,
+    operationId: "native-followup-1",
+    child: { ...nativeCoordinationCommandReceipt.child, taskId: followupTaskId, path: `/${spawnRootTaskId}/${followupTaskId}` },
+  }),
+  sourceTaskId: spawnTaskId,
+}
 const durableWaitReceipt = {
   waitId: "wait-12345678-1234-4234-9234-123456789012",
   status: "ready",
@@ -528,6 +545,35 @@ describe("ToolLifecycle", () => {
     const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
     const output = await lifecycle.completed(ordinaryCall, { waitId: durableWaitReceipt.waitId })
     expect(output).toEqual({ waitId: "wait-[REDACTED_PHONE]" })
+  })
+
+  it("persists native spawn, alias, and follow-up receipts inline without redacting generated lineage", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const cases = [
+      { call: spawnCall, output: nativeSpawnOutput },
+      { call: { ...spawnCall, id: "call-spawn-alias", toolName: "spawn_subagent" }, output: nativeSpawnOutput },
+      { call: { ...spawnCall, id: "call-native-followup", toolName: "agent.followup" }, output: nativeFollowupOutput },
+    ] as const
+
+    for (const entry of cases) {
+      const output = await lifecycle.completed(entry.call, entry.output)
+      expect(output).toEqual(entry.output)
+      expect(Buffer.byteLength(JSON.stringify(output), "utf8")).toBeLessThan(8 * 1024)
+    }
+    expect(sink.events).toHaveLength(cases.length)
+    expect(sink.events.map(event => event.payload.output)).toEqual(cases.map(entry => entry.output))
+  })
+
+  it("rejects malformed native follow-up envelopes and keeps legacy follow-up redaction", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const malformed = { ...nativeFollowupOutput, nativeCoordination: { ...nativeFollowupOutput.nativeCoordination, child: { ...nativeFollowupOutput.nativeCoordination.child, taskId: spawnTaskId } } }
+
+    await expect(lifecycle.completed({ ...spawnCall, toolName: "agent.followup" }, malformed)).rejects.toMatchObject({ code: "native_coordination_receipt_invalid" })
+    expect(sink.events).toHaveLength(0)
+    await expect(lifecycle.completed({ ...call, toolName: "agent.followup" }, { message: "Contact candidate@example.com at 202-555-0199" }))
+      .resolves.toEqual({ message: "Contact [REDACTED_EMAIL] at [REDACTED_PHONE]" })
   })
 
   it("fails closed for malformed or extra-field agent.spawn receipts", async () => {

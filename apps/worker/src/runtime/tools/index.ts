@@ -10,7 +10,7 @@ import { ToolRouter } from "./router.js"
 import type { PolicyEngine } from "../policy/index.js"
 import { createCoordinationTools } from "./coordination-tools.js"
 import { createArtifactTools, type ArtifactToolStore } from "./artifact-tools.js"
-import type { CoordinationRuntimeOptions, DurableWaitPort, CoordinationStore } from "./coordination-types.js"
+import type { CoordinationRuntimeOptions, DurableWaitPort, CoordinationStore, NativeCoordinationRuntimeOptions } from "./coordination-types.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { AgentTreeManager } from "../subagents/manager.js"
 import { createGmailTools } from "./gmail-tools.js"
@@ -29,6 +29,7 @@ export * from "./types.js"
 export * from "./coordination-types.js"
 export * from "./coordination-tools.js"
 export * from "./coordination-executors.js"
+export * from "./task-graph-coordination-bridge.js"
 export * from "./gmail-client.js"
 export * from "./gmail-store.js"
 export * from "./gmail-tools.js"
@@ -45,6 +46,7 @@ export type WorkerCoordinationOptions = {
   readonly manager: AgentTreeManager
   readonly store?: CoordinationStore
   readonly wait?: DurableWaitPort
+  readonly nativeCoordination?: NativeCoordinationRuntimeOptions
 }
 
 export type WorkerGmailOptions = GmailToolOptions
@@ -71,6 +73,7 @@ export function createWorkerToolRuntime(
       manager: coordination.manager,
       store: coordination.store ?? new PgCoordinationStore(pool),
       wait: coordination.wait,
+      nativeCoordination: coordination.nativeCoordination,
     }
     definitions.push(...createCoordinationTools(options))
   }

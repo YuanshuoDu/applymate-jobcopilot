@@ -117,7 +117,7 @@ function fakeClient(options: ClientOptions = {}) {
       if (sql.startsWith('SELECT task."id", task."status"')) {
         return { rows: options.taskRows ?? [validTaskRow()], rowCount: (options.taskRows ?? [validTaskRow()]).length }
       }
-      if (sql.startsWith('SELECT event."type", event."payload"')) {
+      if (sql.startsWith('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"')) {
         const rows = options.events ?? []
         return { rows, rowCount: rows.length }
       }
@@ -254,7 +254,8 @@ describe("TaskGraph PostgreSQL state loading", () => {
     const tasks = fake.calls.find(call => call.sql.startsWith('SELECT task."id", task."status"'))
     expect(tasks?.sql).toContain('task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6')
     expect(tasks?.values).toEqual([["child-1"], "session-1", "turn-1", "root-1", "root-1", "user-1"])
-    const events = fake.calls.find(call => call.sql.startsWith('SELECT event."type", event."payload"'))
+    const events = fake.calls.find(call => call.sql.startsWith('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"'))
+    expect(events?.sql).toContain('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"')
     expect(events?.sql).toContain('event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3')
     expect(events?.sql).toContain('session."userId" = $4 AND turn."userId" = $4')
     expect(events?.values).toEqual(["session-1", "turn-1", taskGraphItemId("root-1"), "user-1"])

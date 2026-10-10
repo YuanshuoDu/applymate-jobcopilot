@@ -222,7 +222,7 @@ function hasFailedAncestor(key: string, dependencies: ReadonlyMap<string, { read
   return Boolean(node?.dependsOn.some(dependency => hasFailedAncestor(dependency, dependencies, statuses, visited)))
 }
 
-async function enqueueGraphTask(client: Queryable, sessionId: string, task: SubagentTaskRecord): Promise<void> {
+export async function enqueueGraphTask(client: Queryable, sessionId: string, task: SubagentTaskRecord): Promise<void> {
   const payload = { taskId: task.id, sessionId, rootTaskId: task.rootTaskId, ownerId: `coordination-${randomUUID()}` }
   const inserted = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
     VALUES ($1, 'agent.subagent.dispatch', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,

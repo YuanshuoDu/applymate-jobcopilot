@@ -55,12 +55,18 @@ describe("executeTools persisted replay", () => {
   const waitReceipt = { waitId: durableWaitId, status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: ["child-1"] }
   const resolvedInput = { taskIds: ["child-1"], mode: "all" }
   const resolvedOutput = { waitId: durableWaitId, status: "ready", matchedTaskIds: ["child-1"], targetTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
+  const nativeOutput = {
+    taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1, status: "queued", replay: false,
+    nativeCoordination: { schemaVersion: "agent-harness.v2.native-coordination-receipt.v1", operationKind: "spawn", status: "accepted", replay: false,
+      operationId: "operation-1", requestFingerprint: "a".repeat(64), graphRevision: 1, nodeKey: "node-1", dispatchDisposition: "pending", rootTaskId: "root-1",
+      child: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1, role: "scout", taskType: "research", status: "queued" } },
+  }
 
   function projection(output: unknown, input: unknown = resolvedInput, includeInput = true) {
     return { id: `wait-result:${durableWaitId}`, content: { toolCallId: `wait:${durableWaitId}`, toolName: "agent.wait", ...(includeInput ? { input } : {}), status: "completed", output } }
   }
 
-  function replayFixture(output: unknown, persistedCall = call, additionalToolObservations: readonly { id: string; content: unknown }[] = []) {
+  function replayFixture(output: unknown, persistedCall: { id: string; name: string; arguments: Record<string, unknown> } = call, additionalToolObservations: readonly { id: string; content: unknown }[] = []) {
     const executeTool = vi.fn()
     const options = {
       identity: { kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-2", leaseVersion: 2, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
@@ -118,7 +124,7 @@ describe("executeTools persisted replay", () => {
     )
   }
 
-  async function replay(fixture: ReturnType<typeof replayFixture>, modelCall = call) {
+  async function replay(fixture: ReturnType<typeof replayFixture>, modelCall: { id: string; name: string; arguments: Record<string, unknown> } = call) {
     return executeTools(
       fixture.options,
       fixture.writer,
@@ -270,6 +276,36 @@ describe("executeTools persisted replay", () => {
     expect(result.wait).toBeNull()
     expect(result.snapshot).toBe(fixture.options.snapshot)
     expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("refreshes graph state after a persisted native alias replay", async () => {
+    const spawnCall = { id: "spawn-call", name: "spawn_subagent", arguments: { role: "scout", taskType: "research", goal: "Inspect" } }
+    const fixture = replayFixture(nativeOutput, spawnCall)
+    const refreshed = { ...fixture.options.snapshot, toolObservations: [...fixture.options.snapshot.toolObservations, { id: "task-graph-current", content: { kind: "task_graph_current", revision: 1, nodes: [] } }] }
+    const refresh = vi.fn(async () => refreshed)
+    Object.assign(fixture.options, { refreshTaskGraphAfterPlan: refresh })
+
+    const result = await replay(fixture, spawnCall)
+
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(result.snapshot).toBe(refreshed)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("refreshes graph state immediately after a newly accepted native followup", async () => {
+    const followupCall = { id: "followup-call", name: "agent.followup", arguments: { taskId: "source-1", goal: "Continue" } }
+    const executeTool = vi.fn(async () => ({ id: followupCall.id, toolName: followupCall.name, toolVersion: "1", status: "completed" as const, output: { ...nativeOutput, sourceTaskId: "source-1", nativeCoordination: { ...nativeOutput.nativeCoordination, operationKind: "followup" } }, errorCode: null }))
+    const fixture = execution(pending, executeTool as never)
+    const refreshed = { ...fixture.options.snapshot, toolObservations: [{ id: "task-graph-current", content: { kind: "task_graph_current", revision: 1, nodes: [] } }] }
+    const refresh = vi.fn(async () => refreshed)
+    Object.assign(fixture.options, { refreshTaskGraphAfterPlan: refresh })
+
+    const result = await executeTools(fixture.options, fixture.writer, { id: "step-1", ordinal: 1 },
+      { text: "", reasoningSummary: "", toolCalls: [followupCall], provider: "fixture", model: "fixture", finishReason: "tool_calls", usage: null, continuation: null },
+      fixture.options.snapshot, new Set(), fixture.options.signal!, () => new Date("2026-09-09T00:00:00.000Z"), undefined, vi.fn())
+
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(result.snapshot).toBe(refreshed)
   })
 
   it("persists an attempt-scoped receipt and exact resume link without re-executing the tool", async () => {

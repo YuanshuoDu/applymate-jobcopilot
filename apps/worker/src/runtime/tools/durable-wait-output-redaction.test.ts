@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { redactSensitiveValue } from "@jobcopilot/shared"
 
+import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
 
 const waitId = "wait-12345678-1234-4234-9234-123456789012"
@@ -64,6 +65,35 @@ describe("durable wait output redaction", () => {
     const safeAggregate = safe.aggregate as Record<string, unknown>
     expect(safeAggregate.jobIds).not.toEqual([taskId])
     expect(output.waitId).toBe(waitId)
+  })
+
+  it("projects resumed native wait results through the same feedback allowlist", () => {
+    const output = validOutput()
+    Object.assign(output.tasks[0]!.result, {
+      status: "completed",
+      nativeVerificationReport: {
+        schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA,
+        controlOperationId: "verify-op",
+        controlTaskId: taskId,
+        controlAttempt: 1,
+        owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null },
+        target: { kind: "root_goal", candidateDigest: "a".repeat(64), childBindingSetDigest: "b".repeat(64) },
+        goalDigest: "c".repeat(64), criteriaDigest: "d".repeat(64), evidencePacketDigest: "e".repeat(64), disposition: "passed",
+        criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+      },
+    })
+    const safe = redactDurableWaitOutput(output) as Record<string, unknown>
+    const safeTasks = safe.tasks as Array<Record<string, unknown>>
+    expect(safeTasks[0]?.result).toMatchObject({
+      status: "completed",
+      nativeVerificationFeedback: {
+        disposition: "passed",
+        criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+      },
+    })
+    expect(JSON.stringify(safe)).not.toContain("nativeVerificationReport")
+    expect(JSON.stringify(safe)).not.toContain("childBindingSetDigest")
+    expect(JSON.stringify(safe)).not.toContain("controlTaskId")
   })
 
   it("fails closed on invalid or contradictory IDs", () => {

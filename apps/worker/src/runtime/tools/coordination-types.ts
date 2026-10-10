@@ -1,5 +1,6 @@
 import type { AgentTreeManager } from "../subagents/manager.js"
 import type { SubagentTaskRecord } from "../subagents/types.js"
+import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
 import { ToolExecutionError } from "./types.js"
 
 export type CoordinationTaskView = Pick<SubagentTaskRecord,
@@ -111,10 +112,21 @@ export type DurableWaitResult = {
   readonly matchedTaskIds: readonly string[]
 }
 
+/** Runtime-owned TaskGraph command configuration for planner-enabled root delegation. */
+export type NativeCoordinationRuntimeOptions = Readonly<{
+  enabled: boolean
+  commandPort?: TaskGraphCommandPort
+  turnLeaseOwner: string
+  turnLeaseVersion: number
+  parentLeaseOwner: string
+  parentAttemptCount: () => number | null | undefined
+}>
+
 export type CoordinationRuntimeOptions = {
   readonly manager: AgentTreeManager
   readonly store: CoordinationStore
   readonly wait?: DurableWaitPort
+  readonly nativeCoordination?: NativeCoordinationRuntimeOptions
 }
 
 export class CoordinationError extends ToolExecutionError {

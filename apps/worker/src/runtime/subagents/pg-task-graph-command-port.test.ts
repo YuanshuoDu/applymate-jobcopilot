@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
-import type { TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { PgSubagentPool } from "./types.js"
 
@@ -49,6 +49,9 @@ function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; i
       if (sql.startsWith('SELECT "id" FROM "agent_sessions"')) {
         return options.failFence === "session" ? empty : { rows: [{ id: input.scope.sessionId }], rowCount: 1 }
       }
+      if (sql.startsWith('SELECT session."id" FROM "agent_sessions"')) {
+        return { rows: [{ id: input.scope.sessionId }], rowCount: 1 }
+      }
       if (sql.startsWith('SELECT "id" FROM "agent_turns"')) {
         return options.failFence === "turn" ? empty : { rows: [{ id: input.scope.turnId }], rowCount: 1 }
       }
@@ -70,6 +73,9 @@ function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; i
       if (sql.startsWith('SELECT event."payload"')) {
         if (values.length === 5 && options.includeReplay !== false) return { rows: [{ payload: replayPayload }], rowCount: 1 }
         return empty
+      }
+      if (sql.startsWith("SELECT EXISTS (") && sql.includes('FROM "agent_items"')) {
+        return { rows: [{ exists: options.missingGraph !== true }], rowCount: 1 }
       }
       if (sql.startsWith("SELECT EXISTS (")) return { rows: [{ exists: options.persistedPlanReceipt === true }], rowCount: 1 }
       return empty
@@ -131,6 +137,24 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.some(call => call.sql.startsWith("SELECT EXISTS ("))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_items"'))).toBe(false)
+  })
+
+  it("rejects native replay when an owned event outlives its graph item", async () => {
+    const input = scheduleInput()
+    const native: TaskGraphNativeCommandInput = {
+      scope: input.scope,
+      request: { kind: "spawn", idempotencyKey: "native-missing", role: "auditor", taskType: "audit", goal: "Review" },
+    }
+    const fake = fakePool(input, { missingGraph: true, persistedPlanReceipt: true })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendNativeCoordination!(native)).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "task_graph_state_missing", message: "Persisted TaskGraph state is unavailable",
+    })
+    const ownedReceiptCheck = fake.calls.findIndex(call => call.sql.startsWith("SELECT EXISTS (") && call.sql.includes('FROM "agent_events"'))
+    const graphItemCheck = fake.calls.findIndex(call => call.sql.startsWith("SELECT EXISTS (") && call.sql.includes('FROM "agent_items"'))
+    expect(ownedReceiptCheck).toBeGreaterThan(-1)
+    expect(graphItemCheck).toBeGreaterThan(ownedReceiptCheck)
+    expect(fake.calls.some(call => call.sql.includes('event."idempotencyKey" = $4'))).toBe(false)
   })
 
   it("rejects a new proposal against a missing graph that has an older receipt", async () => {
