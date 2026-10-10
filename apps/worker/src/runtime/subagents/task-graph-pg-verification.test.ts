@@ -194,6 +194,31 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(partial.report.reasonCode).toBe("result_invalid")
   })
 
+  it("does not treat application outcome summaries as TaskGraph evidence", async () => {
+    const data = durableRows()
+    data.items[0]!.content = { ...(data.items[0]!.content as Record<string, unknown>), toolName: "application.outcomes_summary" }
+    data.items[1]!.content = {
+      toolCallId: "call-1",
+      output: {
+        schemaVersion: 1, advisoryOnly: true,
+        coverage: { basis: "latest_100_jobs_by_updatedAt", jobCount: 1, truncated: false },
+        jobStatusCounts: { saved: 1, applied: 0, interview: 0, offer: 0, rejected: 0 },
+        linkedJobsByGmailKind: { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 0 },
+        gmailSemantics: { classification: "heuristic_advisory_only", matchConfidence: "job_linkage_only" },
+      },
+      errorCode: null,
+    }
+    data.events = data.events.map(event => ({
+      ...event, payload: { ...(event.payload as Record<string, unknown>), toolName: "application.outcomes_summary" },
+    }))
+
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult })
+
+    expect(result.verified).toBe(false)
+    expect(result.report.status).toBe("unverified")
+    expect(result.report.evidenceDigest).toBeNull()
+  })
+
   it("rejects foreign persisted item lineage and truncated tool output", async () => {
     const foreign = durableRows({ items: durableRows().items.map(item => item.id === "call-item" ? { ...item, sessionId: "other-session" } : item) })
     const foreignResult = await verifyTaskGraphNodeEvidence(foreign.client, { scope, snapshot, node, structuredResult })

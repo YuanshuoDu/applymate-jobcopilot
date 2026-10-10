@@ -1,7 +1,7 @@
 import { Type, type Static } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 
-import type { RuntimeToolDefinition, ToolExecutionContext } from "./types.js"
+import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 
 export const JobSearchInputSchema = Type.Object({
   target: Type.Optional(Type.String({ maxLength: 160 })),
@@ -33,6 +33,12 @@ export const ApplicationStateInputSchema = Type.Object({
 }, { additionalProperties: false })
 export type ApplicationStateInput = Static<typeof ApplicationStateInputSchema>
 
+export const ApplicationOutcomesSummaryInputSchema = Type.Object({}, { additionalProperties: false })
+export type ApplicationOutcomesSummaryInput = Static<typeof ApplicationOutcomesSummaryInputSchema>
+
+export const OUTCOME_JOB_STATUSES = ["saved", "applied", "interview", "offer", "rejected"] as const
+export const OUTCOME_GMAIL_KINDS = ["application_received", "interview_invitation", "offer", "rejection", "application_update"] as const
+
 /** Read tools available to the canonical planner when their registry entries are present. */
 export const READ_ONLY_TOOL_NAMES = [
   "jobs.search",
@@ -40,6 +46,7 @@ export const READ_ONLY_TOOL_NAMES = [
   "persona.retrieve",
   "resume.get_base",
   "application.get_state",
+  "application.outcomes_summary",
 ] as const
 
 export interface JobRecord {
@@ -102,12 +109,42 @@ export interface ApplicationStateResult {
   approvals: Array<{ id: string; type: string; status: string; title: string; impact: unknown; decidedAt: string | null; createdAt: string }>
 }
 
+export const ApplicationOutcomesSummaryResultSchema = Type.Object({
+  schemaVersion: Type.Literal(1),
+  advisoryOnly: Type.Literal(true),
+  coverage: Type.Object({
+    basis: Type.Literal("latest_100_jobs_by_updatedAt"),
+    jobCount: Type.Integer({ minimum: 0, maximum: 100 }),
+    truncated: Type.Boolean(),
+  }, { additionalProperties: false }),
+  jobStatusCounts: Type.Object({
+    saved: Type.Integer({ minimum: 0, maximum: 100 }),
+    applied: Type.Integer({ minimum: 0, maximum: 100 }),
+    interview: Type.Integer({ minimum: 0, maximum: 100 }),
+    offer: Type.Integer({ minimum: 0, maximum: 100 }),
+    rejected: Type.Integer({ minimum: 0, maximum: 100 }),
+  }, { additionalProperties: false }),
+  linkedJobsByGmailKind: Type.Object({
+    application_received: Type.Integer({ minimum: 0, maximum: 100 }),
+    interview_invitation: Type.Integer({ minimum: 0, maximum: 100 }),
+    offer: Type.Integer({ minimum: 0, maximum: 100 }),
+    rejection: Type.Integer({ minimum: 0, maximum: 100 }),
+    application_update: Type.Integer({ minimum: 0, maximum: 100 }),
+  }, { additionalProperties: false }),
+  gmailSemantics: Type.Object({
+    classification: Type.Literal("heuristic_advisory_only"),
+    matchConfidence: Type.Literal("job_linkage_only"),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false })
+export type ApplicationOutcomesSummaryResult = Static<typeof ApplicationOutcomesSummaryResultSchema>
+
 export interface ReadToolDataSource {
   searchJobs(userId: string, input: JobSearchInput): Promise<JobSearchResult>
   getJob(userId: string, jobId: string): Promise<JobRecord | null>
   retrievePersona(userId: string, input: PersonaRetrieveInput): Promise<{ facts: PersonaFactRecord[] }>
   getBaseResume(userId: string, input: BaseResumeInput): Promise<{ resume: ResumeRecord | null }>
   getApplicationState(userId: string, input: ApplicationStateInput): Promise<ApplicationStateResult>
+  getOutcomesSummary?(userId: string): Promise<ApplicationOutcomesSummaryResult>
 }
 
 const nullableText = Type.Union([Type.String(), Type.Null()])
@@ -145,6 +182,15 @@ export function createReadOnlyTools(source: ReadToolDataSource): RuntimeToolDefi
     { ...readMetadata("persona.retrieve", "Retrieve confirmed candidate facts with provenance", "persona"), inputSchema: PersonaRetrieveInputSchema, outputSchema: PersonaResultSchema, execute: (context, input) => source.retrievePersona(userId(context), input as PersonaRetrieveInput) },
     { ...readMetadata("resume.get_base", "Read an immutable base resume owned by the current user", "resume"), inputSchema: BaseResumeInputSchema, outputSchema: ResumeResultSchema, execute: (context, input) => source.getBaseResume(userId(context), input as BaseResumeInput) },
     { ...readMetadata("application.get_state", "Read application preparation state and pending approvals", "application"), inputSchema: ApplicationStateInputSchema, outputSchema: ApplicationResultSchema, execute: (context, input) => source.getApplicationState(userId(context), input as ApplicationStateInput) },
+    {
+      ...readMetadata("application.outcomes_summary", "Use for general career or application planning when prior outcomes may help; results are advisory only", "application"),
+      inputSchema: ApplicationOutcomesSummaryInputSchema, outputSchema: ApplicationOutcomesSummaryResultSchema,
+      execute: async context => {
+        if (context.actorRole !== "orchestrator") throw new ToolExecutionError("application_outcomes_summary_root_only", "Only the root agent can read application outcomes")
+        if (!source.getOutcomesSummary) throw new ToolExecutionError("application_outcomes_summary_unavailable", "Application outcome summary is unavailable")
+        return source.getOutcomesSummary(userId(context))
+      },
+    },
   ]
 }
 

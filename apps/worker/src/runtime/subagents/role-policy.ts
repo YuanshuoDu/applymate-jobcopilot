@@ -31,6 +31,7 @@ export type ToolVisibilityReason =
   | "external_write_receipt_missing"
   | "external_write_receipt_invalid"
   | "coordination_disabled"
+  | "root_only_tool"
 
 export type ToolVisibility = {
   readonly visible: boolean
@@ -71,6 +72,7 @@ export function visibleToolPolicy(
   tool: RoleToolMetadata,
   receipt?: ApprovalReceiptHint,
 ): ToolVisibility {
+  if (tool.name === "application.outcomes_summary") return { visible: false, reason: "root_only_tool" }
   const policy = getSubagentRolePolicy(role)
   if (!policy) return { visible: false, reason: "role_risk_denied" }
   if (COORDINATION_TOOL_NAMES.has(tool.name)) {
