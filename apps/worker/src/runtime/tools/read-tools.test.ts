@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { createReadOnlyTools, type ApplicationOutcomesSummaryResult, type ReadToolDataSource } from "./read-tools.js"
+import { OUTCOME_JOB_SOURCES, createReadOnlyTools, type ApplicationOutcomesSummaryResult, type ReadToolDataSource } from "./read-tools.js"
+
+const expectedOutcomeSources = ["adzuna", "agent", "ashby", "ats", "cleanjobdata", "fantasticjobs", "gmail", "greenhouse", "indeed", "irishjobs", "jsearch", "lever", "linkedin", "manual", "other_or_unknown", "personio", "smartrecruiters", "workday"] as const
 
 const emptySummary: ApplicationOutcomesSummaryResult = {
-  schemaVersion: 1, advisoryOnly: true,
+  schemaVersion: 2, advisoryOnly: true,
   coverage: { basis: "latest_100_jobs_by_updatedAt", jobCount: 0, truncated: false },
   jobStatusCounts: { saved: 0, applied: 0, interview: 0, offer: 0, rejected: 0 },
   linkedJobsByGmailKind: { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 0 },
   gmailSemantics: { classification: "heuristic_advisory_only", matchConfidence: "job_linkage_only" },
+  sourceBreakdown: { basis: "same_latest_100_jobs_by_updatedAt", minimumAppliedOrBeyondJobCount: 10, groups: [], suppressedGroupCount: 0, semantics: "descriptive_source_association_only" },
 }
 
 function source(): ReadToolDataSource & Required<Pick<ReadToolDataSource, "getOutcomesSummary">> {
@@ -48,7 +51,7 @@ describe("read-only tool definitions", () => {
     expect(dataSource.getOutcomesSummary).toHaveBeenCalledWith("owner-a")
   })
 
-  it("advertises the strict no-argument contract, fixed semantics, and bounded counts", async () => {
+  it("advertises the strict v2 no-argument contract, fixed semantics, and bounded counts", async () => {
     const tool = createReadOnlyTools(source()).find((item) => item.name === "application.outcomes_summary")
     if (!tool) throw new Error("outcomes_summary_tool_missing")
     expect(tool.description).toContain("general career or application planning")
@@ -57,18 +60,34 @@ describe("read-only tool definitions", () => {
     expect(tool.outputSchema).toMatchObject({
       type: "object", additionalProperties: false,
       properties: {
-        schemaVersion: { const: 1 }, advisoryOnly: { const: true },
+        schemaVersion: { const: 2 }, advisoryOnly: { const: true },
         coverage: { additionalProperties: false, properties: { basis: { const: "latest_100_jobs_by_updatedAt" }, jobCount: { minimum: 0, maximum: 100 } } },
         gmailSemantics: { additionalProperties: false, properties: { classification: { const: "heuristic_advisory_only" }, matchConfidence: { const: "job_linkage_only" } } },
+        sourceBreakdown: {
+          additionalProperties: false,
+          properties: {
+            basis: { const: "same_latest_100_jobs_by_updatedAt" },
+            minimumAppliedOrBeyondJobCount: { const: 10 },
+            groups: { minItems: 0, maxItems: 18 },
+            suppressedGroupCount: { minimum: 0, maximum: 18 },
+            semantics: { const: "descriptive_source_association_only" },
+          },
+        },
       },
     })
     const output = await tool.execute(rootContext, {}) as ApplicationOutcomesSummaryResult
     expect(output).toEqual(emptySummary)
-    expect(Object.keys(output)).toEqual(["schemaVersion", "advisoryOnly", "coverage", "jobStatusCounts", "linkedJobsByGmailKind", "gmailSemantics"])
-    for (const nested of [tool.outputSchema.properties.coverage, tool.outputSchema.properties.jobStatusCounts, tool.outputSchema.properties.linkedJobsByGmailKind, tool.outputSchema.properties.gmailSemantics]) {
+    expect(Object.keys(output)).toEqual(["schemaVersion", "advisoryOnly", "coverage", "jobStatusCounts", "linkedJobsByGmailKind", "gmailSemantics", "sourceBreakdown"])
+    for (const nested of [tool.outputSchema.properties.coverage, tool.outputSchema.properties.jobStatusCounts, tool.outputSchema.properties.linkedJobsByGmailKind, tool.outputSchema.properties.gmailSemantics, tool.outputSchema.properties.sourceBreakdown]) {
       expect(nested.additionalProperties).toBe(false)
     }
-    for (const counts of [tool.outputSchema.properties.jobStatusCounts, tool.outputSchema.properties.linkedJobsByGmailKind]) {
+    const sourceBreakdown = tool.outputSchema.properties.sourceBreakdown
+    const groupSchema = sourceBreakdown.properties.groups.items
+    expect(groupSchema.additionalProperties).toBe(false)
+    for (const nested of [groupSchema.properties.jobStatusCounts, groupSchema.properties.linkedJobsByGmailKind]) expect(nested.additionalProperties).toBe(false)
+    expect(OUTCOME_JOB_SOURCES).toEqual(expectedOutcomeSources)
+    expect(groupSchema.properties.source.anyOf.map((item: { const: string }) => item.const)).toEqual(expectedOutcomeSources)
+    for (const counts of [tool.outputSchema.properties.jobStatusCounts, tool.outputSchema.properties.linkedJobsByGmailKind, groupSchema.properties.jobStatusCounts, groupSchema.properties.linkedJobsByGmailKind]) {
       for (const count of Object.values(counts.properties)) expect(count).toMatchObject({ type: "integer", minimum: 0, maximum: 100 })
     }
   })
