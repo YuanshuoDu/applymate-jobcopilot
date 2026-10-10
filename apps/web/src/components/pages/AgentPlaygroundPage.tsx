@@ -61,7 +61,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
   const { data: controlSessionData, refetch: refetchControlSession } = useApi<{ session?: { status?: unknown } }>(selectedSessionId ? `/api/agent/sessions/${encodeURIComponent(selectedSessionId)}` : '', { cache: false, enabled: Boolean(selectedSessionId) })
   const controlStatus = parseAgentSessionControlStatus(controlSessionData?.session?.status)
   useAgentSessionControlRefresh(selectedSessionId, controlStatus, refetchControlSession, refetchTurnState)
-  const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState)
+  const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState, controlStatus)
   const [conversationTitle, setConversationTitle] = useState<string | null>(null)
   const [conversationSubtitle, setConversationSubtitle] = useState<string | null>(null)
   const [sessionsRefreshVersion, setSessionsRefreshVersion] = useState(0)

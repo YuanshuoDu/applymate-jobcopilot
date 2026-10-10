@@ -1,3 +1,5 @@
+import React from 'react'
+import { renderToString } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { ActiveTurnDto } from './agent-session-state'
 import {
@@ -5,7 +7,9 @@ import {
   reconcileComposerMessage,
   sendAgentInterrupt,
   sendAgentTurnMessage,
+  useAgentTurnComposer,
   type ComposerMessage,
+  type TurnComposerController,
   AgentTurnCommandError,
 } from './agent-turn-commands'
 
@@ -62,5 +66,19 @@ describe('agent Turn commands', () => {
     const accepted: ComposerMessage[] = [{ clientMessageId: 'message_4', text: 'Done', delivery: 'steer', status: 'accepted', inputId: 'input_4' }]
     expect(reconcileComposerMessage(accepted, 'message_4', { status: 'consumed' })[0]?.status).toBe('consumed')
     expect(reconcileComposerMessage(accepted, 'message_4', { status: 'failed', error: '409 Turn changed' })[0]).toMatchObject({ status: 'failed', error: '409 Turn changed' })
+  })
+
+  it('passes the authoritative Session status and Turn refresh through the controller', () => {
+    const refetch = vi.fn()
+    const captured: { controller: TurnComposerController | null } = { controller: null }
+    function Probe() {
+      captured.controller = useAgentTurnComposer('session_1', activeTurn, refetch, 'running')
+      return null
+    }
+
+    renderToString(React.createElement(Probe))
+    expect(captured.controller?.sessionStatus).toBe('running')
+    captured.controller?.refresh?.()
+    expect(refetch).toHaveBeenCalledOnce()
   })
 })
