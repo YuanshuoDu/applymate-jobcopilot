@@ -373,6 +373,31 @@ describe("automation scheduler", () => {
     expect(request).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    { retryAfter: "3", telemetryDelayMs: 5_000, retryMaxDelayMs: 5_000 },
+    { retryAfter: "60", telemetryDelayMs: 5_000, retryMaxDelayMs: 4_000 },
+  ])("does not extend a Retry-After deadline past telemetry latency (%#)", async ({ retryAfter, telemetryDelayMs, retryMaxDelayMs }) => {
+    let currentTime = 0;
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response("retry later", { status: 429, headers: { "Retry-After": retryAfter } }))
+      .mockResolvedValue(new Response("ok"));
+    const recordUsage = vi.fn().mockImplementation(async () => { currentTime += telemetryDelayMs; });
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs,
+      now: () => currentTime,
+      request,
+      recordUsage,
+    });
+
+    await scheduler.run();
+    expect(currentTime).toBe(telemetryDelayMs);
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it("caps Retry-After at the configured maximum delay", async () => {
     let currentTime = 0;
     const request = vi.fn()

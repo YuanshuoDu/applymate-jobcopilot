@@ -113,7 +113,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
         signal: AbortSignal.timeout(30_000),
       });
       const failure = response.ok ? undefined : `${task.name} returned ${response.status} (${httpErrorCode(response.status)})`;
-      const retryAfterAt = response.status === 429 || response.status === 503 ? parseRetryAfterAt(response.headers.get("retry-after"), now(), config.retryMaxDelayMs ?? MAX_RETRY_DELAY_MS) : undefined;
+      const retryAfterObservedAt = response.status === 429 || response.status === 503 ? now() : undefined, retryAfterAt = retryAfterObservedAt === undefined ? undefined : parseRetryAfterAt(response.headers.get("retry-after"), retryAfterObservedAt, config.retryMaxDelayMs ?? MAX_RETRY_DELAY_MS);
       await recordUsageSafely({
         operation: `scheduler_${task.name}`,
         status: response.ok ? "success" : "error",
@@ -123,7 +123,7 @@ export function createAutomationScheduler(config: AutomationSchedulerConfig): Au
         latencyMs: now() - startedAt,
       });
       if (failure) {
-        markSchedulerTaskFailure(current, failure, now(), task.intervalMs ?? config.intervalMs, config.retryBaseDelayMs ?? config.intervalMs, config.retryMaxDelayMs ?? MAX_RETRY_DELAY_MS, retryAfterAt);
+        markSchedulerTaskFailure(current, failure, now(), task.intervalMs ?? config.intervalMs, config.retryBaseDelayMs ?? config.intervalMs, config.retryMaxDelayMs ?? MAX_RETRY_DELAY_MS, retryAfterAt, retryAfterAt === undefined ? undefined : retryAfterObservedAt);
         console.error(`[automation-scheduler] ${failure}; retry backoff engaged`);
         return failure;
       }
