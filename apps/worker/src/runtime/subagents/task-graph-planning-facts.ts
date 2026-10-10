@@ -9,21 +9,17 @@ export type TaskGraphPlanningFacts = Readonly<{
 
 /** Projects only aggregate counts from the already loaded current graph. */
 export function buildTaskGraphPlanningFacts(loaded: LoadedGraph): TaskGraphPlanningFacts | null {
-  try {
-    const binding = buildTaskGraphFinalSummaryBinding(loaded)
-    if (!binding) return null
-    const counts = binding.summary.counts
-    return {
-      graphRevision: binding.graphRevision,
-      counts: {
-        discoveredJobs: copyCount(counts.discoveredJobs),
-        analyzedJobs: copyCount(counts.analyzedJobs),
-        artifactReferences: copyCount(counts.artifactReferences),
-        reviewOutcomes: copyCount(counts.reviewOutcomes),
-      },
-    }
-  } catch {
-    return null
+  const binding = buildTaskGraphFinalSummaryBinding(loaded)
+  if (!binding) return null
+  const counts = binding.summary.counts
+  return {
+    graphRevision: binding.graphRevision,
+    counts: {
+      discoveredJobs: copyCount(counts.discoveredJobs),
+      analyzedJobs: copyCount(counts.analyzedJobs),
+      artifactReferences: copyCount(counts.artifactReferences),
+      reviewOutcomes: copyCount(counts.reviewOutcomes),
+    },
   }
 }
 
