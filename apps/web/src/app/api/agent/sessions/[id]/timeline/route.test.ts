@@ -151,7 +151,12 @@ describe("agent timeline query API", () => {
       causationId: null, idempotencyKey: "private-receipt-key",
       payload: { receiptVersion: privateMarker, steerInputIds: [privateMarker], rationale: privateMarker },
     }
-    mocks.agendaFindMany.mockResolvedValueOnce([row]).mockResolvedValueOnce([row]).mockResolvedValueOnce([row])
+    const clarification = {
+      ...row, id: "private-clarification-event", sequence: BigInt(13), type: "agent.plan.clarification",
+      idempotencyKey: "private-clarification-key",
+      payload: { waitId: privateMarker, steerInputIds: [privateMarker], questionText: privateMarker },
+    }
+    mocks.agendaFindMany.mockResolvedValueOnce([row, clarification]).mockResolvedValueOnce([row, clarification]).mockResolvedValueOnce([row, clarification])
     const { GET } = await import("./route")
 
     const response = await GET(request() as never, params)
@@ -160,8 +165,11 @@ describe("agent timeline query API", () => {
 
     expect(response.status).toBe(200)
     expect(serialized).not.toContain("agent.plan.reconciliation")
+    expect(serialized).not.toContain("agent.plan.clarification")
     expect(serialized).not.toContain("private-reconciliation-event")
+    expect(serialized).not.toContain("private-clarification-event")
     expect(serialized).not.toContain("private-receipt-key")
+    expect(serialized).not.toContain("private-clarification-key")
     expect(serialized).not.toContain(privateMarker)
     expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(1, expect.objectContaining({
       where: { sessionId: "session_1", type: "cognitive.agenda" },

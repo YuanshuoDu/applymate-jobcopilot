@@ -202,8 +202,14 @@ describe("agent session events API", () => {
         payload: { inputIds: [privateMarker], receiptVersion: privateMarker, rationale: privateMarker },
       },
       {
-        id: "event_3", sessionId: "session_1", turnId: "turn_1", itemId: "item_1", taskId: null,
-        sequence: BigInt(3), type: "item.completed", actor: "orchestrator", correlationId: "turn_1",
+        id: "private-clarification-event", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "root_1",
+        sequence: BigInt(3), type: "agent.plan.clarification", actor: "orchestrator", correlationId: "turn_1",
+        causationId: null, idempotencyKey: "private-clarification-key",
+        payload: { steerInputIds: [privateMarker], questionText: privateMarker },
+      },
+      {
+        id: "event_4", sessionId: "session_1", turnId: "turn_1", itemId: "item_1", taskId: null,
+        sequence: BigInt(4), type: "item.completed", actor: "orchestrator", correlationId: "turn_1",
         causationId: null, idempotencyKey: null, payload: { text: "visible event" },
       },
     ])
@@ -213,11 +219,14 @@ describe("agent session events API", () => {
     const reader = response.body?.getReader()
     const text = new TextDecoder().decode((await reader?.read())?.value)
 
-    expect(text).toContain("event: item.completed\nid: 3\n")
+    expect(text).toContain("event: item.completed\nid: 4\n")
     expect(text).toContain("visible event")
     expect(text).not.toContain("agent.plan.reconciliation")
+    expect(text).not.toContain("agent.plan.clarification")
     expect(text).not.toContain("private-reconciliation-event")
+    expect(text).not.toContain("private-clarification-event")
     expect(text).not.toContain("private-receipt-key")
+    expect(text).not.toContain("private-clarification-key")
     expect(text).not.toContain(privateMarker)
     expect(mocks.findAgentEvents).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", sequence: { gt: BigInt(1) } },

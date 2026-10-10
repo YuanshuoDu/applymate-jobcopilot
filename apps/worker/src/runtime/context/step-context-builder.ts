@@ -6,6 +6,8 @@ import { appendNewObservedSteeringMarkers, type SteeringMarkerContext } from "./
 import type { SteeringMarkerPayload } from "./steering-marker.js"
 import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, loadStepSteeringContext, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal, safeTaskGraphRevision, stepSteeringMarkerControl } from "./step-context-support.js"
 import type { HydrationScope } from "./steering-reconciliation-context.js"
+import type { TurnQuestionPlanningSummary } from "../turns/turn-question-planning-contract.js"
+import { planningClarificationContext, type PlanningClarificationHistoryPair } from "./planning-clarification-context.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -33,6 +35,9 @@ export type StepContextSnapshot = {
   readonly businessRefs: readonly BusinessReference[]
   readonly toolObservations: readonly ContextSeedBlock[]
   readonly taskGraphRevision?: number
+  readonly planningClarifications?: readonly TurnQuestionPlanningSummary[]
+  /** Ephemeral recovery association; canonical snapshot codecs intentionally omit it. */
+  readonly planningClarificationHistoryPair?: PlanningClarificationHistoryPair
 }
 
 export type ContextBlock = {
@@ -54,6 +59,7 @@ export type StepContext = {
   readonly blocks: readonly ContextBlock[]
   readonly canonicalJson: string
   readonly taskGraphRevision?: number
+  readonly planningClarifications?: readonly TurnQuestionPlanningSummary[]
   readonly steeringMarkerControl?: StepSteeringMarkerControl
 }
 
@@ -205,11 +211,16 @@ export class StepContextBuilder {
       if (reference.ownerId !== request.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", `Reference ${reference.id} is outside the tenant scope`)
       await this.ownerFence.assertReferenceOwned(reference, request.scope)
     }
+    const clarification = planningClarificationContext(request.snapshot.planningClarifications, request.snapshot.steerHistory,
+      request.snapshot.planningClarificationHistoryPair)
     const blocks: ContextBlock[] = []
     for (const seed of request.snapshot.system) blocks.push(block("system", "instruction", "system", "harness", `system:${seed.id}`, seed.content))
     for (const seed of request.snapshot.profile) blocks.push(block("profile", "data", "internal_record", "profile", `profile:${seed.id}`, seed.content))
     if (request.snapshot.goal) blocks.push(block("goal", "data", "external_untrusted", "turn_goal", `goal:${request.snapshot.goal.id}`, request.snapshot.goal.content))
-    for (const entry of request.snapshot.steerHistory) blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
+    for (const entry of request.snapshot.steerHistory) {
+      blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
+      if (entry.id === clarification.afterAnswerEntryId) blocks.push(...clarification.blocks)
+    }
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
     for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent", `observation:${observation.id}`, observation.content))
     for (const input of renderInputs) {
@@ -226,9 +237,9 @@ export class StepContextBuilder {
     return {
       ...result,
       ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }),
+      ...(clarification.summaries.length ? { planningClarifications: clarification.summaries } : {}),
       canonicalJson: stableJson({ ...result, inputThroughSequence: result.inputThroughSequence.toString() }),
       steeringMarkerControl: stepSteeringMarkerControl(request, claimed, steering, newlyClaimedSteerInputIds),
     }
   }
 }
-
