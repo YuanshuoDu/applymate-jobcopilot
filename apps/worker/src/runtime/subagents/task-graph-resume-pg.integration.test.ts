@@ -9773,6 +9773,49 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 ...scoutResult, taskGraphVerificationReport: { ...scoutReport, resultDigest: "0".repeat(64) },
               })
 
+              const graphSnapshotRows = await pool!.query<{ content: unknown }>(
+                `SELECT "content" FROM "agent_items"
+                 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
+                [taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId],
+              )
+              const graphSnapshot = record(graphSnapshotRows.rows[0]?.content)
+              const graphNodes: unknown[] = Array.isArray(graphSnapshot?.nodes) ? graphSnapshot.nodes : []
+              const scoutNode = graphNodes.map(record).find(node => node?.key === "scout")
+              const scoutVerification = record(scoutNode?.verification)
+              const scoutCriteria: RecordValue[] = Array.isArray(scoutVerification?.criteria)
+                ? scoutVerification.criteria.map(record).filter((criterion): criterion is RecordValue => criterion !== null) : []
+              const candidateCriterion = scoutCriteria.find(criterion => criterion.id === "candidate-count")
+              const candidateCheck = record(candidateCriterion?.check)
+              if (!graphSnapshot || !scoutNode || !scoutVerification || candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
+                throw new Error("Discovery Scout snapshot contract was unavailable for the persisted mutation")
+              }
+              const changedGraphSnapshot: RecordValue = {
+                ...graphSnapshot,
+                nodes: graphNodes.map(value => {
+                  const node = record(value)
+                  return node?.key === "scout" ? {
+                    ...node,
+                    verification: {
+                      ...scoutVerification,
+                      criteria: scoutCriteria.map(criterion => criterion.id === "candidate-count"
+                        ? { ...criterion, check: { kind: "all_candidates_have_evidence", minimumItems: 1 } }
+                        : criterion),
+                    },
+                  } : value
+                }),
+              }
+              const updateGraphSnapshot = async (content: RecordValue) => pool!.query(
+                `UPDATE "agent_items" SET "content" = $1::jsonb
+                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "type" = 'task_graph'`,
+                [JSON.stringify(content), taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId],
+              )
+              try {
+                expect((await updateGraphSnapshot(changedGraphSnapshot)).rowCount).toBe(1)
+                await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+              } finally {
+                expect((await updateGraphSnapshot(graphSnapshot)).rowCount).toBe(1)
+              }
+
               const sourceReceiptRows = await pool!.query<{ id: string; content: unknown }>(
                 `SELECT result."id", result."content" FROM "agent_items" AS call
                  JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
