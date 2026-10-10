@@ -24,17 +24,23 @@ const config = { provider: "anthropic", model: "claude-test", baseUrl: "https://
 
 describe("Anthropic Messages adapter", () => {
   it("normalizes a zero-network stream and keeps usage observable", async () => {
-    const fetcher = vi.fn(async () => response([
-      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}",
-      "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
-      "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Ready\"}}",
-      "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}",
-      "event: message_stop\ndata: {\"type\":\"message_stop\"}",
-      "",
-    ].join("\n\n")))
+    const fetcher = vi.fn(async (_url: string, init: { body: string }) => {
+      expect(JSON.parse(init.body)).toMatchObject({ max_tokens: 1_024 })
+      return response([
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Ready\"}}",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}",
+        "",
+      ].join("\n\n"))
+    })
     const adapter = createAnthropicAdapter(config, { fetch: fetcher })
     const events: unknown[] = []
     for await (const event of adapter.stream(request())) events.push(event)
+    expect(adapter.profile).toMatchObject({
+      maxContextTokens: null, maxOutputTokens: null, defaultMaxOutputTokens: 1_024,
+    })
     expect(fetcher).toHaveBeenCalledWith("https://api.anthropic.com/v1/messages", expect.objectContaining({
       method: "POST", signal: expect.any(AbortSignal),
     }))

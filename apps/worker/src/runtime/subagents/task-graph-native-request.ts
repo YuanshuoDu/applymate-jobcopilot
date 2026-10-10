@@ -1,11 +1,24 @@
 import { createHash } from "node:crypto"
-import type { TaskGraphNativeCommandInput } from "./task-graph-native-command.js"
+import type {
+  TaskGraphNativeCommandInput as BaseNativeCommandInput,
+  TaskGraphNativeFollowupRequest as BaseNativeFollowupRequest,
+  TaskGraphNativeRequest as BaseNativeRequest,
+} from "./task-graph-native-command.js"
 import { canonicalTaskGraphJson, taskGraphItemId } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 const MAX_JSON_BYTES = 32 * 1024
 const MAX_JSON_DEPTH = 32
 const MAX_JSON_NODES = 8_192
+const MAX_REPLACEMENT_REVISION = 2_147_483_644
+
+export type TaskGraphNativeReplacementRequest = Omit<BaseNativeFollowupRequest, "constraints" | "successCriteria"> & Readonly<{
+  mode: "replace_unstarted"
+  expectedRevision: number
+}>
+export type TaskGraphNativeFollowupRequest = BaseNativeFollowupRequest | TaskGraphNativeReplacementRequest
+export type TaskGraphNativeRequest = Exclude<BaseNativeRequest, BaseNativeFollowupRequest> | TaskGraphNativeFollowupRequest
+export type TaskGraphNativeCommandInput = Omit<BaseNativeCommandInput, "request"> & Readonly<{ request: TaskGraphNativeRequest }>
 
 export type NormalizedNativeCommand = Readonly<{
   request: TaskGraphNativeCommandInput["request"] & Readonly<{
@@ -24,15 +37,18 @@ export function normalizeNativeCommand(input: TaskGraphNativeCommandInput): Norm
   if (!row || !exact(row, Object.hasOwn(row, "outputSchemaMarker") ? "outputSchemaMarker,request,scope" : "request,scope")) invalid()
   const source = object(row.request)
   if (!source || (source.kind !== "spawn" && source.kind !== "followup")) invalid()
+  const replacement = source.kind === "followup" && Object.hasOwn(source, "mode")
   const required = source.kind === "spawn"
     ? "goal,idempotencyKey,kind,role,taskType"
-    : "goal,idempotencyKey,kind,sourceTaskId"
+    : replacement ? "expectedRevision,goal,idempotencyKey,kind,mode,sourceTaskId" : "goal,idempotencyKey,kind,sourceTaskId"
   const optional = source.kind === "spawn"
     ? ["allowedActions", "constraints", "context", "parentTaskId", "successCriteria"]
-    : ["constraints", "context", "successCriteria"]
+    : replacement ? ["context"] : ["constraints", "context", "successCriteria"]
   if (!hasRequiredOptionalKeys(source, required, optional) || !text(source.idempotencyKey, 256)
     || !text(source.goal, 4_000) || !stringList(source.constraints, 32, 1_000)
     || !stringList(source.successCriteria, 32, 1_000)
+    || replacement && (source.mode !== "replace_unstarted" || !Number.isSafeInteger(source.expectedRevision)
+      || Number(source.expectedRevision) < 0 || Number(source.expectedRevision) > MAX_REPLACEMENT_REVISION)
     || source.kind === "spawn" && !stringList(source.allowedActions, 32, 1_000)) invalid()
   const context = cloneJson(source.kind === "spawn" ? source.context ?? {} : source.context ?? null)
   const contextJson = canonicalTaskGraphJson(context)
@@ -52,6 +68,7 @@ export function normalizeNativeCommand(input: TaskGraphNativeCommandInput): Norm
       sourceTaskId: requiredText(source.sourceTaskId, 256), goal: source.goal as string,
       constraints: [...(source.constraints as string[] | undefined ?? [])],
       successCriteria: [...(source.successCriteria as string[] | undefined ?? [])], context,
+      ...(replacement ? { mode: "replace_unstarted" as const, expectedRevision: source.expectedRevision as number } : {}),
     }
   const fingerprintPayload = { request, outputSchemaMarker: marker }
   const requestFingerprint = sha256(canonicalTaskGraphJson(fingerprintPayload))

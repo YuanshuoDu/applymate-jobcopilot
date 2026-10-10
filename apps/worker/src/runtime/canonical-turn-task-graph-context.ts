@@ -227,7 +227,7 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   const content = { kind: "task_graph_current", revision: Number(state.revision), nodes }
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
   return {
-    ...snapshot,
+    ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [
       ...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID),
       { id: OBSERVATION_ID, content },

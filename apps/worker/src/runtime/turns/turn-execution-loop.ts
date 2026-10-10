@@ -13,7 +13,7 @@ import { RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./tur
 import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import type { StepContext } from "../context/step-context-builder.js"
-import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
+import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
@@ -72,9 +72,11 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       let questionIntentCallId: string | null = null
       try {
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
+        if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
+          rootContextInputId: options.rootContextInputId,
           taskId: options.identity.taskId,
           steeringMarkerState,
         })
@@ -84,10 +86,12 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
+        // The model sees the durable root background, but later agenda receipts must not turn it into actionable pending input.
+        const agendaContext = excludeUnconsumedRootReferenceFromAgenda(context, ordinal > 0 ? options.rootContextInputId : undefined)
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
           inputThroughSequence, consumedInputIds,
-          agenda: buildCognitiveActionAgenda(context, { freshSteering }),
+          agenda: buildCognitiveActionAgenda(agendaContext, { freshSteering }),
         })
         const receiptKey = cognitiveAgendaReceiptIdempotencyKey(step.id)
         if (!receipt || !receiptKey) throw new TurnEngineError("invalid_output", "Cognitive agenda receipt could not be built")
@@ -100,7 +104,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           context, model: options.model, tools: options.tools,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
-          freshSteering,
+          freshSteering: options.identity.kind === "turn" && freshSteering,
           outputSchema: options.outputSchema,
         })
         if (freshSteering) recoveredCandidate = undefined

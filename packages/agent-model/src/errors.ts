@@ -4,6 +4,7 @@ export type ModelErrorCode =
   | "unsupported_capability"
   | "unsupported_input"
   | "configuration_error"
+  | "context_estimate_exceeded"
   | "provider_error"
   | "malformed_response"
   | "timeout"

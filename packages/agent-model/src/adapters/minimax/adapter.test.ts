@@ -66,13 +66,41 @@ describe("MiniMax provider profile", () => {
     const events: unknown[] = []
     for await (const event of adapter.stream(request())) events.push(event)
     expect(adapter.id).toBe("minimax:MiniMax-M3")
-    expect(adapter.profile).toMatchObject({ provider: "minimax", model: "MiniMax-M3", supportsReasoningSummary: true })
+    expect(adapter.profile).toMatchObject({
+      provider: "minimax", model: "MiniMax-M3", supportsReasoningSummary: true,
+      maxOutputTokens: null, defaultMaxOutputTokens: 1_024,
+    })
     expect(adapter.credentialSource).toBe("user")
     expect(events).toContainEqual({ type: "reasoning_summary_delta", text: "Plan" })
     expect(events).toContainEqual({ type: "reasoning_summary_delta", text: " carefully" })
     expect(events).toContainEqual({ type: "text_delta", text: "Done" })
     expect(events).toContainEqual({ type: "usage", inputTokens: 3, outputTokens: 4 })
     expect(events.at(-1)).toEqual({ type: "completed", finishReason: "stop" })
+  })
+
+  it("describes the transport default separately and preserves an explicit request cap", async () => {
+    const caps: number[] = []
+    const fetcher = vi.fn(async (_url: string, init: { body: string }) => {
+      const body = JSON.parse(init.body) as { max_completion_tokens?: number }
+      caps.push(body.max_completion_tokens ?? -1)
+      return response([
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}`,
+        "",
+        `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } })}`,
+        "",
+        "data: [DONE]",
+        "",
+      ])
+    })
+    const adapter = createMiniMaxAdapter({ apiKey: "key" }, { fetch: fetcher })
+    expect(adapter.profile).toMatchObject({
+      maxContextTokens: 512_000, maxOutputTokens: null, defaultMaxOutputTokens: 4_096,
+    })
+
+    await adapter.complete?.(request())
+    await adapter.complete?.({ ...request(), maxOutputTokens: 256 })
+
+    expect(caps).toEqual([4_096, 256])
   })
 
   it("preserves typed cancellation before invoking the provider", async () => {

@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { TenantScope } from "@jobcopilot/agent-protocol"
-import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { AgentModelError, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "../context/input-claim-store.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import { createHarnessModelRuntime } from "../harness-model.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
@@ -17,6 +18,9 @@ import { classifyTurnFailure } from "./dlq.js"
 import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
+import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
+import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
+import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -129,6 +133,23 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
   return { ...root, timeline, usage, waitForQuestion, stageQuestionUsage, cancelPausedQuestion, readPendingQuestion }
 }
 
+function replaceHarnessRoute(
+  runtime: ReturnType<typeof createHarnessModelRuntime>,
+  provider: string,
+  model: string,
+  maxContextTokens: number,
+  stream: ModelAdapter["stream"],
+): void {
+  const existing = runtime.registry.list().find(adapter => adapter.profile.provider === provider && adapter.profile.model === model)
+  if (!existing) throw new Error(`Missing fixture route ${provider}/${model}`)
+  runtime.registry.unregister(existing.id)
+  runtime.registry.register({
+    id: existing.id,
+    profile: { ...existing.profile, maxContextTokens, maxOutputTokens: 4_096, defaultMaxOutputTokens: 256 },
+    stream,
+  })
+}
+
 class LateSteerInputClaimStore implements InputClaimStore {
   readonly scope: TenantScope = { userId: "user-1" }
   readonly inputs: StoredAgentInput[] = []
@@ -171,6 +192,76 @@ class LateSteerInputClaimStore implements InputClaimStore {
         this.checkpoints.set(stepId, { inputThroughSequence: checkpoint.inputThroughSequence, consumedInputIds: [...checkpoint.consumedInputIds] })
       },
     })
+  }
+}
+
+class RootContextClaimStore implements InputClaimStore {
+  readonly scope: TenantScope = { userId: "user-1" }
+  readonly checkpoints = new Map<string, StepCheckpoint>()
+  readonly inputs: Array<StoredAgentInput & { status: StoredAgentInput["status"]; consumedByStepId: string | null; consumedAt: Date | null }>
+  readonly claimCounts = new Map<string, number>()
+  readCount = 0
+
+  constructor(input: StoredAgentInput) { this.inputs = [{ ...input }] }
+  get input() { return this.inputs[0]! }
+  addInput(input: StoredAgentInput): void { this.inputs.push({ ...input }) }
+  startStep(stepId: string, inputThroughSequence: bigint): void { this.checkpoints.set(stepId, { inputThroughSequence, consumedInputIds: [] }) }
+
+  async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+    return work({
+      getCheckpoint: async ({ stepId }) => this.checkpoints.get(stepId) ?? { inputThroughSequence: 0n, consumedInputIds: [] },
+      claimInputs: async request => {
+        const checkpoint = request.checkpoint
+        const existing = this.inputs.filter(input => input.status === "consumed" && (input.consumedByStepId === request.stepId || checkpoint.consumedInputIds.includes(input.id)))
+        const mode = request.mode ?? (request.rebuild ? "rebuild" : "new")
+        if (mode !== "new") return { inputs: existing, newlyClaimedInputIds: [] }
+        const candidates = this.inputs.filter(input => input.sessionId === request.sessionId && input.targetTurnId === request.turnId && input.userId === this.scope.userId
+          && (input.delivery === "steer" ? input.acceptedSequence > checkpoint.inputThroughSequence : input.id === request.rootInputId)
+          && ["accepted", "queued"].includes(input.status) && input.consumedByStepId === null && input.consumedAt === null)
+        for (const input of candidates) {
+          input.status = "consumed"
+          input.consumedByStepId = request.stepId
+          input.consumedAt = request.now
+          this.claimCounts.set(input.id, (this.claimCounts.get(input.id) ?? 0) + 1)
+        }
+        return { inputs: [...existing, ...candidates], newlyClaimedInputIds: candidates.map(input => input.id) }
+      },
+      loadActiveSteeringInputs: async () => [],
+      loadRootInputContext: async request => {
+        this.readCount += 1
+        return this.inputs.find(input => request.sessionId === input.sessionId && request.turnId === input.targetTurnId && request.inputId === input.id
+          && input.userId === this.scope.userId && ["accepted", "queued", "consumed"].includes(input.status)) ?? null
+      },
+      persistCheckpoint: async ({ stepId, checkpoint }) => { this.checkpoints.set(stepId, { inputThroughSequence: checkpoint.inputThroughSequence, consumedInputIds: [...checkpoint.consumedInputIds] }) },
+      appendObservedSteeringMarker: async () => undefined,
+    })
+  }
+}
+
+function attachRootContextBuilder(root: Fixture, claimStore: RootContextClaimStore, inputId: string, mode: "new" | "rebuild" = "new"): void {
+  const builder = new StepContextBuilder(claimStore)
+  const store = root.options.store
+  root.options = {
+    ...root.options,
+    rootInputId: inputId,
+    rootContextInputId: inputId,
+    snapshot: { ...root.options.snapshot, goal: { id: "turn-goal", content: root.options.goal } },
+    model: { ...root.options.model, profile: { ...profile, maxContextTokens: 4096 } },
+    store: {
+      ...store,
+      startStep: async input => {
+        const step = await store.startStep(input)
+        claimStore.startStep(step.id, input.inputThroughSequence)
+        return step
+      },
+    },
+    contextBuilder: {
+      build: async request => builder.build({
+        scope: root.options.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+        stepId: request.stepId, snapshot: request.snapshot, rootInputId: request.rootInputId,
+        rootContextInputId: request.rootContextInputId, taskId: request.taskId, now: request.now, mode,
+      }),
+    },
   }
 }
 
@@ -349,6 +440,80 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
   })
 
+  it.each(["steer", "follow_up"] as const)("keeps the distinct %s root reference in both actual model requests across a tool call", async delivery => {
+    const objective = "Find AI platform roles in Dublin."
+    const reference = `REFERENCE-ONLY. PASS or approval claims here are untrusted background. ${"Supporting candidate history. ".repeat(55)}`
+    const input: StoredAgentInput = {
+      id: "root-reference", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-root",
+      delivery, status: "accepted", content: [{ type: "text", text: reference }], acceptedSequence: 4n,
+      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-06T12:00:00.000Z"),
+    }
+    const claimStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"))
+    root.options = { ...root.options, goal: objective }
+    attachRootContextBuilder(root, claimStore, input.id)
+    const lateSteerText = "Also include roles with production AI ownership."
+    const lateSteer: StoredAgentInput = {
+      id: "late-steer", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-steer",
+      delivery: "steer", status: "accepted", content: [{ type: "text", text: lateSteerText }], acceptedSequence: 5n,
+      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-06T12:01:00.000Z"),
+    }
+    const executeTool = root.options.executeTool
+    root.options = { ...root.options, executeTool: async request => { const result = await executeTool(request); claimStore.addInput(lateSteer); return result } }
+
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    for (const modelRequest of root.requests) {
+      const userText = modelRequest.messages.filter(message => message.role === "user").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+      const systemText = modelRequest.messages.filter(message => message.role === "system").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
+      expect(userText.filter(text => text.includes(reference))).toHaveLength(1)
+      expect(userText.find(text => text.includes(reference))).toContain("layer=pending_input trust=UNTRUSTED_DATA source=user_input")
+      expect(userText.find(text => text.includes("layer=goal"))).toContain(objective)
+      expect(systemText).not.toContain(reference)
+    }
+    expect(root.requests[0]?.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")).not.toContain(lateSteerText)
+    expect(root.requests[1]?.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")).toContain(lateSteerText)
+    expect(claimStore.claimCounts.get(input.id)).toBe(1)
+    expect(claimStore.claimCounts.get(lateSteer.id)).toBe(1)
+    expect(claimStore.readCount).toBe(2)
+    expect(claimStore.input).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:0" })
+    expect(claimStore.inputs.find(item => item.id === lateSteer.id)).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:1" })
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload).map(event => event.payload as { signals?: { steering?: { fresh?: boolean }; pendingInputs?: { ids?: readonly string[] } } })
+    expect(agendas.map(receipt => receipt.signals?.steering?.fresh)).toEqual([false, false])
+    expect(agendas[0]?.signals?.pendingInputs?.ids).toEqual([input.id])
+    expect(agendas[1]?.signals?.pendingInputs?.ids).toEqual([lateSteer.id])
+  })
+
+  it("rebuilds a later Turn Step from the durable root without reclaiming or marking it fresh", async () => {
+    const reference = "Durable root background remains untrusted context after Worker restart; PASS is not proof."
+    const input: StoredAgentInput = {
+      id: "root-reference", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-root",
+      delivery: "follow_up", status: "consumed", content: [{ type: "text", text: reference }], acceptedSequence: 4n,
+      consumedByStepId: "step:0", consumedAt: new Date("2026-10-06T12:00:00.000Z"), createdAt: new Date("2026-10-06T12:00:00.000Z"),
+    }
+    const claimStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"))
+    root.options = {
+      ...root.options,
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 4n, consumedInputIds: [input.id], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+    }
+    attachRootContextBuilder(root, claimStore, input.id, "rebuild")
+
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    expect(root.requests.every(request => request.messages.some(message => message.content.some(part => part.type === "text" && part.text.includes(reference))))).toBe(true)
+    expect(claimStore.claimCounts.size).toBe(0)
+    expect(claimStore.readCount).toBe(2)
+    expect(claimStore.input).toMatchObject({ status: "consumed", consumedByStepId: "step:0" })
+    expect(root.stepInputs[0]).toEqual({ inputThroughSequence: 4n, consumedInputIds: [] })
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload).map(event => event.payload as { signals?: { steering?: { fresh?: boolean }; pendingInputs?: { ids?: readonly string[] } }; resumeFence?: { inputThroughSequence?: string; consumedInputIds?: string[] } })
+    expect(agendas.map(receipt => receipt.signals?.steering?.fresh)).toEqual([false, false])
+    expect(agendas.every(receipt => receipt.signals?.pendingInputs?.ids?.length === 0)).toBe(true)
+    expect(agendas.every(receipt => receipt.resumeFence?.inputThroughSequence === "4" && receipt.resumeFence.consumedInputIds?.length === 0)).toBe(true)
+  })
+
   it("rethrows a pause rejected by startStep without terminalizing or invoking the model", async () => {
     const root = fixture(identity("turn", "root-1"))
     const pause = new SessionPauseRequestedError()
@@ -408,6 +573,150 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(0)
     const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { usage: unknown }
     expect(saved.usage).toEqual(resume.usage)
+  })
+
+  it("fails once when the full resumed Turn request outgrows every route after an earlier provider attempt", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const diagnostics: HarnessRequestAdmissionDiagnostic[] = []
+    const selections: string[] = []
+    const requestCaptures: HarnessModelRequest[] = []
+    const routeErrors: unknown[] = []
+    const primaryRequests: HarnessModelRequest[] = []
+    const settlements: WorkerUsageSettlementInput[] = []
+    const authorizations: WorkerUsageAuthorizationInput[] = []
+    const runtime = createHarnessModelRuntime({
+      primary: { provider: "minimax", model: "MiniMax-M3", apiKey: "fixture-minimax" },
+      fallbacks: [{ provider: "anthropic", model: "claude-sonnet-5", apiKey: "fixture-anthropic" }],
+      allowEnvironmentFallbacks: false,
+      maxReroutes: 1,
+      onRequestAdmission: diagnostic => diagnostics.push(diagnostic),
+      onSelectionEvent: event => selections.push(event.type),
+    })
+    let primaryCalls = 0
+    let fallbackCalls = 0
+    replaceHarnessRoute(runtime, "minimax", "MiniMax-M3", 100_000, async function* (request) {
+      primaryRequests.push(request)
+      primaryCalls += 1
+      if (primaryCalls === 1) {
+        yield { type: "tool_call_completed", callId: "call:large-search", name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "usage", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      throw new AgentModelError({
+        code: "provider_error", message: "fixture provider rejected the second request",
+        provider: request.provider, model: request.model, retryable: true, recoverable: true,
+      })
+    })
+    replaceHarnessRoute(runtime, "anthropic", "claude-sonnet-5", 4_096, async function* () {
+      fallbackCalls += 1
+      throw new Error("oversized fallback must not reach its provider adapter")
+    })
+
+    const capturedRouter: ModelAdapter = {
+      ...runtime.adapter,
+      async *stream(request) {
+        requestCaptures.push(request)
+        try { yield* runtime.adapter.stream(request) }
+        catch (error: unknown) { routeErrors.push(error); throw error }
+      },
+    }
+    const authorize = async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
+      authorizations.push(input)
+      return { settle: async settlement => { settlements.push(settlement) } }
+    }
+    const model = createUsageAwareModelAdapter(capturedRouter, { owner: root.options.identity, authorize })
+    const goal = "Find senior software engineering roles in Dublin while preserving the original candidate constraints."
+    const goalBlock: StepContext["blocks"][number] = {
+      id: "goal:original", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: goal,
+    }
+    const baseBuilder = root.options.contextBuilder
+    const searchOutput = `Dublin role result with the original search detail. `.repeat(2_000)
+    const tools = [{
+      name: "jobs.search", version: "1", description: "Search public job postings.",
+      inputSchema: { type: "object", properties: { location: { type: "string" } }, required: ["location"], additionalProperties: false },
+    }]
+    const outputSchema = {
+      type: "object", properties: { summary: { type: "string" }, sourceCount: { type: "integer" } },
+      required: ["summary", "sourceCount"], additionalProperties: false,
+    }
+    const resumedUsage = { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.011 }
+    root.options = {
+      ...root.options,
+      goal,
+      snapshot: { ...root.options.snapshot, goal: { id: "original", content: goal } },
+      contextBuilder: {
+        build: async request => {
+          const context = await baseBuilder.build(request)
+          return {
+            ...context,
+            blocks: [goalBlock, ...context.blocks],
+            canonicalJson: JSON.stringify({ goal, context: context.canonicalJson }),
+          }
+        },
+      },
+      model,
+      tools,
+      outputSchema,
+      executeTool: async ({ call }) => ({
+        id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+        output: { summary: searchOutput }, errorCode: null,
+      }),
+      resume: {
+        nextOrdinal: 0, stepCount: 0, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [], usage: resumedUsage,
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "context_estimate_exceeded", stepCount: 2, toolCallCount: 1 })
+    expect(primaryCalls).toBe(2)
+    expect(fallbackCalls).toBe(0)
+    expect(requestCaptures).toHaveLength(2)
+    expect(primaryRequests).toHaveLength(2)
+    expect(routeErrors).toHaveLength(1)
+    expect(routeErrors[0]).toMatchObject({
+      code: "context_estimate_exceeded", provider: "anthropic", model: "claude-sonnet-5", guaranteedNoProviderAttempt: false,
+    })
+    expect(selections).toContain("model.rerouted")
+    expect(diagnostics).toHaveLength(3)
+    expect(diagnostics.map(item => [item.provider, item.status, item.withinWindow])).toEqual([
+      ["minimax", "known", true], ["minimax", "known", true], ["anthropic", "known", false],
+    ])
+
+    const finalRequest = requestCaptures[1]!
+    expect(finalRequest.messages).toEqual(expect.arrayContaining([
+      { role: "user", content: expect.arrayContaining([expect.objectContaining({ type: "text", text: expect.stringContaining(goal) })]) },
+      { role: "tool", content: expect.arrayContaining([expect.objectContaining({ type: "tool_result", content: expect.stringContaining(searchOutput) })]) },
+    ]))
+    expect(finalRequest.tools).toEqual(tools)
+    expect(finalRequest.outputSchema).toEqual(outputSchema)
+    expect(finalRequest.toolChoice).toBe("auto")
+
+    expect(authorizations).toHaveLength(2)
+    expect(settlements).toEqual([
+      { status: "success", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 },
+      { status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "context_estimate_exceeded" },
+    ])
+    expect(root.stepStatuses).toEqual(["completed", "failed"])
+    expect(root.finalResponses).toHaveLength(1)
+    const finalResponse = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as {
+      completed: boolean; blocker: string; usage: { inputTokens: number; outputTokens: number; estimatedCostUsd: number }
+    }
+    expect(finalResponse).toMatchObject({
+      completed: false,
+      blocker: expect.stringMatching(/Approximate.*retained prompt\/tool context.*required content was not removed/),
+      usage: { inputTokens: 48, outputTokens: 16, estimatedCostUsd: 0.048 },
+    })
+    const persistedFailure = root.events.find(event => event.type === "turn.failed" && event.payload !== undefined)
+    expect(persistedFailure?.payload).toMatchObject({
+      errorCode: "context_estimate_exceeded", final: { completed: false, usage: finalResponse.usage },
+    })
+    const modelUsageEvents = root.events.filter(event => event.type === "model.usage" && event.payload !== undefined)
+    expect(modelUsageEvents).toHaveLength(1)
+    expect(modelUsageEvents[0]?.payload).toMatchObject({ usage: { inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 } })
+    expect(root.events.some(event => event.type === "model.failed" && event.payload !== undefined)).toBe(true)
+    expect(root.events.filter(event => event.type === "turn.failed" && event.payload !== undefined)).toHaveLength(1)
   })
 
   it("replaces a recovered candidate when fresh steering arrives before the resumed step", async () => {
@@ -783,6 +1092,125 @@ describe("owner-agnostic turn execution loop", () => {
     ]))
     expect(JSON.stringify(secondRequest?.messages).split(lateSteerText)).toHaveLength(2)
     expect(JSON.stringify(secondRequest?.messages).match(/"type":"tool_result"/g)).toHaveLength(1)
+  })
+
+  it("binds each refreshed graph revision to the same-step fresh-steering request and agenda", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = root.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let graphRead = 0
+    let contextBuild = 0
+    const refresh = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: graphRead++ === 0 ? 0 : 7, nodes: [] }))
+    root.options = {
+      ...root.options,
+      tools: [{ name: "jobs.search", version: "1" }, { name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }, { name: "agent.ask_user", version: "1" }],
+      refreshTaskGraphBeforeStep: refresh,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => {
+          const built = await contextBuilder.build({
+            scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+            stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+            steeringMarkerState: request.steeringMarkerState,
+          })
+          if (contextBuild++ === 0) inputStore.acceptSteer()
+          return built
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const secondRequest = root.requests[1]
+    const instruction = secondRequest?.messages.find(message => message.role === "system" && message.content.some(part => part.type === "text" && part.text.includes("Fresh user steering")))
+    const instructionText = instruction?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(refresh).toHaveBeenCalledTimes(2)
+    expect(instructionText).toContain("TaskGraph revision is 7")
+    expect(instructionText).toContain("agent.plan with expectedRevision 7")
+    expect(instructionText).not.toContain("agent.ask_user")
+    expect(instructionText).toContain("state what clarification is needed")
+    expect(instructionText).not.toContain(lateSteerText)
+    expect(JSON.stringify(secondRequest?.messages)).toContain(lateSteerText)
+    expect(agendas).toHaveLength(2)
+    expect(agendas.map(event => (event.payload as { planRevision?: number | null }).planRevision)).toEqual([0, 7])
+    expect(agendas[1]?.payload).toMatchObject({
+      stepId: secondRequest?.metadata.stepId, goalRevision: null, planRevision: 7,
+    })
+  })
+
+  it("fails before dispatch on Root refresh failure and skips refresh for child tasks", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const refreshFailure = new Error("task graph read unavailable")
+    const refresh = vi.fn(async () => { throw refreshFailure })
+    root.options = { ...root.options, refreshTaskGraphBeforeStep: refresh }
+    const failed = await runTurnExecutionLoop(root.options)
+    expect(failed.status).toBe("failed")
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(root.requests).toHaveLength(0)
+    expect(root.events.some(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE)).toBe(false)
+
+    const child = fixture(identity("task", "child-1", 2))
+    const childRefresh = vi.fn(async snapshot => snapshot)
+    child.options = { ...child.options, refreshTaskGraphBeforeStep: childRefresh }
+    await expect(runTurnExecutionLoop(child.options)).resolves.toMatchObject({ status: "completed" })
+    expect(childRefresh).not.toHaveBeenCalled()
+    expect(child.requests).toHaveLength(2)
+  })
+
+  it("keeps child fresh input untrusted without Root plan guidance despite graph metadata", async () => {
+    const child = fixture(identity("task", "child-1", 2), undefined, [{
+      id: "task-graph-current", content: { kind: "task_graph_current", revision: 9, nodes: [] },
+    }])
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = child.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let contextBuild = 0
+    const refresh = vi.fn(async snapshot => snapshot)
+    child.options = {
+      ...child.options,
+      snapshot: { ...child.options.snapshot, taskGraphRevision: 9 },
+      refreshTaskGraphBeforeStep: refresh,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => {
+          const built = await contextBuilder.build({
+            scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+            stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+            steeringMarkerState: request.steeringMarkerState,
+          })
+          if (contextBuild++ === 0) inputStore.acceptSteer()
+          return built
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(child.options)
+    const secondRequest = child.requests[1]
+    const messageText = secondRequest?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(refresh).not.toHaveBeenCalled()
+    expect(secondRequest?.messages).toBeDefined()
+    expect(messageText).toContain(lateSteerText)
+    expect(messageText).toContain("trust=UNTRUSTED_DATA")
+    expect(messageText).not.toContain("Fresh user steering is present")
+    expect(messageText).not.toContain("owner-scoped TaskGraph revision is")
+    expect(messageText).not.toContain("expectedRevision 9")
   })
 
   it("preserves the count of persisted calls when a later call in the batch exceeds budget", async () => {

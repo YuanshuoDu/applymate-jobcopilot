@@ -11,6 +11,7 @@ import {
   executeWaitSubagents,
 } from "./coordination-executors.js"
 import { createCoordinationTools } from "./coordination-tools.js"
+import { createCanonicalRootToolGuards } from "../interactive-discovery-runtime.js"
 import type {
   CloseSubagentInput,
   FollowupInput,
@@ -225,6 +226,90 @@ describe("coordination executors", () => {
     expect(replay).toMatchObject({ taskId: "followup-child", sourceTaskId: source.taskId, status: "waiting", replay: true })
     expect(lookup).not.toHaveBeenCalled()
     expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
+  it("routes explicit unstarted replacement only through the native command without mutable source prechecks", async () => {
+    const runtime = makeRuntime()
+    const received: TaskGraphNativeCommandInput[] = []
+    const source = { taskId: "queued-source", rootTaskId: "root-1", parentTaskId: "root-1", turnId: "turn-a", role: "scout", taskType: "research", status: "cancelled" as const, attemptCount: 0, resultDigest: "c".repeat(64), graphNodeKey: "source-node", origin: "task_graph" as const }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 0, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      appendNativeCoordination: vi.fn(async input => {
+        received.push(input)
+        const replay = received.length > 1
+        return { status: replay ? "duplicate" as const : "accepted" as const, replay, operationId: "replace-op", requestFingerprint: "d".repeat(64), graphRevision: 3,
+          nodeKey: "replacement-node", dispatchDisposition: "pending" as const,
+          child: { taskId: "replacement-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/replacement-child", depth: 1, role: "scout", taskType: "research", status: "queued" as const }, source }
+      }),
+    }
+    const options = { ...runtime.options, nativeCoordination: { enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2 } }
+    const input: FollowupInput = { taskId: source.taskId, idempotencyKey: "replace-native", goal: "Inspect the updated evidence", mode: "replace_unstarted", expectedRevision: 1 }
+    const root = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const mutableLookup = vi.spyOn(runtime.store, "getTask")
+
+    const first = await executeFollowup(root, input, options)
+    const replay = await executeFollowup(root, input, options)
+
+    expect(received).toHaveLength(2)
+    expect(received[0]?.request).toMatchObject({
+      kind: "followup", sourceTaskId: source.taskId, goal: input.goal, mode: "replace_unstarted", expectedRevision: 1,
+    })
+    expect(received[1]?.request).toMatchObject({ idempotencyKey: received[0]?.request.idempotencyKey, mode: "replace_unstarted", expectedRevision: 1 })
+    expect(mutableLookup).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(first).toMatchObject({ taskId: "replacement-child", sourceTaskId: source.taskId, replay: false, nativeCoordination: { graphRevision: 3 } })
+    expect(replay).toMatchObject({ taskId: "replacement-child", sourceTaskId: source.taskId, replay: true })
+  })
+
+  it("fails closed for replacement mode outside the general native root surface", async () => {
+    const runtime = makeRuntime()
+    const appendNativeCoordination = vi.fn()
+    const options = { ...runtime.options, nativeCoordination: {
+      enabled: true, commandPort: { appendNativeCoordination } as unknown as TaskGraphCommandPort,
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+    } }
+    const input: FollowupInput = { taskId: "source", idempotencyKey: "replace-child-origin", goal: "Continue", mode: "replace_unstarted", expectedRevision: 1 }
+
+    await expect(executeFollowup(context({ taskId: "child", rootTaskId: "root-1", actorRole: "subagent" }), input, options))
+      .rejects.toMatchObject({ code: "coordination_native_replacement_unavailable" })
+    expect(appendNativeCoordination).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("blocks a selected-job root replacement call before routing or appending", async () => {
+    const runtime = makeRuntime()
+    const appendNativeCoordination = vi.fn()
+    const commandPort = { appendNativeCoordination } as unknown as TaskGraphCommandPort
+    const options = { ...runtime.options, nativeCoordination: {
+      enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
+      parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+    } }
+    const selectedJobRoot = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const input: FollowupInput = {
+      taskId: "source", idempotencyKey: "selected-job-replace", goal: "Continue", mode: "replace_unstarted", expectedRevision: 1,
+    }
+    const routeTool = vi.fn(async () => {
+      await executeFollowup(selectedJobRoot, input, options)
+      return { id: "call-selected-job-replace", toolName: "agent.followup", toolVersion: "1", status: "completed" as const }
+    })
+    const validateArguments = vi.fn(() => true)
+    const guards = createCanonicalRootToolGuards({
+      interactiveDiscoveryMode: false, selectedJobMode: true, routeTool: routeTool as never, validateArguments,
+    })
+    const request = { call: { id: "call-selected-job-replace", toolName: "agent.followup", toolVersion: "1", input } } as never
+
+    await expect(guards.executeTool(request)).resolves.toMatchObject({
+      status: "failed", errorCode: "selected_job_root_tool_disabled",
+    })
+    expect(guards.validateToolArguments("agent.followup", input)).toBe("selected_job_root_tool_disabled")
+    expect(routeTool).not.toHaveBeenCalled()
+    expect(validateArguments).not.toHaveBeenCalled()
+    expect(appendNativeCoordination).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
   })
 
   it("fails closed on missing native support and preserves session pause through the executor boundary", async () => {
