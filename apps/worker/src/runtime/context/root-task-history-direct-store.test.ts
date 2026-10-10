@@ -2,6 +2,8 @@ import { Buffer } from "node:buffer"
 import type pg from "pg"
 import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 import { resolveRootTaskObjective } from "./root-task-objective.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
 
@@ -17,6 +19,7 @@ type Options = Readonly<{
   badGraph?: boolean
   sourceSessionStatusAtGraphLoad?: "archived" | "aborted"
   sourceSessionLockedAtGraphLoad?: boolean
+  typedFailureGraph?: boolean
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -108,11 +111,21 @@ function fixture(options: Options = {}) {
         return { rows: [{ id: values?.[0], revision: 1, content: options.badGraph ? { schemaVersion: "bad", nodes: [] } : {
           schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
           nodes: [{ key: "scout", templateId: "scout", goal: "Find roles", successCriteria: ["Find one role"],
-            dependsOn: [], depth: 1, taskId: childId }],
+            dependsOn: [], depth: 1, taskId: childId,
+            ...(options.typedFailureGraph ? { verificationDisposition: "typed", verification: {
+              schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+              criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
+            } } : {}) }],
         }, source }] }
       }
       if (sql.includes("ANY($1::text[])")) return { rows: (values?.[0] as string[]).map(id => ({
-        id, status: "completed", role: "scout", taskType: "scout", expectedOutputSchema: {}, failureReason: null, result: null,
+        id, status: options.typedFailureGraph ? "failed" : "completed", role: "scout", taskType: "scout", expectedOutputSchema: {},
+        failureReason: options.typedFailureGraph ? "task_graph_verification_failed" : null,
+        result: options.typedFailureGraph ? { taskGraphVerificationReport: {
+          verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+          criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+          evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64),
+        } } : null,
       })) }
       if (sql.includes('FROM "agent_events" AS event')) return { rows: [] }
       throw new Error(`unexpected query: ${sql}`)
@@ -229,6 +242,23 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(sourceLock?.sql).toContain("FOR SHARE SKIP LOCKED")
     expect(sourceLock?.values).toEqual(["session-other", "user-1"])
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(0)
+  })
+
+  it("derives sanitized source-order lessons from the already owner-scoped graph load", async () => {
+    const test = fixture({ typedFailureGraph: true })
+
+    const outcomes = await test.store.load(test.input)
+
+    expect(outcomes[0]?.nodeLessons).toEqual([{
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+    }])
+    expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(1)
+    expect(test.queries.filter(query => query.sql.includes("ANY($1::text[])"))).toHaveLength(1)
+    const serialized = JSON.stringify(outcomes[0]?.nodeLessons)
+    for (const forbidden of ["candidate-count", "child-root-source-1", "taskGraphVerificationReport", "evidenceDigest", "resultDigest"]) {
+      expect(serialized).not.toContain(forbidden)
+    }
   })
 
   it("omits candidates with mismatched status, duplicate receipts, or nonprior sequence ordering", async () => {

@@ -23,6 +23,13 @@ function graph(nodes: readonly TaskGraphCurrentNode[]): TaskGraphCurrentState {
 function outcome(id: string, sequence: bigint, nodes: readonly TaskGraphCurrentNode[] = [node()]): ValidatedRootTaskHistoryOutcome {
   return { sourceTurnId: "turn-" + id, sourceRootTaskId: "root-" + id, terminalSequence: sequence, taskGraph: graph(nodes) }
 }
+function lesson(nodeOrdinal: number, criterionOrdinals: readonly number[] = []): NonNullable<ValidatedRootTaskHistoryOutcome["nodeLessons"]>[number] {
+  if (!criterionOrdinals.length) return undefined
+  return {
+    ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal,
+    criterionFailures: criterionOrdinals.map(criterionOrdinal => ({ criterionOrdinal, status: "failed", reasonCode: "criterion_not_met" })),
+  }
+}
 
 describe("root task history projection", () => {
   it("emits only typed advisory outcomes and negative reason codes", () => {
@@ -119,6 +126,92 @@ describe("root task history projection", () => {
     const newerId = { ...outcome("z", 1n, [node({ status: "interrupted" })]), terminalAt: time }
     const projected = projectRootTaskHistory([olderId, newerId], true)?.content as { turns?: Array<{ nodes: Array<{ status: string }> }> }
     expect(projected.turns?.map(turn => turn.nodes[0]?.status)).toEqual(["interrupted", "failed"])
+  })
+
+  it("keeps criterion ordinals source-local through the legacy task-kind sort and preserves repair links", () => {
+    const scout = node({ templateId: "scout", status: "failed" })
+    const analyst = node({ templateId: "analyst", status: "completed" })
+    const targetLesson = lesson(1, [1, 2])
+    const repairLesson = { ordinalScope: "source_graph_local" as const, advisoryOnly: true as const, notCurrentEvidence: true as const,
+      nodeOrdinal: 2, criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1, 2], status: "passed" as const }] }
+    const source = { ...outcome("lesson-source", 12n, [scout, analyst]), nodeLessons: [targetLesson, repairLesson] }
+
+    const projected = projectRootTaskHistory([source])
+    const turns = (projected?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }).turns
+
+    expect(turns[0]?.nodes.map(value => value.taskKind)).toEqual(["analyst", "scout"])
+    expect(turns[0]?.nodes[0]?.lesson).toEqual({
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1, 2], status: "passed" }],
+    })
+    expect(turns[0]?.nodes[1]?.lesson).toEqual({
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+      criterionFailures: [
+        { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+        { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+      ],
+    })
+    const serialized = JSON.stringify(projected)
+    for (const forbidden of ["lesson-source", "PRIVATE_", "criterion-a", "verificationReport", "evidenceDigest", "resultDigest"]) {
+      expect(serialized).not.toContain(forbidden)
+    }
+  })
+
+  it("ignores malformed optional lesson facts while preserving the exact legacy projection", () => {
+    const source = outcome("malformed-lessons", 3n)
+    const baseline = projectRootTaskHistory([source])
+    const malformed = { ...source, nodeLessons: [{ nodeOrdinal: 1, criterionFailures: [{ criterionId: "raw-id" }] }] }
+
+    expect(projectRootTaskHistory([malformed as unknown as ValidatedRootTaskHistoryOutcome])).toEqual(baseline)
+  })
+
+  it("drops a repair link when node capping omits its failed target without renumbering source ordinals", () => {
+    const newest = outcome("newest-cap", 20n, Array.from({ length: 5 }, (_, index) => node({ key: `new-${index}`, status: "completed" })))
+    const olderNodes = [
+      node({ key: "target", templateId: "scout", status: "failed" }),
+      node({ key: "other-a", templateId: "misc-a", status: "completed" }),
+      node({ key: "other-b", templateId: "misc-b", status: "completed" }),
+      node({ key: "other-c", templateId: "misc-c", status: "completed" }),
+      node({ key: "repair", templateId: "analyst", status: "completed" }),
+    ]
+    const oldLessons = [lesson(1, [1]), undefined, undefined, undefined, {
+      ordinalScope: "source_graph_local" as const, advisoryOnly: true as const, notCurrentEvidence: true as const,
+      nodeOrdinal: 5, criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" as const }],
+    }]
+    const older = { ...outcome("older-cap", 10n, olderNodes), nodeLessons: oldLessons }
+
+    const projected = projectRootTaskHistory([newest, older])?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }
+    const oldTurnNodes = projected.turns[1]?.nodes ?? []
+
+    expect(projected.turns.flatMap(turn => turn.nodes)).toHaveLength(8)
+    expect(oldTurnNodes.some(value => value.taskKind === "scout")).toBe(false)
+    expect(oldTurnNodes.find(value => value.taskKind === "analyst")).not.toHaveProperty("lesson")
+    expect(oldTurnNodes.some(value => (value.lesson as { nodeOrdinal?: number } | undefined)?.nodeOrdinal === 1)).toBe(false)
+  })
+
+  it("drops links to target criteria trimmed by the UTF-8 byte cap", () => {
+    const ordinals = Array.from({ length: 8 }, (_, index) => index + 1)
+    const failedCriteria = ordinals.map(criterionOrdinal => ({ criterionOrdinal, status: "failed" as const, reasonCode: "canonical_evidence_ambiguous" as const }))
+    const nodes = [node({ templateId: "scout", status: "failed" }), ...Array.from({ length: 7 }, (_, index) =>
+      node({ key: `repair-${index + 1}`, templateId: "analyst", status: "failed" }))]
+    const nodeLessons = nodes.map((_, index) => ({
+      ordinalScope: "source_graph_local" as const, advisoryOnly: true as const, notCurrentEvidence: true as const,
+      nodeOrdinal: index + 1, criterionFailures: failedCriteria,
+      ...(index > 0 ? { successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: ordinals, status: "passed" as const }] } : {}),
+    }))
+
+    const projected = projectRootTaskHistory([{ ...outcome("byte-cap", 15n, nodes), nodeLessons }])
+    const emitted = (projected?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }).turns[0]?.nodes ?? []
+    const target = emitted.find(value => value.taskKind === "scout")
+    const repairs = emitted.filter(value => value.taskKind === "analyst")
+
+    expect(Buffer.byteLength(JSON.stringify(projected), "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(target).not.toHaveProperty("lesson")
+    expect(repairs).toHaveLength(7)
+    expect(repairs.every(value => {
+      const fact = value.lesson as { successfulRepairs?: unknown[] } | undefined
+      return !!fact && !Object.hasOwn(fact, "successfulRepairs")
+    })).toBe(true)
   })
 
   it("strips large untrusted node strings before applying the byte bound", () => {
