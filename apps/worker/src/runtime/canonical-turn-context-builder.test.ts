@@ -10,8 +10,9 @@ import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { progressCheckpointFromStepContext } from "./progress.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
 import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
+import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
-import type { SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
+import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
 import type { TurnLease } from "./turns/lease.js"
 
 const scope: TenantScope = { userId: "user-a" }
@@ -170,6 +171,85 @@ describe("canonical Turn context builder", () => {
     expect(systemText).not.toContain(jobId)
     expect(request.tools).toEqual([{ name: "agent.plan", version: "1" }])
     const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
+    expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
+    expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
+  })
+
+  it("recalls direct outcomes with compaction records absent and keeps fresh current context through token admission", async () => {
+    const jobId = "selected-job-direct-a"
+    const outcomes: readonly ValidatedSelectedJobHistoryOutcome[] = [{
+      jobId, sourceTurnId: "private-source-turn", sourceRootTaskId: "private-source-root", terminalSequence: 12n,
+      nodes: [{ role: "analyst", status: "completed", readiness: "terminal", repairState: "none",
+        result: { availability: "available", role: "analyst", status: "completed", score: 6.5, evidenceKinds: ["job"] } }],
+    }]
+    const directReader: DirectSelectedJobHistoryReader = { load: vi.fn(async () => outcomes) }
+    const steer: StoredAgentInput = {
+      id: "fresh-steer-direct", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: scope.userId,
+      clientMessageId: "fresh-steer-direct", delivery: "steer", status: "consumed",
+      content: [{ type: "text", text: "FRESH_STEERING_SENTINEL: prioritize Dublin" }], acceptedSequence: 3n,
+      consumedByStepId: "step-direct", consumedAt: now, createdAt: now,
+    }
+    const claimStore: InputClaimStore = {
+      scope,
+      withTransaction: work => work({
+        getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [steer], newlyClaimedInputIds: [steer.id] }),
+        persistCheckpoint: async () => undefined,
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const baseBuilder = new StepContextBuilder(claimStore, ownerFence)
+    const currentGraph = {
+      key: "current-analyst", templateId: "analyst", taskId: "current-task", goal: "CURRENT_GRAPH_DIRECT_SENTINEL",
+      successCriteria: [], dependsOn: [], status: "running", readiness: "active",
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" },
+    }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("the direct reader and injected builder avoid another client") } } as unknown as Pick<pg.Pool, "connect">,
+      store: claimStore, baseBuilder, scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+      planningEnabled: false, selectedJobMode: true, selectedJobMemories: [], selectedJobId: jobId,
+      selectedJobDirectHistoryReader: directReader,
+    })
+    const snapshot: StepContextRequest["snapshot"] = {
+      system: [{ id: "fixed-system", content: "Keep current authorization checks." }], profile: [],
+      goal: { id: "goal-current", content: "CURRENT_GOAL_DIRECT_SENTINEL: find Dublin roles" },
+      steerHistory: [{ id: "qa-current", content: { question: "Preferred location?", answer: "Dublin" } }],
+      businessRefs: [{ id: jobId, kind: "job", ownerId: scope.userId, label: "Current selected role" }],
+      toolObservations: [{ id: "task-graph-current", content: { kind: "task_graph_current", revision: 5, nodes: [currentGraph] } }],
+    }
+    const context = await builder.build({
+      scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-direct", snapshot,
+      now, mode: "new", lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now },
+    })
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context, model, tools: [{ name: "agent.plan", version: "1" }], sessionId: lease.sessionId, turnId: lease.turnId,
+      stepId: "step-direct", userId: scope.userId, taskId: "root-a", signal: new AbortController().signal, freshSteering: true,
+    })
+    const messageText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const historyBlocks = context.blocks.filter(block => block.id === "observation:selected-job-history")
+    const history = JSON.stringify(historyBlocks[0]?.content)
+    const systemText = request.messages.filter(message => message.role === "system").flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(directReader.load).toHaveBeenCalledWith({
+      lease, rootTaskId: "root-a", rootAttemptCount: 2, stepId: "step-direct", jobId, now,
+    })
+    expect(historyBlocks).toHaveLength(1)
+    expect(messageText).toContain("selected_job_history")
+    expect(messageText).toContain('"score":6.5')
+    expect(messageText).toContain("CURRENT_GOAL_DIRECT_SENTINEL")
+    expect(messageText).toContain("FRESH_STEERING_SENTINEL")
+    expect(messageText).toContain("Preferred location?")
+    expect(messageText).toContain("CURRENT_GRAPH_DIRECT_SENTINEL")
+    expect(historyBlocks[0]).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
+    for (const privateValue of ["private-source-turn", "private-source-root", jobId, "terminalSequence", "verification", "criteria", "PASS"]) {
+      expect(history).not.toContain(privateValue)
+      expect(systemText).not.toContain(privateValue)
+    }
+    const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlocks[0]?.id) }
     expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
     expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
   })

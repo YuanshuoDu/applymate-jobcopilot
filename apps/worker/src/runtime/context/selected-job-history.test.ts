@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
-import { projectSelectedJobMemory, type SelectedJobMemoryRecord } from "./selected-job-memory.js"
-import { projectSelectedJobHistory, type ValidatedSelectedJobHistory } from "./selected-job-history.js"
+import { projectSelectedJobMemory, type SelectedJobMemoryNode, type SelectedJobMemoryRecord } from "./selected-job-memory.js"
+import { projectSelectedJobHistory, projectSelectedJobHistoryOutcomes, type ValidatedSelectedJobHistory, type ValidatedSelectedJobHistoryOutcome } from "./selected-job-history.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 
 const jobId = "job-current"
@@ -35,6 +35,9 @@ function makeRecord(turn: string, root: string, score: number, throughSequence =
 }
 function history(record: SelectedJobMemoryRecord, terminalSequence: bigint): ValidatedSelectedJobHistory {
   return { record, terminalSequence }
+}
+function outcome(record: SelectedJobMemoryRecord, terminalSequence: bigint): ValidatedSelectedJobHistoryOutcome {
+  return { jobId: record.jobId, sourceTurnId: record.sourceTurnId, sourceRootTaskId: record.sourceRootTaskId, terminalSequence, nodes: record.nodes }
 }
 function json(value: unknown): string { return JSON.stringify(value) }
 
@@ -90,17 +93,38 @@ describe("selected-job history projection", () => {
       .toEqual((projectSelectedJobHistory([distinct])?.content as { turns: unknown[] }).turns)
   })
 
-  it("uses stable private identity ordering only for equal terminal sequences", () => {
+  it("projects direct graph outcomes into the byte-compatible historical block without compaction metadata", () => {
+    const records = [history(makeRecord("turn-old", "root-old", 5), 11n), history(makeRecord("turn-new", "root-new", 8), 31n)]
+    const compacted = projectSelectedJobHistory(records)
+    const direct = projectSelectedJobHistoryOutcomes(records.map(value => outcome(value.record, value.terminalSequence)))
+    expect(direct).toEqual(compacted)
+    const serialized = json(direct)
+    for (const privateValue of ["turn-old", "root-new", "job-current", "terminalSequence", "throughSequence", "graphDigest", "verification", "criteria", "repairState", "readiness", "PASS"]) {
+      expect(serialized).not.toContain(privateValue)
+    }
+  })
+
+  it("keeps full record digest and cursor conflicts in the legacy wrapper", () => {
+    const first = makeRecord("turn-same", "root-same", 7, "11")
+    const cursorChanged = makeRecord("turn-same", "root-same", 7, "12")
+    const separate = history(makeRecord("turn-separate", "root-separate", 4), 19n)
+    expect(cursorChanged.nodes).toEqual(first.nodes)
+    expect(cursorChanged.graphDigest).not.toBe(first.graphDigest)
+    const conflictProjection = projectSelectedJobHistory([history(first, 17n), history(cursorChanged, 17n), separate])
+    expect(conflictProjection).toEqual(projectSelectedJobHistory([separate]))
+  })
+
+  it("fails closed when distinct sources have equal terminal sequences", () => {
     const candidates = [
       history(makeRecord("turn-z", "root-z", 9), 25n),
       history(makeRecord("turn-a", "root-a", 2), 25n),
     ]
-    const projected = projectSelectedJobHistory(candidates)
-    const turns = (projected?.content as { turns: Array<{ nodes: Array<{ role: string; result: { score?: number } }> }> }).turns
-    expect(turns[0]?.nodes.find(item => item.role === "analyst")?.result.score).toBe(2)
-    expect(projected).toEqual(projectSelectedJobHistory([...candidates].reverse()))
-    expect(json(projected)).not.toContain("turn-a")
-    expect(json(projected)).not.toContain("root-z")
+    expect(projectSelectedJobHistory(candidates)).toBeUndefined()
+    expect(projectSelectedJobHistory([...candidates].reverse())).toBeUndefined()
+
+    const outcomes = candidates.map(value => outcome(value.record, value.terminalSequence))
+    expect(projectSelectedJobHistoryOutcomes(outcomes)).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([...outcomes].reverse())).toBeUndefined()
   })
 
   it("fails closed on sparse, malformed, mixed-job, oversized, or nonpositive metadata", () => {
@@ -123,5 +147,35 @@ describe("selected-job history projection", () => {
 
     const sparseNodes = { ...valid.record, nodes: new Array(valid.record.nodes.length) }
     expect(projectSelectedJobHistory([history(sparseNodes as SelectedJobMemoryRecord, 34n)])).toBeUndefined()
+  })
+
+  it("fails closed on malformed direct identity, sequence, job, and node envelopes", () => {
+    const record = makeRecord("turn-safe", "root-safe", 8)
+    const valid = outcome(record, 33n)
+    expect(projectSelectedJobHistoryOutcomes([valid])).toEqual(projectSelectedJobHistory([history(record, 33n)]))
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, extra: "must not pass" } as ValidatedSelectedJobHistoryOutcome])).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, jobId: " job-current" }])).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, sourceTurnId: "x".repeat(257) }])).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, terminalSequence: 33 as unknown as bigint }])).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, terminalSequence: 0n }])).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, nodes: [{ ...valid.nodes[0]!, privateText: "must not pass" }] as unknown as SelectedJobMemoryNode[] }])).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, nodes: new Array(1) as SelectedJobMemoryNode[] }])).toBeUndefined()
+    const oversizedNodes = new Proxy(new Array(9), {
+      getOwnPropertyDescriptor(target, property) {
+        if (property !== "length") throw new Error("oversized sparse outcome nodes must be rejected before traversal")
+        return Reflect.getOwnPropertyDescriptor(target, property)
+      },
+    })
+    expect(projectSelectedJobHistoryOutcomes([{ ...valid, nodes: oversizedNodes as SelectedJobMemoryNode[] }])).toBeUndefined()
+    expect(projectSelectedJobHistoryOutcomes([valid, outcome(makeRecord("turn-other-job", "root-other-job", 1, "11", "another-job"), 32n)])).toBeUndefined()
+    const sparse = new Array<ValidatedSelectedJobHistoryOutcome>(1)
+    expect(projectSelectedJobHistoryOutcomes(sparse)).toBeUndefined()
+    const oversized = new Proxy(new Array<ValidatedSelectedJobHistoryOutcome>(9), {
+      getOwnPropertyDescriptor(target, property) {
+        if (property !== "length") throw new Error("oversized sparse outcomes must be rejected before traversal")
+        return Reflect.getOwnPropertyDescriptor(target, property)
+      },
+    })
+    expect(projectSelectedJobHistoryOutcomes(oversized)).toBeUndefined()
   })
 })
