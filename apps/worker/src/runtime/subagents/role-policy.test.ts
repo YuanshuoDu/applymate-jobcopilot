@@ -31,6 +31,13 @@ describe("subagent role policy", () => {
     expect(preflightSubagentTool("executor", mislabeled)).toMatchObject({ allowed: false, execute: false, externalWriteBlocked: true, reasonCode: "external_write_disabled" })
   })
 
+  it.each(["scout", "analyst", "writer", "reviewer", "auditor", "executor"] as const)("denies outcome summaries to the %s role", role => {
+    const outcomes = tool("application.outcomes_summary", "read", "application")
+    expect(visibleToolPolicy(role, outcomes)).toEqual({ visible: false, reason: "root_only_tool" })
+    expect(visibleSubagentTools(role, [outcomes])).toEqual([])
+    expect(preflightSubagentTool(role, outcomes)).toMatchObject({ allowed: false, execute: false, reasonCode: "root_only_tool" })
+  })
+
   it("fails closed for an unknown role and missing tools", () => {
     expect(visibleSubagentTools("future-role", [tool("jobs.search", "read", "jobs")])).toEqual([])
     expect(preflightSubagentTool("executor", null)).toMatchObject({ allowed: false, execute: false })

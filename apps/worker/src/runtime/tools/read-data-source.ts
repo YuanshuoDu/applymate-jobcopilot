@@ -1,16 +1,19 @@
 import type pg from "pg"
 
-import type {
-  ApplicationStateInput,
-  ApplicationStateResult,
-  BaseResumeInput,
-  JobRecord,
-  JobSearchInput,
-  JobSearchResult,
-  PersonaFactRecord,
-  PersonaRetrieveInput,
-  ReadToolDataSource,
-  ResumeRecord,
+import {
+  OUTCOME_GMAIL_KINDS,
+  OUTCOME_JOB_STATUSES,
+  type ApplicationOutcomesSummaryResult,
+  type ApplicationStateInput,
+  type ApplicationStateResult,
+  type BaseResumeInput,
+  type JobRecord,
+  type JobSearchInput,
+  type JobSearchResult,
+  type PersonaFactRecord,
+  type PersonaRetrieveInput,
+  type ReadToolDataSource,
+  type ResumeRecord,
 } from "./read-tools.js"
 
 interface JobRow extends JobRecord { createdAt: Date | string; updatedAt: Date | string }
@@ -21,6 +24,29 @@ interface TaskRow {
   resumeId: string | null; coverLetterId: string | null; startedAt: Date | string | null; completedAt: Date | string | null; createdAt: Date | string; updatedAt: Date | string
 }
 interface ApprovalRow { id: string; type: string; status: string; title: string; impact: unknown; decidedAt: Date | string | null; createdAt: Date | string }
+interface OutcomeJobRow { id: string; status: string; updatedAt: Date | string }
+interface LinkedGmailKindRow { job_id: string; kind: string }
+
+const OUTCOME_JOB_LIMIT = 100
+const OUTCOME_JOB_QUERY_LIMIT = OUTCOME_JOB_LIMIT + 1
+
+function emptyOutcomesSummary(jobCount: number, truncated: boolean): ApplicationOutcomesSummaryResult {
+  return {
+    schemaVersion: 1, advisoryOnly: true,
+    coverage: { basis: "latest_100_jobs_by_updatedAt", jobCount, truncated },
+    jobStatusCounts: { saved: 0, applied: 0, interview: 0, offer: 0, rejected: 0 },
+    linkedJobsByGmailKind: { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 0 },
+    gmailSemantics: { classification: "heuristic_advisory_only", matchConfidence: "job_linkage_only" },
+  }
+}
+
+function isOutcomeStatus(value: string): value is keyof ApplicationOutcomesSummaryResult["jobStatusCounts"] {
+  return (OUTCOME_JOB_STATUSES as readonly string[]).includes(value)
+}
+
+function isOutcomeGmailKind(value: string): value is keyof ApplicationOutcomesSummaryResult["linkedJobsByGmailKind"] {
+  return (OUTCOME_GMAIL_KINDS as readonly string[]).includes(value)
+}
 
 function iso(value: Date | string | null): string | null {
   if (value === null) return null
@@ -31,7 +57,9 @@ function job(row: JobRow): JobRecord {
   return { id: row.id, company: row.company, role: row.role, location: row.location ?? null, status: row.status, score: row.score ?? null, url: row.url ?? null, source: row.source ?? null, salary: row.salary ?? null, description: row.description ?? null, keywords: row.keywords ?? null }
 }
 
-export function createPostgresReadToolDataSource(pool: Pick<pg.Pool, "query">): ReadToolDataSource {
+export function createPostgresReadToolDataSource(
+  pool: Pick<pg.Pool, "query">,
+): ReadToolDataSource & Required<Pick<ReadToolDataSource, "getOutcomesSummary">> {
   return {
     async searchJobs(userId: string, input: JobSearchInput): Promise<JobSearchResult> {
       const page = input.page ?? 1
@@ -100,6 +128,37 @@ export function createPostgresReadToolDataSource(pool: Pick<pg.Pool, "query">): 
         task: task ? { id: task.id, status: task.status, checkpoint: task.checkpoint, question: task.question, sensitiveFlags: task.sensitiveFlags, resumeId: task.resumeId, coverLetterId: task.coverLetterId, startedAt: iso(task.startedAt), completedAt: iso(task.completedAt), createdAt: iso(task.createdAt) as string, updatedAt: iso(task.updatedAt) as string } : null,
         approvals: approvals.rows.map((row) => ({ ...row, decidedAt: iso(row.decidedAt), createdAt: iso(row.createdAt) as string })),
       }
+    },
+
+    async getOutcomesSummary(userId: string): Promise<ApplicationOutcomesSummaryResult> {
+      const jobs = await pool.query<OutcomeJobRow>(
+        `SELECT "id", "status", "updatedAt" FROM "Job"
+         WHERE "userId" = $1
+         ORDER BY "updatedAt" DESC, "id" DESC LIMIT $2`,
+        [userId, OUTCOME_JOB_QUERY_LIMIT],
+      )
+      const sampledJobs = jobs.rows.slice(0, OUTCOME_JOB_LIMIT)
+      const summary = emptyOutcomesSummary(sampledJobs.length, jobs.rows.length > OUTCOME_JOB_LIMIT)
+      for (const row of sampledJobs) {
+        if (isOutcomeStatus(row.status)) summary.jobStatusCounts[row.status] += 1
+      }
+      if (sampledJobs.length === 0) return summary
+
+      const sampledJobIds = new Set(sampledJobs.map(row => row.id))
+      const linked = await pool.query<LinkedGmailKindRow>(
+        `SELECT DISTINCT "job_id", "kind" FROM "gmail_messages"
+         WHERE "user_id" = $1 AND "job_id" = ANY($2::text[])
+           AND "kind"::text = ANY($3::text[])`,
+        [userId, [...sampledJobIds], [...OUTCOME_GMAIL_KINDS]],
+      )
+      const linkedJobs = new Map<keyof ApplicationOutcomesSummaryResult["linkedJobsByGmailKind"], Set<string>>()
+      for (const kind of OUTCOME_GMAIL_KINDS) linkedJobs.set(kind, new Set())
+      for (const row of linked.rows) {
+        if (!sampledJobIds.has(row.job_id) || !isOutcomeGmailKind(row.kind)) continue
+        linkedJobs.get(row.kind)?.add(row.job_id)
+      }
+      for (const kind of OUTCOME_GMAIL_KINDS) summary.linkedJobsByGmailKind[kind] = linkedJobs.get(kind)?.size ?? 0
+      return summary
     },
   }
 }
