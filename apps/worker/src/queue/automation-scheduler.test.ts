@@ -313,10 +313,10 @@ describe("automation scheduler", () => {
   });
 
   it("honors leap-second Retry-After as the next representable UTC second", async () => {
-    const startTime = Date.parse("Sun, 06 Nov 1994 08:49:59 GMT");
+    const startTime = Date.parse("Thu, 30 Jun 1994 23:59:59 GMT");
     let currentTime = startTime;
     const request = vi.fn()
-      .mockResolvedValueOnce(new Response("retry later", { status: 429, headers: { "Retry-After": "Sun Nov  6 08:49:60 1994" } }))
+      .mockResolvedValueOnce(new Response("retry later", { status: 429, headers: { "Retry-After": "Thu Jun 30 23:59:60 1994" } }))
       .mockResolvedValue(new Response("ok"));
     const scheduler = createAutomationScheduler({
       tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],

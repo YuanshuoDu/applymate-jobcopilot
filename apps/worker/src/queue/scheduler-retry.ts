@@ -97,7 +97,7 @@ function parseHttpDate(value: string, now: number): number | undefined {
 
   const month = MONTHS.indexOf(parts.month)
   const second = Number(parts.second)
-  if (second > 60) return undefined
+  if (second > 60 || (second === 60 && (parts.hour !== "23" || parts.minute !== "59"))) return undefined
   let year = Number(parts.year)
   const weekdayNames = parts.longWeekday ? LONG_WEEKDAYS : SHORT_WEEKDAYS
   if (parts.twoDigitYear) {

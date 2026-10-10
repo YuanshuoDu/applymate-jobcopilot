@@ -36,11 +36,11 @@ describe("scheduler retry state", () => {
   });
 
   it.each([
-    "Sun, 06 Nov 1994 08:49:60 GMT",
-    "Sunday, 06-Nov-94 08:49:60 GMT",
-    "Sun Nov  6 08:49:60 1994",
+    "Thu, 30 Jun 1994 23:59:60 GMT",
+    "Thursday, 30-Jun-94 23:59:60 GMT",
+    "Thu Jun 30 23:59:60 1994",
   ])("maps a valid leap second to the next UTC second (%s)", (value) => {
-    const now = Date.parse("Sun, 06 Nov 1994 08:49:30 GMT");
+    const now = Date.parse("Thu, 30 Jun 1994 23:59:30 GMT");
     expect(parseRetryAfterAt(value, now, 60_000)).toBe(now + 30_000);
   });
 
@@ -62,6 +62,9 @@ describe("scheduler retry state", () => {
     "Sun Nov 6 08:49:35 1994",
     "Sun Nov  6 08:49:35 1994 GMT",
     "Sunday, 06-Nov-94 08:49:35 UTC",
+    "Sun, 06 Nov 1994 08:49:60 GMT",
+    "Sunday, 06-Nov-94 08:49:60 GMT",
+    "Sun Nov  6 08:49:60 1994",
     "Sun, 06 Nov 1994 08:49:61 GMT",
     "Sunday, 06-Nov-94 08:49:61 GMT",
     "Sun Nov  6 08:49:61 1994",
