@@ -9,6 +9,10 @@ const SCHEMA = 'agent-harness.v2'
 const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
 const TRACE_SCHEMA = 'agent-harness.v2.plan-ledger-trace'
 const DISCOVERY_TRACE_SCHEMA = 'agent-harness.v2.interactive-discovery-trace'
+const DISCOVERY_FINAL_CANDIDATE_TEXT = JSON.stringify({
+  schemaVersion: 'agent-harness.v2.final',
+  response: 'p3-process-restart-discovery-shortlist-ready',
+})
 const SESSION_B = 'task-graph-session-b'
 const TURN_B = 'task-graph-turn-b'
 const GOAL_B = 'Compare engineering teams in Amsterdam'
@@ -139,6 +143,19 @@ type TaskGraphSelectorResult =
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function isExactPersistedDiscoveryCandidate(value: unknown): value is string {
+  if (typeof value !== 'string' || value !== DISCOVERY_FINAL_CANDIDATE_TEXT) return false
+  try {
+    const candidate = record(JSON.parse(value) as unknown)
+    return !!candidate && Object.keys(candidate).sort().join(',') === 'response,schemaVersion'
+      && candidate.schemaVersion === 'agent-harness.v2.final'
+      && candidate.response === 'p3-process-restart-discovery-shortlist-ready'
+      && JSON.stringify(candidate) === value
+  } catch {
+    return false
+  }
 }
 
 function planLedgerEnumLabel(locale: 'en' | 'zh', group: 'readiness' | 'status', value: string): string {
@@ -296,11 +313,8 @@ function parsePersistedDiscoveryTrace(value: unknown): PersistedPlanLedgerTrace 
   if (envelope?.schemaVersion !== DISCOVERY_TRACE_SCHEMA || typeof sessionId !== 'string' || typeof turnId !== 'string'
     || typeof rootTaskId !== 'string' || typeof graphItemId !== 'string' || !Number.isSafeInteger(graphRevision)
     || !graphSnapshot || !ledger || !shortlist || !rawTasks || outcome?.turnStatus !== 'completed'
-    || Object.keys(outcome).sort().join(',') !== 'response,turnStatus' || typeof outcome.response !== 'string'
+    || Object.keys(outcome).sort().join(',') !== 'response,turnStatus' || !isExactPersistedDiscoveryCandidate(outcome.response)
     || ledger.sessionId !== sessionId || ledger.revision !== graphRevision || graphSnapshot.nodes.length !== ledger.nodes.length) return null
-  let finalShortlist: PersistedInteractiveDiscoveryShortlist | null = null
-  try { finalShortlist = parsePersistedDiscoveryShortlist(JSON.parse(outcome.response) as unknown) } catch { return null }
-  if (!finalShortlist || JSON.stringify(finalShortlist) !== JSON.stringify(shortlist)) return null
 
   const graphContent = { schemaVersion: GRAPH_SCHEMA, nodes: graphSnapshot.nodes }
   const graphItem = parsePersistedGraphItem({
@@ -362,6 +376,29 @@ function parsePersistedDiscoveryTrace(value: unknown): PersistedPlanLedgerTrace 
     interactiveDiscoveryShortlist: shortlist,
   }
 }
+
+test('accepts only the exact persisted v2 discovery candidate envelope', () => {
+  expect(isExactPersistedDiscoveryCandidate(DISCOVERY_FINAL_CANDIDATE_TEXT)).toBe(true)
+  expect(JSON.parse(DISCOVERY_FINAL_CANDIDATE_TEXT)).toEqual({
+    schemaVersion: 'agent-harness.v2.final',
+    response: 'p3-process-restart-discovery-shortlist-ready',
+  })
+
+  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
+    schemaVersion: 1, status: 'completed', items: [{ jobId: 'job-1', score: 9, evidenceIds: ['evidence-1'] }], failures: [],
+  }))).toBe(false)
+  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
+    schemaVersion: 'agent-harness.v2.final', response: 'p3-process-restart-discovery-shortlist-ready', extra: true,
+  }))).toBe(false)
+  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
+    schemaVersion: 'agent-harness.v2.final', response: 'changed candidate',
+  }))).toBe(false)
+  expect(isExactPersistedDiscoveryCandidate(JSON.stringify({
+    response: 'p3-process-restart-discovery-shortlist-ready', schemaVersion: 'agent-harness.v2.final',
+  }))).toBe(false)
+  expect(isExactPersistedDiscoveryCandidate(` ${DISCOVERY_FINAL_CANDIDATE_TEXT}`)).toBe(false)
+  expect(isExactPersistedDiscoveryCandidate('{invalid-json')).toBe(false)
+})
 
 // CI wraps the public ledger with persisted TaskGraph/task identities for this browser-only handoff.
 const traceArtifactPath = process.env.AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH

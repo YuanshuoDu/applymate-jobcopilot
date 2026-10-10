@@ -28,6 +28,9 @@ import { hasPendingSteerOrInvalidResult, hasUnresolvedPlanningSteering } from ".
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "./subagents/steering-reconciliation-contract.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { taskGraphFinalSummaryCopiesMatch } from "./finalizer.js"
+import type { AtomicTurnCompletionInput } from "./turns/turn-engine-types.js"
 
 export type NativeVerificationRuntime = Readonly<{
   port: NativeVerificationPort
@@ -82,13 +85,14 @@ export function createCanonicalTurnTerminalGuard(input: Readonly<{
   finalizeSelectedJob?: (client: PoolClient) => Promise<TurnEngineCompletionGateResult>
 }>): TurnEngineTerminalGuard | undefined {
   if (!input.enabled) return undefined
-  return async (client, terminal) => {
+  return async (client, terminal: AtomicTurnCompletionInput & Readonly<{ response: string }>) => {
     const native = await input.nativeVerification.checkTerminal(client, terminal)
     if (native.denial) return native.denial
-    if (input.checkRootGraph) {
-      const graph = await input.checkRootGraph(client, native.nativeVerificationPassed)
-      if (!graph) return { ok: false, blocker: "task_graph_verification_unverified", feedback: "TaskGraph completion verification is unavailable." }
-      if (!graph.ok) return graph
+    const graph = input.checkRootGraph ? await input.checkRootGraph(client, native.nativeVerificationPassed) : undefined
+    if (input.checkRootGraph && !graph) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph completion verification is unavailable." }
+    if (graph && !graph.ok) return graph
+    if (!taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph?.[TASK_GRAPH_FINAL_SUMMARY_BINDING], terminal.finalContent, terminal.response)) return {
+      ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph final summary is stale or unavailable. Re-read the current graph before completing.",
     }
     return input.finalizeSelectedJob ? input.finalizeSelectedJob(client) : { ok: true }
   }
@@ -112,11 +116,13 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
     if (native) return native
     const children = await input.checkChildren()
     if (children && !children.ok) return children
-    if (input.interactiveDiscovery) return input.interactiveDiscovery()
+    const carryGraphSummary = (result: TurnEngineCompletionGateResult) => result.ok && children?.ok && children[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+      ? { ...result, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: children[TASK_GRAPH_FINAL_SUMMARY_BINDING] } : result
+    if (input.interactiveDiscovery) return carryGraphSummary(await input.interactiveDiscovery())
     if (!input.selectedJobMode) return children ?? { ok: true }
-    return input.selectedJobCompletion ? input.selectedJobCompletion() : {
+    return carryGraphSummary(input.selectedJobCompletion ? await input.selectedJobCompletion() : {
       ok: false, blocker: "selected_job_draft_review_required", feedback: "Selected-job completion verification is unavailable.",
-    }
+    })
   }
   if (input.nativeVerification.resetSemanticProgress) gate[RESET_NATIVE_SEMANTIC_PROGRESS] = input.nativeVerification.resetSemanticProgress
   return gate

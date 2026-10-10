@@ -10,6 +10,10 @@ import { buildCognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js
 import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS } from "./turns/turn-execution-types.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
+import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
+import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 
 const candidate = "A current root answer with verified evidence."
 const owner = { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1",
@@ -26,6 +30,25 @@ const witness: NativeVerificationRootGoalWitness = {
 }
 const waitPort: DurableWaitPort = { wait: vi.fn(async () => { throw new Error("unexpected wait") }) }
 const terminalInput = { stepId: "step-1", finalContent: { text: candidate }, response: candidate } as unknown as Parameters<TurnEngineTerminalGuard>[1]
+
+function graphSummaryBinding(graphRevision: number, jobId: string) {
+  return {
+    graphRevision,
+    summary: reduceTaskGraphFinalSummary({ graphRevision, nodes: [{
+      kind: "business", taskId: "task-scout", role: "scout", taskStatus: "completed",
+      structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+        candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [`read:job:${jobId}`] }],
+        evidence: [{ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "fixture" }], summary: "Found one role" },
+    }] }),
+  }
+}
+
+function finalSummaryTerminal(binding: ReturnType<typeof graphSummaryBinding>) {
+  const summary = formatTaskGraphFinalSummary(binding.summary)
+  const final = { schemaVersion: "agent-harness.v2.final", response: candidate, summary }
+  return { stepId: "step-1", finalContent: { text: candidate, final }, response: JSON.stringify(final),
+    [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } as unknown as Parameters<TurnEngineTerminalGuard>[1]
+}
 
 function coordination() {
   return {
@@ -202,6 +225,25 @@ describe("canonical native verification runtime composition", () => {
     expect(gate).toBeDefined()
     gate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
     expect(reset).toHaveBeenCalledOnce()
+  })
+
+  it("checks child completion and carries its summary after native proof passes", async () => {
+    const { factory } = runtimeFactory(vi.fn(async () => true))
+    const nativeVerification = configureLegacyProgress(createCanonicalNativeVerificationRuntime({
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    }))
+    await expect(nativeVerification.checkCompletion("step-1", candidate)).resolves.toBeNull()
+    const binding = { graphRevision: 4, summary: reduceTaskGraphFinalSummary({ graphRevision: 4, nodes: [] }) }
+    const children = { ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
+    const checkChildren = vi.fn(async () => children)
+    const gate = createCanonicalRootCompletionGate({
+      enabled: true, nativeVerification, onCandidateStart: vi.fn(), checkChildren, selectedJobMode: false,
+    })
+
+    const result = await gate?.({ stepId: "step-1", candidateText: candidate } as never)
+
+    expect(checkChildren).toHaveBeenCalledOnce()
+    expect(result?.[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
   })
 
   it("signals the third distinct strict root rejection while keeping its key private", async () => {
@@ -577,6 +619,70 @@ describe("canonical native verification runtime composition", () => {
       ok: false, blocker: "task_graph_verification_unverified",
     })
     expect(finalizeSelectedJob).not.toHaveBeenCalled()
+  })
+
+  it("requires the exact current graph revision and full summary facts before terminal acceptance", async () => {
+    const client = { query: vi.fn() } as unknown as PoolClient
+    const expected = graphSummaryBinding(1, "job-1")
+    const sameCountChangedFacts = graphSummaryBinding(1, "job-2")
+    const changedRevision = graphSummaryBinding(2, "job-1")
+    expect(sameCountChangedFacts.summary.counts).toEqual(expected.summary.counts)
+    const terminal = finalSummaryTerminal(expected)
+
+    const staleBindings: ReadonlyArray<{
+      terminal: Parameters<TurnEngineTerminalGuard>[1]
+      current?: typeof expected
+    }> = [
+      { terminal, current: sameCountChangedFacts },
+      { terminal, current: changedRevision },
+      { terminal },
+      { terminal: terminalInput, current: expected },
+    ]
+    for (const stale of staleBindings) {
+      const finalizeSelectedJob = vi.fn(async () => ({ ok: true as const }))
+      const guard = createCanonicalTurnTerminalGuard({
+        enabled: true,
+        nativeVerification: { checkTerminal: vi.fn(async () => ({ nativeVerificationPassed: true })) },
+        checkRootGraph: vi.fn(async () => stale.current
+          ? { ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: stale.current }
+          : { ok: true as const }),
+        finalizeSelectedJob,
+      })
+      if (!guard) throw new Error("terminal guard was not enabled")
+      await expect(guard(client, stale.terminal)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+      expect(finalizeSelectedJob).not.toHaveBeenCalled()
+    }
+
+    const finalizeSelectedJob = vi.fn(async () => ({ ok: true as const }))
+    const matchingGuard = createCanonicalTurnTerminalGuard({
+      enabled: true,
+      nativeVerification: { checkTerminal: vi.fn(async () => ({ nativeVerificationPassed: true })) },
+      checkRootGraph: vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: expected })),
+      finalizeSelectedJob,
+    })
+    if (!matchingGuard) throw new Error("terminal guard was not enabled")
+    await expect(matchingGuard(client, terminal)).resolves.toEqual({ ok: true })
+    expect(finalizeSelectedJob).toHaveBeenCalledOnce()
+  })
+
+  it("rejects a bound terminal whose serialized summary copies differ", async () => {
+    const client = { query: vi.fn() } as unknown as PoolClient
+    const binding = graphSummaryBinding(1, "job-1")
+    const terminal = finalSummaryTerminal(binding)
+    const malformedCopies = [
+      { ...terminal, finalContent: { text: candidate, final: { response: candidate, summary: "changed" } } },
+      { ...terminal, response: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: candidate, summary: "changed" }) },
+    ]
+    const guard = createCanonicalTurnTerminalGuard({
+      enabled: true,
+      nativeVerification: { checkTerminal: vi.fn(async () => ({ nativeVerificationPassed: true })) },
+      checkRootGraph: vi.fn(async () => ({ ok: true as const, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding })),
+    })
+    if (!guard) throw new Error("terminal guard was not enabled")
+
+    for (const malformed of malformedCopies) {
+      await expect(guard(client, malformed)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    }
   })
 
   it("keeps selected-job finalization authoritative after native and root proof", async () => {

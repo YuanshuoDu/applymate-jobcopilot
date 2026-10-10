@@ -50,6 +50,7 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
@@ -9038,9 +9039,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(root.rows).toHaveLength(1)
       expect(root.rows[0]?.status).toBe("completed")
-      expect(record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist).toEqual({
-        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
-      })
+      const persistedShortlist = record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist
       const children = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
         `SELECT "id", "role", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "role" = ANY($4::text[]) ORDER BY "role"`,
         [value.turnId, value.sessionId, root.rows[0]!.id, ["analyst", "scout"]],
@@ -9110,7 +9109,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [value.turnId, value.sessionId, value.userId],
       )
       expect(turn.rows[0]?.leaseVersion).toBeGreaterThan(checkpointTurn.rows[0]!.leaseVersion)
-      expect(turn.rows[0]?.finalResponse).toContain(jobId)
+      expect(persistedShortlist).toEqual({
+        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
+      })
       expect(workerTwo.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(false)
       expect(workerThree.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(true)
       expect(workerThree.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_SETTLED ${analyst!.id} analyst completed`))).toHaveLength(1)
@@ -9423,9 +9424,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           failures: Array.isArray(shortlist?.failures) ? shortlist.failures.filter((failure): failure is string => typeof failure === "string").slice(0, 12) : [],
         }
         const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
-        const finalShortlistText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
-        if (turn.rows[0]?.status !== "completed" || !finalShortlistText || JSON.stringify(JSON.parse(finalShortlistText)) !== JSON.stringify(safeShortlist)) {
-          throw new Error("Interactive discovery trace final outcome does not match its persisted shortlist")
+        const finalCandidateText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
+        if (turn.rows[0]?.status !== "completed" || finalCandidateText !== JSON.stringify({
+          schemaVersion: "agent-harness.v2.final", response: "p3-process-restart-discovery-shortlist-ready",
+        })) {
+          throw new Error("Interactive discovery trace final outcome does not preserve its verified model candidate")
         }
         await writeFile(interactiveDiscoveryTraceArtifactPath, JSON.stringify({
           schemaVersion: "agent-harness.v2.interactive-discovery-trace",
@@ -9438,7 +9441,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           tasks: safeTasks,
           planLedger,
           interactiveDiscoveryShortlist: safeShortlist,
-          finalOutcome: { turnStatus: turn.rows[0].status, response: finalShortlistText },
+          finalOutcome: { turnStatus: turn.rows[0].status, response: finalCandidateText },
         }), "utf8")
       }
     } finally {
@@ -9798,7 +9801,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(waits.rows.every(wait => wait.consumedAt instanceof Date)).toBe(true)
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [discoveryOwner.turnId])
     const finalResponse = JSON.parse(final.rows[0]?.finalResponse ?? "null") as RecordValue
-    expect(finalResponse.response).toContain('"jobId":"' + jobId + '"')
+    expect(finalResponse.response).toBe(JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }))
+    expect(finalResponse.summary).toContain("discovered jobs: 1 (complete)")
   }, 90_000)
 
   it("fails an interactive shortlist when its Scout prerequisite fails and cancels dependent work", async () => {
@@ -10539,7 +10543,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(secondJobSeeded).toBe(true)
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
     expect(turn.rows[0]?.status).toBe("completed")
-    expect(turn.rows[0]?.finalResponse).toContain("verified shortlist")
+    const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
+    expect(finalResponse.response).toBe(JSON.stringify({
+      schemaVersion: "agent-harness.v2.final", response: "The verified shortlist is ready",
+    }))
     const rootTaskId = turn.rows[0]?.rootTaskId
     expect(rootTaskId).toBeTruthy()
     const rejection = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected' AND "payload"->>'blocker' = 'task_graph_verification_unverified'`, [value.turnId, value.sessionId])
@@ -10567,7 +10574,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(analyst).toMatchObject({ status: "completed", failureReason: null })
     expectPassedVerificationReport(record(analyst?.result)?.taskGraphVerificationReport, "finding-count")
     if (!terminalGateLease || !rootTaskId) throw new Error("repair fixture lost its terminal-gate identity")
-    expect(await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)).toEqual({ ok: true })
+    const persistedGraph = await pool!.query<{ revision: number }>(`SELECT "revision" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+    [taskGraphItemId(rootTaskId), value.sessionId, value.turnId])
+    const persistedRevision = Number(persistedGraph.rows[0]?.revision ?? 0)
+    const terminalDecision = await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)
+    expect(terminalDecision.ok).toBe(true)
+    if (!terminalDecision.ok) throw new Error("repaired current TaskGraph did not pass its terminal gate")
+    const binding = terminalDecision[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+    expect(binding).toBeDefined()
+    expect(persistedRevision).toBeGreaterThan(0)
+    expect(binding?.graphRevision).toBe(persistedRevision)
+    expect(binding?.summary.graphRevision).toBe(persistedRevision)
+    expect(JSON.stringify(terminalDecision)).toBe('{"ok":true}')
   }, 120_000)
 
   it("drains a fenced running TaskGraph child after root failure without changing root or Turn", async () => {

@@ -9,6 +9,7 @@ import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completion
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
@@ -161,7 +162,7 @@ function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>, re
   return { query: vi.fn(async (sql: string, params?: unknown[]) => {
     onQuery?.(sql, params)
     if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: "graph-item", revision, content }], rowCount: 1 }
-    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: tasks, rowCount: tasks.length }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: tasks.map(task => ({ taskType: "scout", ...task })), rowCount: tasks.length }
     if (sql.includes('FROM "agent_events" AS event')) return { rows: [], rowCount: 0 }
     throw new Error(`Unexpected graph query: ${sql}`)
   }) } as never
@@ -341,7 +342,11 @@ describe("TaskGraph terminal verification gate", () => {
       { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: storedResult("unverified") },
       { id: repair.taskId, status: "completed", role: "scout", failureReason: null, result: { ...storedResult("passed"), taskGraphRepairReceipt: receipt } },
     ]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, repair], tasks), graphLease, "root-1")).resolves.toEqual({ ok: true })
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target, repair], tasks), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: true })
+    expect(decision[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toMatchObject({ graphRevision: 1, summary: { graphRevision: 1, counts: { discoveredJobs: { knownCount: 1, coverage: "partial" } } } })
+    await expect(assertCompletionAllowed(gateOptions(async () => decision), gateWriter(), step, new AbortController().signal, () => nowValue, "candidate"))
+      .resolves.toBe(decision[TASK_GRAPH_FINAL_SUMMARY_BINDING])
     const forged = [{ ...tasks[0], result: { ...storedResult("unverified"), taskGraphVerificationReport: { ...report("unverified"), reasonCode: "worker_claim", criteria: [{ criterionId: "candidate-present", status: "unverified", reasonCode: "worker_claim" }] } } }, tasks[1]]
     const forgedDecision = await checkTaskGraphTerminalVerification(graphClient([target, repair], forged), graphLease, "root-1")
     expect(forgedDecision).toMatchObject({ ok: false, feedback: expect.stringContaining("issue=verification_report") })
@@ -359,7 +364,7 @@ describe("TaskGraph terminal verification gate", () => {
       { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: storedResult("failed") },
       { id: repair.taskId, status: "completed", role: "scout", failureReason: null, result: { ...storedResult("passed"), taskGraphRepairReceipt: receipt } },
     ]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, repair], baseTasks), graphLease, "root-1")).resolves.toEqual({ ok: true })
+    await expect(checkTaskGraphTerminalVerification(graphClient([target, repair], baseTasks), graphLease, "root-1")).resolves.toMatchObject({ ok: true })
     const forged = [{ ...baseTasks[0] }, { ...baseTasks[1], result: { ...storedResult("passed"), taskGraphRepairReceipt: { ...receipt, targetTaskId: "foreign-task" } } }]
     const forgedDecision = await checkTaskGraphTerminalVerification(graphClient([target, repair], forged), graphLease, "root-1")
     expect(forgedDecision).toMatchObject({ ok: false, feedback: expect.stringContaining("issue=repair_receipt") })
@@ -384,7 +389,7 @@ describe("TaskGraph terminal verification gate", () => {
       { id: rejected.taskId, status: "failed", role: "scout", failureReason: "task_graph_repair_target_unresolved", result: { structuredResult: structuredResult("passed"), taskGraphVerificationReport: rejectedReport } },
       { id: repair.taskId, status: "completed", role: "scout", failureReason: null, result: { ...storedResult("passed"), taskGraphRepairReceipt: receipt } },
     ]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")).resolves.toEqual({ ok: true })
+    await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")).resolves.toMatchObject({ ok: true })
     const unresolved = await checkTaskGraphTerminalVerification(graphClient([target, rejected], tasks.slice(0, 2)), graphLease, "root-1")
     expect(unresolved).toMatchObject({ ok: false })
     if (unresolved.ok) return

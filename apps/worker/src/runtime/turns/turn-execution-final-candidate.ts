@@ -12,6 +12,8 @@ import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
 import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
 import { tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
+import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string }>
@@ -83,7 +85,9 @@ export async function completeTurnCandidate(input: Readonly<{
     return { kind: "replan", feedback: gate.feedback }
   }
   await finishStep(options, writer, step, output, now, input.onStepClosed)
+  const summaryBinding = gate as TaskGraphFinalSummaryBinding | undefined
   const finalResponse = finalizeTurn({ goal: options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
+    ...(summaryBinding ? { summaryOverride: formatTaskGraphFinalSummary(summaryBinding.summary) } : {}),
     usage: totalTurnUsage(options.resume?.usage, input.usage), stepCount: input.stepCount, toolCallCount: input.toolCallCount })
   if (canPersistFinalResponse(options)) {
     if (!options.store.recordFinalResponse) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion is unavailable")
@@ -92,7 +96,8 @@ export async function completeTurnCandidate(input: Readonly<{
     try {
       terminal = await options.store.recordFinalResponse({ identity: options.identity, response: serializeFinalResponse(finalResponse), now: now(),
         terminal: { stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse) }),
-          stepCount: input.stepCount, toolCallCount: input.toolCallCount, usage: finalResponse.usage } })
+          stepCount: input.stepCount, toolCallCount: input.toolCallCount, usage: finalResponse.usage,
+          ...(summaryBinding ? { [TASK_GRAPH_FINAL_SUMMARY_BINDING]: summaryBinding } : {}) } })
     } catch (error: unknown) {
       const reconciliation = steeringReconciliationGateRecovery(error)
       if (reconciliation) {

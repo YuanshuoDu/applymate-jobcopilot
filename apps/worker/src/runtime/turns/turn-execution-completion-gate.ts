@@ -15,6 +15,7 @@ import { validateRoleResult } from "../subagents/role-results.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 
 type CompletionGateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate" | "isOwnershipLost">
 type CompletionGateWriter = Pick<TurnExecutionEventWriter, "append">
@@ -164,11 +165,12 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
         return deny("repair_receipt", [...(targetReport ? reportFeedback(target, targetReport, nodes, "invalid_receipt") : []), ...reportFeedback(repair, report, nodes)])
       }
     }
-    return { ok: true }
+    const binding = buildTaskGraphFinalSummaryBinding(loaded)
+    return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
   } catch { graphRevision = null; return deny() }
 }
 
-export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<{ feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity } | { waitId: string } | undefined> {
+export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity } | { waitId: string } | undefined> {
   if (!options.completionGate) return undefined
   let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
   try {
@@ -181,8 +183,11 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
   if (!decision || typeof decision !== "object" || typeof decision.ok !== "boolean") throw new TurnEngineError("invalid_output", "Completion gate returned an invalid decision")
   if (decision.ok) {
     if (Object.hasOwn(decision, NATIVE_SEMANTIC_NO_PROGRESS) || Object.hasOwn(decision, NATIVE_SEMANTIC_REJECTION)) throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic progress signal")
-    return undefined
+    const binding = decision[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+    if (binding !== undefined && (!binding || !Number.isSafeInteger(binding.graphRevision) || binding.graphRevision < 1 || !binding.summary || typeof binding.summary !== "object")) throw new TurnEngineError("invalid_output", "Completion gate returned an invalid TaskGraph summary binding")
+    return binding
   }
+  if (decision[TASK_GRAPH_FINAL_SUMMARY_BINDING] !== undefined) throw new TurnEngineError("invalid_output", "Completion gate returned a TaskGraph summary binding while denying completion")
   const stopForSemanticNoProgress = decision[NATIVE_SEMANTIC_NO_PROGRESS]
   const rawRejection = decision[NATIVE_SEMANTIC_REJECTION]
   const rejection = rawRejection === undefined ? undefined : parseNativeSemanticRejectionIdentity(rawRejection)
