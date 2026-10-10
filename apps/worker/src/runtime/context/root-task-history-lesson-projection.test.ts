@@ -14,7 +14,7 @@ const CRITERIA = [
 const CONTRACT = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout", criteria: CRITERIA } as const
 const DIGEST = "a".repeat(64)
 
-function report(status: "failed" | "passed", ids = CRITERIA.map(item => item.id), statuses?: readonly ("failed" | "passed")[]) {
+function report(status: "failed" | "passed", ids: readonly string[] = CRITERIA.map(item => item.id), statuses?: readonly ("failed" | "passed")[]) {
   const criteria = ids.map((criterionId, index) => {
     const criterionStatus = statuses?.[index] ?? status
     return { criterionId, status: criterionStatus, reasonCode: criterionStatus === "passed" ? "criteria_met" : "criterion_not_met" }
@@ -55,6 +55,38 @@ function fixture(options: { repairCount?: number; targetStatuses?: readonly ("fa
   const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot, state, tasks, item: { id: "private-item", revision: 7, content: snapshot, createdAt: new Date(0) } }
   return { loaded, graph: currentTaskGraph(loaded) }
 }
+
+function overlappingCoverageFixture() {
+  const criteria = [...CRITERIA, { id: "third-count", check: { kind: "candidate_count_gte" as const, minimum: 4 } }] as const
+  const target = { key: "source-node-private", templateId: "scout", goal: "source private goal", successCriteria: ["private requirement"],
+    dependsOn: [], depth: 1, taskId: "source-task-private", verificationDisposition: "typed", verification: { ...CONTRACT, criteria } }
+  const repairCriterionIds = [["first-count", "second-count"], ["second-count", "third-count"]] as const
+  const repairs = repairCriterionIds.map((criterionIds, index) => {
+    const key = `repair-node-${index + 1}`, taskId = `repair-task-${index + 1}`
+    return { key, templateId: "scout", goal: "repair private goal", successCriteria: ["private repair requirement"], dependsOn: [], depth: 2,
+      taskId, verificationDisposition: "typed", verification: { ...CONTRACT, criteria: criterionIds.map(id => criteria.find(item => item.id === id)!) },
+      repairOf: { graphRootTaskId: ROOT, nodeKey: target.key, taskId: target.taskId, criterionIds: [...criterionIds] } }
+  })
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [target, ...repairs] })
+  const tasks = new Map<string, GraphTaskRow>()
+  tasks.set(target.taskId, { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed",
+    result: { taskGraphVerificationReport: report("failed", criteria.map(item => item.id)) } })
+  for (let index = 0; index < repairs.length; index++) {
+    const node = snapshot.nodes[index + 1]!, criterionIds = repairCriterionIds[index]!, taskReport = report("passed", [...criterionIds])
+    const receipt = { schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: ROOT, targetNodeKey: target.key,
+      targetTaskId: target.taskId, criterionIds: [...criterionIds], repairNodeKey: node.key, repairTaskId: node.taskId,
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: taskReport.evidenceDigest }
+    tasks.set(node.taskId, { id: node.taskId, status: "completed", role: "scout", failureReason: null,
+      result: { taskGraphVerificationReport: taskReport, taskGraphRepairReceipt: receipt } })
+  }
+  const statuses = new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }] as const))
+  const base = taskGraphState(snapshot, 7, statuses, []), coverage = resolveTaskGraphRepairDependencies(snapshot, tasks, ROOT)
+  const state = { ...base, repairSatisfiedNodeKeys: coverage.satisfied, repairPendingNodeKeys: coverage.pending }
+  const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot, state, tasks,
+    item: { id: "private-item", revision: 7, content: snapshot, createdAt: new Date(0) } }
+  return { loaded, graph: currentTaskGraph(loaded), targetKey: target.key }
+}
+
 describe("root history ordinal lessons", () => {
   it("derives separate same-reason failures and a receipt-backed one-to-one repair link", () => {
     const { loaded, graph } = fixture(), lessons = deriveRootTaskHistoryLessonFacts(loaded, graph)
@@ -102,6 +134,13 @@ describe("root history ordinal lessons", () => {
     expect(deriveRootTaskHistoryLessonFacts({ ...loaded, state: { ...loaded.state!, repairSatisfiedNodeKeys: [] } }, graph)[1]?.successfulRepairs).toBeUndefined()
     const missing = new Map(loaded.tasks).set(repair.taskId, { ...oldTask, result: { taskGraphVerificationReport: badResult.taskGraphVerificationReport } })
     expect(deriveRootTaskHistoryLessonFacts({ ...loaded, tasks: missing }, graph)[1]?.successfulRepairs).toBeUndefined()
+  })
+
+  it("omits an exact-repair relationship when successful receipt coverage partially overlaps", () => {
+    const { loaded, graph, targetKey } = overlappingCoverageFixture()
+    const lessons = deriveRootTaskHistoryLessonFacts(loaded, graph)
+    expect(loaded.state?.repairSatisfiedNodeKeys).not.toContain(targetKey)
+    expect(lessons.slice(1).every(lesson => !lesson?.successfulRepairs)).toBe(true)
   })
 
   it("records failed repair criteria without a success link and resets ordinals for each source graph", () => {
