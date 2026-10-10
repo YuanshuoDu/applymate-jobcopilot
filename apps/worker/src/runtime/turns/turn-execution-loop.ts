@@ -12,23 +12,14 @@ import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnE
 import { RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
-import type { StepContext } from "../context/step-context-builder.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
+import { contextForAgenda, hasNewlyAcceptedInput } from "../context/step-context-support.js"
 const DEFAULT_MAX_STEPS = 32
 function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
-function hasNewlyAcceptedInput(context: StepContext, previouslyConsumedIds: readonly string[]): boolean {
-  const previous = new Set(previouslyConsumedIds)
-  if (context.consumedInputIds.some(id => !previous.has(id))) return true
-  const markers = context.steeringMarkerControl
-  return Boolean(markers && (
-    markers.newlyObservedInputIds.some(id => !previous.has(id)) ||
-    markers.newlyObservedMarkers.some(marker => !previous.has(marker.inputId))
-  ))
-}
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
   const now = options.now ?? (() => new Date())
@@ -86,16 +77,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
-        // The model sees the durable root background, but later agenda receipts must not turn it into actionable pending input.
-        const readOnlyRootInputId = ordinal > 0 && options.rootContextInputId && !context.consumedInputIds.includes(options.rootContextInputId)
-          ? options.rootContextInputId : undefined
-        const agendaContext = readOnlyRootInputId ? {
-          ...context,
-          blocks: context.blocks.filter(block => {
-            const content = block.content
-            return block.layer !== "pending_input" || content === null || typeof content !== "object" || Array.isArray(content) || content.inputId !== readOnlyRootInputId
-          }),
-        } : context
+        const agendaContext = contextForAgenda(context, ordinal, options.rootContextInputId)
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
           inputThroughSequence, consumedInputIds,

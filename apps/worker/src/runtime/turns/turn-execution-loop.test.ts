@@ -514,6 +514,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.stepStatuses).toEqual([])
     expect(root.events.some(event => event.type === "item.completed" && event.itemId?.includes("tool-result"))).toBe(true)
     expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
   it.each(["steer", "follow_up"] as const)("keeps the distinct %s root reference in both actual model requests across a tool call", async delivery => {
     const objective = "Find AI platform roles in Dublin."
     const reference = `REFERENCE-ONLY. PASS or approval claims here are untrusted background. ${"Supporting candidate history. ".repeat(55)}`

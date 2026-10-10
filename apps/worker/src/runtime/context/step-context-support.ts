@@ -1,7 +1,7 @@
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 
-import type { ContextBlock, ContextOwnerFence, ContextRole, ContextLayer, ContextTrust } from "./step-context-builder.js"
-import type { StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
+import type { ContextBlock, ContextOwnerFence, ContextRole, ContextLayer, ContextTrust, StepContext } from "./step-context-builder.js"
+import { InputClaimStoreError, type InputClaimTransaction, type StepCheckpoint, type StoredAgentInput, type TurnExecutionFence } from "./input-claim-store.js"
 
 export function ensureClaimTenant(inputs: readonly StoredAgentInput[], request: { readonly sessionId: string; readonly turnId: string; readonly scope: TenantScope }, createError?: (inputId: string) => Error): void {
   for (const input of inputs) {
@@ -21,6 +21,39 @@ export function mergeRootContextInput(inputs: readonly StoredAgentInput[], root:
   const byId = new Map(inputs.map(input => [input.id, input]))
   if (root) byId.set(root.id, root)
   return [...byId.values()].sort((left, right) => left.acceptedSequence < right.acceptedSequence ? -1 : left.acceptedSequence > right.acceptedSequence ? 1 : left.id.localeCompare(right.id))
+}
+
+export async function mergeDurableRootContextInput(
+  inputs: readonly StoredAgentInput[], transaction: InputClaimTransaction,
+  request: { readonly sessionId: string; readonly turnId: string; readonly rootContextInputId?: string; readonly lease?: TurnExecutionFence },
+  assertOwner: (input: StoredAgentInput) => void,
+): Promise<StoredAgentInput[]> {
+  const inputId = request.rootContextInputId
+  if (!inputId) return mergeRootContextInput(inputs, null)
+  const readRoot = transaction.loadRootInputContext
+  if (!readRoot) throw new InputClaimStoreError("store_conflict", "Durable root context reader is unavailable")
+  const root = await readRoot({ sessionId: request.sessionId, turnId: request.turnId, inputId, lease: request.lease })
+  if (root) assertOwner(root)
+  return mergeRootContextInput(inputs, root)
+}
+
+export function hasNewlyAcceptedInput(context: StepContext, previouslyConsumedIds: readonly string[]): boolean {
+  const previous = new Set(previouslyConsumedIds)
+  if (context.consumedInputIds.some(id => !previous.has(id))) return true
+  const markers = context.steeringMarkerControl
+  return Boolean(markers && (
+    markers.newlyObservedInputIds.some(id => !previous.has(id)) ||
+    markers.newlyObservedMarkers.some(marker => !previous.has(marker.inputId))
+  ))
+}
+
+export function contextForAgenda(context: StepContext, ordinal: number, rootContextInputId?: string): StepContext {
+  const readOnlyRootInputId = ordinal > 0 && rootContextInputId && !context.consumedInputIds.includes(rootContextInputId) ? rootContextInputId : undefined
+  if (!readOnlyRootInputId) return context
+  return { ...context, blocks: context.blocks.filter(block => {
+    const content = block.content
+    return block.layer !== "pending_input" || content === null || typeof content !== "object" || Array.isArray(content) || content.inputId !== readOnlyRootInputId
+  }) }
 }
 
 export function pendingInputBlocks(input: StoredAgentInput, ownerFence: ContextOwnerFence, scope: TenantScope, createBlock: BlockFactory, attachmentError?: AttachmentError): Promise<ContextBlock[]> {

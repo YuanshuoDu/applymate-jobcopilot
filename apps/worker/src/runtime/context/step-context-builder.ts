@@ -5,7 +5,7 @@ import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction,
 import { appendNewObservedSteeringMarkers, buildObservedSteeringMarker, type SteeringMarkerContext } from "./steering-marker-store.js"
 import type { SteeringMarkerPayload } from "./steering-marker.js"
 import { activeMarkerInputIds, assertHydratedSteeringInputs, mergeSteeringInputs } from "./steering-marker-hydration.js"
-import { checkpointWithInputs, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
+import { checkpointWithInputs, mergeDurableRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -200,13 +200,7 @@ export class StepContextBuilder {
     assertHydratedSteeringInputs(activeIds, hydrated)
     const contextInputs = mergeSteeringInputs(claimed.inputs, hydrated)
     ensureTurnInputs(contextInputs, request)
-    const readRoot = transaction.loadRootInputContext
-    if (request.rootContextInputId && !readRoot) throw new InputClaimStoreError("store_conflict", "Durable root context reader is unavailable")
-    const rootContextInput = request.rootContextInputId
-      ? await readRoot!({ sessionId: request.sessionId, turnId: request.turnId, inputId: request.rootContextInputId, lease: request.lease })
-      : null
-    if (rootContextInput) ensureTurnInputs([rootContextInput], request)
-    const renderInputs = mergeRootContextInput(contextInputs, rootContextInput)
+    const renderInputs = await mergeDurableRootContextInput(contextInputs, transaction, request, input => ensureTurnInputs([input], request))
     const sequences = new Map<bigint, string>()
     for (const input of claimed.inputs) {
       const previous = sequences.get(input.acceptedSequence)
