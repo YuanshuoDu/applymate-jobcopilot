@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS } from "../subagents/steering-reconciliation-contract.js"
 import {
   parseTurnQuestionPlanningReceipt,
   summarizeTurnQuestionPlanningReceipt,
@@ -18,6 +19,10 @@ const valid: TurnQuestionPlanningReceipt = {
     { id: "steer-2", acceptedSequence: "12", status: "accepted", consumedByStepId: null, consumingOrdinal: null },
   ],
   inputCheckpoint: { throughSequence: "12", consumedInputIds: ["original-input", "steer-1"] },
+}
+function pendingSteerSet(count: number) {
+  return Array.from({ length: count }, (_, index) => ({ id: `steer-${index}`, acceptedSequence: String(index + 1),
+    status: "accepted" as const, consumedByStepId: null, consumingOrdinal: null }))
 }
 
 describe("turn question planning clarification contract", () => {
@@ -43,12 +48,16 @@ describe("turn question planning clarification contract", () => {
       pendingSteerCount: 0, unconsumedSteerCount: 0, inputThroughSequence: "0" })
   })
 
-  it("preserves the complete validated pending set without imposing a new count cap", () => {
-    const pendingSteers = Array.from({ length: 129 }, (_, index) => ({ id: `steer-${index}`, acceptedSequence: String(index + 1),
-      status: "accepted" as const, consumedByStepId: null, consumingOrdinal: null }))
+  it("accepts and preserves the ledger maximum pending steer set", () => {
+    const pendingSteers = pendingSteerSet(STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS)
     const parsed = parseTurnQuestionPlanningReceipt({ ...valid, pendingSteers })
-    expect(parsed?.pendingSteers).toHaveLength(129)
-    expect(summarizeTurnQuestionPlanningReceipt(parsed!).pendingSteerCount).toBe(129)
+    expect(parsed).toEqual({ ...valid, pendingSteers })
+    expect(summarizeTurnQuestionPlanningReceipt(parsed!).pendingSteerCount).toBe(STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS)
+  })
+
+  it("rejects pending steers beyond the ledger maximum", () => {
+    expect(parseTurnQuestionPlanningReceipt({ ...valid,
+      pendingSteers: pendingSteerSet(STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS + 1) })).toBeUndefined()
   })
 
   it.each([
