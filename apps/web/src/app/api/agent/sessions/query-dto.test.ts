@@ -105,6 +105,53 @@ describe("agent query DTO redaction", () => {
     expect(dto.content).toEqual({ title: "Resume ready", body: "Bearer [REDACTED]", data: { apiKey: "[REDACTED]", resume: "[REDACTED]", resumeText: "[REDACTED]" } })
   })
 
+  it("projects only a bounded final agent summary beside redacted response text", () => {
+    const row = {
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: { text: "Bearer response-token", final: {
+        summary: "Verified facts. alex@example.test +353 871234567. Bearer summary-token; password=private-value", goal: "PRIVATE_GOAL", blocker: "PRIVATE_BLOCKER",
+        next: "PRIVATE_NEXT", evidenceRefs: ["PRIVATE_EVIDENCE"], usage: { tokens: 9 },
+      } },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    }
+    const dto = itemDto(row)
+    expect(dto.content).toEqual({
+      text: "Bearer [REDACTED]",
+      summary: "Verified facts. [REDACTED_EMAIL] [REDACTED_PHONE]. Bearer [REDACTED]; password=[REDACTED]",
+    })
+    expect(JSON.stringify(dto)).not.toContain("PRIVATE_GOAL")
+    expect(JSON.stringify(dto)).not.toContain("PRIVATE_BLOCKER")
+    expect(JSON.stringify(dto)).not.toContain("PRIVATE_NEXT")
+    expect(JSON.stringify(dto)).not.toContain("PRIVATE_EVIDENCE")
+    expect(JSON.stringify(dto)).not.toContain("alex@example.test")
+    expect(JSON.stringify(dto)).not.toContain("871234567")
+    expect(JSON.stringify(dto)).not.toContain("private-value")
+    expect(JSON.stringify(dto)).not.toContain("tokens\":9")
+  })
+
+  it("omits summary for malformed, oversized, non-final, and non-message items", () => {
+    const base = {
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 1,
+      content: { text: "unchanged response", final: { summary: "Valid summary" } },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    }
+    const invalidRows = [
+      { ...base, phase: "commentary" },
+      { ...base, status: "running" },
+      { ...base, content: { ...base.content, final: { summary: 5 } } },
+      { ...base, content: { ...base.content, final: { summary: "x".repeat(1_001) } } },
+      { ...base, content: { text: "unchanged response", final: null, summary: "PRIVATE_FALLBACK" } },
+      { ...base, type: "tool_call" },
+    ]
+    for (const row of invalidRows) {
+      const dto = itemDto(row)
+      expect(dto.content).not.toHaveProperty("summary")
+      expect(JSON.stringify(dto)).not.toContain("PRIVATE_FALLBACK")
+    }
+  })
+
   it("projects only a strictly validated selected saved-job ID from Turn input", () => {
     const row = {
       id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
