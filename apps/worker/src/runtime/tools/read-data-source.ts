@@ -3,6 +3,8 @@ import type pg from "pg"
 import {
   OUTCOME_GMAIL_KINDS,
   OUTCOME_JOB_STATUSES,
+  OUTCOME_JOB_SOURCES,
+  type OutcomeJobSource,
   type ApplicationOutcomesSummaryResult,
   type ApplicationStateInput,
   type ApplicationStateResult,
@@ -24,7 +26,7 @@ interface TaskRow {
   resumeId: string | null; coverLetterId: string | null; startedAt: Date | string | null; completedAt: Date | string | null; createdAt: Date | string; updatedAt: Date | string
 }
 interface ApprovalRow { id: string; type: string; status: string; title: string; impact: unknown; decidedAt: Date | string | null; createdAt: Date | string }
-interface OutcomeJobRow { id: string; status: string; updatedAt: Date | string }
+interface OutcomeJobRow { id: string; status: string; updatedAt: Date | string; source: string | null }
 interface LinkedGmailKindRow { job_id: string; kind: string }
 
 const OUTCOME_JOB_LIMIT = 100
@@ -32,11 +34,15 @@ const OUTCOME_JOB_QUERY_LIMIT = OUTCOME_JOB_LIMIT + 1
 
 function emptyOutcomesSummary(jobCount: number, truncated: boolean): ApplicationOutcomesSummaryResult {
   return {
-    schemaVersion: 1, advisoryOnly: true,
+    schemaVersion: 2, advisoryOnly: true,
     coverage: { basis: "latest_100_jobs_by_updatedAt", jobCount, truncated },
     jobStatusCounts: { saved: 0, applied: 0, interview: 0, offer: 0, rejected: 0 },
     linkedJobsByGmailKind: { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 0 },
     gmailSemantics: { classification: "heuristic_advisory_only", matchConfidence: "job_linkage_only" },
+    sourceBreakdown: {
+      basis: "same_latest_100_jobs_by_updatedAt", minimumAppliedOrBeyondJobCount: 10,
+      groups: [], suppressedGroupCount: 0, semantics: "descriptive_source_association_only",
+    },
   }
 }
 
@@ -46,6 +52,23 @@ function isOutcomeStatus(value: string): value is keyof ApplicationOutcomesSumma
 
 function isOutcomeGmailKind(value: string): value is keyof ApplicationOutcomesSummaryResult["linkedJobsByGmailKind"] {
   return (OUTCOME_GMAIL_KINDS as readonly string[]).includes(value)
+}
+
+function isOutcomeSource(value: string): value is OutcomeJobSource {
+  return (OUTCOME_JOB_SOURCES as readonly string[]).includes(value)
+}
+
+function outcomeSource(value: string | null): OutcomeJobSource {
+  const normalized = value?.trim().toLowerCase()
+  return normalized && isOutcomeSource(normalized) ? normalized : "other_or_unknown"
+}
+
+function emptyJobStatusCounts(): ApplicationOutcomesSummaryResult["jobStatusCounts"] {
+  return { saved: 0, applied: 0, interview: 0, offer: 0, rejected: 0 }
+}
+
+function emptyLinkedJobCounts(): ApplicationOutcomesSummaryResult["linkedJobsByGmailKind"] {
+  return { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 0 }
 }
 
 function iso(value: Date | string | null): string | null {
@@ -132,15 +155,25 @@ export function createPostgresReadToolDataSource(
 
     async getOutcomesSummary(userId: string): Promise<ApplicationOutcomesSummaryResult> {
       const jobs = await pool.query<OutcomeJobRow>(
-        `SELECT "id", "status", "updatedAt" FROM "Job"
+        `SELECT "id", "status", "updatedAt", "source" FROM "Job"
          WHERE "userId" = $1
          ORDER BY "updatedAt" DESC, "id" DESC LIMIT $2`,
         [userId, OUTCOME_JOB_QUERY_LIMIT],
       )
       const sampledJobs = jobs.rows.slice(0, OUTCOME_JOB_LIMIT)
       const summary = emptyOutcomesSummary(sampledJobs.length, jobs.rows.length > OUTCOME_JOB_LIMIT)
+      const sourceByJobId = new Map<string, OutcomeJobSource>()
+      const groups = new Map<OutcomeJobSource, ApplicationOutcomesSummaryResult["sourceBreakdown"]["groups"][number]>()
       for (const row of sampledJobs) {
         if (isOutcomeStatus(row.status)) summary.jobStatusCounts[row.status] += 1
+        const source = outcomeSource(row.source)
+        sourceByJobId.set(row.id, source)
+        let group = groups.get(source)
+        if (!group) {
+          group = { source, jobStatusCounts: emptyJobStatusCounts(), linkedJobsByGmailKind: emptyLinkedJobCounts() }
+          groups.set(source, group)
+        }
+        if (isOutcomeStatus(row.status)) group.jobStatusCounts[row.status] += 1
       }
       if (sampledJobs.length === 0) return summary
 
@@ -153,11 +186,26 @@ export function createPostgresReadToolDataSource(
       )
       const linkedJobs = new Map<keyof ApplicationOutcomesSummaryResult["linkedJobsByGmailKind"], Set<string>>()
       for (const kind of OUTCOME_GMAIL_KINDS) linkedJobs.set(kind, new Set())
+      const linkedBySource = new Map<OutcomeJobSource, Map<keyof ApplicationOutcomesSummaryResult["linkedJobsByGmailKind"], Set<string>>>()
+      for (const source of groups.keys()) linkedBySource.set(source, new Map(OUTCOME_GMAIL_KINDS.map(kind => [kind, new Set<string>()])))
       for (const row of linked.rows) {
         if (!sampledJobIds.has(row.job_id) || !isOutcomeGmailKind(row.kind)) continue
         linkedJobs.get(row.kind)?.add(row.job_id)
+        const source = sourceByJobId.get(row.job_id)
+        if (source) linkedBySource.get(source)?.get(row.kind)?.add(row.job_id)
       }
       for (const kind of OUTCOME_GMAIL_KINDS) summary.linkedJobsByGmailKind[kind] = linkedJobs.get(kind)?.size ?? 0
+      let suppressedGroupCount = 0
+      summary.sourceBreakdown.groups = [...groups.values()].filter(group => {
+        const appliedOrBeyond = group.jobStatusCounts.applied + group.jobStatusCounts.interview + group.jobStatusCounts.offer + group.jobStatusCounts.rejected
+        if (appliedOrBeyond >= 10) {
+          for (const kind of OUTCOME_GMAIL_KINDS) group.linkedJobsByGmailKind[kind] = linkedBySource.get(group.source)?.get(kind)?.size ?? 0
+          return true
+        }
+        if (appliedOrBeyond > 0) suppressedGroupCount += 1
+        return false
+      }).sort((left, right) => left.source < right.source ? -1 : left.source > right.source ? 1 : 0)
+      summary.sourceBreakdown.suppressedGroupCount = suppressedGroupCount
       return summary
     },
   }

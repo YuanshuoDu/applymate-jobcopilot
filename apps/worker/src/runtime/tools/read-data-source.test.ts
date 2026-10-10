@@ -48,7 +48,7 @@ describe("Postgres read tool data source", () => {
   it("bounds outcome counts to the latest 100 owner jobs and distinct linked job-kind pairs", async () => {
     const statuses = ["saved", "applied", "interview", "offer", "rejected"]
     const jobRows = Array.from({ length: 101 }, (_, index) => ({
-      id: `private-job-id-${index}`, status: statuses[index % statuses.length]!, updatedAt: new Date(2026, 0, 101 - index),
+      id: `private-job-id-${index}`, status: statuses[index % statuses.length]!, updatedAt: new Date(2026, 0, 101 - index), source: index === 100 ? "workday" : " GreenHouse ",
     }))
     const linkedRows = [
       { job_id: "private-job-id-0", kind: "application_received" },
@@ -72,14 +72,19 @@ describe("Postgres read tool data source", () => {
     const result = await dataSource.getOutcomesSummary("owner-a")
 
     expect(result).toEqual({
-      schemaVersion: 1, advisoryOnly: true,
+      schemaVersion: 2, advisoryOnly: true,
       coverage: { basis: "latest_100_jobs_by_updatedAt", jobCount: 100, truncated: true },
       jobStatusCounts: { saved: 20, applied: 20, interview: 20, offer: 20, rejected: 20 },
       linkedJobsByGmailKind: { application_received: 2, interview_invitation: 1, offer: 1, rejection: 1, application_update: 1 },
       gmailSemantics: { classification: "heuristic_advisory_only", matchConfidence: "job_linkage_only" },
+      sourceBreakdown: {
+        basis: "same_latest_100_jobs_by_updatedAt", minimumAppliedOrBeyondJobCount: 10,
+        groups: [{ source: "greenhouse", jobStatusCounts: { saved: 20, applied: 20, interview: 20, offer: 20, rejected: 20 }, linkedJobsByGmailKind: { application_received: 2, interview_invitation: 1, offer: 1, rejection: 1, application_update: 1 } }],
+        suppressedGroupCount: 0, semantics: "descriptive_source_association_only",
+      },
     })
     expect(queries).toHaveLength(2)
-    expect(queries[0]?.sql).toContain('SELECT "id", "status", "updatedAt" FROM "Job"')
+    expect(queries[0]?.sql).toContain('SELECT "id", "status", "updatedAt", "source" FROM "Job"')
     expect(queries[0]?.sql).toContain('WHERE "userId" = $1')
     expect(queries[0]?.sql).toContain('ORDER BY "updatedAt" DESC, "id" DESC LIMIT $2')
     expect(queries[0]?.values).toEqual(["owner-a", 101])
@@ -103,13 +108,59 @@ describe("Postgres read tool data source", () => {
     const result = await createPostgresReadToolDataSource(pool).getOutcomesSummary("owner-empty")
 
     expect(result).toEqual({
-      schemaVersion: 1, advisoryOnly: true,
+      schemaVersion: 2, advisoryOnly: true,
       coverage: { basis: "latest_100_jobs_by_updatedAt", jobCount: 0, truncated: false },
       jobStatusCounts: { saved: 0, applied: 0, interview: 0, offer: 0, rejected: 0 },
       linkedJobsByGmailKind: { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 0 },
       gmailSemantics: { classification: "heuristic_advisory_only", matchConfidence: "job_linkage_only" },
+      sourceBreakdown: { basis: "same_latest_100_jobs_by_updatedAt", minimumAppliedOrBeyondJobCount: 10, groups: [], suppressedGroupCount: 0, semantics: "descriptive_source_association_only" },
     })
     expect(pool.query).toHaveBeenCalledTimes(1)
     expect(pool.query).toHaveBeenCalledWith(expect.stringContaining('WHERE "userId" = $1'), ["owner-empty", 101])
+  })
+
+  it("normalizes sources, suppresses groups below ten applied-or-beyond jobs, and counts distinct linked jobs per kind", async () => {
+    const advanced = ["applied", "interview", "offer", "rejected"]
+    const jobRows = Array.from({ length: 101 }, (_, index) => {
+      const source = index < 10 ? "  LINKEDIN " : index < 20 ? " Greenhouse " : index < 29 ? "lever" : index === 29 ? "Vendor A" : index === 30 ? null : index === 31 ? "" : index < 39 ? "unlisted-source" : index === 39 ? "ats" : index < 100 ? "linkedin" : "workday"
+      const status = index < 10 ? advanced[index % advanced.length]! : index < 20 ? advanced[(index - 10) % advanced.length]! : index >= 20 && index < 39 ? "applied" : index === 100 ? "offer" : "saved"
+      return { id: `private-job-${index}`, status, updatedAt: new Date(2026, 0, 101 - index), source }
+    })
+    const linkedRows = [
+      { job_id: "private-job-0", kind: "application_received" },
+      { job_id: "private-job-0", kind: "application_received" },
+      { job_id: "private-job-1", kind: "application_received" },
+      { job_id: "private-job-0", kind: "interview_invitation" },
+      { job_id: "private-job-10", kind: "application_received" },
+      { job_id: "private-job-10", kind: "offer" },
+      { job_id: "private-job-20", kind: "rejection" },
+      { job_id: "private-job-29", kind: "application_update" },
+      { job_id: "private-job-30", kind: "application_update" },
+      { job_id: "private-job-100", kind: "offer" },
+    ]
+    const queries: Array<{ sql: string; values: readonly unknown[] }> = []
+    const pool = { query: vi.fn(async (sql: unknown, values: readonly unknown[] = []) => {
+      const text = String(sql)
+      queries.push({ sql: text, values })
+      return { rows: text.includes('FROM "Job"') ? jobRows : linkedRows }
+    }) } as unknown as pg.Pool
+    const result = await createPostgresReadToolDataSource(pool).getOutcomesSummary("owner-a")
+
+    expect(result.sourceBreakdown).toEqual({
+      basis: "same_latest_100_jobs_by_updatedAt", minimumAppliedOrBeyondJobCount: 10,
+      groups: [
+        { source: "greenhouse", jobStatusCounts: { saved: 0, applied: 3, interview: 3, offer: 2, rejected: 2 }, linkedJobsByGmailKind: { application_received: 1, interview_invitation: 0, offer: 1, rejection: 0, application_update: 0 } },
+        { source: "linkedin", jobStatusCounts: { saved: 60, applied: 3, interview: 3, offer: 2, rejected: 2 }, linkedJobsByGmailKind: { application_received: 2, interview_invitation: 1, offer: 0, rejection: 0, application_update: 0 } },
+        { source: "other_or_unknown", jobStatusCounts: { saved: 0, applied: 10, interview: 0, offer: 0, rejected: 0 }, linkedJobsByGmailKind: { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 2 } },
+      ],
+      suppressedGroupCount: 1, semantics: "descriptive_source_association_only",
+    })
+    expect(result.coverage).toEqual({ basis: "latest_100_jobs_by_updatedAt", jobCount: 100, truncated: true })
+    expect(result.linkedJobsByGmailKind).toEqual({ application_received: 3, interview_invitation: 1, offer: 1, rejection: 1, application_update: 2 })
+    expect(queries).toHaveLength(2)
+    expect(queries[0]?.values).toEqual(["owner-a", 101])
+    expect(queries[1]?.values).toEqual(["owner-a", jobRows.slice(0, 100).map(row => row.id), ["application_received", "interview_invitation", "offer", "rejection", "application_update"]])
+    const encoded = JSON.stringify(result)
+    for (const privateValue of ["private-job-", "Vendor A", "unlisted-source", "LINKEDIN", "Greenhouse", "lever", "workday", "owner-a", "2026-"]) expect(encoded).not.toContain(privateValue)
   })
 })

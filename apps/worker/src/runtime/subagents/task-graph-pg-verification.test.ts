@@ -200,11 +200,12 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     data.items[1]!.content = {
       toolCallId: "call-1",
       output: {
-        schemaVersion: 1, advisoryOnly: true,
+        schemaVersion: 2, advisoryOnly: true,
         coverage: { basis: "latest_100_jobs_by_updatedAt", jobCount: 1, truncated: false },
         jobStatusCounts: { saved: 1, applied: 0, interview: 0, offer: 0, rejected: 0 },
         linkedJobsByGmailKind: { application_received: 0, interview_invitation: 0, offer: 0, rejection: 0, application_update: 0 },
         gmailSemantics: { classification: "heuristic_advisory_only", matchConfidence: "job_linkage_only" },
+        sourceBreakdown: { basis: "same_latest_100_jobs_by_updatedAt", minimumAppliedOrBeyondJobCount: 10, groups: [], suppressedGroupCount: 0, semantics: "descriptive_source_association_only" },
       },
       errorCode: null,
     }
