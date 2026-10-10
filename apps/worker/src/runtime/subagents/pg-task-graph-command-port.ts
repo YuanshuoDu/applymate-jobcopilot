@@ -65,6 +65,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
       return transaction(pool, client => readCurrentWithClient(client, scope))
     },
+    async readCurrentForPlanning(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
+      return transaction(pool, client => readCurrentForPlanningWithClient(client, scope))
+    },
     async readCurrentResultPage(scope, request) {
       return transaction(pool, client => readCurrentResultPageWithClient(client, scope, request))
     },
@@ -104,7 +107,19 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
 }
 
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
-  const loaded = await loadCurrentWithClient(client, scope, true)
+  return readCurrentStateWithClient(client, scope, false)
+}
+
+async function readCurrentForPlanningWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
+  return readCurrentStateWithClient(client, scope, true)
+}
+
+async function readCurrentStateWithClient(
+  client: Pick<PoolClient, "query">,
+  scope: TaskGraphReadScope,
+  includeSourceInputRelations: boolean,
+): Promise<TaskGraphCurrentState> {
+  const loaded = await loadCurrentWithClient(client, scope, includeSourceInputRelations)
   const current = currentTaskGraph(loaded)
   const planningFacts = buildTaskGraphPlanningFacts(loaded)
   if (!planningFacts) return current

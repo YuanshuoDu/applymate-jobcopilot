@@ -139,7 +139,8 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.find(call => call.sql.startsWith("SELECT set_config"))?.values).toEqual([input.scope.userId])
     expect(fake.calls.some(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toBe(true)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(true)
-    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(0)
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT event."type"'))).toHaveLength(1)
   })
 
   it("derives counts from the same owner-scoped LoadedGraph without another SELECT", async () => {
@@ -214,7 +215,27 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(taskRead[0]?.values).toEqual([nodes.map(([key]) => key), input.scope.sessionId, input.scope.turnId,
       input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId])
     expect(eventRead).toHaveLength(1)
-    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(0)
+  })
+
+  it("keeps generic reads provenance-free and exposes source relations only to planner reads", async () => {
+    const input = scheduleInput()
+    const { stepId: _stepId, ...scope } = input.scope
+    const genericFake = fakePool(input, { includeReplay: false })
+    const plannerFake = fakePool(input, { includeReplay: false })
+    const port = createPgTaskGraphCommandPort(genericFake.pool)
+    const plannerPort = createPgTaskGraphCommandPort(plannerFake.pool)
+
+    const generic = await port.readCurrent(scope)
+    const planner = await plannerPort.readCurrentForPlanning!(scope)
+
+    expect(generic.nodes[0]).not.toHaveProperty("inputRelation")
+    expect(genericFake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(0)
+    expect(planner.nodes[0]).toHaveProperty("inputRelation", "unknown")
+    expect(plannerFake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(1)
+    expect(plannerFake.calls.some(call => call.sql === "BEGIN")).toBe(true)
+    expect(plannerFake.calls.at(-1)?.sql).toBe("COMMIT")
+    expect(plannerFake.calls.filter(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toHaveLength(1)
   })
 
   it("reads one current typed result page under the existing owner fence and one graph load", async () => {

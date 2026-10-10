@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
@@ -207,8 +207,11 @@ describe("TaskGraph turn observation", () => {
       ...state,
       nodes: [{ ...state.nodes[0]!, resultSummary: "Alice Example summary must stay hidden" }],
     }
+    const readCurrent = vi.fn(async () => persistedState)
+    const readCurrentForPlanning = vi.fn(async () => persistedState)
     const port: TaskGraphCommandPort = {
-      readCurrent: async () => persistedState,
+      readCurrent,
+      readCurrentForPlanning,
       appendAndSchedule: async () => { throw new Error("unused") },
     }
     const lease: TurnLease = {
@@ -230,6 +233,8 @@ describe("TaskGraph turn observation", () => {
     })
     expect(JSON.stringify(observation)).not.toContain("Alice Example")
     expect(JSON.stringify(observation)).not.toContain("private.example")
+    expect(readCurrentForPlanning).toHaveBeenCalledOnce()
+    expect(readCurrent).not.toHaveBeenCalled()
   })
 
   it("replaces unsafe result projections with an untrusted unavailable marker", () => {

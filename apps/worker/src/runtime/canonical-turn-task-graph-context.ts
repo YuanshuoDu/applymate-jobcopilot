@@ -109,5 +109,8 @@ export async function loadTaskGraphCurrentObservation(
     userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: root.id, parentTaskId: root.id,
     turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: root.attemptCount,
   }
-  return mergeTaskGraphCurrentObservation(snapshot, await commandPort.readCurrent(scope))
+  const state = commandPort.readCurrentForPlanning
+    ? await commandPort.readCurrentForPlanning(scope)
+    : await commandPort.readCurrent(scope)
+  return mergeTaskGraphCurrentObservation(snapshot, state)
 }

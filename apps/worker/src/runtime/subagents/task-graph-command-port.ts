@@ -199,6 +199,8 @@ export type TaskGraphCommandPort = Readonly<{
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */
   appendNativeCoordination?(input: TaskGraphNativeCommandInput): Promise<TaskGraphNativeCommandReceipt>
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
+  /** Reads advisory source-intent context for Root planning refreshes only. */
+  readCurrentForPlanning?(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads current graph state using a caller-owned transaction and client. */
   readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads one bounded advisory page from the current owner-fenced graph. */
