@@ -7,7 +7,9 @@ export const TASK_GRAPH_RESULT_PAGE_SCHEMA = "agent-harness.v2.task-graph.result
 export const TASK_GRAPH_RESULT_PAGE_SIZE = 3
 export const TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT = 256 * 1024
 const MAX_GRAPH_REVISION = 2_147_483_646
-const CanonicalJobId = Type.String({ pattern: "^(?:c[a-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$" })
+const CANONICAL_JOB_ID_PATTERN = "^(?:c[a-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?![\\s\\S])"
+const CANONICAL_JOB_ID = new RegExp(CANONICAL_JOB_ID_PATTERN)
+const CanonicalJobId = Type.String({ pattern: CANONICAL_JOB_ID_PATTERN })
 const EvidenceKind = Type.Union([Type.Literal("job"), Type.Literal("persona"), Type.Literal("resume"), Type.Literal("source")])
 const AtsSource = Type.Union([
   Type.Literal("greenhouse"), Type.Literal("lever"), Type.Literal("workday"),
@@ -54,7 +56,7 @@ export type TaskGraphResultPage = TaskGraphResultPageAvailable | TaskGraphResult
 export const TaskGraphResultPageSchema = Type.Union([AvailableScout, AvailableAnalyst, Unavailable])
 
 export function isCanonicalTaskGraphJobId(value: unknown): value is string {
-  return typeof value === "string" && /^(?:c[a-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.test(value)
+  return typeof value === "string" && CANONICAL_JOB_ID.test(value)
 }
 
 export function parseTaskGraphResultPageRequest(value: unknown): TaskGraphResultPageRequest | null {

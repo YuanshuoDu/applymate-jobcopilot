@@ -29,6 +29,16 @@ describe("TaskGraph result page contract", () => {
     expect(isCanonicalTaskGraphJobId(UUID.toUpperCase())).toBe(false)
     expect(isCanonicalTaskGraphJobId("00000000-0000-1000-8000-000000000000")).toBe(false)
     expect(isCanonicalTaskGraphJobId("job-123")).toBe(false)
+
+    const page = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 1,
+      role: "scout", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
+      offset: 0, nextOffset: null, items: [{ jobId: CUID, source: "other", evidenceKinds: ["job"] }],
+    }
+    for (const invalidJobId of [`${CUID}\n`, `${UUID}\r\n`, `${CUID}x`]) {
+      expect(isCanonicalTaskGraphJobId(invalidJobId)).toBe(false)
+      expect(parseTaskGraphResultPage({ ...page, items: [{ ...page.items[0]!, jobId: invalidJobId }] })).toBeNull()
+    }
   })
 
   it("reconstructs an exact public envelope and rejects altered or hostile output", () => {
