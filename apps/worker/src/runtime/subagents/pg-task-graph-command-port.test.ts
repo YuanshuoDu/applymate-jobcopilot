@@ -139,6 +139,7 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.find(call => call.sql.startsWith("SELECT set_config"))?.values).toEqual([input.scope.userId])
     expect(fake.calls.some(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toBe(true)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(true)
+    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(1)
   })
 
   it("derives counts from the same owner-scoped LoadedGraph without another SELECT", async () => {
@@ -213,6 +214,7 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(taskRead[0]?.values).toEqual([nodes.map(([key]) => key), input.scope.sessionId, input.scope.turnId,
       input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId])
     expect(eventRead).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(1)
   })
 
   it("reads one current typed result page under the existing owner fence and one graph load", async () => {
@@ -247,6 +249,7 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
     expect(fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))).toHaveLength(1)
     expect(fake.calls.filter(call => call.sql.startsWith('SELECT event."type"'))).toHaveLength(1)
+    expect(fake.calls.some(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toBe(false)
     expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
     expect(JSON.stringify(fake.calls.map(call => call.values))).not.toContain("PRIVATE_FINAL_TEXT")
   })
@@ -435,6 +438,7 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(reconciliationMocks.prepare.mock.invocationCallOrder[0]).toBeLessThan(reconciliationMocks.create.mock.invocationCallOrder[0] ?? 0)
     expect(reconciliationMocks.create.mock.invocationCallOrder[0]).toBeLessThan(reconciliationMocks.writePlan.mock.invocationCallOrder[0] ?? 0)
     expect(reconciliationMocks.writePlan.mock.invocationCallOrder[0]).toBeLessThan(reconciliationMocks.write.mock.invocationCallOrder[0] ?? 0)
+    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toHaveLength(1)
     expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
     expect(fake.client.release).toHaveBeenCalledOnce()
   })

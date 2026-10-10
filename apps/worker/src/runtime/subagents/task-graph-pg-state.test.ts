@@ -136,10 +136,13 @@ function fakeClient(options: ClientOptions = {}) {
 describe("TaskGraph PostgreSQL state loading", () => {
   it("restores a typed contract from persisted canonical content across a Worker restart", async () => {
     const persisted = canonicalTaskGraphJson(typedSnapshot())
-    const firstWorker = await loadTaskGraph(fakeClient({ itemContent: persisted }).client, identity)
+    const first = fakeClient({ itemContent: persisted })
+    const firstWorker = await loadTaskGraph(first.client, identity)
 
     expect(firstWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "typed", verification: analystVerification })
     expect(firstWorker.state?.nodes[0]?.verification).toEqual(analystVerification)
+    expect(first.calls.some(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toBe(false)
+    expect(currentTaskGraph(firstWorker).nodes[0]).not.toHaveProperty("inputRelation")
     const rewritten = taskGraphSnapshot(firstWorker.state!, new Map([["child", "child-1"]]))
     const restartedWorker = await loadTaskGraph(fakeClient({ itemContent: canonicalTaskGraphJson(rewritten) }).client, identity)
     expect(restartedWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "typed", verification: analystVerification })
@@ -195,11 +198,12 @@ describe("TaskGraph PostgreSQL state loading", () => {
           rootTaskId: identity.rootTaskId, userId: identity.userId, inputThroughSequence: "2", consumedInputIds: ["input-before", "input-after"], isCurrent: true },
       ],
     })
-    const graph = await loadTaskGraph(fake.client, { ...identity, stepId: "current-step" })
+    const graph = await loadTaskGraph(fake.client, { ...identity, stepId: "current-step" }, true, true)
     const node = currentTaskGraph(graph).nodes[0]!
     const provenanceReads = fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))
 
     expect(node).toMatchObject({ status: "queued", readiness: "ready", inputRelation: "predates_current_inputs" })
+    expect(node).toHaveProperty("inputRelation", "predates_current_inputs")
     expect(provenanceReads).toHaveLength(1)
     expect(provenanceReads[0]?.values).toEqual([ ["cause-step"], "current-step", "root-1", "session-1", "turn-1", "root-1", "user-1" ])
   })

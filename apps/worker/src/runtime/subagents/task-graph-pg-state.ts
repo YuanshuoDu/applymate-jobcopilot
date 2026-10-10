@@ -93,7 +93,7 @@ export async function lockTaskGraphScope(client: Queryable, scope: GraphScope, r
   if (leaseState.parentLeaseValid !== true) throw new Error("task_graph_parent_fenced")
   return parent.rows[0] as GraphParent
 }
-export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope & Readonly<{ stepId?: string }>, forUpdate = true): Promise<LoadedGraph> {
+export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope & Readonly<{ stepId?: string }>, forUpdate = true, includeSourceInputRelations = false): Promise<LoadedGraph> {
   const item = await client.query(`SELECT item."id", item."revision", item."content", item."createdAt"
     FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
@@ -134,7 +134,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
     if (event) appliedEvents.push(event)
     else if (parseObject(row.payload)?.kind === "proposal") proposalSources.push({ payload: row.payload, causationId: row.causationId })
   }
-  const sourceInputRelations = await loadTaskGraphSourceInputRelations(client, scope, snapshot, proposalSources, scope.stepId)
+  const sourceInputRelations = includeSourceInputRelations ? await loadTaskGraphSourceInputRelations(client, scope, snapshot, proposalSources, scope.stepId) : undefined
   const baseState = taskGraphState(snapshot, revision, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), appliedEvents)
   const repairs = resolveTaskGraphRepairDependencies(snapshot, tasks, scope.rootTaskId)
   const state = { ...baseState, repairSatisfiedNodeKeys: repairs.satisfied, repairPendingNodeKeys: repairs.pending }
@@ -206,7 +206,7 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
       dependsOn: node.dependsOn, taskId: stored.taskId,
       status: task.status, readiness: node.readiness, resultSummary: resultSummary(task.result),
-      inputRelation: loaded.sourceInputRelations?.get(stored.key) ?? "unknown",
+      ...(loaded.sourceInputRelations ? { inputRelation: loaded.sourceInputRelations.get(stored.key) ?? "unknown" } : {}),
       resultProjection,
       ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
       ...(verificationReport ? { verificationReport } : {}),

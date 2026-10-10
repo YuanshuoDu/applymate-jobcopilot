@@ -82,7 +82,7 @@ function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: Steeri
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
-  const loaded = await loadTaskGraph(client, input.scope)
+  const loaded = await loadTaskGraph(client, input.scope, true, true)
   const current = loaded.state, revision = current?.revision ?? 0
   const key = taskGraphProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
   const fingerprint = taskGraphFingerprint(input.proposal)
@@ -104,7 +104,7 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
 }
 
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
-  const loaded = await loadCurrentWithClient(client, scope)
+  const loaded = await loadCurrentWithClient(client, scope, true)
   const current = currentTaskGraph(loaded)
   const planningFacts = buildTaskGraphPlanningFacts(loaded)
   if (!planningFacts) return current
@@ -119,10 +119,10 @@ async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">
   return projectTaskGraphResultPage(loaded, request)
 }
 
-async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {
+async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, includeSourceInputRelations = false) {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   await lockTaskGraphScope(client, scope)
-  const loaded = await loadTaskGraph(client, scope, false)
+  const loaded = await loadTaskGraph(client, scope, false, includeSourceInputRelations)
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }
