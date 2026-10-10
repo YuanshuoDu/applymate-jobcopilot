@@ -111,6 +111,26 @@ describe("TaskGraph current result pages", () => {
       { nodeKey: "scout-1", expectedRevision: 7, offset: 0 })).toMatchObject({ availability: "unavailable", reason: "node_unavailable" })
   })
 
+  it("does not page a result node absent from current graph membership", () => {
+    const graph = loaded([registered("scout", "scout-1")])
+    const withoutCurrentNode: LoadedGraph = { ...graph, state: { ...graph.state!, nodes: [] } }
+    const page = projectTaskGraphResultPage(withoutCurrentNode, { nodeKey: "scout-1", expectedRevision: 7, offset: 0 })
+
+    expect(page).toMatchObject({ availability: "unavailable", graphRevision: 7, reason: "node_unavailable" })
+    expect(page).not.toHaveProperty("items")
+  })
+
+  it("does not page results whose expected output schema marker mismatches the role", () => {
+    const graph = loaded([registered("scout", "scout-1")])
+    const task = graph.tasks.get("task-scout-1")!
+    const tasks = new Map(graph.tasks)
+    tasks.set(task.id, { ...task, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" } })
+    const page = projectTaskGraphResultPage({ ...graph, tasks }, { nodeKey: "scout-1", expectedRevision: 7, offset: 0 })
+
+    expect(page).toMatchObject({ availability: "unavailable", graphRevision: 7, reason: "node_unavailable" })
+    expect(page).not.toHaveProperty("items")
+  })
+
   it("accepts current native Scout nodes only with root caller and matching persisted role metadata", () => {
     const native = { ...registered("scout", "native-scout", { templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, taskType: "server_admitted_discovery" }) }
     expect(projectTaskGraphResultPage(loaded([native]), { nodeKey: native.key, expectedRevision: 7, offset: 0 }))
