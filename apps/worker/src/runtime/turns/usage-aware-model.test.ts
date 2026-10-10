@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { estimateSharedAiCost } from "@jobcopilot/shared"
 import { createHarnessModelRuntime, type HarnessFetch } from "../harness-model.js"
 
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
@@ -57,6 +58,29 @@ function setRouteContextWindow(runtime: ReturnType<typeof createHarnessModelRunt
 
 function oversizedRequest(): HarnessModelRequest {
   return { ...request, maxOutputTokens: 64, messages: [{ role: "user", content: [{ type: "text", text: "x".repeat(9000) }] }] }
+}
+
+function failedMinimaxStreamResponse(): Response {
+  const data = JSON.stringify({
+    choices: [{ delta: {
+      content: "Primary partial text",
+      tool_calls: [{ index: 0, id: "primary-call", type: "function", function: { name: "jobs.search", arguments: '{"query":"hidden"}' } }],
+    } }],
+    usage: { prompt_tokens: 29, completion_tokens: 31 },
+  })
+  let emitted = false
+  return new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!emitted) {
+        emitted = true
+        controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`))
+      } else controller.error(new Error("provider stream interrupted"))
+    },
+  }), { headers: { "Content-Type": "text/event-stream" } })
+}
+
+function expectedCost(provider: string, model: string, inputTokens: number, outputTokens: number): number {
+  return estimateSharedAiCost({ provider, model, credentialSource: "user", inputTokens, outputTokens, latencyMs: 0, status: "success" })
 }
 
 function harnessRuntime(fetcher: HarnessFetch, contexts: readonly [number, number?], onRequestAdmission?: () => void) {
@@ -202,10 +226,59 @@ describe("usage-aware model owner seam", () => {
     expect(authorize.mock.calls.map(([input]) => `${input.provider}/${input.model}`)).toEqual([
       "minimax/MiniMax-M3", "anthropic/claude-sonnet-5",
     ])
-    expect(settled.get("minimax")).toHaveBeenCalledWith(expect.objectContaining({ status: "error", errorCode: "provider_rerouted" }))
-    expect(settled.get("anthropic")).toHaveBeenCalledWith(expect.objectContaining({ status: "error" }))
+    expect(settled.get("minimax")).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_rerouted" })
+    expect(settled.get("anthropic")).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_error" })
     expect([...released.values()].every(release => !release.mock.calls.length)).toBe(true)
     expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fixture.statuses).toEqual(["consumed"])
+  })
+
+  it("settles failed-route usage before fallback and attributes success only to the fallback", async () => {
+    const order: string[] = [], fixture = store()
+    const settled = new Map<string, ReturnType<typeof vi.fn>>(), released = new Map<string, ReturnType<typeof vi.fn>>()
+    const fetcher: HarnessFetch = vi.fn(async url => {
+      const provider = url.includes("anthropic") ? "anthropic" : "minimax"
+      order.push(`fetch:${provider}`)
+      if (provider === "minimax") return failedMinimaxStreamResponse()
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3}}}',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Fitting fallback"}}',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}',
+        'event: message_stop\ndata: {"type":"message_stop"}',
+      ].join("\n\n"), { headers: { "Content-Type": "text/event-stream" } })
+    })
+    const modelRuntime = harnessRuntime(fetcher, [5000, 5000])
+    const authorize = vi.fn(async input => {
+      order.push(`authorize:${input.provider}`)
+      const settle = vi.fn(async () => { order.push(`settle:${input.provider}`) })
+      const release = vi.fn()
+      settled.set(input.provider, settle); released.set(input.provider, release)
+      return { settle, release }
+    })
+    const model = createUsageAwareModelAdapter(spreadPrivateOutputAdapter(modelRuntime.adapter), { owner, authorize, treeBudget: fixture.store })
+    const events: ModelStreamEvent[] = []
+    for await (const event of model.stream(request)) events.push(event)
+
+    const minimaxCost = expectedCost("minimax", "MiniMax-M3", 29, 31)
+    const anthropicCost = expectedCost("anthropic", "claude-sonnet-5", 3, 4)
+    expect(events).toContainEqual({ type: "text_delta", text: "Fitting fallback" })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "text_delta", text: "Primary partial text" }))
+    expect(events.some(event => event.type.startsWith("tool_") && "callId" in event && event.callId === "primary-call")).toBe(false)
+    expect(order).toEqual([
+      "authorize:minimax", "fetch:minimax", "settle:minimax",
+      "authorize:anthropic", "fetch:anthropic", "settle:anthropic",
+    ])
+    expect(settled.get("minimax")).toHaveBeenCalledOnce()
+    expect(settled.get("minimax")).toHaveBeenCalledWith({
+      status: "error", inputTokens: 29, outputTokens: 31, estimatedCostUsd: minimaxCost, errorCode: "provider_rerouted",
+    })
+    expect(settled.get("anthropic")).toHaveBeenCalledOnce()
+    expect(settled.get("anthropic")).toHaveBeenCalledWith({
+      status: "success", inputTokens: 3, outputTokens: 4, estimatedCostUsd: anthropicCost,
+    })
+    expect(minimaxCost).not.toBe(anthropicCost)
+    expect([...released.values()].every(release => !release.mock.calls.length)).toBe(true)
     expect(fixture.statuses).toEqual(["consumed"])
   })
 
