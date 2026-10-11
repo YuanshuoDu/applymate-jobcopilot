@@ -2,6 +2,8 @@ import type pg from "pg"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { TurnEngineOptions } from "./turns/turn-engine-types.js"
 import type { TurnLease } from "./turns/lease.js"
+import { executionOwnerFence, type ExecutionOwnerFence } from "./execution-owner.js"
+import { readCurrentRootBudget, type CurrentRootBudgetObservation } from "./turns/turn-engine-root-budget.js"
 import type { InputClaimStore } from "./context/input-claim-store.js"
 import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
 import type { HydrationScope } from "./context/steering-reconciliation-context.js"
@@ -36,7 +38,15 @@ type Input = Readonly<{
   /** Explicit adapter for callers that still supply compaction-captured records. Production uses the direct source reader. */
   selectedJobHistoryReader?: SelectedJobHistoryReader
   rootTaskHistoryDirectReader?: DirectRootTaskHistoryReader
+  currentRootBudgetReader?: (owner: ExecutionOwnerFence) => Promise<CurrentRootBudgetObservation>
 }>
+
+const CURRENT_BUDGET_OBSERVATION_ID = "turn-budget-current"
+
+function isCurrentBudgetObservation(value: unknown): boolean {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+    && (value as { kind?: unknown }).kind === "turn_budget_current"
+}
 
 export function canonicalSteeringHydrationScope(input: Pick<Input, "planningEnabled" | "scope" | "lease" | "rootTaskId" | "rootAttemptCount" | "rootInputId">): HydrationScope | undefined {
   if (!input.planningEnabled) return undefined
@@ -83,6 +93,23 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
         snapshot, reader: rootTaskHistoryReader,
         request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date() },
       })
+      if (input.planningEnabled) {
+        const owner = executionOwnerFence({ kind: "turn", taskId: input.rootTaskId, lease: input.lease })
+        const budget = input.currentRootBudgetReader
+          ? await input.currentRootBudgetReader(owner)
+          : await (async () => {
+            const client = await input.pool.connect()
+            if (!client || typeof client.query !== "function" || typeof client.release !== "function") return {
+              kind: "turn_budget_current" as const, status: "unavailable" as const, advisoryOnly: true as const,
+              pointInTime: true as const, notPermission: true as const, notReservation: true as const, notCompletionEvidence: true as const,
+            }
+            try { return await readCurrentRootBudget(client, owner) } finally { client.release() }
+          })()
+        snapshot = { ...snapshot, toolObservations: [
+          ...snapshot.toolObservations.filter(observation => observation.id !== CURRENT_BUDGET_OBSERVATION_ID && !isCurrentBudgetObservation(observation.content)),
+          { id: CURRENT_BUDGET_OBSERVATION_ID, content: budget },
+        ] }
+      }
       return base.build({ ...request, snapshot, taskId: input.rootTaskId })
     },
   }
