@@ -630,6 +630,110 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
     vi.doUnmock("../redis.js")
   })
 
+  it("defers a saturated same-session job without an attempt, then skips a cancelled redelivery", async () => {
+    const ids = { sessionId: "capacity-session-" + randomUUID(), turnId: "capacity-turn-" + randomUUID(), userId: "capacity-user-" + randomUUID() }
+    const { AgentTreeManager } = await import("../runtime/subagents/manager.js")
+    const { createSubagentQueue, dispatchPendingSubagentOutbox, persistSubagentDispatch, subagentJobId } = await import("./subagent-queue.js")
+    const { store, tasks } = createTaskStore()
+    const manager = new AgentTreeManager(store, { heartbeatMs: 60_000 })
+    const queueExecutions: string[] = []
+    const runtime = createSubagentQueue({ manager, execute: async ({ lease }) => {
+      queueExecutions.push(lease.id)
+      return { status: "completed", result: { taskId: lease.id } }
+    } })
+    const heldRuns: Array<Promise<unknown>> = []
+    let releaseFirst: (() => void) | undefined
+    let releaseSecond: (() => void) | undefined
+    async function createRootAndChildren(suffix: string) {
+      const root = await manager.spawn({ ...ids, role: "planner", taskType: "root", goal: suffix + " root", policy: { maxConcurrency: 4, maxDepth: 8, maxFanOut: 8, maxAttempts: 3 } })
+      root.status = "running"
+      const child = (goal: string) => manager.spawn({ ...ids, parentTaskId: root.id, role: "analyst", taskType: "research", goal })
+      return { root, child }
+    }
+    function holdFour(children: SubagentTaskRecord[]) {
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const runs = children.map(task => manager.run({ taskId: task.id, sessionId: ids.sessionId, rootTaskId: task.rootTaskId, ownerId: "holder-" + task.id }, async () => {
+        await gate
+        return { status: "completed" as const }
+      }))
+      heldRuns.push(...runs)
+      return { release, runs }
+    }
+    async function waitForDelayedJob(id: string): Promise<Job<SubagentJobPayload>> {
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline) {
+        const job = await observerQueue!.getJob(id)
+        if (job) {
+          const state = await job.getState()
+          if (state === "delayed") return job
+          if (state === "failed") throw new Error("Subagent job " + id + " failed before deferral")
+        }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      throw new Error("Timed out waiting for subagent job " + id + " to defer")
+    }
+    try {
+      await runtime.worker.waitUntilReady()
+      const first = await createRootAndChildren("first")
+      const firstHolders = await Promise.all(Array.from({ length: 4 }, (_, index) => first.child("holder " + index)))
+      const firstTarget = await first.child("first target")
+      const firstPayload: SubagentJobPayload = { taskId: firstTarget.id, sessionId: ids.sessionId, rootTaskId: first.root.id, ownerId: "first-dispatch" }
+      const firstSql = createSqlFixture({ tasks, rootTaskId: first.root.id, childTaskId: firstTarget.id, ...ids })
+      const firstHold = holdFour(firstHolders)
+      releaseFirst = firstHold.release
+      await waitFor(() => manager.activeCount(ids.sessionId) === 4)
+      await persistSubagentDispatch(firstSql.pool as never, firstPayload)
+      await expect(dispatchPendingSubagentOutbox(firstSql.pool as never, runtime.queue)).resolves.toBe(1)
+      const firstJobId = subagentJobId(firstTarget.id)
+      const firstDelayed = await waitForDelayedJob(firstJobId)
+      expect(firstDelayed.id).toBe(firstJobId)
+      expect(firstDelayed.data).toEqual(firstPayload)
+      expect(firstDelayed.attemptsMade).toBe(0)
+      expect(firstTarget.attemptCount).toBe(0)
+      expect(firstSql.outbox[0]).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1, payload: firstPayload })
+
+      releaseFirst()
+      await Promise.all(firstHold.runs)
+      const firstCompleted = await waitForCompletedJob(observerQueue!, firstJobId)
+      expect(firstCompleted.id).toBe(firstJobId)
+      expect(firstCompleted.data).toEqual(firstPayload)
+      expect(firstTarget).toMatchObject({ status: "completed", attemptCount: 1 })
+      expect(queueExecutions).toEqual([firstTarget.id])
+      expect(firstSql.outbox[0]).toMatchObject({ attemptCount: 1, payload: firstPayload })
+
+      const second = await createRootAndChildren("cancelled")
+      const secondHolders = await Promise.all(Array.from({ length: 4 }, (_, index) => second.child("holder " + index)))
+      const cancelledTarget = await second.child("cancel before redelivery")
+      const cancelledPayload: SubagentJobPayload = { taskId: cancelledTarget.id, sessionId: ids.sessionId, rootTaskId: second.root.id, ownerId: "cancelled-dispatch" }
+      const secondSql = createSqlFixture({ tasks, rootTaskId: second.root.id, childTaskId: cancelledTarget.id, ...ids })
+      const secondHold = holdFour(secondHolders)
+      releaseSecond = secondHold.release
+      await waitFor(() => manager.activeCount(ids.sessionId) === 4)
+      await persistSubagentDispatch(secondSql.pool as never, cancelledPayload)
+      await expect(dispatchPendingSubagentOutbox(secondSql.pool as never, runtime.queue)).resolves.toBe(1)
+      const cancelledJobId = subagentJobId(cancelledTarget.id)
+      const cancelledDelayed = await waitForDelayedJob(cancelledJobId)
+      expect(cancelledDelayed.attemptsMade).toBe(0)
+      expect(cancelledDelayed.data).toEqual(cancelledPayload)
+      cancelledTarget.status = "cancelled"
+
+      releaseSecond()
+      await Promise.all(secondHold.runs)
+      const cancelledCompleted = await waitForCompletedJob(observerQueue!, cancelledJobId)
+      expect(cancelledCompleted.id).toBe(cancelledJobId)
+      expect(cancelledCompleted.data).toEqual(cancelledPayload)
+      expect(cancelledTarget).toMatchObject({ status: "cancelled", attemptCount: 0 })
+      expect(queueExecutions).toEqual([firstTarget.id])
+      expect(secondSql.outbox[0]).toMatchObject({ attemptCount: 1, payload: cancelledPayload })
+    } finally {
+      releaseFirst?.()
+      releaseSecond?.()
+      await Promise.allSettled(heldRuns)
+      await runtime.close().catch(() => undefined)
+      await manager.shutdown().catch(() => undefined)
+    }
+  }, 35_000)
   it("dispatches and consumes a child through production bootstrap, then wakes its durable parent wait", async () => {
     const ids = { sessionId: `redis-session-${randomUUID()}`, turnId: `redis-turn-${randomUUID()}`, userId: `redis-user-${randomUUID()}` }
     const { AgentTreeManager } = await import("../runtime/subagents/manager.js")
