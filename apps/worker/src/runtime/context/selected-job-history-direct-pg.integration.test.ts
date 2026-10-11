@@ -202,7 +202,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
       leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }
     await insertUser(userId)
     await insertUser(otherUserId)
-    await insertSession(sessionId, userId, 40)
+    await insertSession(sessionId, userId, 43)
     await insertSession(otherSessionId, userId, 4)
     await insertSession(foreignSessionId, otherUserId, 4)
     for (const source of matchingSources) await insertSource(source)
@@ -228,7 +228,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
       VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
     await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-      VALUES ($1, $2, $3, NULL, $4, 40, 'turn.started', 'orchestrator', $3, $5, $6::jsonb)`,
+      VALUES ($1, $2, $3, NULL, $4, 43, 'turn.started', 'orchestrator', $3, $5, $6::jsonb)`,
     [`direct-history-current-start-${suffix}`, sessionId, currentTurnId, currentRootTaskId,
       `turn:${currentTurnId}:event:turn-started`, JSON.stringify({ taskId: currentRootTaskId, rootTaskId: currentRootTaskId })])
   })
@@ -307,7 +307,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
     const duplicateId = `direct-history-malformed-duplicate-${suffix}`
     try {
       await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-        VALUES ($1, $2, $3, NULL, $4, 27, 'turn.interrupted', 'system', $3, $5, $6::jsonb)`,
+        VALUES ($1, $2, $3, NULL, $4, 40, 'turn.interrupted', 'system', $3, $5, $6::jsonb)`,
       [duplicateId, source.sessionId, source.turnId, source.rootTaskId, `malformed-duplicate:${suffix}`,
         JSON.stringify({ turnId: source.turnId, taskId: "wrong-root", errorCode: "interrupted" })])
 
@@ -383,7 +383,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
       () => insertStepCompletedEvent(source),
     )
     await checkMutation(
-      () => pool!.query(`UPDATE "agent_steps" SET "status" = 'running' WHERE "id" = $1 AND "sessionId" = $2`, [sourceStepId, source.sessionId]),
+      () => pool!.query(`UPDATE "agent_steps" SET "status" = 'failed' WHERE "id" = $1 AND "sessionId" = $2`, [sourceStepId, source.sessionId]),
       () => pool!.query(`UPDATE "agent_steps" SET "status" = 'completed' WHERE "id" = $1 AND "sessionId" = $2`, [sourceStepId, source.sessionId]),
     )
     await checkMutation(
