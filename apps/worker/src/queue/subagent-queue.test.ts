@@ -499,6 +499,27 @@ describe("Subagent queue", () => {
     await scanner.close()
     expect(manager.recover).toHaveBeenCalledTimes(1)
   })
+
+  it("counts missing published-job recovery before pending outbox dispatch", async () => {
+    const fake = repairPool({ candidate: null })
+    vi.doMock("./subagent-published-dispatch-recovery.js", () => ({
+      recoverMissingPublishedSubagentDispatches: async () => { fake.calls.push(["missing-published-recovery"]); return 2 },
+    }))
+    vi.resetModules()
+    try {
+      const { recoverSubagentQueue: recover } = await import("./subagent-queue.js")
+      const manager = { recover: vi.fn().mockResolvedValue({ rows: [], reclaimed: 0, terminal: 0 }) } as unknown as AgentTreeManager
+      const report = await recover(fake.pool, { add: vi.fn().mockResolvedValue(undefined) }, manager, 1)
+      expect(report).toMatchObject({ repaired: 2, dispatched: 0 })
+      const missing = fake.calls.findIndex(([sql]) => sql === "missing-published-recovery")
+      const pending = fake.calls.findIndex(([sql]) => sql.includes('ORDER BY dispatch."createdAt"'))
+      expect(missing).toBeGreaterThan(-1)
+      expect(missing).toBeLessThan(pending)
+    } finally {
+      vi.doUnmock("./subagent-published-dispatch-recovery.js")
+      vi.resetModules()
+    }
+  })
 })
 
 describe("subagent queue concurrency deferral wiring", () => {
