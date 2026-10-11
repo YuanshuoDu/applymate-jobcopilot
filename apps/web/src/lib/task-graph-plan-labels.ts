@@ -3,6 +3,10 @@ import type { Lang } from './i18n'
 export const TASK_GRAPH_PLAN_LABELS = {
   en: {
     'agent.taskGraph.currentPlan': 'Current plan',
+    'agent.taskGraph.selectedPlan': 'Plan for selected turn',
+    'agent.taskGraph.returnToCurrentPlan': 'Return to current plan',
+    'agent.taskGraph.loadingSelectedPlan': 'Loading selected plan…',
+    'agent.taskGraph.planUnavailable': 'This selected plan is unavailable.',
     'agent.taskGraph.evidenceSummary': 'Evidence summary',
     'agent.taskGraph.dependencies': 'Dependencies',
     'agent.taskGraph.noDependencies': 'No dependencies',
@@ -49,6 +53,10 @@ export const TASK_GRAPH_PLAN_LABELS = {
   },
   zh: {
     'agent.taskGraph.currentPlan': '当前计划',
+    'agent.taskGraph.selectedPlan': '所选轮次的计划',
+    'agent.taskGraph.returnToCurrentPlan': '返回当前计划',
+    'agent.taskGraph.loadingSelectedPlan': '正在加载所选计划…',
+    'agent.taskGraph.planUnavailable': '所选计划不可用。',
     'agent.taskGraph.evidenceSummary': '证据摘要',
     'agent.taskGraph.dependencies': '依赖项',
     'agent.taskGraph.noDependencies': '无依赖项',

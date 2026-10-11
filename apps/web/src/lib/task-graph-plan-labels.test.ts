@@ -5,7 +5,7 @@ const taskGraphPlanLabelKeys = Object.keys(TASK_GRAPH_PLAN_LABELS.en) as TaskGra
 
 describe('TaskGraph plan labels', () => {
   it('keeps the English and Chinese label sets aligned', () => {
-    expect(taskGraphPlanLabelKeys).toHaveLength(44)
+    expect(taskGraphPlanLabelKeys).toHaveLength(48)
     expect(Object.keys(TASK_GRAPH_PLAN_LABELS.zh)).toEqual(taskGraphPlanLabelKeys)
   })
 
@@ -29,6 +29,18 @@ describe('TaskGraph plan labels', () => {
   it('labels repair lineage without implying a verdict', () => {
     expect(taskGraphPlanLabel('en', 'agent.taskGraph.repairAttemptFor')).toBe('Repair attempt for')
     expect(taskGraphPlanLabel('zh', 'agent.taskGraph.repairAttemptFor')).toBe('修复尝试：')
+  })
+
+  it('labels selected historical inspection and safe return in English and Chinese', () => {
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.selectedPlan')).toBe('Plan for selected turn')
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.returnToCurrentPlan')).toBe('Return to current plan')
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.loadingSelectedPlan')).toBe('Loading selected plan…')
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.planUnavailable')).toBe('This selected plan is unavailable.')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.selectedPlan')).toBe('所选轮次的计划')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.returnToCurrentPlan')).toBe('返回当前计划')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.loadingSelectedPlan')).toBe('正在加载所选计划…')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.planUnavailable')).toBe('所选计划不可用。')
+    expect(taskGraphPlanLabel('fr', 'agent.taskGraph.returnToCurrentPlan')).toBe('Return to current plan')
   })
 
   it('keeps typed verification labels bilingual and distinct from task status', () => {
