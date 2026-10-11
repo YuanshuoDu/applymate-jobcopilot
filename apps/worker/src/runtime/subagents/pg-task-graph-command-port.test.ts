@@ -5,7 +5,10 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import type { PgSubagentPool } from "./types.js"
+import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 
 const reconciliationMocks = vi.hoisted(() => ({
   prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
@@ -48,6 +51,23 @@ function scheduleInput(expectedRevision = 1): TaskGraphScheduleInput {
       nodes: [{ key: "planned", templateId: "analyst", goal: "Inspect the source", successCriteria: ["Evidence captured"], dependsOn: [] }],
     },
     templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+  }
+}
+
+function customScoutScheduleInput(expectedRevision = 1): TaskGraphScheduleInput {
+  return {
+    ...scheduleInput(expectedRevision),
+    proposal: {
+      expectedRevision,
+      nodes: [{
+        key: "custom-scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find jobs"], dependsOn: [],
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidates", check: { kind: "candidate_count_gte", minimum: 1 } }] },
+      }],
+    },
+    templates: { scout: {
+      role: "scout", taskType: "research", allowedActions: ["jobs.search"],
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+    } },
   }
 }
 
@@ -114,8 +134,169 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
   return { pool, calls, client }
 }
 
+function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template" | "native"): { input: TaskGraphScheduleInput; graphContent: unknown; taskRows?: Array<Record<string, unknown>> } {
+  const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate_count", check: { kind: "candidate_count_gte", minimum: 1 } }] } as const
+  const analystVerification = (dependencyNodeKey: string) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey } }] } as const)
+  const unaryAnalyst = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "finding_count", check: { kind: "finding_count_gte", minimum: 1 } }] } as const
+  const scout: TaskGraphNodeProposal = { key: "scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find jobs"], dependsOn: [], verification: scoutVerification }
+  const analyst = (key: string, dependency: string, selector: string): TaskGraphNodeProposal => ({
+    key, templateId: "analyst", goal: "Check findings", successCriteria: ["Findings checked"], dependsOn: [dependency], verification: analystVerification(selector),
+  })
+  let nodes: readonly TaskGraphNodeProposal[]
+  let graphContent: unknown = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }
+  let taskRows: Array<Record<string, unknown>> = []
+  if (kind === "unknown") nodes = [scout, analyst("analyst", "scout", "missing")]
+  else if (kind === "indirect") nodes = [scout, { key: "middle", templateId: "analyst", goal: "Intermediate", successCriteria: ["Intermediate"], dependsOn: ["scout"], verification: unaryAnalyst }, analyst("analyst", "middle", "scout")]
+  else if (kind === "wrong-template") nodes = [{ key: "other-analyst", templateId: "analyst", goal: "Other analyst", successCriteria: ["Other"], dependsOn: [], verification: unaryAnalyst }, analyst("analyst", "other-analyst", "other-analyst")]
+  else {
+    const nativeMetadata = { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "native-operation", requestFingerprint: "a".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "job_discovery", contextDigest: "b".repeat(64), contextBytes: 0 }
+    graphContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "native-source", taskId: "native-task", templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID,
+      goal: "Native child", successCriteria: [], dependsOn: [], depth: 1, verificationDisposition: "legacy_unverified", nativeDelegation: nativeMetadata }] }
+    taskRows = [{ id: "native-task", status: "queued", role: "scout", taskType: "job_discovery", failureReason: null, result: null }]
+    nodes = [analyst("analyst", "native-source", "native-source")]
+  }
+  const base = scheduleInput(1)
+  return { graphContent, taskRows, input: { ...base, proposal: { expectedRevision: 1, nodes }, templates: {
+    scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+    analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search"] },
+  } } }
+}
+
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it("stamps the newly registered Scout envelope into the durable snapshot and preserves older declarations", async () => {
+    const input = customScoutScheduleInput(1)
+    const priorEnvelope = {
+      role: "scout", taskType: "old_research", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, allowedActions: ["jobs.get"],
+    }
+    const priorNode = {
+      key: "prior-scout", templateId: "scout", goal: "Earlier scout", successCriteria: ["Find jobs"], dependsOn: [], depth: 1,
+      taskId: "prior-scout-task", verificationDisposition: "typed", verification: input.proposal.nodes[0]!.verification,
+      registeredScoutEnvelope: priorEnvelope,
+    }
+    const newNode = {
+      key: "custom-scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find jobs"], dependsOn: [], depth: 1,
+      taskId: "new-scout-task", verificationDisposition: "typed", verification: input.proposal.nodes[0]!.verification,
+    }
+    const fake = fakePool(input, {
+      includeReplay: false, graphRevision: 1,
+      graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [priorNode] },
+      taskRows: [{ id: "prior-scout-task", status: "completed", role: "scout", taskType: "old_research", failureReason: null, result: null }],
+    })
+    reconciliationMocks.create.mockResolvedValue({
+      state: { revision: 2, nodes: [] },
+      snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [priorNode, newNode] },
+      created: [{ key: "custom-scout", taskId: "new-scout-task", status: "queued" }], readyTaskIds: ["new-scout-task"],
+    })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).resolves.toMatchObject({ status: "accepted", revision: 2 })
+
+    const persisted = reconciliationMocks.writePlan.mock.calls[0]?.[1] as { snapshot?: { nodes?: Array<Record<string, unknown>> } } | undefined
+    expect(persisted?.snapshot?.nodes?.find(node => node.key === "custom-scout")?.registeredScoutEnvelope).toEqual(input.templates.scout)
+    expect(persisted?.snapshot?.nodes?.find(node => node.key === "prior-scout")?.registeredScoutEnvelope).toEqual(priorEnvelope)
+  })
+
+  it("normalizes a canonical JSON-string schema marker into the registered Scout declaration", async () => {
+    const base = customScoutScheduleInput(1)
+    const schemaMarker = JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" })
+    const input = { ...base, templates: { scout: { ...base.templates.scout!, expectedOutputSchema: schemaMarker } } }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, taskRows: [] })
+    const newNode = {
+      key: "custom-scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find jobs"], dependsOn: [], depth: 1,
+      taskId: "new-scout-task", verificationDisposition: "typed", verification: input.proposal.nodes[0]!.verification,
+    }
+    reconciliationMocks.create.mockResolvedValue({
+      state: { revision: 2, nodes: [] }, snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [newNode] },
+      created: [{ key: "custom-scout", taskId: "new-scout-task", status: "queued" }], readyTaskIds: ["new-scout-task"],
+    })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).resolves.toMatchObject({ status: "accepted", revision: 2 })
+
+    const persisted = reconciliationMocks.writePlan.mock.calls[0]?.[1] as { snapshot?: { nodes?: Array<Record<string, unknown>> } } | undefined
+    expect(persisted?.snapshot?.nodes?.[0]?.registeredScoutEnvelope).toEqual({
+      role: "scout", taskType: "research", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, allowedActions: ["jobs.search"],
+    })
+    expect((persisted?.snapshot?.nodes?.[0]?.registeredScoutEnvelope as Record<string, unknown>).expectedOutputSchema).not.toBe(schemaMarker)
+  })
+
+  it("binds an empty-action template declaration so inherited grants cannot enter the legacy fallback", async () => {
+    const base = customScoutScheduleInput(1)
+    const input = { ...base, templates: { scout: { ...base.templates.scout!, allowedActions: [] } } }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, taskRows: [] })
+    const newNode = {
+      key: "custom-scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find jobs"], dependsOn: [], depth: 1,
+      taskId: "new-scout-task", verificationDisposition: "typed", verification: input.proposal.nodes[0]!.verification,
+    }
+    reconciliationMocks.create.mockResolvedValue({
+      state: { revision: 2, nodes: [] }, snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [newNode] },
+      created: [{ key: "custom-scout", taskId: "new-scout-task", status: "queued" }], readyTaskIds: ["new-scout-task"],
+    })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).resolves.toMatchObject({ status: "accepted", revision: 2 })
+
+    const persisted = reconciliationMocks.writePlan.mock.calls[0]?.[1] as { snapshot?: { nodes?: Array<Record<string, unknown>> } } | undefined
+    expect(persisted?.snapshot?.nodes?.[0]?.registeredScoutEnvelope).toEqual({
+      role: "scout", taskType: "research", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, allowedActions: [],
+    })
+  })
+
+  it("rejects a model-proposed registered Scout envelope before any task or receipt write", async () => {
+    const base = customScoutScheduleInput(1)
+    const forgedProposal = {
+      ...base.proposal,
+      nodes: [{ ...base.proposal.nodes[0], registeredScoutEnvelope: {
+        role: "scout", taskType: "forged", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, allowedActions: ["application.submit"],
+      } }],
+    } as unknown as TaskGraphScheduleInput["proposal"]
+    const input = { ...base, proposal: forgedProposal }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, taskRows: [] })
+    const { createGraphTasks } = await vi.importActual<typeof import("./task-graph-pg-create.js")>("./task-graph-pg-create.js")
+    reconciliationMocks.create.mockImplementationOnce(createGraphTasks)
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toMatchObject({ code: "invalid_shape" })
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+  })
+
+  it.each([
+    ["wrong marker object", { schemaVersion: "other", role: "scout" }],
+    ["wrong marker JSON string", JSON.stringify({ schemaVersion: "other", role: "scout" })],
+    ["extra-key JSON string", JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", extra: true })],
+    ["malformed JSON string", "{broken"],
+  ])("fails closed for a new typed Scout with an unrepresentable %s", async (_name, expectedOutputSchema) => {
+    const base = customScoutScheduleInput(1)
+    const input = { ...base, templates: { scout: {
+      ...base.templates.scout!, expectedOutputSchema,
+    } } }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, taskRows: [] })
+    const newNode = {
+      key: "custom-scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find jobs"], dependsOn: [], depth: 1,
+      taskId: "new-scout-task", verificationDisposition: "typed", verification: input.proposal.nodes[0]!.verification,
+    }
+    reconciliationMocks.create.mockResolvedValue({
+      state: { revision: 2, nodes: [] }, snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [newNode] },
+      created: [{ key: "custom-scout", taskId: "new-scout-task", status: "queued" }], readyTaskIds: ["new-scout-task"],
+    })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "task_graph_registered_scout_envelope_invalid",
+    })
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+  })
+
+  it.each(["unknown", "indirect", "wrong-template", "native"] as const)("rejects a %s cross-node selector before creating tasks or writing receipts", async kind => {
+    const invalid = invalidSelectorProposal(kind)
+    const fake = fakePool(invalid.input, { includeReplay: false, graphRevision: 1, graphContent: invalid.graphContent, taskRows: invalid.taskRows })
+    const { createGraphTasks } = await vi.importActual<typeof import("./task-graph-pg-create.js")>("./task-graph-pg-create.js")
+    reconciliationMocks.create.mockImplementationOnce(createGraphTasks)
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(invalid.input)).rejects.toThrow("task_graph_snapshot_verification_dependency_invalid")
+    expect(reconciliationMocks.create).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+  })
+
   it("keeps a missing graph pristine when no durable proposal receipt exists", async () => {
     const input = scheduleInput()
     const fake = fakePool(input, { missingGraph: true })
@@ -213,6 +394,92 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(eventRead).toHaveLength(1)
   })
 
+  it("reads one current typed result page under the existing owner fence and one graph load", async () => {
+    const input = scheduleInput()
+    const graphContent = {
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [{ key: "planned", templateId: "analyst", goal: "Inspect the source", successCriteria: ["Evidence captured"],
+        dependsOn: [], depth: 1, taskId: "child-1" }],
+    }
+    const jobId = "00000000-0000-4000-8000-000000000000"
+    const taskRows = [{
+      id: "child-1", status: "failed", role: "analyst", taskType: "job_analysis",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, failureReason: "worker_stopped",
+      result: { status: "completed", finalItemId: "private-final", finalText: "PRIVATE_FINAL_TEXT", stepCount: 1, toolCallCount: 1,
+        structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "partial",
+          findings: [{ jobId, score: 8, evidenceIds: ["evidence-job"] }],
+          evidence: [{ id: "evidence-job", kind: "job", ref: jobId, source: "private-source" }], summary: "PRIVATE_SUMMARY" } },
+    }]
+    const fake = fakePool(input, { includeReplay: false, graphContent, graphRevision: 8, taskRows })
+    const { stepId: _stepId, ...scope } = input.scope
+    const port = createPgTaskGraphCommandPort(fake.pool)
+
+    await expect(port.readCurrentResultPage!(scope, { nodeKey: "planned", expectedRevision: 8, offset: 0 })).resolves.toEqual({
+      schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "available",
+      graphRevision: 8, role: "analyst", taskStatus: "failed", resultStatus: "partial", totalCount: 1,
+      evidenceCount: 1, offset: 0, nextOffset: null, items: [{ jobId, score: 8, evidenceKinds: ["job"] }],
+    })
+    expect(fake.calls[0]?.sql).toBe("BEGIN")
+    expect(fake.calls.at(-1)?.sql).toBe("COMMIT")
+    expect(fake.client.release).toHaveBeenCalledOnce()
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toBe(true)
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT event."type"'))).toHaveLength(1)
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+    expect(JSON.stringify(fake.calls.map(call => call.values))).not.toContain("PRIVATE_FINAL_TEXT")
+  })
+
+  it("preserves the durable-receipt error when paging a missing current graph", async () => {
+    const input = scheduleInput()
+    const fake = fakePool(input, { missingGraph: true, persistedPlanReceipt: true })
+    const { stepId: _stepId, ...scope } = input.scope
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 0, offset: 0 })).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "task_graph_state_missing",
+    })
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
+  })
+
+  it("preserves existing typed verification and native child-contract errors before returning pages", async () => {
+    const input = scheduleInput()
+    const { stepId: _stepId, ...scope } = input.scope
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] }
+    const typedContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "planned", templateId: "analyst",
+      goal: "Inspect the source", successCriteria: ["Evidence captured"], dependsOn: [], depth: 1, taskId: "child-1",
+      verificationDisposition: "typed", verification }] }
+    const typedResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence: [], summary: "" }
+    const invalidTyped = fakePool(input, { includeReplay: false, graphContent: typedContent, graphRevision: 8, taskRows: [{
+      id: "child-1", status: "completed", role: "analyst", taskType: "job_analysis",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, failureReason: null,
+      result: { status: "completed", finalItemId: null, finalText: "", stepCount: 1, toolCallCount: 1,
+        structuredResult: typedResult, taskGraphVerificationReport: { status: "passed", reasonCode: "criteria_met" } },
+    }] })
+
+    await expect(createPgTaskGraphCommandPort(invalidTyped.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 8, offset: 0 })).rejects.toThrow("task_graph_verification_report_invalid")
+    expect(invalidTyped.calls.at(-1)?.sql).toBe("ROLLBACK")
+    expect(invalidTyped.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+
+    const nativeContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "planned",
+      templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, goal: "Inspect the source", successCriteria: ["Evidence captured"],
+      dependsOn: [], depth: 1, taskId: "child-1", verificationDisposition: "legacy_unverified",
+      nativeDelegation: { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "native-page",
+        requestFingerprint: "a".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "job_discovery",
+        contextDigest: "b".repeat(64), contextBytes: 1 } }] }
+    const invalidNative = fakePool(input, { includeReplay: false, graphContent: nativeContent, graphRevision: 8, taskRows: [{
+      id: "child-1", status: "completed", role: "analyst", taskType: "job_analysis",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, failureReason: null, result: null,
+    }] })
+    await expect(createPgTaskGraphCommandPort(invalidNative.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 8, offset: 0 })).rejects.toThrow("task_graph_native_child_contract_invalid")
+    expect(invalidNative.calls.at(-1)?.sql).toBe("ROLLBACK")
+    expect(invalidNative.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+  })
+
   it.each([
     ["session", "task_graph_session_fenced"], ["turn", "task_graph_turn_fenced"], ["parent", "task_graph_parent_fenced"],
   ] as const)("does not produce planning facts after a %s owner-scope fence", async (fence, error) => {
@@ -222,6 +489,19 @@ describe("createPgTaskGraphCommandPort", () => {
 
     await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentWithClient!(fake.client as unknown as pg.PoolClient, scope))
       .rejects.toThrow(error)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
+  })
+
+  it.each([
+    ["session", "task_graph_session_fenced"], ["turn", "task_graph_turn_fenced"], ["parent", "task_graph_parent_fenced"],
+  ] as const)("does not read result pages after a %s owner-scope fence", async (fence, error) => {
+    const input = scheduleInput()
+    const fake = fakePool(input, { includeReplay: false, failFence: fence })
+    const { stepId: _stepId, ...scope } = input.scope
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 2, offset: 0 })).rejects.toThrow(error)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
   })

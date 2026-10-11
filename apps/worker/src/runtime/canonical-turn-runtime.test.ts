@@ -23,6 +23,7 @@ import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canoni
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
+import type { TaskGraphResultPageRequest } from "./subagents/task-graph-result-page-contract.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
@@ -47,8 +48,9 @@ import { buildTaskGraphPlanningFacts } from "./subagents/task-graph-planning-fac
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
-import type { GraphTaskRow, LoadedGraph } from "./subagents/task-graph-pg-state.js"
-import type { TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
+import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
+import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
+import { projectTaskGraphResultPage } from "./subagents/task-graph-result-page.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -1804,6 +1806,429 @@ describe("createCanonicalTurnRuntime", () => {
     const recovered = await taskGraphRootSurface(false, true, "agent.spawn", "jobs.get", true)
     expect(recovered.route).not.toHaveBeenCalled()
     expect(JSON.stringify(recovered.events)).toContain("interactive_discovery_root_tool_disabled")
+  })
+
+  it("pages current typed results through persisted lifecycle into successive model requests", async () => {
+    const numericUuid = "00000000-0000-4000-8000-000000000000"
+    const cuid = (value: number) => `c${String(value).padStart(24, "0")}`
+    const scoutCandidates = [
+      { jobId: cuid(1), source: "greenhouse" },
+      { jobId: cuid(2), source: "lever" },
+      { jobId: cuid(3), source: "workday" },
+      { jobId: numericUuid, source: "personio" },
+    ] as const
+    const analystFindings = [
+      { jobId: cuid(4), score: 7.25 },
+      { jobId: cuid(5), score: 8 },
+      { jobId: cuid(6), score: 8.5 },
+      { jobId: numericUuid, score: 9.25 },
+    ] as const
+    const loadedGraphAt = (revision: number, includeCurrentAddition = false): LoadedGraph => {
+      const snapshot = parseTaskGraphSnapshot({
+        schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+        nodes: ["scout-node", "analyst-node"].map((key, index) => ({
+          key, templateId: index === 0 ? "scout" : "analyst", goal: `Read ${key}`,
+          successCriteria: ["Return current typed result evidence"], dependsOn: [], depth: 1, taskId: `${key}-task`,
+        })),
+      })
+      const currentScoutCandidates = includeCurrentAddition
+        ? [...scoutCandidates, { jobId: cuid(7), source: "smartrecruiters" as const }]
+        : scoutCandidates
+      const scoutEvidence = currentScoutCandidates.map(({ jobId }) => ({
+        id: `scout-job:${jobId}`, kind: "job" as const, ref: jobId, source: "private-source",
+      }))
+      const analystEvidence = analystFindings.flatMap(({ jobId }, index) => [
+        { id: `analyst-job:${jobId}`, kind: "job" as const, ref: jobId, source: "private-source" },
+        ...(index < 2 ? [{ id: `analyst-persona:${jobId}`, kind: "persona" as const, ref: "private-profile", source: "private-source" }] : []),
+      ])
+      const tasks: GraphTaskRow[] = [
+        {
+          id: "scout-node-task", role: "scout", taskType: "job_discovery", status: "completed", failureReason: null,
+          expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+          result: { status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult: {
+            schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+            candidates: currentScoutCandidates.map(({ jobId, source }) => ({
+              jobId, source, url: `https://private.example/${jobId}`, evidenceIds: [`scout-job:${jobId}`],
+            })), evidence: scoutEvidence, summary: "PRIVATE_RESULT_PROSE",
+          } },
+        },
+        {
+          id: "analyst-node-task", role: "analyst", taskType: "job_analysis", status: "completed", failureReason: null,
+          expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
+          result: { status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult: {
+            schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "partial",
+            findings: analystFindings.map(({ jobId, score }, index) => ({
+              jobId, score, evidenceIds: [`analyst-job:${jobId}`, ...(index < 2 ? [`analyst-persona:${jobId}`] : [])],
+            })), evidence: analystEvidence, summary: "PRIVATE_RESULT_PROSE",
+          } },
+        },
+      ]
+      const statuses = new Map(tasks.map(task => [task.id, { status: task.status, failureReason: task.failureReason }]))
+      return {
+        rootTaskId: "root-1", snapshot,
+        item: { id: "task-graph:root-1", revision, content: snapshot, createdAt: new Date(0) },
+        state: taskGraphState(snapshot, revision, statuses, []),
+        tasks: new Map(tasks.map(task => [task.id, task])),
+      }
+    }
+    const graphAtSeven = loadedGraphAt(7)
+    const graphAtEight = loadedGraphAt(8, true)
+    let graphRevision = 7
+    let currentGraph = graphAtSeven
+    const pageReads: Array<{ scope: TaskGraphReadScope; request: TaskGraphResultPageRequest }> = []
+    const readCurrentResultPage: NonNullable<TaskGraphCommandPort["readCurrentResultPage"]> = vi.fn(async (scope, request) => {
+      pageReads.push({ scope, request })
+      const page = projectTaskGraphResultPage(currentGraph, request)
+      if (request.nodeKey === "analyst-node" && request.offset === 3 && graphRevision === 7) {
+        graphRevision = 8
+        currentGraph = graphAtEight
+      }
+      return page
+    })
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: graphRevision, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => {
+        const current = currentTaskGraph(currentGraph)
+        const planningFacts = buildTaskGraphPlanningFacts(currentGraph)
+        return planningFacts ? { ...current, planningFacts } : current
+      }),
+      readCurrentResultPage,
+    }
+    const activityClient = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT 1 FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+        if (sql.includes('WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3')) return { rows: [{
+          id: "root-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: null,
+          path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "Find jobs", context: {},
+          attemptCount: 1, maxAttempts: 1, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt,
+          interruptRequestedAt: null, result: null, failureReason: null,
+        }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
+    const requests: HarnessModelRequest[] = []
+    const events: RuntimeEvent[] = []
+    const originalText = "Original task: find English-first engineering jobs in Ireland, preserve salary constraints, and verify every recommendation."
+    const originalInput: StoredAgentInput = {
+      id: "page-root-input", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "page-root-message", delivery: "follow_up", status: "consumed",
+      content: [{ type: "text", text: originalText }], acceptedSequence: 1n,
+      consumedByStepId: "prior-root-step", consumedAt: lease.leaseStartedAt, createdAt: lease.leaseStartedAt,
+    }
+    const freshSteer: StoredAgentInput = {
+      id: "page-fresh-steer", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "page-steer-message", delivery: "steer", status: "accepted",
+      content: [{ type: "text", text: "CURRENT_STEERING: prioritize roles with explicit salary ranges." }], acceptedSequence: 3n,
+      consumedByStepId: null, consumedAt: null, createdAt: lease.leaseStartedAt,
+    }
+    const questionEntryId = "agent-question:page-question:question"
+    const answerEntryId = "agent-question:page-question:answer"
+    const questionText = "Should I include hybrid roles in Dublin?"
+    const answerText = "Yes, include hybrid roles within commuting distance."
+    const planningSummary = { observedPlanRevision: 7, graphRevisionAtAsk: 7, pendingSteerCount: 1,
+      unconsumedSteerCount: 1, inputThroughSequence: "2" }
+    const questionHistory = [
+      { id: questionEntryId, content: { role: "assistant", type: "question", question: questionText, options: [{ label: "Yes", value: "yes" }] } },
+      { id: answerEntryId, content: { role: "user", type: "answer", questionId: "page-question-wait", text: answerText } },
+    ]
+    const inputCheckpoints = new Map<string, { inputThroughSequence: bigint; consumedInputIds: readonly string[] }>()
+    const rootContextReads: string[] = []
+    let steerClaimed = false
+    const inputClaimStore: InputClaimStore = {
+      scope: { userId: lease.userId },
+      withTransaction: async work => work({
+        getCheckpoint: async ({ stepId }) => inputCheckpoints.get(stepId) ?? { inputThroughSequence: 2n, consumedInputIds: [] },
+        claimInputs: async request => {
+          if (steerClaimed || request.checkpoint.inputThroughSequence >= freshSteer.acceptedSequence) return { inputs: [], newlyClaimedInputIds: [] }
+          steerClaimed = true
+          return { inputs: [freshSteer], newlyClaimedInputIds: [freshSteer.id] }
+        },
+        persistCheckpoint: async request => { inputCheckpoints.set(request.stepId, request.checkpoint) },
+        loadRootInputContext: async request => {
+          rootContextReads.push(request.inputId)
+          return request.inputId === originalInput.id ? originalInput : null
+        },
+        loadUnresolvedSteeringInputs: async () => [freshSteer],
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const contexts: StepContext[] = []
+    const baseContextBuilder = new StepContextBuilder(inputClaimStore, ownerFence, () => lease.leaseStartedAt, {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+      rootInputId: originalInput.id,
+    })
+    const resumedState = state({
+      rootInputId: originalInput.id,
+      goal: "Find engineering roles in Ireland matching the original constraints and saved answer.",
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 2n, consumedInputIds: [],
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      snapshot: { ...state().snapshot, goal: { id: "page-goal", content: "Find engineering roles in Ireland matching the original constraints and saved answer." },
+        steerHistory: questionHistory, planningClarifications: [planningSummary],
+        planningClarificationHistoryPair: { questionEntryId, answerEntryId } },
+    })
+    rootTaskHistory.load.mockReset().mockImplementation(async () => [failedRootHistoryOutcome()])
+    const calls = [
+      { callId: "scout-first-page", nodeKey: "scout-node", offset: 0 },
+      { callId: "scout-next-page", nodeKey: "scout-node" },
+      { callId: "analyst-first-page", nodeKey: "analyst-node", offset: 0 },
+      { callId: "analyst-next-page", nodeKey: "analyst-node" },
+      { callId: "stale-page-call", nodeKey: "analyst-node", offset: 0 },
+    ] as const
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(activityPool as never), {
+      workerId: "worker-1",
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      taskGraphCommandPort,
+      taskGraphTemplates: {
+        scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+        analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+      },
+      selectedJobPreparationLoader: async () => undefined,
+      stateLoader: async () => ({ ...resumedState, budgetSnapshot: { limits: { maxSteps: 8 } }, toolPolicySnapshot: {} }),
+      rootTaskStore: rootStore() as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      turnEngineStoreFactory: () => ({
+        ...store(events),
+        startStep: async ({ stepId, ordinal, inputThroughSequence }) => {
+          inputCheckpoints.set(stepId, { inputThroughSequence, consumedInputIds: [] })
+          return { id: stepId, ordinal }
+        },
+      }),
+      contextBuilderFactory: () => ({
+        build: async request => {
+          const context = await baseContextBuilder.build(request)
+          contexts.push(context)
+          return context
+        },
+      }),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          const call = calls[requests.length - 1]
+          if (!call) {
+            yield { type: "text_delta", text: "Reviewed the current task results." }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          let offset: unknown = "offset" in call ? call.offset : undefined
+          if (call.callId === "scout-next-page" || call.callId === "analyst-next-page") {
+            const firstCallId = call.callId === "scout-next-page" ? "scout-first-page" : "analyst-first-page"
+            const priorResult = request.messages.flatMap(message => message.content).find(part =>
+              part.type === "tool_result" && part.toolUseId === firstCallId)
+            if (!priorResult || priorResult.type !== "tool_result") throw new Error("first_page_lifecycle_result_missing")
+            const priorPage = JSON.parse(priorResult.content) as { nextOffset?: unknown }
+            offset = priorPage.nextOffset
+          }
+          if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) throw new Error("task_graph_page_next_offset_invalid")
+          yield { type: "tool_call_completed", callId: call.callId, name: "agent.list", arguments: {
+            nodeKey: call.nodeKey, expectedRevision: 7, offset,
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    const expectedScoutFirstPage = projectTaskGraphResultPage(graphAtSeven, { nodeKey: "scout-node", expectedRevision: 7, offset: 0 })
+    const expectedScoutNextPage = projectTaskGraphResultPage(graphAtSeven, { nodeKey: "scout-node", expectedRevision: 7, offset: 3 })
+    const expectedAnalystPage = projectTaskGraphResultPage(graphAtSeven, { nodeKey: "analyst-node", expectedRevision: 7, offset: 0 })
+    const expectedAnalystNextPage = projectTaskGraphResultPage(graphAtSeven, { nodeKey: "analyst-node", expectedRevision: 7, offset: 3 })
+    const expectedStalePage = projectTaskGraphResultPage(graphAtEight, { nodeKey: "analyst-node", expectedRevision: 7, offset: 0 })
+    expect(expectedScoutFirstPage).toMatchObject({ availability: "available", graphRevision: 7, role: "scout", taskStatus: "completed",
+      resultStatus: "completed", totalCount: 4, evidenceCount: 4, offset: 0, nextOffset: 3,
+      items: scoutCandidates.slice(0, 3).map(({ jobId, source }) => ({ jobId, source, evidenceKinds: ["job"] })) })
+    expect(expectedScoutNextPage).toMatchObject({ availability: "available", graphRevision: 7, role: "scout", offset: 3,
+      totalCount: 4, evidenceCount: 4, nextOffset: null, items: [{ jobId: numericUuid, source: "personio", evidenceKinds: ["job"] }] })
+    expect(expectedAnalystPage).toMatchObject({ availability: "available", graphRevision: 7, role: "analyst", offset: 0,
+      resultStatus: "partial", totalCount: 4, evidenceCount: 6, nextOffset: 3, items: [
+        { jobId: cuid(4), score: 7.25, evidenceKinds: ["job", "persona"] },
+        { jobId: cuid(5), score: 8, evidenceKinds: ["job", "persona"] },
+        { jobId: cuid(6), score: 8.5, evidenceKinds: ["job"] },
+      ] })
+    expect(expectedAnalystPage.availability === "available" ? expectedAnalystPage.items : []).toHaveLength(3)
+    expect(expectedAnalystNextPage).toMatchObject({ availability: "available", graphRevision: 7, role: "analyst", offset: 3,
+      resultStatus: "partial", totalCount: 4, evidenceCount: 6, nextOffset: null,
+      items: [{ jobId: numericUuid, score: 9.25, evidenceKinds: ["job"] }] })
+    expect(expectedStalePage).toEqual({ schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "unavailable",
+      graphRevision: 8, reason: "revision_mismatch" })
+    expect(pageReads.map(entry => entry.request)).toEqual([
+      { nodeKey: "scout-node", expectedRevision: 7, offset: 0 },
+      { nodeKey: "scout-node", expectedRevision: 7, offset: 3 },
+      { nodeKey: "analyst-node", expectedRevision: 7, offset: 0 },
+      { nodeKey: "analyst-node", expectedRevision: 7, offset: 3 },
+      { nodeKey: "analyst-node", expectedRevision: 7, offset: 0 },
+    ])
+    expect(pageReads.map(entry => entry.scope)).toEqual(calls.map(() => ({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+    })))
+
+    for (const [callId, expected] of [[calls[0].callId, expectedScoutFirstPage], [calls[1].callId, expectedScoutNextPage],
+      [calls[2].callId, expectedAnalystPage], [calls[3].callId, expectedAnalystNextPage], [calls[4].callId, expectedStalePage]] as const) {
+      const persisted = events.find(event => event.type === "tool_call.completed" && (event.payload as { toolCallId?: string }).toolCallId === callId)
+      expect(persisted?.payload).toMatchObject({ toolName: "agent.list", status: "completed", output: expected })
+      const request = requests.find(candidate => candidate.messages.some(message => message.content.some(part => part.type === "tool_result" && part.toolUseId === callId)))
+      const result = request?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === callId)
+      expect(result && result.type === "tool_result" ? JSON.parse(result.content) : null).toEqual(expected)
+    }
+    const numericUuidRequest = requests.find(request => request.messages.some(message => message.content.some(part =>
+      part.type === "tool_result" && part.toolUseId === "scout-next-page")))
+    const numericUuidResult = numericUuidRequest?.messages.flatMap(message => message.content).find(part =>
+      part.type === "tool_result" && part.toolUseId === "scout-next-page")
+    expect(numericUuidResult && numericUuidResult.type === "tool_result" ? JSON.parse(numericUuidResult.content) : null).toEqual(expectedScoutNextPage)
+    expect(numericUuidRequest && JSON.stringify(numericUuidRequest.messages)).toContain(numericUuid)
+    expect(pageReads[1]?.request.offset).toBe(expectedScoutFirstPage.availability === "available" ? expectedScoutFirstPage.nextOffset : null)
+    const analystNumericUuidRequest = requests.find(request => request.messages.some(message => message.content.some(part =>
+      part.type === "tool_result" && part.toolUseId === "analyst-next-page")))
+    const analystNumericUuidResult = analystNumericUuidRequest?.messages.flatMap(message => message.content).find(part =>
+      part.type === "tool_result" && part.toolUseId === "analyst-next-page")
+    expect(analystNumericUuidResult && analystNumericUuidResult.type === "tool_result" ? JSON.parse(analystNumericUuidResult.content) : null).toEqual(expectedAnalystNextPage)
+    expect(analystNumericUuidRequest && JSON.stringify(analystNumericUuidRequest.messages)).toContain(numericUuid)
+    expect(pageReads[3]?.request.offset).toBe(expectedAnalystPage.availability === "available" ? expectedAnalystPage.nextOffset : null)
+    expect(contexts).toHaveLength(6)
+    expect(contexts.map(context => context.taskGraphRevision)).toEqual([7, 7, 7, 7, 8, 8])
+    expect(contexts.map(context => context.inputThroughSequence)).toEqual([3n, 3n, 3n, 3n, 3n, 3n])
+    expect(contexts.map(context => context.consumedInputIds)).toEqual([[freshSteer.id], [], [], [], [], []])
+    expect(contexts.every(context => !context.consumedInputIds.includes(originalInput.id))).toBe(true)
+    expect(rootContextReads).toEqual(Array(6).fill(originalInput.id))
+    const expectedFactsByRevision = [buildTaskGraphPlanningFacts(graphAtSeven)!, buildTaskGraphPlanningFacts(graphAtEight)!]
+    const currentBlocks = contexts.map(context => context.blocks.find(block => block.content !== null && typeof block.content === "object"
+      && !Array.isArray(block.content) && block.content.kind === "task_graph_current"))
+    expect(currentBlocks).toHaveLength(6)
+    expect(currentBlocks.map(block => block?.trust)).toEqual(Array(6).fill("external_untrusted"))
+    expect(currentBlocks.map(block => (block?.content as { taskReportedCounts?: unknown }).taskReportedCounts)).toEqual([
+      expectedFactsByRevision[0]!.counts, expectedFactsByRevision[0]!.counts, expectedFactsByRevision[0]!.counts,
+      expectedFactsByRevision[0]!.counts, expectedFactsByRevision[1]!.counts, expectedFactsByRevision[1]!.counts,
+    ])
+    expect(expectedFactsByRevision.map(facts => facts.counts.discoveredJobs.knownCount)).toEqual([4, 5])
+    expect(currentBlocks.map(block => (block?.content as { revision?: number }).revision)).toEqual([7, 7, 7, 7, 8, 8])
+    const historyBlocks = contexts.map(context => context.blocks.find(block => block.content !== null && typeof block.content === "object"
+      && !Array.isArray(block.content) && block.content.kind === "root_task_history"))
+    expect(historyBlocks).toHaveLength(6)
+    for (const block of historyBlocks) {
+      expect(block).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent",
+        content: { kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+          turns: [{ label: "earlier terminal attempt", nodes: [{ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"] }] }] } })
+      expect(JSON.stringify(block?.content)).not.toMatch(/PRIVATE_HISTORY|private-history|evidenceDigest|resultDigest|verificationReport|PASS/)
+    }
+    for (const context of contexts) {
+      const rootBlock = context.blocks.find(block => block.layer === "pending_input" && block.content !== null
+        && typeof block.content === "object" && !Array.isArray(block.content) && block.content.inputId === originalInput.id)
+      expect(rootBlock).toMatchObject({ trust: "external_untrusted", content: { inputId: originalInput.id, text: originalText } })
+      const questionIndex = context.blocks.findIndex(block => block.id === `history:${questionEntryId}`)
+      expect(context.blocks[questionIndex + 1]?.id).toBe(`history:${answerEntryId}`)
+      expect(context.blocks[questionIndex + 2]).toMatchObject({ id: "planning-clarification:latest-answered-question",
+        trust: "internal_record", source: "native_question_recovery", content: planningSummary })
+      const steerBlock = context.blocks.find(block => block.layer === "pending_input" && block.content !== null
+        && typeof block.content === "object" && !Array.isArray(block.content) && block.content.inputId === freshSteer.id)
+      expect(steerBlock).toMatchObject({ trust: "external_untrusted", content: { inputId: freshSteer.id,
+        text: "CURRENT_STEERING: prioritize roles with explicit salary ranges." } })
+      expect(context.planningClarifications).toEqual([planningSummary])
+    }
+    const capturedRequestText = requests.map(request => request.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n"))
+    for (let index = 0; index < capturedRequestText.length; index += 1) {
+      const text = capturedRequestText[index]!
+      expect(text).toContain(originalText)
+      expect(text).toContain(questionText)
+      expect(text).toContain(answerText)
+      expect(text).toContain("CURRENT_STEERING: prioritize roles with explicit salary ranges.")
+      expect(text).toContain('"graphRevisionAtAsk":7')
+      expect(text).toContain("root_task_history")
+      expect(text).toContain("criterion_not_met")
+      expect(text).not.toMatch(/PRIVATE_HISTORY|private-history|private\.example|PRIVATE_RESULT_PROSE|PRIVATE_FINAL_TEXT|TASK_GRAPH_FINAL_SUMMARY_BINDING/)
+      expect(text).toContain(index < 4 ? '"knownCount":4' : '"knownCount":5')
+    }
+    expect(rootTaskHistory.load).toHaveBeenCalledTimes(6)
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(JSON.stringify(events)).not.toContain("nativeCoordination")
+    expect(JSON.stringify(events)).not.toContain("privateTaskId")
+    expect(JSON.stringify(events)).not.toContain("evidenceReferenceId")
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_RESULT_PROSE")
+    expect(JSON.stringify(events)).not.toContain("private.example")
+    expect(JSON.stringify(events)).not.toContain("evidenceDigest")
+    expect(JSON.stringify(events)).not.toContain("resultDigest")
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(readCurrentResultPage).toHaveBeenCalledTimes(5)
+    expect(requests).toHaveLength(6)
+  })
+
+  it("fails page mode closed without an optional page port while keeping explicit legacy agent.list available", async () => {
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 1, nodes: [] })),
+    }
+    const activityClient = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT 1 FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+        if (sql.includes('WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3')) return { rows: [{
+          id: "root-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: null,
+          path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "Find jobs", context: {},
+          attemptCount: 1, maxAttempts: 1, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt,
+          interruptRequestedAt: null, result: null, failureReason: null,
+        }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
+    const requests: HarnessModelRequest[] = []
+    const events: RuntimeEvent[] = []
+    const modelCalls = [
+      { callId: "unavailable-page", arguments: { nodeKey: "scout-node", expectedRevision: 1, offset: 0 } },
+      { callId: "legacy-list", arguments: {} },
+    ] as const
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(activityPool as never), {
+      workerId: "worker-1",
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => undefined,
+      stateLoader: async () => state({ budgetSnapshot: { limits: { maxSteps: 6 } }, toolPolicySnapshot: {} }),
+      rootTaskStore: rootStore() as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      turnEngineStoreFactory: () => store(events),
+      contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          const call = modelCalls[requests.length - 1]
+          if (!call) {
+            yield { type: "text_delta", text: "Legacy listing remains available." }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          yield { type: "tool_call_completed", callId: call.callId, name: "agent.list", arguments: call.arguments }
+          yield { type: "completed", finishReason: "tool_calls" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    const result = await runtime.execute({ lease, signal: new AbortController().signal })
+    expect(result).toMatchObject({ status: "completed" })
+    expect(events.find(event => event.type === "tool_call.failed" && (event.payload as { toolCallId?: string }).toolCallId === "unavailable-page")?.payload)
+      .toMatchObject({ errorCode: "coordination_task_graph_page_unavailable" })
+    expect(events.find(event => event.type === "tool_call.completed" && (event.payload as { toolCallId?: string }).toolCallId === "legacy-list")?.payload)
+      .toMatchObject({ toolName: "agent.list", output: { tasks: [] } })
+    const legacyResult = requests[2]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "legacy-list")
+    expect(legacyResult && legacyResult.type === "tool_result" ? JSON.parse(legacyResult.content) : null).toEqual({ tasks: [] })
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(requests).toHaveLength(3)
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {

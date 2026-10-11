@@ -702,6 +702,7 @@ function requireDuplicateRedeliveryPredicates(predicates) {
 
 async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJobId }) {
   const readJobDescription = `recruiter-${ids.suffix}@example.com +353 87 123 4567`
+  const readJobRole = `Fixture Engineer ${ids.suffix}`
   const requestParts = request.messages.flatMap(message => Array.isArray(message.content)
     ? message.content.map(part => ({ message, part })) : [])
   const toolUses = requestParts.filter(entry => entry.part?.type === "tool_use" && entry.part.id === readCallId)
@@ -764,7 +765,7 @@ async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJob
     completed_output_matches_model_result: stableJson(completed?.output) === stableJson(resultOutput),
     result_job_id: outputJob?.id === readJobId,
     result_job_company: outputJob?.company === `Fixture Employer ${ids.suffix}`,
-    result_job_role: outputJob?.role === "Fixture Engineer",
+    result_job_role: outputJob?.role === readJobRole,
     result_job_description_redacted: outputJob?.description === "[REDACTED_EMAIL] [REDACTED_PHONE]",
     raw_description_absent: !JSON.stringify(resultOutput).includes(readJobDescription),
     result_page: resultOutput?.page === 1,

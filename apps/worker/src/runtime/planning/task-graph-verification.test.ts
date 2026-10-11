@@ -5,6 +5,7 @@ import {
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
   TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   validateTaskGraphVerificationContract,
+  type TaskGraphVerificationDependencyEvidence,
   type TaskGraphVerificationContract,
   type TaskGraphVerificationEvidenceProjection,
 } from "./task-graph-verification.js"
@@ -78,6 +79,22 @@ describe("TaskGraph typed verification contract", () => {
     }
   })
 
+  it("accepts only the exact Analyst dependency selector shape within the existing key bound", () => {
+    const check = { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" }
+    expect(validateTaskGraphVerificationContract(contract("analyst", [{ id: "source", check }]), "analyst"))
+      .toMatchObject({ ok: true, contract: { criteria: [{ check }] } })
+    for (const invalid of [
+      { ...check, taskId: "model-selected" },
+      { kind: check.kind, dependencyNodeKey: " " },
+      { kind: check.kind, dependencyNodeKey: "s".repeat(129) },
+    ]) {
+      expect(validateTaskGraphVerificationContract(contract("analyst", [{ id: "source", check: invalid }]), "analyst"))
+        .toMatchObject({ ok: false })
+    }
+    expect(validateTaskGraphVerificationContract(contract("scout", [{ id: "source", check }]), "scout"))
+      .toMatchObject({ ok: false, error: { code: "unknown_check" } })
+  })
+
   it("rejects sparse criteria arrays rather than skipping missing entries", () => {
     const sparse = new Array(1)
     expect(validateTaskGraphVerificationContract(contract("scout", sparse), "scout"))
@@ -125,6 +142,28 @@ function analystProjection(): TaskGraphVerificationEvidenceProjection {
   }
 }
 
+function projectionForScout(jobIds: readonly string[]): TaskGraphVerificationEvidenceProjection {
+  const candidates = jobIds.map(jobId => ({ jobId, evidenceIds: [canonicalEvidence("job", jobId)] }))
+  return {
+    schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+    role: "scout",
+    candidates,
+    evidenceIds: [...candidates.map(candidate => candidate.evidenceIds[0]!), canonicalEvidence("persona", "source-fact")],
+  }
+}
+
+function projectionForAnalyst(jobIds: readonly string[]): TaskGraphVerificationEvidenceProjection {
+  const findings = jobIds.map(jobId => ({
+    jobId, score: 7, evidenceIds: [canonicalEvidence("job", jobId), canonicalEvidence("persona", "analysis-fact")],
+  }))
+  return {
+    schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+    role: "analyst",
+    findings,
+    evidenceIds: [...new Set([...findings.flatMap(finding => finding.evidenceIds), canonicalEvidence("persona", "analysis-fact")])],
+  }
+}
+
 describe("TaskGraph durable evidence verification", () => {
   it("evaluates Scout counts only after candidate evidence IDs bind to canonical persisted evidence", () => {
     const scout = scoutProjection()
@@ -158,6 +197,48 @@ describe("TaskGraph durable evidence verification", () => {
       status: "failed", reasonCode: "reported_score_below_minimum",
       criteria: [{ criterionId: "reported-score", status: "failed", reasonCode: "reported_score_below_minimum" }],
     })
+  })
+
+  it("checks every Analyst finding against the full Scout set while allowing subsets", () => {
+    const source = projectionForScout(["job-1", "job-2", "job-3", "job-4", "job-5", "job-6"])
+    const analyst = projectionForAnalyst(["job-6"])
+    const typed = validatedContract("analyst", [
+      { id: "in-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } },
+    ])
+    const dependencies: TaskGraphVerificationDependencyEvidence = new Map([["scout-source", source]])
+    expect(evaluateTaskGraphVerification(typed, analyst, dependencies)).toMatchObject({ status: "passed", reasonCode: "criteria_met" })
+
+    const outOfSet = evaluateTaskGraphVerification(typed, projectionForAnalyst(["job-not-from-scout"]), dependencies)
+    expect(outOfSet).toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
+    expect(JSON.stringify(outOfSet)).not.toContain("job-not-from-scout")
+  })
+
+  it("keeps empty membership vacuous and leaves minimum counts as independent checks", () => {
+    const typed = validatedContract("analyst", [
+      { id: "minimum-findings", check: { kind: "finding_count_gte", minimum: 1 } },
+      { id: "in-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } },
+    ])
+    expect(evaluateTaskGraphVerification(typed, projectionForAnalyst([]), new Map([["scout-source", projectionForScout(["job-1"])]]))).toEqual({
+      status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "minimum-findings", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "in-scout", status: "passed", reasonCode: "criteria_met" },
+      ],
+    })
+  })
+
+  it("fails closed when selected dependency evidence is missing, extra, or not a Scout projection", () => {
+    const typed = validatedContract("analyst", [
+      { id: "in-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } },
+    ])
+    const analyst = projectionForAnalyst(["job-1"])
+    expect(evaluateTaskGraphVerification(typed, analyst)).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    expect(evaluateTaskGraphVerification(typed, analyst, new Map([
+      ["scout-source", analystProjection()],
+    ]))).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    expect(evaluateTaskGraphVerification(typed, analyst, new Map([
+      ["scout-source", projectionForScout(["job-1"])], ["other", projectionForScout(["job-2"])],
+    ]))).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
   })
 
   it("fails vacuous result arrays against positive minima", () => {
