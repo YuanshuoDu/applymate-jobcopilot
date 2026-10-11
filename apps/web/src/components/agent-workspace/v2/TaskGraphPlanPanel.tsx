@@ -1,12 +1,12 @@
 'use client'
 
 import React, { useMemo } from 'react'
-import { parsePlanLedger } from '@jobcopilot/agent-protocol'
 
 import { useI18n, type Lang } from '@/lib/i18n'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
+import { parsePlanLedgerWithRepairTargets, type PlanLedgerWithRepairTargetGoals } from '@/lib/task-graph-repair-display'
 
-import { projectCurrentTaskGraph, type TaskGraphEvidencePreview, type TaskGraphPlan, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
+import { projectCurrentTaskGraph, type TaskGraphEvidencePreview, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
 import { selectedTaskGraphIdentity, type TaskGraphIdentity } from './task-graph-plan-query'
 import type { SupervisorTaskSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
@@ -71,7 +71,7 @@ interface DiscoveryShortlistResult {
   readonly failures: readonly string[]
 }
 
-function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: TaskGraphPlan } | null {
+function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: PlanLedgerWithRepairTargetGoals } | null {
   const response = record(value)
   const identity = response ? record(response.identity) : null
   if (!response || !identity || Object.keys(response).length !== 2 || Object.keys(identity).length !== 5
@@ -79,7 +79,7 @@ function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity;
     || typeof identity.turnId !== 'string' || typeof identity.rootTaskId !== 'string'
     || ![identity.sessionId, identity.graphItemId, identity.turnId, identity.rootTaskId].every(value => value.length > 0 && value.length <= 128 && value.trim() === value)
     || !Number.isSafeInteger(identity.revision) || Number(identity.revision) < 1) return null
-  const projection = parsePlanLedger(response.projection)
+  const projection = parsePlanLedgerWithRepairTargets(response.projection)
   if (!projection || projection.sessionId !== identity.sessionId || projection.revision !== identity.revision) return null
   return { identity: identity as unknown as TaskGraphIdentity, projection }
 }
@@ -135,7 +135,7 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 
 function TaskGraphPlanSection({ plan, sessionId, lang, t }: {
-  readonly plan: TaskGraphPlan
+  readonly plan: PlanLedgerWithRepairTargetGoals
   readonly sessionId: string
   readonly lang: Lang
   readonly t: (key: string) => string
@@ -155,6 +155,7 @@ function TaskGraphPlanSection({ plan, sessionId, lang, t }: {
         {plan.nodes.map(node => (
           <li key={node.key} style={nodeStyle}>
             <strong style={goalStyle}>{node.goal}</strong>
+            {node.repairTargetGoal && <div data-task-graph-repair-target="true">{taskGraphPlanLabel(lang, 'agent.taskGraph.repairAttemptFor')} {node.repairTargetGoal}</div>}
             <div>{t('agent.status')}: {node.status ? taskGraphPlanLabel(lang, STATUS_LABELS[node.status]) : taskGraphPlanLabel(lang, 'agent.taskGraph.statusUnavailable')}</div>
             {node.evidencePreview
               ? <TaskGraphEvidenceSummary preview={node.evidencePreview} lang={lang} />

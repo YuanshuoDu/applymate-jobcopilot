@@ -3,6 +3,7 @@ import { parseTaskGraphSnapshot, projectPlanLedger } from "@jobcopilot/agent-pro
 
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { decoratePlanLedgerRepairTargets } from "@/lib/task-graph-repair-display"
 
 import {
   afterCursor,
@@ -169,9 +170,10 @@ export async function GET(request: NextRequest, context: RouteContext) {
       const tasks = scopedRows.map(taskDto)
       const projection = projectPlanLedger({ sessionId, revision: graph.revision, rootTaskId: graph.taskId, graph: graph.content, tasks })
       const identity = { sessionId, graphItemId: graph.id, turnId: graph.turnId, rootTaskId: graph.taskId, revision: graph.revision }
-      const planLedger = projection ? {
+      const displayProjection = projection ? decoratePlanLedgerRepairTargets(projection, graph.content, graph.taskId) : null
+      const planLedger = displayProjection ? {
         identity,
-        projection,
+        projection: displayProjection,
       } : null
       const rootTask = scopedRows.find((row) => row.id === graph!.taskId && row.sessionId === sessionId
         && row.turnId === graph!.turnId && row.rootTaskId === graph!.taskId && row.parentTaskId === null
