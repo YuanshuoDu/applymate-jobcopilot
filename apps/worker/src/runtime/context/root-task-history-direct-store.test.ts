@@ -2,6 +2,9 @@ import { Buffer } from "node:buffer"
 import type pg from "pg"
 import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { resolveRootTaskObjective } from "./root-task-objective.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
 
@@ -15,6 +18,8 @@ type Options = Readonly<{
   candidateError?: Error
   graphError?: Error
   badGraph?: boolean
+  typedFailure?: boolean
+  reportedOutput?: boolean
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -99,11 +104,32 @@ function fixture(options: Options = {}) {
         return { rows: [{ id: values?.[0], revision: 1, content: options.badGraph ? { schemaVersion: "bad", nodes: [] } : {
           schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
           nodes: [{ key: "scout", templateId: "scout", goal: "Find roles", successCriteria: ["Find one role"],
+            ...(options.typedFailure ? { verificationDisposition: "typed", verification: {
+              schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+              criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+            } } : {}),
             dependsOn: [], depth: 1, taskId: childId }],
         }, source }] }
       }
       if (sql.includes("ANY($1::text[])")) return { rows: (values?.[0] as string[]).map(id => ({
-        id, status: "completed", role: "scout", taskType: "scout", expectedOutputSchema: {}, failureReason: null, result: null,
+        id, status: options.typedFailure ? "failed" : "completed", role: "scout", taskType: "scout", expectedOutputSchema: {},
+        failureReason: options.typedFailure ? "task_graph_verification_failed" : null,
+        result: options.typedFailure ? { taskGraphVerificationReport: {
+          verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+          criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+          evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+        } } : options.reportedOutput ? {
+          finalItemId: "final-scout", finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+          structuredResult: {
+            schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial", summary: "private summary",
+            evidence: [{ id: "e1", kind: "job", ref: "job-1", source: "greenhouse" },
+              { id: "e2", kind: "job", ref: "job-2", source: "greenhouse" }, { id: "e3", kind: "job", ref: "job-3", source: "greenhouse" }],
+            candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://private.example/1", evidenceIds: ["e1"] },
+              { jobId: "job-1", source: "greenhouse", url: "https://private.example/1", evidenceIds: ["e1"] },
+              { jobId: "job-2", source: "greenhouse", url: "https://private.example/2", evidenceIds: ["e2"] },
+              { jobId: "job-3", source: "greenhouse", url: "https://private.example/3", evidenceIds: ["e3"] }],
+          },
+        } : null,
       })) }
       if (sql.includes('FROM "agent_events" AS event')) return { rows: [] }
       throw new Error(`unexpected query: ${sql}`)
@@ -144,6 +170,30 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(graphReads.every(query => query.values?.[1] === "session-1" && query.values?.[2] !== "turn-current"
       && query.values?.[0] === taskGraphItemId(String(query.values?.[3])))).toBe(true)
     expect(scan?.sql).not.toContain("turnInputDigest")
+  })
+
+  it("passes safe lessons and full counts from the already-loaded graph", async () => {
+    const failed = fixture({ typedFailure: true })
+    const failedOutcome = (await failed.store.load(failed.input))[0]
+    expect(failedOutcome?.sourceNodeOrdinals).toEqual([1])
+    expect(failedOutcome?.nodeLessons).toEqual([{ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] }])
+    expect(failedOutcome?.reportedOutputs).toBeUndefined()
+
+    const reported = fixture({ reportedOutput: true })
+    const reportedOutcome = (await reported.store.load(reported.input))[0]
+    expect(reportedOutcome?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 4, resultStatus: "partial" }])
+    expect(reportedOutcome?.nodeLessons).toBeUndefined()
+    const projection = reportedOutcome?.taskGraph.nodes[0]?.resultProjection
+    expect(projection).toMatchObject({ candidateCount: 4, candidates: expect.any(Array) })
+    if (projection?.availability !== "available" || projection.role !== "scout") throw new Error("scout result projection was unavailable")
+    expect(projection.candidates).toHaveLength(3)
+
+    for (const test of [failed, reported]) {
+      expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(1)
+      expect(test.queries.filter(query => query.sql.includes('SELECT task."id", task."status", task."role", task."taskType"'))).toHaveLength(1)
+      expect(test.queries.filter(query => query.sql.includes("'task_graph.lifecycle', 'item.started', 'item.delta'"))).toHaveLength(1)
+    }
   })
 
   it("caps the prior terminal scan and graph loads independently", async () => {
