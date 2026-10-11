@@ -1,0 +1,152 @@
+import { createHash } from "node:crypto"
+import { describe, expect, it } from "vitest"
+
+import { projectPlanLedger, type PlanLedger } from "./plan-ledger.js"
+import {
+  parseTaskGraphVerificationSummary,
+  projectTaskGraphVerificationSummary,
+  type TaskGraphVerificationSummary,
+} from "./plan-ledger-task-graph-verification-display.js"
+
+const sessionId = "session-1", turnId = "turn-1", rootTaskId = "root-1", digest = "a".repeat(64)
+const scoutCriteria = [
+  { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+  { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 2 } },
+  { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 2 } },
+]
+const analystCriteria = [
+  { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+  { id: "analyst-evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
+  { id: "finding-evidence", check: { kind: "all_findings_have_evidence", minimumItems: 1 } },
+  { id: "score", check: { kind: "reported_score_gte", minimumScore: 7, minimumFindings: 1, aggregation: "any" } },
+  { id: "from-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
+]
+
+function typedNode(key: string, taskId: string, role: "scout" | "analyst", criteria: typeof scoutCriteria, dependsOn: string[] = []) {
+  return { key, templateId: role, goal: `Private goal ${key}`, successCriteria: [`Private criterion ${key}`], dependsOn, depth: dependsOn.length + 1, taskId,
+    verificationDisposition: "typed", verification: { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role, criteria } }
+}
+function report(criteria: readonly { id: string }[], status: "passed" | "failed" | "unverified" = "passed") {
+  const criterionStatus = status === "passed" ? "passed" : status
+  const reasonCode = status === "passed" ? "criteria_met" : status === "failed" ? "criterion_not_met" : "canonical_evidence_missing"
+  return { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status, reasonCode,
+    criteria: criteria.map(item => ({ criterionId: item.id, status: criterionStatus, reasonCode })),
+    evidenceDigest: status === "unverified" ? null : digest, resultDigest: status === "unverified" ? null : "b".repeat(64) }
+}
+function result(taskGraphVerificationReport?: ReturnType<typeof report>, extra: Record<string, unknown> = {}) {
+  return { finalItemId: null, finalText: "PRIVATE_RESULT_TEXT", status: taskGraphVerificationReport?.status === "failed" ? "failed" : "completed",
+    stepCount: 2, toolCallCount: 1, structuredResult: { private: "PRIVATE_STRUCTURED_RESULT" },
+    ...(taskGraphVerificationReport ? { taskGraphVerificationReport } : {}), ...extra }
+}
+function row(id: string, role: string, status: string, resultValue: unknown = null) {
+  return { id, sessionId, turnId, rootTaskId, role, status, attemptCount: 1, failureReason: null, result: resultValue, goal: `Private row goal ${id}` }
+}
+function graph(nodes: readonly unknown[]) { return { schemaVersion: "agent-harness.v2.task-graph", nodes } }
+function projection(nodes: readonly unknown[], rows: readonly unknown[], revision = 3): PlanLedger {
+  const snapshot = graph(nodes)
+  const plan = projectPlanLedger({ sessionId, revision, rootTaskId, graph: snapshot, tasks: rows })
+  if (!plan) throw new Error("fixture_plan_projection_invalid")
+  return plan
+}
+function summary(nodes: readonly unknown[], rows: readonly unknown[], revision = 3, selected = projection(nodes, rows, revision)) {
+  return projectTaskGraphVerificationSummary({ sessionId, turnId, rootTaskId, revision, graph: graph(nodes), tasks: rows,
+    digestCanonicalJson: (canonicalJson) => createHash("sha256").update(canonicalJson).digest("hex") }, selected)
+}
+function workerDigest(value: unknown): string { return createHash("sha256").update(workerCanonicalJson(value)).digest("hex") }
+function workerCanonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return "[" + value.map(workerCanonicalJson).join(",") + "]"
+  const object = workerObject(value)
+  if (object) return "{" + Object.keys(object).sort().map(key => JSON.stringify(key) + ":" + workerCanonicalJson(object[key])).join(",") + "}"
+  const encoded = JSON.stringify(value)
+  if (encoded === undefined) throw new Error("test_json_invalid")
+  return encoded
+}
+function workerObject(value: unknown): Record<string, unknown> | null {
+  let parsed = value
+  if (typeof value === "string") { try { parsed = JSON.parse(value) as unknown } catch { return null } }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const prototype = Object.getPrototypeOf(parsed)
+  return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(parsed).length === 0
+    ? parsed as Record<string, unknown> : null
+}
+function publicReport(value: ReturnType<typeof report>) {
+  return { verifierVersion: value.verifierVersion, status: value.status, reasonCode: value.reasonCode, criteria: value.criteria,
+    evidenceDigest: value.evidenceDigest, resultDigest: value.resultDigest }
+}
+function passedResult(criteria: readonly { id: string }[], extra: Record<string, unknown> = {}) { return result(report(criteria), extra) }
+function scoutResult() {
+  return { schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed", summary: "Scout result",
+    candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://jobs.example/1", evidenceIds: ["evidence-1"] }],
+    evidence: [{ id: "evidence-1", kind: "job", ref: "job-1", source: "greenhouse" }] }
+}
+
+describe("TaskGraph verification display projection", () => {
+  it("projects all seven closed check kinds in snapshot order and omits private identities and evidence", () => {
+    const scout = typedNode("scout", "task-scout", "scout", scoutCriteria)
+    const analyst = typedNode("analyst", "task-analyst", "analyst", analystCriteria, ["scout"])
+    const scoutReport = report(scoutCriteria)
+    const bindings = [{ nodeKey: "scout", taskId: "task-scout", attemptCount: 1, nodeDigest: workerDigest(scout),
+      resultDigest: scoutReport.resultDigest, evidenceDigest: scoutReport.evidenceDigest, reportDigest: workerDigest(publicReport(scoutReport)) }]
+    const rows = [row(rootTaskId, "orchestrator", "running"), row("task-scout", "scout", "completed", passedResult(scoutCriteria, { structuredResult: scoutResult() })),
+      row("task-analyst", "analyst", "completed", passedResult(analystCriteria, { taskGraphVerificationReport: { ...report(analystCriteria), dependencyBindings: bindings } }))]
+    const value = summary([scout, analyst], rows)
+    expect(value?.nodes.map(node => node && "status" in node ? node.status : node)).toEqual(["passed", "passed"])
+    expect(value?.nodes[0]).toMatchObject({ totalCount: 3, passedCount: 3, failedCount: 0, unverifiedCount: 0 })
+    expect(value?.nodes[1]).toMatchObject({ totalCount: 5, passedCount: 5 })
+    expect(value?.nodes.flatMap(node => node && "checks" in node ? node.checks : []).map(check => check.kind)).toEqual([
+      "candidate_count_gte", "evidence_count_gte", "all_candidates_have_evidence", "finding_count_gte", "evidence_count_gte",
+      "all_findings_have_evidence", "reported_score_gte", "findings_from_scout_dependency",
+    ])
+    const serialized = JSON.stringify(value)
+    for (const privateValue of ["task-scout", "root-1", '"nodeKey":"scout"', "PRIVATE_RESULT_TEXT", "PRIVATE_STRUCTURED_RESULT", digest,
+      bindings[0]!.nodeDigest, bindings[0]!.reportDigest,
+      "criteria_met", "dependencyBindings", "dependencyNodeKey", "Private goal"]) expect(serialized).not.toContain(privateValue)
+    expect(value?.nodes[1] && "checks" in value.nodes[1] ? value.nodes[1].checks.at(-1) : null).toEqual({ kind: "findings_from_scout_dependency", status: "passed" })
+  })
+
+  it("keeps untyped nodes null and never infers a pass from completed status or missing reports", () => {
+    const scout = typedNode("scout", "task-scout", "scout", [scoutCriteria[0]])
+    const legacy = { key: "legacy", templateId: "writer", goal: "Legacy", successCriteria: ["Write"], dependsOn: [], depth: 1, taskId: "task-legacy", verificationDisposition: "legacy_unverified" }
+    const rows = [row(rootTaskId, "orchestrator", "running"), row("task-scout", "scout", "completed", result()), row("task-legacy", "writer", "completed", result())]
+    expect(summary([legacy, scout], rows)?.nodes).toEqual([null, { status: "unavailable" }])
+    const noTyped = { ...legacy, key: "other", taskId: "task-other" }
+    expect(summary([legacy, noTyped], [...rows, row("task-other", "writer", "completed", result())])).toBeNull()
+  })
+
+  it("requires ordered criteria and coherent persisted task/report status", () => {
+    const scout = typedNode("scout", "task-scout", "scout", scoutCriteria.slice(0, 2))
+    const rows = [row(rootTaskId, "orchestrator", "running"), row("task-scout", "scout", "completed", passedResult(scoutCriteria.slice(0, 2)))]
+    const wrongOrder = result({ ...report(scoutCriteria.slice(0, 2)), criteria: [...report(scoutCriteria.slice(0, 2)).criteria].reverse() })
+    expect(summary([scout], [rows[0], row("task-scout", "scout", "completed", wrongOrder)])?.nodes).toEqual([{ status: "unavailable" }])
+    const wrongStatusReport = report(scoutCriteria.slice(0, 2), "failed")
+    expect(summary([scout], [rows[0], row("task-scout", "scout", "completed", result(wrongStatusReport))])?.nodes).toEqual([{ status: "unavailable" }])
+    const invalidEnvelope = { ...passedResult(scoutCriteria.slice(0, 2)), taskGraphVerificationReport: { ...report(scoutCriteria.slice(0, 2)), schemaVersion: "wrong" } }
+    expect(summary([scout], [rows[0], row("task-scout", "scout", "completed", invalidEnvelope)])?.nodes).toEqual([{ status: "unavailable" }])
+  })
+
+  it("keeps a failed target failed beside a passing repair and rejects foreign repair lineage", () => {
+    const targetCriteria = [scoutCriteria[0]]
+    const target = typedNode("target", "task-target", "scout", targetCriteria)
+    const repair = { ...typedNode("repair", "task-repair", "scout", targetCriteria), repairOf: { graphRootTaskId: rootTaskId, nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"] } }
+    const receipt = { schemaVersion: "agent-harness.v2.task-graph-repair-receipt.v1", graphRootTaskId: rootTaskId, targetNodeKey: "target", targetTaskId: "task-target",
+      criterionIds: ["candidate-count"], repairNodeKey: "repair", repairTaskId: "task-repair", verifierVersion: "agent-harness.v2.task-graph-verifier.v1", evidenceDigest: digest }
+    const rows = [row(rootTaskId, "orchestrator", "running"), { ...row("task-target", "scout", "failed", result(report(targetCriteria, "failed"))), failureReason: "task_graph_verification_failed" },
+      row("task-repair", "scout", "completed", passedResult(targetCriteria, { taskGraphRepairReceipt: receipt }))]
+    expect(summary([target, repair], rows)?.nodes.map(node => node && "status" in node ? node.status : node)).toEqual(["failed", "passed"])
+    const foreignRepair = { ...repair, repairOf: { ...repair.repairOf, graphRootTaskId: "other-root" } }
+    expect(summary([target, foreignRepair], rows)?.nodes[1]).toEqual({ status: "unavailable" })
+  })
+
+  it("rejects malformed or internally inconsistent untrusted sidecars", () => {
+    const valid: TaskGraphVerificationSummary = { schemaVersion: 1, nodes: [{ status: "failed", checks: [
+      { kind: "candidate_count_gte", minimum: 2, status: "failed" },
+    ], totalCount: 1, passedCount: 0, failedCount: 1, unverifiedCount: 0 }] }
+    expect(parseTaskGraphVerificationSummary(valid, 1)).toEqual(valid)
+    expect(parseTaskGraphVerificationSummary({ ...valid, nodes: [{ ...valid.nodes[0], passedCount: 1 }] }, 1)).toBeNull()
+    expect(parseTaskGraphVerificationSummary({ ...valid, nodes: [{ ...valid.nodes[0], status: "passed" }] }, 1)).toBeNull()
+    expect(parseTaskGraphVerificationSummary({ ...valid, private: "raw result" }, 1)).toBeNull()
+    expect(parseTaskGraphVerificationSummary({ schemaVersion: 1, nodes: [{ status: "unverified", checks: [
+      { kind: "finding_count_gte", minimum: 1, status: "passed" }, { kind: "finding_count_gte", minimum: 2, status: "failed" },
+    ], totalCount: 2, passedCount: 1, failedCount: 1, unverifiedCount: 0 }] }, 1)).toBeNull()
+  })
+})

@@ -115,6 +115,41 @@ describe('TaskGraphPlanPanel', () => {
     } finally { vi.unstubAllGlobals() }
   })
 
+  it('renders only a valid identity-matched positional verification sidecar and preserves legacy plans', () => {
+    const verification = { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'scout', criteria: [
+      { id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 2 } },
+    ] }
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'scout', templateId: 'scout', goal: 'Find candidates', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'task-a', verification, verificationDisposition: 'typed' },
+    ] })]
+    const ownedTasks: SupervisorTaskSummary[] = [
+      { ...tasks[0]!, goal: 'Root plan' },
+      { ...tasks[1]!, id: 'task-a', role: 'scout', taskType: 'scout', goal: 'Find candidates', status: 'completed' },
+    ]
+    const projection = projectCurrentTaskGraph(graphItems, ownedTasks, 'session-1')!
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const panel = (ledger: unknown) => renderToStaticMarkup(<TaskGraphPlanPanel sessionId="session-1" items={graphItems} tasks={ownedTasks} ledger={ledger} />)
+    const summary = { schemaVersion: 1, nodes: [{ status: 'unverified', checks: [
+      { kind: 'candidate_count_gte', minimum: 2, status: 'passed' },
+    ], totalCount: 1, passedCount: 1, failedCount: 0, unverifiedCount: 0 }] }
+    const accepted = panel({ identity, projection, verificationSummary: summary })
+    expect(accepted).toContain('Verification: Not verified')
+    expect(accepted).toContain('Completed')
+    expect(accepted).toContain('At least this many candidates: 2')
+    expect(accepted).toContain('data-task-graph-verification="unverified"')
+
+    const legacy = panel({ identity, projection })
+    expect(legacy).toContain('Find candidates')
+    expect(legacy).not.toContain('data-task-graph-verification=')
+    const invalidOptional = panel({ identity, projection, verificationSummary: { ...summary, extra: 'PRIVATE_RAW_REPORT' } })
+    expect(invalidOptional).toContain('Find candidates')
+    expect(invalidOptional).not.toContain('PRIVATE_RAW_REPORT')
+    expect(invalidOptional).not.toContain('data-task-graph-verification=')
+
+    const foreign = panel({ identity: { ...identity, graphItemId: 'other-graph' }, projection, verificationSummary: summary })
+    expect(foreign).not.toContain('data-task-graph-verification=')
+  })
+
   it('rejects a valid but stale Plan Ledger from another session', () => {
     const foreignItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
       { key: 'foreign', templateId: 'scout', goal: 'CROSS_SESSION_LEDGER_SECRET', successCriteria: ['criterion'], dependsOn: [], depth: 1, taskId: 'foreign-task' },
