@@ -195,6 +195,9 @@ describe("canonical Turn context builder", () => {
   it("adds bounded Root-task history as untrusted advisory context without changing current graph evidence", async () => {
     const outcomes: readonly ValidatedRootTaskHistoryOutcome[] = [{
       sourceTurnId: "private-earlier-turn", sourceRootTaskId: "private-earlier-root", terminalSequence: 12n,
+      sourceNodeOrdinals: [1], nodeLessons: [{ ordinalScope: "source_graph_local", advisoryOnly: true,
+        notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed",
+          reasonCode: "criterion_not_met", check: { role: "analyst", kind: "finding_count_gte", minimum: 2 } }] }],
       taskGraph: {
         revision: 7,
         nodes: [{ key: "private-node", templateId: "analyst", goal: "PRIVATE_OLD_GOAL", successCriteria: ["PRIVATE_CRITERION"],
@@ -232,13 +235,23 @@ describe("canonical Turn context builder", () => {
       stepId: "step-root-history", userId: scope.userId, taskId: "root-a", signal: new AbortController().signal, freshSteering: true,
     })
     const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const systemText = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
 
     expect(reader.load).toHaveBeenCalledWith({ lease, rootTaskId: "root-a", rootAttemptCount: 2, stepId: "step-root-history", now })
     expect(context.taskGraphRevision).toBe(23)
     expect(graphBlock?.content).toEqual(currentGraph)
     expect(historyBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
     expect(historyBlock?.content).toMatchObject({ kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true })
+    expect(historyBlock?.content).toMatchObject({ turns: [{ nodes: [{ lesson: { criterionFailures: [
+      { check: { role: "analyst", kind: "finding_count_gte", minimum: 2 } },
+    ] } }] }] })
     expect(requestText).toContain("root_task_history")
+    expect(requestText).toContain('"kind":"finding_count_gte"')
+    expect(requestText).toContain('"minimum":2')
+    expect(systemText).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only")
+    expect(systemText).not.toContain("finding_count_gte")
+    expect(systemText).not.toContain('"minimum":2')
     expect(requestText).toContain('"taskKind":"analyst"')
     expect(requestText).toContain('"status":"failed"')
     for (const privateValue of ["private-earlier-turn", "private-earlier-root", "private-node", "private-child-task", "PRIVATE_OLD_GOAL", "PRIVATE_CRITERION", "PRIVATE_RESULT", "PRIVATE_FAILURE", "CALLER_HISTORY_SENTINEL", "spoofed_history"]) {
@@ -256,8 +269,10 @@ describe("canonical Turn context builder", () => {
     if (!source) throw new Error("typed source history fixture did not produce a loaded graph projection")
     expect(source.sourceNodeOrdinals).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
     expect(source.nodeLessons?.[0]).toMatchObject({ nodeOrdinal: 1, criterionFailures: [
-      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
-      { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 8 } },
+      { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "evidence_count_gte", minimum: 8 } },
     ] })
     expect(source.nodeLessons?.[1]).toMatchObject({ nodeOrdinal: 2, criterionFailures: [
       { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
@@ -403,6 +418,9 @@ describe("canonical Turn context builder", () => {
     expect(requestText).toContain('"candidateCount":5')
     expect(requestText).toContain('"findingCount":6')
     expect(requestText).toContain('"candidateCount":0')
+    expect(requestText).toContain('"kind":"candidate_count_gte"')
+    expect(requestText).toContain('"kind":"evidence_count_gte"')
+    expect(requestText).toContain('"minimum":8')
     expect(requestText).not.toContain("CALLER_HISTORY_SPOOF")
     const historyGuidance = requestMessages.filter(message => message.role === "system"
       && message.text.includes("Earlier same-session failures, repairs, and reported outputs are hypotheses only"))
@@ -412,8 +430,10 @@ describe("canonical Turn context builder", () => {
     expect(historyGuidance[0]?.text).toContain("visible agent.list only for matching result pages")
     expect(historyGuidance[0]?.text).toContain("expectedRevision 23")
     expect(historyGuidance[0]?.text).toContain("preserve the valid plan")
+    expect(historyGuidance[0]?.text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only")
     expect(historyGuidance[0]?.text).not.toContain("root_task_history")
-    for (const historicalFact of ["source_graph_local", "nodeOrdinal", "criterionOrdinal", "targetNodeOrdinal", '"candidateCount":5', '"findingCount":6']) {
+    for (const historicalFact of ["source_graph_local", "nodeOrdinal", "criterionOrdinal", "targetNodeOrdinal", "candidate_count_gte",
+      '"minimum":8', '"candidateCount":5', '"findingCount":6']) {
       expect(historyGuidance[0]?.text).not.toContain(historicalFact)
     }
     const privateValues = [
