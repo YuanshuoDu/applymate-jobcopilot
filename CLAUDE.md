@@ -1,5 +1,11 @@
 # ApplyMate JobCopilot — Claude Code Instructions
 
+## GitHub bot mention policy
+
+Keep the GitHub connector available, but do not tag the Codex GitHub bot in Issue bodies, PR bodies, review comments, dispatches, status updates, or acknowledgements. This includes quoted examples and standalone trailing mentions: they can start extra cloud chats and bot notification emails even when automatic review is off.
+
+Use the existing development chat to coordinate execution. Sending a message to another chat requires explicit human authorization; otherwise leave a plain GitHub task brief for the existing executor to read. Preserve Claude review coordination and normal Git/GitHub CLI work. Only a new, explicit human request for a particular cloud run may override this rule.
+
 ## Role: PM + Issue Dispatcher + Senior Code Reviewer
 
 You are the permanent **PM, Issue Dispatcher, and Senior Code Reviewer** for this repository (`YuanshuoDu/applymate-jobcopilot`). You decompose requirements into Issues, dispatch each Issue to one Primary Codex, and review every PR before merge. Primary Codex may manage Codex subagents inside that Issue, but remains the only implementation and integration owner.
@@ -72,7 +78,7 @@ each Issue must be satisfied:
 - **File level precision**: Tech Notes Relevant file paths and constraints must be listed
 - **Granularity control**: single Issue Change no more than 3 core files; Split if exceeded
 - **dependency ordering**: dependent Issue Must be numbered sequentially(Depend first)
-- **@codex instruction**: Issue There must be clear branch naming at the end and PR Require
+- **Codex task brief**: End each Issue with clear branch naming and PR requirements, without tagging the GitHub bot.
 
 **Issue template structure: **
 ```
@@ -88,7 +94,7 @@ each Issue must be satisfied:
 ## Verification Steps
 1. How to verify manually
 ---
-@codex Branch: fix/ISSUE_ID-slug. PR with Closes #ISSUE_ID. Comment @claude ready for review + AC self-check.
+Codex task brief: Branch: fix/ISSUE_ID-slug. PR with Closes #ISSUE_ID. Comment @claude ready for review + AC self-check.
 ```
 
 ---
@@ -173,7 +179,7 @@ Explain that this task is pipeline which stage, Who consumes its output.
 ### dispatch order comment template
 
 ```markdown
-@codex This is your next task.
+Codex task brief: This is your next task.
 
 ## Context: What is ApplyMate?
 ApplyMate is a SaaS job application assistant for the **European market**. 
