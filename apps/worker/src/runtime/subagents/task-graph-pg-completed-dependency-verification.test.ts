@@ -18,6 +18,9 @@ vi.mock("./task-graph-pg-verification.js", async (importOriginal) => {
 beforeEach(() => vi.mocked(verification.verifyCompletedTaskGraphNodeEvidence).mockReset())
 
 const scope: GraphIdentityScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+const customScoutEnvelope = {
+  role: "scout", taskType: "research", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, allowedActions: ["jobs.search"],
+} as const
 const sourceVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidates", check: { kind: "candidate_count_gte", minimum: 1 } }] } as const
 const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } }] } as const
 function graph(overrides: { source?: Record<string, unknown>; analyst?: Record<string, unknown>; sourceTask?: Record<string, unknown>; sourceResult?: unknown } = {}): { snapshot: TaskGraphSnapshot; analyst: TaskGraphSnapshot["nodes"][number]; task: Record<string, unknown> } {
@@ -31,6 +34,89 @@ function graph(overrides: { source?: Record<string, unknown>; analyst?: Record<s
 }
 
 describe("verifyCompletedScoutDependencies", () => {
+  it("accepts a declared custom Scout envelope when the completed task and recomputed report match it", async () => {
+    const value = graph({
+      source: { registeredScoutEnvelope: customScoutEnvelope },
+      sourceTask: {
+        taskType: customScoutEnvelope.taskType,
+        expectedOutputSchema: JSON.stringify(customScoutEnvelope.expectedOutputSchema),
+        allowedActions: customScoutEnvelope.allowedActions,
+      },
+    })
+    const query = vi.fn(async () => ({ rows: [value.task], rowCount: 1 }))
+    const projection: TaskGraphVerificationEvidenceProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [{ jobId: "job-1", evidenceIds: ["job-evidence"] }], evidenceIds: ["job-evidence"] }
+    const report: TaskGraphVerificationReport = { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }
+    const evaluation: TaskGraphVerificationEvaluation = { status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }] }
+    vi.mocked(verification.verifyCompletedTaskGraphNodeEvidence).mockResolvedValue({ verified: true, report, evaluation, projection, structuredResult: value.task.result })
+
+    const proof = await verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, value.snapshot, value.analyst)
+
+    expect(proof?.projections.get("scout")).toEqual(projection)
+    expect(proof?.bindings).toHaveLength(1)
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      scope: { ...scope, taskId: "scout-task", attemptCount: 2 },
+      node: expect.objectContaining({ registeredScoutEnvelope: customScoutEnvelope }),
+    }))
+    expect(query).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["task type", { taskType: "job_discovery" }],
+    ["allowed actions", { allowedActions: ["jobs.search", "jobs.get"] }],
+    ["output schema", { expectedOutputSchema: { schemaVersion: "other", role: "scout" } }],
+  ])("rejects a custom Scout whose persisted %s differs from its registered envelope", async (_name, taskMutation) => {
+    const value = graph({
+      source: { registeredScoutEnvelope: customScoutEnvelope },
+      sourceTask: { taskType: "research", expectedOutputSchema: customScoutEnvelope.expectedOutputSchema,
+        allowedActions: customScoutEnvelope.allowedActions, ...taskMutation },
+    })
+    const query = vi.fn(async () => ({ rows: [value.task], rowCount: 1 }))
+
+    await expect(verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, value.snapshot, value.analyst)).resolves.toBeNull()
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).not.toHaveBeenCalled()
+  })
+
+  it("fails closed for an unbound custom Scout with inherited grants and for a malformed registered envelope", async () => {
+    const unbound = graph({ sourceTask: { taskType: "research", allowedActions: ["agent.plan"] } })
+    const unboundQuery = vi.fn(async () => ({ rows: [unbound.task], rowCount: 1 }))
+    await expect(verifyCompletedScoutDependencies({ query: unboundQuery } as unknown as Pick<pg.PoolClient, "query">, scope, unbound.snapshot, unbound.analyst)).resolves.toBeNull()
+    expect(unboundQuery).toHaveBeenCalledOnce()
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).not.toHaveBeenCalled()
+
+    const malformed = graph({ source: { registeredScoutEnvelope: { ...customScoutEnvelope, unexpected: true } } })
+    const malformedQuery = vi.fn(async () => ({ rows: [malformed.task], rowCount: 1 }))
+    await expect(verifyCompletedScoutDependencies({ query: malformedQuery } as unknown as Pick<pg.PoolClient, "query">, scope, malformed.snapshot, malformed.analyst)).resolves.toBeNull()
+    expect(malformedQuery).not.toHaveBeenCalled()
+  })
+
+  it("does not let an empty-action registered Scout fall back to a built-in envelope when the row inherited those grants", async () => {
+    const emptyActionTemplate = {
+      ...customScoutEnvelope, taskType: TASK_GRAPH_TEMPLATES.scout.taskType, allowedActions: [],
+    }
+    const value = graph({
+      source: { registeredScoutEnvelope: emptyActionTemplate },
+      sourceTask: { taskType: TASK_GRAPH_TEMPLATES.scout.taskType, allowedActions: TASK_GRAPH_TEMPLATES.scout.allowedActions },
+    })
+    const query = vi.fn(async () => ({ rows: [value.task], rowCount: 1 }))
+
+    await expect(verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, value.snapshot, value.analyst)).resolves.toBeNull()
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { name: "default Scout", allowedActions: TASK_GRAPH_TEMPLATES.scout.allowedActions },
+    { name: "selected-job Scout", allowedActions: ["jobs.get"] },
+  ])("keeps the exact legacy $name envelope accepted when undeclared", async ({ allowedActions }) => {
+    const value = graph({ sourceTask: { allowedActions } })
+    const query = vi.fn(async () => ({ rows: [value.task], rowCount: 1 }))
+    const projection: TaskGraphVerificationEvidenceProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [{ jobId: "job-1", evidenceIds: ["job-evidence"] }], evidenceIds: ["job-evidence"] }
+    const report: TaskGraphVerificationReport = { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }
+    const evaluation: TaskGraphVerificationEvaluation = { status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }] }
+    vi.mocked(verification.verifyCompletedTaskGraphNodeEvidence).mockResolvedValue({ verified: true, report, evaluation, projection, structuredResult: value.task.result })
+
+    await expect(verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, value.snapshot, value.analyst)).resolves.toMatchObject({ projections: expect.any(Map) })
+  })
+
   it("binds only the fresh full-source proof to current node, task attempt and six-field report digests", async () => {
     const value = graph()
     const query = vi.fn(async (sql: string) => {
@@ -71,11 +157,25 @@ describe("verifyCompletedScoutDependencies", () => {
     ["foreign role", { sourceTask: { role: "analyst" } }],
     ["unsupported task type", { sourceTask: { taskType: "research" } }],
     ["tampered tools", { sourceTask: { allowedActions: ["jobs.search", "application.submit"] } }],
+    ["oversized action list", { sourceTask: { allowedActions: Array.from({ length: 33 }, () => "jobs.search") } }],
+    ["sparse action list", { sourceTask: { allowedActions: new Array<string>(1) } }],
     ["wrong output marker", { sourceTask: { expectedOutputSchema: { schemaVersion: "other", role: "scout" } } }],
   ])("rejects %s source metadata", async (_name, overrides) => {
     const value = graph(overrides)
     const query = vi.fn(async () => ({ rows: [value.task], rowCount: 1 }))
     await expect(verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, value.snapshot, value.analyst)).resolves.toBeNull()
     expect(verification.verifyCompletedTaskGraphNodeEvidence).not.toHaveBeenCalled()
+  })
+
+  it("rejects a stored passed report that differs from the fresh canonical report", async () => {
+    const value = graph()
+    const query = vi.fn(async () => ({ rows: [value.task], rowCount: 1 }))
+    const projection: TaskGraphVerificationEvidenceProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [{ jobId: "job-1", evidenceIds: ["job-evidence"] }], evidenceIds: ["job-evidence"] }
+    const report: TaskGraphVerificationReport = { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "c".repeat(64), resultDigest: "b".repeat(64) }
+    const evaluation: TaskGraphVerificationEvaluation = { status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }] }
+    vi.mocked(verification.verifyCompletedTaskGraphNodeEvidence).mockResolvedValue({ verified: true, report, evaluation, projection, structuredResult: value.task.result })
+
+    await expect(verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, value.snapshot, value.analyst)).resolves.toBeNull()
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).toHaveBeenCalledOnce()
   })
 })

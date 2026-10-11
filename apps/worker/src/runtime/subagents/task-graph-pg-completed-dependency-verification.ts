@@ -44,8 +44,7 @@ export async function verifyCompletedScoutDependencies(
     if (!task || task.id !== source.taskId || task.sessionId !== scope.sessionId || task.turnId !== scope.turnId
       || task.rootTaskId !== scope.rootTaskId || task.parentTaskId !== scope.parentTaskId || task.turnRootTaskId !== scope.rootTaskId
       || task.userId !== scope.userId || task.status !== "completed" || task.failureReason !== null || task.role !== "scout"
-      || task.taskType !== TASK_GRAPH_TEMPLATES.scout.taskType || !validAttempt(task.attemptCount)
-      || !validScoutEnvelope(task.expectedOutputSchema, task.allowedActions)) return null
+      || !validAttempt(task.attemptCount) || !validScoutEnvelope(source, task.taskType, task.expectedOutputSchema, task.allowedActions)) return null
     const envelope = parseObject(task.result)
     if (!envelope || envelope.status !== "completed" || !Object.hasOwn(envelope, "structuredResult")) return null
     const criterionIds = source.verification.criteria.map(criterion => criterion.id)
@@ -76,14 +75,26 @@ export async function verifyRepairedTaskGraphFindings(
   return Boolean(proof && node.verification && evaluateTaskGraphVerification(node.verification, projection, proof.projections).status === "passed")
 }
 
-function validScoutEnvelope(schema: unknown, actions: unknown): boolean {
+function validScoutEnvelope(source: StoredTaskGraphNode, taskType: unknown, schema: unknown, actions: unknown): boolean {
   const marker = parseObject(schema)
-  if (!marker || Reflect.ownKeys(marker).sort().join(",") !== "role,schemaVersion"
+  if (!marker || !Reflect.ownKeys(marker).every(key => typeof key === "string")
+    || Reflect.ownKeys(marker).sort().join(",") !== "role,schemaVersion"
     || marker.schemaVersion !== ROLE_RESULT_SCHEMA || marker.role !== "scout") return false
-  if (!Array.isArray(actions) || Reflect.ownKeys(actions).length !== actions.length + 1
-    || actions.some(action => typeof action !== "string")) return false
+  if (!Array.isArray(actions) || actions.length > 32 || !Reflect.ownKeys(actions).every(key => key === "length"
+    || typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < actions.length)
+    || Reflect.ownKeys(actions).length !== actions.length + 1
+    || Array.from({ length: actions.length }, (_, index) => {
+      const action = actions[index]
+      return typeof action === "string" && action.trim().length > 0 && action.length <= 128
+    }).some(valid => !valid)) return false
   const exact = (expected: readonly string[]) => actions.length === expected.length && actions.every((action, index) => action === expected[index])
-  return exact(TASK_GRAPH_TEMPLATES.scout.allowedActions) || exact(["jobs.get"])
+  const registered = source.registeredScoutEnvelope
+  if (registered) return taskType === registered.taskType
+    && canonicalTaskGraphJson(marker) === canonicalTaskGraphJson(registered.expectedOutputSchema)
+    && exact(registered.allowedActions)
+  return taskType === TASK_GRAPH_TEMPLATES.scout.taskType
+    && canonicalTaskGraphJson(marker) === canonicalTaskGraphJson(TASK_GRAPH_TEMPLATES.scout.expectedOutputSchema)
+    && (exact(TASK_GRAPH_TEMPLATES.scout.allowedActions) || exact(["jobs.get"]))
 }
 function validAttempt(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 1 }
 function digest(value: unknown): string { return createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex") }

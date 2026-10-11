@@ -8,6 +8,11 @@ const base = {
 }
 const criterion = { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }
 const verification = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout", criteria: [criterion] }
+const registeredScoutEnvelope = {
+  role: "scout", taskType: "research",
+  expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "scout" },
+  allowedActions: ["jobs.search"],
+}
 const digest = "a".repeat(64)
 const report = {
   verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
@@ -35,6 +40,12 @@ const nativeDelegation = {
 describe("Plan Ledger persisted TaskGraph metadata", () => {
   it("projects typed, repaired, legacy, and specialized shapes without metadata", () => {
     const typed = parsePersistedTaskGraphNode({ ...base, verification, verificationDisposition: "typed" })
+    const registered = parsePersistedTaskGraphNode({
+      ...base, verification, verificationDisposition: "typed", registeredScoutEnvelope,
+    })
+    const inheritedActions = parsePersistedTaskGraphNode({
+      ...base, verification, verificationDisposition: "typed", registeredScoutEnvelope: { ...registeredScoutEnvelope, allowedActions: [] },
+    })
     const repaired = parsePersistedTaskGraphNode({
       ...base, key: "scout-repair", taskId: "task-repair", verification, verificationDisposition: "typed",
       repairOf: { graphRootTaskId: "root-1", nodeKey: "scout", taskId: "task-scout", criterionIds: ["candidate-count"] },
@@ -43,6 +54,9 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
     const specialized = parsePersistedTaskGraphNode({ ...base, templateId: "cover_letter_writer", verificationDisposition: "specialized" })
 
     expect(typed).toEqual(base)
+    expect(registered).toEqual(base)
+    expect(inheritedActions).toEqual(base)
+    expect(registered).not.toHaveProperty("registeredScoutEnvelope")
     expect(repaired).toMatchObject({ key: "scout-repair", taskId: "task-repair" })
     expect(repaired).not.toHaveProperty("repairOf")
     expect(legacy).toEqual(base)
@@ -84,6 +98,7 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
   })
 
   it("rejects unknown persisted shapes and malformed typed or repair metadata", () => {
+    const sparseActions = new Array<string>(1)
     const invalid = [
       { ...base, verification },
       { ...base, verificationDisposition: "typed" },
@@ -103,6 +118,12 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
       { ...base, verificationDisposition: "typed", verification, repairOf: { graphRootTaskId: "root", nodeKey: "node", taskId: "task", criterionIds: ["not stable"] } },
       { ...base, verificationDisposition: "typed", verification, repairOf: { graphRootTaskId: "root", nodeKey: "node", taskId: "task", criterionIds: ["a".repeat(65)] } },
       { ...base, private: true },
+      { ...base, verificationDisposition: "typed", verification, registeredScoutEnvelope: { ...registeredScoutEnvelope, role: "analyst" } },
+      { ...base, verificationDisposition: "typed", verification, registeredScoutEnvelope: { ...registeredScoutEnvelope, taskType: " " } },
+      { ...base, verificationDisposition: "typed", verification, registeredScoutEnvelope: { ...registeredScoutEnvelope, unexpected: true } },
+      { ...base, verificationDisposition: "typed", verification, registeredScoutEnvelope: { ...registeredScoutEnvelope, allowedActions: [" "] } },
+      { ...base, verificationDisposition: "typed", verification, registeredScoutEnvelope: { ...registeredScoutEnvelope, allowedActions: sparseActions } },
+      { ...base, templateId: "analyst", verificationDisposition: "typed", verification: { ...verification, role: "analyst" }, registeredScoutEnvelope },
     ]
     for (const node of invalid) expect(parsePersistedTaskGraphNode(node)).toBeNull()
   })

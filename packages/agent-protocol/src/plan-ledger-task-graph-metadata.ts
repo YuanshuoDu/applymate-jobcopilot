@@ -8,6 +8,7 @@ const REPAIR_KEYS = "dependsOn,depth,goal,key,repairOf,successCriteria,taskId,te
 const VERIFICATION_VERSION = "agent-harness.v2.task-graph-verification.v1"
 const VERIFIER_VERSION = "agent-harness.v2.task-graph-verifier.v1"
 const RECEIPT_VERSION = "agent-harness.v2.task-graph-repair-receipt.v1"
+const ROLE_RESULT_SCHEMA = "agent-harness.v2.subagent.result"
 const CRITERION_ID = /^[a-z][a-z0-9._-]{0,63}$/
 const DIGEST = /^[a-f0-9]{64}$/
 const REPORT_REASONS = new Set([
@@ -26,6 +27,10 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function exact(value: Record<string, unknown>, keys: string): boolean {
   return Reflect.ownKeys(value).sort().join(",") === keys
+}
+function exactNodeKeys(value: Record<string, unknown>, keys: string): boolean {
+  return exact(value, keys) || Object.hasOwn(value, "registeredScoutEnvelope")
+    && Reflect.ownKeys(value).filter(key => key !== "registeredScoutEnvelope").sort().join(",") === keys
 }
 
 function dense(value: unknown, min: number, max: number): value is unknown[] {
@@ -77,6 +82,15 @@ function verification(value: unknown, templateId: unknown): boolean {
   })
 }
 
+function registeredScoutEnvelope(value: unknown, templateId: unknown, disposition: unknown): boolean {
+  if (templateId !== "scout" || disposition !== "typed" || !record(value)
+    || !exact(value, "allowedActions,expectedOutputSchema,role,taskType") || value.role !== "scout" || !boundedId(value.taskType)
+    || !record(value.expectedOutputSchema) || !exact(value.expectedOutputSchema, "role,schemaVersion")
+    || value.expectedOutputSchema.schemaVersion !== ROLE_RESULT_SCHEMA || value.expectedOutputSchema.role !== "scout"
+    || !dense(value.allowedActions, 0, 32)) return false
+  return value.allowedActions.every(action => typeof action === "string" && action.trim().length > 0 && action.length <= 128)
+}
+
 function repairOf(value: unknown): boolean {
   if (!record(value) || !exact(value, "criterionIds,graphRootTaskId,nodeKey,taskId")
     || !boundedId(value.graphRootTaskId) || !boundedId(value.nodeKey) || !boundedId(value.taskId)
@@ -91,11 +105,13 @@ export function parsePersistedTaskGraphNode(value: unknown): TaskGraphSnapshotNo
     const nativeDeclared = Object.hasOwn(value, "nativeDelegation") || value.templateId === "native"
     const native = isStrictNativeTaskGraphNode(value)
     if (nativeDeclared && !native) return null
+    if (Object.hasOwn(value, "registeredScoutEnvelope")
+      && !registeredScoutEnvelope(value.registeredScoutEnvelope, value.templateId, value.verificationDisposition)) return null
     const shape = native ? "native"
-      : exact(value, BASE_KEYS) ? "base"
-      : exact(value, DISPOSITION_KEYS) ? "disposition"
-        : exact(value, VERIFICATION_KEYS) ? "verification"
-          : exact(value, REPAIR_KEYS) ? "repair" : null
+      : exactNodeKeys(value, BASE_KEYS) ? "base"
+      : exactNodeKeys(value, DISPOSITION_KEYS) ? "disposition"
+        : exactNodeKeys(value, VERIFICATION_KEYS) ? "verification"
+          : exactNodeKeys(value, REPAIR_KEYS) ? "repair" : null
     if (!shape) return null
     const hasVerification = Object.hasOwn(value, "verification")
     const disposition = shape === "base" ? (hasVerification ? "typed" : "legacy_unverified") : value.verificationDisposition

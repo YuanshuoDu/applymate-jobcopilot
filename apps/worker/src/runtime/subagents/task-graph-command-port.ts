@@ -11,6 +11,7 @@ import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphN
 import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
 import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -129,6 +130,40 @@ export type TaskGraphScheduleInput = Readonly<{
   proposal: TaskGraphProposal
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
 }>
+
+export type RegisteredScoutEnvelope = Readonly<{
+  role: "scout"
+  taskType: string
+  expectedOutputSchema: Readonly<{ schemaVersion: typeof ROLE_RESULT_SCHEMA; role: "scout" }>
+  allowedActions: readonly string[]
+}>
+
+export function parseRegisteredScoutEnvelope(value: unknown): RegisteredScoutEnvelope | undefined {
+  if (!exactRecord(value, "allowedActions,expectedOutputSchema,role,taskType") || value.role !== "scout"
+    || !boundedString(value.taskType, 128) || !exactRecord(value.expectedOutputSchema, "role,schemaVersion")
+    || value.expectedOutputSchema.schemaVersion !== ROLE_RESULT_SCHEMA || value.expectedOutputSchema.role !== "scout"
+    || !scoutActions(value.allowedActions)) return undefined
+  return { role: "scout", taskType: value.taskType,
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, allowedActions: [...value.allowedActions] }
+}
+
+export function taskGraphNodeKeysMatch(value: Record<string, unknown>, keys: string): boolean {
+  const actual = Reflect.ownKeys(value)
+  if (!actual.every((key): key is string => typeof key === "string")) return false
+  const sorted = actual.sort().join(",")
+  return sorted === keys || Object.hasOwn(value, "registeredScoutEnvelope")
+    && actual.filter(key => key !== "registeredScoutEnvelope").join(",") === keys
+}
+
+function scoutActions(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > 32 || Reflect.ownKeys(value).length !== value.length + 1
+    || !Reflect.ownKeys(value).every(key => key === "length" || typeof key === "string"
+      && /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < value.length)) return false
+  return Array.from({ length: value.length }, (_, index) => {
+    const action = value[index]
+    return typeof action === "string" && action.trim().length > 0 && action.length <= 128
+  }).every(Boolean)
+}
 
 /** Ownership fence for reads; it is never populated from model-controlled input. */
 export type TaskGraphReadScope = Omit<TaskGraphExecutionScope, "stepId">
