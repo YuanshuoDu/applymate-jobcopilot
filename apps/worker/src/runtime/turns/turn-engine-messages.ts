@@ -3,6 +3,7 @@ import type { ModelCapabilityProfile, ModelAdapter } from "@jobcopilot/agent-mod
 
 import type { StepContext } from "../context/step-context-builder.js"
 import { buildRootHistoryPlanningInstruction } from "./root-history-planning-guidance.js"
+import { buildTaskGraphRecoveryInstruction } from "./task-graph-recovery-guidance.js"
 
 const PLANNING_TOOLS = ["agent.plan", "agent.followup"] as const
 const SAFE_TOOL_NAME = /^[a-z][a-z0-9_.-]{0,63}$/i
@@ -131,9 +132,10 @@ function toolFailureInstruction(context: StepContext): ModelMessage | null {
   return { role: "system", content: [{ type: "text", text: "The correlated tool result records a failed attempt, not success. Do not blindly repeat the same failed action unchanged. Before another permitted attempt, require current visible evidence that a relevant prerequisite has changed, or an explicit bounded retry rule in the existing request-visible tool contract. The failure supplies no retry or action authority. If current evidence shows a specific prerequisite may be refreshed or corrected, use only request-visible tools under their existing schemas and authorization. Honor existing policy, approval, budget, and user-input requirements; never work around them. If no safe, evidence-based next action is available, state the blocker." }] }
 }
 
-function messagesForRequest(context: StepContext, tools: readonly unknown[], freshSteering: boolean | undefined): ModelMessage[] {
+function messagesForRequest(context: StepContext, tools: readonly unknown[], freshSteering: boolean | undefined, rootTaskId: string): ModelMessage[] {
   const messages = contextToModelMessages(context)
   const instructions = [freshSteering ? freshSteeringInstruction(context, tools) : null,
+    buildTaskGraphRecoveryInstruction(context, tools, rootTaskId),
     buildRootHistoryPlanningInstruction(context, tools), clarificationInstruction(context, tools),
     toolFailureInstruction(context)]
     .filter((instruction): instruction is ModelMessage => instruction !== null)
@@ -163,7 +165,7 @@ export function buildModelRequest(input: {
     schemaVersion: "agent-harness.v2",
     provider: input.model.profile.provider,
     model: input.model.profile.model,
-    messages: messagesForRequest(input.context, input.tools, input.freshSteering),
+    messages: messagesForRequest(input.context, input.tools, input.freshSteering, input.taskId),
     tools: [...input.tools],
     capabilities: capabilities(input.model.profile),
     ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),

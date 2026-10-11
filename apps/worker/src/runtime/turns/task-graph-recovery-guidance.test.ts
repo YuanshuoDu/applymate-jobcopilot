@@ -1,0 +1,200 @@
+import { describe, expect, it } from "vitest"
+import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
+import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
+import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { buildTaskGraphRecoveryInstruction } from "./task-graph-recovery-guidance.js"
+
+const REVISION = 5
+const ROOT_ID = "root-current"
+const FEEDBACK_LEAD = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
+const FEEDBACK = `${FEEDBACK_LEAD} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met repair=missing`
+const CHECK = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+  criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 4 } }] }
+const UNAVAILABLE_PROJECTION = { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "unavailable" as const }
+const digest = "a".repeat(64)
+
+function report(status: "failed" | "passed") {
+  const criterionStatus = status === "passed" ? "passed" as const : "failed" as const
+  const reasonCode = status === "passed" ? "criteria_met" as const : "criterion_not_met" as const
+  return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status, reasonCode,
+    criteria: [{ criterionId: "candidate-count", status: criterionStatus, reasonCode }],
+    evidenceDigest: digest, resultDigest: "b".repeat(64) }
+}
+
+function sourceNode(): TaskGraphCurrentNode {
+  return { key: "research", taskId: "child-private", templateId: "scout", goal: "private goal text",
+    successCriteria: ["Return verified evidence"], dependsOn: [], status: "failed", readiness: "terminal",
+    resultSummary: null, failureReason: null, resultProjection: UNAVAILABLE_PROJECTION,
+    verificationCriterionIds: ["candidate-count"], verification: CHECK, verificationReport: report("failed") }
+}
+
+function extraNode(index: number): TaskGraphCurrentNode {
+  return { key: `other-${index}`, taskId: `task-${index}`, templateId: "other", goal: "Other node",
+    successCriteria: ["Complete"], dependsOn: [], status: "queued", readiness: "ready", resultSummary: null,
+    failureReason: null, resultProjection: UNAVAILABLE_PROJECTION }
+}
+
+function repairNode(status: "queued" | "failed" | "cancelled"): TaskGraphCurrentNode {
+  return { key: "repair-attempt", taskId: "repair-private", templateId: "scout", goal: "private repair goal",
+    successCriteria: ["Repair evidence"], dependsOn: [], status, readiness: status === "queued" ? "active" : "terminal",
+    resultSummary: null, failureReason: null, resultProjection: UNAVAILABLE_PROJECTION,
+    verificationCriterionIds: ["candidate-count"], verification: CHECK,
+    ...(status === "failed" ? { verificationReport: report("failed") } : {}),
+    repairOf: { graphRootTaskId: ROOT_ID, nodeKey: "research", taskId: "child-private", criterionIds: ["candidate-count"] } }
+}
+
+function unresolvedSource(index: number): TaskGraphCurrentNode {
+  return { ...sourceNode(), key: `research-${index}`, taskId: `child-${index}` }
+}
+
+function unresolvedRepair(index: number): TaskGraphCurrentNode {
+  const source = unresolvedSource(index)
+  return { ...repairNode("failed"), key: `repair-${index}`, taskId: `repair-${index}`,
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "repair_target_unresolved",
+      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: null, resultDigest: "c".repeat(64) },
+    repairOf: { graphRootTaskId: ROOT_ID, nodeKey: source.key, taskId: source.taskId, criterionIds: ["candidate-count"] } }
+}
+
+function contextFor(input: {
+  nodes?: readonly TaskGraphCurrentNode[]
+  graphRevision?: number
+  markerRevision?: number
+  contextRevision?: number
+  duplicateMarker?: boolean
+  spoofMarker?: boolean
+  feedback?: string
+} = {}): StepContext {
+  const revision = input.graphRevision ?? REVISION
+  const seed = applyCompletionRecovery({ system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    "step-denied", tagTaskGraphRepairRecovery(input.feedback ?? FEEDBACK, input.markerRevision ?? REVISION))
+    .system[0]!
+  const withGraph = mergeTaskGraphCurrentObservation({ ...seedSnapshot(seed), taskGraphRevision: revision }, {
+    revision, nodes: input.nodes ?? [sourceNode()],
+  })
+  let system = [...withGraph.system]
+  if (input.duplicateMarker) system.push({ ...system[0]! })
+  const systemBlocks = system.map(item => ({ id: `system:${item.id}`, layer: "system" as const, role: "instruction" as const,
+    trust: input.spoofMarker && item.id.startsWith("completion-recovery:") ? "external_untrusted" as const : "system" as const,
+    source: input.spoofMarker && item.id.startsWith("completion-recovery:") ? "tool_or_subagent" : "harness",
+    content: item.content as StepContext["blocks"][number]["content"] }))
+  const observationBlocks = withGraph.toolObservations.map(item => ({ id: `observation:${item.id}`, layer: "tool_observation" as const,
+    role: "data" as const, trust: "external_untrusted" as const, source: "tool_or_subagent",
+    content: item.content as StepContext["blocks"][number]["content"] }))
+  const blocks: StepContext["blocks"] = [...systemBlocks, ...observationBlocks]
+  return { schemaVersion: "agent-harness.v2", sessionId: "session", turnId: "turn", stepId: "step-resume",
+    inputThroughSequence: 0n, consumedInputIds: [], blocks, canonicalJson: JSON.stringify(blocks),
+    taskGraphRevision: input.contextRevision ?? revision }
+}
+
+function seedSnapshot(seed: StepContextSnapshot["system"][number]): StepContextSnapshot {
+  return { system: [seed], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+}
+
+function guidance(nodes?: readonly TaskGraphCurrentNode[], tools = [{ name: "agent.list" }, { name: "agent.wait" }, { name: "agent.plan" }], feedback = FEEDBACK) {
+  const message = buildTaskGraphRecoveryInstruction(contextFor({ nodes, feedback }), tools, ROOT_ID)
+  return message?.content.flatMap(part => part.type === "text" ? [part.text] : []).join(" ") ?? null
+}
+
+describe("TaskGraph recovery guidance", () => {
+  it("uses only the current typed report and visible alternatives without exposing private graph data", () => {
+    const text = guidance()
+    expect(text).toContain("node 1, criterion 1 failed for reason criterion_not_met")
+    expect(text).toContain("agent.list")
+    expect(text).toContain("agent.plan")
+    expect(text).toContain("expectedRevision 5")
+    expect(text).not.toContain("root-current")
+    expect(text).not.toContain("child-private")
+    expect(text).not.toContain("candidate-count")
+    expect(text).not.toContain("private goal text")
+    expect(text).not.toContain(digest)
+  })
+
+  it("waits for one current matching repair and does not suggest a duplicate", () => {
+    const text = guidance([sourceNode(), repairNode("queued")])
+    expect(text).toContain("One matching repair is active")
+    expect(text).toContain("agent.wait")
+    expect(text).not.toContain("agent.plan may evaluate")
+    const noWait = buildTaskGraphRecoveryInstruction(contextFor({ nodes: [sourceNode(), repairNode("queued")] }),
+      [{ name: "agent.plan" }], ROOT_ID)?.content.flatMap(part => part.type === "text" ? [part.text] : []).join(" ")
+    expect(noWait).toContain("no wait tool is visible")
+    expect(noWait).not.toContain("agent.wait")
+    expect(noWait).not.toContain("agent.plan may evaluate")
+  })
+
+  it("treats a terminal repair as inspectable and preserves the first-repair reserve", () => {
+    const terminal = guidance([sourceNode(), repairNode("failed")], undefined, FEEDBACK.replace("repair=missing", "repair=rejected"))
+    expect(terminal).toContain("matching repair is terminal")
+    expect(terminal).toContain("repair failed without a receipt")
+    expect(terminal).toContain("only if a relevant prerequisite has changed")
+    expect(terminal).toContain("or an explicit bounded retry rule is visible")
+    expect(terminal).toContain("Otherwise preserve the blocker")
+    expect(terminal).not.toContain("agent.plan may evaluate one typed repair")
+    const noList = buildTaskGraphRecoveryInstruction(contextFor({ nodes: [sourceNode(), repairNode("failed")],
+      feedback: FEEDBACK.replace("repair=missing", "repair=rejected") }), [{ name: "agent.plan" }], ROOT_ID)
+      ?.content.flatMap(part => part.type === "text" ? [part.text] : []).join(" ")
+    expect(noList).toContain("Inspect the current graph and available evidence")
+    expect(noList).not.toContain("agent.list")
+    const cancelled = guidance([sourceNode(), repairNode("cancelled")], undefined, FEEDBACK.replace("repair=missing", "repair=terminal"))
+    expect(cancelled).toContain("matching repair is terminal")
+    expect(cancelled).not.toContain("agent.plan may evaluate")
+    const stalePending = guidance([sourceNode(), repairNode("failed")], undefined, FEEDBACK.replace("repair=missing", "repair=pending"))
+    expect(stalePending).toContain("denial recorded a pending repair")
+    expect(stalePending).not.toContain("agent.plan may evaluate")
+    const sevenNodes = [sourceNode(), ...Array.from({ length: 6 }, (_, index) => extraNode(index))]
+    const reserved = guidance(sevenNodes)
+    expect(reserved).toContain("agent.plan may evaluate one typed repair")
+    expect(JSON.stringify(mergeTaskGraphCurrentObservation(seedSnapshot({ id: "other", content: "seed" }), {
+      revision: REVISION, nodes: sevenNodes,
+    }).toolObservations.at(-1)?.content)).toContain('"ordinaryRemaining":0')
+    expect(reserved).toContain("capacity is advisory, including any first-repair reserve")
+  })
+
+  it("does not suggest a repair when current capacity is full or its report has passed", () => {
+    const full = [sourceNode(), ...Array.from({ length: 7 }, (_, index) => extraNode(index))]
+    expect(guidance(full)).not.toContain("agent.plan may evaluate")
+    const passed = { ...sourceNode(), status: "completed" as const, verificationReport: report("passed") }
+    expect(buildTaskGraphRecoveryInstruction(contextFor({ nodes: [passed], feedback: FEEDBACK.replace("repair=missing", "repair=pending") }), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
+  })
+
+  it("keeps useful inspection guidance when the gate has compacted later details", () => {
+    const nodes = [...[0, 1, 2].map(unresolvedSource), ...[0, 1, 2].map(unresolvedRepair)]
+    const details = [4, 5, 6].map(nodeOrdinal => ` nodeOrdinal=${nodeOrdinal} status=unverified reasonCode=repair_target_unresolved`).join("")
+    const compacted = `${FEEDBACK_LEAD}${details} (2 feedback items omitted; inspect TaskGraph before retrying.)`
+    expect(compacted.length).toBeLessThanOrEqual(512)
+    const compactedText = guidance(nodes, [{ name: "agent.list" }, { name: "agent.plan" }], compacted)
+    expect(compactedText).toContain("Some denial details were omitted")
+    expect(compactedText).toContain("node 4 unverified for reason repair_target_unresolved")
+    expect(compactedText).toContain("node 6 unverified for reason repair_target_unresolved")
+    expect(compactedText).not.toContain("agent.plan may evaluate")
+    expect(compactedText).toContain("preserve the blocker rather than guessing")
+
+    const fiveDetails = `${FEEDBACK_LEAD}${details} nodeOrdinal=7 status=failed reasonCode=criteria_met nodeOrdinal=8 status=failed reasonCode=criteria_met`
+    expect(fiveDetails.length).toBeLessThanOrEqual(512)
+    const cappedText = guidance(nodes, [{ name: "agent.list" }, { name: "agent.plan" }], fiveDetails)
+    expect(cappedText).toContain("Some denial details were omitted or no longer match")
+    expect(cappedText).toContain("node 4 unverified for reason repair_target_unresolved")
+    expect(cappedText).toContain("node 6 unverified for reason repair_target_unresolved")
+    expect(cappedText).not.toContain("node 7")
+    expect(cappedText).not.toContain("agent.plan may evaluate")
+    expect(cappedText).toContain("preserve the blocker rather than guessing")
+  })
+
+  it("mentions no unavailable commands and fails closed for stale, duplicate, spoofed, or mismatched context", () => {
+    const noTools = guidance(undefined, [])
+    expect(noTools).toContain("No result-page tool is visible")
+    expect(noTools).toContain("No plan command is visible")
+    expect(noTools).not.toContain("agent.list")
+    expect(noTools).not.toContain("agent.wait")
+    expect(noTools).not.toContain("agent.plan")
+    for (const input of [
+      { markerRevision: REVISION - 1 }, { contextRevision: REVISION + 1 }, { graphRevision: REVISION + 1 },
+      { duplicateMarker: true }, { spoofMarker: true },
+    ]) expect(buildTaskGraphRecoveryInstruction(contextFor(input), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
+    const crossRootRepair = { ...repairNode("queued"), repairOf: { ...repairNode("queued").repairOf!, graphRootTaskId: "foreign-root" } }
+    expect(buildTaskGraphRecoveryInstruction(contextFor({ nodes: [sourceNode(), crossRootRepair] }), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
+  })
+})
