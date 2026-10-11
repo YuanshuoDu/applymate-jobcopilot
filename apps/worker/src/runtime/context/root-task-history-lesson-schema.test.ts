@@ -14,6 +14,7 @@ const analystChecks = [
   { id: "analyst-complete", check: { kind: "all_findings_have_evidence", minimumItems: 4 } },
   { id: "analyst-score", check: { kind: "reported_score_gte", minimumScore: 10, minimumFindings: 5, aggregation: "all" } },
   { id: "analyst-source", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-key" } },
+  { id: "analyst-coverage", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-key", minimumPercent: 75 } },
 ] as const
 
 function snapshot(withDirectDependency = true, analystChecksOverride: readonly unknown[] = analystChecks) {
@@ -31,7 +32,7 @@ function snapshot(withDirectDependency = true, analystChecksOverride: readonly u
 }
 
 describe("root history check descriptor schema", () => {
-  it("projects all seven typed checks with bounded operands and canonical dependency ordinal", () => {
+  it("projects typed checks with bounded operands and canonical dependency ordinals", () => {
     const facts = describeValidatedRootTaskHistoryChecks(snapshot())
     expect(facts).toEqual([
       [
@@ -45,6 +46,7 @@ describe("root history check descriptor schema", () => {
         { role: "analyst", kind: "all_findings_have_evidence", minimumItems: 4 },
         { role: "analyst", kind: "reported_score_gte", minimumScore: 10, minimumFindings: 5, aggregation: "all" },
         { role: "analyst", kind: "findings_from_scout_dependency", dependencyNodeOrdinal: 1 },
+        { role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75 },
       ],
     ])
     const serialized = JSON.stringify(facts)
@@ -76,6 +78,11 @@ describe("root history check descriptor schema", () => {
       minimumFindings: 1, aggregation: "sometimes" }, "analyst")).toBeUndefined()
     expect(rejects({ role: "scout", kind: "findings_from_scout_dependency", dependencyNodeOrdinal: 1 }, "scout")).toBeUndefined()
     expect(rejects({ role: "analyst", kind: "findings_from_scout_dependency", dependencyNodeOrdinal: 9 }, "analyst")).toBeUndefined()
+    expect(rejects({ role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 0 }, "analyst")).toBeUndefined()
+    expect(rejects({ role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 101 }, "analyst")).toBeUndefined()
+    expect(rejects({ role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75.5 }, "analyst")).toBeUndefined()
+    expect(rejects({ role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 9, minimumPercent: 75 }, "analyst")).toBeUndefined()
+    expect(rejects({ role: "scout", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75 }, "scout")).toBeUndefined()
     expect(rejects({ role: "scout", kind: "candidate_count_gte", minimum: 1, criterionId: "private" }, "scout")).toBeUndefined()
   })
 
@@ -93,6 +100,14 @@ describe("root history check descriptor schema", () => {
     expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependent], [2], [1])).toEqual([undefined, undefined])
     const pruned = filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependent], [2])
     expect(pruned[1]?.criterionFailures).toEqual([{ criterionOrdinal: 1, status: "unverified", reasonCode: "criterion_not_met" }])
+    const coverageDependent = parseRootTaskHistoryNodeLesson({ ordinalScope: "source_graph_local", advisoryOnly: true,
+      notCurrentEvidence: true, nodeOrdinal: 2, criterionFailures: [{ criterionOrdinal: 2, status: "failed",
+        reasonCode: "criterion_not_met", check: { role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75 } }] }, "analyst")!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, coverageDependent], [2], [1, 2])[1]?.criterionFailures)
+      .toEqual(coverageDependent.criterionFailures)
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, coverageDependent], [2], [2])[1]?.criterionFailures).toEqual([
+      { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+    ])
     expect(parseRootTaskHistoryNodeLesson({ ...legacy, criterionFailures: [{ ...legacy.criterionFailures[0],
       check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] }, "analyst")).toBeUndefined()
     expect(parseRootTaskHistoryNodeLesson({ ...legacy, criterionFailures: [{ ...legacy.criterionFailures[0],

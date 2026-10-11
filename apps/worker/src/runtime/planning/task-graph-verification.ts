@@ -1,6 +1,8 @@
 import {
   TASK_GRAPH_VERIFICATION_LIMITS,
+  evaluateFindingsCoverScoutCandidates,
   evaluateFindingsFromScoutDependency,
+  parseFindingsCoverScoutCandidatesCheck,
   parseFindingsFromScoutDependencyCheck,
   parseTaskGraphVerificationDependencyEvidence,
   parseTaskGraphVerificationEvidenceProjection,
@@ -41,6 +43,7 @@ export type TaskGraphVerificationCheck =
       aggregation: "any" | "all"
     }>
   | Readonly<{ kind: "findings_from_scout_dependency"; dependencyNodeKey: string }>
+  | Readonly<{ kind: "findings_cover_scout_candidates_gte"; dependencyNodeKey: string; minimumPercent: number }>
 
 export type TaskGraphVerificationCriterion = Readonly<{
   id: string
@@ -160,6 +163,7 @@ function parseCheck(value: unknown, role: TaskGraphVerificationRole, path: strin
     }
   }
   if (kind === "findings_from_scout_dependency") return parseFindingsFromScoutDependencyCheck(value, role, path)
+  if (kind === "findings_cover_scout_candidates_gte") return parseFindingsCoverScoutCandidatesCheck(value, role, path)
   return { code: "unknown_check", path }
 }
 
@@ -200,7 +204,7 @@ function unverifiedEvaluation(contract: TaskGraphVerificationContract, reasonCod
 }
 type CheckEvaluation = "passed" | "criterion_not_met" | "reported_score_below_minimum"
 function evaluateCheck(check: TaskGraphVerificationCheck, p: TaskGraphVerificationParsedProjection): CheckEvaluation {
-  if (check.kind === "findings_from_scout_dependency") return "criterion_not_met"
+  if (check.kind === "findings_from_scout_dependency" || check.kind === "findings_cover_scout_candidates_gte") return "criterion_not_met"
   if (check.kind === "candidate_count_gte") return p.role === "scout" && p.items.length >= check.minimum ? "passed" : "criterion_not_met"
   if (check.kind === "finding_count_gte") return p.role === "analyst" && p.items.length >= check.minimum ? "passed" : "criterion_not_met"
   if (check.kind === "evidence_count_gte") return p.evidenceIds.length >= check.minimum ? "passed" : "criterion_not_met"
@@ -226,7 +230,9 @@ export function evaluateTaskGraphVerification(
     const criteria = contract.criteria.map(c => {
       const result = c.check.kind === "findings_from_scout_dependency"
         ? evaluateFindingsFromScoutDependency(c.check.dependencyNodeKey, findingJobIds, dependencies)
-        : evaluateCheck(c.check, parsed.value)
+        : c.check.kind === "findings_cover_scout_candidates_gte"
+          ? evaluateFindingsCoverScoutCandidates(c.check.dependencyNodeKey, findingJobIds, dependencies, c.check.minimumPercent)
+          : evaluateCheck(c.check, parsed.value)
       return result === "passed" ? { criterionId: c.id, status: "passed" as const, reasonCode: "criteria_met" as const } : { criterionId: c.id, status: "failed" as const, reasonCode: result }
     })
     const failed = criteria.find(c => c.status === "failed")

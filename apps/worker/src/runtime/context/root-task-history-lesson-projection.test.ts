@@ -106,6 +106,39 @@ function reportedOutputFixture(): LoadedGraph {
 }
 
 describe("root history ordinal lessons", () => {
+  it("projects only a failed coverage check and its source-local Scout ordinal", () => {
+    const coverageSnapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+      { key: "scout-private-key", templateId: "scout", goal: "private source goal", successCriteria: ["find"], dependsOn: [], depth: 1,
+        taskId: "scout-private-task", verificationDisposition: "typed", verification: { schemaVersion: "agent-harness.v2.task-graph-verification.v1",
+          role: "scout", criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } },
+      { key: "analyst-private-key", templateId: "analyst", goal: "private analysis goal", successCriteria: ["cover"], dependsOn: ["scout-private-key"], depth: 2,
+        taskId: "analyst-private-task", verificationDisposition: "typed", verification: { schemaVersion: "agent-harness.v2.task-graph-verification.v1",
+          role: "analyst", criteria: [{ id: "coverage-private-id", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-private-key", minimumPercent: 75 } }] } },
+    ] })
+    const makeReport = (criterionId: string, status: "passed" | "failed") => ({ verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+      status, reasonCode: status === "passed" ? "criteria_met" : "criterion_not_met",
+      criteria: [{ criterionId, status, reasonCode: status === "passed" ? "criteria_met" : "criterion_not_met" }],
+      evidenceDigest: DIGEST, resultDigest: DIGEST })
+    const tasks = new Map<string, GraphTaskRow>([
+      ["scout-private-task", { id: "scout-private-task", status: "completed", role: "scout", failureReason: null,
+        result: { taskGraphVerificationReport: makeReport("scout-count", "passed") } }],
+      ["analyst-private-task", { id: "analyst-private-task", status: "failed", role: "analyst", failureReason: "task_graph_verification_failed",
+        result: { taskGraphVerificationReport: makeReport("coverage-private-id", "failed") } }],
+    ])
+    const statuses = new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }] as const))
+    const base = taskGraphState(coverageSnapshot, 9, statuses, [])
+    const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot: coverageSnapshot, state: { ...base, repairSatisfiedNodeKeys: [], repairPendingNodeKeys: [] },
+      tasks, item: { id: "coverage-private-item", revision: 9, content: coverageSnapshot, createdAt: new Date(0) } }
+    const projected = projectLoadedRootTaskHistoryGraph(loaded)
+    const descriptor = projected?.nodeLessons?.[1]?.criterionFailures[0]?.check
+    expect(projected?.sourceNodeOrdinals).toEqual([1, 2])
+    expect(descriptor).toEqual({ role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75 })
+    const serialized = JSON.stringify(projected?.nodeLessons)
+    for (const secret of ["scout-private-key", "scout-private-task", "analyst-private-key", "analyst-private-task", "coverage-private-id", "private analysis goal"]) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
   it("derives separate same-reason failures and a receipt-backed one-to-one repair link", () => {
     const { loaded, graph } = fixture(), lessons = deriveRootTaskHistoryLessonFacts(loaded, graph)
     expect(lessons).toHaveLength(2)
