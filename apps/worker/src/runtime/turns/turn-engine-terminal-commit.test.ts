@@ -4,6 +4,10 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
+import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
+import type { TurnExecutionOptions } from "./turn-execution-types.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
 vi.mock("../subagents/steering-reconciliation-ledger.js", async importOriginal => ({
@@ -344,10 +348,70 @@ describe("atomic Turn terminal commit", () => {
 
   it("surfaces a TaskGraph race denial as a same-Turn recovery receipt", async () => {
     const fake = makePool()
-    const guard = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved." }))
-    await expect(commitTurnTerminal(fake.pool, input, guard)).rejects.toMatchObject({
-      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved.",
+    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing. issue=verification_report nodeOrdinal=2 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing"
+    const decision = { ok: false as const, blocker: "task_graph_verification_unverified", feedback }
+    Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: 41 })
+    const guard = vi.fn(async () => decision)
+    let recoveryError: unknown
+    try { await commitTurnTerminal(fake.pool, input, guard) } catch (error: unknown) { recoveryError = error }
+    expect(recoveryError).toMatchObject({
+      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback,
     })
+    expect(recoveryError && typeof recoveryError === "object" ? Reflect.get(recoveryError, "recoveryFeedback") : undefined)
+      .toBe(tagTaskGraphRepairRecovery(feedback, 41))
+    expect(JSON.stringify(recoveryError)).not.toContain("task-graph-repair-recovery.v1:")
+    expect(JSON.stringify(recoveryError)).not.toContain("graphRevision")
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("carries the gate revision through atomic race recovery without changing rejection evidence", async () => {
+    const fake = makePool()
+    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing. issue=verification_report nodeOrdinal=2 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing"
+    const decision = { ok: false as const, blocker: "task_graph_verification_unverified", feedback }
+    Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: 41, enumerable: true })
+    const guard = vi.fn(async () => decision)
+    const snapshot = applyCompletionRecovery({ system: [], profile: [], steerHistory: [], businessRefs: [{ id: "evidence-1", kind: "artifact" as const, ownerId: owner.userId }], toolObservations: [] },
+      "older-step", tagTaskGraphRepairRecovery(feedback, 17))
+    const options = {
+      identity: owner, goal: "complete the task", snapshot,
+      store: {
+        updateStep: vi.fn(async () => undefined),
+        recordFinalResponse: vi.fn(async (candidate: Parameters<NonNullable<TurnExecutionOptions["store"]["recordFinalResponse"]>>[0]) => {
+          if (!candidate.terminal) return undefined
+          if (candidate.identity.kind !== "turn") throw new Error("Expected a root Turn owner")
+          return commitTurnTerminal(fake.pool, { ...candidate.terminal, owner: candidate.identity, response: candidate.response, now: candidate.now }, guard)
+        }),
+      },
+      idFactory: (value: string) => value,
+    } as unknown as TurnExecutionOptions
+    const appended: Array<{ type: string; payload: unknown }> = []
+    const writer = { append: vi.fn(async (type: string, _stepId: string, _itemId: string | null, payload: unknown) => { appended.push({ type, payload }) }) }
+
+    const outcome = await completeTurnCandidate({
+      options, writer: writer as unknown as TurnExecutionEventWriter, step: { id: input.stepId, ordinal: 1 },
+      output: { text: "candidate answer", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null },
+      snapshot,
+      stepCount: 2, toolCallCount: 1, usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 },
+      signal: new AbortController().signal, now: () => now, onStepClosed: vi.fn(),
+    })
+
+    const rejected = appended.find(event => event.type === "final.rejected")
+    expect(rejected?.payload).toEqual({ code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback, taskId: owner.taskId })
+    expect(JSON.stringify(rejected)).not.toContain("task-graph-repair-recovery.v1:")
+    expect(JSON.stringify(rejected)).not.toContain("graphRevision")
+    expect(outcome).toEqual({ kind: "replan", feedback: tagTaskGraphRepairRecovery(feedback, 41) })
+    if (outcome.kind !== "replan") throw new Error("Expected atomic TaskGraph recovery to replan")
+    const refreshed = applyCompletionRecovery(snapshot, "step-after-race", outcome.feedback)
+    expect(refreshed.system).toEqual([expect.objectContaining({ id: "completion-recovery:task-graph:41" })])
+    expect(refreshed.system[0]?.content).toContain("graph revision 41")
+    expect(guard).toHaveBeenCalledOnce()
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
     expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
     expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
   })
