@@ -118,7 +118,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       })
       return terminal.result
     }
-    let state = await (options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes }))
+    const durableWaitPort = createPgDurableWaitPort(pool)
+    let state = await (options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }))
     const { enabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobPreparation, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
@@ -139,7 +140,6 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const toolCapabilities = [...new Set([...configuredCapabilities, ...(coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
     let lifecycleSink: ToolLifecycleSink | null = null; let lifecycleOwner: ExecutionOwner | null = null
     let taskGraphParentAttemptCount: number | null = null
-    const durableWaitPort = createPgDurableWaitPort(pool)
     const sinkProxy: ToolLifecycleSink = { append: async (event) => {
       if (!lifecycleSink) throw new Error("root_task_not_bound")
       await lifecycleSink.append(event)
@@ -193,9 +193,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const preparedContext = await prepareNativeVerificationRootContext({
       state, selectedJobMode, taskGraphPlanningEnabled, ...nativeRootContext, refreshTaskGraph: turnCoordination.refresh,
       preflight: {
-        enabled: productionFlags?.turnBoundaryCompactionEnabled === true, signal,
+        enabled: productionFlags?.turnBoundaryCompactionEnabled === true && !state.recoveredWaitControl, signal,
         compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, taskGraphCommandPort: options.taskGraphCommandPort, model, signal }),
-        reload: () => options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: false }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: false }),
+        reload: () => options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: false, durableWaitControlReader: durableWaitPort }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: false, durableWaitControlReader: durableWaitPort }),
       },
     })
     state = preparedContext.state
@@ -218,6 +218,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       nativeSemanticProgressMode,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphBeforeStep: turnCoordination.refresh, refreshTaskGraphAfterReadyWait: turnCoordination.refresh, refreshTaskGraphAfterPlan: turnCoordination.refresh } : {}),
+      durableWaitControlReader: durableWaitPort, ...(state.recoveredWaitControl ? { recoveredWaitControl: state.recoveredWaitControl } : {}),
       ...(nativeRecovery.candidateText !== undefined ? { recoveredFinalCandidate: nativeRecovery.candidateText } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
       completionGate: createCanonicalRootCompletionGate({
