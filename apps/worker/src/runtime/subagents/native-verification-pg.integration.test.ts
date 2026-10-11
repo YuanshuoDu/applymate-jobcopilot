@@ -59,7 +59,7 @@ const suffix = randomUUID(), ids = {
 type QuestionSeedInput = Readonly<{
   turnId: string; rootTaskId: string; stepId: string; callItemId: string; resultItemId: string; ownerId: string; question: string; answer: string
 }>
-type PriorQuestionFixture = QuestionSeedInput & Readonly<{ questionId: string; itemId: string; answerEventId: string }>
+type PriorQuestionFixture = QuestionSeedInput & Readonly<{ questionId: string; itemId: string; answerEventId: string; wakeupEventId: string }>
 type QuestionSeedOverrides = Partial<QuestionSeedInput>
 let priorQuestionFixture: PriorQuestionFixture | undefined
 const goal = "Find and verify the persisted source facts"
@@ -230,9 +230,12 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
 
   const eventPrefix = seed.turnId === ids.turn ? "native-question" : "native-prior-question"
   const answeredEventId = `${eventPrefix}-answered-event-${suffix}`
+  const answerIdempotencyKey = seed.turnId === ids.turn
+    ? `question-answer:${suffix}`
+    : `question-answer:${seed.turnId}:${waitId}`
   const answerPayload = { waitKind: "question", waitId, itemId, turnId: seed.turnId,
     toolCallId, status: "answered", nextTurnRevision: 3, answerAvailable: true }
-  const answerKey = "question-answer:" + seed.turnId + ":" + waitId
+  const wakeupEventId = `${eventPrefix}-wakeup-event-${suffix}`
   const eventRows = [
     { id: `${eventPrefix}-step-event-${suffix}`, itemId: null, taskId: seed.rootTaskId, sequence: firstSequence + 1, type: "step.completed",
       actor: "orchestrator", correlationId: seed.stepId, causationId: previousRootEvent.rows[0]?.id ?? null,
@@ -242,10 +245,10 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
       actor: "orchestrator", correlationId: itemId, causationId: waitId, key: `agent-wait:${itemId}:started`,
       payload: { itemId, waitKind: "question", questionId: waitId, toolCallId }, topic: "agent.events" },
     { id: answeredEventId, itemId, taskId: null, sequence: firstSequence + 3, type: "question.answered",
-      actor: "user", correlationId: waitId, causationId: itemId, key: answerKey, payload: answerPayload, topic: "agent.session.event" },
-    { id: `${eventPrefix}-wakeup-event-${suffix}`, itemId, taskId: null, sequence: firstSequence + 4, type: "turn.wakeup",
+      actor: "user", correlationId: waitId, causationId: itemId, key: answerIdempotencyKey, payload: answerPayload, topic: "agent.session.event" },
+    { id: wakeupEventId, itemId, taskId: null, sequence: firstSequence + 4, type: "turn.wakeup",
       actor: "user", correlationId: seed.turnId, causationId: answeredEventId,
-      key: answerKey + ":wakeup", payload: answerPayload, topic: "agent.turn.wakeup" },
+      key: `${answerIdempotencyKey}:wakeup`, payload: answerPayload, topic: "agent.turn.wakeup" },
   ]
   for (const event of eventRows) {
     const envelope = { eventId: event.id, sessionId: ids.session, turnId: seed.turnId, itemId: event.itemId,
@@ -262,7 +265,7 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
     [`agent-outbox-${event.id}`, event.topic, ids.session, outboxIdempotencyKey, JSON.stringify(envelope)])
   }
   await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [ids.session, firstSequence + 4])
-  return { ...seed, questionId: waitId, itemId, answerEventId: answeredEventId }
+  return { ...seed, questionId: waitId, itemId, answerEventId: answeredEventId, wakeupEventId }
 }
 
 async function completeControls(taskIds: readonly string[]): Promise<void> {
@@ -403,6 +406,19 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const answeredQuestion = await seedAnsweredQuestion()
     const priorQuestion = priorQuestionFixture
     if (!priorQuestion) throw new Error("native_prior_question_fixture_unavailable")
+    const answerEvents = await pool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_events"
+      WHERE "id" IN ($1, $2)`, [answeredQuestion.answerEventId, priorQuestion.answerEventId])
+    expect(answerEvents.rows).toHaveLength(2)
+    expect(new Set(answerEvents.rows.map(event => event.idempotencyKey)).size).toBe(2)
+    expect(answerEvents.rows.map(event => event.idempotencyKey).sort()).toEqual([
+      `question-answer:${suffix}`, `question-answer:${priorQuestion.turnId}:${priorQuestion.questionId}`,
+    ].sort())
+    const wakeupEvents = await pool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_events"
+      WHERE "id" IN ($1, $2)`, [answeredQuestion.wakeupEventId, priorQuestion.wakeupEventId])
+    expect(wakeupEvents.rows).toHaveLength(2)
+    expect(wakeupEvents.rows.map(event => event.idempotencyKey).sort()).toEqual([
+      `question-answer:${suffix}:wakeup`, `question-answer:${priorQuestion.turnId}:${priorQuestion.questionId}:wakeup`,
+    ].sort())
     const childControl = await pool!.query<{ context: unknown; expectedOutputSchema: unknown }>(
       `SELECT "context", "expectedOutputSchema" FROM "sub_agent_tasks" WHERE "id" = $1`, [first.controlTaskIds[0]])
     const childMarker = parseNativeVerificationControl(childControl.rows[0]?.expectedOutputSchema)
@@ -430,6 +446,14 @@ describePg("native verification PostgreSQL producer and readback", () => {
       question: answeredQuestion.question, options: [], answer: answeredQuestion.answer }))
     expect(privateSummaries).toContainEqual(expect.objectContaining({ kind: "user_self_attestation", stage: "user_input",
       question: priorQuestion.question, options: [], answer: priorQuestion.answer }))
+    expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
+      question: answeredQuestion.question, options: [], answer: answeredQuestion.answer })
+    expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", statementSource: "user_statement",
+      turnRelation: "earlier_turn", stage: "user_input", question: priorQuestion.question,
+      options: [], answer: priorQuestion.answer })
+    expect(privateSummaries.find(summary => summary.answer === priorQuestion.answer)).toMatchObject({
+      statementSource: "user_statement", turnRelation: "earlier_turn",
+    })
     const privateReferenceIds = attestation.map(item => item.referenceId)
     if (!rootControl || !rootPacket || privateReferenceIds.some(value => !value)) throw new Error("native_answer_evidence_packet_unavailable")
     for (const referenceId of privateReferenceIds) expect(referenceId).toMatch(/^user-self-attestation:[a-f0-9]{64}$/)
