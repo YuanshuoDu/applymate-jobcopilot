@@ -51,6 +51,32 @@ function state(options: { status?: string; stepTaskId?: string | null; modelTool
   return { step, callItem, resultItem, items: [callItem, resultItem], events, observations }
 }
 
+function twoCallPrefixState() {
+  const value = state({ status: "streaming", modelToolCallCount: 3 })
+  const createdAt = new Date("2026-10-11T12:00:00.000Z")
+  const priorId = "prior-call"
+  const waitCall = { ...value.callItem, id: "a-wait-call-item", createdAt }
+  const waitResult = { ...value.resultItem, id: "b-wait-result-item", createdAt }
+  const priorCall = { ...value.callItem, id: "y-prior-call-item", createdAt,
+    content: { toolCallId: priorId, toolName: "agent.plan", input: {}, status: "completed" } }
+  const priorResult = { ...value.resultItem, id: "z-prior-result-item", createdAt,
+    content: { toolCallId: priorId, output: { planned: true }, errorCode: null } }
+  const waitFinished = value.events.find(event => event.id === "tool-done")!
+  const priorFinished = { ...waitFinished, id: "prior-finished", itemId: priorCall.id, correlationId: priorId,
+    idempotencyKey: `turn:${turnId}:event:tool-finished:${priorId}`, sequence: "4",
+    payload: { toolCallId: priorId, toolName: "agent.plan", status: "completed", taskId: rootTaskId } }
+  const finishedWait = { ...waitFinished, itemId: waitCall.id, sequence: "5" }
+  const observations = [
+    { id: `tool-result:${priorId}`, content: { toolCallId: priorId, toolName: "agent.plan", input: {}, status: "completed", output: { planned: true }, errorCode: null } },
+    ...value.observations,
+  ]
+  return { ...value, callItem: waitCall, resultItem: waitResult,
+    // Equal item timestamps and lexical IDs put the wait before its earlier executed call.
+    items: [waitCall, waitResult, priorCall, priorResult],
+    events: [...value.events.filter(event => event.type !== "tool_call.completed" && event.type !== "tool_call.failed"), priorFinished, finishedWait],
+    observations }
+}
+
 function snapshot(toolObservations: StepContextSnapshot["toolObservations"]): StepContextSnapshot {
   return { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations }
 }
@@ -127,6 +153,32 @@ describe("canonical archived-wait state recovery", () => {
     expect(unread.readByInvocation).not.toHaveBeenCalled()
     const underCount = state({ status: "streaming", modelToolCallCount: 0 })
     await expect(recover(underCount)).rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+
+  it("orders a tied-item two-call prefix by exact finish receipt sequence", async () => {
+    const value = twoCallPrefixState(), reads = reader()
+    expect(value.items.filter(item => item.type === "tool_call").map(item => item.content.toolCallId)).toEqual([callId, "prior-call"])
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
+      observations: value.observations, snapshot: snapshot(value.observations), reader: reads.value,
+      now: new Date("2026-10-11T12:00:30.000Z") })).resolves.toMatchObject({
+      status: "waiting", toolCallCount: 3, persistedToolCallCount: 2, stepStatus: "streaming",
+    })
+    expect(reads.readByInvocation).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["a later executed call after the wait", (events: Array<Record<string, unknown>>) => events.map(event =>
+      event.id === "prior-finished" ? { ...event, sequence: "6" } : event)],
+    ["duplicate receipt sequence", (events: Array<Record<string, unknown>>) => events.map(event =>
+      event.id === "prior-finished" ? { ...event, sequence: "5" } : event)],
+    ["a receipt before model usage", (events: Array<Record<string, unknown>>) => events.map(event =>
+      event.id === "prior-finished" ? { ...event, sequence: "2" } : event)],
+  ])("rejects %s in the persisted prefix", async (_name, reviseEvents) => {
+    const value = twoCallPrefixState(), reads = reader()
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: reviseEvents(value.events),
+      observations: value.observations, snapshot: snapshot(value.observations), reader: reads.value,
+      now: new Date("2026-10-11T12:00:30.000Z") })).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(reads.readByInvocation).not.toHaveBeenCalled()
   })
 
   it("requires exact Root identities throughout a streaming prefix but retains legacy running Step compatibility", async () => {
