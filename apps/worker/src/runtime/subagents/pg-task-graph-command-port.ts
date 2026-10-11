@@ -1,19 +1,21 @@
 import type { PoolClient } from "pg"
-import type { TaskGraphCommandPort, TaskGraphScheduleInput, TaskGraphScheduleReceipt, TaskGraphReadScope, TaskGraphCurrentState, TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "./task-graph-command-port.js"
+import { parseRegisteredScoutEnvelope, type RegisteredScoutEnvelope, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { TaskGraphCommandError } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
-import { transaction, type Queryable } from "./pg-store-persistence.js"
+import { actionList, transaction, type Queryable } from "./pg-store-persistence.js"
 import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph } from "./task-graph-pg-state.js"
 import { buildTaskGraphPlanningFacts } from "./task-graph-planning-facts.js"
 import { createGraphTasks } from "./task-graph-pg-create.js"
 import { writePlanReceipt } from "./task-graph-pg-events.js"
-import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
 import { replaceUnstartedNativeFollowup } from "./task-graph-native-pending-replacement.js"
 import { assertPlanningRootHasNoUnresolvedSteering } from "./pg-store-create.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
+import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -62,6 +64,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
       return transaction(pool, client => readCurrentWithClient(client, scope))
     },
+    async readCurrentResultPage(scope, request) {
+      return transaction(pool, client => readCurrentResultPageWithClient(client, scope, request))
+    },
     readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
   }
 }
@@ -90,23 +95,60 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
   const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []))
+  const snapshot = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
-  await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot: created.snapshot, expectedRevision: revision,
+  await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot, expectedRevision: revision,
     now: new Date(), idempotencyKey: key, fingerprint, receipt })
   if (prepared) await writeSteeringReconciliationReceipt(client, prepared, created.state.revision)
   return receipt
 }
 
+function stampCreatedScoutEnvelopes(
+  snapshot: TaskGraphSnapshot, created: readonly { key: string }[], templates: Readonly<Record<string, TaskGraphTaskTemplate>>,
+): TaskGraphSnapshot {
+  const keys = new Set(created.map(node => node.key))
+  return parseTaskGraphSnapshot({ ...snapshot, nodes: snapshot.nodes.map(node => {
+    if (!keys.has(node.key) || node.templateId !== "scout" || node.verificationDisposition !== "typed") return node
+    const registeredScoutEnvelope = templates.scout && registeredScoutEnvelopeFor(templates.scout)
+    if (!registeredScoutEnvelope) throw new TaskGraphCommandError("task_graph_registered_scout_envelope_invalid", "Registered Scout template is invalid")
+    return { ...node, registeredScoutEnvelope }
+  }) })
+}
+
+function registeredScoutEnvelopeFor(template: TaskGraphTaskTemplate): RegisteredScoutEnvelope | undefined {
+  return parseRegisteredScoutEnvelope({ role: template.role, taskType: template.taskType,
+    expectedOutputSchema: parseScoutSchemaMarker(template.expectedOutputSchema), allowedActions: actionList(template.allowedActions) })
+}
+
+function parseScoutSchemaMarker(value: unknown): unknown {
+  if (typeof value !== "string") return value
+  try {
+    const parsed: unknown = JSON.parse(value) as unknown
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined
+  } catch { return undefined }
+}
+
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
+  const loaded = await loadCurrentWithClient(client, scope)
+  const current = currentTaskGraph(loaded)
+  const planningFacts = buildTaskGraphPlanningFacts(loaded)
+  return planningFacts ? { ...current, planningFacts } : current
+}
+
+async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, request: TaskGraphResultPageRequest) {
+  const loaded = await loadCurrentWithClient(client, scope)
+  currentTaskGraph(loaded)
+  return projectTaskGraphResultPage(loaded, request)
+}
+
+async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   await lockTaskGraphScope(client, scope)
   const loaded = await loadTaskGraph(client, scope, false)
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }
-  const current = currentTaskGraph(loaded)
-  const planningFacts = buildTaskGraphPlanningFacts(loaded)
-  return planningFacts ? { ...current, planningFacts } : current
+  return loaded
 }
 
 async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {

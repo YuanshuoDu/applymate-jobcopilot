@@ -3,6 +3,7 @@ import { TERMINAL_TASK_STATUSES } from "./coordination-followup.js"
 import { validatedStructuredResult } from "./coordination-result-aggregate.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import { projectNativeVerificationResult } from "./native-verification-feedback-projection.js"
+import { parseTaskGraphVerificationCriterionIds, parseTaskGraphVerificationReport } from "../subagents/task-graph-command-port.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
 
@@ -74,8 +75,25 @@ export function waitTaskOutput(task: CoordinationTaskView) {
 
 export function waitResult(value: unknown): ReturnType<typeof sanitizeLifecyclePreview> | null {
   if (value === undefined || value === null) return null
-  try { return stripForeignResultKeys(sanitizeLifecyclePreview(projectNativeVerificationResult(value), WAIT_RESULT_MAX_BYTES)) }
+  try { return stripForeignResultKeys(sanitizeLifecyclePreview(projectNativeVerificationResult(projectTaskGraphVerificationResult(value)), WAIT_RESULT_MAX_BYTES)) }
   catch { return { $truncated: true, summary: "Task result was omitted because it could not be safely encoded" } }
+}
+
+function projectTaskGraphVerificationResult(value: unknown): unknown {
+  if (typeof value === "string") {
+    try { const parsed = JSON.parse(value) as unknown, projected = projectTaskGraphVerificationResult(parsed); return projected === parsed ? value : JSON.stringify(projected) }
+    catch { const trimmed = value.trim(); return trimmed.startsWith("{") || trimmed.startsWith("[") || value.includes("taskGraphVerificationReport") || value.includes("dependencyBindings") ? null : value }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value
+  const result = value as Record<string, unknown>
+  if (!Object.hasOwn(result, "taskGraphVerificationReport")) return value
+  const report = result.taskGraphVerificationReport as Record<string, unknown> | null
+  const criteria = report && typeof report === "object" && !Array.isArray(report) ? report.criteria : null
+  const ids = Array.isArray(criteria) ? parseTaskGraphVerificationCriterionIds(criteria.map(item =>
+    item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>).criterionId : undefined)) : undefined
+  const parsed = ids && parseTaskGraphVerificationReport(report, ids)
+  const { taskGraphVerificationReport: _private, ...safe } = result
+  return parsed ? { ...safe, taskGraphVerificationReport: parsed } : safe
 }
 
 function stripForeignResultKeys(value: ReturnType<typeof sanitizeLifecyclePreview>): ReturnType<typeof sanitizeLifecyclePreview> {
