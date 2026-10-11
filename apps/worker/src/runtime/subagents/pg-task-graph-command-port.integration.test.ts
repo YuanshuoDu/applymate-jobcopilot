@@ -283,8 +283,13 @@ async function seedCanonicalFailedTarget(pool: PgPool, value: Fixture, taskId: s
 async function repairDurableRows(pool: PgPool, value: Fixture): Promise<Readonly<{
   children: readonly unknown[]
   item: readonly Readonly<{ revision: number }>[]
-  events: readonly Readonly<{ idempotencyKey: string }>[]
-  outbox: readonly unknown[]
+  events: readonly Readonly<{
+    id: string; itemId: string | null; taskId: string | null; sequence: string | bigint
+    type: string; idempotencyKey: string; payload: unknown
+  }>[]
+  outbox: readonly Readonly<{
+    topic: string; aggregateId: string; idempotencyKey: string; payload: unknown
+  }>[]
   sequence: readonly Readonly<{ eventSequence: string | bigint }>[]
 }>> {
   const [children, item, events, outbox, sequence] = await Promise.all([
@@ -293,10 +298,10 @@ async function repairDurableRows(pool: PgPool, value: Fixture): Promise<Readonly
     pool.query<{ revision: number }>(`SELECT "id", "revision", "content", "updatedAt" FROM "agent_items"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
     [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId, value.rootTaskId]),
-    pool.query<{ idempotencyKey: string }>(`SELECT "id", "itemId", "taskId", "sequence", "type", "idempotencyKey", "payload" FROM "agent_events"
+    pool.query<{ id: string; itemId: string | null; taskId: string | null; sequence: string | bigint; type: string; idempotencyKey: string; payload: unknown }>(`SELECT "id", "itemId", "taskId", "sequence", "type", "idempotencyKey", "payload" FROM "agent_events"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 ORDER BY "sequence"`,
     [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId)]),
-    pool.query(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox"
+    pool.query<{ topic: string; aggregateId: string; idempotencyKey: string; payload: unknown }>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox"
       WHERE "aggregateId" = $1 ORDER BY "idempotencyKey"`, [value.sessionId]),
     pool.query<{ eventSequence: string | bigint }>(`SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [value.sessionId]),
   ])
@@ -873,11 +878,39 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(repairs).toHaveLength(1)
     expect(["race-repair-a", "race-repair-b"]).toContain(repairs[0]!.key)
     const after = await repairDurableRows(adminPool!, value)
+    const acceptedRepair = repairs[0]!
+    const acceptedPlanKey = taskGraphProposalKey(value.rootTaskId, 1)
+    const addedOutbox = after.outbox.filter(row => !before.outbox.some(previous => previous.idempotencyKey === row.idempotencyKey))
     expect(after.children).toHaveLength(before.children.length + 1)
     expect(after.item[0]?.revision).toBe(2)
     expect(after.events).toHaveLength(before.events.length + 1)
-    expect(after.outbox).toHaveLength(before.outbox.length + 1)
-    expect(BigInt(String(after.sequence[0]?.eventSequence))).toBe(BigInt(String(before.sequence[0]?.eventSequence)) + 1n)
+    expect(after.outbox).toHaveLength(before.outbox.length + 2)
+    expect(addedOutbox.map(row => row.topic).sort()).toEqual(["agent.session.event", "agent.subagent.dispatch"])
+    const dispatchOutbox = addedOutbox.find(row => row.topic === "agent.subagent.dispatch")
+    expect(dispatchOutbox).toMatchObject({
+      aggregateId: value.sessionId,
+      idempotencyKey: `subagent-dispatch:${acceptedRepair.taskId}`,
+      payload: { taskId: acceptedRepair.taskId, sessionId: value.sessionId, rootTaskId: value.rootTaskId },
+    })
+    const acceptedPlanEvent = after.events.find(event => event.idempotencyKey === acceptedPlanKey)
+    expect(acceptedPlanEvent).toMatchObject({
+      itemId: taskGraphItemId(value.rootTaskId), taskId: value.rootTaskId, type: "item.delta",
+      payload: { kind: "proposal", revision: 2, receipt: { status: "accepted", revision: 2, nodes: [{ key: acceptedRepair.key, taskId: acceptedRepair.taskId }] } },
+    })
+    const acceptedSequence = BigInt(String(acceptedPlanEvent!.sequence))
+    const sequenceBefore = BigInt(String(before.sequence[0]?.eventSequence))
+    expect(acceptedSequence).toBe(sequenceBefore + 1n)
+    expect(addedOutbox.find(row => row.topic === "agent.session.event")).toMatchObject({
+      aggregateId: value.sessionId,
+      idempotencyKey: `agent-event:${acceptedPlanEvent!.id}`,
+      payload: {
+        eventId: acceptedPlanEvent!.id, sessionId: value.sessionId, turnId: value.turnId,
+        itemId: taskGraphItemId(value.rootTaskId), taskId: value.rootTaskId, sequence: acceptedSequence.toString(), type: "item.delta",
+        idempotencyKey: acceptedPlanKey,
+        payload: { kind: "proposal", revision: 2, receipt: { status: "accepted", revision: 2, nodes: [{ key: acceptedRepair.key, taskId: acceptedRepair.taskId }] } },
+      },
+    })
+    expect(BigInt(String(after.sequence[0]?.eventSequence))).toBe(acceptedSequence)
     expect(after.events.map(event => event.idempotencyKey).sort()).toEqual([
       taskGraphProposalKey(value.rootTaskId, 0), taskGraphProposalKey(value.rootTaskId, 1),
     ])
