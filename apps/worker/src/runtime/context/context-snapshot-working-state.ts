@@ -196,6 +196,16 @@ function workingState(content: ContextSnapshotContent): ContextSeedBlock | undef
     }
     if (withinMemoryBound(partial)) return { id, content: partial }
   }
+  const staleLegacyCount = content.confirmedDecisions.length + content.completedWork.length + content.failedAttempts.length
+  if (compacted && staleLegacyCount > 0) {
+    const { legacySnapshotFields: _legacySnapshotFields, ...protectedState } = value
+    const partial = {
+      ...protectedState,
+      status: "partial",
+      omissions: [{ field: "legacySnapshotFields", count: staleLegacyCount }],
+    }
+    if (withinMemoryBound(partial)) return { id, content: partial }
+  }
   return {
     id,
     content: {
