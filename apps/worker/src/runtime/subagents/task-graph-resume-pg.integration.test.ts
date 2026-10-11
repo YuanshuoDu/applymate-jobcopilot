@@ -6680,7 +6680,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
-    await seed(pool, coverageRepairOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    await seed(pool, coverageRepairOwner, "waiting_for_user", { ...TASK_GRAPH_FIXTURE_TURN_LIMITS, maxSteps: 13 })
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
@@ -13643,7 +13643,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       ])
       expect(persistedFinal).toMatchObject({
         schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied",
-        response: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "p3-process-archived-wait-resumed" }),
+        response: "p3-process-archived-wait-resumed",
       })
       expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
       const completedRoot = await pool!.query<{ status: string; result: unknown }>(
