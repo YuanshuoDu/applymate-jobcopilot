@@ -76,13 +76,14 @@ function sourceOrdinals(value: unknown, count: number): number[] | undefined {
   return values.every((ordinal, index) => Number.isSafeInteger(ordinal) && Number(ordinal) >= 1 && Number(ordinal) <= count
     && values.indexOf(ordinal) === index) ? values.map(Number) : undefined
 }
-function nodeLessons(value: unknown, count: number, ordinals: readonly number[]): readonly (RootTaskHistoryNodeLesson | undefined)[] | undefined {
+function nodeLessons(value: unknown, count: number, ordinals: readonly number[], nodes: readonly unknown[]): readonly (RootTaskHistoryNodeLesson | undefined)[] | undefined {
   if (!Array.isArray(value) || value.length !== count || !dense(value)) return undefined
   const byOrdinal: Array<RootTaskHistoryNodeLesson | undefined> = Array.from({ length: count })
   for (let index = 0; index < count; index++) {
     const item = value[index]
     if (item === undefined) continue
-    const lesson = parseRootTaskHistoryNodeLesson(item)
+    const templateId = record(nodes[index])?.templateId, role = typeof templateId === "string" ? TASK_KINDS.get(templateId) ?? "other" : "other"
+    const lesson = parseRootTaskHistoryNodeLesson(item, role)
     if (!lesson || lesson.nodeOrdinal !== ordinals[index]) return undefined
     byOrdinal[lesson.nodeOrdinal - 1] = lesson
   }
@@ -146,7 +147,7 @@ function candidate(value: unknown): Candidate | null {
     || !Array.isArray(graph.nodes) || graph.nodes.length < 1 || graph.nodes.length > MAX_NODES || !dense(graph.nodes)) return null
   const ordinals = hasOrdinals ? sourceOrdinals(item.sourceNodeOrdinals, graph.nodes.length) : undefined
   const effectiveOrdinals = ordinals ?? graph.nodes.map((_, index) => index + 1)
-  const lessons = hasLessons && ordinals ? nodeLessons(item.nodeLessons, graph.nodes.length, ordinals) : undefined
+  const lessons = hasLessons && ordinals ? nodeLessons(item.nodeLessons, graph.nodes.length, ordinals, graph.nodes) : undefined
   const outputs = hasOutputs ? reportedOutputs(item.reportedOutputs, graph.nodes) : undefined
   const nodes = graph.nodes.map((value, index) => {
     const projection = projectNode(value)
@@ -176,7 +177,7 @@ function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeN
 }
 function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutputs: boolean): SafeNode[] {
   const facts = withLessons && turn.candidate.lessonsBySourceOrdinal
-    ? filterRootTaskHistoryLessonsForEmittedNodes(turn.candidate.lessonsBySourceOrdinal, [...turn.lessonOrdinals]) : []
+    ? filterRootTaskHistoryLessonsForEmittedNodes(turn.candidate.lessonsBySourceOrdinal, [...turn.lessonOrdinals], turn.nodes.map(node => node.nodeOrdinal)) : []
   const byOrdinal = new Map<number, RootTaskHistoryNodeLesson>()
   for (const fact of facts) if (fact) byOrdinal.set(fact.nodeOrdinal, fact)
   return turn.nodes.map(node => {

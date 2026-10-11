@@ -110,7 +110,10 @@ describe("root history ordinal lessons", () => {
     const { loaded, graph } = fixture(), lessons = deriveRootTaskHistoryLessonFacts(loaded, graph)
     expect(lessons).toHaveLength(2)
     expect(lessons[0]).toEqual({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
-      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }, { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" }] })
+      criterionFailures: [
+        { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met", check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } },
+        { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met", check: { role: "scout", kind: "candidate_count_gte", minimum: 3 } },
+      ] })
     expect(lessons[1]).toEqual({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
       criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1, 2], status: "passed" }] })
     const serialized = JSON.stringify(lessons)
@@ -122,6 +125,8 @@ describe("root history ordinal lessons", () => {
     expect(projection?.taskGraph).toEqual(graph)
     expect(projection?.sourceNodeOrdinals).toEqual([1, 2])
     expect(projection?.nodeLessons).toEqual(deriveRootTaskHistoryLessonFacts(loaded, graph))
+    expect(projection?.nodeLessons?.[0]?.criterionFailures[0]?.check).toEqual({ role: "scout", kind: "candidate_count_gte", minimum: 2 })
+    expect(projection?.nodeLessons?.[1]?.successfulRepairs).toEqual([{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1, 2], status: "passed" }])
     expect(projection?.reportedOutputs).toBeUndefined()
     expect(projectLoadedRootTaskHistoryGraph({ ...loaded, item: null })).toBeUndefined()
   })

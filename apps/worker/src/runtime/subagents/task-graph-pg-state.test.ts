@@ -146,7 +146,8 @@ describe("TaskGraph PostgreSQL state loading", () => {
       status: "failed", role: "analyst", result: { taskGraphVerificationReport: findingReport, raw: "private raw output" },
     })] })
     const node = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes[0]!
-    expect(node).toMatchObject({ verificationCriterionIds: ["finding-count"], verificationReport: findingReport })
+    expect(node).toMatchObject({ verification: analystVerification, verificationCriterionIds: ["finding-count"], verificationReport: findingReport })
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT item."id"')).length).toBe(1)
     expect(JSON.stringify(node)).not.toContain("private raw output")
     const malformed = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({
       status: "failed", role: "analyst", result: { taskGraphVerificationReport: report },
@@ -208,6 +209,7 @@ describe("TaskGraph PostgreSQL state loading", () => {
 
   it("keeps legacy and specialized terminal nodes compatible without generic reports", async () => {
     const legacy = fakeClient({ itemContent: validSnapshot(), taskRows: [validTaskRow({ status: "completed" })] })
+    expect(currentTaskGraph(await loadTaskGraph(legacy.client, identity)).nodes[0]).not.toHaveProperty("verification")
     expect(currentTaskGraph(await loadTaskGraph(legacy.client, identity)).nodes[0]).not.toHaveProperty("verificationReport")
     const specialized = {
       schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,

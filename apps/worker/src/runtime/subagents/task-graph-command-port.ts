@@ -12,6 +12,7 @@ import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js
 import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -179,6 +180,7 @@ export type TaskGraphCurrentNode = Readonly<{
   resultSummary: string | null
   resultProjection?: TaskGraphResultProjection
   verificationCriterionIds?: readonly string[]
+  verification?: TaskGraphVerificationContract
   verificationReport?: TaskGraphVerificationReport
   repairOf?: TaskGraphRepairOf
   repairReceipt?: TaskGraphRepairReceipt

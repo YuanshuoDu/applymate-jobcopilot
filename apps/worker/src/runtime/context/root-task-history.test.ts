@@ -87,7 +87,8 @@ describe("root task history projection", () => {
         { jobId: "job-2", source: "greenhouse", evidenceKinds: ["job"] }],
     } satisfies TaskGraphResultProjection
     const targetLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
-      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] } as const
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] } as const
     const repairLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
       criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] } as const
     const source = outcome("safe-facts", 16n, [repair, target])
@@ -99,12 +100,55 @@ describe("root task history projection", () => {
     expect(projected?.content).toMatchObject({ turns: [{ nodes: [
       { status: "completed", reportedOutput: { role: "scout", candidateCount: 4, resultStatus: "partial" },
         lesson: { nodeOrdinal: 2, successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] } },
-      { status: "failed", lesson: { nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] } },
+      { status: "failed", lesson: { nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] } },
     ] }] })
     const serialized = JSON.stringify(projected)
     for (const forbidden of ["safe-facts", "PRIVATE_", "job-1", "job-2", "greenhouse", "evidenceKinds", "evidenceDigest", "resultDigest", "criterion-a"]) {
       expect(serialized).not.toContain(forbidden)
     }
+  })
+
+  it("retains dependency meaning for an emitted Scout with no lesson and strips it if that Scout is pruned", () => {
+    const scout = node({ key: "source-scout", taskId: "source-scout-task", status: "completed", failureReason: null,
+      verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: "criterion-a", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64) } })
+    const analyst = node({ key: "dependent-analyst", taskId: "dependent-analyst-task", templateId: "analyst" })
+    const dependentLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "analyst", kind: "findings_from_scout_dependency", dependencyNodeOrdinal: 1 } }] } as const
+    const prior = outcome("dependency-source", 20n, [scout, analyst])
+    const aligned = { ...prior, sourceNodeOrdinals: [1, 2], nodeLessons: [undefined, dependentLesson] }
+    const retained = projectRootTaskHistory([aligned])
+    expect(retained?.content).toMatchObject({ turns: [{ nodes: [
+      { taskKind: "analyst", lesson: { criterionFailures: [{ check: { role: "analyst", kind: "findings_from_scout_dependency", dependencyNodeOrdinal: 1 } }] } },
+      { taskKind: "scout", status: "completed" },
+    ] }] })
+
+    const newerNodes = Array.from({ length: 7 }, (_, index) => node({ key: `newer-${index}`, taskId: `newer-task-${index}`, templateId: "analyst" }))
+    const pruned = projectRootTaskHistory([aligned, outcome("newer-turn", 21n, newerNodes)])
+    const prunedTurns = (pruned?.content as { turns?: { nodes?: { taskKind: string; lesson?: { criterionFailures?: unknown[] } }[] }[] } | undefined)?.turns
+    expect(prunedTurns).toHaveLength(2)
+    expect(prunedTurns?.[0]?.nodes).toHaveLength(7)
+    expect(prunedTurns?.[1]?.nodes).toHaveLength(1)
+    expect(prunedTurns?.[1]?.nodes?.[0]).toMatchObject({ taskKind: "analyst", lesson: { criterionFailures: [
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+    ] } })
+    const oldLesson = prunedTurns?.[1]?.nodes?.[0]?.lesson
+    expect(oldLesson?.criterionFailures?.[0]).not.toHaveProperty("check")
+  })
+
+  it("omits an aligned lesson whose typed-check role conflicts with the public node", () => {
+    const source = outcome("role-mismatch", 22n, [node()])
+    const invalidLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "analyst", kind: "finding_count_gte", minimum: 2 } }] } as const
+    const projected = projectRootTaskHistory([{ ...source, sourceNodeOrdinals: [1], nodeLessons: [invalidLesson] }])
+    expect(projected?.content).toMatchObject({ turns: [{ nodes: [{ taskKind: "scout", status: "failed" }] }] })
+    const serialized = JSON.stringify(projected)
+    expect(serialized).not.toContain("finding_count_gte")
+    expect(serialized).not.toContain("invalidLesson")
   })
 
   it("keeps valid history when optional lessons lack source ordinals and validates counts independently", () => {
