@@ -12050,7 +12050,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
     expect(initialTaskIds).toHaveLength(3)
     const taskStore = new PgSubagentTaskStore(pool!)
-    const executeChild = async (taskId: string, ownerId: string) => {
+    const executeChild = async (taskId: string, ownerId: string, expectedStatus: "completed" | "failed" = "completed") => {
       const claimed = await taskStore.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
       if (!claimed) throw new Error("Coverage fixture child did not acquire its scoped task")
       const leaseExpiresAt = claimed.leaseExpiresAt
@@ -12060,10 +12060,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const finished = await taskStore.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
         status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition,
         mailboxMessageIds: result.mailboxMessageIds, now: new Date() })
-      expect(finished).toBe("completed")
+      expect(finished).toBe(expectedStatus)
     }
     await executeChild(initialTaskIds[0]!, `p3-cohort-scout-${value.suffix}`)
-    await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`)
+    await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`, "failed")
     await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey)
     expect(failedCoverageObserved).toBe(true)
     expect(repairAccepted).toBe(true)
@@ -13611,7 +13611,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(completedTurn.rows).toHaveLength(1)
       expect(completedTurn.rows[0]).toMatchObject({
-        status: "completed", rootTaskId, finalResponse: "p3-process-archived-wait-resumed", inputTokens: 37, outputTokens: 17,
+        status: "completed", rootTaskId, inputTokens: 37, outputTokens: 17,
+      })
+      const persistedFinal = record(JSON.parse(completedTurn.rows[0]!.finalResponse ?? "null"))
+      expect(Object.keys(persistedFinal ?? {}).sort()).toEqual([
+        "blocker", "completed", "completedTasks", "evidenceRefs", "goal", "next", "notCompleted", "response",
+        "schemaVersion", "stepCount", "summary", "terminalReason", "toolCallCount", "usage",
+      ])
+      expect(persistedFinal).toMatchObject({
+        schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied",
+        response: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "p3-process-archived-wait-resumed" }),
       })
       expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
       const completedRoot = await pool!.query<{ status: string; result: unknown }>(
