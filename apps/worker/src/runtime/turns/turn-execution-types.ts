@@ -22,6 +22,8 @@ import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import type { NativeSemanticProgressMode, NativeSemanticRejectionCount, NativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
+import type { DurableWaitControlReader } from "../tools/coordination-types.js"
+import type { RecoveredArchivedWaitControl } from "./turn-execution-wait.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
 export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
@@ -136,6 +138,8 @@ export type TurnExecutionOptions = {
   readonly refreshTaskGraphAfterReadyWait?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
   /** Re-read durable TaskGraph state after an accepted agent.plan receipt. */
   readonly refreshTaskGraphAfterPlan?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
+  readonly durableWaitControlReader?: DurableWaitControlReader
+  readonly recoveredWaitControl?: RecoveredArchivedWaitControl
 }
 
 export type TurnExecutionOutcome = TurnEngineResult
