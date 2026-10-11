@@ -295,6 +295,74 @@ describe("TaskGraph turn observation", () => {
       .toolObservations.at(-1)?.content as { nodes: unknown[] }).nodes)
   })
 
+  it("rejects an oversized base observation even when fresh planning facts are supplied", () => {
+    const keys = Array.from({ length: 16 }, (_, index) => "k".repeat(120) + String(index).padStart(8, "0"))
+    const criterionIds = Array.from({ length: 8 }, (_, index) => "c".repeat(62) + String(index).padStart(2, "0"))
+    const graphRootTaskId = "r".repeat(128)
+    const nodes = keys.map((key, index) => ({
+      key,
+      templateId: "m".repeat(128),
+      goal: "g".repeat(1_200),
+      successCriteria: Array.from({ length: 8 }, () => "c".repeat(320)),
+      dependsOn: keys,
+      taskId: "t".repeat(120) + String(index).padStart(8, "0"),
+      status: "completed" as const,
+      readiness: "terminal" as const,
+      verificationCriterionIds: criterionIds,
+      repairOf: {
+        graphRootTaskId,
+        nodeKey: "n".repeat(120) + String(index).padStart(8, "0"),
+        taskId: "s".repeat(120) + String(index).padStart(8, "0"),
+        criterionIds,
+      },
+      native: {
+        operationKind: "followup" as const,
+        operationId: "o".repeat(256),
+        requestFingerprint: "a".repeat(64),
+        callerTaskId: "p".repeat(128),
+        role: "r".repeat(64),
+        taskType: "y".repeat(128),
+        contextDigest: "b".repeat(64),
+        source: {
+          taskId: "s".repeat(128),
+          rootTaskId: "r".repeat(128),
+          parentTaskId: "p".repeat(128),
+          turnId: "u".repeat(128),
+          role: "x".repeat(64),
+          taskType: "z".repeat(128),
+          status: "completed" as const,
+          attemptCount: 1,
+          resultDigest: "c".repeat(64),
+          graphNodeKey: "g".repeat(128),
+          origin: "task_graph" as const,
+        },
+      },
+      nativeResult: {
+        schemaVersion: "agent-harness.v2.task-graph.native-result.v1" as const,
+        role: "r".repeat(64),
+        taskStatus: "completed" as const,
+        disposition: "structured" as const,
+        resultDigest: "d".repeat(64),
+      },
+    }))
+    const baseState = { revision: 3, nodes } as unknown as TaskGraphCurrentState
+    const planningFacts = {
+      graphRevision: 3,
+      counts: {
+        discoveredJobs: { knownCount: 12, coverage: "partial" },
+        analyzedJobs: { knownCount: 7, coverage: "complete" },
+        artifactReferences: { knownCount: null, coverage: "not_requested" },
+        reviewOutcomes: { knownCount: null, coverage: "unavailable" },
+      },
+    }
+
+    expect(() => mergeTaskGraphCurrentObservation(snapshot(), baseState))
+      .toThrow("task_graph_current_state_too_large")
+    expect(() => mergeTaskGraphCurrentObservation(snapshot(), {
+      ...baseState, planningFacts,
+    } as unknown as TaskGraphCurrentState)).toThrow("task_graph_current_state_too_large")
+  })
+
   it("does not evaluate a planning-facts accessor on the current-state object", () => {
     let getterRead = false
     const unsafeState = { ...state }
