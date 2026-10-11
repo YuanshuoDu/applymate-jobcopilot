@@ -7,10 +7,10 @@ import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMa
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
+import { attachTurnQuestionStore } from "./turn-question-store-factory.js"
 import { resolveNativeSemanticProgressModeWithClient } from "./native-semantic-mode-store.js"
 import { completeNativeSemanticRejectionStepWithClient } from "./native-semantic-rejection-completion.js"
 import { nativeSemanticSchemaConflict, readNativeSemanticRejectionsWithClient } from "./native-semantic-rejection-ledger.js"
-import { attachTurnQuestionStore } from "./turn-question-store-factory.js"
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
 function conflict(resource: string): Error {
   const error = new Error(`TurnEngine persistence conflict: ${resource}`)
