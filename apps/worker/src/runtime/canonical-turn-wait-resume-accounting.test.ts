@@ -33,6 +33,27 @@ const archivedEvents: Array<Record<string, unknown>> = [
     payload: { stepId: "step-1", status: "waiting_for_dependency", toolCallCount: 3, taskId: scope.rootTaskId } },
 ]
 
+function twoCallArchivedState() {
+  const createdAt = new Date("2026-10-11T12:00:00.000Z")
+  const priorId = "prior-call"
+  const waitCall = { ...call, id: "a-wait-call-item", createdAt }
+  const waitResult = { ...result, id: "b-wait-result-item", createdAt }
+  const priorCall = { ...call, id: "y-prior-call-item", createdAt,
+    content: { toolCallId: priorId, toolName: "agent.plan", input: {}, status: "completed" } }
+  const priorResult = { ...result, id: "z-prior-result-item", createdAt,
+    content: { toolCallId: priorId, output: { planned: true } } }
+  const waitFinished = archivedEvents.find(event => event.type === "tool_call.completed")!
+  const priorFinished = { ...waitFinished, id: "prior-finished", itemId: priorCall.id, correlationId: priorId,
+    idempotencyKey: `turn:${scope.turnId}:event:tool-finished:${priorId}`, sequence: "4",
+    payload: { taskId: scope.rootTaskId, toolCallId: priorId, toolName: "agent.plan", status: "completed" } }
+  const finishedWait = { ...waitFinished, itemId: waitCall.id, sequence: "5" }
+  const stepCompleted = { ...archivedEvents.find(event => event.type === "step.completed")!, sequence: "6" }
+  const events = [...archivedEvents.filter(event => event.type !== "tool_call.completed" && event.type !== "step.completed"),
+    priorFinished, finishedWait, stepCompleted]
+  // Equal item timestamps and lexical IDs put the wait before its earlier executed call.
+  return { items: [waitCall, waitResult, priorCall, priorResult], events }
+}
+
 function build(input: {
   steps?: readonly Record<string, unknown>[]; items?: readonly Record<string, unknown>[]; events?: readonly Record<string, unknown>[]
   persistedToolCallCount?: number; recoveredWaitControl?: RecoveredArchivedWaitControl
@@ -54,6 +75,27 @@ describe("canonical resume accounting for archived waits", () => {
     const resumed = build({ steps: [archivedStep, { id: "step-2", ordinal: 5, status: "running", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }] })
     expect(resumed?.toolCallCount).toBe(3)
     expect(resumed?.usage).toEqual({ inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 })
+  })
+
+  it("orders a tied-item closed prefix by exact finish receipts before retaining the full count", () => {
+    const value = twoCallArchivedState()
+    expect(value.items.filter(item => item.type === "tool_call").map(item => item.content.toolCallId)).toEqual(["wait-call", "prior-call"])
+    const resumed = build({ items: value.items, events: value.events, persistedToolCallCount: 2 })
+    expect(resumed?.toolCallCount).toBe(3)
+    expect(resumed?.usage).toEqual({ inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 })
+  })
+
+  it.each([
+    ["a persisted call after the wait", (events: Array<Record<string, unknown>>) => events.map(event =>
+      event.id === "prior-finished" ? { ...event, sequence: "6" } : event.id === "step-completed" ? { ...event, sequence: "7" } : event)],
+    ["a duplicate receipt sequence", (events: Array<Record<string, unknown>>) => events.map(event =>
+      event.id === "prior-finished" ? { ...event, sequence: "5" } : event)],
+    ["an invalid receipt sequence", (events: Array<Record<string, unknown>>) => events.map(event =>
+      event.id === "prior-finished" ? { ...event, sequence: "invalid" } : event)],
+  ])("rejects %s in historical accounting", (_name, reviseEvents) => {
+    const value = twoCallArchivedState()
+    expect(() => build({ items: value.items, events: reviseEvents(value.events), persistedToolCallCount: 2 }))
+      .toThrow("archived_wait_accounting_invalid")
   })
 
   it("retains a legacy nullable-task wait only when root-owned receipts prove its closure", () => {

@@ -65,6 +65,10 @@ const WAIT_CALL_ID = "p3-resume-wait"
 const DISCOVERY_RESTART_WAIT_CALL_ID = "p3-process-restart-discovery-wait-call"
 const DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID = "p3-process-restart-discovery-analyst-plan"
 const DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID = "p3-process-restart-discovery-analyst-wait"
+const ARCHIVED_WAIT_CALL_ID = "p3-process-archived-wait-call"
+const ARCHIVED_WAIT_TAIL_CALL_ID = "p3-process-archived-wait-unexecuted-tail"
+const ARCHIVED_WAIT_FRESH_LIST_CALL_ID = "p3-process-archived-wait-fresh-list"
+const ARCHIVED_WAIT_IDEMPOTENCY_KEY = "p3-process-archived-wait"
 const DISCOVERY_RESTART_DIAGNOSTIC_CALL_IDS = new Set([
   DISCOVERY_RESTART_WAIT_CALL_ID, DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID,
 ])
@@ -3458,7 +3462,7 @@ function processDiscoveryTurnWorkerDiagnostics(
 }
 
 function startTaskGraphRestartWorker(
-  mode: "park-parent" | "resume-parent" | "park-discovery" | "resume-discovery" | "worker2-input-guard-self-test",
+  mode: "park-parent" | "resume-parent" | "park-discovery" | "resume-discovery" | "crash-archived-wait" | "resume-archived-wait" | "worker2-input-guard-self-test",
   value: Record<string, unknown>,
   envOverrides: Record<string, string> = {},
 ): ProcessFixtureChild {
@@ -6395,6 +6399,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const verificationRepairOwner = fixture()
   const lateRepairOwner = fixture()
   const leaseRecoveryOwner = fixture()
+  const archivedWaitOwner = fixture()
   const rootRecoveryScanSeed = fixture()
   const rootRecoveryScanOwner = {
     ...rootRecoveryScanSeed,
@@ -6443,6 +6448,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
 
@@ -6459,7 +6465,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner]) {
+    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner, archivedWaitOwner]) {
       await attempt("delete outbox for " + current.sessionId, () => pool!.query(
         "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
       ))
@@ -6487,7 +6493,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
         })
         for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
+          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner, archivedWaitOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
             await attempt("remove " + label + " job " + job.id, () => job.remove())
           }
         }
@@ -12047,6 +12053,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const initialWaitKey = `p3-lease-recovery-wait:${value.turnId}`
     const repairPlanCallId = `p3-lease-recovery-repair-plan:${value.turnId}`
     const repairWaitKey = `p3-lease-recovery-repair-wait:${value.turnId}`
+    const repairWaitCallId = `p3-lease-recovery-repair-wait:${value.turnId}`
     const fixtureInvocationCounters: LeaseRecoveryFixtureDiagnostics = {
       modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0,
       runtimeExecuteInvocations: 0, runtimeExecuteFailureClass: "none", startupStage: "not_started",
@@ -12177,7 +12184,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(repair).toMatchObject({ status: "queued", repairOf: { nodeKey: "scout", criterionIds: ["candidate-count"] } })
               expect(dependent).toMatchObject({ taskId: originalDependentTaskId, status: "waiting" })
               repairPlanAccepted = true
-              yield { type: "tool_call_completed", callId: `p3-lease-recovery-repair-wait:${value.turnId}`, name: "agent.wait", arguments: {
+              yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: repairWaitKey, taskIds: [repairTaskIds[0]!, originalDependentTaskId], mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -12317,7 +12324,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(recoveredTarget).toMatchObject({ status: "failed", failureReason: "task_graph_verification_unverified" })
     expectUnverifiedVerificationReport(record(recoveredTarget?.result)?.taskGraphVerificationReport, "candidate-count")
 
-    await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey, 45_000)
+    await waitForPersistedTaskWait(
+      pool!, value.turnId, repairWaitKey, 45_000, repairWaitCallId, fixtureInvocationCounters,
+    )
     expect(initialWaitReportSeen).toBe(true)
     expect(repairPlanAccepted).toBe(true)
     expect(repairTaskId).not.toBe("")
@@ -12859,4 +12868,295 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
     }
   }, 45_000)
+
+  it("recovers a real oversized archived wait from a streaming process cut without replay or extra usage", async () => {
+    let workerOne: ProcessFixtureChild | undefined
+    let workerTwo: ProcessFixtureChild | undefined
+    const value = archivedWaitOwner
+    const waitKey = `${ARCHIVED_WAIT_IDEMPOTENCY_KEY}:${value.turnId}`
+    let rootTaskId: string | undefined
+    let taskIds: string[] = []
+    let waitId: string | undefined
+    let originalStepId: string | undefined
+    let originalLeaseVersion: number | undefined
+    try {
+      const [turnQueue, childQueue] = await Promise.all([
+        import("../turns/turn-queue.js"), import("../../queue/subagent-queue.js"),
+      ])
+      turnQueueName = turnQueue.TURN_QUEUE_NAME
+      childQueueName = childQueue.SUBAGENT_QUEUE_NAME
+      workerOne = startTaskGraphRestartWorker("crash-archived-wait", { ...value })
+      const firstReady = await waitForProcessLine(workerOne, "P3_ARCHIVED_WAIT_FIRST_WORKER_READY ", 45_000)
+      if (workerOne.pid === undefined) throw new Error("Archived-wait first Worker has no process ID")
+      expect(firstReady).toContain(`p3-archived-wait-worker-${workerOne.pid}`)
+      const created = await waitForProcessLine(workerOne, "P3_ARCHIVED_WAIT_TASKS_CREATED ", 45_000)
+      const createdValue = record(JSON.parse(created.slice("P3_ARCHIVED_WAIT_TASKS_CREATED ".length)))
+      rootTaskId = typeof createdValue?.rootTaskId === "string" ? createdValue.rootTaskId : undefined
+      taskIds = Array.isArray(createdValue?.taskIds)
+        ? createdValue.taskIds.filter((taskId): taskId is string => typeof taskId === "string") : []
+      expect(rootTaskId).toBeTruthy()
+      expect(taskIds).toHaveLength(7)
+      expect(new Set(taskIds).size).toBe(7)
+      await waitForProcessLine(workerOne, "P3_ARCHIVED_WAIT_STEP_CLOSE_BARRIER", 45_000)
+
+      const workerOwner = `p3-archived-wait-worker-${workerOne.pid}`
+      const activeTurn = await pool!.query<{
+        status: string; rootTaskId: string | null; leaseOwnerId: string | null; leaseVersion: number; leaseExpiresAt: Date | null
+      }>(`SELECT "status", "rootTaskId", "leaseOwnerId", "leaseVersion", "leaseExpiresAt"
+          FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId])
+      expect(activeTurn.rows).toHaveLength(1)
+      expect(activeTurn.rows[0]).toMatchObject({
+        status: "in_progress", rootTaskId, leaseOwnerId: workerOwner, leaseVersion: expect.any(Number),
+        leaseExpiresAt: expect.any(Date),
+      })
+      originalLeaseVersion = activeTurn.rows[0]!.leaseVersion
+
+      const steps = await pool!.query<{
+        id: string; taskId: string | null; status: string; inputTokens: number; outputTokens: number; estimatedCostUsd: string | number
+      }>(`SELECT step."id", step."taskId", step."status", step."inputTokens", step."outputTokens", step."estimatedCostUsd"
+          FROM "agent_steps" AS step JOIN "agent_sessions" AS session ON session."id" = step."sessionId"
+          WHERE session."userId" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND step."taskId" = $4 ORDER BY step."ordinal"`,
+      [value.userId, value.sessionId, value.turnId, rootTaskId])
+      expect(steps.rows).toHaveLength(1)
+      const cutStep = steps.rows[0]!
+      originalStepId = cutStep.id
+      expect(cutStep).toMatchObject({ taskId: rootTaskId, status: "streaming", inputTokens: 0, outputTokens: 0 })
+      expect(Number(cutStep.estimatedCostUsd)).toBe(0)
+
+      const modelEvents = await pool!.query<{
+        id: string; type: string; sequence: string | bigint; userId: string; sessionId: string; turnId: string
+        actor: string; taskId: string | null; itemId: string | null
+        correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown
+      }>(`SELECT event."id", event."type", event."sequence", session."userId" AS "userId", event."sessionId", event."turnId",
+                 event."actor", event."taskId", event."itemId", event."correlationId", event."causationId", event."idempotencyKey", event."payload"
+          FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+          WHERE session."userId" = $1 AND event."sessionId" = $2 AND event."turnId" = $3 AND event."correlationId" = $4
+            AND event."type" = ANY($5::text[]) ORDER BY event."sequence"`,
+      [value.userId, value.sessionId, value.turnId, originalStepId, ["model.started", "model.completed", "model.usage"]])
+      expect(modelEvents.rows.map(event => event.type)).toEqual(["model.started", "model.completed", "model.usage"])
+      const [started, completed, usage] = modelEvents.rows
+      for (const event of modelEvents.rows) expect(event).toMatchObject({
+        userId: value.userId,
+        sessionId: value.sessionId, turnId: value.turnId, taskId: rootTaskId, actor: "orchestrator", itemId: null,
+        correlationId: originalStepId,
+      })
+      expect(started?.idempotencyKey).toBe(`turn:${value.turnId}:event:model-started:${originalStepId}`)
+      expect(completed?.idempotencyKey).toBe(`turn:${value.turnId}:event:model-completed:${originalStepId}`)
+      expect(usage?.idempotencyKey).toBe(`turn:${value.turnId}:event:model-usage:${originalStepId}`)
+      expect(completed?.causationId).toBe(started?.id)
+      expect(usage?.causationId).toBe(completed?.id)
+      expect(BigInt(started!.sequence)).toBeLessThan(BigInt(completed!.sequence))
+      expect(BigInt(completed!.sequence)).toBeLessThan(BigInt(usage!.sequence))
+      expect(record(started?.payload)).toMatchObject({ taskId: rootTaskId, provider: "fixture", model: "fixture-model" })
+      expect(record(completed?.payload)).toMatchObject({ taskId: rootTaskId, provider: "fixture", model: "fixture-model", toolCallCount: 2 })
+      expect(record(usage?.payload)).toMatchObject({ taskId: rootTaskId, provider: "fixture", model: "fixture-model",
+        usage: { inputTokens: 23, outputTokens: 11, estimatedCostUsd: 0.004 } })
+
+      const callItems = await pool!.query<{ id: string; type: string; status: string; content: unknown }>(
+        `SELECT item."id", item."type", item."status", item."content" FROM "agent_items" AS item
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE session."userId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4 AND item."stepId" = $5
+           AND item."type" IN ('tool_call', 'tool_result') AND item."content"->>'toolCallId' = ANY($6::text[])
+         ORDER BY item."type"`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId, originalStepId, [ARCHIVED_WAIT_CALL_ID, ARCHIVED_WAIT_TAIL_CALL_ID]],
+      )
+      expect(callItems.rows.map(item => [item.type, record(item.content)?.toolCallId])).toEqual([
+        ["tool_call", ARCHIVED_WAIT_CALL_ID], ["tool_result", ARCHIVED_WAIT_CALL_ID],
+      ])
+      expect(callItems.rows.every(item => item.status === "completed")).toBe(true)
+      const callContent = record(callItems.rows.find(item => item.type === "tool_call")?.content)
+      expect(callContent).toMatchObject({ toolCallId: ARCHIVED_WAIT_CALL_ID, toolName: "agent.wait", status: "completed",
+        input: { idempotencyKey: waitKey, taskIds, mode: "all", timeoutMs: 30_000 } })
+      const resultContent = record(callItems.rows.find(item => item.type === "tool_result")?.content)
+      const outputReference = record(resultContent?.output)
+      expect(Object.keys(outputReference ?? {}).sort()).toEqual(["$ref", "sha256", "sizeBytes"])
+      expect(outputReference).toMatchObject({ $ref: expect.any(String), sha256: expect.stringMatching(/^[a-f0-9]{64}$/) })
+      expect(outputReference?.sizeBytes).toEqual(expect.any(Number))
+      expect(Number(outputReference?.sizeBytes)).toBeGreaterThan(8_192)
+      expect(Number(outputReference?.sizeBytes)).toBeLessThanOrEqual(VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT)
+      const waitRows = await pool!.query<{
+        id: string; parentTaskId: string; stepId: string; idempotencyKey: string; mode: string; status: string
+        targetTaskIds: unknown; matchedTaskIds: unknown; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+      }>(`SELECT "id", "parentTaskId", "stepId", "idempotencyKey", "mode", "status", "targetTaskIds", "matchedTaskIds",
+                 "suspendedAt", "resolvedAt", "consumedAt" FROM "agent_wait_conditions"
+          WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 AND "idempotencyKey" = $5`,
+      [value.userId, value.sessionId, value.turnId, rootTaskId, waitKey])
+      expect(waitRows.rows).toHaveLength(1)
+      const pendingWait = waitRows.rows[0]!
+      waitId = pendingWait.id
+      expect(pendingWait).toMatchObject({ parentTaskId: rootTaskId, stepId: originalStepId, idempotencyKey: waitKey,
+        mode: "all", status: "waiting", suspendedAt: null, resolvedAt: null, consumedAt: null })
+      expect(pendingWait.targetTaskIds).toEqual(taskIds)
+      expect(pendingWait.matchedTaskIds).toEqual(taskIds.slice(0, 6))
+      const childRows = await pool!.query<{ id: string; status: string; rootTaskId: string; parentTaskId: string; turnId: string; sessionId: string }>(
+        `SELECT "id", "status", "rootTaskId", "parentTaskId", "turnId", "sessionId" FROM "sub_agent_tasks"
+         WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
+           AND "id" = ANY($5::text[]) ORDER BY array_position($5::text[], "id")`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId, taskIds],
+      )
+      expect(childRows.rows.map(row => row.id)).toEqual(taskIds)
+      expect(childRows.rows.map(row => row.status)).toEqual(["completed", "completed", "completed", "completed", "completed", "completed", "queued"])
+      expect(childRows.rows.every(row => row.rootTaskId === rootTaskId && row.parentTaskId === rootTaskId
+        && row.turnId === value.turnId && row.sessionId === value.sessionId)).toBe(true)
+      expect((await pool!.query(`SELECT event."id" FROM "agent_events" AS event
+        JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+        WHERE session."userId" = $1 AND event."sessionId" = $2 AND event."turnId" = $3
+          AND event."taskId" = $4 AND event."type" = 'step.completed' AND event."correlationId" = $5`,
+      [value.userId, value.sessionId, value.turnId, rootTaskId, originalStepId])).rowCount).toBe(0)
+
+      const firstExit = waitForProcessExit(workerOne)
+      expect(workerOne.kill("SIGKILL")).toBe(true)
+      await firstExit
+      expect(workerOne.signalCode).toBe("SIGKILL")
+      const expiredLease = await pool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second',
+          "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'in_progress'
+            AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > clock_timestamp() RETURNING "id"`,
+      [value.turnId, value.sessionId, value.userId, workerOwner, originalLeaseVersion])
+      expect(expiredLease.rowCount).toBe(1)
+
+      workerTwo = startTaskGraphRestartWorker("resume-archived-wait", { ...value, rootTaskId, taskIds, waitId })
+      await waitForProcessLine(workerTwo, "P3_ARCHIVED_WAIT_RESUME_WORKER_READY ", 45_000)
+      await waitForPersistedTaskWait(pool!, value.turnId, waitKey, 45_000, ARCHIVED_WAIT_CALL_ID)
+      const suspended = await pool!.query<{
+        status: string; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; targetTaskIds: unknown; matchedTaskIds: unknown
+      }>(`SELECT "status", "suspendedAt", "resolvedAt", "consumedAt", "targetTaskIds", "matchedTaskIds"
+          FROM "agent_wait_conditions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4
+            AND "parentTaskId" = $5 AND "idempotencyKey" = $6`,
+      [waitId, value.userId, value.sessionId, value.turnId, rootTaskId, waitKey])
+      expect(suspended.rows).toHaveLength(1)
+      expect(suspended.rows[0]).toMatchObject({ status: "waiting", suspendedAt: expect.any(Date), resolvedAt: null, consumedAt: null })
+      expect(suspended.rows[0]?.targetTaskIds).toEqual(taskIds)
+      expect(suspended.rows[0]?.matchedTaskIds).toEqual(taskIds.slice(0, 6))
+      const recoveredTurn = await pool!.query<{ status: string; rootTaskId: string; leaseOwnerId: string | null; leaseVersion: number }>(
+        `SELECT "status", "rootTaskId", "leaseOwnerId", "leaseVersion" FROM "agent_turns"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId],
+      )
+      expect(recoveredTurn.rows).toHaveLength(1)
+      expect(recoveredTurn.rows[0]).toMatchObject({ status: "waiting_for_dependency", rootTaskId, leaseOwnerId: null })
+      expect(recoveredTurn.rows[0]!.leaseVersion).toBeGreaterThan(originalLeaseVersion!)
+      const closedStep = await pool!.query<{ id: string; status: string; inputTokens: number; outputTokens: number; estimatedCostUsd: string | number }>(
+        `SELECT step."id", step."status", step."inputTokens", step."outputTokens", step."estimatedCostUsd" FROM "agent_steps" AS step
+         JOIN "agent_sessions" AS session ON session."id" = step."sessionId"
+         WHERE session."userId" = $1 AND step."id" = $2 AND step."sessionId" = $3 AND step."turnId" = $4 AND step."taskId" = $5`,
+        [value.userId, originalStepId, value.sessionId, value.turnId, rootTaskId],
+      )
+      expect(closedStep.rows).toHaveLength(1)
+      expect(closedStep.rows[0]).toMatchObject({ id: originalStepId, status: "waiting_for_tool", inputTokens: 23, outputTokens: 11 })
+      expect(Number(closedStep.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.004, 8)
+      const completion = await pool!.query<{ id: string; type: string; actor: string; taskId: string; payload: unknown }>(
+        `SELECT event."id", event."type", event."actor", event."taskId", event."payload"
+         FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+         WHERE session."userId" = $1 AND event."sessionId" = $2 AND event."turnId" = $3 AND event."taskId" = $4
+           AND event."type" = 'step.completed' AND event."correlationId" = $5`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId, originalStepId],
+      )
+      expect(completion.rows).toHaveLength(1)
+      expect(completion.rows[0]).toMatchObject({ type: "step.completed", actor: "orchestrator", taskId: rootTaskId,
+        payload: { stepId: originalStepId, status: "waiting_for_dependency", taskId: rootTaskId, toolCallCount: 2 } })
+      const beforeReadyItems = await pool!.query<{ type: string; content: unknown }>(
+        `SELECT item."type", item."content" FROM "agent_items" AS item
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE session."userId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3
+           AND item."taskId" = $4 AND item."stepId" = $5 AND item."type" IN ('tool_call', 'tool_result') ORDER BY item."type"`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId, originalStepId],
+      )
+      expect(beforeReadyItems.rows).toHaveLength(2)
+      expect(beforeReadyItems.rows.map(item => [item.type, record(item.content)?.toolCallId])).toEqual([
+        ["tool_call", ARCHIVED_WAIT_CALL_ID], ["tool_result", ARCHIVED_WAIT_CALL_ID],
+      ])
+      expect((await pool!.query(`SELECT event."id" FROM "agent_events" AS event
+        JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+        WHERE session."userId" = $1 AND event."sessionId" = $2 AND event."turnId" = $3
+          AND event."taskId" = $4 AND event."type" = 'model.usage' AND event."correlationId" = $5`,
+      [value.userId, value.sessionId, value.turnId, rootTaskId, originalStepId])).rowCount).toBe(1)
+
+      const childStore = new PgSubagentTaskStore(pool!, 300_000)
+      const queuedChild = await childStore.get(taskIds[6]!, value.sessionId)
+      expect(queuedChild).toMatchObject({ id: taskIds[6], status: "queued", rootTaskId, parentTaskId: rootTaskId, turnId: value.turnId })
+      const childOwner = `p3-archived-wait-final-child-${value.suffix}`
+      const childLease = await childStore.claim({ taskId: taskIds[6]!, sessionId: value.sessionId, ownerId: childOwner,
+        policy: defaultSubagentPolicy(), now: new Date() })
+      if (!childLease) throw new Error("Archived-wait final target could not be claimed through the normal task store")
+      await expect(childStore.finish({ taskId: taskIds[6]!, sessionId: value.sessionId, ownerId: childOwner,
+        attemptCount: childLease.attemptCount, status: "completed",
+        result: { summary: "Final bounded archived-wait target completed through the task store" }, now: new Date() })).resolves.toBe("completed")
+
+      const readyLine = await waitForProcessLine(workerTwo, "P3_ARCHIVED_WAIT_READY_OUTCOME_SEEN ", 45_000)
+      expect(readyLine).toMatch(/"status":"ready".*"targetCount":7.*"matchedCount":7/)
+      await waitForProcessLine(workerTwo, "P3_ARCHIVED_WAIT_TURN_COMPLETED", 45_000)
+      const completedTurn = await pool!.query<{ status: string; rootTaskId: string; finalResponse: string | null }>(
+        `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId],
+      )
+      expect(completedTurn.rows).toEqual([{ status: "completed", rootTaskId, finalResponse: "p3-process-archived-wait-resumed" }])
+      const resolved = await pool!.query<{ status: string; targetTaskIds: unknown; matchedTaskIds: unknown; result: unknown; suspendedAt: Date | null; consumedAt: Date | null }>(
+        `SELECT "status", "targetTaskIds", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
+         FROM "agent_wait_conditions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+        [waitId, value.userId, value.sessionId, value.turnId],
+      )
+      expect(resolved.rows).toHaveLength(1)
+      expect(resolved.rows[0]).toMatchObject({ status: "ready", targetTaskIds: taskIds, matchedTaskIds: taskIds,
+        suspendedAt: expect.any(Date), consumedAt: expect.any(Date) })
+      const outcome = record(record(resolved.rows[0]?.result)?.outcome)
+      expect(outcome).toMatchObject({ waitId, status: "ready", targetTaskIds: taskIds, matchedTaskIds: taskIds })
+      expect(Array.isArray(outcome?.tasks) ? outcome.tasks : []).toHaveLength(7)
+      const allSteps = await pool!.query<{ id: string; status: string }>(
+        `SELECT step."id", step."status" FROM "agent_steps" AS step
+         JOIN "agent_sessions" AS session ON session."id" = step."sessionId"
+         WHERE session."userId" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND step."taskId" = $4 ORDER BY step."ordinal"`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId],
+      )
+      expect(allSteps.rows.filter(step => step.id === originalStepId)).toEqual([{ id: originalStepId, status: "waiting_for_tool" }])
+      expect(allSteps.rows).toHaveLength(3)
+      expect(allSteps.rows.map(step => step.status)).toEqual(["waiting_for_tool", "completed", "completed"])
+      const rootCalls = await pool!.query<{ toolCallId: string; toolName: string; itemType: string }>(
+        `SELECT item."type" AS "itemType", item."content"->>'toolCallId' AS "toolCallId", item."content"->>'toolName' AS "toolName"
+         FROM "agent_items" AS item JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE session."userId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4 AND item."type" = 'tool_call'`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId],
+      )
+      expect(rootCalls.rows.map(row => row.toolCallId).sort()).toEqual([ARCHIVED_WAIT_CALL_ID, ARCHIVED_WAIT_FRESH_LIST_CALL_ID].sort())
+      expect(rootCalls.rows.some(row => row.toolCallId === ARCHIVED_WAIT_TAIL_CALL_ID)).toBe(false)
+      expect(rootCalls.rows.filter(row => row.toolCallId === ARCHIVED_WAIT_FRESH_LIST_CALL_ID)).toHaveLength(1)
+      expect(rootCalls.rows.find(row => row.toolCallId === ARCHIVED_WAIT_FRESH_LIST_CALL_ID)?.toolName).toBe("agent.list")
+      const freshListItems = await pool!.query<{ type: string; status: string; content: unknown }>(
+        `SELECT item."type", item."status", item."content" FROM "agent_items" AS item
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE session."userId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+           AND item."type" IN ('tool_call', 'tool_result') AND item."content"->>'toolCallId' = $5 ORDER BY item."type"`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId, ARCHIVED_WAIT_FRESH_LIST_CALL_ID],
+      )
+      expect(freshListItems.rows.map(item => item.type)).toEqual(["tool_call", "tool_result"])
+      expect(freshListItems.rows.every(item => item.status === "completed")).toBe(true)
+      expect(record(freshListItems.rows.find(item => item.type === "tool_call")?.content)).toMatchObject({
+        toolCallId: ARCHIVED_WAIT_FRESH_LIST_CALL_ID, toolName: "agent.list", input: {},
+      })
+      expect(record(record(freshListItems.rows.find(item => item.type === "tool_result")?.content)?.output)).toEqual({ tasks: [] })
+      const modelRoundReceipts = await pool!.query<{ type: string; correlationId: string; payload: unknown }>(
+        `SELECT event."type", event."correlationId", event."payload" FROM "agent_events" AS event
+         JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+         WHERE session."userId" = $1 AND event."sessionId" = $2 AND event."turnId" = $3 AND event."taskId" = $4
+           AND event."type" IN ('model.completed', 'model.usage') ORDER BY event."sequence"`,
+        [value.userId, value.sessionId, value.turnId, rootTaskId],
+      )
+      const completedReceipts = modelRoundReceipts.rows.filter(event => event.type === "model.completed")
+      const usageReceipts = modelRoundReceipts.rows.filter(event => event.type === "model.usage")
+      expect(completedReceipts.map(event => record(event.payload)?.toolCallCount)).toEqual([2, 1, 0])
+      expect(new Set(completedReceipts.map(event => event.correlationId)).size).toBe(3)
+      expect(usageReceipts).toHaveLength(3)
+      expect(new Set(usageReceipts.map(event => event.correlationId))).toEqual(new Set(completedReceipts.map(event => event.correlationId)))
+      expect((await pool!.query(`SELECT event."id" FROM "agent_events" AS event
+        JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+        WHERE session."userId" = $1 AND event."sessionId" = $2 AND event."turnId" = $3
+          AND event."taskId" = $4 AND event."type" = 'model.usage' AND event."correlationId" = $5`,
+      [value.userId, value.sessionId, value.turnId, rootTaskId, originalStepId])).rowCount).toBe(1)
+      if (!workerTwo) throw new Error("Archived-wait resume worker disappeared before graceful cleanup")
+      await stopProcessFixture(workerTwo)
+      workerTwo = undefined
+    } finally {
+      if (workerOne && !processFixtureExited(workerOne)) await killProcessFixture(workerOne)
+      if (workerTwo && !processFixtureExited(workerTwo)) await killProcessFixture(workerTwo)
+    }
+  }, 150_000)
 })

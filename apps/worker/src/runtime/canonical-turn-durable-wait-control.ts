@@ -63,28 +63,36 @@ function modelUsage(events: readonly Row[], stepId: string, identity: TurnExecut
 }
 
 function completedPrefix(callItems: readonly Row[], stepItems: readonly Row[], events: readonly Row[], identity: TurnExecutionIdentity, lastCallItem: Row,
-  usageSequence: bigint, requireExactTask: boolean): void {
-  if (callItems.length === 0 || callItems[callItems.length - 1] !== lastCallItem) invalid()
-  let previousSequence = usageSequence
+  usageSequence: bigint, receiptCeiling: bigint, requireExactTask: boolean): void {
+  const ordered: Array<{ item: Row; sequence: bigint }> = []
   for (const item of callItems) {
     const call = object(item.content), id = call?.toolCallId, name = call?.toolName, status = call?.status
-    if ((requireExactTask ? item.taskId !== identity.rootTaskId : !scopedTask(item.taskId, identity.rootTaskId))
+    if (typeof item.id !== "string" || !item.id || (requireExactTask ? item.taskId !== identity.rootTaskId : !scopedTask(item.taskId, identity.rootTaskId))
       || item.status !== "completed" || typeof id !== "string" || typeof name !== "string"
       || (status !== "completed" && status !== "failed" && status !== "cancelled")) invalid()
     const resultItems = stepItems.filter(result => (requireExactTask ? result.taskId === identity.rootTaskId : scopedTask(result.taskId, identity.rootTaskId))
       && result.type === "tool_result" && object(result.content)?.toolCallId === id)
     if (resultItems.length !== 1 || resultItems[0]?.status !== "completed") invalid()
     const eventType = status === "completed" ? "tool_call.completed" : "tool_call.failed"
-    const receipts = events.filter(event => event.type === eventType && event.correlationId === id && event.itemId === item.id
-      && event.idempotencyKey === `turn:${identity.turnId}:event:tool-finished:${id}`)
+    const receipts = events.filter(event => (event.type === "tool_call.completed" || event.type === "tool_call.failed")
+      && event.correlationId === id && event.itemId === item.id)
     const event = receipts[0], data = payload(event?.payload)
     const receiptSequence = eventSequence(event?.sequence)
-    if (receipts.length !== 1 || !event || event.userId !== identity.userId || event.sessionId !== identity.sessionId
+    if (receipts.length !== 1 || !event || event.type !== eventType || event.userId !== identity.userId || event.sessionId !== identity.sessionId
       || event.turnId !== identity.turnId || event.taskId !== identity.rootTaskId || event.actor !== "orchestrator"
+      || event.idempotencyKey !== `turn:${identity.turnId}:event:tool-finished:${id}`
       || data?.toolCallId !== id || data.toolName !== name || data.status !== status || data.taskId !== identity.rootTaskId
-      || receiptSequence === null || receiptSequence <= previousSequence) invalid()
-    previousSequence = receiptSequence
+      || receiptSequence === null) invalid()
+    ordered.push({ item, sequence: receiptSequence })
   }
+  ordered.sort((left, right) => left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0)
+  if (ordered.length === 0) invalid()
+  let previousSequence = usageSequence
+  for (const receipt of ordered) {
+    if (receipt.sequence <= previousSequence || receipt.sequence > receiptCeiling) invalid()
+    previousSequence = receipt.sequence
+  }
+  if (ordered[ordered.length - 1]?.item !== lastCallItem) invalid()
 }
 
 /** Finds only a completed archived wait on the exact latest owner-loaded root Step. */
@@ -141,20 +149,24 @@ export async function recoverCanonicalArchivedWaitControl(input: {
   const usage = modelUsage(input.events, String(step.id), identity)
   const waitSequence = eventSequence(candidate.event.sequence)
   if (waitSequence === null || usage.sequence >= waitSequence) invalid()
-  completedPrefix(callItems, stepItems, input.events, identity, candidate.callItem, usage.sequence, step.status === "streaming")
   if (step.status === "streaming" && (step.taskId !== identity.rootTaskId || usage.toolCallCount === undefined)) invalid()
   const completionEvents = input.events.filter(event => event.type === "step.completed" && event.correlationId === step.id)
   if (completionEvents.length > 1) invalid()
   const completion = completionEvents[0]
   const completionPayload = payload(completion?.payload)
-  if (completion && (step.status !== "waiting_for_tool" || !scopedTask(completion.taskId, identity.rootTaskId)
-    || completionPayload?.stepId !== step.id || completionPayload.status !== "waiting_for_dependency"
-    || !scopedTask(completionPayload.taskId, identity.rootTaskId)
+  const completionSequence = completion ? eventSequence(completion.sequence) : null
+  if (completion && (step.status !== "waiting_for_tool" || completion.userId !== identity.userId || completion.sessionId !== identity.sessionId
+    || completion.turnId !== identity.turnId || completion.taskId !== identity.rootTaskId || completion.actor !== "orchestrator"
+    || completion.itemId !== null || completion.idempotencyKey !== `turn:${identity.turnId}:event:step-completed:${step.id}`
+    || typeof completion.id !== "string" || !completion.id || !exactKeys(completionPayload, ["stepId", "status", "toolCallCount", "taskId"])
+    || completionPayload.stepId !== step.id || completionPayload.status !== "waiting_for_dependency"
+    || completionPayload.taskId !== identity.rootTaskId || completionSequence === null || waitSequence >= completionSequence
     || !Number.isSafeInteger(completionPayload.toolCallCount) || Number(completionPayload.toolCallCount) < callItems.length
     || (usage.toolCallCount !== undefined && Number(completionPayload.toolCallCount) !== usage.toolCallCount))) invalid()
   if ((step.status === "streaming" || step.status === "running") && completion) invalid()
   const toolCallCount = completion ? Number(completionPayload!.toolCallCount) : usage.toolCallCount ?? callItems.length
   if (!Number.isSafeInteger(toolCallCount) || toolCallCount < callItems.length || (step.status === "streaming" && toolCallCount === 0)) invalid()
+  completedPrefix(callItems, stepItems, input.events, identity, candidate.callItem, usage.sequence, completionSequence ?? waitSequence, step.status === "streaming")
   const stepUsage = { inputTokens: persistedNumber(step.inputTokens, true), outputTokens: persistedNumber(step.outputTokens, true), estimatedCostUsd: persistedNumber(step.estimatedCostUsd) }
   const stepHasZeroUsage = stepUsage.inputTokens === 0 && stepUsage.outputTokens === 0 && stepUsage.estimatedCostUsd === 0
   const stepMatchesUsage = stepUsage.inputTokens === usage.inputTokens && stepUsage.outputTokens === usage.outputTokens && stepUsage.estimatedCostUsd === usage.estimatedCostUsd

@@ -68,26 +68,33 @@ function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly
       || typeof usage.estimatedCostUsd !== "number" || !Number.isFinite(usage.estimatedCostUsd) || usage.estimatedCostUsd < 0) invalid()
   }
 
-  let previousReceiptSequence = usageSequence
+  const orderedReceipts: Array<{ readonly toolName: string; readonly sequence: bigint }> = []
   for (const item of calls) {
     const call = object(item.content), callId = call?.toolCallId, toolName = call?.toolName, status = call?.status
-    if (typeof callId !== "string" || !callId || typeof toolName !== "string" || !toolName
+    if (typeof item.id !== "string" || !item.id || typeof callId !== "string" || !callId || typeof toolName !== "string" || !toolName
       || (status !== "completed" && status !== "failed" && status !== "cancelled")) invalid()
     const resultRows = items.filter(result => result.stepId === stepId && result.type === "tool_result"
       && (result.taskId == null || result.taskId === scope.rootTaskId)
       && object(result.content)?.toolCallId === callId)
     if (resultRows.length !== 1 || resultRows[0]?.status !== "completed") invalid()
-    const receipts = events.filter(event => event.type === (status === "completed" ? "tool_call.completed" : "tool_call.failed")
-      && event.correlationId === callId && event.itemId === item.id && event.idempotencyKey === `turn:${scope.turnId}:event:tool-finished:${callId}`)
-    if (receipts.length !== 1 || !eventScope(receipts[0]!, status === "completed" ? "tool_call.completed" : "tool_call.failed", callId, scope,
-      `turn:${scope.turnId}:event:tool-finished:${callId}`, String(item.id))) invalid()
+    const receipts = events.filter(event => (event.type === "tool_call.completed" || event.type === "tool_call.failed")
+      && event.correlationId === callId && event.itemId === item.id)
+    if (receipts.length !== 1 || receipts[0]!.type !== (status === "completed" ? "tool_call.completed" : "tool_call.failed")
+      || !eventScope(receipts[0]!, status === "completed" ? "tool_call.completed" : "tool_call.failed", callId, scope,
+        `turn:${scope.turnId}:event:tool-finished:${callId}`, item.id)) invalid()
     const receiptPayload = object(receipts[0]!.payload), receiptSequence = sequence(receipts[0]!.sequence)
     if (!receiptPayload || receiptPayload.toolCallId !== callId || receiptPayload.toolName !== toolName || receiptPayload.status !== status
-      || receiptPayload.taskId !== scope.rootTaskId || receiptSequence === null || receiptSequence <= previousReceiptSequence
-      || receiptSequence >= completedSequence) invalid()
-    previousReceiptSequence = receiptSequence
+      || receiptPayload.taskId !== scope.rootTaskId || receiptSequence === null) invalid()
+    orderedReceipts.push({ toolName, sequence: receiptSequence })
   }
-  if (calls.length === 0 || !["agent.wait", "wait_subagents"].includes(String(object(calls[calls.length - 1]!.content)?.toolName))) invalid()
+  orderedReceipts.sort((left, right) => left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0)
+  if (orderedReceipts.length === 0) invalid()
+  let previousReceiptSequence = usageSequence
+  for (const receipt of orderedReceipts) {
+    if (receipt.sequence <= previousReceiptSequence || receipt.sequence >= completedSequence) invalid()
+    previousReceiptSequence = receipt.sequence
+  }
+  if (!["agent.wait", "wait_subagents"].includes(orderedReceipts[orderedReceipts.length - 1]!.toolName)) invalid()
   return fullCount
 }
 
