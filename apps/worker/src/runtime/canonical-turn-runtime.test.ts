@@ -572,6 +572,10 @@ describe("createCanonicalTurnRuntime", () => {
         kind: "task_graph_current", revision: 9, nodes: [],
         nodeCapacity: { nodeCount: 0, maxNodes: 8, remaining: 8, ordinaryRemaining: 8, reserveActive: false, repairRecorded: false },
       } },
+      { id: "turn-budget-current", content: {
+        kind: "turn_budget_current", status: "unavailable", advisoryOnly: true, pointInTime: true,
+        notPermission: true, notReservation: true, notCompletionEvidence: true,
+      } },
     ])
     expect(modelRequests).toHaveLength(1)
   })
@@ -2165,8 +2169,38 @@ describe("createCanonicalTurnRuntime", () => {
       }),
       readCurrentResultPage,
     }
+    const openedRootSteps: string[] = []
+    let readingCurrentBudget = false
+    let budgetObservationReads = 0
+    let pendingBudgetClientRelease = false
+    let budgetClientReleases = 0
     const activityClient = {
       query: vi.fn(async (sql: string) => {
+        if (sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") {
+          if (!openedRootSteps.at(-1)) throw new Error("current_budget_read_before_step_open")
+          readingCurrentBudget = true
+          return { rows: [], rowCount: 0 }
+        }
+        if (sql === "COMMIT" && readingCurrentBudget) {
+          readingCurrentBudget = false
+          budgetObservationReads += 1
+          pendingBudgetClientRelease = true
+          return { rows: [], rowCount: 0 }
+        }
+        if (sql === "ROLLBACK") { readingCurrentBudget = false; return { rows: [], rowCount: 0 } }
+        if (readingCurrentBudget && sql.includes('SELECT root_task."budgetSnapshot"')) return { rows: [{ budgetSnapshot: { limits: {
+          maxSteps: 32, maxToolCalls: 20, maxInputTokens: 5000, maxOutputTokens: 8000, maxCostUsd: 1,
+        } } }], rowCount: 1 }
+        if (readingCurrentBudget && sql.includes('COUNT(*)::bigint AS "used"') && sql.includes('FROM "agent_steps"')) {
+          return { rows: [{ used: String(6 + openedRootSteps.length) }], rowCount: 1 }
+        }
+        if (readingCurrentBudget && sql.includes('COUNT(*)::bigint AS "used"') && sql.includes('FROM "agent_items"')) {
+          return { rows: [{ used: String(5 + budgetObservationReads) }], rowCount: 1 }
+        }
+        if (readingCurrentBudget && sql.includes("SUM(usage_row.")) return { rows: [{
+          inputTokens: String(1000 + budgetObservationReads * 10), outputTokens: String(2000 + budgetObservationReads * 20),
+          estimatedCostUsd: String((0.1 + budgetObservationReads * 0.01).toFixed(2)),
+        }], rowCount: 1 }
         if (sql.includes('SELECT 1 FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
         if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
         if (sql.includes('WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3')) return { rows: [{
@@ -2177,7 +2211,9 @@ describe("createCanonicalTurnRuntime", () => {
         }], rowCount: 1 }
         return { rows: [], rowCount: 1 }
       }),
-      release: vi.fn(),
+      release: vi.fn(() => {
+        if (pendingBudgetClientRelease) { budgetClientReleases += 1; pendingBudgetClientRelease = false }
+      }),
     }
     const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
     const requests: HarnessModelRequest[] = []
@@ -2269,6 +2305,7 @@ describe("createCanonicalTurnRuntime", () => {
       turnEngineStoreFactory: () => ({
         ...store(events),
         startStep: async ({ stepId, ordinal, inputThroughSequence }) => {
+          openedRootSteps.push(stepId)
           inputCheckpoints.set(stepId, { inputThroughSequence, consumedInputIds: [] })
           return { id: stepId, ordinal }
         },
@@ -2367,6 +2404,9 @@ describe("createCanonicalTurnRuntime", () => {
     expect(analystNumericUuidRequest && JSON.stringify(analystNumericUuidRequest.messages)).toContain(numericUuid)
     expect(pageReads[3]?.request.offset).toBe(expectedAnalystPage.availability === "available" ? expectedAnalystPage.nextOffset : null)
     expect(contexts).toHaveLength(6)
+    expect(budgetObservationReads).toBe(6)
+    expect(budgetClientReleases).toBe(6)
+    expect(openedRootSteps).toHaveLength(6)
     expect(contexts.map(context => context.taskGraphRevision)).toEqual([7, 7, 7, 7, 8, 8])
     expect(contexts.map(context => context.inputThroughSequence)).toEqual([3n, 3n, 3n, 3n, 3n, 3n])
     expect(contexts.map(context => context.consumedInputIds)).toEqual([[freshSteer.id], [], [], [], [], []])
@@ -2393,6 +2433,27 @@ describe("createCanonicalTurnRuntime", () => {
       const observation = JSON.parse(text.text.slice(text.text.indexOf("\n") + 1)) as Record<string, unknown>
       return observation
     })
+    const capturedBudgets = requests.map(request => {
+      const text = request.messages.flatMap(message => message.content)
+        .find(part => part.type === "text" && part.text.includes('"kind":"turn_budget_current"'))
+      if (!text || text.type !== "text") throw new Error("captured_request_missing_current_turn_budget")
+      return JSON.parse(text.text.slice(text.text.indexOf("\n") + 1)) as Record<string, unknown>
+    })
+    expect(capturedBudgets).toHaveLength(6)
+    expect(capturedBudgets.map(budget => budget.status)).toEqual(Array(6).fill("available"))
+    expect(capturedBudgets.map(budget => budget.advisoryOnly)).toEqual(Array(6).fill(true))
+    expect(capturedBudgets.map(budget => budget.pointInTime)).toEqual(Array(6).fill(true))
+    expect(capturedBudgets.every(budget => budget.notPermission === true && budget.notReservation === true
+      && budget.notCompletionEvidence === true && !Object.hasOwn(budget, "toolCallId") && !Object.hasOwn(budget, "businessRefs"))).toBe(true)
+    const budgetRows = capturedBudgets.map(budget => budget.budgets as Record<string, { limit: number | null; used: number; remaining: number | null }>)
+    expect(budgetRows.map(row => row.steps)).toEqual(Array.from({ length: 6 }, (_, index) => ({ limit: 32, used: 7 + index, remaining: 25 - index })))
+    expect(budgetRows.map(row => row.toolCalls)).toEqual(Array.from({ length: 6 }, (_, index) => ({ limit: 20, used: 5 + index, remaining: 15 - index })))
+    expect(budgetRows.map(row => row.inputTokens)).toEqual(Array.from({ length: 6 }, (_, index) => ({ limit: 5000, used: 1000 + index * 10, remaining: 4000 - index * 10 })))
+    expect(budgetRows.map(row => row.outputTokens)).toEqual(Array.from({ length: 6 }, (_, index) => ({ limit: 8000, used: 2000 + index * 20, remaining: 6000 - index * 20 })))
+    expect(budgetRows.map(row => row.costUsd)).toEqual(Array.from({ length: 6 }, (_, index) => {
+      const used = Number((0.1 + index * 0.01).toFixed(2))
+      return { limit: 1, used, remaining: Number((1 - used).toFixed(2)) }
+    }))
     expect(capturedGraphObservations.map(observation => observation.nodeCapacity))
       .toEqual(Array(6).fill(currentTypedGraphCapacity))
     expect(capturedGraphObservations.every(observation => !Object.hasOwn(observation, "rootTaskId"))).toBe(true)
