@@ -1,5 +1,5 @@
 import type pg from "pg"
-import type { DurableWaitControl, DurableWaitControlInvocation, DurableWaitControlReader } from "../tools/coordination-types.js"
+import type { DurableWaitControl, DurableWaitControlInvocation, DurableWaitControlReader, DurableWaitStepAdmission } from "../tools/coordination-types.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Queryable = Pick<pg.PoolClient, "query">
@@ -10,6 +10,9 @@ const INVOCATION_KEYS = "idempotencyKey,leaseVersion,mode,now,ownerId,rootTaskId
 
 function record(value: unknown): Row | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Row : null }
 function text(value: unknown): value is string { return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256 }
+function validAdmission(value: unknown): value is DurableWaitStepAdmission {
+  return value === "fresh_streaming_root" || value === "restored_inflight_root"
+}
 function valid(input: DurableWaitControlInvocation): boolean {
   const row = record(input)
   if (!row || Object.getPrototypeOf(row) !== Object.prototype || Reflect.ownKeys(row).some(key => typeof key !== "string")
@@ -26,8 +29,8 @@ function valid(input: DurableWaitControlInvocation): boolean {
     && new Set(targets).size === targets.length && !targets.includes(input.taskId)
 }
 
-async function read(client: Queryable, input: DurableWaitControlInvocation, matchesReplay: DurableWaitReplayMatcher): Promise<DurableWaitControl | null> {
-  if (!valid(input)) return null
+async function read(client: Queryable, input: DurableWaitControlInvocation, admission: DurableWaitStepAdmission, matchesReplay: DurableWaitReplayMatcher): Promise<DurableWaitControl | null> {
+  if (!validAdmission(admission) || !valid(input)) return null
   const session = (await client.query<Row>(`SELECT "id" FROM "agent_sessions"
     WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived')`, [input.sessionId, input.userId])).rows[0]
   if (!session) return null
@@ -42,9 +45,14 @@ async function read(client: Queryable, input: DurableWaitControlInvocation, matc
       AND session."status" NOT IN ('aborted', 'archived')`, [input.rootTaskId, input.sessionId, input.userId])).rows[0]
   if (!parent || String(parent.rootTaskId ?? parent.id) !== input.rootTaskId || String(parent.turnId ?? "") !== input.turnId
     || !ACTIVE_TASKS.has(String(parent.status))) return null
-  const step = (await client.query<Row>(`SELECT "taskId" FROM "agent_steps"
-    WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND "status" IN ('running', 'waiting_for_tool')
-      AND ("taskId" = $4 OR "taskId" IS NULL)`, [input.stepId, input.turnId, input.sessionId, input.rootTaskId])).rows[0]
+  const step = admission === "fresh_streaming_root"
+    ? (await client.query<Row>(`SELECT "taskId" FROM "agent_steps"
+        WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND "status" = 'streaming' AND "taskId" = $4`,
+      [input.stepId, input.turnId, input.sessionId, input.rootTaskId])).rows[0]
+    : (await client.query<Row>(`SELECT "taskId" FROM "agent_steps"
+        WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND "status" IN ('running', 'waiting_for_tool')
+          AND ("taskId" = $4 OR "taskId" IS NULL)`,
+      [input.stepId, input.turnId, input.sessionId, input.rootTaskId])).rows[0]
   if (!step) return null
   const targets = await client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -67,12 +75,13 @@ async function read(client: Queryable, input: DurableWaitControlInvocation, matc
 
 /** The store's waitReplay matcher is injected so the read cannot drift from idempotency semantics. */
 export function createPgDurableWaitControlReader(pool: Pool, matchesReplay: DurableWaitReplayMatcher): DurableWaitControlReader {
-  return { async readByInvocation(input) {
+  return { async readByInvocation(input, admission) {
+    if (!validAdmission(admission)) return null
     const client = await pool.connect()
     try {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
       await client.query("SELECT set_config('app.user_id', $1, true)", [input.userId])
-      const control = await read(client, input, matchesReplay)
+      const control = await read(client, input, admission, matchesReplay)
       await client.query("COMMIT")
       return control
     } catch (error: unknown) {

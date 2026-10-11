@@ -255,7 +255,8 @@ describe("executeTools persisted replay", () => {
     const modelCall = { ...call, name: toolName }
     const executeTool = vi.fn(async () => ({ id: modelCall.id, toolName, toolVersion: "1", status: "completed" as const, output: reference, errorCode: null }))
     const fixture = execution(pending, executeTool as never)
-    fixture.options = { ...fixture.options, durableWaitControlReader: { readByInvocation: async () => ({ waitId: durableWaitId, status: "interrupted" as const }) } }
+    const readByInvocation = vi.fn(async () => ({ waitId: durableWaitId, status: "interrupted" as const }))
+    fixture.options = { ...fixture.options, durableWaitControlReader: { readByInvocation } }
 
     await expect(executeTools(
       fixture.options, fixture.writer, { id: "step-1", ordinal: 1 },
@@ -263,6 +264,7 @@ describe("executeTools persisted replay", () => {
       fixture.options.snapshot, new Set(), fixture.options.signal!, () => new Date("2026-09-09T00:00:00.000Z"), undefined, vi.fn(),
     )).rejects.toMatchObject({ code: "persistence_conflict" })
     expect(executeTool).toHaveBeenCalledOnce()
+    expect(readByInvocation).toHaveBeenCalledWith(expect.objectContaining({ stepId: "step-1" }), "fresh_streaming_root")
   })
 
   it("does not apply archived-wait replay fencing to an ordinary tool reference", async () => {

@@ -207,7 +207,7 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
 
   return {
     wait, resolve, cancel,
-    readByInvocation: input => controlReader.readByInvocation(input),
+    readByInvocation: (input, admission) => controlReader.readByInvocation(input, admission),
     suspendAndRelease: input => suspendAndReleaseWait(pool, input),
     reconcile: input => reconcileDurableWaits(pool, input),
   }
