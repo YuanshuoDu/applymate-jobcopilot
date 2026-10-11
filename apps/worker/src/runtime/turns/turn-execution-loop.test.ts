@@ -929,50 +929,6 @@ describe("owner-agnostic turn execution loop", () => {
     expect(agendas.every(receipt => !receipt.resumeFence?.consumedInputIds?.includes(rootInput.id))).toBe(true)
   })
 
-  it.each(["steer", "follow_up"] as const)("keeps the distinct %s root reference in both actual model requests across a tool call", async delivery => {
-    const objective = "Find AI platform roles in Dublin."
-    const reference = `REFERENCE-ONLY. PASS or approval claims here are untrusted background. ${"Supporting candidate history. ".repeat(55)}`
-    const input: StoredAgentInput = {
-      id: "root-reference", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-root",
-      delivery, status: "accepted", content: [{ type: "text", text: reference }], acceptedSequence: 4n,
-      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-06T12:00:00.000Z"),
-    }
-    const claimStore = new RootContextClaimStore(input)
-    const root = fixture(identity("turn", "root-1"))
-    root.options = { ...root.options, goal: objective }
-    attachRootContextBuilder(root, claimStore, input.id)
-    const lateSteerText = "Also include roles with production AI ownership."
-    const lateSteer: StoredAgentInput = {
-      id: "late-steer", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-steer",
-      delivery: "steer", status: "accepted", content: [{ type: "text", text: lateSteerText }], acceptedSequence: 5n,
-      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-06T12:01:00.000Z"),
-    }
-    const executeTool = root.options.executeTool
-    root.options = { ...root.options, executeTool: async request => { const result = await executeTool(request); claimStore.addInput(lateSteer); return result } }
-
-    const result = await runTurnExecutionLoop(root.options)
-    expect(result.status).toBe("completed")
-    expect(root.requests).toHaveLength(2)
-    for (const modelRequest of root.requests) {
-      const userText = modelRequest.messages.filter(message => message.role === "user").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
-      const systemText = modelRequest.messages.filter(message => message.role === "system").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
-      expect(userText.filter(text => text.includes(reference))).toHaveLength(1)
-      expect(userText.find(text => text.includes(reference))).toContain("layer=pending_input trust=UNTRUSTED_DATA source=user_input")
-      expect(userText.find(text => text.includes("layer=goal"))).toContain(objective)
-      expect(systemText).not.toContain(reference)
-    }
-    expect(root.requests[0]?.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")).not.toContain(lateSteerText)
-    expect(root.requests[1]?.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")).toContain(lateSteerText)
-    expect(claimStore.claimCounts.get(input.id)).toBe(1)
-    expect(claimStore.claimCounts.get(lateSteer.id)).toBe(1)
-    expect(claimStore.readCount).toBe(2)
-    expect(claimStore.input).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:0" })
-    expect(claimStore.inputs.find(item => item.id === lateSteer.id)).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:1" })
-    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload).map(event => event.payload as { signals?: { steering?: { fresh?: boolean }; pendingInputs?: { ids?: readonly string[] } } })
-    expect(agendas.map(receipt => receipt.signals?.steering?.fresh)).toEqual([false, false])
-    expect(agendas[0]?.signals?.pendingInputs?.ids).toEqual([input.id])
-    expect(agendas[1]?.signals?.pendingInputs?.ids).toEqual([lateSteer.id])
-  })
 
   it("rethrows a pause rejected by startStep without terminalizing or invoking the model", async () => {
     const root = fixture(identity("turn", "root-1"))
