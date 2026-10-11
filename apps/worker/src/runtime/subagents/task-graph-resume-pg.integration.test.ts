@@ -613,6 +613,10 @@ const LEASE_RECOVERY_ADAPTER_BRANCHES = new Set([
 const LEASE_RECOVERY_ADAPTER_STAGES = new Set([
   "not_started", "stream_entered", "branch_entered", "graph_checked", "outcome_checked",
   "database_checked", "tool_call_emitted", "completion_emitted", "final_output_emitted",
+  "final_proof_graph_nodes", "final_proof_node_statuses", "final_proof_dependent_identity",
+  "final_proof_dependent_report", "final_proof_repair_report", "final_proof_repair_receipt",
+  "final_proof_wait_outcome", "final_proof_wait_task_statuses", "final_proof_repair_wait_report",
+  "final_proof_dependent_wait_report",
 ])
 const LEASE_RECOVERY_STARTUP_STAGES = new Set([
   "not_started", "state_loading", "state_loaded", "selected_job_loading", "selected_job_loaded",
@@ -4808,6 +4812,10 @@ type LeaseRecoveryAdapterBranch = "not_started" | "initial_plan" | "initial_wait
 type LeaseRecoveryAdapterStage =
   | "not_started" | "stream_entered" | "branch_entered" | "graph_checked" | "outcome_checked"
   | "database_checked" | "tool_call_emitted" | "completion_emitted" | "final_output_emitted"
+  | "final_proof_graph_nodes" | "final_proof_node_statuses" | "final_proof_dependent_identity"
+  | "final_proof_dependent_report" | "final_proof_repair_report" | "final_proof_repair_receipt"
+  | "final_proof_wait_outcome" | "final_proof_wait_task_statuses" | "final_proof_repair_wait_report"
+  | "final_proof_dependent_wait_report"
 type LeaseRecoveryModelResult = {
   resultStatus: "completed" | "failed" | "missing" | "other"
   isError: boolean | null
@@ -5857,6 +5865,11 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
       adapterStage: "outcome_checked",
     })
+    const finalProofStage = leaseRecoveryFixtureDiagnosticProjection({
+      adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
+      adapterStage: "final_proof_repair_receipt",
+    })
+    expect(finalProofStage?.adapterStage).toBe("final_proof_repair_receipt")
     const invalid = leaseRecoveryFixtureDiagnosticProjection({
       adapterExecutionOrdinal: 8, adapterRoundOrdinal: -1, adapterBranch: secret, adapterStage: secret,
       startupStage: secret, runtimeExecuteFailureClass: secret, private: secret,
@@ -6617,6 +6630,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const verificationRepairOwner = fixture()
   const lateRepairOwner = fixture()
   const leaseRecoveryOwner = fixture()
+  const coverageRepairOwner = fixture()
   const archivedWaitOwner = fixture()
   const rootRecoveryScanSeed = fixture()
   const rootRecoveryScanOwner = {
@@ -6666,6 +6680,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, coverageRepairOwner, "waiting_for_user", { ...TASK_GRAPH_FIXTURE_TURN_LIMITS, maxSteps: 13 })
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
@@ -6683,7 +6698,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner, archivedWaitOwner]) {
+    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, coverageRepairOwner, rootRecoveryScanOwner, archivedWaitOwner]) {
       await attempt("delete outbox for " + current.sessionId, () => pool!.query(
         "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
       ))
@@ -6711,7 +6726,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
         })
         for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner, archivedWaitOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
+          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, coverageRepairOwner, rootRecoveryScanOwner, archivedWaitOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
             await attempt("remove " + label + " job " + job.id, () => job.remove())
           }
         }
@@ -11846,6 +11861,260 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(JSON.stringify(terminalDecision)).toBe('{"ok":true}')
   }, 120_000)
 
+  it("repairs an explicit 75-percent Analyst cohort after two of four findings, then completes its dependent", async () => {
+    const [workerQueue, canonical, commandPortModule, turnQueueModule] = await Promise.all([
+      import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"), import("../turns/turn-queue.js"),
+    ])
+    const { createProductionChildExecutor } = await import("./production-child-runtime.js")
+    const value = coverageRepairOwner
+    const ids = Array.from({ length: 4 }, (_, index) => fixtureJobId(value.suffix, index))
+    turnQueueName = turnQueueModule.TURN_QUEUE_NAME
+    childQueueName = (await import("../../queue/subagent-queue.js")).SUBAGENT_QUEUE_NAME
+    await activateFixtureTurn(pool!, value)
+    await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb
+      WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      value.turnId, JSON.stringify({ goal: "Analyze at least 75 percent of the four jobs found by the Scout" }), value.sessionId, value.userId,
+    ])
+    for (let index = 0; index < ids.length; index++) {
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+        VALUES ($1, $2, $3, 'Software Engineer', 'Dublin', 'saved', $4, 'Coverage fixture source', 'greenhouse', CURRENT_TIMESTAMP)
+        ON CONFLICT ("id") DO NOTHING`, [ids[index], value.userId, `Coverage Fixture ${index + 1}`, `https://jobs.example.invalid/${ids[index]}`])
+    }
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    const coverageVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "cohort-coverage", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout", minimumPercent: 75 } }],
+    } as const
+    const scoutVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 4 } }],
+    } as const
+    const finalVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+    } as const
+    const planCallId = `p3-cohort-coverage-plan:${value.turnId}`
+    const initialWaitCallId = `p3-cohort-coverage-initial-wait:${value.turnId}`
+    const repairPlanCallId = `p3-cohort-coverage-repair-plan:${value.turnId}`
+    const repairWaitCallId = `p3-cohort-coverage-repair-wait:${value.turnId}`
+    const initialWaitKey = `p3-cohort-coverage-initial-wait:${value.turnId}`
+    const repairWaitKey = `p3-cohort-coverage-repair-wait:${value.turnId}`
+    let rootExecution = 0
+    let initialTaskIds: string[] = []
+    let targetTaskId = "", downstreamTaskId = "", repairTaskId = ""
+    let failedCoverageObserved = false, repairAccepted = false, repairPassed = false, downstreamCompleted = false
+    const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags,
+      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => {
+        const execution = ++rootExecution
+        let round = 0
+        const adapter: ModelAdapter = {
+          id: "p3-explicit-cohort-coverage-root-fixture", profile,
+          async *stream(request) {
+            round += 1
+            const graph = currentGraphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+            const scout = nodes.find(node => node?.key === "scout")
+            const analysis = nodes.find(node => node?.key === "analysis")
+            const downstream = nodes.find(node => node?.key === "downstream")
+            const repair = nodes.find(node => node?.key === "analysis-repair")
+            if (execution === 1 && round === 1) {
+              yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [
+                  { key: "scout", templateId: "scout", goal: "Find four current engineering roles", successCriteria: ["Return four evidence-bound candidates"], dependsOn: [], verification: scoutVerification },
+                  { key: "analysis", templateId: "analyst", goal: "Analyze findings covering at least 75 percent of the Scout cohort", successCriteria: ["Return findings for at least three of four candidates"], dependsOn: ["scout"], verification: coverageVerification },
+                  { key: "downstream", templateId: "analyst", goal: "Continue only after the coverage target is repaired", successCriteria: ["Return one evidence-bound finding"], dependsOn: ["analysis"], verification: finalVerification },
+                ],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 1 && round === 2) {
+              initialTaskIds = planTaskIds(request, planCallId, 3)
+              targetTaskId = initialTaskIds[1]!
+              downstreamTaskId = initialTaskIds[2]!
+              yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: initialWaitKey, taskIds: [targetTaskId], mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 1) {
+              const outcome = waitOutcomeFromRequest(request, 1)
+              expect(outcome.status).toBe("ready")
+              const failedTask = record(outcome.tasks[0])
+              expect(failedTask).toMatchObject({ taskId: targetTaskId, status: "failed", role: "analyst" })
+              expect(record(failedTask?.verificationReport)).toMatchObject({ status: "failed", criteria: [{
+                criterionId: "cohort-coverage", status: "failed", reasonCode: "criterion_not_met",
+              }] })
+              expect(scout).toMatchObject({ status: "completed" })
+              expect(analysis).toMatchObject({ taskId: targetTaskId, status: "failed" })
+              expect(downstream).toMatchObject({ taskId: downstreamTaskId, status: "waiting" })
+              failedCoverageObserved = true
+              if (!analysis?.taskId || typeof graph?.revision !== "number") throw new Error("Coverage fixture lost its current target identity")
+              yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
+                expectedRevision: graph.revision,
+                nodes: [{ key: "analysis-repair", templateId: "analyst", goal: "Add the third evidence-bound cohort finding", successCriteria: ["Return findings for at least three of four candidates"], dependsOn: ["scout"], verification: coverageVerification,
+                  repairOf: { nodeKey: "analysis", taskId: analysis.taskId, criterionIds: ["cohort-coverage"] } }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 2) {
+              const repairIds = planTaskIds(request, repairPlanCallId, 1)
+              repairTaskId = repairIds[0]!
+              expect(repair).toMatchObject({ taskId: repairTaskId, status: "queued", repairOf: { nodeKey: "analysis", criterionIds: ["cohort-coverage"] } })
+              expect(analysis).toMatchObject({ taskId: targetTaskId, status: "failed" })
+              expect(downstream).toMatchObject({ taskId: downstreamTaskId, status: "waiting" })
+              repairAccepted = true
+              yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: repairWaitKey, taskIds: [repairTaskId, downstreamTaskId], mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 3 && round === 1) {
+              const outcome = waitOutcomeFromRequest(request, 2)
+              expect(outcome.status).toBe("ready")
+              expect(outcome.tasks.map(task => record(task)?.status)).toEqual(["completed", "completed"])
+              expect(repair).toMatchObject({ taskId: repairTaskId, status: "completed" })
+              expectPassedVerificationReport(repair?.verificationReport, "cohort-coverage")
+              expect(record(repair?.repairReceipt)).toMatchObject({ targetNodeKey: "analysis", targetTaskId, criterionIds: ["cohort-coverage"] })
+              expect(downstream).toMatchObject({ taskId: downstreamTaskId, status: "completed" })
+              expectPassedVerificationReport(downstream?.verificationReport, "finding-count")
+              repairPassed = true
+              downstreamCompleted = true
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "The declared cohort coverage was verified after repair" }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error(`Unexpected cohort coverage root round ${execution}/${round}`)
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    const childExecutor = createProductionChildExecutor({
+      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: ({ task }) => {
+        let round = 0
+        const callId = `p3-cohort-coverage-search:${task.id}:${task.attemptCount}`
+        const adapter: ModelAdapter = {
+          id: `p3-cohort-coverage-${task.role}-child`, profile,
+          async *stream(request) {
+            round += 1
+            if (round === 1) {
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            const search = record(latestToolResult(request, callId))
+            const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
+            const cohort = ids.map(id => jobs.find(job => job.id === id)).filter((job): job is RecordValue => job !== undefined)
+            if (cohort.length !== 4) throw new Error("Coverage child did not observe the full four-job Scout cohort")
+            const count = task.id === targetTaskId ? 2 : task.id === repairTaskId ? 3 : task.id === downstreamTaskId ? 1 : cohort.length
+            const selected = cohort.slice(0, count)
+            const evidence = selected.map(job => ({ id: `read:job:${job.id}`, kind: "job", ref: job.id, source: "greenhouse" }))
+            const structuredResult = task.role === "scout"
+              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+                candidates: selected.map((job, index) => ({ jobId: job.id as string, source: "fixture", url: null, evidenceIds: [evidence[index]!.id] })),
+                evidence, summary: "Four current Scout candidates" }
+              : task.role === "analyst"
+                ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                  findings: selected.map((job, index) => ({ jobId: job.id as string, score: 8, evidenceIds: [evidence[index]!.id] })),
+                  evidence, summary: "Evidence-bound cohort findings" }
+                : null
+            if (!structuredResult) throw new Error("Coverage fixture received an unsupported task role")
+            yield { type: "text_delta", text: JSON.stringify(structuredResult) }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }
+        return adapter
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: turnQueueModule.createTurnQueue,
+      turnRecoveryIntervalMs: 100,
+      waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-cohort-coverage-resolver-${value.suffix}` },
+      subagents: {
+        execute: async () => { throw new Error("Coverage fixture manually executes only its scoped children") }, intervalMs: 10,
+        queueFactory: () => {
+          const queue = { add: async () => undefined, close: async () => undefined }, worker = { pause: async () => undefined, close: async () => undefined }
+          return { queue, worker, close: async () => { await worker.close(); await queue.close() } } as never
+        },
+        recoveryFactory: () => ({ close: async () => undefined }) as never,
+      },
+    })
+    await turnQueueModule.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+    await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
+    expect(initialTaskIds).toHaveLength(3)
+    const taskStore = new PgSubagentTaskStore(pool!)
+    const executeChild = async (taskId: string, ownerId: string, expectedStatus: "completed" | "failed" = "completed") => {
+      const claimed = await taskStore.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
+      if (!claimed) throw new Error("Coverage fixture child did not acquire its scoped task")
+      const leaseExpiresAt = claimed.leaseExpiresAt
+      if (!(leaseExpiresAt instanceof Date) || !Number.isFinite(leaseExpiresAt.getTime())) throw new Error("Coverage fixture child lease expired before execution")
+      const lease: SubagentLease = { ...claimed, ownerId, leaseExpiresAt, signal: new AbortController().signal }
+      const result = await childExecutor({ lease })
+      const finished = await taskStore.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
+        status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition,
+        mailboxMessageIds: result.mailboxMessageIds, now: new Date() })
+      expect(finished).toBe(expectedStatus)
+    }
+    await executeChild(initialTaskIds[0]!, `p3-cohort-scout-${value.suffix}`)
+    await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`, "failed")
+    await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey)
+    expect(failedCoverageObserved).toBe(true)
+    expect(repairAccepted).toBe(true)
+    const repairPlan = await pool!.query<{ result: unknown; status: string }>(
+      `SELECT task."result", task."status" FROM "sub_agent_tasks" AS task WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3`,
+      [repairTaskId, value.sessionId, value.turnId],
+    )
+    expect(repairPlan.rows[0]?.status).toBe("queued")
+    await executeChild(repairTaskId, `p3-cohort-coverage-repair-${value.suffix}`)
+    await executeChild(downstreamTaskId, `p3-cohort-downstream-${value.suffix}`)
+    await waitForTurnStatus(pool!, value.turnId, "completed", 45_000, repairWaitKey)
+    expect(repairPassed).toBe(true)
+    expect(downstreamCompleted).toBe(true)
+    const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
+      `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId],
+    )
+    expect(turn.rows[0]).toMatchObject({ status: "completed", finalResponse: expect.stringContaining("cohort coverage was verified") })
+    const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
+      `SELECT "id", "goal", "status", "failureReason", "result" FROM "sub_agent_tasks"
+       WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`, [value.turnId, value.sessionId, turn.rows[0]?.rootTaskId],
+    )
+    expect(tasks.rows).toHaveLength(4)
+    const original = tasks.rows.find(task => task.id === targetTaskId), repaired = tasks.rows.find(task => task.id === repairTaskId)
+    const downstream = tasks.rows.find(task => task.id === downstreamTaskId)
+    expect(original).toMatchObject({ status: "failed", failureReason: "task_graph_verification_failed" })
+    expect(record(record(original?.result)?.structuredResult)?.findings).toHaveLength(2)
+    expect(record(original?.result)?.taskGraphVerificationReport).toMatchObject({ status: "failed", criteria: [{ criterionId: "cohort-coverage", status: "failed" }] })
+    expect(repaired).toMatchObject({ status: "completed", failureReason: null })
+    expect(record(record(repaired?.result)?.structuredResult)?.findings).toHaveLength(3)
+    expectPassedVerificationReport(record(repaired?.result)?.taskGraphVerificationReport, "cohort-coverage")
+    expect(record(record(repaired?.result)?.taskGraphRepairReceipt)).toMatchObject({
+      targetNodeKey: "analysis", targetTaskId, criterionIds: ["cohort-coverage"], repairNodeKey: "analysis-repair", repairTaskId,
+    })
+    expect(downstream).toMatchObject({ status: "completed", failureReason: null })
+    expectPassedVerificationReport(record(downstream?.result)?.taskGraphVerificationReport, "finding-count")
+  }, 120_000)
+
   it("drains a fenced running TaskGraph child after root failure without changing root or Turn", async () => {
     const seedValue = fixture()
     const value = { ...seedValue, sessionId: `000-0-root-running-drain-${seedValue.suffix}` }
@@ -12445,26 +12714,36 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              fixtureInvocationCounters.adapterStage = "final_proof_graph_nodes"
               expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent", "scout-repair"])
               const scout = nodes.find(node => node?.key === "scout")
               const dependent = nodes.find(node => node?.key === "dependent")
               const repair = nodes.find(node => node?.key === "scout-repair")
+              fixtureInvocationCounters.adapterStage = "final_proof_node_statuses"
               expect(nodes.map(node => node?.status)).toEqual(["failed", "completed", "completed"])
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_identity"
               expect(dependent?.taskId).toBe(originalDependentTaskId)
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_report"
               expectPassedVerificationReport(dependent?.verificationReport, "finding-count")
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_report"
               expectPassedVerificationReport(repair?.verificationReport, "candidate-count")
               fixtureInvocationCounters.adapterStage = "graph_checked"
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_receipt"
               expect(record(repair?.repairReceipt)).toMatchObject({
                 targetNodeKey: "scout", targetTaskId: scout?.taskId, criterionIds: ["candidate-count"],
                 repairNodeKey: "scout-repair", repairTaskId: repair?.taskId,
               })
+              fixtureInvocationCounters.adapterStage = "final_proof_wait_outcome"
               const outcome = waitOutcomeFromRequest(request, 2)
               expect(outcome.status).toBe("ready")
               const waitTasks = outcome.tasks.map(record)
+              fixtureInvocationCounters.adapterStage = "final_proof_wait_task_statuses"
               expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed"])
               const repairWaitTask = waitTasks.find(task => task?.taskId === repair?.taskId)
               const dependentWaitTask = waitTasks.find(task => task?.taskId === originalDependentTaskId)
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_wait_report"
               expectPassedVerificationReport(repairWaitTask?.verificationReport, "candidate-count")
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_wait_report"
               expectPassedVerificationReport(dependentWaitTask?.verificationReport, "finding-count")
               fixtureInvocationCounters.adapterStage = "outcome_checked"
               rootCompletedAfterRepair = true
@@ -13248,9 +13527,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(pendingWait.targetTaskIds).toEqual(orderedTaskIds)
       expect(pendingWait.matchedTaskIds).toEqual(orderedInitiallyMatchedTaskIds)
       const childRows = await pool!.query<{ id: string; status: string; rootTaskId: string; parentTaskId: string; turnId: string; sessionId: string }>(
-        `SELECT "id", "status", "rootTaskId", "parentTaskId", "turnId", "sessionId" FROM "sub_agent_tasks"
-         WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
-           AND "id" = ANY($5::text[]) ORDER BY array_position($5::text[], "id")`,
+        `SELECT task."id", task."status", task."rootTaskId", task."parentTaskId", task."turnId", task."sessionId"
+           FROM "sub_agent_tasks" AS task
+           JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+          WHERE session."userId" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+            AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND task."id" = ANY($5::text[])
+          ORDER BY array_position($5::text[], task."id")`,
         [value.userId, value.sessionId, value.turnId, rootTaskId, taskIds],
       )
       expect(childRows.rows.map(row => row.id)).toEqual(taskIds)
@@ -13352,12 +13634,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(completedTurn.rows).toHaveLength(1)
       expect(completedTurn.rows[0]).toMatchObject({
-        status: "completed", rootTaskId, finalResponse: "p3-process-archived-wait-resumed", inputTokens: 37, outputTokens: 17,
+        status: "completed", rootTaskId, inputTokens: 37, outputTokens: 17,
+      })
+      const persistedFinal = record(JSON.parse(completedTurn.rows[0]!.finalResponse ?? "null"))
+      expect(Object.keys(persistedFinal ?? {}).sort()).toEqual([
+        "blocker", "completed", "completedTasks", "evidenceRefs", "goal", "next", "notCompleted", "response",
+        "schemaVersion", "stepCount", "summary", "terminalReason", "toolCallCount", "usage",
+      ])
+      expect(persistedFinal).toMatchObject({
+        schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied",
+        response: "p3-process-archived-wait-resumed",
       })
       expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
       const completedRoot = await pool!.query<{ status: string; result: unknown }>(
-        `SELECT "status", "result" FROM "sub_agent_tasks"
-         WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "rootTaskId" = $1`,
+        `SELECT task."status", task."result" FROM "sub_agent_tasks" AS task
+         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+         WHERE task."id" = $1 AND session."userId" = $2 AND task."sessionId" = $3
+           AND task."turnId" = $4 AND task."rootTaskId" = $1`,
         [rootTaskId, value.userId, value.sessionId, value.turnId],
       )
       expect(completedRoot.rows).toHaveLength(1)

@@ -104,6 +104,16 @@ describe("agent.plan tool executor", () => {
       },
     }
     expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [scout, analyst] }, "1")).toBe(true)
+    const coverageAnalyst = { ...analyst, verification: { ...analyst.verification, criteria: [{ id: "coverage",
+      check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-source", minimumPercent: 75 } }] } }
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [scout, coverageAnalyst] }, "1")).toBe(true)
+    for (const minimumPercent of [0, 101, 75.5]) {
+      expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [scout, { ...coverageAnalyst,
+        verification: { ...coverageAnalyst.verification, criteria: [{ id: "coverage", check: {
+          kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-source", minimumPercent,
+        } }] },
+      }] }, "1")).not.toBe(true)
+    }
     expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
       ...analyst, verification: { ...analyst.verification, criteria: [{
         id: "source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source", taskId: "forged" },
@@ -117,6 +127,8 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("successCriteria prose is explanatory and never proof")
     expect(tool.description).toContain("reported_score_gte checks an Analyst-reported number, not its correctness")
     expect(tool.description).toContain("findings_from_scout_dependency")
+    expect(tool.description).toContain("findings_cover_scout_candidates_gte is Analyst-only")
+    expect(tool.description).toContain("Omitting it preserves normal top-N selection")
   })
 
   it("binds omitted repair roots at the executor and accepts only the matching legacy value", async () => {

@@ -59,7 +59,7 @@ describe("root history planning guidance", () => {
 
     expect(result?.role).toBe("system")
     expect(text).toContain("hypotheses only")
-    expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only")
+    expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
     expect(text).toContain("current verifier evidence")
     expect(text).toContain("exactly the returned nextOffset")
     expect(text).toContain("complete original Turn task, accepted current user instructions, and success criteria authoritative")
@@ -79,6 +79,19 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("session-current")
     expect(text).not.toContain("turn-current")
     expect(text).not.toContain("step-current")
+  })
+
+  it("accepts the bounded coverage lesson without placing its operands or ordinals in guidance", () => {
+    const coverageLesson = { ...lesson, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+      check: { role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75 } }] }
+    const content = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "analyst", status: "failed", negativeReasonHints: ["criterion_not_met"], lesson: coverageLesson },
+    ] }] }
+    const result = buildRootHistoryPlanningInstruction(context([historyBlock(content)]), [{ name: "agent.plan" }])
+    expect(textOf(result)).toContain("declared cohort-coverage failure shapes only")
+    for (const privateFact of ["75", "dependencyNodeOrdinal", "criterionOrdinal", "findings_cover_scout_candidates_gte", "criterion_not_met"]) {
+      expect(textOf(result)).not.toContain(privateFact)
+    }
   })
 
   it.each([

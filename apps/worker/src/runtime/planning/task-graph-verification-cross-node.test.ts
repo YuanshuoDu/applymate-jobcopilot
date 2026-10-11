@@ -22,6 +22,11 @@ const analystContract: TaskGraphVerificationContract = {
     { id: "from-scout-again", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-a" } },
   ],
 }
+const coverageContract: TaskGraphVerificationContract = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [{ id: "coverage", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-a", minimumPercent: 75 } }],
+}
 
 function scout(key: string): TaskGraphVerificationDependencyGraphNode {
   return { key, templateId: "scout", dependsOn: [], verificationDisposition: "typed", verification: scoutContract }
@@ -35,6 +40,17 @@ describe("TaskGraph cross-node verification selectors", () => {
     expect(taskGraphVerificationDependencyNodeKeys(analystContract)).toEqual(["scout-a", "scout-b"])
     expect(validateTaskGraphVerificationDependencySelectors([scout("scout-b"), scout("scout-a"), analyst(["scout-a", "scout-b"])]))
       .toBe(true)
+  })
+
+  it("treats coverage as an exact direct typed Scout dependency", () => {
+    const coverageAnalyst = (dependsOn: readonly string[]): TaskGraphVerificationDependencyGraphNode =>
+      ({ key: "analyst", templateId: "analyst", dependsOn, verificationDisposition: "typed", verification: coverageContract })
+    expect(taskGraphVerificationDependencyNodeKeys(coverageContract)).toEqual(["scout-a"])
+    expect(validateTaskGraphVerificationDependencySelectors([scout("scout-a"), coverageAnalyst(["scout-a"])] )).toBe(true)
+    expect(validateTaskGraphVerificationDependencySelectors([scout("scout-a"), coverageAnalyst([])])).toBe(false)
+    expect(validateTaskGraphVerificationDependencySelectors([
+      { ...scout("scout-a"), verificationDisposition: "legacy_unverified", verification: undefined }, coverageAnalyst(["scout-a"]),
+    ])).toBe(false)
   })
 
   it.each([

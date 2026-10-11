@@ -116,10 +116,23 @@ export function parseFindingsFromScoutDependencyCheck(
   return { kind: "findings_from_scout_dependency", dependencyNodeKey: check.dependencyNodeKey }
 }
 
+export function parseFindingsCoverScoutCandidatesCheck(
+  value: unknown, role: TaskGraphVerificationRole, path: string,
+): TaskGraphVerificationCheck | TaskGraphVerificationValidationError {
+  const check = exactRecord(value, "dependencyNodeKey,kind,minimumPercent")
+  if (role !== "analyst") return { code: "unknown_check", path }
+  if (!check || typeof check.dependencyNodeKey !== "string" || check.dependencyNodeKey.trim() !== check.dependencyNodeKey
+    || check.dependencyNodeKey.length < 1 || check.dependencyNodeKey.length > 128
+    || !Number.isSafeInteger(check.minimumPercent) || Number(check.minimumPercent) < 1 || Number(check.minimumPercent) > 100) {
+    return { code: "invalid_shape", path }
+  }
+  return { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: check.dependencyNodeKey, minimumPercent: Number(check.minimumPercent) }
+}
+
 export function taskGraphVerificationDependencyNodeKeys(contract: TaskGraphVerificationContract): string[] {
   return [...new Set(contract.criteria
-    .filter(item => item.check.kind === "findings_from_scout_dependency")
-    .map(item => item.check.kind === "findings_from_scout_dependency" ? item.check.dependencyNodeKey : ""))].sort()
+    .filter(item => item.check.kind === "findings_from_scout_dependency" || item.check.kind === "findings_cover_scout_candidates_gte")
+    .map(item => item.check.kind === "findings_from_scout_dependency" || item.check.kind === "findings_cover_scout_candidates_gte" ? item.check.dependencyNodeKey : ""))].sort()
 }
 
 /** Call with nodes normalized by the strict snapshot parser and from one graph only. */
@@ -132,7 +145,7 @@ export function validateTaskGraphVerificationDependencySelectors(nodes: readonly
   for (const node of nodes) {
     if (node.templateId !== "analyst" || node.verificationDisposition !== "typed" || node.verification?.role !== "analyst") continue
     for (const criterion of node.verification.criteria) {
-      if (criterion.check.kind !== "findings_from_scout_dependency") continue
+      if (criterion.check.kind !== "findings_from_scout_dependency" && criterion.check.kind !== "findings_cover_scout_candidates_gte") continue
       const source = byKey.get(criterion.check.dependencyNodeKey)
       if (!source || !node.dependsOn.includes(source.key) || source.templateId !== "scout"
         || source.verificationDisposition !== "typed" || source.verification?.role !== "scout") return false
@@ -150,6 +163,17 @@ export function evaluateFindingsFromScoutDependency(
   if (!source || source.role !== "scout") return "criterion_not_met"
   const candidateIds = new Set(source.items.map(item => item.jobId))
   return findingJobIds.every(jobId => candidateIds.has(jobId)) ? "passed" : "criterion_not_met"
+}
+
+export function evaluateFindingsCoverScoutCandidates(
+  dependencyNodeKey: string, findingJobIds: readonly string[], dependencies: ReadonlyMap<string, TaskGraphVerificationParsedProjection>, minimumPercent: number,
+): "passed" | "criterion_not_met" {
+  const source = dependencies.get(dependencyNodeKey), candidateIds = source?.items.map(item => item.jobId) ?? []
+  const candidates = new Set(candidateIds), findings = new Set(findingJobIds)
+  if (source?.role !== "scout" || !candidateIds.length || candidates.size !== candidateIds.length
+    || findings.size !== findingJobIds.length || !Number.isSafeInteger(minimumPercent) || minimumPercent < 1 || minimumPercent > 100
+    || findingJobIds.some(jobId => !candidates.has(jobId))) return "criterion_not_met"
+  return findingJobIds.length * 100 >= candidateIds.length * minimumPercent ? "passed" : "criterion_not_met"
 }
 
 export function parseTaskGraphVerificationDependencyEvidence(

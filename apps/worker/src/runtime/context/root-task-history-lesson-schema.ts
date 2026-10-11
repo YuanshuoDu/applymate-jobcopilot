@@ -9,6 +9,7 @@ export type RootTaskHistoryCheckDescriptor =
   | Readonly<{ role: "analyst"; kind: "all_findings_have_evidence"; minimumItems: number }>
   | Readonly<{ role: "analyst"; kind: "reported_score_gte"; minimumScore: number; minimumFindings: number; aggregation: "any" | "all" }>
   | Readonly<{ role: "analyst"; kind: "findings_from_scout_dependency"; dependencyNodeOrdinal: number }>
+  | Readonly<{ role: "analyst"; kind: "findings_cover_scout_candidates_gte"; dependencyNodeOrdinal: number; minimumPercent: number }>
 
 type CriterionFailure = Readonly<{
   criterionOrdinal: number
@@ -68,6 +69,7 @@ function safeArray(value: unknown, maximum: number, allowEmpty: boolean): unknow
 
 function ordinal(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= MAX_NODES }
 function count(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= TASK_GRAPH_VERIFICATION_LIMITS.maxItems }
+function percent(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= 100 }
 
 /** Reconstructs only the closed public check descriptor; IDs and unknown fields are rejected. */
 function parseRootTaskHistoryCheckDescriptor(value: unknown, expectedRole?: string): RootTaskHistoryCheckDescriptor | undefined {
@@ -100,6 +102,11 @@ function parseRootTaskHistoryCheckDescriptor(value: unknown, expectedRole?: stri
     && dependency.role === "analyst" && (expectedRole === undefined || dependency.role === expectedRole)) {
     return { kind: "findings_from_scout_dependency", role: "analyst", dependencyNodeOrdinal: dependency.dependencyNodeOrdinal }
   }
+  const coverage = exactDataRecord(value, "dependencyNodeOrdinal,kind,minimumPercent,role")
+  if (coverage?.kind === "findings_cover_scout_candidates_gte" && ordinal(coverage.dependencyNodeOrdinal)
+    && percent(coverage.minimumPercent) && coverage.role === "analyst" && (expectedRole === undefined || expectedRole === coverage.role)) {
+    return { kind: "findings_cover_scout_candidates_gte", role: "analyst", dependencyNodeOrdinal: coverage.dependencyNodeOrdinal, minimumPercent: coverage.minimumPercent }
+  }
   return undefined
 }
 
@@ -112,11 +119,12 @@ export function describeValidatedRootTaskHistoryChecks(snapshotValue: unknown): 
     const verification = node.verification
     if (node.verificationDisposition !== "typed" || !verification) return undefined
     return verification.criteria.map(criterion => {
-      if (criterion.check.kind === "findings_from_scout_dependency") {
+      if (criterion.check.kind === "findings_from_scout_dependency" || criterion.check.kind === "findings_cover_scout_candidates_gte") {
         const sourceOrdinal = ordinalByKey.get(criterion.check.dependencyNodeKey)
-        return sourceOrdinal === undefined ? undefined : parseRootTaskHistoryCheckDescriptor({
-          kind: criterion.check.kind, role: verification.role, dependencyNodeOrdinal: sourceOrdinal,
-        }, verification.role)
+        if (sourceOrdinal === undefined) return undefined
+        return parseRootTaskHistoryCheckDescriptor(criterion.check.kind === "findings_from_scout_dependency"
+          ? { kind: criterion.check.kind, role: verification.role, dependencyNodeOrdinal: sourceOrdinal }
+          : { kind: criterion.check.kind, role: verification.role, dependencyNodeOrdinal: sourceOrdinal, minimumPercent: criterion.check.minimumPercent }, verification.role)
       }
       return parseRootTaskHistoryCheckDescriptor({ ...criterion.check, role: verification.role }, verification.role)
     })
@@ -181,7 +189,8 @@ export function filterRootTaskHistoryLessonsForEmittedNodes(
   return parsed.map((lesson, index) => {
     if (!lesson || !selected.has(index + 1)) return undefined
     const criterionFailures = lesson.criterionFailures.map(failure => {
-      if (failure.check?.kind !== "findings_from_scout_dependency" || emittedNodes.has(failure.check.dependencyNodeOrdinal)) return failure
+      if ((failure.check?.kind !== "findings_from_scout_dependency" && failure.check?.kind !== "findings_cover_scout_candidates_gte")
+        || emittedNodes.has(failure.check.dependencyNodeOrdinal)) return failure
       return { criterionOrdinal: failure.criterionOrdinal, status: failure.status, reasonCode: failure.reasonCode }
     })
     const links = lesson.successfulRepairs?.filter(link => selected.has(link.targetNodeOrdinal)
