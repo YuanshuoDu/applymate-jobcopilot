@@ -5,6 +5,7 @@ import { getPool } from "../db/apply-results.js"
 import { redisConnection } from "../redis.js"
 import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
+import { recoverMissingPublishedSubagentDispatches } from "./subagent-published-dispatch-recovery.js"
 import { dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
 import { lockAndAdmitSubagentDispatch, markPauseAwareDispatchError, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches, runSubagentQueueJob } from "./subagent-pause-dispatch.js"
 import { runWithSubagentConcurrencyDeferral } from "./subagent-concurrency-deferral.js"
@@ -17,7 +18,7 @@ export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 export const SUBAGENT_DISPATCH_POLL_MS = 30_000
 export const SUBAGENT_MAX_BATCH = 50
 export { persistSubagentDispatch }
-export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; close?(): Promise<void> }
+export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; getJob?(jobId: string): Promise<unknown>; close?(): Promise<void> }
 /** Queue boundary preserves the complete runtime outcome for manager.run to persist. */
 export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>
 type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
@@ -209,6 +210,7 @@ export async function recoverSubagentQueue(pool: PgSubagentPool, queue: Subagent
   const repaired = await repairStaleSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
     + await repairMissingSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
     + await repairDeferredSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
+    + await recoverMissingPublishedSubagentDispatches(pool, queue, limit)
   const dispatched = await dispatchPendingSubagentOutbox(pool, queue, limit)
   return { reclaimed: report.reclaimed, terminal: report.terminal, repaired, dispatched }
 }
