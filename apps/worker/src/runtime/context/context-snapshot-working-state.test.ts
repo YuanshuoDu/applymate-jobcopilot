@@ -3,6 +3,7 @@ import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 
 import { sha256Hex } from "./context-compaction-canonical.js"
+import { canonicalJson as snapshotCanonicalJson } from "./context-snapshot-json.js"
 import { validateSnapshotContent } from "./context-snapshot-validation.js"
 import { ContextSnapshotError, type ContextSnapshotCompactionState } from "./context-snapshot-types.js"
 import { stepContextSnapshotFromContent } from "./context-snapshot-working-state.js"
@@ -227,6 +228,34 @@ describe("durable context snapshot working state", () => {
     expect(JSON.stringify(projected).length).toBeLessThanOrEqual(16_000)
     expect(snapshot.goal).toEqual({ id: "snapshot-goal", content: "Legacy goal" })
     expect(JSON.stringify(legacy)).toBe(original)
+  })
+
+  it("retains compacted state when oversized stale decisions and failures exceed the model-memory cap", () => {
+    const compacted = content({
+      confirmedDecisions: [{ id: "decision-old", decision: "x".repeat(9_000), evidenceEventIds: ["event-old"], sequence: "1" }],
+      failedAttempts: [{ taskId: "task-old", reason: "y".repeat(9_000), doNotRepeat: ["old retry"], sequence: "3" }],
+    })
+    const original = JSON.stringify(compacted)
+    const snapshot = stepContextSnapshotFromContent(compacted)
+    const projected = snapshot.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
+
+    expect(projected).toMatchObject({
+      kind: "durable_context_snapshot", status: "partial", authority: "informational_only",
+      provenance: {
+        ownerId: "user-a", sessionId: "session-a", throughSequence: "7",
+        compactionItemId: "compaction-1", digest: compacted.compaction?.digest,
+      },
+      goal: "Search EU roles", userConstraints: ["Dublin only"], answers: state().answers,
+      openWork: state().openTasks,
+      approvalState: { entries: state().approvals, freshness: "compaction_state", grantsActionAuthority: false },
+      artifacts: state().artifacts, doNotRepeat: state().doNotRepeat, facts: state().facts,
+      factValuesIncluded: false, evidenceBodiesIncluded: false,
+      omissions: [{ field: "legacySnapshotFields", count: 3 }],
+    })
+    expect(projected).not.toHaveProperty("legacySnapshotFields")
+    expect(projected).not.toHaveProperty("actionAuthority")
+    expect(snapshotCanonicalJson(projected).length).toBeLessThanOrEqual(16_000)
+    expect(JSON.stringify(compacted)).toBe(original)
   })
 
   it("preserves the exact selected goal at the model-memory boundary and rejects an over-cap selected goal", () => {
