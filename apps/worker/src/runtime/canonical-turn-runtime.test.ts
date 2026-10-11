@@ -664,9 +664,12 @@ describe("createCanonicalTurnRuntime", () => {
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
-    const names = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
-    expect(names).toContain("agent.plan")
-    expect(readCurrent).toHaveBeenCalledTimes(2)
+    expect(requests).toHaveLength(2)
+    for (const request of requests) {
+      const names = request.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : [])
+      expect(names).toContain("agent.plan")
+    }
+    expect(readCurrent).toHaveBeenCalledTimes(3)
     expect(rootTaskHistory.load).toHaveBeenCalledWith(expect.objectContaining({
       lease, rootTaskId: "root-1", rootAttemptCount: 1, stepId: expect.any(String), now: expect.any(Date),
     }))
@@ -689,10 +692,13 @@ describe("createCanonicalTurnRuntime", () => {
         })]),
       },
     })
-    const observation = JSON.stringify(modelSnapshots[0]?.toolObservations)
-    expect(observation).not.toContain("Found two roles")
-    expect(observation).not.toContain("Jane Doe")
-    expect(observation).not.toContain("private.example")
+    expect(modelSnapshots).toHaveLength(2)
+    for (const snapshot of modelSnapshots) {
+      const observation = JSON.stringify(snapshot?.toolObservations)
+      expect(observation).not.toContain("Found two roles")
+      expect(observation).not.toContain("Jane Doe")
+      expect(observation).not.toContain("private.example")
+    }
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
@@ -1812,26 +1818,32 @@ describe("createCanonicalTurnRuntime", () => {
         resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "analyst",
           status: "completed", findingCount: 1, evidenceCount: 1, findings: [{ jobId, score: 8.75, evidenceKinds: ["job"] }] } }],
     } })!
-    const requests: HarnessModelRequest[] = []
+    const requests: HarnessModelRequest[] = [], events: RuntimeEvent[] = []
+    const settlement = vi.fn(async () => undefined)
     const ordinaryTools = tools()
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", stateLoader: async () => ({ ...state(), selectedJobMemories: [selectedMemory] }),
       rootTaskStore: rootStore() as never, toolRuntimeFactory: () => ordinaryTools as never,
-      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
       modelRuntimeFactory: async () => ({ adapter: {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
       }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
+      authorizeUsage: async () => ({ settle: settlement }),
     })
 
-    await runtime.execute({ lease, signal: new AbortController().signal })
-    expect(requests).toHaveLength(1)
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
+    expect(requests).toHaveLength(2)
     expect(selectedJobDirectHistory.load).not.toHaveBeenCalled()
-    const requestText = JSON.stringify(requests[0]?.messages)
-    expect(requestText).not.toContain("selected_job_memory")
-    expect(requestText).not.toContain(JSON.stringify(selectedMemory))
-    expect(requestText).not.toContain(jobId)
+    for (const request of requests) {
+      const requestText = JSON.stringify(request.messages)
+      expect(requestText).not.toContain("selected_job_memory")
+      expect(requestText).not.toContain(JSON.stringify(selectedMemory))
+      expect(requestText).not.toContain(jobId)
+    }
+    expect(settlement).toHaveBeenCalledTimes(2)
+    expect(events.filter(event => event.type === "model.usage")).toHaveLength(2)
+    expect(events.filter(event => event.type === "step.completed")).toHaveLength(2)
   })
 
   it("fails closed before provider invocation when the scoped current graph read fails", async () => {
