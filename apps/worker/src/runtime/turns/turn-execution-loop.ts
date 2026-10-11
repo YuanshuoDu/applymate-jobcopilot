@@ -45,7 +45,10 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       { goal: options.goal, taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId },
       "turn-started",
     )
-    if (options.recoveredWaitControl) return await handoffRecoveredArchivedWait(options, writer, options.recoveredWaitControl, { stepCount: steps, toolCallCount: toolCalls }, now)
+    if (options.recoveredWaitControl) {
+      const recoveredWait = await handoffRecoveredArchivedWait(options, writer, options.recoveredWaitControl, { stepCount: steps, toolCallCount: toolCalls }, now)
+      if (recoveredWait) return recoveredWait
+    }
     const recoveredToolObservations = await recoverPersistedToolCalls(executionOptions, writer, now)
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
     const recoveredQuestion = await recoverPendingNativeQuestion(executionOptions, now, steps, toolCalls)

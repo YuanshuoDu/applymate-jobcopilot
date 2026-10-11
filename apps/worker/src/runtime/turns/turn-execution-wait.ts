@@ -12,14 +12,18 @@ export type WaitRequest = {
 }
 export type RecoveredArchivedWaitControl = DurableWaitControl & {
   readonly stepId: string
-  readonly stepStatus: "running" | "waiting_for_tool"
+  readonly stepStatus: "streaming" | "running" | "waiting_for_tool"
   readonly finishReason: string | null
   readonly errorCode: string | null
   readonly inputTokens: number
   readonly outputTokens: number
   readonly estimatedCostUsd: number
+  /** Full server-received model batch; persisted calls remain a prefix only. */
   readonly toolCallCount: number
+  readonly persistedToolCallCount: number
+  readonly usageDelta: { readonly inputTokens: number; readonly outputTokens: number; readonly estimatedCostUsd: number }
   readonly stepCompletionRecorded: boolean
+  readonly canonicalOutcomeResolved: boolean
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -88,7 +92,7 @@ function exactInterruptedOutput(value: unknown, waitId: string, targetTaskIds: r
 }
 
 export function hasResolvedWaitOutcome(
-  snapshot: TurnExecutionOptions["snapshot"], waitId: string, expectedInput: unknown, expectedStatus?: "interrupted",
+  snapshot: TurnExecutionOptions["snapshot"], waitId: string, expectedInput: unknown, expectedStatus?: "ready" | "timed_out" | "interrupted",
 ): boolean {
   const expected = parseWaitRequest(expectedInput)
   if (!expected) return false
@@ -107,7 +111,7 @@ export function hasResolvedWaitOutcome(
       && exactKeys(content, ["errorCode", "input", "output", "status", "toolCallId", "toolName"])
       && exactInterruptedOutput(result, waitId, expected.taskIds, expected.mode)
     if (result.status !== "ready" && result.status !== "timed_out") return false
-    if (expectedStatus === "interrupted") return false
+    if (expectedStatus !== undefined && expectedStatus !== result.status) return false
     const targetTaskIds = normalizedWaitIds(result.targetTaskIds)
     const matchedTaskIds = Array.isArray(result.matchedTaskIds) ? result.matchedTaskIds : null
     if (!targetTaskIds || targetTaskIds.length !== expected.taskIds.length
@@ -144,13 +148,14 @@ export async function handoffRecoveredArchivedWait(
   control: RecoveredArchivedWaitControl,
   counts: { readonly stepCount: number; readonly toolCallCount: number },
   now: () => Date,
-): Promise<TurnEngineResult> {
-  if (control.stepStatus === "running") await updateExecutionStep(options, {
+): Promise<TurnEngineResult | null> {
+  if (control.stepStatus === "running" || control.stepStatus === "streaming") await updateExecutionStep(options, {
     stepId: control.stepId, status: "waiting_for_tool", finishReason: control.finishReason, errorCode: control.errorCode,
     inputTokens: control.inputTokens, outputTokens: control.outputTokens, estimatedCostUsd: control.estimatedCostUsd, now: now(),
   })
   if (!control.stepCompletionRecorded) await writer.append("step.completed", control.stepId, null,
     { stepId: control.stepId, status: "waiting_for_dependency", toolCallCount: control.toolCallCount, taskId: options.identity.taskId },
     `step-completed:${control.stepId}`)
-  return { status: "waiting_for_dependency", stepCount: counts.stepCount, toolCallCount: counts.toolCallCount, waitId: control.waitId }
+  return control.canonicalOutcomeResolved ? null
+    : { status: "waiting_for_dependency", stepCount: counts.stepCount, toolCallCount: counts.toolCallCount, waitId: control.waitId }
 }

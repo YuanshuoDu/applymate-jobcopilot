@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertQuestionOwner, assertQuestionUsage, completedQuestionResult, questionId, questionItemId,
-  type TurnQuestionQueryClient, type TurnQuestionReadIdentity } from "./turn-question-store-guards.js"
+  recoverIncompleteQuestionCall, type TurnQuestionQueryClient, type TurnQuestionReadIdentity } from "./turn-question-store-guards.js"
 import { TurnQuestionStoreError, type TurnQuestionUsageInput } from "./turn-question-contract.js"
 
 const owner: TurnExecutionOwnerFence = {
@@ -52,5 +52,95 @@ describe("native question persistence guards", () => {
     expect(() => assertQuestionUsage({ ...usageInput, usage: { ...usageInput.usage, outputTokens: Number.NaN } })).toThrow(/usage is invalid/)
     expect(() => assertQuestionUsage({ ...usageInput, finishReason: "" })).toThrow(/usage is invalid/)
     expect(() => assertQuestionUsage({ ...usageInput, now: new Date(Number.NaN) })).toThrow(/usage is invalid/)
+  })
+
+  it.each([
+    ["legacy receipt", { taskId: owner.taskId, provider: "fixture", model: "test" }],
+    ["counted receipt", { taskId: owner.taskId, provider: "fixture", model: "test", toolCallCount: 1 }],
+  ])("recovers an exact incomplete ask_user call with a %s", async (_label, completionPayload) => {
+    const stepId = "step-1", toolCallId = "call-1"
+    const argumentsValue = { question: "Where should the search focus?", choices: [{ label: "Dublin", value: "dublin" }] }
+    const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
+      question: argumentsValue.question, options: argumentsValue.choices }
+    const events = [
+      { id: "model-start", sequence: "1", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: null,
+        type: "model.started", actor: "orchestrator", correlationId: stepId, causationId: null,
+        idempotencyKey: `turn:${owner.turnId}:event:model-started:${stepId}`, payload: { taskId: owner.taskId, provider: "fixture", model: "test" } },
+      { id: "model-done", sequence: "2", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: null,
+        type: "model.completed", actor: "orchestrator", correlationId: stepId, causationId: "model-start",
+        idempotencyKey: `turn:${owner.turnId}:event:model-completed:${stepId}`, payload: completionPayload },
+      { id: "model-usage", sequence: "3", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: null,
+        type: "model.usage", actor: "orchestrator", correlationId: stepId, causationId: "model-done",
+        idempotencyKey: `turn:${owner.turnId}:event:model-usage:${stepId}`,
+        payload: { taskId: owner.taskId, provider: "fixture", model: "test", usage: { inputTokens: 12, outputTokens: 3, estimatedCostUsd: 0.001 } } },
+    ]
+    const query = vi.fn(async (sql: string) => {
+      if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql.trim()) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions" AS session')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, status: "in_progress", revision: 4 }], rowCount: 1 }
+      if (sql.includes('FROM "agent_items" AS callItem')) return { rows: [{
+        callItemId: "call-item", stepId, callStatus: "completed", callContent: { toolCallId, toolName: "agent.ask_user", toolVersion: "1",
+          status: "completed", errorCode: null, input: argumentsValue }, stepStatus: "streaming", stepErrorCode: null, finishReason: null,
+        inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, resultItemId: "result-item", resultStatus: "started", resultCount: "1",
+        resultContent: { toolCallId, output: intent, errorCode: null },
+      }], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps" WHERE')) return { rows: [{ id: stepId, status: "streaming", taskId: owner.taskId, attempt: 1,
+        finishReason: null, errorCode: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"') && sql.includes("ANY($5::text[])")) return { rows: events, rowCount: events.length }
+      if (sql.includes("session.pause_requested")) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT "id" FROM "agent_items"')) return { rows: [], rowCount: 0 }
+      if (sql.includes("UPDATE \"agent_steps\"")) return { rows: [], rowCount: 1 }
+      throw new Error("unexpected_question_recovery_query")
+    })
+    const client = { query, release: vi.fn() }
+    const pool = { connect: vi.fn(async () => client) }
+
+    await expect(recoverIncompleteQuestionCall(pool as never, owner, new Date("2026-09-01T00:00:10Z")))
+      .resolves.toMatchObject({ status: "replayable", stepId, toolCallId })
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("UPDATE \"agent_steps\""))).toBe(true)
+  })
+
+  it.each([
+    ["negative count", { taskId: owner.taskId, provider: "fixture", model: "test", toolCallCount: -1 }],
+    ["extra field", { taskId: owner.taskId, provider: "fixture", model: "test", toolCallCount: 1, extra: true }],
+  ])("rejects an ask_user %s before restoring the Step", async (_label, completionPayload) => {
+    const stepId = "step-1", toolCallId = "call-1"
+    const argumentsValue = { question: "Where should the search focus?", choices: [{ label: "Dublin", value: "dublin" }] }
+    const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
+      question: argumentsValue.question, options: argumentsValue.choices }
+    const events = [
+      { id: "model-start", sequence: "1", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: null,
+        type: "model.started", actor: "orchestrator", correlationId: stepId, causationId: null,
+        idempotencyKey: `turn:${owner.turnId}:event:model-started:${stepId}`, payload: { taskId: owner.taskId, provider: "fixture", model: "test" } },
+      { id: "model-done", sequence: "2", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: null,
+        type: "model.completed", actor: "orchestrator", correlationId: stepId, causationId: "model-start",
+        idempotencyKey: `turn:${owner.turnId}:event:model-completed:${stepId}`, payload: completionPayload },
+      { id: "model-usage", sequence: "3", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: null,
+        type: "model.usage", actor: "orchestrator", correlationId: stepId, causationId: "model-done",
+        idempotencyKey: `turn:${owner.turnId}:event:model-usage:${stepId}`,
+        payload: { taskId: owner.taskId, provider: "fixture", model: "test", usage: { inputTokens: 12, outputTokens: 3, estimatedCostUsd: 0.001 } } },
+    ]
+    const query = vi.fn(async (sql: string) => {
+      if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql.trim()) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions" AS session')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, status: "in_progress", revision: 4 }], rowCount: 1 }
+      if (sql.includes('FROM "agent_items" AS callItem')) return { rows: [{
+        callItemId: "call-item", stepId, callStatus: "completed", callContent: { toolCallId, toolName: "agent.ask_user", toolVersion: "1",
+          status: "completed", errorCode: null, input: argumentsValue }, stepStatus: "streaming", stepErrorCode: null, finishReason: null,
+        inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, resultItemId: "result-item", resultStatus: "started", resultCount: "1",
+        resultContent: { toolCallId, output: intent, errorCode: null },
+      }], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps" WHERE')) return { rows: [{ id: stepId, status: "streaming", taskId: owner.taskId, attempt: 1,
+        finishReason: null, errorCode: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"') && sql.includes("ANY($5::text[])")) return { rows: events, rowCount: events.length }
+      if (sql.includes("session.pause_requested")) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT "id" FROM "agent_items"')) return { rows: [], rowCount: 0 }
+      throw new Error("unexpected_question_recovery_query")
+    })
+    const client = { query, release: vi.fn() }, pool = { connect: vi.fn(async () => client) }
+
+    await expect(recoverIncompleteQuestionCall(pool as never, owner, new Date("2026-09-01T00:00:10Z")))
+      .rejects.toMatchObject({ code: "question_usage_unavailable" })
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("UPDATE \"agent_steps\""))).toBe(false)
   })
 })
