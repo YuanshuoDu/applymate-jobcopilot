@@ -13611,7 +13611,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(completedTurn.rows).toHaveLength(1)
       expect(completedTurn.rows[0]).toMatchObject({
-        status: "completed", rootTaskId, finalResponse: "p3-process-archived-wait-resumed", inputTokens: 37, outputTokens: 17,
+        status: "completed", rootTaskId, inputTokens: 37, outputTokens: 17,
+      })
+      const persistedFinal = record(JSON.parse(completedTurn.rows[0]!.finalResponse ?? "null"))
+      expect(Object.keys(persistedFinal ?? {}).sort()).toEqual([
+        "blocker", "completed", "completedTasks", "evidenceRefs", "goal", "next", "notCompleted", "response",
+        "schemaVersion", "stepCount", "summary", "terminalReason", "toolCallCount", "usage",
+      ])
+      expect(persistedFinal).toMatchObject({
+        schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied",
+        response: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "p3-process-archived-wait-resumed" }),
       })
       expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
       const completedRoot = await pool!.query<{ status: string; result: unknown }>(
