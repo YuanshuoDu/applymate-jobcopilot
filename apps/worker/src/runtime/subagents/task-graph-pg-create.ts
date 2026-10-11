@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
 import { taskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
+import { hasOverlappingTaskGraphRepair } from "./task-graph-repair-conflicts.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
 import { createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
@@ -51,6 +52,7 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   }
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
+  if (hasOverlappingTaskGraphRepair(current.nodes, appended.addedNodes)) throw Object.assign(new Error("Overlapping TaskGraph repair"), { code: "task_graph_repair_conflict" })
   const capacity = taskGraphNodeCapacity({
     nodeCount: current.nodes.length,
     hasTypedVerification: appended.state.nodes.some(node => (node.verification?.criteria.length ?? 0) > 0),

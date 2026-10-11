@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
 
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
-import type { TaskGraphNativeCommandInput, TaskGraphReadScope, TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
@@ -237,6 +237,70 @@ async function graphRows(pool: PgPool, value: Fixture): Promise<Record<string, u
     pool.query(`SELECT "topic", "idempotencyKey" FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "idempotencyKey"`, [value.sessionId]),
   ])
   return { children: children.rows, item: item.rows, events: events.rows, outbox: outbox.rows }
+}
+
+function repairNode(value: Fixture, targetTaskId: string, key: string): TaskGraphScheduleInput["proposal"]["nodes"][number] {
+  return {
+    key, templateId: "analyst", goal: `Repair finding-count for ${targetTaskId}`,
+    successCriteria: ["Return one finding"], verification: ANALYST_VERIFICATION, dependsOn: [],
+    repairOf: { graphRootTaskId: value.rootTaskId, nodeKey: "task-1", taskId: targetTaskId, criterionIds: ["finding-count"] },
+  }
+}
+
+function repairScheduleInput(
+  value: Fixture, expectedRevision: number, targetTaskId: string, repairKeys: readonly string[], includeOrdinary = false,
+): TaskGraphScheduleInput {
+  const registered = scheduleInput(value, 1, true)
+  const nodes: TaskGraphScheduleInput["proposal"]["nodes"][number][] = repairKeys.map(key => repairNode(value, targetTaskId, key))
+  if (includeOrdinary) nodes.push({
+    key: "ordinary-overlap-batch", templateId: "analyst", goal: "Record a separate finding",
+    successCriteria: ["Return one finding"], verification: ANALYST_VERIFICATION, dependsOn: [],
+  })
+  return { scope: registered.scope, templates: registered.templates, proposal: { expectedRevision, nodes } }
+}
+
+async function seedCanonicalFailedTarget(pool: PgPool, value: Fixture, taskId: string): Promise<void> {
+  // This persisted canonical report isolates admission behavior; the resume PG suite covers worker-produced failures.
+  const report = {
+    verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+    status: "failed",
+    reasonCode: "criterion_not_met",
+    criteria: [{ criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }],
+    evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+  }
+  const updated = await pool.query(`UPDATE "sub_agent_tasks" AS task SET "status" = 'failed',
+      "failureReason" = 'task_graph_verification_failed', "result" = $6::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+    FROM "agent_sessions" AS session
+    WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+      AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND task."status" = 'queued'
+      AND session."id" = task."sessionId" AND session."userId" = $5`,
+  [taskId, value.sessionId, value.turnId, value.rootTaskId, value.userId, JSON.stringify({
+    summary: "Fixture-seeded canonical verifier failure", taskGraphVerificationReport: report,
+  })])
+  if (updated.rowCount !== 1) throw new Error("TaskGraph PG fixture could not seed the canonical failed target")
+}
+
+async function repairDurableRows(pool: PgPool, value: Fixture): Promise<Readonly<{
+  children: readonly unknown[]
+  item: readonly Readonly<{ revision: number }>[]
+  events: readonly Readonly<{ idempotencyKey: string }>[]
+  outbox: readonly unknown[]
+  sequence: readonly Readonly<{ eventSequence: string | bigint }>[]
+}>> {
+  const [children, item, events, outbox, sequence] = await Promise.all([
+    pool.query(`SELECT "id", "status", "attemptCount", "role", "taskType", "goal", "failureReason", "result", "updatedAt"
+      FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [value.sessionId, value.rootTaskId]),
+    pool.query<{ revision: number }>(`SELECT "id", "revision", "content", "updatedAt" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
+    [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId, value.rootTaskId]),
+    pool.query<{ idempotencyKey: string }>(`SELECT "id", "itemId", "taskId", "sequence", "type", "idempotencyKey", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 ORDER BY "sequence"`,
+    [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId)]),
+    pool.query(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox"
+      WHERE "aggregateId" = $1 ORDER BY "idempotencyKey"`, [value.sessionId]),
+    pool.query<{ eventSequence: string | bigint }>(`SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [value.sessionId]),
+  ])
+  return { children: children.rows, item: item.rows, events: events.rows, outbox: outbox.rows, sequence: sequence.rows }
 }
 
 function readScope(value: Fixture): TaskGraphReadScope {
@@ -734,6 +798,89 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     }
     await expect(command.appendAndSchedule(ordinaryAppend)).rejects.toMatchObject({ code: "node_limit" })
     expect(await graphRows(adminPool!, value)).toEqual(sevenRows)
+  }, 60_000)
+
+  it("rejects same-batch and active overlapping repairs before durable writes", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const target = await command.appendAndSchedule(scheduleInput(value, 1, true))
+    expect(target).toMatchObject({ status: "accepted", revision: 1, nodes: [{ key: "task-1", status: "queued" }] })
+    const targetTaskId = target.nodes[0]!.taskId
+    await seedCanonicalFailedTarget(adminPool!, value, targetTaskId)
+    const failedGraph = await command.readCurrent(readScope(value))
+    expect(failedGraph.nodes).toEqual(expect.arrayContaining([expect.objectContaining({
+      key: "task-1", taskId: targetTaskId, status: "failed", verificationCriterionIds: ["finding-count"],
+      verificationReport: expect.objectContaining({ status: "failed", criteria: [expect.objectContaining({
+        criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met",
+      })] }),
+    })]))
+
+    const beforeSameBatch = await repairDurableRows(adminPool!, value)
+    const sameBatch = repairScheduleInput(value, target.revision, targetTaskId, ["same-batch-a", "same-batch-b"])
+    await expect(command.appendAndSchedule(sameBatch)).rejects.toMatchObject({ code: "task_graph_repair_conflict" })
+    expect(await repairDurableRows(adminPool!, value)).toEqual(beforeSameBatch)
+    expect(await command.readCurrent(readScope(value))).toEqual(failedGraph)
+
+    const activeRepair = await command.appendAndSchedule(repairScheduleInput(value, target.revision, targetTaskId, ["active-repair"]))
+    expect(activeRepair).toMatchObject({ status: "accepted", revision: 2, nodes: [{ key: "active-repair", status: "queued" }] })
+    const activeGraph = await command.readCurrent(readScope(value))
+    expect(activeGraph.nodes.filter(node => node.repairOf !== undefined)).toHaveLength(1)
+    const beforeOverlap = await repairDurableRows(adminPool!, value)
+    const mixedBatch = repairScheduleInput(value, activeRepair.revision, targetTaskId, ["overlapping-repair"], true)
+    expect(mixedBatch.proposal.nodes).toHaveLength(2)
+    await expect(command.appendAndSchedule(mixedBatch)).rejects.toMatchObject({ code: "task_graph_repair_conflict" })
+    expect(await repairDurableRows(adminPool!, value)).toEqual(beforeOverlap)
+    expect(await command.readCurrent(readScope(value))).toEqual(activeGraph)
+  }, 60_000)
+
+  it("serializes distinct overlapping repair submissions to one durable attempt", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const target = await command.appendAndSchedule(scheduleInput(value, 1, true))
+    expect(target).toMatchObject({ status: "accepted", revision: 1 })
+    const targetTaskId = target.nodes[0]!.taskId
+    await seedCanonicalFailedTarget(adminPool!, value, targetTaskId)
+    expect((await command.readCurrent(readScope(value))).nodes[0]).toMatchObject({
+      key: "task-1", taskId: targetTaskId, status: "failed", verificationReport: { status: "failed" },
+    })
+    const before = await repairDurableRows(adminPool!, value)
+    const first = repairScheduleInput(value, target.revision, targetTaskId, ["race-repair-a"])
+    const second = repairScheduleInput(value, target.revision, targetTaskId, ["race-repair-b"])
+    const racingPool = new PgPool({ connectionString: databaseUrl!, max: 2 })
+    try {
+      const racingCommand = createPgTaskGraphCommandPort(restrictedTransactionPool(racingPool, roleName, value.userId))
+      const results = await Promise.allSettled([
+        racingCommand.appendAndSchedule(first), racingCommand.appendAndSchedule(second),
+      ])
+      const accepted = results.find(result => result.status === "fulfilled")
+      const rejected = results.find(result => result.status === "rejected")
+      if (!accepted || accepted.status !== "fulfilled" || !rejected || rejected.status !== "rejected") {
+        throw new Error("TaskGraph repair race did not produce one accepted and one rejected submission")
+      }
+      expect(accepted.value).toMatchObject({ status: "accepted", revision: 2, nodes: [{ status: "queued" }] })
+      expect(rejected.reason).toMatchObject({ code: "idempotency_conflict" })
+    } finally {
+      await racingPool.end()
+    }
+
+    const current = await command.readCurrent(readScope(value))
+    const repairs = current.nodes.filter(node => node.repairOf !== undefined)
+    expect(current.revision).toBe(2)
+    expect(repairs).toHaveLength(1)
+    expect(["race-repair-a", "race-repair-b"]).toContain(repairs[0]!.key)
+    const after = await repairDurableRows(adminPool!, value)
+    expect(after.children).toHaveLength(before.children.length + 1)
+    expect(after.item[0]?.revision).toBe(2)
+    expect(after.events).toHaveLength(before.events.length + 1)
+    expect(after.outbox).toHaveLength(before.outbox.length + 1)
+    expect(BigInt(String(after.sequence[0]?.eventSequence))).toBe(BigInt(String(before.sequence[0]?.eventSequence)) + 1n)
+    expect(after.events.map(event => event.idempotencyKey).sort()).toEqual([
+      taskGraphProposalKey(value.rootTaskId, 0), taskGraphProposalKey(value.rootTaskId, 1),
+    ])
   }, 60_000)
 
   it("rolls back a native replacement denied by the typed graph reserve", async () => {

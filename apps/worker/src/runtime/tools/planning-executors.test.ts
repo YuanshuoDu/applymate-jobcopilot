@@ -351,6 +351,27 @@ describe("agent.plan tool executor", () => {
     expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledTimes(1)
   })
 
+  it("surfaces the fixed repair-conflict code without the port's dynamic details", async () => {
+    const { tool, commandPort } = setup()
+    const privateDetail = "target-task-91 failed because criterion salary-floor is still pending"
+    vi.mocked(commandPort.appendAndSchedule).mockRejectedValue(Object.assign(new Error(privateDetail), {
+      code: "task_graph_repair_conflict", targetTaskId: "target-task-91",
+    }))
+
+    const error = await tool.execute(context(), proposal).then(() => undefined, failure => failure)
+    expect(error).toMatchObject({
+      code: "task_graph_repair_conflict",
+      message: "TaskGraph proposal could not be durably scheduled",
+      safeOutput: { code: "task_graph_repair_conflict" },
+    })
+    expect(JSON.stringify(error)).not.toContain(privateDetail)
+    expect(JSON.stringify(error)).not.toContain("target-task-91")
+    expect(tool.description).toContain("If agent.plan returns task_graph_repair_conflict, inspect or refresh the current owner-scoped graph")
+    expect(tool.description).toContain("if none is active, correct the rejected batch so each target/criterion has only one proposed attempt")
+    expect(tool.description).toContain("wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits")
+    expect(tool.description).toContain("An active repair is not evidence of success")
+  })
+
   it("requires two remaining root steps before persisting a plan", async () => {
     const { tool, commandPort } = setup()
 
