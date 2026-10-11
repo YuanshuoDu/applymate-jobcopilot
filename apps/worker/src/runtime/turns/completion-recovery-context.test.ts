@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
-import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, retireStaleTaskGraphRepair, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { applyCompletionRecovery, currentTaskGraphRepairRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, retireStaleTaskGraphRepair, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 const feedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
@@ -215,5 +215,22 @@ describe("completion recovery context", () => {
     const fixedNative = applyCompletionRecovery(base, "step-fixed-native",
       tagTaskGraphRepairRecovery("Native TaskGraph work has no independent verification runtime.", null)).system[0]!
     expect(retireStaleTaskGraphRepair({ ...base, system: [fixedNative] }, 8).system).toEqual([fixedNative])
+  })
+
+  it("exposes only unique fixed current-revision denial enums and ordinals", () => {
+    const detail = `${feedbackLead} issue=repair_criterion nodeOrdinal=2 criterionOrdinal=1 status=failed reasonCode=canonical_evidence_missing repair=pending`
+    const seed = applyCompletionRecovery(base, "step-1", tagTaskGraphRepairRecovery(detail, 12)).system[0]!
+    expect(currentTaskGraphRepairRecovery([seed], 12)).toEqual({
+      issue: "repair_criterion",
+      details: [{ nodeOrdinal: 2, criterionOrdinal: 1, status: "failed", reasonCode: "canonical_evidence_missing", repairState: "pending" }],
+      omitted: false,
+    })
+    expect(currentTaskGraphRepairRecovery([seed, seed], 12)).toBeUndefined()
+    expect(currentTaskGraphRepairRecovery([seed], 13)).toBeUndefined()
+    expect(currentTaskGraphRepairRecovery([seed], -1)).toBeUndefined()
+    const duplicated = applyCompletionRecovery(base, "step-2", tagTaskGraphRepairRecovery(
+      `${detail} nodeOrdinal=2 criterionOrdinal=1 status=failed reasonCode=canonical_evidence_missing repair=pending`, 12)).system[0]!
+    expect(currentTaskGraphRepairRecovery([duplicated], 12)).toBeUndefined()
+    expect(JSON.stringify(currentTaskGraphRepairRecovery([seed], 12))).not.toContain("candidate-count")
   })
 })

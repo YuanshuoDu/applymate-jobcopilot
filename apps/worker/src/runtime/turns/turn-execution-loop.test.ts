@@ -2569,7 +2569,9 @@ describe("owner-agnostic turn execution loop", () => {
     const clarification = { observedPlanRevision: 5, graphRevisionAtAsk: 5, pendingSteerCount: 0, unconsumedSteerCount: 0, inputThroughSequence: "4" }
     const verifiedNode: TaskGraphCurrentState["nodes"][number] = {
       key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return verified links"], dependsOn: [],
-      taskId: "child-research", status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      taskId: "child-research", status: "failed", readiness: "terminal", resultSummary: null, failureReason: null,
+      verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+        criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 4 } }] },
       verificationCriterionIds: ["candidate-count"], verificationReport: {
         verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
         criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
@@ -2608,7 +2610,8 @@ describe("owner-agnostic turn execution loop", () => {
       },
       resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 4n, consumedInputIds: [rootInput.id],
         usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 } },
-      tools: [{ name: "agent.plan", version: "1" }, { name: "jobs.search", version: "1" }],
+      tools: [{ name: "agent.list", version: "1" }, { name: "agent.wait", version: "1" },
+        { name: "agent.plan", version: "1" }, { name: "jobs.search", version: "1" }],
       refreshTaskGraphBeforeStep: beforeStep,
       refreshTaskGraphAfterPlan: afterPlan,
     }
@@ -2673,6 +2676,16 @@ describe("owner-agnostic turn execution loop", () => {
     expect(second).not.toContain("at graph revision 5")
     expect(third).toContain("at graph revision 5")
     expect(third).toContain("nodeOrdinal=1")
+    const recoveryInstruction = root.requests[2]!.messages.filter(message => message.role === "system")
+      .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+      .find(text => text.startsWith("The current owner-read TaskGraph denial"))
+    expect(recoveryInstruction).toContain("node 1, criterion 1 failed for reason criterion_not_met")
+    expect(recoveryInstruction).toContain("agent.list")
+    expect(recoveryInstruction).toContain("agent.plan")
+    expect(recoveryInstruction).toContain("expectedRevision 5")
+    for (const privateValue of ["root-1", "child-research", "candidate-count", "Find roles", "a".repeat(64), "e".repeat(64)]) {
+      expect(recoveryInstruction).not.toContain(privateValue)
+    }
     expect(afterPlanRequest).toContain('"revision":6')
     expect(afterPlanRequest).not.toContain("at graph revision 5")
     expect(afterPlanRequest).not.toContain("nodeOrdinal=1")
