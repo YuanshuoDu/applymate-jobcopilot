@@ -648,7 +648,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
   it("rejects fresh completion after a lock wait crosses only the Turn lease expiry", async () => {
     const stepId = `native-semantic-expiry-fresh-${suffix}`
     await requiredStoreMethod(store!, "resolveNativeSemanticProgressMode")({ owner, requestedEnabled: true, now: new Date() })
-    await seedStep(stepId, 20, "20")
+    await seedStep(stepId, 23, "20")
     const identity = await ensureRejectedCandidate(candidateA, stepId)
     const completeInput = { owner, stepId, finishReason: "stop", errorCode: null as null,
       inputTokens: 21, outputTokens: 8, estimatedCostUsd: 0.0021, now: new Date(), identity }
@@ -700,13 +700,13 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
   it("rejects completed receipt replay after a lock wait crosses only the Turn lease expiry", async () => {
     const stepId = `native-semantic-expiry-replay-${suffix}`
     const newerStepId = `native-semantic-expiry-newer-${suffix}`
-    await seedStep(stepId, 22, "22")
+    await seedStep(stepId, 24, "22")
     const identity = await ensureRejectedCandidate(candidateB, stepId)
     const completeInput = { owner, stepId, finishReason: "stop", errorCode: null as null,
       inputTokens: 19, outputTokens: 6, estimatedCostUsd: 0.0019, now: new Date(), identity }
     const complete = requiredStoreMethod(store!, "completeNativeSemanticRejectionStep")
     await expect(complete(completeInput)).resolves.toMatchObject({ inputThroughSequence: 22n, distinctStepCount: 1 })
-    await seedStep(newerStepId, 23, "22")
+    await seedStep(newerStepId, 25, "22")
     const before = await persistedStepAndReceiptSnapshot(stepId)
     expect(before.step).toMatchObject({ status: "completed" })
     expect(before.receiptCount).toBe(1)
