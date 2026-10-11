@@ -1521,6 +1521,7 @@ async function startArchivedWaitRuntime(workerOwnerId, resume) {
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId,
     productionFlags: { ...flags(), taskGraphPlanningEnabled: false },
+    authorizeUsage: async () => ({ settle: async () => undefined }),
     turnEngineStoreFactory(database, terminalGuard) {
       const base = createPgTurnEngineStore(database, terminalGuard)
       return new Proxy(base, { get(target, property, receiver) {
