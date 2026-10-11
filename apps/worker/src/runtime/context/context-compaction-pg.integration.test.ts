@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool } from "pg"
 
 import { ContextCompactor } from "./context-compactor.js"
@@ -62,6 +62,27 @@ async function seedOwnerFixture(pool: PgPool): Promise<OwnerFixture> {
 
 function emptySource(fixture: OwnerFixture): CompactionSource {
   return { state: { ownerId: fixture.userId, sessionId: fixture.sessionId, throughSequence: 0n, goal: "Find a role", userConstraints: [], approvals: [], answers: [], artifacts: [], openTasks: [], doNotRepeat: [], facts: [] }, items: [] }
+}
+
+async function insertCompletedItem(pool: PgPool, fixture: OwnerFixture, label: string, text: string) {
+  const allocated = await pool.query<{ eventSequence: string | number }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+    WHERE "id" = $1 RETURNING "eventSequence"`, [fixture.sessionId])
+  const sequence = BigInt(allocated.rows[0]?.eventSequence ?? 0)
+  if (sequence < 1n) throw new Error("Expected the database to allocate a positive event sequence")
+  const id = `${fixture.sessionId}-tail-${randomUUID()}`
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "content", "completedAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, 'agent_message', 'completed', $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+    id, fixture.sessionId, fixture.turnId, fixture.taskId, JSON.stringify({ text: `${label} ${text}` }),
+  ])
+  await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+    VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'orchestrator', $4, $7, '{"status":"completed"}'::jsonb)`, [
+    `${id}-completed`, fixture.sessionId, fixture.turnId, id, fixture.taskId, sequence.toString(), `${id}:completed`,
+  ])
+  return { sequence, id }
+}
+
+function occurrenceCount(value: string, marker: string): number {
+  return value.split(marker).length - 1
 }
 
 describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
@@ -177,6 +198,132 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       expect((restored.items[1]?.content as { text?: string } | undefined)?.text).toBe("Post-compaction tail")
     } finally {
       await restartedPool.end()
+    }
+  })
+
+  it("keeps the snapshot cursor aligned to complete narrative groups across capped compactions and reloads", async () => {
+    const fixture = await seedOwnerFixture(pool!)
+    const reloadPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    const verificationPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    try {
+      const firstMarker = "first-marker"
+      const omittedMarker = "omitted-tail-one"
+      const tailMarker = "omitted-tail-marker"
+      const firstGroup = await insertCompletedItem(pool!, fixture, firstMarker, "A".repeat(650))
+      const omittedGroup = await insertCompletedItem(pool!, fixture, omittedMarker, "B".repeat(200))
+      const tailGroup = await insertCompletedItem(pool!, fixture, tailMarker, "D".repeat(200))
+      const initial = await createPgCompactionSource(pool!).load({ scope: fixture.scope, owner: fixture.owner })
+      if (!initial) throw new Error("Expected a source before the capped compaction")
+      expect(initial.state.throughSequence).toBe(tailGroup.sequence)
+      expect(initial.items.map(({ sequence }) => sequence)).toEqual([
+        firstGroup.sequence, omittedGroup.sequence, tailGroup.sequence,
+      ])
+
+      const narrativeInputs: string[] = []
+      const summaries = [
+        `Summary preserves ${firstMarker}`,
+        `Summary preserves ${firstMarker}, ${omittedMarker}, and ${tailMarker}`,
+      ]
+      const summarize = ({ narrativeText }: { readonly narrativeText: string }) => {
+        narrativeInputs.push(narrativeText)
+        return summaries[narrativeInputs.length - 1] ?? "Summary preserves newer-marker"
+      }
+      let compactionIndex = 0
+      const compactorFor = (targetPool: PgPool) => new ContextCompactor(
+        createPgContextSnapshotCompactionPort(targetPool, fixture.owner), summarize, () => `coverage-${fixture.sessionId}-${++compactionIndex}`,
+      )
+      const request = (source: CompactionSource) => ({
+        scope: fixture.scope, turnId: fixture.turnId, source,
+        policy: { inputTokenThreshold: 1, itemCountThreshold: 1, compactAtTurnBoundary: true },
+        atTurnBoundary: false, requested: true,
+        bounds: { maxNarrativeInputCharacters: 900 },
+      })
+
+      const first = await compactorFor(pool!).compact(request(initial))
+      if (first.status !== "compacted" || !first.snapshot) throw new Error("Expected the first capped compaction to publish")
+      expect(first.snapshot.throughSequence).toBe(firstGroup.sequence)
+      expect(narrativeInputs[0]).toContain(firstMarker)
+      expect(narrativeInputs[0]).toContain("A".repeat(650))
+      expect(narrativeInputs[0]).not.toContain(omittedMarker)
+      expect(narrativeInputs[0]).not.toContain(tailMarker)
+      const firstSaved = await pool!.query<{ throughSequence: string; stateCursor: string; sourceItemIds: string[] }>(`SELECT "throughSequence",
+        "content" #>> '{compaction,state,throughSequence}' AS "stateCursor",
+        "content"->'compaction'->'sourceItemIds' AS "sourceItemIds"
+        FROM "agent_context_snapshots" WHERE "id" = $1`, [first.snapshot.id])
+      expect(firstSaved.rows[0]).toEqual({
+        throughSequence: firstGroup.sequence.toString(), stateCursor: firstGroup.sequence.toString(), sourceItemIds: [firstGroup.id],
+      })
+
+      const afterFirst = await createPgCompactionSource(reloadPool).load({ scope: fixture.scope, owner: fixture.owner })
+      if (!afterFirst) throw new Error("Expected the omitted suffix after a fresh source reload")
+      expect(afterFirst.items.map(({ id, type, sequence }) => ({ id, type, sequence }))).toEqual([
+        { id: `context-compaction-summary:${first.snapshot.id}`, type: "compaction_summary", sequence: firstGroup.sequence },
+        { id: omittedGroup.id, type: "agent_message", sequence: omittedGroup.sequence },
+        { id: tailGroup.id, type: "agent_message", sequence: tailGroup.sequence },
+      ].sort((left, right) => left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : left.id.localeCompare(right.id)))
+      expect(afterFirst.items[0]?.content).toBe(summaries[0])
+      expect(afterFirst.state.throughSequence).toBe(tailGroup.sequence)
+      const reloadedTailText = afterFirst.items.map(item => JSON.stringify(item.content)).join("\n")
+      for (const marker of [firstMarker, omittedMarker, tailMarker]) expect(occurrenceCount(reloadedTailText, marker)).toBe(1)
+      expect(afterFirst.items.filter(item => item.type !== "compaction_summary")).toHaveLength(2)
+
+      const second = await compactorFor(reloadPool).compact(request(afterFirst))
+      if (second.status !== "compacted" || !second.snapshot) throw new Error("Expected the second compaction to incorporate the omitted suffix")
+      expect(second.snapshot.throughSequence).toBe(tailGroup.sequence)
+      for (const marker of [firstMarker, omittedMarker, tailMarker]) expect(occurrenceCount(narrativeInputs[1] ?? "", marker)).toBe(1)
+      expect(narrativeInputs[1]).toContain(summaries[0])
+      const secondSaved = await reloadPool.query<{ throughSequence: string; stateCursor: string; sourceItemIds: string[] }>(`SELECT "throughSequence",
+        "content" #>> '{compaction,state,throughSequence}' AS "stateCursor",
+        "content"->'compaction'->'sourceItemIds' AS "sourceItemIds"
+        FROM "agent_context_snapshots" WHERE "id" = $1`, [second.snapshot.id])
+      expect(secondSaved.rows[0]?.throughSequence).toBe(tailGroup.sequence.toString())
+      expect(secondSaved.rows[0]?.stateCursor).toBe(tailGroup.sequence.toString())
+      expect(secondSaved.rows[0]?.sourceItemIds?.slice().sort()).toEqual(afterFirst.items.map(({ id }) => id).sort())
+
+      const newerMarker = "newer-marker"
+      const newerGroup = await insertCompletedItem(reloadPool, fixture, newerMarker, "E".repeat(100))
+      const afterSecond = await createPgCompactionSource(verificationPool).load({ scope: fixture.scope, owner: fixture.owner })
+      if (!afterSecond) throw new Error("Expected a source after the second fresh reload")
+      expect(afterSecond.state.throughSequence).toBe(newerGroup.sequence)
+      expect(afterSecond.items.map(({ id, type }) => ({ id, type }))).toEqual([
+        { id: `context-compaction-summary:${second.snapshot.id}`, type: "compaction_summary" },
+        { id: newerGroup.id, type: "agent_message" },
+      ])
+      expect(afterSecond.items[0]?.content).toBe(summaries[1])
+      const finalText = afterSecond.items.map(item => JSON.stringify(item.content)).join("\n")
+      for (const marker of [firstMarker, omittedMarker, tailMarker, newerMarker]) expect(occurrenceCount(finalText, marker)).toBe(1)
+    } finally {
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [fixture.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [fixture.userId])
+      await reloadPool.end()
+      await verificationPool.end()
+    }
+  })
+
+  it("fails closed without summarizing or publishing an oversized first sequence group", async () => {
+    const fixture = await seedOwnerFixture(pool!)
+    try {
+      await insertCompletedItem(pool!, fixture, "oversized-first-group", "X".repeat(2_000))
+      const source = await createPgCompactionSource(pool!).load({ scope: fixture.scope, owner: fixture.owner })
+      if (!source) throw new Error("Expected a source with an oversized first group")
+      const port = createPgContextSnapshotCompactionPort(pool!, fixture.owner)
+      const publish = vi.spyOn(port, "publishAtomically")
+      const summarize = vi.fn(() => "must not be called")
+      const compactor = new ContextCompactor(port, summarize, () => `oversized-${fixture.sessionId}`)
+      const result = await compactor.compact({
+        scope: fixture.scope, turnId: fixture.turnId, source,
+        policy: { inputTokenThreshold: 1, itemCountThreshold: 1, compactAtTurnBoundary: true },
+        atTurnBoundary: false, requested: true,
+        bounds: { maxNarrativeInputCharacters: 100 },
+      })
+      expect(result.status).toBe("failed")
+      expect(summarize).not.toHaveBeenCalled()
+      expect(publish).not.toHaveBeenCalled()
+      const snapshots = await pool!.query(`SELECT "id" FROM "agent_context_snapshots" WHERE "sessionId" = $1`, [fixture.sessionId])
+      expect(snapshots.rows).toEqual([])
+    } finally {
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [fixture.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [fixture.userId])
     }
   })
 

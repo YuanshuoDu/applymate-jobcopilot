@@ -43,7 +43,7 @@ export class ContextCompactor {
   async compact(request: CompactionRequest): Promise<CompactionResult> {
     const limits = bounds(request.bounds)
     const collection = collectCompactionState(request.source, limits.maxNarrativeInputCharacters)
-    const trigger = evaluateCompactionTrigger({ inputTokens: collection.beforeInputTokens, itemCount: collection.sourceItemIds.length, atTurnBoundary: request.atTurnBoundary, requested: request.requested }, request.policy)
+    const trigger = evaluateCompactionTrigger({ inputTokens: collection.beforeInputTokens, itemCount: collection.sourceItemCount, atTurnBoundary: request.atTurnBoundary, requested: request.requested }, request.policy)
     if (!trigger.shouldCompact || !trigger.reason) return { status: "skipped", trigger, item: null }
 
     const started = createCompactionStartedItem({ sessionId: collection.state.sessionId, turnId: request.turnId, throughSequence: collection.state.throughSequence, source: request.source, reason: trigger.reason, id: request.itemId }, this.idFactory)
@@ -55,15 +55,23 @@ export class ContextCompactor {
       await this.port.recordStarted(started, request.scope)
       previousSnapshot = await this.port.loadLatest({ scope: request.scope, sessionId: collection.state.sessionId })
       previousSnapshotLoaded = true
-      const preservedState = cloneCompactionState(collection.state)
+      if (collection.coveredThroughSequence === null) {
+        throw new CompactionError("invalid_source", "The first source sequence group exceeds the narrative input character limit")
+      }
+      const coveredThroughSequence = collection.coveredThroughSequence
+      if (previousSnapshot !== null && coveredThroughSequence <= previousSnapshot.throughSequence) {
+        throw new CompactionError("invalid_source", "The covered source prefix does not advance the previous snapshot cursor")
+      }
+      const preservedState = { ...cloneCompactionState(collection.state), throughSequence: coveredThroughSequence }
       const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: preservedState.sessionId, throughSequence: preservedState.throughSequence, narrativeText: collection.narrativeText, state: cloneCompactionState(preservedState), itemCount: collection.sourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
       const candidateState = cloneCompactionState(preservedState)
       const report = assertCompactionInvariantsPreserved(preservedState, candidateState)
-      const measurement = tokenMeasurement(candidateState, narrativeSummary, collection.beforeInputTokens)
+      const measurement = tokenMeasurement(candidateState, narrativeSummary, collection.coveredInputTokens)
       const draft = { scope: request.scope, turnId: request.turnId, state: candidateState, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.sourceItemIds, reason: trigger.reason }
       const completed = completeCompactionItem(started, { summary: narrativeSummary, measurement, report })
-      const snapshot = await this.port.publishAtomically({ scope: request.scope, previousSnapshot, draft, startedItem: started, completedItem: completed })
-      return { status: "compacted", trigger, item: completed, snapshot, invariantReport: report, tokenMeasurement: measurement, failureRecorded: false }
+      const coveredCompleted = { ...completed, data: { ...completed.data, throughSequence: coveredThroughSequence.toString() } }
+      const snapshot = await this.port.publishAtomically({ scope: request.scope, previousSnapshot, draft, startedItem: started, completedItem: coveredCompleted })
+      return { status: "compacted", trigger, item: coveredCompleted, snapshot, invariantReport: report, tokenMeasurement: measurement, failureRecorded: false }
     } catch (error: unknown) {
       const failure = error instanceof CompactionError ? error : new CompactionError("publish_failed", "Compaction failed")
       const failed = failCompactionItem(started, failure, previousSnapshotLoaded && previousSnapshot !== null)
