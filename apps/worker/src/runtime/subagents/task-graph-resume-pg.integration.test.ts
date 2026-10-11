@@ -600,6 +600,25 @@ const PROCESS_FIXTURE_FAILURE_CATEGORIES = new Set([
   "coordination_wait_unavailable", "wait_handoff_state", "turn_lease_state", "generic_tool_execution_failed",
   "task_graph_failure", "plan_ledger_projection_invalid", "business_precondition_failed", "turn_output_invalid", "turn_budget_exhausted",
 ])
+const ARCHIVED_WAIT_PROGRESS_PREFIX = "P3_ARCHIVED_WAIT_PROGRESS "
+const ARCHIVED_WAIT_PROGRESS_PHASES = new Set([
+  "model_stream_entered", "tools_validated", "root_identity_validated", "child_create_started", "child_create_failed",
+  "child_created", "child_claim_started", "child_claim_failed", "child_claimed", "child_finish_started",
+  "child_finish_failed", "child_finished", "child_pending", "wait_call_emitted", "model_stream_failed",
+])
+const ARCHIVED_WAIT_PROGRESS_ERROR_KINDS = new Set(["none", "error", "type_error", "range_error", "syntax_error", "non_error", "other"])
+const LEASE_RECOVERY_ADAPTER_BRANCHES = new Set([
+  "not_started", "initial_plan", "initial_wait", "repair_plan", "repair_wait", "final_proof", "unexpected",
+])
+const LEASE_RECOVERY_ADAPTER_STAGES = new Set([
+  "not_started", "stream_entered", "branch_entered", "graph_checked", "outcome_checked",
+  "database_checked", "tool_call_emitted", "completion_emitted", "final_output_emitted",
+])
+const LEASE_RECOVERY_STARTUP_STAGES = new Set([
+  "not_started", "state_loading", "state_loaded", "selected_job_loading", "selected_job_loaded",
+  "root_ensure_entered", "root_ensure_returned", "root_ensure_failed", "model_factory",
+])
+const LEASE_RECOVERY_FAILURE_CLASSES = new Set(["none", "assertion", "coordination", "database", "generic", "other"])
 const PROCESS_RESTART_ROOT_STAGES = new Set([
   "not_started", "worker_ready", "model_failed", "graph_restored", "resume_context_ready",
   "follow_up_dependency_context_ready", "follow_up_graph_ready", "follow_up_graph_completed",
@@ -3608,8 +3627,31 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
   return projected
 }
 
+function archivedWaitProgressProjection(value: unknown): RecordValue | null {
+  const source = record(value)
+  if (!source) return null
+  const progress = source.progress
+  return {
+    phase: diagnosticEnum(source.phase, ARCHIVED_WAIT_PROGRESS_PHASES) ?? "other",
+    progress: typeof progress === "number" && Number.isSafeInteger(progress) && progress >= 0 && progress <= 7
+      ? progress : null,
+    errorKind: diagnosticEnum(source.errorKind, ARCHIVED_WAIT_PROGRESS_ERROR_KINDS) ?? "other",
+  }
+}
+
 function processFixtureDiagnostics(child: ProcessFixtureChild): string {
   const prefix = "P3_PARENT_SUSPENSION_DIAGNOSTICS "
+  let archivedWaitProgress: RecordValue | null = null
+  for (const line of child.output) {
+    if (!line.startsWith(ARCHIVED_WAIT_PROGRESS_PREFIX)) continue
+    try {
+      archivedWaitProgress = archivedWaitProgressProjection(
+        JSON.parse(line.slice(ARCHIVED_WAIT_PROGRESS_PREFIX.length)) as unknown,
+      ) ?? archivedWaitProgress
+    } catch {
+      // Ignore malformed progress markers and keep the latest valid bounded marker.
+    }
+  }
   const processState = "pid=" + (Number.isSafeInteger(child.pid) ? child.pid : "unavailable")
     + " exitCode=" + (child.exitCode === null ? "null"
       : typeof child.exitCode === "number" && Number.isInteger(child.exitCode) ? child.exitCode : "unavailable")
@@ -3628,7 +3670,8 @@ function processFixtureDiagnostics(child: ProcessFixtureChild): string {
       // Ignore malformed fixture diagnostics and keep looking for a valid line.
     }
   }
-  const diagnostic = processState + (safeLine ? " " + safeLine : " fixtureDiagnostics=unavailable")
+  const progressLine = archivedWaitProgress ? " archivedWaitProgress=" + JSON.stringify(archivedWaitProgress) : ""
+  const diagnostic = processState + progressLine + (safeLine ? " " + safeLine : " fixtureDiagnostics=unavailable")
   return boundedDiagnostic(diagnostic, 1_600)
 }
 
@@ -4761,12 +4804,38 @@ function waitForTurnStatusFailureDiagnostic(error: unknown): RecordValue {
 type LeaseRecoveryStartupStage =
   | "not_started" | "state_loading" | "state_loaded" | "selected_job_loading" | "selected_job_loaded"
   | "root_ensure_entered" | "root_ensure_returned" | "root_ensure_failed" | "model_factory"
+type LeaseRecoveryAdapterBranch = "not_started" | "initial_plan" | "initial_wait" | "repair_plan" | "repair_wait" | "final_proof" | "unexpected"
+type LeaseRecoveryAdapterStage =
+  | "not_started" | "stream_entered" | "branch_entered" | "graph_checked" | "outcome_checked"
+  | "database_checked" | "tool_call_emitted" | "completion_emitted" | "final_output_emitted"
 type LeaseRecoveryFixtureDiagnostics = {
   modelRuntimeFactoryInvocations: number
   adapterStreamInvocations: number
   runtimeExecuteInvocations: number
   runtimeExecuteFailureClass: FailurePreflightErrorClass
   startupStage: LeaseRecoveryStartupStage
+  adapterExecutionOrdinal: number
+  adapterRoundOrdinal: number
+  adapterBranch: LeaseRecoveryAdapterBranch
+  adapterStage: LeaseRecoveryAdapterStage
+}
+
+function leaseRecoveryFixtureDiagnosticProjection(value: unknown): RecordValue | null {
+  const source = record(value)
+  if (!source) return null
+  const ordinal = (candidate: unknown) => typeof candidate === "number" && Number.isSafeInteger(candidate)
+    && candidate >= 0 && candidate <= 7 ? candidate : null
+  return {
+    modelRuntimeFactoryInvocations: diagnosticBoundedCount(source.modelRuntimeFactoryInvocations),
+    adapterStreamInvocations: diagnosticBoundedCount(source.adapterStreamInvocations),
+    runtimeExecuteInvocations: diagnosticBoundedCount(source.runtimeExecuteInvocations),
+    runtimeExecuteFailureClass: diagnosticEnum(source.runtimeExecuteFailureClass, LEASE_RECOVERY_FAILURE_CLASSES) ?? "other",
+    startupStage: diagnosticEnum(source.startupStage, LEASE_RECOVERY_STARTUP_STAGES) ?? "other",
+    adapterExecutionOrdinal: ordinal(source.adapterExecutionOrdinal),
+    adapterRoundOrdinal: ordinal(source.adapterRoundOrdinal),
+    adapterBranch: diagnosticEnum(source.adapterBranch, LEASE_RECOVERY_ADAPTER_BRANCHES) ?? "other",
+    adapterStage: diagnosticEnum(source.adapterStage, LEASE_RECOVERY_ADAPTER_STAGES) ?? "other",
+  }
 }
 
 async function waitForPersistedTaskWait(
@@ -4846,11 +4915,7 @@ async function persistedWaitTimeoutDiagnostics(
         suspended: waitRow.suspendedAt !== null, resolved: waitRow.resolvedAt !== null, consumed: waitRow.consumedAt !== null,
         targetCount: diagnosticCount(waitRow.targetTaskIds), matchedCount: diagnosticCount(waitRow.matchedTaskIds),
       } : { found: false },
-      fixtureCounters: fixtureCounters ? {
-        ...fixtureCounters,
-        runtimeExecuteFailureClass: fixtureCounters.runtimeExecuteFailureClass,
-        startupStage: fixtureCounters.startupStage,
-      } : null,
+      fixtureCounters: fixtureCounters ? leaseRecoveryFixtureDiagnosticProjection(fixtureCounters) : null,
       tools: tools.rows.map(item => ({
         id: item.id.slice(-12), type: item.type, status: diagnosticEnum(item.status, ITEM_DIAGNOSTIC_STATUSES),
         errorCode: diagnosticErrorCode(item.errorCode),
@@ -5690,6 +5755,48 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(projected).not.toHaveProperty("unknownNested")
     expect(markers.some(marker => output.includes(marker)), "diagnostic output must omit marker values").toBe(false)
     expect(output.length).toBeLessThanOrEqual(1_600)
+  })
+
+  it("projects archived-wait child progress to closed phases, bounded ordinals, and error kinds", () => {
+    const secret = "private task or database detail"
+    const child = {
+      pid: 42, exitCode: null, signalCode: null, errors: [],
+      output: [
+        ARCHIVED_WAIT_PROGRESS_PREFIX + JSON.stringify({ phase: "child_created", progress: 4, errorKind: "none", taskId: secret }),
+        ARCHIVED_WAIT_PROGRESS_PREFIX + JSON.stringify({ phase: "child_finish_failed", progress: 7, errorKind: "type_error", error: secret }),
+      ],
+    } as unknown as ProcessFixtureChild
+    const output = processFixtureDiagnostics(child)
+    expect(output).toContain('archivedWaitProgress={"phase":"child_finish_failed","progress":7,"errorKind":"type_error"}')
+    expect(output).not.toContain(secret)
+    expect(archivedWaitProgressProjection({ phase: secret, progress: 8, errorKind: secret, payload: secret })).toEqual({
+      phase: "other", progress: null, errorKind: "other",
+    })
+  })
+
+  it("projects repair-follow-up model diagnostics through closed branch and stage labels", () => {
+    const secret = "private goal, ID, or provider detail"
+    const projected = leaseRecoveryFixtureDiagnosticProjection({
+      modelRuntimeFactoryInvocations: 3, adapterStreamInvocations: 4, runtimeExecuteInvocations: 2,
+      runtimeExecuteFailureClass: "database", startupStage: "model_factory",
+      adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
+      adapterStage: "outcome_checked", privateId: secret, error: secret,
+    })
+    expect(projected).toEqual({
+      modelRuntimeFactoryInvocations: 3, adapterStreamInvocations: 4, runtimeExecuteInvocations: 2,
+      runtimeExecuteFailureClass: "database", startupStage: "model_factory",
+      adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
+      adapterStage: "outcome_checked",
+    })
+    const invalid = leaseRecoveryFixtureDiagnosticProjection({
+      adapterExecutionOrdinal: 8, adapterRoundOrdinal: -1, adapterBranch: secret, adapterStage: secret,
+      startupStage: secret, runtimeExecuteFailureClass: secret, private: secret,
+    })
+    expect(invalid).toMatchObject({
+      adapterExecutionOrdinal: null, adapterRoundOrdinal: null, adapterBranch: "other", adapterStage: "other",
+      startupStage: "other", runtimeExecuteFailureClass: "other",
+    })
+    expect(JSON.stringify([projected, invalid])).not.toContain(secret)
   })
 
   it("redacts proposal event lineage markers while retaining safe comparisons and mismatch keys", () => {
@@ -12057,6 +12164,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const fixtureInvocationCounters: LeaseRecoveryFixtureDiagnostics = {
       modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0,
       runtimeExecuteInvocations: 0, runtimeExecuteFailureClass: "none", startupStage: "not_started",
+      adapterExecutionOrdinal: 0, adapterRoundOrdinal: 0, adapterBranch: "not_started", adapterStage: "not_started",
     }
     let initialWaitReportSeen = false
     let originalDependentTaskId = ""
@@ -12099,13 +12207,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       modelRuntimeFactory: () => {
         fixtureInvocationCounters.startupStage = "model_factory"
         const execution = ++fixtureInvocationCounters.modelRuntimeFactoryInvocations
+        fixtureInvocationCounters.adapterExecutionOrdinal = Math.min(execution, 7)
+        fixtureInvocationCounters.adapterRoundOrdinal = 0
+        fixtureInvocationCounters.adapterBranch = "not_started"
+        fixtureInvocationCounters.adapterStage = "not_started"
         let round = 0
         const adapter: ModelAdapter = {
           id: "p3-taskgraph-lease-recovery-root-fixture", profile,
           async *stream(request) {
             fixtureInvocationCounters.adapterStreamInvocations += 1
             round += 1
+            fixtureInvocationCounters.adapterRoundOrdinal = Math.min(round, 7)
+            fixtureInvocationCounters.adapterBranch = "unexpected"
+            fixtureInvocationCounters.adapterStage = "stream_entered"
             if (execution === 1 && round === 1) {
+              fixtureInvocationCounters.adapterBranch = "initial_plan"
+              fixtureInvocationCounters.adapterStage = "branch_entered"
+              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
                 nodes: [
@@ -12113,20 +12231,28 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   { key: "dependent", templateId: "analyst", goal: dependentGoal, successCriteria: ["Wait for the exact repair receipt"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION },
                 ],
               } }
+              fixtureInvocationCounters.adapterStage = "completion_emitted"
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             if (execution === 1 && round === 2) {
+              fixtureInvocationCounters.adapterBranch = "initial_wait"
+              fixtureInvocationCounters.adapterStage = "branch_entered"
               const taskIds = planTaskIds(request, planCallId, 2)
               if (taskIds.length !== 2) throw new Error("Lease recovery fixture plan did not persist its dependent task")
               originalDependentTaskId = taskIds[1]!
+              fixtureInvocationCounters.adapterStage = "graph_checked"
+              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
               yield { type: "tool_call_completed", callId: `p3-lease-recovery-initial-wait:${value.turnId}`, name: "agent.wait", arguments: {
                 idempotencyKey: initialWaitKey, taskIds: [taskIds[0]!], mode: "all", timeoutMs: 30_000,
               } }
+              fixtureInvocationCounters.adapterStage = "completion_emitted"
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             if (execution === 2 && round === 1) {
+              fixtureInvocationCounters.adapterBranch = "repair_plan"
+              fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               const scout = nodes.find(node => node?.key === "scout")
@@ -12135,12 +12261,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(scout?.status).toBe("failed")
               expectUnverifiedVerificationReport(scout?.verificationReport, "candidate-count")
               expect(dependent).toMatchObject({ taskId: originalDependentTaskId, status: "waiting" })
+              fixtureInvocationCounters.adapterStage = "graph_checked"
               const outcome = waitOutcomeFromRequest(request, 1)
               expect(outcome.status).toBe("ready")
               const waitedScout = outcome.tasks.map(record).find(task => task?.role === "scout")
               expect(waitedScout?.status).toBe("failed")
               expect(waitedScout?.taskId).toBe(scout?.taskId)
               expectUnverifiedVerificationReport(waitedScout?.verificationReport, "candidate-count")
+              fixtureInvocationCounters.adapterStage = "outcome_checked"
               const liveDependent = await pool!.query<{ id: string; status: string; turnStatus: string }>(
                 "SELECT task.\"id\", task.\"status\", turn.\"status\" AS \"turnStatus\" FROM \"sub_agent_tasks\" AS task JOIN \"agent_turns\" AS turn ON turn.\"id\" = task.\"turnId\" AND turn.\"sessionId\" = task.\"sessionId\" WHERE task.\"sessionId\" = $1 AND task.\"turnId\" = $2 AND task.\"goal\" = $3",
                 [value.sessionId, value.turnId, dependentGoal],
@@ -12158,6 +12286,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 [value.sessionId, value.turnId, originalDependentTaskId, "lifecycle", "task.cancelled"],
               )
               expect(noPrematureCancellation.rowCount).toBe(0)
+              fixtureInvocationCounters.adapterStage = "database_checked"
               initialWaitReportSeen = true
               const root = await pool!.query<{ rootTaskId: string | null }>(
                 `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
@@ -12165,15 +12294,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               )
               const graphRootTaskId = root.rows[0]?.rootTaskId
               if (!graphRootTaskId || !scout?.taskId || typeof graph?.revision !== "number") throw new Error("Lease recovery fixture lost its graph identity")
+              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
               yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
                 expectedRevision: graph.revision,
                 nodes: [{ key: "scout-repair", templateId: "scout", goal: repairGoal, successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION,
                   repairOf: { graphRootTaskId, nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
               } }
+              fixtureInvocationCounters.adapterStage = "completion_emitted"
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             if (execution === 2 && round === 2) {
+              fixtureInvocationCounters.adapterBranch = "repair_wait"
+              fixtureInvocationCounters.adapterStage = "branch_entered"
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
@@ -12183,14 +12316,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               repairTaskId = repairTaskIds[0]!
               expect(repair).toMatchObject({ status: "queued", repairOf: { nodeKey: "scout", criterionIds: ["candidate-count"] } })
               expect(dependent).toMatchObject({ taskId: originalDependentTaskId, status: "waiting" })
+              fixtureInvocationCounters.adapterStage = "graph_checked"
               repairPlanAccepted = true
+              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
               yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: repairWaitKey, taskIds: [repairTaskIds[0]!, originalDependentTaskId], mode: "all", timeoutMs: 30_000,
               } }
+              fixtureInvocationCounters.adapterStage = "completion_emitted"
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             if (execution === 3 && round === 1) {
+              fixtureInvocationCounters.adapterBranch = "final_proof"
+              fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent", "scout-repair"])
@@ -12201,6 +12339,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(dependent?.taskId).toBe(originalDependentTaskId)
               expectPassedVerificationReport(dependent?.verificationReport, "finding-count")
               expectPassedVerificationReport(repair?.verificationReport, "candidate-count")
+              fixtureInvocationCounters.adapterStage = "graph_checked"
               expect(record(repair?.repairReceipt)).toMatchObject({
                 targetNodeKey: "scout", targetTaskId: scout?.taskId, criterionIds: ["candidate-count"],
                 repairNodeKey: "scout-repair", repairTaskId: repair?.taskId,
@@ -12213,8 +12352,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const dependentWaitTask = waitTasks.find(task => task?.taskId === originalDependentTaskId)
               expectPassedVerificationReport(repairWaitTask?.verificationReport, "candidate-count")
               expectPassedVerificationReport(dependentWaitTask?.verificationReport, "finding-count")
+              fixtureInvocationCounters.adapterStage = "outcome_checked"
               rootCompletedAfterRepair = true
+              fixtureInvocationCounters.adapterStage = "final_output_emitted"
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Lease recovery repair unlocked the original dependent" }) }
+              fixtureInvocationCounters.adapterStage = "completion_emitted"
               yield { type: "completed", finishReason: "stop" }
               return
             }
