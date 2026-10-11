@@ -22,6 +22,39 @@ describe('HarnessItem renderers', () => {
     expect(html).toContain('Final answer')
   })
 
+  it('renders the same plain accessible summary for live and replay content without changing response text', () => {
+    const summary = 'Verified two facts. Contact alex@example.test +353 871234567; Bearer summary-token; password=private-value; **Keep this literal.**'
+    const live = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({
+      phase: 'final_answer', content: { text: 'Assistant response stays exact.', final: { summary, goal: 'PRIVATE_GOAL' } },
+    })} /></I18nProvider>)
+    const replay = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({
+      phase: 'final_answer', content: { text: 'Assistant response stays exact.', summary },
+    })} /></I18nProvider>)
+
+    expect(live).toBe(replay)
+    expect(live).toContain('<section aria-label="Summary" data-agent-final-summary="true"><strong>Summary</strong><p>Verified two facts. Contact [REDACTED_EMAIL] [REDACTED_PHONE]; Bearer [REDACTED]; password=[REDACTED]; **Keep this literal.**</p></section>')
+    expect(live).toContain('Assistant response stays exact.')
+    expect(live).not.toContain('PRIVATE_GOAL')
+    expect(live).not.toContain('alex@example.test')
+    expect(live).not.toContain('871234567')
+    expect(live).not.toContain('private-value')
+    expect(live).not.toContain('<strong>Keep this literal.</strong>')
+  })
+
+  it('does not render summaries for non-final, non-message, malformed, or oversized content', () => {
+    const invalidItems = [
+      item({ phase: 'commentary', content: { text: 'unchanged', final: { summary: 'not final' } } }),
+      item({ status: 'running', phase: 'final_answer', content: { text: 'unchanged', final: { summary: 'not complete' } } }),
+      item({ type: 'tool_result', phase: 'final_answer', content: { text: 'unchanged', final: { summary: 'not a message' } } }),
+      item({ phase: 'final_answer', content: { text: 'unchanged', final: { summary: 5 } } }),
+      item({ phase: 'final_answer', content: { text: 'unchanged', final: { summary: 'x'.repeat(1_001) } } }),
+    ]
+    for (const candidate of invalidItems) {
+      const html = renderToStaticMarkup(<I18nProvider><HarnessItem item={candidate} /></I18nProvider>)
+      expect(html).not.toContain('data-agent-final-summary')
+    }
+  })
+
   it('renders plan steps and the complete tool lifecycle state', () => {
     expect(reducePlanSteps({ steps: [{ id: 'one', title: 'Search roles', status: 'completed' }, 'Review matches'] })).toEqual([
       { id: 'one', label: 'Search roles', status: 'completed' }, { id: '1', label: 'Review matches', status: 'queued' },
