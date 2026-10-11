@@ -30,14 +30,25 @@ function analystResult(findings: readonly Readonly<{ jobId: string; score: numbe
   }
 }
 
-function row(id: string, role: string, taskType: string, status: GraphTaskRow["status"], structuredResult?: unknown): GraphTaskRow {
+function row(
+  id: string,
+  role: string,
+  taskType: string,
+  status: GraphTaskRow["status"],
+  structuredResult?: unknown,
+): GraphTaskRow {
   return {
     id, role, taskType, status, failureReason: null,
     result: structuredResult === undefined ? null : { status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult },
   }
 }
 
-function loadedGraph(revision: number, currentTaskIds: readonly string[], rows: readonly GraphTaskRow[], stateRevision = revision): LoadedGraph {
+function loadedGraph(
+  revision: number,
+  currentTaskIds: readonly string[],
+  rows: readonly GraphTaskRow[],
+  stateRevision = revision,
+): LoadedGraph {
   return {
     rootTaskId: "root-task",
     item: { id: "task-graph:root-task", revision, content: {}, createdAt: new Date(0) },
