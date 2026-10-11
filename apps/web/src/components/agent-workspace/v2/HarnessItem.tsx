@@ -2,6 +2,7 @@
 
 import React from 'react'
 import { redactSensitiveValue } from '@jobcopilot/shared/agent-redaction'
+import { projectFinalSummary } from '@/lib/agent/session/final-summary-projection'
 import { useI18n, type Lang } from '@/lib/i18n'
 import type { TimelineItem } from './timeline-reducer'
 import { contentParts, itemText, type HarnessContentPart, type SuggestedActionCommand } from './harness-item-types'
@@ -73,7 +74,15 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
     return <details><summary style={{ cursor: 'pointer', color: '#7c3aed', fontSize: 12 }}>{t('agent.reasoningSummary')}</summary><div style={{ marginTop: 8 }}><HarnessMarkdown markdown={itemText(item) || t('agent.noReasoningSummary')} /></div></details>
   }
   if (item.type === 'unknown') return <Fallback label={t('agent.unknownItem')} />
-  return <div style={{ display: 'grid', gap: 8 }}>{contentParts(item.content).map((part, index) => <ContentPart key={index} part={part} t={t} onSuggestedAction={onSuggestedAction} />)}</div>
+  const summary = projectFinalSummary(item.type, item.phase, item.status, item.content)
+  const summaryLabel = lang === 'zh' ? '摘要' : 'Summary'
+  return <div style={{ display: 'grid', gap: 8 }}>
+    {summary && <section aria-label={summaryLabel} data-agent-final-summary="true">
+      <strong>{summaryLabel}</strong>
+      <p>{summary}</p>
+    </section>}
+    {contentParts(item.content).map((part, index) => <ContentPart key={index} part={part} t={t} onSuggestedAction={onSuggestedAction} />)}
+  </div>
 }
 
 function PlanBody({ item, t }: { item: TimelineItem; t: (key: string) => string }) {
