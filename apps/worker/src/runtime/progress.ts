@@ -1,6 +1,7 @@
 import type { StepContext, StepContextSnapshot } from "./context/step-context-builder.js"
 import { stableJson } from "./turns/turn-engine-replay.js"
 import type { TurnEngineToolCall } from "./turns/turn-engine-types.js"
+import { createRepairConflictProgressDetector } from "./repair-conflict-progress.js"
 
 export type ProgressObservation = {
   readonly signature: string
@@ -13,6 +14,8 @@ export type ProgressCheckpoint = Readonly<{
   taskGraphRevision?: number
 }>
 
+export type NoProgressReasonCode = "repeated_signature" | "repeated_repair_conflict"
+
 export function progressCheckpointFromStepContext(context: Pick<StepContext, "inputThroughSequence" | "consumedInputIds" | "taskGraphRevision">): ProgressCheckpoint {
   return { inputThroughSequence: context.inputThroughSequence, consumedInputIds: context.consumedInputIds,
     ...(context.taskGraphRevision === undefined ? {} : { taskGraphRevision: context.taskGraphRevision }) }
@@ -20,11 +23,12 @@ export function progressCheckpointFromStepContext(context: Pick<StepContext, "in
 
 export class NoProgressError extends Error {
   readonly code = "no_progress" as const
-  readonly reasonCode = "repeated_signature" as const
+  readonly reasonCode: NoProgressReasonCode
 
-  constructor(readonly observation: ProgressObservation) {
+  constructor(readonly observation: ProgressObservation, reasonCode: NoProgressReasonCode = "repeated_signature") {
     super(`Turn made no progress: repeated ${observation.signature}`)
     this.name = "NoProgressError"
+    this.reasonCode = reasonCode
   }
 }
 
@@ -82,8 +86,11 @@ export function createProgressDetector(repeatLimit = 2): ProgressDetector {
   if (!Number.isInteger(repeatLimit) || repeatLimit < 2) throw new TypeError("repeatLimit must be an integer of at least 2")
   let observations = new Map<string, number>()
   let effectiveCheckpoint: EffectiveCheckpoint | undefined
+  const repairConflicts = createRepairConflictProgressDetector(repeatLimit)
   return {
     observe(input, checkpoint): ProgressObservation {
+      const repairConflict = repairConflicts.observe(input, checkpoint)
+      if (repairConflict) throw new NoProgressError(repairConflict, "repeated_repair_conflict")
       const parsedCheckpoint = parseCheckpoint(checkpoint)
       if (parsedCheckpoint) {
         const advanced = advanceCheckpoint(effectiveCheckpoint, parsedCheckpoint)
