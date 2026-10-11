@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import type { TimelineItem } from './timeline-reducer'
+import type { SupervisorTaskSummary, SupervisorTurnSummary } from './task-tree-projection'
 import { latestWriterArtifact } from './draft-artifact-projection'
 import { projectCurrentTaskGraph } from './task-graph-plan'
-import { buildTaskGraphTaskLookupUrl, latestSelectedJobPreparationTurnId, selectCurrentTaskGraphTaskIds, selectedJobIdForTurn, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
+import { buildTaskGraphTaskLookupUrl, latestSelectedJobPreparationTurnId, resolveTaskGraphPlanInspectionSelection, selectCurrentTaskGraphTaskIds, selectedJobIdForTurn, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
 import { SELECTED_JOB_PREPARATION_MESSAGE_TEXT } from './selected-job-preparation-action'
+import type { TaskTreeNode } from './types'
 
 const schemaVersion = 'agent-harness.v2.task-graph'
 
@@ -36,6 +38,21 @@ function writerTask(turnId: string, rootTaskId: string, artifactId: string) {
     status: 'completed', goal: 'Prepare draft', hasResult: true, updatedAt: '2026-09-23T12:00:00.000Z',
     artifactRef: { artifactId, version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` },
   }
+}
+
+function turn(id: string, sessionId = 'session-1'): SupervisorTurnSummary {
+  return { id, sessionId, source: 'message', goal: `Goal ${id}`, status: 'failed', revision: 2, activeStepId: null, finalItemId: null,
+    createdAt: '2026-09-23T12:00:00.000Z', updatedAt: '2026-09-23T12:00:00.000Z', completedAt: null }
+}
+
+function supervisorTask(id: string, turnId: string | null, sessionId = 'session-1'): SupervisorTaskSummary {
+  return { id, sessionId, turnId, rootTaskId: `root-${turnId}`, role: 'analyst', taskType: 'analysis', status: 'failed', goal: id, hasResult: true }
+}
+
+function evidenceItem(overrides: Partial<TimelineItem> = {}): TimelineItem {
+  return { schemaVersion: 'agent-harness.v2', id: 'evidence-1', sessionId: 'session-1', turnId: 'turn-old', stepId: 'step-old', taskId: null,
+    type: 'tool_result', status: 'completed', phase: 'commentary', revision: 1, content: { toolCallId: 'call-old' }, startedAt: null,
+    completedAt: null, createdAt: '2026-09-23T12:00:00.000Z', updatedAt: '2026-09-23T12:00:00.000Z', source: 'replay', sequence: null, ...overrides }
 }
 
 describe('TaskGraph query projection', () => {
@@ -174,5 +191,61 @@ describe('TaskGraph query projection', () => {
     expect(buildTaskGraphTaskLookupUrl('session-1', completedItems)).toContain('graphItemId=graph-second')
     expect(projectCurrentTaskGraph(completedItems, [firstWriter, secondWriter], 'session-1')?.nodes.map(node => node.key)).toEqual(['second'])
     expect(latestWriterArtifact('session-1', [firstWriter, secondWriter], currentIdentity)?.artifactId).toBe('draft-second')
+  })
+
+  it('resolves only session-owned turn, task, step, and tool nodes to an existing Turn', () => {
+    const turns = [turn('turn-old'), turn('turn-current')]
+    const tasks = [supervisorTask('task-old', 'turn-old'), supervisorTask('task-current', 'turn-current')]
+    const items = [evidenceItem(), evidenceItem({ id: 'call-old-item', type: 'tool_call', content: { toolCallId: 'call-old' } })]
+    const resolve = (node: TaskTreeNode) => resolveTaskGraphPlanInspectionSelection({
+      sessionId: 'session-1', selectedNodeId: node.id, selectedNode: node, turns, tasks, items,
+    })
+
+    expect(resolve({ id: 'turn:turn-old', kind: 'turn', label: 'old', status: 'failed' })).toEqual({ kind: 'selected', turnId: 'turn-old' })
+    expect(resolve({ id: 'task:task-old', kind: 'task', label: 'old', status: 'failed' })).toEqual({ kind: 'selected', turnId: 'turn-old' })
+    expect(resolve({ id: 'step:step-old', kind: 'step', label: 'old', status: 'failed', itemId: 'evidence-1' })).toEqual({ kind: 'selected', turnId: 'turn-old' })
+    expect(resolve({ id: 'tool:call-old', kind: 'tool', label: 'old', status: 'completed', itemId: 'call-old-item' })).toEqual({ kind: 'selected', turnId: 'turn-old' })
+  })
+
+  it('rejects ambiguous tool IDs repeated across steps or duplicated within one step', () => {
+    const call = evidenceItem({ id: 'call-1', type: 'tool_call', content: { toolCallId: 'same-call' } })
+    const result = evidenceItem({ id: 'result-1', type: 'tool_result', content: { toolCallId: 'same-call' } })
+    const secondStep = evidenceItem({ id: 'call-2', stepId: 'step-other', type: 'tool_call', content: { toolCallId: 'same-call' } })
+    const selected: TaskTreeNode = { id: 'tool:same-call', kind: 'tool', label: 'search', status: 'completed', itemId: 'result-1' }
+    const resolve = (items: TimelineItem[]) => resolveTaskGraphPlanInspectionSelection({
+      sessionId: 'session-1', selectedNodeId: selected.id, selectedNode: selected,
+      turns: [turn('turn-old')], tasks: [], items,
+    })
+
+    expect(resolve([call, result])).toEqual({ kind: 'selected', turnId: 'turn-old' })
+    expect(resolve([call, result, secondStep])).toEqual({ kind: 'unavailable' })
+    expect(resolve([call, result, { ...result, id: 'duplicate-result' }])).toEqual({ kind: 'unavailable' })
+    expect(resolve([call, result, { ...call, id: 'other-turn-call', turnId: 'turn-current' }])).toEqual({ kind: 'unavailable' })
+  })
+
+  it('keeps default distinct from unavailable explicit selections and refuses foreign or dangling owners', () => {
+    const turns = [turn('turn-current')]
+    const tasks = [supervisorTask('task-current', 'turn-current'), supervisorTask('foreign-task', 'turn-current', 'session-2')]
+    const resolve = (selectedNodeId?: string, selectedNode?: TaskTreeNode, sessionId = 'session-1') =>
+      resolveTaskGraphPlanInspectionSelection({ sessionId, selectedNodeId, selectedNode, turns, tasks, items: [evidenceItem()] })
+
+    expect(resolve()).toEqual({ kind: 'current' })
+    expect(resolve('task:missing', undefined)).toEqual({ kind: 'unavailable' })
+    expect(resolve('task:foreign-task', { id: 'task:foreign-task', kind: 'task', label: 'foreign', status: 'failed' })).toEqual({ kind: 'unavailable' })
+    expect(resolve('task:task-current', { id: 'task:task-current', kind: 'task', label: 'dangling', status: 'failed' }, 'session-2')).toEqual({ kind: 'unavailable' })
+    expect(resolve('step:step-old', { id: 'step:step-old', kind: 'step', label: 'foreign', status: 'failed', itemId: 'evidence-1' }, 'session-2')).toEqual({ kind: 'unavailable' })
+    expect(resolve('tool:other', { id: 'tool:other', kind: 'tool', label: 'mismatch', status: 'failed', itemId: 'evidence-1' })).toEqual({ kind: 'unavailable' })
+  })
+
+  it('builds an explicit older-Turn request only from that Turn and never falls back when it is absent', () => {
+    const older = graphItem([graphNode('old', 'old-child')], '2026-09-23T11:00:00.000Z', 'session-1', 'graph-old', 'old-root', 'turn-old')
+    const current = graphItem([graphNode('new', 'new-child')], '2026-09-23T12:00:00.000Z', 'session-1', 'graph-current', 'current-root', 'turn-current')
+
+    const url = buildTaskGraphTaskLookupUrl('session-1', [older, current], 'turn-old')
+    expect(url).toContain('graphItemId=graph-old')
+    expect(url).toContain('graphTurnId=turn-old')
+    expect(url).toContain('rootTaskId=old-root')
+    expect(buildTaskGraphTaskLookupUrl('session-1', [older, current], 'turn-missing')).toBeNull()
+    expect(buildTaskGraphTaskLookupUrl('session-1', [older, current], null)).toContain('graphItemId=graph-current')
   })
 })

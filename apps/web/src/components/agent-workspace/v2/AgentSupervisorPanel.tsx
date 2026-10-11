@@ -11,7 +11,7 @@ import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-
 import { AgentApprovalLedgerCard } from './AgentApprovalLedgerCard'
 import { AgentQuestionInputCard } from './AgentQuestionInputCard'
 import { projectSelectedTaskInterrupt, projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
-import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
+import { AgentSupervisorPlanView, supervisorPlanSelectionControls } from './AgentSupervisorPlanView'
 import { buildTaskGraphTaskLookupUrl, selectedJobIdForTurn, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 import { EvidenceSummary, statusLabel } from './agent-supervisor-evidence'
@@ -34,7 +34,9 @@ export interface AgentSupervisorPanelProps {
 /** V2 evidence panel for the live task tree and selected timeline evidence. */
 export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelProps) {
   const { t } = useI18n()
-  const [selectedId, setSelectedId] = useState<string | undefined>()
+  const [selectedNodeState, setSelectedNodeState] = useState<{ sessionId: string; id: string } | null>(null)
+  const selectionControls = supervisorPlanSelectionControls(selectedNodeState, sessionId, setSelectedNodeState)
+  const selectedId = selectionControls.selectedId
   const [extraTurns, setExtraTurns] = useState<SupervisorTurnSummary[]>([])
   const [extraTasks, setExtraTasks] = useState<SupervisorTaskSummary[]>([])
   const [loadingMore, setLoadingMore] = useState(false)
@@ -57,7 +59,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
 
   useEffect(() => {
     sessionEpochRef.current += 1
-    setSelectedId(undefined)
+    setSelectedNodeState(null)
     setExtraTurns([])
     setExtraTasks([])
     setLoadMoreError(null)
@@ -67,10 +69,6 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
   const turns = useMemo(() => (sessionId ? [...(turnsQuery.data?.turns ?? []), ...extraTurns].filter(turn => turn.sessionId === sessionId) : []), [sessionId, turnsQuery.data, extraTurns])
   const restoredSelectedJobId = sessionId ? selectedJobIdForTurn(turns, sessionId, selectedPreparationTurnId) : null
   const tasks = useMemo(() => (sessionId ? [...(tasksQuery.data?.tasks ?? []), ...extraTasks].filter(task => task.sessionId === sessionId) : []), [sessionId, tasksQuery.data, extraTasks])
-  const planTasks = useMemo(() => sessionId ? [
-    ...(graphTasksQuery.data?.tasks ?? []).filter(task => task.sessionId === sessionId),
-    ...tasks,
-  ] : [], [graphTasksQuery.data, sessionId, tasks])
   const lifecycleKey = String(timeline.lifecycleRevision)
 
   const { data: turnsData, refetch: refetchTurns } = turnsQuery
@@ -202,11 +200,15 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <SelectedJobPreparationCard sessionId={sessionId} restoredJobId={restoredSelectedJobId} onAccepted={handlePreparationAccepted} />
-      <TaskGraphPlanPanel sessionId={sessionId} items={timeline.items} tasks={planTasks} ledger={graphTasksQuery.data?.planLedger} discoveryShortlist={graphTasksQuery.data?.discoveryShortlist} selectedPreparationTurnId={selectedPreparationTurnId} />
+      <AgentSupervisorPlanView
+        sessionId={sessionId} items={timeline.items} turns={turns} tasks={tasks} selectedNodeId={selectedId} selectedNode={selectedNode}
+        currentGraphTasks={graphTasksQuery.data?.tasks ?? []} currentLedger={graphTasksQuery.data?.planLedger} currentDiscoveryShortlist={graphTasksQuery.data?.discoveryShortlist}
+        currentPreparationTurnId={selectedPreparationTurnId} lifecycleRevision={timeline.lifecycleRevision}
+        onReturnToCurrent={selectionControls.onReturnToCurrent} />
       <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
-      {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} sessionKey={sessionId} showHeading={false} onSelect={setSelectedId} />}
+      {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} showHeading={false} onSelect={selectionControls.onSelect} />}
       {hasMore && <button type="button" onClick={() => void loadMore()} disabled={loadingMore} style={loadMoreStyle}>
         {loadingMore ? t('agent.loadingMoreSupervisorRecords') : t('agent.loadMoreSupervisorRecords')}
       </button>}
