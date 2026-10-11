@@ -1841,6 +1841,11 @@ type FixtureTurnLimits = { readonly maxSteps: number; readonly maxToolCalls: num
 const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCalls: 8 }
 // The discovery fixtures execute root planning/replanning and child turns under the same root-scoped ceiling.
 const DISCOVERY_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 16, maxToolCalls: 8 }
+const VERIFICATION_REPAIR_MAX_WAIT_POLLS = TASK_GRAPH_LIMITS.maxNodes
+const VERIFICATION_REPAIR_BASELINE_STEPS = 22
+const VERIFICATION_REPAIR_BASELINE_TOOL_CALLS = 19
+const VERIFICATION_REPAIR_STEP_BUDGET = VERIFICATION_REPAIR_BASELINE_STEPS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1
+const VERIFICATION_REPAIR_TOOL_BUDGET = VERIFICATION_REPAIR_BASELINE_TOOL_CALLS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1
 // TaskGraph multi-round fixtures need 10-11 root and child model steps; retain bounded headroom.
 const TASK_GRAPH_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 12, maxToolCalls: 12 }
 
@@ -5933,8 +5938,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, discoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
-    // The typed-capacity path uses 6 root + 16 child model steps and 4 coordination + 15 exact job calls.
-    await seed(pool, verificationRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxSteps: 24, maxToolCalls: 20 })
+    // The existing one-poll witness uses 22 steps/19 tool calls; each additional bounded poll adds one of each.
+    await seed(pool, verificationRepairOwner, "waiting_for_user", {
+      ...DISCOVERY_FIXTURE_TURN_LIMITS,
+      maxSteps: VERIFICATION_REPAIR_STEP_BUDGET,
+      maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET,
+    })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
@@ -10582,6 +10591,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let optimisticFinalAttempted = false
     let repairPlanSent = false
     let repairWaitSent = false
+    const repairWaitCallIds: string[] = []
+    const repairWaitStatuses: string[] = []
     let secondJobSeeded = false
     let initialPlanTaskIds: string[] | undefined
     let terminalGateLease: TurnLease | undefined
@@ -10634,7 +10645,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (repairPlanSent && !repairWaitSent) {
+            const previousRepairWaitCallId = repairWaitCallIds.at(-1)
+            const previousRepairWait = previousRepairWaitCallId
+              ? record(latestToolResult(request, previousRepairWaitCallId)) : null
+            if (typeof previousRepairWait?.status === "string") repairWaitStatuses.push(previousRepairWait.status)
+            const repairWaitNeedsPoll = !previousRepairWaitCallId
+              || (!hardExecutorFailure && previousRepairWait?.status === "waiting")
+            if (repairPlanSent && repairWaitNeedsPoll) {
+              if (repairWaitCallIds.length >= VERIFICATION_REPAIR_MAX_WAIT_POLLS) {
+                throw new Error("repair fixture exhausted its bounded wait polls")
+              }
               repairWaitSent = true
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               if (!initialPlanTaskIds?.[1]) throw new Error("repair fixture lost the original dependent task ID")
@@ -10649,8 +10669,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   .map(node => node?.key)).toContain("scout-repair")
               }
               const taskIds = [...repairTaskIds, ...initialPlanTaskIds.slice(1)]
-              yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
-                idempotencyKey: `p3-verifier-repair-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
+              const pollIndex = repairWaitCallIds.length
+              const pollSuffix = pollIndex === 0 ? "" : `:poll:${pollIndex + 1}`
+              const callId = `${repairWaitCallId}${pollSuffix}`
+              repairWaitCallIds.push(callId)
+              yield { type: "tool_call_completed", callId, name: "agent.wait", arguments: {
+                idempotencyKey: `${repairWaitCallId}${pollSuffix}`, taskIds, mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
@@ -10890,7 +10914,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
     try {
       await waitForTurnStatus(
-        pool!, value.turnId, "completed", 90_000, initialWaitCallId, [repairWaitCallId],
+        pool!, value.turnId, "completed", 90_000, initialWaitCallId, repairWaitCallIds,
       )
     } catch (error) {
       let progress = JSON.stringify({ available: false })
@@ -10901,7 +10925,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       try {
         const [initialWait, repairWait] = await Promise.all([
           scopedWaitToolResultDiagnostic(pool!, value, initialWaitCallId),
-          scopedWaitToolResultDiagnostic(pool!, value, repairWaitCallId),
+          scopedWaitToolResultDiagnostic(pool!, value, repairWaitCallIds.at(-1) ?? repairWaitCallId),
         ])
         waitResults = { initial: initialWait, repair: repairWait }
         const [failure, verdict] = await Promise.all([
@@ -10912,7 +10936,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         try { scoutResultDiagnostic = await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, value, [firstJobId, secondJobId]) } catch { /* keep the fixed unavailable projection */ }
         verification = verdict
         progress = await turnProgressDiagnostics(
-          pool!, value.turnId, initialWaitCallId, [repairWaitCallId],
+          pool!, value.turnId, initialWaitCallId, repairWaitCallIds,
         )
       } catch {
         // Keep only the fixed failure class if durable wait diagnostics are unavailable.
@@ -10941,6 +10965,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(optimisticFinalAttempted).toBe(true)
     expect(repairPlanSent).toBe(true)
     expect(repairWaitSent).toBe(true)
+    if (!hardExecutorFailure) {
+      expect(repairWaitCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_WAIT_POLLS)
+      expect(repairWaitStatuses).toHaveLength(repairWaitCallIds.length)
+      expect(repairWaitStatuses.at(-1)).toBe("ready")
+      expect(repairWaitCallIds.length).toBe(repairWaitStatuses.filter(status => status === "waiting").length + 1)
+    }
     expect(secondJobSeeded).toBe(true)
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
     expect(turn.rows[0]?.status).toBe("completed")
