@@ -60,6 +60,10 @@ function check(value: unknown, role: "scout" | "analyst"): boolean {
   if (kind === "findings_from_scout_dependency" && role === "analyst") {
     return exact(value, "dependencyNodeKey,kind") && boundedId(value.dependencyNodeKey)
   }
+  if (kind === "findings_cover_scout_candidates_gte" && role === "analyst") {
+    return exact(value, "dependencyNodeKey,kind,minimumPercent") && boundedId(value.dependencyNodeKey)
+      && Number.isSafeInteger(value.minimumPercent) && Number(value.minimumPercent) >= 1 && Number(value.minimumPercent) <= 100
+  }
   return kind === "reported_score_gte" && role === "analyst" && exact(value, "aggregation,kind,minimumFindings,minimumScore")
     && positive(value.minimumFindings) && typeof value.minimumScore === "number" && Number.isFinite(value.minimumScore)
     && value.minimumScore >= 0 && value.minimumScore <= 10 && (value.aggregation === "any" || value.aggregation === "all")
