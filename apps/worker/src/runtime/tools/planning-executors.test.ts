@@ -119,27 +119,69 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("findings_from_scout_dependency")
   })
 
-  it("exposes and forwards the bounded repair relation only for typed roles", async () => {
-    const { tool, getReceived } = setup({
+  it("binds omitted repair roots at the executor and accepts only the matching legacy value", async () => {
+    const templates = {
       scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
       analyst: { role: "analyst", taskType: "analysis", allowedActions: ["persona.retrieve"] },
       cover_letter_writer: { role: "writer", taskType: "cover_letter", allowedActions: ["cover_letter.write"] },
-    })
-    const registry = new ToolRegistry([tool])
-    const repairOf = { graphRootTaskId: "runtime-root", nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] }
-    const input = { ...proposal, nodes: [{ ...proposal.nodes[0], repairOf }] }
-    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
-    expect(JSON.stringify(tool.inputSchema)).toContain("graphRootTaskId")
-    expect(tool.description).toContain("repeats exactly those criteria and checks")
-    expect(tool.description).toContain("must not add the target to dependsOn")
-    await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
-    expect(getReceived()?.proposal.nodes[0]?.repairOf).toEqual(repairOf)
-
-    const writer = {
-      ...proposal,
-      nodes: [{ key: "writer", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save draft"], dependsOn: [], repairOf }],
+    } as const
+    const repairOf = { nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] }
+    const inputs = [
+      { ...proposal, nodes: [{ ...proposal.nodes[0], repairOf }] },
+      { ...proposal, nodes: [{ ...proposal.nodes[0], repairOf: { ...repairOf, graphRootTaskId: "runtime-root" } }] },
+    ]
+    const normalized: Array<Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0]["proposal"] | undefined> = []
+    for (const input of inputs) {
+      const { tool, getReceived } = setup(templates)
+      const registry = new ToolRegistry([tool])
+      expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+      await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
+      normalized.push(getReceived()?.proposal)
     }
+    expect(normalized[0]).toEqual(normalized[1])
+    expect(normalized[0]?.nodes[0]?.repairOf).toEqual({ ...repairOf, graphRootTaskId: "runtime-root" })
+
+    const { tool: nonRepairTool, getReceived: getNonRepair } = setup(templates)
+    await expect(nonRepairTool.execute(context(), proposal)).resolves.toEqual(receipt)
+    expect(getNonRepair()?.proposal).toEqual(proposal)
+    const { tool: descriptionTool } = setup(templates)
+    expect(descriptionTool.description).toContain("Repeat exactly those criteria and checks")
+    expect(descriptionTool.description).toContain("omit graphRootTaskId because the server binds the active Root")
+    expect(descriptionTool.description).toContain("must not add the target to dependsOn")
+
+    const { tool: typedTool } = setup(templates)
+    const registry = new ToolRegistry([typedTool])
+    const writer = { ...proposal, nodes: [{ key: "writer", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save draft"], dependsOn: [], repairOf }] }
     expect(registry.validateArguments("agent.plan", writer, "1")).toEqual(expect.any(String))
+    for (const invalidRepairOf of [
+      { taskId: "target-task", criterionIds: ["candidate-count"] },
+      { nodeKey: "target", criterionIds: ["candidate-count"] },
+      { nodeKey: "target", taskId: "target-task" },
+      { nodeKey: "target", taskId: "target-task", criterionIds: [] },
+      { nodeKey: "target", taskId: "target-task", criterionIds: ["Not-an-id"] },
+      { nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"], extra: true },
+    ]) {
+      expect(registry.validateArguments("agent.plan", {
+        ...proposal, nodes: [{ ...proposal.nodes[0], repairOf: invalidRepairOf }],
+      }, "1")).toEqual(expect.any(String))
+    }
+  })
+
+  it("rejects a mismatched legacy repair root before any command-port call", async () => {
+    const { tool, commandPort } = setup()
+    const registry = new ToolRegistry([tool])
+    const input = { ...proposal, nodes: [{
+      ...proposal.nodes[0],
+      repairOf: { graphRootTaskId: "other-root", nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] },
+    }] }
+    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+    await expect(tool.execute(context(), input)).rejects.toMatchObject({
+      code: "task_graph_repair_root_mismatch",
+      safeOutput: { code: "task_graph_repair_root_mismatch" },
+    })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(commandPort.reconcileSteering).not.toHaveBeenCalled()
   })
 
   it("keeps Writer and Reviewer on specialized gates without generic verification fields", async () => {

@@ -1,7 +1,7 @@
 import { Type, type TSchema } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
-import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
+import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
 import type {
   TaskGraphCommandPort,
@@ -48,7 +48,7 @@ function verificationSchema(role: TaskGraphVerificationRole): TSchema {
 
 function repairOfSchema(): TSchema {
   return Type.Object({
-    graphRootTaskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    graphRootTaskId: Type.Optional(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength })),
     nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
     taskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
     criterionIds: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
@@ -86,7 +86,9 @@ function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?:
 
 export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ minLength: 1, maxLength: 128 }))
 
-export type TaskGraphProposalInput = TaskGraphProposal
+type ModelTaskGraphRepairOf = Omit<TaskGraphRepairOf, "graphRootTaskId"> & Readonly<{ graphRootTaskId?: string }>
+type ModelTaskGraphNodeProposal = Omit<TaskGraphNodeProposal, "repairOf"> & Readonly<{ repairOf?: ModelTaskGraphRepairOf }>
+export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{ nodes: readonly ModelTaskGraphNodeProposal[] }>
 
 export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
@@ -153,21 +155,28 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     }
     const operation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
     const scope = operation.scope
+    const proposal: TaskGraphProposal = {
+      expectedRevision: input.expectedRevision,
+      nodes: input.nodes.map(node => {
+        const repairOf = node.repairOf
+        if (repairOf?.graphRootTaskId !== undefined && repairOf.graphRootTaskId !== scope.rootTaskId) {
+          throw new ToolExecutionError("task_graph_repair_root_mismatch", "The repair target does not belong to the active root task", { code: "task_graph_repair_root_mismatch" })
+        }
+        return {
+          key: node.key, templateId: node.templateId, goal: node.goal,
+          successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn],
+          ...(node.verification ? { verification: node.verification } : {}),
+          ...(repairOf ? { repairOf: { ...repairOf, graphRootTaskId: scope.rootTaskId, criterionIds: [...repairOf.criterionIds] } } : {}),
+        }
+      }),
+    }
     try {
       if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {
         throw new ToolExecutionError("steering_reconciliation_unavailable", "TaskGraph revision requires an atomic reconciliation-capable port")
       }
       const receipt = await options.commandPort.appendAndScheduleWithReconciliation({
         scope,
-        proposal: {
-          expectedRevision: input.expectedRevision,
-          nodes: input.nodes.map(node => ({
-            key: node.key, templateId: node.templateId, goal: node.goal,
-            successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn],
-            ...(node.verification ? { verification: node.verification } : {}),
-            ...(node.repairOf ? { repairOf: { ...node.repairOf, criterionIds: [...node.repairOf.criterionIds] } } : {}),
-          })),
-        },
+        proposal,
         templates: options.templates,
       }, operation)
       return receipt
@@ -181,7 +190,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     schemaVersion,
     name: "agent.plan",
     version: "1",
-    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency. Use only checks allowed for that role. findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. A repair uses repairOf={graphRootTaskId,nodeKey,taskId,criterionIds} for a prior typed same-template node, repeats exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
+    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency. Use only checks allowed for that role. findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. A repair uses repairOf={nodeKey,taskId,criterionIds} for a prior typed same-template node; omit graphRootTaskId because the server binds the active Root. A matching legacy graphRootTaskId is accepted, but a mismatch is rejected. Repeat exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
     capabilities: ["coordination"],
     inputSchema: proposalInputSchema(templateIdSchema, templates),
     outputSchema: ReceiptSchema,
