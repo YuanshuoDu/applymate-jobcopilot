@@ -12,6 +12,7 @@ import type { TurnLease } from "./turns/lease.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "./planning/task-graph-verification.js"
 
 const state: TaskGraphCurrentState = {
   revision: 3,
@@ -30,6 +31,23 @@ const state: TaskGraphCurrentState = {
       criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }], evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
     },
   }],
+}
+
+const currentScoutVerification: TaskGraphVerificationContract = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+    { id: "candidate-floor", check: { kind: "candidate_count_gte", minimum: 2 } },
+    { id: "evidence-floor", check: { kind: "evidence_count_gte", minimum: 3 } },
+    { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 2 } },
+  ],
+}
+const currentAnalystVerification: TaskGraphVerificationContract = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+    { id: "finding-floor", check: { kind: "finding_count_gte", minimum: 1 } },
+    { id: "analyst-evidence-floor", check: { kind: "evidence_count_gte", minimum: 2 } },
+    { id: "finding-evidence", check: { kind: "all_findings_have_evidence", minimumItems: 1 } },
+    { id: "reported-score", check: { kind: "reported_score_gte", minimumScore: 7.5, minimumFindings: 1, aggregation: "all" } },
+    { id: "scout-source", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
+  ],
 }
 
 function snapshot(): StepContextSnapshot {
@@ -205,6 +223,70 @@ describe("TaskGraph turn observation", () => {
       ...state, nodes: [{ ...state.nodes[0]!, verificationCriterionIds: ["foreign"] }],
     })).toThrow("task_graph_current_state_invalid:verification")
     expect(JSON.stringify(node)).not.toContain("Alice Example")
+  })
+
+  it("sends the validated full current check contract as untrusted model data", async () => {
+    const failedReport = (contract: TaskGraphVerificationContract, digest: string) => ({
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" as const, reasonCode: "criterion_not_met" as const,
+      criteria: contract.criteria.map(item => ({ criterionId: item.id, status: "failed" as const, reasonCode: "criterion_not_met" as const })),
+      evidenceDigest: digest.repeat(64), resultDigest: "e".repeat(64),
+    })
+    const current = mergeTaskGraphCurrentObservation(snapshot(), {
+      revision: 4,
+      nodes: [
+        { ...state.nodes[0]!, key: "scout", taskId: "task-scout", verification: currentScoutVerification,
+          verificationCriterionIds: currentScoutVerification.criteria.map(item => item.id),
+          verificationReport: failedReport(currentScoutVerification, "a") },
+        { ...state.nodes[0]!, key: "analyst", taskId: "task-analyst", templateId: "analyst", dependsOn: ["scout"],
+          verification: currentAnalystVerification, verificationCriterionIds: currentAnalystVerification.criteria.map(item => item.id),
+          verificationReport: failedReport(currentAnalystVerification, "b") },
+      ],
+    })
+    const context = await new StepContextBuilder(emptyInputStore()).build({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1",
+      snapshot: selectedJobSnapshot(current), now: new Date(0),
+    })
+    const block = context.blocks.find(item => item.id === "observation:task-graph-current")
+    expect(block?.trust).toBe("external_untrusted")
+    expect(block?.content).toMatchObject({ kind: "task_graph_current", revision: 4, nodes: [
+      { key: "scout", verification: currentScoutVerification, verificationCriterionIds: currentScoutVerification.criteria.map(item => item.id) },
+      { key: "analyst", dependsOn: ["scout"], verification: currentAnalystVerification, verificationCriterionIds: currentAnalystVerification.criteria.map(item => item.id) },
+    ] })
+    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
+    const text = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(text).toContain('"kind":"candidate_count_gte"')
+    expect(text).toContain('"minimum":2')
+    expect(text).toContain('"kind":"all_candidates_have_evidence"')
+    expect(text).toContain('"kind":"finding_count_gte"')
+    expect(text).toContain('"kind":"all_findings_have_evidence"')
+    expect(text).toContain('"kind":"reported_score_gte"')
+    expect(text).toContain('"aggregation":"all"')
+    expect(text).toContain('"kind":"findings_from_scout_dependency"')
+    expect(text).toContain('"dependencyNodeKey":"scout"')
+  })
+
+  it("charges full typed contracts to the existing aggregate verifier byte limit", () => {
+    const criteria = Array.from({ length: 8 }, (_, index) => ({
+      id: `criterion-${index}-${"x".repeat(52)}`,
+      check: { kind: "candidate_count_gte" as const, minimum: 50 },
+    }))
+    const verification: TaskGraphVerificationContract = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria }
+    const ids = criteria.map(item => item.id)
+    const report = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified" as const,
+      reasonCode: "canonical_evidence_ambiguous" as const,
+      criteria: ids.map(criterionId => ({ criterionId, status: "unverified" as const, reasonCode: "canonical_evidence_ambiguous" as const })),
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }
+    const nodes = Array.from({ length: 16 }, (_, index) => ({
+      key: `typed-${index}`, taskId: `task-${index}`, templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"],
+      dependsOn: [], status: "failed" as const, readiness: "terminal" as const, resultSummary: null, failureReason: null,
+      verification: { ...verification, criteria: criteria.map(item => ({ ...item, id: `${item.id.slice(0, 60)}${String(index).padStart(2, "0")}` })) },
+      verificationCriterionIds: ids.map(id => `${id.slice(0, 60)}${String(index).padStart(2, "0")}`),
+      verificationReport: { ...report, criteria: report.criteria.map(item => ({ ...item, criterionId: `${item.criterionId.slice(0, 60)}${String(index).padStart(2, "0")}` })) },
+    })) as TaskGraphCurrentState["nodes"]
+
+    expect(() => mergeTaskGraphCurrentObservation(snapshot(), { revision: 3, nodes }))
+      .toThrow("task_graph_current_verification_too_large")
   })
 
   it("keeps repair receipts separate and bound to a passing repair report", () => {

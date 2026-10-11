@@ -2024,13 +2024,36 @@ describe("createCanonicalTurnRuntime", () => {
       { jobId: cuid(6), score: 8.5 },
       { jobId: numericUuid, score: 9.25 },
     ] as const
+    const currentScoutVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+        { id: "current-candidate-floor", check: { kind: "candidate_count_gte", minimum: 2 } },
+        { id: "current-evidence-floor", check: { kind: "evidence_count_gte", minimum: 3 } },
+        { id: "current-candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 2 } },
+      ],
+    } as const
+    const currentAnalystVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+        { id: "current-finding-floor", check: { kind: "finding_count_gte", minimum: 1 } },
+        { id: "current-analyst-evidence-floor", check: { kind: "evidence_count_gte", minimum: 2 } },
+        { id: "current-finding-evidence", check: { kind: "all_findings_have_evidence", minimumItems: 1 } },
+        { id: "current-reported-score", check: { kind: "reported_score_gte", minimumScore: 7.5, minimumFindings: 1, aggregation: "all" } },
+        { id: "current-scout-source", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-node" } },
+      ],
+    } as const
+    const passedVerificationReport = (verification: typeof currentScoutVerification | typeof currentAnalystVerification, digit: string) => ({
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: verification.criteria.map(item => ({ criterionId: item.id, status: "passed", reasonCode: "criteria_met" })),
+      evidenceDigest: digit.repeat(64), resultDigest: "f".repeat(64),
+    })
     const loadedGraphAt = (revision: number, includeCurrentAddition = false): LoadedGraph => {
       const snapshot = parseTaskGraphSnapshot({
         schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
-        nodes: ["scout-node", "analyst-node"].map((key, index) => ({
-          key, templateId: index === 0 ? "scout" : "analyst", goal: `Read ${key}`,
-          successCriteria: ["Return current typed result evidence"], dependsOn: [], depth: 1, taskId: `${key}-task`,
-        })),
+        nodes: [
+          { key: "scout-node", templateId: "scout", goal: "Read scout-node", successCriteria: ["Return current typed result evidence"],
+            dependsOn: [], depth: 1, taskId: "scout-node-task", verificationDisposition: "typed", verification: currentScoutVerification },
+          { key: "analyst-node", templateId: "analyst", goal: "Read analyst-node", successCriteria: ["Return current typed result evidence"],
+            dependsOn: ["scout-node"], depth: 1, taskId: "analyst-node-task", verificationDisposition: "typed", verification: currentAnalystVerification },
+        ],
       })
       const currentScoutCandidates = includeCurrentAddition
         ? [...scoutCandidates, { jobId: cuid(7), source: "smartrecruiters" as const }]
@@ -2046,7 +2069,8 @@ describe("createCanonicalTurnRuntime", () => {
         {
           id: "scout-node-task", role: "scout", taskType: "job_discovery", status: "completed", failureReason: null,
           expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
-          result: { status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult: {
+          result: { status: "completed", finalText: "PRIVATE_FINAL_TEXT",
+            taskGraphVerificationReport: passedVerificationReport(currentScoutVerification, "a"), structuredResult: {
             schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
             candidates: currentScoutCandidates.map(({ jobId, source }) => ({
               jobId, source, url: `https://private.example/${jobId}`, evidenceIds: [`scout-job:${jobId}`],
@@ -2056,7 +2080,8 @@ describe("createCanonicalTurnRuntime", () => {
         {
           id: "analyst-node-task", role: "analyst", taskType: "job_analysis", status: "completed", failureReason: null,
           expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
-          result: { status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult: {
+          result: { status: "completed", finalText: "PRIVATE_FINAL_TEXT",
+            taskGraphVerificationReport: passedVerificationReport(currentAnalystVerification, "b"), structuredResult: {
             schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "partial",
             findings: analystFindings.map(({ jobId, score }, index) => ({
               jobId, score, evidenceIds: [`analyst-job:${jobId}`, ...(index < 2 ? [`analyst-persona:${jobId}`] : [])],
@@ -2350,11 +2375,11 @@ describe("createCanonicalTurnRuntime", () => {
       expectedFactsByRevision[0]!.counts, expectedFactsByRevision[0]!.counts, expectedFactsByRevision[0]!.counts,
       expectedFactsByRevision[0]!.counts, expectedFactsByRevision[1]!.counts, expectedFactsByRevision[1]!.counts,
     ])
-    const legacyGraphCapacity = {
-      nodeCount: 2, maxNodes: 8, remaining: 6, ordinaryRemaining: 6, reserveActive: false, repairRecorded: false,
+    const currentTypedGraphCapacity = {
+      nodeCount: 2, maxNodes: 8, remaining: 6, ordinaryRemaining: 5, reserveActive: true, repairRecorded: false,
     }
     expect(currentBlocks.map(block => (block?.content as { nodeCapacity?: unknown }).nodeCapacity))
-      .toEqual(Array(6).fill(legacyGraphCapacity))
+      .toEqual(Array(6).fill(currentTypedGraphCapacity))
     const capturedGraphObservations = requests.map(request => {
       const text = request.messages.flatMap(message => message.content)
         .find(part => part.type === "text" && part.text.includes('"kind":"task_graph_current"'))
@@ -2363,13 +2388,18 @@ describe("createCanonicalTurnRuntime", () => {
       return observation
     })
     expect(capturedGraphObservations.map(observation => observation.nodeCapacity))
-      .toEqual(Array(6).fill(legacyGraphCapacity))
+      .toEqual(Array(6).fill(currentTypedGraphCapacity))
     expect(capturedGraphObservations.every(observation => !Object.hasOwn(observation, "rootTaskId"))).toBe(true)
     expect(expectedFactsByRevision.map(facts => facts.counts.discoveredJobs.knownCount)).toEqual([4, 5])
     expect(currentBlocks.map(block => (block?.content as { revision?: number }).revision)).toEqual([7, 7, 7, 7, 8, 8])
-    const currentGraphNodes = currentBlocks.map(block => (block?.content as { nodes?: Array<{ status?: string; verificationCriterionIds?: unknown }> }).nodes ?? [])
+    const currentGraphNodes = currentBlocks.map(block => (block?.content as { nodes?: Array<{ status?: string; verificationCriterionIds?: unknown; verification?: unknown }> }).nodes ?? [])
     expect(currentGraphNodes.map(nodes => nodes.map(node => node.status))).toEqual(Array.from({ length: 6 }, () => ["completed", "completed"]))
-    expect(currentGraphNodes.flat().every(node => node.verificationCriterionIds === undefined)).toBe(true)
+    expect(currentGraphNodes.map(nodes => nodes.map(node => node.verificationCriterionIds))).toEqual(Array.from({ length: 6 }, () => [
+      currentScoutVerification.criteria.map(item => item.id), currentAnalystVerification.criteria.map(item => item.id),
+    ]))
+    expect(currentGraphNodes.map(nodes => nodes.map(node => node.verification))).toEqual(Array.from({ length: 6 }, () => [
+      currentScoutVerification, currentAnalystVerification,
+    ]))
     const historyBlocks = contexts.map(context => context.blocks.find(block => block.content !== null && typeof block.content === "object"
       && !Array.isArray(block.content) && block.content.kind === "root_task_history"))
     expect(historyBlocks).toHaveLength(6)
@@ -2377,9 +2407,11 @@ describe("createCanonicalTurnRuntime", () => {
       expect(block).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent",
         content: { kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
           turns: [{ label: "earlier terminal attempt", nodes: [{ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"],
-            lesson: { criterionFailures: [{ check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] } }] }] } })
+            lesson: { ordinalScope: "source_graph_local", nodeOrdinal: 1,
+              criterionFailures: [{ criterionOrdinal: 1, check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] } }] }] } })
       expect(JSON.stringify(block?.content)).not.toMatch(/PRIVATE_HISTORY|private-history|evidenceDigest|resultDigest|verificationReport|PASS/)
       expect(JSON.stringify(block?.content)).not.toContain("candidate-count")
+      expect(JSON.stringify(block?.content)).not.toContain("current-candidate-floor")
     }
     for (const context of contexts) {
       const rootBlock = context.blocks.find(block => block.layer === "pending_input" && block.content !== null
@@ -2408,6 +2440,18 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).toContain("criterion_not_met")
       expect(text).toContain('"kind":"candidate_count_gte"')
       expect(text).toContain('"minimum":1')
+      expect(text).toContain('"id":"current-candidate-floor"')
+      expect(text).toContain('"minimum":2')
+      expect(text).toContain('"kind":"evidence_count_gte"')
+      expect(text).toContain('"kind":"all_candidates_have_evidence"')
+      expect(text).toContain('"kind":"finding_count_gte"')
+      expect(text).toContain('"kind":"all_findings_have_evidence"')
+      expect(text).toContain('"kind":"reported_score_gte"')
+      expect(text).toContain('"aggregation":"all"')
+      expect(text).toContain('"kind":"findings_from_scout_dependency"')
+      expect(text).toContain('"dependencyNodeKey":"scout-node"')
+      expect(text).toContain('"ordinalScope":"source_graph_local"')
+      expect(text).toContain('"criterionOrdinal":1')
       expect(text).not.toMatch(/PRIVATE_HISTORY|private-history|private\.example|PRIVATE_RESULT_PROSE|PRIVATE_FINAL_TEXT|TASK_GRAPH_FINAL_SUMMARY_BINDING/)
       expect(text).toContain(index < 4 ? '"knownCount":4' : '"knownCount":5')
     }
