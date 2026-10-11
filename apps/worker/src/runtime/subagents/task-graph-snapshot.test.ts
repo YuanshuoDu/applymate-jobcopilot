@@ -124,6 +124,31 @@ describe("parseTaskGraphSnapshot", () => {
     expect(rewritten.nodes[0]).not.toHaveProperty("verification")
   })
 
+  it("keeps a previously persisted full typed graph readable after first-repair capacity closes", () => {
+    const fullTyped = snapshotWithNodes(Array.from({ length: 8 }, (_, index) => ({
+      ...storedNode(`historical-${index + 1}`, index === 0 ? [] : [`historical-${index}`]),
+      templateId: "analyst",
+      verification: analystVerification,
+      verificationDisposition: "typed",
+    })))
+    const parsed = parseTaskGraphSnapshot(fullTyped)
+    const persistedAgain = parseTaskGraphSnapshot(canonicalTaskGraphJson(parsed))
+    const current = taskGraphState(parsed, 8, new Map(parsed.nodes.map(node => [node.taskId, {
+      status: "completed" as const,
+      failureReason: null,
+    }])), [])
+
+    expect(parsed.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes)
+    expect(parsed.nodes.every(node => node.verificationDisposition === "typed")).toBe(true)
+    expect(persistedAgain).toEqual(parsed)
+    expect(current.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes)
+    expect(current.nodes.map(node => node.key)).toEqual(Array.from({ length: 8 }, (_, index) => `historical-${index + 1}`))
+    expect(current.nodes.map(node => node.dependsOn)).toEqual([
+      [], ...Array.from({ length: 7 }, (_, index) => [`historical-${index + 1}`]),
+    ])
+    expect(current.nodes.every(node => node.status === "completed" && node.verificationDisposition === "typed")).toBe(true)
+  })
+
   it("strictly round-trips a registered Scout envelope while keeping undeclared legacy snapshots compatible", () => {
     const typedScout = {
       ...storedNode("registered-scout"), verification: scoutVerification, verificationDisposition: "typed",

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { createInitialTaskGraphState, type TaskGraphNode } from "../planning/task-graph.js"
+import { createInitialTaskGraphState, type TaskGraphNode, type TaskGraphState } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphNativeSourceProvenance } from "./task-graph-native-command.js"
 import {
@@ -31,6 +31,30 @@ function sourceNode(status: TaskGraphNode["status"] = "failed"): TaskGraphNode {
     dependsOn: [], depth: 1, taskId: source.taskId, status, verificationDisposition: "legacy_unverified",
     nativeDelegation: metadata({ operationKind: "spawn", source: undefined }),
   }
+}
+function spawnMetadata(): TaskGraphNativeDelegationMetadata {
+  return {
+    schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "spawn-operation",
+    requestFingerprint: "d".repeat(64), callerTaskId: "root-task", role: "auditor", taskType: "audit",
+    contextDigest: "e".repeat(64), contextBytes: 16,
+  }
+}
+function capacityNode(index: number, repairOf?: TaskGraphNode["repairOf"]): TaskGraphNode {
+  return {
+    key: `typed-${index}`, templateId: "analyst", goal: "Analyze current evidence", successCriteria: [], dependsOn: [],
+    depth: 1, taskId: `typed-task-${index}`, status: "failed", verificationDisposition: "typed",
+    verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: `criterion-${index}`, check: { kind: "finding_count_gte", minimum: 1 } },
+    ] },
+    ...(repairOf ? { repairOf } : {}),
+  }
+}
+function capacityState(nodes: readonly TaskGraphNode[]): TaskGraphState {
+  return { revision: nodes.length, nodes, appliedEvents: [] }
+}
+function appendSpawn(state: TaskGraphState) {
+  return appendTaskGraphNativeNode({ state, maxDepth: 8, key: `native-${state.nodes.length}`, goal: "Continue bounded work",
+    successCriteria: [], dependsOn: [], metadata: spawnMetadata() })
 }
 
 describe("native TaskGraph state", () => {
@@ -84,6 +108,27 @@ describe("native TaskGraph state", () => {
       metadata: metadata({ role: "analyst", taskType: "analysis", source: completed }),
     })
     expect(result.node.dependsOn).toEqual([])
+  })
+
+  it("reserves one append position on typed graphs but preserves legacy and recorded-repair capacity", () => {
+    const typedSix = capacityState(Array.from({ length: 6 }, (_, index) => capacityNode(index)))
+    expect(appendSpawn(typedSix).state.nodes).toHaveLength(7)
+    const typedSeven = capacityState(Array.from({ length: 7 }, (_, index) => capacityNode(index)))
+    expect(() => appendSpawn(typedSeven)).toThrow(expect.objectContaining({ code: "native_graph_node_invalid" }))
+
+    const legacySeven = capacityState(Array.from({ length: 7 }, (_, index): TaskGraphNode => ({
+      key: `legacy-${index}`, templateId: "writer", goal: "Write bounded output", successCriteria: [], dependsOn: [],
+      depth: 1, status: "completed", verificationDisposition: "legacy_unverified",
+    })))
+    expect(appendSpawn(legacySeven).state.nodes).toHaveLength(8)
+
+    const repair = capacityNode(6, {
+      graphRootTaskId: "root-task", nodeKey: "typed-0", taskId: "typed-task-0", criterionIds: ["criterion-0"],
+    })
+    const typedWithRepair = capacityState([...Array.from({ length: 6 }, (_, index) => capacityNode(index)), repair])
+    expect(appendSpawn(typedWithRepair).state.nodes).toHaveLength(8)
+    expect(() => appendSpawn(capacityState(Array.from({ length: 8 }, (_, index) => capacityNode(index)))))
+      .toThrow(expect.objectContaining({ code: "native_graph_node_invalid" }))
   })
 
   it("round-trips frozen follow-up provenance in both first receipt and duplicate replay", () => {

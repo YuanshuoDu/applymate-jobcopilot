@@ -42,6 +42,7 @@ import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { ROLE_RESULT_SCHEMA, RoleResultValidationError, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import { parseTaskGraphVerificationReport, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
@@ -5932,8 +5933,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, discoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
-    // Repair flow uses four coordination calls and five exact job reads.
-    await seed(pool, verificationRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
+    // The typed-capacity path uses 6 root + 16 child model steps and 4 coordination + 15 exact job calls.
+    await seed(pool, verificationRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxSteps: 24, maxToolCalls: 20 })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
@@ -10605,11 +10606,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const dependent = nodes.find(node => node?.key === "analyst")
             if (!initialPlanSent) {
               initialPlanSent = true
+              const supplementalAnalysts = hardExecutorFailure ? [] : Array.from({ length: 5 }, (_, index) => ({
+                key: `analyst-capacity-${index + 1}`,
+                templateId: "analyst",
+                goal: `Score supplemental typed task ${index + 1} after Scout proof`,
+                successCriteria: ["Return an evidence-bound finding"],
+                dependsOn: ["scout"],
+                verification: ANALYST_VERIFICATION,
+              }))
               yield { type: "tool_call_completed", callId: initialPlanCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
                 nodes: [
                   { key: "scout", templateId: "scout", goal: "Find at least two owner jobs", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification },
                   { key: "analyst", templateId: "analyst", goal: "Score only after Scout proof", successCriteria: ["Return an evidence-bound finding"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION },
+                  ...supplementalAnalysts,
                 ],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -10617,7 +10627,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (initialPlanSent && !initialWaitSent) {
               initialWaitSent = true
-              initialPlanTaskIds = planTaskIds(request, initialPlanCallId, 2)
+              initialPlanTaskIds = planTaskIds(request, initialPlanCallId, hardExecutorFailure ? 2 : 7)
               yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: `p3-verifier-repair-initial-wait:${value.turnId}`, taskIds: [initialPlanTaskIds[0]!], mode: "all", timeoutMs: 30_000,
               } }
@@ -10628,7 +10638,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               repairWaitSent = true
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               if (!initialPlanTaskIds?.[1]) throw new Error("repair fixture lost the original dependent task ID")
-              const taskIds = [...repairTaskIds, initialPlanTaskIds[1]]
+              if (!hardExecutorFailure) {
+                const repairedGraph = currentGraphFromRequest(request)
+                expect(repairedGraph?.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes)
+                expect(repairedGraph?.nodeCapacity).toEqual({
+                  nodeCount: 8, maxNodes: TASK_GRAPH_LIMITS.maxNodes, remaining: 0,
+                  ordinaryRemaining: 0, reserveActive: false, repairRecorded: true,
+                })
+                expect((Array.isArray(repairedGraph?.nodes) ? repairedGraph.nodes.map(record) : [])
+                  .map(node => node?.key)).toContain("scout-repair")
+              }
+              const taskIds = [...repairTaskIds, ...initialPlanTaskIds.slice(1)]
               yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: `p3-verifier-repair-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
               } }
@@ -10636,6 +10656,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (scout?.status === "failed" && !repair) {
+              if (!hardExecutorFailure) {
+                expect(nodes).toHaveLength(7)
+                expect(graph?.nodeCapacity).toEqual({
+                  nodeCount: 7, maxNodes: TASK_GRAPH_LIMITS.maxNodes, remaining: 1,
+                  ordinaryRemaining: 0, reserveActive: true, repairRecorded: false,
+                })
+                const serverTurn = await pool!.query<{ rootTaskId: string | null }>(
+                  `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+                  [value.turnId, value.sessionId, value.userId],
+                )
+                const hiddenRootTaskId = serverTurn.rows[0]?.rootTaskId
+                if (!hiddenRootTaskId) throw new Error("repair fixture could not read the server-owned root identity")
+                expect(JSON.stringify(graph)).not.toContain(hiddenRootTaskId)
+              }
               const dependentBeforeRepair = await pool!.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Score only after Scout proof"])
               expect(dependentBeforeRepair.rows).toHaveLength(1)
               expect(dependentBeforeRepair.rows[0]?.status).toBe("waiting")
@@ -10682,10 +10716,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   expect(String(record(failedReportBeforeRepair)?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
                 }
                 repairPlanSent = true
+                const repairOf = { nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] }
+                expect(repairOf).not.toHaveProperty("graphRootTaskId")
                 yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
                   expectedRevision: graph.revision,
                   nodes: [{ key: "scout-repair", templateId: "scout", goal: "Recheck after new owner evidence is available", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification,
-                    repairOf: { nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
+                    repairOf }],
                 } }
                 yield { type: "completed", finishReason: "tool_calls" }
                 return
@@ -10920,6 +10956,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const original = tasks.rows.find(task => task.goal === "Find at least two owner jobs")
     const repaired = tasks.rows.find(task => task.goal === "Recheck after new owner evidence is available")
     const analyst = tasks.rows.find(task => task.goal === "Score only after Scout proof")
+    const supplementalAnalysts = tasks.rows.filter(task => task.goal.startsWith("Score supplemental typed task "))
     expect(original).toMatchObject({
       status: "failed",
       failureReason: hardExecutorFailure ? "task_graph_verification_unverified" : "task_graph_verification_failed",
@@ -10938,6 +10975,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(String(repairReceipt?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
     expect(analyst).toMatchObject({ status: "completed", failureReason: null })
     expectPassedVerificationReport(record(analyst?.result)?.taskGraphVerificationReport, "finding-count")
+    expect(supplementalAnalysts).toHaveLength(hardExecutorFailure ? 0 : 5)
+    for (const supplemental of supplementalAnalysts) {
+      expect(supplemental).toMatchObject({ status: "completed", failureReason: null })
+      expectPassedVerificationReport(record(supplemental.result)?.taskGraphVerificationReport, "finding-count")
+    }
     if (!terminalGateLease || !rootTaskId) throw new Error("repair fixture lost its terminal-gate identity")
     const persistedGraph = await pool!.query<{ revision: number }>(`SELECT "revision" FROM "agent_items"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
