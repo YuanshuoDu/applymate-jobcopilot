@@ -32,6 +32,9 @@ const archivedEvents: Array<Record<string, unknown>> = [
     taskId: scope.rootTaskId, itemId: null, correlationId: "step-1", idempotencyKey: "turn:turn-1:event:step-completed:step-1", sequence: "5",
     payload: { stepId: "step-1", status: "waiting_for_dependency", toolCallCount: 3, taskId: scope.rootTaskId } },
 ]
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
 
 function twoCallArchivedState() {
   const createdAt = new Date("2026-10-11T12:00:00.000Z")
@@ -54,6 +57,41 @@ function twoCallArchivedState() {
   return { items: [waitCall, waitResult, priorCall, priorResult], events }
 }
 
+function nativeGateEvents(modelToolCallCount: number | null = 0): Array<Record<string, unknown>> {
+  const modelEvents = archivedEvents.filter(event => event.type === "model.started" || event.type === "model.completed" || event.type === "model.usage")
+    .map(event => {
+      if (event.type !== "model.completed") return event
+      const persistedPayload = record(event.payload)
+      if (!persistedPayload) throw new Error("invalid test model receipt")
+      const payload = { ...persistedPayload }
+      if (modelToolCallCount === null) delete payload.toolCallCount
+      else payload.toolCallCount = modelToolCallCount
+      return { ...event, payload }
+    })
+  const completion = archivedEvents.find(event => event.type === "step.completed")!
+  return [...modelEvents, { ...completion, sequence: "4", payload: { stepId: "step-1", status: "waiting_for_dependency", taskId: scope.rootTaskId } }]
+}
+
+function combinedNativeAndArchivedEvents(): Array<Record<string, unknown>> {
+  const nativeIds: Record<string, string> = { start: "native-start", done: "native-done", usage: "native-usage", "step-completed": "native-step-completed" }
+  const native = nativeGateEvents(0).map((event, index) => {
+    const eventId = String(event.id)
+    const id = nativeIds[eventId]!
+    const type = String(event.type)
+    const payload = record(event.payload) ?? {}
+    return { ...event, id, sequence: String(index + 1), correlationId: "native-step",
+      idempotencyKey: type === "model.started" ? `turn:${scope.turnId}:event:model-started:native-step`
+        : type === "model.completed" ? `turn:${scope.turnId}:event:model-completed:native-step`
+          : type === "model.usage" ? `turn:${scope.turnId}:event:model-usage:native-step`
+            : `turn:${scope.turnId}:event:step-completed:native-step`,
+      ...(type === "model.completed" ? { causationId: "native-start" } : {}),
+      ...(type === "model.usage" ? { causationId: "native-done" } : {}),
+      payload: type === "step.completed" ? { ...payload, stepId: "native-step" } : payload }
+  })
+  const archived = archivedEvents.map(event => ({ ...event, sequence: String(Number(event.sequence) + 4) }))
+  return [...native, ...archived]
+}
+
 function build(input: {
   steps?: readonly Record<string, unknown>[]; items?: readonly Record<string, unknown>[]; events?: readonly Record<string, unknown>[]
   persistedToolCallCount?: number; recoveredWaitControl?: RecoveredArchivedWaitControl
@@ -64,6 +102,56 @@ function build(input: {
 }
 
 describe("canonical resume accounting for archived waits", () => {
+  it("leaves exact no-tool native gate waits on persisted usage with current and legacy model receipts", () => {
+    const nativeGateStep = { ...archivedStep }
+    const expectedUsage = { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }
+    const current = build({ steps: [nativeGateStep], items: [], events: nativeGateEvents(0), persistedToolCallCount: 2 })
+    expect(current?.toolCallCount).toBe(2)
+    expect(current?.usage).toEqual(expectedUsage)
+
+    const afterNewerStep = build({ steps: [nativeGateStep,
+      { id: "step-2", ordinal: 5, status: "running", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+    items: [], events: nativeGateEvents(0), persistedToolCallCount: 2 })
+    expect(afterNewerStep?.toolCallCount).toBe(2)
+    expect(afterNewerStep?.usage).toEqual(expectedUsage)
+
+    const legacy = build({ steps: [nativeGateStep], items: [], events: nativeGateEvents(null), persistedToolCallCount: 2 })
+    expect(legacy?.toolCallCount).toBe(2)
+    expect(legacy?.usage).toEqual(expectedUsage)
+  })
+
+  it("combines a native gate wait with a separate archived tool-wait suffix", () => {
+    const resumed = build({ steps: [{ ...archivedStep, id: "native-step", ordinal: 3 }, { ...archivedStep }],
+      items: [call, result], events: combinedNativeAndArchivedEvents(), persistedToolCallCount: 1 })
+    expect(resumed?.toolCallCount).toBe(3)
+    expect(resumed?.usage).toEqual({ inputTokens: 34, outputTokens: 10, estimatedCostUsd: 0.006 })
+  })
+
+  it.each([
+    ["a nonzero modern model batch", () => ({ items: [], events: nativeGateEvents(1) })],
+    ["an unexpected tool call", () => ({ items: [call], events: nativeGateEvents(0) })],
+    ["an unexpected tool result", () => ({ items: [result], events: nativeGateEvents(0) })],
+    ["an orphan archived tool result", () => ({ items: [call, result,
+      { ...result, id: "orphan-result", content: { toolCallId: "orphan-call", output: { ok: true } } }], events: archivedEvents })],
+    ["a duplicate native step completion", () => {
+      const events = nativeGateEvents(0)
+      const completion = events.find(event => event.type === "step.completed")!
+      return { items: [], events: [...events, { ...completion, id: "duplicate-step-completed", sequence: "5" }] }
+    }],
+    ["an extra completion field", () => ({ items: [], events: nativeGateEvents(0).map(event => {
+      const payload = record(event.payload)
+      return event.type === "step.completed" && payload ? { ...event, payload: { ...payload, toolCallCount: 0 } } : event
+    }) })],
+    ["a foreign completion root", () => ({ items: [], events: nativeGateEvents(0).map(event => {
+      const payload = record(event.payload)
+      return event.type === "step.completed" && payload ? { ...event, payload: { ...payload, taskId: "foreign-root" } } : event
+    }) })],
+  ])("rejects %s instead of treating it as a no-tool gate wait", (_name, fixture) => {
+    const value = fixture()
+    expect(() => build({ steps: [{ ...archivedStep }], ...value, persistedToolCallCount: 2 }))
+      .toThrow("archived_wait_accounting_invalid")
+  })
+
   it("adds the full-minus-prefix suffix and usage once during the first pre-close recovery", () => {
     const streaming = { ...archivedStep, status: "streaming", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
     const resumed = build({ steps: [streaming], events: archivedEvents.slice(0, 4), recoveredWaitControl: recovered })

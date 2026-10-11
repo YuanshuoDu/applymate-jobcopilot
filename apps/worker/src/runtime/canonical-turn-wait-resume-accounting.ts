@@ -32,12 +32,15 @@ function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly
   if (completions.length === 0) return undefined
   if (completions.length !== 1 || !eventScope(completions[0]!, "step.completed", stepId, scope, key)) invalid()
   const completed = completions[0]!, completedPayload = object(completed.payload), completedSequence = sequence(completed.sequence)
-  if (!completedPayload || !exactKeys(completedPayload, ["stepId", "status", "toolCallCount", "taskId"])
+  const nativeGateWait = !!completedPayload && exactKeys(completedPayload, ["stepId", "status", "taskId"])
+  if (!completedPayload || (!nativeGateWait && !exactKeys(completedPayload, ["stepId", "status", "toolCallCount", "taskId"]))
     || completedPayload.stepId !== stepId || completedPayload.status !== "waiting_for_dependency"
-    || completedPayload.taskId !== scope.rootTaskId || !Number.isSafeInteger(completedPayload.toolCallCount)
-    || Number(completedPayload.toolCallCount) < 0 || completedSequence === null) invalid()
-  const fullCount = Number(completedPayload.toolCallCount)
+    || completedPayload.taskId !== scope.rootTaskId || (!nativeGateWait && (!Number.isSafeInteger(completedPayload.toolCallCount)
+      || Number(completedPayload.toolCallCount) < 0)) || completedSequence === null) invalid()
+  const fullCount = nativeGateWait ? 0 : Number(completedPayload.toolCallCount)
   const calls = items.filter(item => item.stepId === stepId && item.type === "tool_call")
+  const results = items.filter(item => item.stepId === stepId && item.type === "tool_result")
+  if (nativeGateWait && (calls.length !== 0 || results.length !== 0)) invalid()
   if (fullCount < calls.length || calls.some(item => (item.taskId != null && item.taskId !== scope.rootTaskId) || item.status !== "completed")) invalid()
 
   const startedRows = events.filter(event => event.type === "model.started" && event.correlationId === stepId)
@@ -69,10 +72,12 @@ function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly
   }
 
   const orderedReceipts: Array<{ readonly toolName: string; readonly sequence: bigint }> = []
+  const ownedCallIds = new Set<string>()
   for (const item of calls) {
     const call = object(item.content), callId = call?.toolCallId, toolName = call?.toolName, status = call?.status
     if (typeof item.id !== "string" || !item.id || typeof callId !== "string" || !callId || typeof toolName !== "string" || !toolName
-      || (status !== "completed" && status !== "failed" && status !== "cancelled")) invalid()
+      || ownedCallIds.has(callId) || (status !== "completed" && status !== "failed" && status !== "cancelled")) invalid()
+    ownedCallIds.add(callId)
     const resultRows = items.filter(result => result.stepId === stepId && result.type === "tool_result"
       && (result.taskId == null || result.taskId === scope.rootTaskId)
       && object(result.content)?.toolCallId === callId)
@@ -87,7 +92,16 @@ function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly
       || receiptPayload.taskId !== scope.rootTaskId || receiptSequence === null) invalid()
     orderedReceipts.push({ toolName, sequence: receiptSequence })
   }
+  if (results.length !== calls.length || results.some(result => {
+    const resultCallId = object(result.content)?.toolCallId
+    return result.status !== "completed" || (result.taskId != null && result.taskId !== scope.rootTaskId)
+      || typeof resultCallId !== "string" || !ownedCallIds.has(resultCallId)
+  })) invalid()
   orderedReceipts.sort((left, right) => left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0)
+  // Native verification can suspend the Step without emitting a tool batch. Its
+  // exact three-key completion is already represented by persisted Step usage;
+  // it must not be interpreted as an archived-tool suffix.
+  if (nativeGateWait) return undefined
   if (orderedReceipts.length === 0) invalid()
   let previousReceiptSequence = usageSequence
   for (const receipt of orderedReceipts) {
