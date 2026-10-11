@@ -8,11 +8,22 @@ import type { StoredAgentInput } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { progressCheckpointFromStepContext } from "./progress.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCurrentState } from "./subagents/task-graph-command-port.js"
+import {
+  TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
+  type TaskGraphCurrentState,
+} from "./subagents/task-graph-command-port.js"
+import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
+import { resolveTaskGraphRepairDependencies } from "./subagents/task-graph-dependency-context.js"
+import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState } from "./subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
+import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
+import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
+import { mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
 import type { DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
 import type { TurnLease } from "./turns/lease.js"
@@ -36,6 +47,109 @@ function store(calls: unknown[]): InputClaimStore {
 const lease: TurnLease = {
   userId: "user-a", sessionId: "session-a", turnId: "turn-a", ownerId: "worker-a", leaseVersion: 3,
   leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000),
+}
+
+const HISTORY_ROOT_ID = "PRIVATE_HISTORY_ROOT_ID"
+const HISTORY_DIGEST = "a".repeat(64)
+
+function historyContract(role: "scout" | "analyst", criteria: readonly unknown[]) {
+  return { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role, criteria }
+}
+
+function historyReport(status: "failed" | "passed" | "unverified", criterionIds: readonly string[], salt: string) {
+  const passed = status !== "failed"
+  return {
+    verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+    status,
+    reasonCode: status === "passed" ? "criteria_met" : status === "unverified" ? "repair_target_unresolved" : "criterion_not_met",
+    criteria: criterionIds.map(criterionId => ({ criterionId, status: passed ? "passed" : "failed", reasonCode: passed ? "criteria_met" : "criterion_not_met" })),
+    evidenceDigest: status === "unverified" ? null : HISTORY_DIGEST,
+    resultDigest: salt.repeat(64),
+  }
+}
+
+function historicalRoleResult(role: "scout" | "analyst", count: number, status: "completed" | "partial", marker: string) {
+  const shared = { schemaVersion: ROLE_RESULT_SCHEMA, status, summary: `PRIVATE_${marker}_SUMMARY` }
+  if (role === "scout") {
+    const candidates = Array.from({ length: count }, (_, index) => {
+      const jobId = `PRIVATE_${marker}_JOB_${index + 1}`, evidenceId = `PRIVATE_${marker}_EVIDENCE_${index + 1}`
+      return { jobId, evidenceId, source: "greenhouse", url: `https://private.example/${marker}/${index + 1}` }
+    })
+    return { ...shared, role: "scout" as const, evidence: candidates.map(row => ({ id: row.evidenceId, kind: "job", ref: row.jobId, source: `PRIVATE_${marker}_EVIDENCE_SOURCE` })),
+      candidates: candidates.map(row => ({ jobId: row.jobId, source: row.source, url: row.url, evidenceIds: [row.evidenceId] })) }
+  }
+  const findings = Array.from({ length: count }, (_, index) => {
+    const jobId = `PRIVATE_${marker}_JOB_${index + 1}`, evidenceId = `PRIVATE_${marker}_EVIDENCE_${index + 1}`
+    return { jobId, evidenceId, score: 9.75 }
+  })
+  return { ...shared, role: "analyst" as const, evidence: findings.map(row => ({ id: row.evidenceId, kind: "job", ref: row.jobId, source: `PRIVATE_${marker}_EVIDENCE_SOURCE` })),
+    findings: findings.map(row => ({ jobId: row.jobId, score: row.score, evidenceIds: [row.evidenceId] })) }
+}
+
+function loadedHistoryGraphFixture(): LoadedGraph {
+  const scoutFailures = [
+    { id: "private-scout-count", check: { kind: "candidate_count_gte", minimum: 8 } },
+    { id: "private-scout-evidence", check: { kind: "evidence_count_gte", minimum: 8 } },
+  ]
+  const analystFailures = [
+    { id: "private-analyst-count-a", check: { kind: "finding_count_gte", minimum: 8 } },
+    { id: "private-analyst-count-b", check: { kind: "finding_count_gte", minimum: 9 } },
+  ]
+  const scoutRepairCriteria = [{ id: "private-scout-repair-check", check: { kind: "candidate_count_gte", minimum: 2 } }]
+  const scoutOutputCriteria = [{ id: "private-scout-output-check", check: { kind: "candidate_count_gte", minimum: 1 } }]
+  const analystOutputCriteria = [{ id: "private-analyst-output-check", check: { kind: "finding_count_gte", minimum: 1 } }]
+  const nodes = [
+    { key: "PRIVATE_HISTORY_SCOUT_FAILURE", templateId: "scout", goal: "PRIVATE_HISTORY_SCOUT_GOAL", successCriteria: ["PRIVATE_HISTORY_SCOUT_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_SCOUT_TASK", verificationDisposition: "typed", verification: historyContract("scout", scoutFailures) },
+    { key: "PRIVATE_HISTORY_ANALYST_FAILURE", templateId: "analyst", goal: "PRIVATE_HISTORY_ANALYST_GOAL", successCriteria: ["PRIVATE_HISTORY_ANALYST_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_ANALYST_TASK", verificationDisposition: "typed", verification: historyContract("analyst", analystFailures) },
+    { key: "PRIVATE_HISTORY_ANALYST_REPAIR", templateId: "analyst", goal: "PRIVATE_HISTORY_REPAIR_GOAL", successCriteria: ["PRIVATE_HISTORY_REPAIR_CRITERION"], dependsOn: [], depth: 2, taskId: "PRIVATE_HISTORY_REPAIR_TASK", verificationDisposition: "typed", verification: historyContract("analyst", analystFailures), repairOf: { graphRootTaskId: HISTORY_ROOT_ID, nodeKey: "PRIVATE_HISTORY_ANALYST_FAILURE", taskId: "PRIVATE_HISTORY_ANALYST_TASK", criterionIds: analystFailures.map(item => item.id) } },
+    { key: "PRIVATE_HISTORY_SCOUT_PARTIAL", templateId: "scout", goal: "PRIVATE_HISTORY_SCOUT_OUTPUT_GOAL", successCriteria: ["PRIVATE_HISTORY_SCOUT_OUTPUT_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_SCOUT_OUTPUT_TASK", verificationDisposition: "typed", verification: historyContract("scout", scoutOutputCriteria) },
+    { key: "PRIVATE_HISTORY_ANALYST_PARTIAL", templateId: "analyst", goal: "PRIVATE_HISTORY_ANALYST_OUTPUT_GOAL", successCriteria: ["PRIVATE_HISTORY_ANALYST_OUTPUT_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_ANALYST_OUTPUT_TASK", verificationDisposition: "typed", verification: historyContract("analyst", analystOutputCriteria) },
+    { key: "PRIVATE_HISTORY_UNRESOLVED_TARGET", templateId: "scout", goal: "PRIVATE_HISTORY_UNRESOLVED_GOAL", successCriteria: ["PRIVATE_HISTORY_UNRESOLVED_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_UNRESOLVED_TASK", verificationDisposition: "typed", verification: historyContract("scout", scoutRepairCriteria) },
+    { key: "PRIVATE_HISTORY_UNRESOLVED_REPAIR", templateId: "scout", goal: "PRIVATE_HISTORY_UNRESOLVED_REPAIR_GOAL", successCriteria: ["PRIVATE_HISTORY_UNRESOLVED_REPAIR_CRITERION"], dependsOn: [], depth: 2, taskId: "PRIVATE_HISTORY_UNRESOLVED_REPAIR_TASK", verificationDisposition: "typed", verification: historyContract("scout", scoutRepairCriteria), repairOf: { graphRootTaskId: HISTORY_ROOT_ID, nodeKey: "PRIVATE_HISTORY_UNRESOLVED_TARGET", taskId: "PRIVATE_HISTORY_UNRESOLVED_TASK", criterionIds: ["private-scout-repair-check"] } },
+    { key: "PRIVATE_HISTORY_SCOUT_ZERO", templateId: "scout", goal: "PRIVATE_HISTORY_ZERO_GOAL", successCriteria: ["PRIVATE_HISTORY_ZERO_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_ZERO_TASK", verificationDisposition: "legacy_unverified" },
+  ]
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes })
+  const tasks = new Map<string, GraphTaskRow>()
+  const add = (index: number, status: GraphTaskRow["status"], report?: ReturnType<typeof historyReport>, structuredResult?: unknown, receipt?: unknown) => {
+    const node = snapshot.nodes[index]!
+    const failureReason = status === "failed"
+      ? report?.reasonCode === "repair_target_unresolved" ? "task_graph_repair_target_unresolved"
+        : report?.status === "failed" ? "task_graph_verification_failed" : "task_graph_verification_unverified"
+      : null
+    const result: Record<string, unknown> = structuredResult === undefined ? {} : {
+      finalItemId: `PRIVATE_HISTORY_FINAL_ITEM_${index + 1}`, finalText: `PRIVATE_HISTORY_FINAL_TEXT_${index + 1}`,
+      status: "completed", stepCount: 4, structuredResult, toolCallCount: 2,
+    }
+    if (report !== undefined) result.taskGraphVerificationReport = report
+    if (receipt !== undefined) result.taskGraphRepairReceipt = receipt
+    tasks.set(node.taskId, { id: node.taskId, status, role: node.templateId, failureReason, result })
+  }
+  const scoutFailureReport = historyReport("failed", scoutFailures.map(item => item.id), "b")
+  const analystFailureReport = historyReport("failed", analystFailures.map(item => item.id), "c")
+  const analystRepairReport = historyReport("passed", analystFailures.map(item => item.id), "d")
+  const repairNode = snapshot.nodes[2]!
+  const repairReceipt = {
+    schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: HISTORY_ROOT_ID,
+    targetNodeKey: snapshot.nodes[1]!.key, targetTaskId: snapshot.nodes[1]!.taskId,
+    criterionIds: analystFailures.map(item => item.id), repairNodeKey: repairNode.key, repairTaskId: repairNode.taskId,
+    verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: analystRepairReport.evidenceDigest,
+  }
+  add(0, "failed", scoutFailureReport)
+  add(1, "failed", analystFailureReport)
+  add(2, "completed", analystRepairReport, undefined, repairReceipt)
+  add(3, "completed", historyReport("passed", scoutOutputCriteria.map(item => item.id), "e"), historicalRoleResult("scout", 5, "partial", "SCOUT"))
+  add(4, "completed", historyReport("passed", analystOutputCriteria.map(item => item.id), "f"), historicalRoleResult("analyst", 6, "partial", "ANALYST"))
+  add(5, "failed", historyReport("failed", scoutRepairCriteria.map(item => item.id), "1"))
+  add(6, "failed", historyReport("unverified", scoutRepairCriteria.map(item => item.id), "2"))
+  add(7, "completed", undefined, historicalRoleResult("scout", 0, "completed", "ZERO"))
+  const statuses = new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }] as const))
+  const baseState = taskGraphState(snapshot, 7, statuses, [])
+  const coverage = resolveTaskGraphRepairDependencies(snapshot, tasks, HISTORY_ROOT_ID)
+  return {
+    rootTaskId: HISTORY_ROOT_ID, snapshot, tasks,
+    state: { ...baseState, repairSatisfiedNodeKeys: coverage.satisfied, repairPendingNodeKeys: coverage.pending },
+    item: { id: "PRIVATE_HISTORY_GRAPH_ITEM", revision: 7, content: snapshot, createdAt: now },
+  }
 }
 
 describe("canonical Turn context builder", () => {
@@ -129,6 +243,179 @@ describe("canonical Turn context builder", () => {
     expect(requestText).toContain('"status":"failed"')
     for (const privateValue of ["private-earlier-turn", "private-earlier-root", "private-node", "private-child-task", "PRIVATE_OLD_GOAL", "PRIVATE_CRITERION", "PRIVATE_RESULT", "PRIVATE_FAILURE", "CALLER_HISTORY_SENTINEL", "spoofed_history"]) {
       expect(serializedHistory).not.toContain(privateValue)
+      expect(requestText).not.toContain(privateValue)
+    }
+    const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
+    expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
+    expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
+  })
+
+  it("composes loaded Root-history lessons and result counts into the actual request without changing current Turn evidence", async () => {
+    const loaded = loadedHistoryGraphFixture()
+    const source = projectLoadedRootTaskHistoryGraph(loaded)
+    if (!source) throw new Error("typed source history fixture did not produce a loaded graph projection")
+    expect(source.sourceNodeOrdinals).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    expect(source.nodeLessons?.[0]).toMatchObject({ nodeOrdinal: 1, criterionFailures: [
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+      { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+    ] })
+    expect(source.nodeLessons?.[1]).toMatchObject({ nodeOrdinal: 2, criterionFailures: [
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+      { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+    ] })
+    expect(source.nodeLessons?.[2]?.successfulRepairs).toEqual([{ targetNodeOrdinal: 2, targetCriterionOrdinals: [1, 2], status: "passed" }])
+    expect(source.reportedOutputs?.[3]).toEqual({ role: "scout", candidateCount: 5, resultStatus: "partial" })
+    expect(source.reportedOutputs?.[4]).toEqual({ role: "analyst", findingCount: 6, resultStatus: "partial" })
+    expect(source.reportedOutputs?.[7]).toEqual({ role: "scout", candidateCount: 0, resultStatus: "completed" })
+
+    const outcome: ValidatedRootTaskHistoryOutcome = {
+      sourceTurnId: "PRIVATE_HISTORY_SOURCE_TURN", sourceRootTaskId: HISTORY_ROOT_ID, terminalSequence: 19n,
+      taskGraph: source.taskGraph, sourceNodeOrdinals: source.sourceNodeOrdinals,
+      ...(source.nodeLessons ? { nodeLessons: source.nodeLessons } : {}),
+      ...(source.reportedOutputs ? { reportedOutputs: source.reportedOutputs } : {}),
+    }
+    const historyReader: DirectRootTaskHistoryReader = { load: vi.fn(async () => [outcome]) }
+    const originalText = "FULL_ORIGINAL_ROOT_REFERENCE: Find senior data roles in Amsterdam while preserving the complete initial task."
+    const steerText = "CURRENT_ACCEPTED_STEER_SENTINEL: prioritize roles with platform ownership."
+    const rootInput: StoredAgentInput = {
+      id: "original-root-input", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: scope.userId,
+      clientMessageId: "original-root-message", delivery: "follow_up", status: "consumed",
+      content: [{ type: "text", text: originalText }], acceptedSequence: 4n,
+      consumedByStepId: "step-before-history", consumedAt: now, createdAt: now,
+    }
+    const steerInput: StoredAgentInput = {
+      id: "current-steer-input", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: scope.userId,
+      clientMessageId: "current-steer-message", delivery: "steer", status: "consumed",
+      content: [{ type: "text", text: steerText }], acceptedSequence: 5n,
+      consumedByStepId: "step-history-composition", consumedAt: now, createdAt: now,
+    }
+    let persistedCheckpoint: { inputThroughSequence: bigint; consumedInputIds: readonly string[] } | undefined
+    const claimStore: InputClaimStore = {
+      scope,
+      withTransaction: work => work({
+        getCheckpoint: async () => ({ inputThroughSequence: 4n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [steerInput], newlyClaimedInputIds: [steerInput.id] }),
+        loadUnresolvedSteeringInputs: async () => [],
+        loadRootInputContext: async input => input.inputId === rootInput.id ? rootInput : null,
+        persistCheckpoint: async input => { persistedCheckpoint = input.checkpoint },
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const baseBuilder = new StepContextBuilder(claimStore, ownerFence)
+    const currentCounts = {
+      discoveredJobs: { knownCount: 23, coverage: "partial" as const },
+      analyzedJobs: { knownCount: 11, coverage: "complete" as const },
+      artifactReferences: { knownCount: null, coverage: "not_requested" as const },
+      reviewOutcomes: { knownCount: null, coverage: "unavailable" as const },
+    }
+    const requestSnapshot = mergeTaskGraphCurrentObservation({
+      system: [{ id: "current-policy", content: "System policy remains authoritative." }], profile: [],
+      goal: { id: "current-goal", content: "CURRENT_GOAL_SENTINEL: find suitable platform roles." },
+      steerHistory: [
+        { id: "saved-question", content: { role: "assistant", type: "question", question: "Which city should I prioritize?" } },
+        { id: "saved-answer", content: { role: "user", type: "answer", text: "Amsterdam, with Dublin as a backup." } },
+      ],
+      planningClarifications: [{ observedPlanRevision: 22, graphRevisionAtAsk: 23, pendingSteerCount: 1, unconsumedSteerCount: 0, inputThroughSequence: "4" }],
+      planningClarificationHistoryPair: { questionEntryId: "saved-question", answerEntryId: "saved-answer" },
+      businessRefs: [], toolObservations: [{ id: "root-task-history", content: { kind: "caller_spoof", text: "CALLER_HISTORY_SPOOF" } }],
+    }, {
+      revision: 23,
+      nodes: [{
+        key: "current-graph-node", templateId: "scout", goal: "CURRENT_GRAPH_SENTINEL: search current roles", successCriteria: ["current-only criterion"],
+        dependsOn: [], taskId: "current-graph-task", status: "running", readiness: "active", resultSummary: null,
+        resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" }, failureReason: null,
+      }],
+      planningFacts: { graphRevision: 23, counts: currentCounts },
+    } satisfies TaskGraphCurrentState)
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected readers and the base builder must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      store: claimStore, baseBuilder, scope, lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
+      rootInputId: rootInput.id, planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: historyReader,
+    })
+    const context = await builder.build({
+      scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-history-composition", snapshot: requestSnapshot,
+      rootInputId: rootInput.id, rootContextInputId: rootInput.id, mode: "new", now,
+      lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now },
+    })
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context, model, tools: [{ name: "agent.plan", version: "1" }], sessionId: lease.sessionId, turnId: lease.turnId,
+      stepId: "step-history-composition", userId: scope.userId, taskId: "current-root-task", signal: new AbortController().signal,
+    })
+    const requestMessages = request.messages.map(message => ({
+      role: message.role,
+      text: message.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n"),
+    }))
+    const requestText = requestMessages.map(message => message.text).join("\n")
+    const systemText = requestMessages.filter(message => message.role === "system").map(message => message.text).join("\n")
+    const historyBlock = context.blocks.find(block => block.id === "observation:root-task-history")
+    const graphBlock = context.blocks.find(block => block.id === "observation:task-graph-current")
+    const historyJson = JSON.stringify(historyBlock?.content)
+    const historyContent = historyBlock?.content as { turns?: Array<{ nodes?: Array<Record<string, unknown>> }> } | undefined
+    const historyNodes = historyContent?.turns?.flatMap(turn => turn.nodes ?? []) ?? []
+    const scoutFailure = historyNodes.find(node => (node.lesson as { nodeOrdinal?: number } | undefined)?.nodeOrdinal === 1)
+    const analystFailure = historyNodes.find(node => (node.lesson as { nodeOrdinal?: number } | undefined)?.nodeOrdinal === 2)
+    const exactRepair = historyNodes.find(node => (node.lesson as { nodeOrdinal?: number } | undefined)?.nodeOrdinal === 3)
+    const unresolvedRepair = historyNodes.find(node => Array.isArray(node.negativeReasonHints) && node.negativeReasonHints.includes("repair_target_unresolved"))
+    const scoutOutput = historyNodes.find(node => (node.reportedOutput as { candidateCount?: number } | undefined)?.candidateCount === 5)
+    const analystOutput = historyNodes.find(node => (node.reportedOutput as { findingCount?: number } | undefined)?.findingCount === 6)
+    const zeroOutput = historyNodes.find(node => (node.reportedOutput as { candidateCount?: number } | undefined)?.candidateCount === 0)
+    const clarification = context.blocks.find(block => block.id === "planning-clarification:latest-answered-question")
+
+    expect(historyReader.load).toHaveBeenCalledWith({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2, stepId: "step-history-composition", now })
+    expect(persistedCheckpoint).toEqual({ inputThroughSequence: 5n, consumedInputIds: [steerInput.id] })
+    expect(context.inputThroughSequence).toBe(5n)
+    expect(context.consumedInputIds).toEqual([steerInput.id])
+    expect(context.taskGraphRevision).toBe(23)
+    expect(clarification).toMatchObject({ source: "native_question_recovery", trust: "internal_record", content: { graphRevisionAtAsk: 23, observedPlanRevision: 22 } })
+    expect(graphBlock?.content).toMatchObject({ kind: "task_graph_current", revision: 23, taskReportedCounts: currentCounts, nodes: [{ key: "current-graph-node", taskId: "current-graph-task" }] })
+    expect(historyBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
+    expect(historyBlock?.content).toMatchObject({ kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true })
+    expect(scoutFailure).toMatchObject({ taskKind: "scout", status: "failed", lesson: {
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }, { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" }],
+    } })
+    expect(analystFailure).toMatchObject({ taskKind: "analyst", status: "failed", lesson: {
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }, { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" }],
+    } })
+    expect(exactRepair).toMatchObject({ taskKind: "analyst", status: "completed", lesson: {
+      nodeOrdinal: 3, successfulRepairs: [{ targetNodeOrdinal: 2, targetCriterionOrdinals: [1, 2], status: "passed" }],
+    } })
+    expect(unresolvedRepair).toMatchObject({ taskKind: "scout", status: "failed", negativeReasonHints: ["repair_target_unresolved"] })
+    expect(scoutOutput).toMatchObject({ reportedOutput: { role: "scout", candidateCount: 5, resultStatus: "partial" } })
+    expect(analystOutput).toMatchObject({ reportedOutput: { role: "analyst", findingCount: 6, resultStatus: "partial" } })
+    expect(zeroOutput).toMatchObject({ reportedOutput: { role: "scout", candidateCount: 0, resultStatus: "completed" } })
+    expect(historyNodes.find(node => node.taskKind === "scout" && node.status === "failed" && !(node.negativeReasonHints as unknown[] | undefined)?.includes("repair_target_unresolved")))
+      .not.toHaveProperty("reportedOutput")
+    expect(requestMessages.some(message => message.role === "user" && message.text.includes("root_task_history") && message.text.includes("UNTRUSTED_DATA"))).toBe(true)
+    expect(requestText).toContain("FULL_ORIGINAL_ROOT_REFERENCE")
+    expect(requestText).toContain("CURRENT_ACCEPTED_STEER_SENTINEL")
+    expect(requestText).toContain("CURRENT_GOAL_SENTINEL")
+    expect(requestText).toContain("Which city should I prioritize?")
+    expect(requestText).toContain("Amsterdam, with Dublin as a backup.")
+    expect(requestText).toContain('"graphRevisionAtAsk":23')
+    expect(requestText).toContain("CURRENT_GRAPH_SENTINEL")
+    expect(requestText).toContain('"discoveredJobs":{"coverage":"partial","knownCount":23}')
+    expect(requestText).toContain('"candidateCount":5')
+    expect(requestText).toContain('"findingCount":6')
+    expect(requestText).toContain('"candidateCount":0')
+    expect(requestText).not.toContain("CALLER_HISTORY_SPOOF")
+    expect(systemText).not.toContain("root_task_history")
+    const privateValues = [
+      HISTORY_ROOT_ID, "PRIVATE_HISTORY_SOURCE_TURN", "PRIVATE_HISTORY_GRAPH_ITEM", "PRIVATE_HISTORY_SCOUT_FAILURE", "PRIVATE_HISTORY_ANALYST_FAILURE",
+      "PRIVATE_HISTORY_ANALYST_REPAIR", "PRIVATE_HISTORY_SCOUT_TASK", "PRIVATE_HISTORY_ANALYST_TASK", "PRIVATE_HISTORY_REPAIR_TASK",
+      "private-scout-count", "private-scout-evidence", "private-analyst-count-a", "private-analyst-count-b", "private-scout-repair-check",
+      "PRIVATE_HISTORY_SCOUT_GOAL", "PRIVATE_HISTORY_ANALYST_GOAL", "PRIVATE_HISTORY_REPAIR_GOAL", "PRIVATE_SCOUT_JOB_1", "PRIVATE_ANALYST_JOB_1",
+      "PRIVATE_SCOUT_EVIDENCE_1", "PRIVATE_ANALYST_EVIDENCE_1", "https://private.example/", "PRIVATE_SCOUT_SUMMARY", "PRIVATE_ANALYST_SUMMARY",
+      "PRIVATE_HISTORY_FINAL_ITEM", "PRIVATE_HISTORY_FINAL_TEXT", "taskGraphRepairReceipt", "verificationReport", "evidenceDigest", "resultDigest",
+      "sourceTurnId", "sourceRootTaskId", "terminalSequence", "repairNodeKey", "targetTaskId", "graphDigest",
+    ]
+    for (const privateValue of privateValues) {
+      expect(historyJson).not.toContain(privateValue)
       expect(requestText).not.toContain(privateValue)
     }
     const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }

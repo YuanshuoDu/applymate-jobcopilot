@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer"
 import type pg from "pg"
-import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
-import type { TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
+import { loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
+import { projectLoadedRootTaskHistoryGraph, type LoadedRootTaskHistoryGraphProjection } from "./root-task-history-lesson-projection.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { resolveRootTaskObjective, rootTaskObjectiveDigest } from "./root-task-objective.js"
 import {
@@ -209,14 +209,14 @@ function graphEvidenceError(value: unknown): boolean {
     && /^task_graph_[a-z0-9_]+$/.test(value.message)
 }
 
-async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInput, source: Candidate): Promise<TaskGraphCurrentState | undefined> {
+async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInput, source: Candidate): Promise<LoadedRootTaskHistoryGraphProjection | undefined> {
   const scope: GraphIdentityScope = { userId: input.lease.userId, sessionId: input.lease.sessionId,
     turnId: source.turnId, rootTaskId: source.rootTaskId, parentTaskId: source.rootTaskId }
   try {
     const loaded = await loadTaskGraph(client, scope, false)
     if (!loaded.item || !loaded.snapshot || !loaded.state) return undefined
-    const graph = currentTaskGraph(loaded)
-    return graph.nodes.length ? graph : undefined
+    const graph = projectLoadedRootTaskHistoryGraph(loaded)
+    return graph?.taskGraph.nodes.length ? graph : undefined
   } catch (error: unknown) {
     if (graphEvidenceError(error)) return undefined
     throw error
@@ -236,9 +236,10 @@ export function createPgDirectRootTaskHistoryStore(pool: Pool) {
         for (const source of sources) {
           if (graphLoads >= GRAPH_LOAD_LIMIT) break
           graphLoads += 1
-          const taskGraph = await graphForCandidate(client, input, source)
-          if (taskGraph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
-            terminalSequence: source.terminalSequence, taskGraph })
+          const graph = await graphForCandidate(client, input, source)
+          if (graph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
+            terminalSequence: source.terminalSequence, taskGraph: graph.taskGraph, sourceNodeOrdinals: graph.sourceNodeOrdinals,
+            ...(graph.nodeLessons ? { nodeLessons: graph.nodeLessons } : {}), ...(graph.reportedOutputs ? { reportedOutputs: graph.reportedOutputs } : {}) })
         }
         return outcomes
       })
