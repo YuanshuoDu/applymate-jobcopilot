@@ -87,7 +87,7 @@ describe("ContextCompactor", () => {
     }
     const collected = collectCompactionState(stalePrefixSource)
     expect(collected.coveredThroughSequence).toBe(100n)
-    expect(collected.coveredSourceItemIds).toEqual(["compaction-at-100"])
+    expect(collected.sourceItemIds).toEqual(["compaction-at-100"])
     const summarizer = vi.fn(async () => "must not be called")
     const result = await new ContextCompactor(runtime, summarizer, () => "compaction-item").compact(request({ source: stalePrefixSource, requested: true }))
     expect(result.status).toBe("failed")

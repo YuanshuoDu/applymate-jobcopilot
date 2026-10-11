@@ -43,7 +43,7 @@ export class ContextCompactor {
   async compact(request: CompactionRequest): Promise<CompactionResult> {
     const limits = bounds(request.bounds)
     const collection = collectCompactionState(request.source, limits.maxNarrativeInputCharacters)
-    const trigger = evaluateCompactionTrigger({ inputTokens: collection.beforeInputTokens, itemCount: collection.sourceItemIds.length, atTurnBoundary: request.atTurnBoundary, requested: request.requested }, request.policy)
+    const trigger = evaluateCompactionTrigger({ inputTokens: collection.beforeInputTokens, itemCount: collection.sourceItemCount, atTurnBoundary: request.atTurnBoundary, requested: request.requested }, request.policy)
     if (!trigger.shouldCompact || !trigger.reason) return { status: "skipped", trigger, item: null }
 
     const started = createCompactionStartedItem({ sessionId: collection.state.sessionId, turnId: request.turnId, throughSequence: collection.state.throughSequence, source: request.source, reason: trigger.reason, id: request.itemId }, this.idFactory)
@@ -63,11 +63,11 @@ export class ContextCompactor {
         throw new CompactionError("invalid_source", "The covered source prefix does not advance the previous snapshot cursor")
       }
       const preservedState = { ...cloneCompactionState(collection.state), throughSequence: coveredThroughSequence }
-      const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: preservedState.sessionId, throughSequence: preservedState.throughSequence, narrativeText: collection.narrativeText, state: cloneCompactionState(preservedState), itemCount: collection.coveredSourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
+      const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: preservedState.sessionId, throughSequence: preservedState.throughSequence, narrativeText: collection.narrativeText, state: cloneCompactionState(preservedState), itemCount: collection.sourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
       const candidateState = cloneCompactionState(preservedState)
       const report = assertCompactionInvariantsPreserved(preservedState, candidateState)
       const measurement = tokenMeasurement(candidateState, narrativeSummary, collection.coveredInputTokens)
-      const draft = { scope: request.scope, turnId: request.turnId, state: candidateState, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.coveredSourceItemIds, reason: trigger.reason }
+      const draft = { scope: request.scope, turnId: request.turnId, state: candidateState, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.sourceItemIds, reason: trigger.reason }
       const completed = completeCompactionItem(started, { summary: narrativeSummary, measurement, report })
       const coveredCompleted = { ...completed, data: { ...completed.data, throughSequence: coveredThroughSequence.toString() } }
       const snapshot = await this.port.publishAtomically({ scope: request.scope, previousSnapshot, draft, startedItem: started, completedItem: coveredCompleted })

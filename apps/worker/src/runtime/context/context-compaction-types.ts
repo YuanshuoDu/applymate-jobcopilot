@@ -111,8 +111,10 @@ export type CompactionCollection = {
   readonly narrativeItems: readonly CompactionNarrativeItem[]
   readonly narrativeText: string
   readonly coveredThroughSequence: bigint | null
-  readonly coveredSourceItemIds: readonly string[]
+  /** Source Items fully represented in narrativeText and safe for snapshot publication. */
   readonly sourceItemIds: readonly string[]
+  /** Full normalized source count, including any capped-out suffix, for trigger compatibility. */
+  readonly sourceItemCount: number
   readonly beforeInputTokens: number
   readonly coveredInputTokens: number
   readonly stateDigest: string

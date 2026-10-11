@@ -29,23 +29,23 @@ describe("deterministic compaction collector", () => {
     ] as const
     const collected = collectCompactionState(source(items, 2n))
     expect(collected.sourceItemIds).toEqual(["item-1", "item-2"])
-    expect(collected.coveredSourceItemIds).toEqual(["item-1", "item-2"])
+    expect(collected.sourceItemCount).toBe(2)
     expect(collected.coveredThroughSequence).toBe(2n)
     expect(collected.state.throughSequence).toBe(2n)
     expect(collected.narrativeText.indexOf("first" /* content is intentionally data-only */)).toBeGreaterThanOrEqual(0)
     expect(state.userConstraints).toEqual(["remote", "EU"])
   })
 
-  it("keeps all source IDs for thresholds while bounding the covered whole-item prefix", () => {
+  it("returns only covered IDs while preserving full-source threshold accounting", () => {
     const items = Array.from({ length: 120 }, (_, index) => ({
       id: `item-${index.toString().padStart(3, "0")}`, sessionId: "session-a", turnId: "turn-a", sequence: BigInt(index + 1), type: "agent_message", status: "completed", content: "narrative ".repeat(3),
     }))
     const collected = collectCompactionState(source(items, 120n), 500)
-    const coveredCount = collected.coveredSourceItemIds.length
-    expect(collected.sourceItemIds).toHaveLength(120)
+    const coveredCount = collected.sourceItemIds.length
+    expect(collected.sourceItemCount).toBe(120)
     expect(coveredCount).toBeGreaterThan(0)
     expect(coveredCount).toBeLessThan(120)
-    expect(collected.coveredSourceItemIds).toEqual(items.slice(0, coveredCount).map(({ id }) => id))
+    expect(collected.sourceItemIds).toEqual(items.slice(0, coveredCount).map(({ id }) => id))
     expect(collected.coveredThroughSequence).toBe(BigInt(coveredCount))
     expect(collected.coveredThroughSequence).toBeLessThan(120n)
     expect(collected.state.throughSequence).toBe(collected.coveredThroughSequence)
@@ -64,19 +64,22 @@ describe("deterministic compaction collector", () => {
     expect(exact.narrativeText).toBe(rendered)
     expect(exact.coveredThroughSequence).toBe(8n)
     expect(exact.state.throughSequence).toBe(8n)
-    expect(exact.coveredSourceItemIds).toEqual(["item-8"])
+    expect(exact.sourceItemIds).toEqual(["item-8"])
+    expect(exact.sourceItemCount).toBe(1)
 
     const tooSmall = collectCompactionState(itemSource, rendered.length - 1)
     expect(tooSmall.narrativeText).toBe("")
     expect(tooSmall.coveredThroughSequence).toBeNull()
     expect(tooSmall.state).toEqual(collectCompactionState({ state: itemSource.state, items: [] }).state)
     expect(tooSmall.state.throughSequence).toBe(8n)
-    expect(tooSmall.coveredSourceItemIds).toEqual([])
-    expect(tooSmall.sourceItemIds).toEqual(["item-8"])
+    expect(tooSmall.sourceItemIds).toEqual([])
+    expect(tooSmall.sourceItemCount).toBe(1)
   })
 
   it("preserves the existing cursor for an actually empty source", () => {
     const collected = collectCompactionState(source([]))
+    expect(collected.sourceItemIds).toEqual([])
+    expect(collected.sourceItemCount).toBe(0)
     expect(collected.coveredThroughSequence).toBe(state.throughSequence)
     expect(collected.state.throughSequence).toBe(state.throughSequence)
   })
@@ -90,7 +93,7 @@ describe("deterministic compaction collector", () => {
     const sourceWithPeerAnswer = { state: { ...state, throughSequence: 9n, answers: [...state.answers, { id: "peer-b", question: "User input", answer: "peer B" }] }, items: [peerB, before, peerA] }
     const partialGroup = collectCompactionState(sourceWithPeerAnswer, beforeText.length + 1 + peerAText.length)
     expect(partialGroup.narrativeText).toBe(beforeText)
-    expect(partialGroup.coveredSourceItemIds).toEqual(["before"])
+    expect(partialGroup.sourceItemIds).toEqual(["before"])
     expect(partialGroup.coveredThroughSequence).toBe(8n)
     expect(partialGroup.state.throughSequence).toBe(8n)
     expect(partialGroup.state.answers.filter(answer => answer.id === "peer-b")).toEqual([{ id: "peer-b", question: "User input", answer: "peer B" }])
@@ -98,7 +101,7 @@ describe("deterministic compaction collector", () => {
     const completeText = `${beforeText}\n${peerAText}\n[9] user_input {"answer":"peer B"}`
     const completeGroup = collectCompactionState(sourceWithPeerAnswer, completeText.length)
     expect(completeGroup.narrativeText).toBe(completeText)
-    expect(completeGroup.coveredSourceItemIds).toEqual(["before", "peer-a", "peer-b"])
+    expect(completeGroup.sourceItemIds).toEqual(["before", "peer-a", "peer-b"])
     expect(completeGroup.coveredThroughSequence).toBe(9n)
     expect(completeGroup.state.throughSequence).toBe(9n)
     expect(completeGroup.state.answers.filter(answer => answer.id === "peer-b")).toEqual([{ id: "peer-b", question: "User input", answer: "peer B" }])
