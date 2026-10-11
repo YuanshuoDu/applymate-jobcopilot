@@ -1,11 +1,13 @@
 import type pg from "pg"
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 import { persistObservedSteeringMarker, type SteeringMarkerWrite } from "./steering-marker-store.js"
+import { readRootInputContext, type RootInputContextRow } from "./root-input-context-reader.js"
 import type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
 export type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
 export interface InputClaimTransaction {
   getCheckpoint(input: { sessionId: string; turnId: string; stepId: string; lease?: TurnExecutionFence }): Promise<StepCheckpoint>; claimInputs(input: ClaimInputsRequest & { readonly rootInputId?: string }): Promise<ClaimedInputs>
   loadActiveSteeringInputs?(input: { sessionId: string; turnId: string; inputIds: readonly string[]; lease?: TurnExecutionFence }): Promise<readonly StoredAgentInput[]>; persistCheckpoint(input: { sessionId: string; turnId: string; stepId: string; checkpoint: StepCheckpoint; lease?: TurnExecutionFence }): Promise<void>
+  loadRootInputContext?(input: { sessionId: string; turnId: string; inputId: string; lease?: TurnExecutionFence }): Promise<StoredAgentInput | null>
   appendObservedSteeringMarker?(input: SteeringMarkerWrite): Promise<void>
 }
 export interface InputClaimStore {
@@ -13,18 +15,10 @@ export interface InputClaimStore {
 }
 export class InputClaimStoreError extends Error {
   readonly recoverable = false
-  constructor(readonly code: "owner_conflict" | "checkpoint_conflict" | "store_conflict", message: string) {
-    super(message)
-    this.name = "InputClaimStoreError"
-  }
+  constructor(readonly code: "owner_conflict" | "checkpoint_conflict" | "store_conflict", message: string) { super(message); this.name = "InputClaimStoreError" }
 }
 type CheckpointRow = { inputThroughSequence: bigint | string; consumedInputIds: unknown }; type QueryClient = Pick<pg.PoolClient, "query">
-type InputRow = {
-  id: string; sessionId: string; targetTurnId: string | null
-  userId: string; clientMessageId: string; delivery: string; status: string
-  content: unknown; acceptedSequence: bigint | string; consumedByStepId: string | null
-  consumedAt: Date | string | null; createdAt: Date | string
-}
+type InputRow = RootInputContextRow
 function nonEmpty(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw new InputClaimStoreError("store_conflict", `Invalid ${field}`)
   return value
@@ -207,6 +201,7 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       }
       return inputs
     },
+    loadRootInputContext: input => readRootInputContext(client, scope, input, () => assertOwner(client, scope, input, input.lease), mapInput),
     async persistCheckpoint(input) {
       await assertOwner(client, scope, input, input.lease)
       const result = await client.query(
