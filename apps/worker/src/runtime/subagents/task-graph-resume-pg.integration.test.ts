@@ -13387,7 +13387,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       ])
       expect(persistedFinal).toMatchObject({
         schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied",
-        response: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "p3-process-archived-wait-resumed" }),
+        response: "p3-process-archived-wait-resumed",
       })
       expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
       const completedRoot = await pool!.query<{ status: string; result: unknown }>(
