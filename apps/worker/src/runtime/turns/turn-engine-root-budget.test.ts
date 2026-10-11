@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { enforceRootStepAndUsageBudgets, enforceRootStepBudget, enforceRootToolCallBudget, enforceRootUsageBudget } from "./turn-engine-root-budget.js"
+import { enforceRootStepAndUsageBudgets, enforceRootStepBudget, enforceRootToolCallBudget, enforceRootUsageBudget, readCurrentRootBudget } from "./turn-engine-root-budget.js"
 
 const owner = {
   kind: "task" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1",
@@ -9,7 +9,10 @@ const owner = {
 
 function client(results: unknown[]) {
   let index = 0
-  return { query: vi.fn(async (_sql: string, _values?: readonly unknown[]) => results[index++] ?? { rows: [], rowCount: 0 }) }
+  return { query: vi.fn(async (sql: string, _values?: readonly unknown[]) => {
+    if (sql === "SELECT set_config('app.user_id', $1, true)") return { rows: [], rowCount: 1 }
+    return results[index++] ?? { rows: [], rowCount: 0 }
+  }) }
 }
 
 describe("root budget persistence guards", () => {
@@ -190,5 +193,89 @@ describe("root budget persistence guards", () => {
     ])
 
     await expect(enforceRootUsageBudget(db as never, owner)).rejects.toThrow("turn_budget_usage_invalid")
+  })
+})
+
+describe("current shared Root budget observation", () => {
+  it("reads the current step, descendant/null-task usage and limits in one read-only repeatable snapshot", async () => {
+    const db = client([
+      { rows: [], rowCount: 0 },
+      { rows: [{ budgetSnapshot: { limits: { maxSteps: 10, maxToolCalls: 8, maxInputTokens: 100, maxOutputTokens: 200, maxCostUsd: 0.5 } } }] },
+      { rows: [{ used: "4" }] }, { rows: [{ used: "7" }] },
+      { rows: [{ inputTokens: "20", outputTokens: "30", estimatedCostUsd: "0.125" }] },
+      { rows: [], rowCount: 0 },
+    ])
+
+    const budget = await readCurrentRootBudget(db as never, owner)
+
+    expect(budget).toEqual({ kind: "turn_budget_current", status: "available", advisoryOnly: true, pointInTime: true,
+      notPermission: true, notReservation: true, notCompletionEvidence: true, budgets: {
+        steps: { limit: 10, used: 4, remaining: 6 }, toolCalls: { limit: 8, used: 7, remaining: 1 },
+        inputTokens: { limit: 100, used: 20, remaining: 80 }, outputTokens: { limit: 200, used: 30, remaining: 170 },
+        costUsd: { limit: 0.5, used: 0.125, remaining: 0.375 },
+      } })
+    const calls = db.query.mock.calls.map(([sql, values]) => ({ sql: String(sql), values }))
+    expect(calls.map(call => call.sql)).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SELECT set_config('app.user_id', $1, true)",
+      expect.stringContaining('SELECT root_task."budgetSnapshot"'),
+      expect.stringContaining('COUNT(*)::bigint'),
+      expect.stringContaining('COUNT(*)::bigint'),
+      expect.stringContaining('SUM(usage_row."inputTokens")'),
+      "COMMIT",
+    ])
+    expect(calls[1]?.values).toEqual([owner.userId])
+    expect(calls[2]?.sql).toContain('root_task."rootTaskId" = root_task."id"')
+    expect(calls[2]?.sql).toContain('session."userId" = $4')
+    for (const call of calls.slice(3, 6)) {
+      expect(call.sql).toContain('usage_row."sessionId" = $1')
+      expect(call.sql).toContain('usage_row."turnId" = $2')
+      expect(call.sql).toContain('task."rootTaskId" = $3')
+      expect(call.sql).toContain('session."userId" = $4')
+      expect(call.values).toEqual([owner.sessionId, owner.turnId, owner.rootTaskId, owner.userId])
+    }
+    expect(calls[4]?.sql).toContain("usage_row.\"type\" = 'tool_call'")
+    expect(calls[5]?.sql).toContain('SUM(usage_row."inputTokens")')
+  })
+
+  it("shows default steps and explicit unbounded dimensions instead of inventing optional caps", async () => {
+    const db = client([
+      { rows: [] }, { rows: [{ budgetSnapshot: {} }] }, { rows: [{ used: "32" }] },
+      { rows: [{ used: "0" }] }, { rows: [{ inputTokens: "0", outputTokens: "0", estimatedCostUsd: "0" }] }, { rows: [] },
+    ])
+
+    await expect(readCurrentRootBudget(db as never, owner)).resolves.toMatchObject({ status: "available", budgets: {
+      steps: { limit: 32, used: 32, remaining: 0 }, toolCalls: { limit: null, used: 0, remaining: null },
+      inputTokens: { limit: null, used: 0, remaining: null }, outputTokens: { limit: null, used: 0, remaining: null },
+      costUsd: { limit: null, used: 0, remaining: null },
+    } })
+  })
+
+  it.each([
+    { root: { rows: [] }, counts: [] },
+    { root: { rows: [{ budgetSnapshot: { limits: { maxSteps: "3" } } }] }, counts: [] },
+    { root: { rows: [{ budgetSnapshot: { limits: [] } }] }, counts: [] },
+    { root: { rows: [{ budgetSnapshot: {} }] }, counts: [{ rows: [{ used: "bad" }] }] },
+    ...[null, "", " ", true, -1, Number.MAX_SAFE_INTEGER + 1, "9007199254740992"].map(used => ({
+      root: { rows: [{ budgetSnapshot: {} }] }, counts: [{ rows: [{ used }] }],
+    })),
+    { root: { rows: [{ budgetSnapshot: {} }] }, counts: [{ rows: [{ used: "1" }] }, { rows: [{ used: "0" }] }, { rows: [{ inputTokens: "1.5", outputTokens: "0", estimatedCostUsd: "0" }] }] },
+  ])("fails closed as unavailable for missing ownership or malformed budget state", async ({ root, counts }) => {
+    const db = client([{ rows: [] }, root, ...counts, { rows: [] }])
+    await expect(readCurrentRootBudget(db as never, owner)).resolves.toMatchObject({ kind: "turn_budget_current", status: "unavailable" })
+    expect(db.query.mock.calls[0]?.[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    expect(db.query.mock.calls[1]).toEqual(["SELECT set_config('app.user_id', $1, true)", [owner.userId]])
+    expect(String(db.query.mock.calls[2]?.[0])).toContain('SELECT root_task."budgetSnapshot"')
+    expect(db.query.mock.calls.at(-1)?.[0]).toBe("COMMIT")
+  })
+
+  it("rolls back and propagates a failed snapshot read without emitting fabricated usage", async () => {
+    const db = { query: vi.fn(async (sql: string) => {
+      if (sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") return { rows: [] }
+      if (sql.includes('SELECT root_task."budgetSnapshot"')) throw new Error("read_failed")
+      return { rows: [] }
+    }) }
+    await expect(readCurrentRootBudget(db as never, owner)).rejects.toThrow("read_failed")
+    expect(db.query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK")
   })
 })

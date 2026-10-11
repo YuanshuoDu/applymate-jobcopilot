@@ -51,6 +51,10 @@ const lease: TurnLease = {
 
 const HISTORY_ROOT_ID = "PRIVATE_HISTORY_ROOT_ID"
 const HISTORY_DIGEST = "a".repeat(64)
+const unavailableBudget = {
+  kind: "turn_budget_current", status: "unavailable", advisoryOnly: true, pointInTime: true,
+  notPermission: true, notReservation: true, notCompletionEvidence: true,
+} as const
 
 function historyContract(role: "scout" | "analyst", criteria: readonly unknown[]) {
   return { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role, criteria }
@@ -159,6 +163,7 @@ describe("canonical Turn context builder", () => {
       pool: { connect: async () => { throw new Error("context without attachments must not acquire another client") } } as unknown as Pick<pg.Pool, "connect">,
       store: store(calls), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2, rootInputId: "original-input-a",
       planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: { load: async () => [] },
+      currentRootBudgetReader: async () => unavailableBudget,
     })
 
     const context = await builder.build({
@@ -220,6 +225,7 @@ describe("canonical Turn context builder", () => {
       pool: { connect: async () => { throw new Error("the injected reader must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
       store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
       planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: reader,
+      currentRootBudgetReader: async () => unavailableBudget,
     })
 
     const context = await builder.build({
@@ -349,6 +355,7 @@ describe("canonical Turn context builder", () => {
       pool: { connect: async () => { throw new Error("injected readers and the base builder must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
       store: claimStore, baseBuilder, scope, lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
       rootInputId: rootInput.id, planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: historyReader,
+      currentRootBudgetReader: async () => unavailableBudget,
     })
     const context = await builder.build({
       scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-history-composition", snapshot: requestSnapshot,
@@ -463,9 +470,10 @@ describe("canonical Turn context builder", () => {
       store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
       planningEnabled: true, selectedJobMode: true, selectedJobId: "job-a",
       rootTaskHistoryDirectReader: rootReader, selectedJobDirectHistoryReader: selectedJobReader,
+      currentRootBudgetReader: async () => unavailableBudget,
     })
 
-    await builder.build({
+    const context = await builder.build({
       scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-selected-job", snapshot: {
         system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
       },
@@ -473,6 +481,43 @@ describe("canonical Turn context builder", () => {
 
     expect(rootReader.load).not.toHaveBeenCalled()
     expect(selectedJobReader.load).toHaveBeenCalledTimes(1)
+    expect(context.blocks.find(block => block.id === "observation:turn-budget-current")).toMatchObject({
+      layer: "tool_observation", role: "data", trust: "external_untrusted", content: unavailableBudget,
+    })
+  })
+
+  it("rolls back and releases the owned budget snapshot client when tenant setup fails", async () => {
+    const client = {
+      query: vi.fn(async (sql: string, _values?: readonly unknown[]) => {
+        if (sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") return { rows: [] }
+        if (sql === "SELECT set_config('app.user_id', $1, true)") throw new Error("budget_tenant_setup_failed")
+        if (sql.includes('SELECT root_task."budgetSnapshot"')) throw new Error("budget_read_failed")
+        return { rows: [] }
+      }),
+      release: vi.fn(),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => client } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), baseBuilder: new StepContextBuilder(store([]), ownerFence), scope, lease,
+      rootTaskId: "root-a", rootAttemptCount: 2, planningEnabled: true, selectedJobMode: false,
+      rootTaskHistoryDirectReader: { load: async () => [] },
+    })
+
+    await expect(builder.build({
+      scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-budget-failure",
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    })).rejects.toThrow("budget_tenant_setup_failed")
+    expect(client.query.mock.calls.map(([sql]) => sql)).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SELECT set_config('app.user_id', $1, true)",
+      "ROLLBACK",
+    ])
+    expect(client.query.mock.calls[1]?.[1]).toEqual([scope.userId])
+    expect(client.release).toHaveBeenCalledOnce()
   })
 
   it("adds validated same-job history to the actual request as untrusted data beside current Turn context", async () => {
