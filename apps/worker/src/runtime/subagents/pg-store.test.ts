@@ -13,6 +13,7 @@ import { loadTaskGraph } from "./task-graph-pg-state.js"
 import type { GraphTaskRow } from "./task-graph-pg-state.js"
 import { loadScopedTaskGraphDependencyContext } from "./task-graph-pg-dependency-context-loader.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { parseSubagentDispatchJobId, subagentDispatchJobId } from "./dispatch-identity.js"
 
 const { verifyEvidenceMock, resultDigestMock } = vi.hoisted(() => ({ verifyEvidenceMock: vi.fn(), resultDigestMock: vi.fn(() => "d".repeat(64)) }))
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
@@ -702,6 +703,29 @@ describe("PgSubagentTaskStore", () => {
     expect(update).toContain('"nextAttemptAt" <= clock_timestamp()')
     expect(fake.calls.find(([sql]) => sql.includes('FROM "agent_sessions"'))?.[0]).not.toContain("controlGate")
     expect(update).not.toContain("controlGate")
+  })
+
+  it("forwards the optional dispatch identity into the locked outbox claim fence", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId("task-1", 2), "task-1")
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_outbox" AS dispatch')) return { rows: [{
+        id: "dispatch-1", lastError: null, publishedAt: now, attemptCount: 3,
+        payload: { taskId: "task-1", sessionId: "session-1", rootTaskId: "task-1", ownerId: "worker-1" },
+      }], rowCount: 1 }
+      if (sql.includes("COUNT(*)")) return { rows: [{ count: 0 }], rowCount: 1 }
+      if (sql.startsWith("UPDATE")) return { rows: [{ id: "task-1" }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    const result = await store.claim({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", policy, now, dispatchIdentity: identity })
+    expect(result).toMatchObject({ status: "running", leaseOwner: "worker-1", attemptCount: 1 })
+    const dispatch = fake.calls.find(([sql]) => sql.includes('FROM "agent_outbox" AS dispatch'))
+    expect(dispatch?.[1]).toEqual(["session-1", "task-1"])
+    expect(dispatch?.[0]).toContain("FOR UPDATE")
   })
 
   it.each([

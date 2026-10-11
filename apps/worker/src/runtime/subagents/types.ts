@@ -1,4 +1,5 @@
 import type pg from "pg"
+import type { SubagentDispatchIdentity } from "./dispatch-identity.js"
 
 export const SUBAGENT_LEASE_WINDOW_MS = 60_000
 export const SUBAGENT_HEARTBEAT_INTERVAL_MS = 20_000
@@ -125,7 +126,8 @@ export type SubagentStore = {
   create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord>
   createWithSpawn?(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult>
   get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null>
-  claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null>
+  claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }): Promise<SubagentTaskRecord | null>
+  matchesPublishedDispatch?(input: { payload: SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean>
   heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost">
   finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
   release?(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean>
