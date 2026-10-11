@@ -613,6 +613,10 @@ const LEASE_RECOVERY_ADAPTER_BRANCHES = new Set([
 const LEASE_RECOVERY_ADAPTER_STAGES = new Set([
   "not_started", "stream_entered", "branch_entered", "graph_checked", "outcome_checked",
   "database_checked", "tool_call_emitted", "completion_emitted", "final_output_emitted",
+  "final_proof_graph_nodes", "final_proof_node_statuses", "final_proof_dependent_identity",
+  "final_proof_dependent_report", "final_proof_repair_report", "final_proof_repair_receipt",
+  "final_proof_wait_outcome", "final_proof_wait_task_statuses", "final_proof_repair_wait_report",
+  "final_proof_dependent_wait_report",
 ])
 const LEASE_RECOVERY_STARTUP_STAGES = new Set([
   "not_started", "state_loading", "state_loaded", "selected_job_loading", "selected_job_loaded",
@@ -4808,6 +4812,10 @@ type LeaseRecoveryAdapterBranch = "not_started" | "initial_plan" | "initial_wait
 type LeaseRecoveryAdapterStage =
   | "not_started" | "stream_entered" | "branch_entered" | "graph_checked" | "outcome_checked"
   | "database_checked" | "tool_call_emitted" | "completion_emitted" | "final_output_emitted"
+  | "final_proof_graph_nodes" | "final_proof_node_statuses" | "final_proof_dependent_identity"
+  | "final_proof_dependent_report" | "final_proof_repair_report" | "final_proof_repair_receipt"
+  | "final_proof_wait_outcome" | "final_proof_wait_task_statuses" | "final_proof_repair_wait_report"
+  | "final_proof_dependent_wait_report"
 type LeaseRecoveryModelResult = {
   resultStatus: "completed" | "failed" | "missing" | "other"
   isError: boolean | null
@@ -5857,6 +5865,11 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
       adapterStage: "outcome_checked",
     })
+    const finalProofStage = leaseRecoveryFixtureDiagnosticProjection({
+      adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
+      adapterStage: "final_proof_repair_receipt",
+    })
+    expect(finalProofStage?.adapterStage).toBe("final_proof_repair_receipt")
     const invalid = leaseRecoveryFixtureDiagnosticProjection({
       adapterExecutionOrdinal: 8, adapterRoundOrdinal: -1, adapterBranch: secret, adapterStage: secret,
       startupStage: secret, runtimeExecuteFailureClass: secret, private: secret,
@@ -12445,26 +12458,36 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              fixtureInvocationCounters.adapterStage = "final_proof_graph_nodes"
               expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent", "scout-repair"])
               const scout = nodes.find(node => node?.key === "scout")
               const dependent = nodes.find(node => node?.key === "dependent")
               const repair = nodes.find(node => node?.key === "scout-repair")
+              fixtureInvocationCounters.adapterStage = "final_proof_node_statuses"
               expect(nodes.map(node => node?.status)).toEqual(["failed", "completed", "completed"])
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_identity"
               expect(dependent?.taskId).toBe(originalDependentTaskId)
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_report"
               expectPassedVerificationReport(dependent?.verificationReport, "finding-count")
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_report"
               expectPassedVerificationReport(repair?.verificationReport, "candidate-count")
               fixtureInvocationCounters.adapterStage = "graph_checked"
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_receipt"
               expect(record(repair?.repairReceipt)).toMatchObject({
                 targetNodeKey: "scout", targetTaskId: scout?.taskId, criterionIds: ["candidate-count"],
                 repairNodeKey: "scout-repair", repairTaskId: repair?.taskId,
               })
+              fixtureInvocationCounters.adapterStage = "final_proof_wait_outcome"
               const outcome = waitOutcomeFromRequest(request, 2)
               expect(outcome.status).toBe("ready")
               const waitTasks = outcome.tasks.map(record)
+              fixtureInvocationCounters.adapterStage = "final_proof_wait_task_statuses"
               expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed"])
               const repairWaitTask = waitTasks.find(task => task?.taskId === repair?.taskId)
               const dependentWaitTask = waitTasks.find(task => task?.taskId === originalDependentTaskId)
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_wait_report"
               expectPassedVerificationReport(repairWaitTask?.verificationReport, "candidate-count")
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_wait_report"
               expectPassedVerificationReport(dependentWaitTask?.verificationReport, "finding-count")
               fixtureInvocationCounters.adapterStage = "outcome_checked"
               rootCompletedAfterRepair = true
