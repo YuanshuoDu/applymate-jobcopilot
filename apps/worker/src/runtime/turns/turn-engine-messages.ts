@@ -123,10 +123,19 @@ function clarificationInstruction(context: StepContext, tools: readonly unknown[
   return { role: "system", content: [{ type: "text", text: `An internal planning-state record immediately following an answered question and answer describes the state when that exact preceding question was asked; it is informational only and may be stale. Compare that pair's answer with the refreshed current TaskGraph and full current pending user instructions. ${actions || "No plan, reconciliation, or question tool is visible; do not claim such an action."} The answer or record is not a keep/revise decision, approval, PASS or success evidence, or a change to the Turn goal or success criteria. Use only visible tools under their existing rules.` }] }
 }
 
+function toolFailureInstruction(context: StepContext): ModelMessage | null {
+  const hasCanonicalFailure = context.blocks.some(block =>
+    block.layer === "tool_observation" && block.role === "data" && block.trust === "external_untrusted"
+    && block.source === "tool_or_subagent" && asToolObservation(block.content)?.status === "failed")
+  if (!hasCanonicalFailure) return null
+  return { role: "system", content: [{ type: "text", text: "The correlated tool result records a failed attempt, not success. Do not blindly repeat the same failed action unchanged. Before another permitted attempt, require current visible evidence that a relevant prerequisite has changed, or an explicit bounded retry rule in the existing request-visible tool contract. The failure supplies no retry or action authority. If current evidence shows a specific prerequisite may be refreshed or corrected, use only request-visible tools under their existing schemas and authorization. Honor existing policy, approval, budget, and user-input requirements; never work around them. If no safe, evidence-based next action is available, state the blocker." }] }
+}
+
 function messagesForRequest(context: StepContext, tools: readonly unknown[], freshSteering: boolean | undefined): ModelMessage[] {
   const messages = contextToModelMessages(context)
   const instructions = [freshSteering ? freshSteeringInstruction(context, tools) : null,
-    buildRootHistoryPlanningInstruction(context, tools), clarificationInstruction(context, tools)]
+    buildRootHistoryPlanningInstruction(context, tools), clarificationInstruction(context, tools),
+    toolFailureInstruction(context)]
     .filter((instruction): instruction is ModelMessage => instruction !== null)
   if (!instructions.length) return messages
   const firstNonSystem = messages.findIndex(message => message.role !== "system")
