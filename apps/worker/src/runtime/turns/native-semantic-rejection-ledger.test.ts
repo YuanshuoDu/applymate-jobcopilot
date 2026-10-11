@@ -6,6 +6,7 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 
 const identity = {
   candidateDigest: "a".repeat(64),
+  inputThroughSequence: 9_007_199_254_740_993n,
   controlTaskId: "control-task",
   controlOperationId: "operation-1",
   controlAttempt: 2,
@@ -49,6 +50,14 @@ describe("native semantic rejection identity", () => {
     expect(parseNativeSemanticRejectionIdentity(null)).toBeNull()
   })
 
+  it("requires an in-range bigint checkpoint on the private proof identity", () => {
+    expect(parseNativeSemanticRejectionIdentity({ ...identity, inputThroughSequence: "9007199254740993" })).toBeNull()
+    expect(parseNativeSemanticRejectionIdentity({ ...identity, inputThroughSequence: -1n })).toBeNull()
+    expect(parseNativeSemanticRejectionIdentity({ ...identity, inputThroughSequence: 9_223_372_036_854_775_808n })).toBeNull()
+    const { inputThroughSequence: _checkpoint, ...missing } = identity
+    expect(parseNativeSemanticRejectionIdentity(missing)).toBeNull()
+  })
+
   it("bounds bigint and decimal-string checkpoints to PostgreSQL int64", () => {
     const maximum = 9_223_372_036_854_775_807n
     expect(nativeSemanticCheckpoint(maximum)).toBe(maximum)
@@ -76,5 +85,13 @@ describe("native semantic rejection identity", () => {
       .rejects.toMatchObject({ code: "persistence_conflict" })
     await expect(readNativeSemanticRejectionsWithClient(readClient({ sequence: "01" }).client, { owner, stepId: "current", identity }))
       .rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+
+  it("fails closed before history lookup when the proof epoch differs from the locked Step", async () => {
+    const mock = readClient()
+    await expect(readNativeSemanticRejectionsWithClient(mock.client, { owner, stepId: "current",
+      identity: { ...identity, inputThroughSequence: identity.inputThroughSequence + 1n } }))
+      .rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(mock.calls.some(call => call.sql.includes('FROM "agent_native_semantic_rejections" AS rejection'))).toBe(false)
   })
 })

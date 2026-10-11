@@ -279,7 +279,7 @@ describe("nativeVerificationCompletionGate", () => {
 
   it("carries only a strict private identity for a current failed root control", async () => {
     const identity = { candidateDigest: digestNativeVerificationValue(candidateText), controlTaskId: "owned-root-control",
-      controlOperationId: "owned-operation", controlAttempt: 2, controlReportDigest: "f".repeat(64) }
+      controlOperationId: "owned-operation", controlAttempt: 2, controlReportDigest: "f".repeat(64), inputThroughSequence: 5n }
     const port: NativeVerificationPort = {
       ensureChildren: vi.fn(async () => passed), ensureRootGoal: vi.fn(async () => rootFailed()), readRecoverableGoal: vi.fn(async () => null),
     }

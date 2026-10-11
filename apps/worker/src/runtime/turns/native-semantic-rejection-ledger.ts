@@ -6,6 +6,7 @@ export type NativeSemanticProgressMode = "legacy_v1" | "durable_v1"
 
 export type NativeSemanticRejectionIdentity = Readonly<{
   candidateDigest: string
+  inputThroughSequence: bigint
   controlTaskId: string
   controlOperationId: string
   controlAttempt: number
@@ -53,13 +54,15 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 export function parseNativeSemanticRejectionIdentity(value: unknown): NativeSemanticRejectionIdentity | null {
   const row = record(value)
-  if (!row || Reflect.ownKeys(row).some(key => typeof key !== "string") || Object.keys(row).sort().join(",") !== "candidateDigest,controlAttempt,controlOperationId,controlReportDigest,controlTaskId"
+  if (!row || Reflect.ownKeys(row).some(key => typeof key !== "string") || Object.keys(row).sort().join(",") !== "candidateDigest,controlAttempt,controlOperationId,controlReportDigest,controlTaskId,inputThroughSequence"
     || typeof row.candidateDigest !== "string" || !SHA256.test(row.candidateDigest)
     || typeof row.controlTaskId !== "string" || !ID.test(row.controlTaskId)
     || typeof row.controlOperationId !== "string" || !ID.test(row.controlOperationId)
     || typeof row.controlReportDigest !== "string" || !SHA256.test(row.controlReportDigest)
-    || !Number.isSafeInteger(row.controlAttempt) || Number(row.controlAttempt) < 1) return null
-  return { candidateDigest: row.candidateDigest as string, controlTaskId: row.controlTaskId as string,
+    || !Number.isSafeInteger(row.controlAttempt) || Number(row.controlAttempt) < 1
+    || typeof row.inputThroughSequence !== "bigint" || row.inputThroughSequence < 0n
+    || row.inputThroughSequence > 9_223_372_036_854_775_807n) return null
+  return { candidateDigest: row.candidateDigest as string, inputThroughSequence: row.inputThroughSequence as bigint, controlTaskId: row.controlTaskId as string,
     controlOperationId: row.controlOperationId as string, controlAttempt: row.controlAttempt as number,
     controlReportDigest: row.controlReportDigest as string }
 }
@@ -99,6 +102,7 @@ export async function readNativeSemanticRejectionsWithClient(
   const step = current.rows[0]
   if (!step || step.taskId !== owner.taskId || Number(step.attempt) !== 1 || step.status !== "streaming") throw conflict(`step ${input.stepId} is not current`)
   const checkpoint = nativeSemanticCheckpoint(step.inputThroughSequence)
+  if (input.identity.inputThroughSequence !== checkpoint) throw conflict("proof input checkpoint changed")
   const rows = await client.query<TurnEngineRow>(`SELECT rejection."stepId"
     FROM "agent_native_semantic_rejections" AS rejection
     JOIN "agent_steps" AS completed_step ON completed_step."id" = rejection."stepId"
