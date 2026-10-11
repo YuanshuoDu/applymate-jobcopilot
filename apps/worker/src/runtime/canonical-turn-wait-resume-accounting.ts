@@ -24,6 +24,67 @@ function eventScope(event: Row, type: string, stepId: string, scope: Scope, key:
     && typeof event.id === "string" && event.id.length > 0
 }
 
+const EVIDENCE_RECOVERY_KEY = "evidence-recovery-once"
+function closedEvidenceRecoveryStep(step: Row, stepId: string, marker: Row, events: readonly Row[], scope: Scope): boolean {
+  if (step.status !== "completed" || step.taskId !== scope.rootTaskId || step.errorCode !== null) return false
+  const matching = (type: string) => events.filter(event => event.type === type && event.correlationId === stepId)
+  const starts = matching("model.started"), completions = matching("model.completed"), usages = matching("model.usage"), closes = matching("step.completed")
+  if (starts.length !== 1 || completions.length !== 1 || usages.length !== 1 || closes.length !== 1) return false
+  const started = starts[0]!, completed = completions[0]!, usageEvent = usages[0]!, closed = closes[0]!
+  const startPayload = object(started.payload), usagePayload = object(usageEvent.payload), usage = usagePayload && usagePayload.usage
+  const receipt = parseModelCompletedReceipt(completed.payload), closePayload = object(closed.payload)
+  const startSequence = sequence(started.sequence), modelSequence = sequence(completed.sequence), usageSequence = sequence(usageEvent.sequence)
+  const markerSequence = sequence(marker.sequence), closeSequence = sequence(closed.sequence)
+  if (!eventScope(started, "model.started", stepId, scope, `turn:${scope.turnId}:event:model-started:${stepId}`)
+    || !eventScope(completed, "model.completed", stepId, scope, `turn:${scope.turnId}:event:model-completed:${stepId}`)
+    || !eventScope(usageEvent, "model.usage", stepId, scope, `turn:${scope.turnId}:event:model-usage:${stepId}`)
+    || !eventScope(closed, "step.completed", stepId, scope, `turn:${scope.turnId}:event:step-completed:${stepId}`)
+    || !startPayload || !exactKeys(startPayload, ["provider", "model", "taskId"]) || startPayload.taskId !== scope.rootTaskId
+    || typeof startPayload.provider !== "string" || !startPayload.provider || typeof startPayload.model !== "string" || !startPayload.model
+    || !receipt || receipt.taskId !== scope.rootTaskId || receipt.provider !== startPayload.provider || receipt.model !== startPayload.model
+    || receipt.toolCallCount !== 0 || completed.causationId !== started.id || usageEvent.causationId !== completed.id
+    || !usagePayload || !exactKeys(usagePayload, ["provider", "model", "usage", "taskId"])
+    || usagePayload.taskId !== scope.rootTaskId || usagePayload.provider !== startPayload.provider || usagePayload.model !== startPayload.model
+    || !closePayload || !exactKeys(closePayload, ["stepId", "status", "taskId"])
+    || closePayload.stepId !== stepId || closePayload.status !== "completed" || closePayload.taskId !== scope.rootTaskId
+    || closed.causationId !== marker.id || startSequence === null || modelSequence === null || usageSequence === null
+    || markerSequence === null || closeSequence === null
+    || startSequence >= modelSequence || modelSequence >= usageSequence || usageSequence >= markerSequence || markerSequence >= closeSequence) return false
+  const expected = usage === null ? usageZero() : object(usage)
+  if (!expected || (usage !== null && (!exactKeys(expected, ["inputTokens", "outputTokens", "estimatedCostUsd"])
+    || !Number.isSafeInteger(expected.inputTokens) || Number(expected.inputTokens) < 0
+    || !Number.isSafeInteger(expected.outputTokens) || Number(expected.outputTokens) < 0
+    || typeof expected.estimatedCostUsd !== "number" || !Number.isFinite(expected.estimatedCostUsd) || expected.estimatedCostUsd < 0))) return false
+  return Number(step.inputTokens) === Number(expected.inputTokens) && Number(step.outputTokens) === Number(expected.outputTokens)
+    && Number(step.estimatedCostUsd) === Number(expected.estimatedCostUsd)
+}
+
+function finalEvidenceRecoveryUsed(events: readonly Row[], steps: readonly Row[], scope: Scope): boolean {
+  const prefix = `turn:${scope.turnId}:event:final-rejected:`, suffix = `:${EVIDENCE_RECOVERY_KEY}`
+  const markers = events.filter(event => typeof event.idempotencyKey === "string"
+    && event.idempotencyKey.startsWith(prefix) && event.idempotencyKey.endsWith(suffix)
+    && event.idempotencyKey.length > prefix.length + suffix.length)
+  if (markers.length === 0) return false
+  if (markers.length !== 1) throw new Error("final_evidence_recovery_marker_invalid")
+  const marker = markers[0]!, stepId = marker.correlationId
+  const matchingSteps = typeof stepId === "string" ? steps.filter(step => step.id === stepId) : []
+  if (typeof stepId !== "string" || !stepId || !eventScope(marker, "final.rejected", stepId, scope,
+      `turn:${scope.turnId}:event:final-rejected:${stepId}:${EVIDENCE_RECOVERY_KEY}`)
+    || sequence(marker.sequence) === null || matchingSteps.length !== 1 || matchingSteps[0]?.taskId !== scope.rootTaskId) {
+    throw new Error("final_evidence_recovery_marker_invalid")
+  }
+  const payload = object(marker.payload)
+  if (!payload || !exactKeys(payload, ["code", "blocker", "feedback", "taskId"])
+    || payload.code !== "evidence_missing" || payload.blocker !== "No verifiable evidence is attached to the candidate final"
+    || payload.feedback !== "Attach verified business or tool evidence before claiming completion" || payload.taskId !== scope.rootTaskId) {
+    throw new Error("final_evidence_recovery_marker_invalid")
+  }
+  if (!closedEvidenceRecoveryStep(matchingSteps[0]!, stepId, marker, events, scope)) {
+    throw new Error("final_evidence_recovery_marker_invalid")
+  }
+  return true
+}
+
 /** Returns only a server-closed waiting Step's full emitted batch count. */
 function closedWaitBatchCount(step: Row, items: readonly Row[], events: readonly Row[], scope: Scope): number | undefined {
   if (step.status !== "waiting_for_tool" || typeof step.id !== "string" || !step.id || step.taskId != null && step.taskId !== scope.rootTaskId) return undefined
@@ -118,6 +179,7 @@ export function buildCanonicalTurnResumeState(input: {
   readonly persistedToolCallCount: number; readonly items: readonly Row[]; readonly events: readonly Row[]; readonly scope: Scope
   readonly recoveredWaitControl?: RecoveredArchivedWaitControl
 }): TurnResumeState | undefined {
+  const evidenceRecoveryUsed = finalEvidenceRecoveryUsed(input.events, input.steps, input.scope)
   if (!input.last && input.maxOrdinal === null) return undefined
   const usage = input.steps.reduce<Usage>((total, step) => ({
     inputTokens: total.inputTokens + Number(step.inputTokens ?? 0), outputTokens: total.outputTokens + Number(step.outputTokens ?? 0),
@@ -146,6 +208,7 @@ export function buildCanonicalTurnResumeState(input: {
   }
   return {
     nextOrdinal: (input.maxOrdinal ?? Number(input.last?.ordinal)) + 1, stepCount: input.steps.length, toolCallCount,
+    ...(evidenceRecoveryUsed ? { finalEvidenceRecoveryUsed: true } : {}),
     inputThroughSequence: BigInt(String(input.last?.inputThroughSequence ?? 0)),
     consumedInputIds: Array.isArray(input.last?.consumedInputIds) ? input.last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
     usage,

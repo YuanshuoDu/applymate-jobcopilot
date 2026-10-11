@@ -8,6 +8,7 @@ import { StepContextBuilder, type StepContext } from "../context/step-context-bu
 import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "../context/input-claim-store.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { nativeVerificationFeedbackText } from "../canonical-turn-native-verification.js"
+import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-accounting.js"
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
@@ -32,7 +33,7 @@ import type { SteeringMarkerContext, SteeringMarkerWrite } from "../context/stee
 import type { HydrationScope } from "../context/steering-reconciliation-context.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { steeringReconciliationRecoveryError } from "./turn-execution-completion-gate.js"
-import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -2015,6 +2016,156 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "final.rejected")).toBe(true)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+  })
+
+  it("gathers read evidence after one premature final and verifies a fresh final in the same loop", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const baseBuilder = root.options.contextBuilder
+    const usage = [
+      { inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0.01 },
+      { inputTokens: 5, outputTokens: 2, estimatedCostUsd: 0.02 },
+      { inputTokens: 6, outputTokens: 3, estimatedCostUsd: 0.03 },
+    ]
+    root.options = { ...root.options, budget: { maxSteps: 3 }, maxSteps: 3,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        const call = root.requests.length
+        if (call === 2) yield { type: "tool_call_completed", callId: "evidence-search-1", name: "jobs.search", arguments: { location: "Dublin" } }
+        if (call !== 2) yield { type: "text_delta", text: call === 1 ? "A suitable role appears likely." : "I found a Dublin role." }
+        yield { type: "usage", ...usage[call - 1]! }
+        yield { type: "completed", finishReason: call === 2 ? "tool_calls" : "stop" }
+      } },
+      executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+        output: { jobs: [{ id: "job-1" }], page: 1, hasMore: false }, errorCode: null }),
+      contextBuilder: { ...baseBuilder, build: async request => {
+        const context = await baseBuilder.build(request)
+        const systemBlocks = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+          role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+        return { ...context, blocks: [...systemBlocks, ...context.blocks] }
+      } },
+    }
+    const updateStep = vi.spyOn(root.options.store, "updateStep")
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1, finalText: "I found a Dublin role." })
+    expect(root.requests).toHaveLength(3)
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+    expect(updateStep.mock.calls[0]?.[0]).toMatchObject({ status: "completed", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0.01 })
+    expect(root.events.filter(event => event.type === "model.usage" && event.payload !== undefined)).toHaveLength(3)
+    expect(root.events.filter(event => event.type === "step.completed" && event.payload !== undefined)).toHaveLength(3)
+    const denial = root.events.find(event => event.type === "final.rejected" && event.payload !== undefined)!
+    expect(denial.idempotencyKey).toBe("turn:turn-1:event:final-rejected:turn:turn-1:step:0:evidence-recovery-once")
+    expect(denial.payload).toMatchObject({ code: "evidence_missing", taskId: "root-1" })
+    expect(JSON.stringify(denial.payload)).not.toContain("job-1")
+    const recoveryRequest = JSON.stringify(root.requests[1]?.messages)
+    expect(recoveryRequest).toContain("currently visible read-only evidence tool")
+    expect(recoveryRequest).toContain("Do not repeat a final response without evidence")
+    expect(recoveryRequest).not.toContain("No verifiable evidence is attached to the candidate final")
+    expect(root.requests[2]?.messages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: [{ type: "tool_use", id: "evidence-search-1", name: "jobs.search", input: { location: "Dublin" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "evidence-search-1", content: '{"hasMore":false,"jobs":[{"id":"job-1"}],"page":1}' }] },
+    ]))
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(root.finalResponses).toHaveLength(1)
+    expect(JSON.parse(root.finalResponses[0]!.slice("root-1:".length))).toMatchObject({
+      response: "I found a Dublin role.", usage: { inputTokens: 15, outputTokens: 7, estimatedCostUsd: 0.06 },
+      evidenceRefs: ["evidence-search-1", "read:job:job-1"],
+    })
+  })
+
+  it("restores the consumed recovery instruction across restart and accounts prior usage once", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const baseBuilder = root.options.contextBuilder
+    const priorUsage = { inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0.01 }
+    const priorStarted = { id: "prior-model-start", type: "model.started", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "prior-step", sequence: "1",
+      idempotencyKey: "turn:turn-1:event:model-started:prior-step", payload: { taskId: "root-1", provider: "fixture", model: "test" } }
+    const priorCompleted = { id: "prior-model-done", type: "model.completed", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "prior-step", causationId: priorStarted.id, sequence: "2",
+      idempotencyKey: "turn:turn-1:event:model-completed:prior-step", payload: { taskId: "root-1", provider: "fixture", model: "test", toolCallCount: 0 } }
+    const priorUsageEvent = { id: "prior-model-usage", type: "model.usage", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "prior-step", causationId: priorCompleted.id, sequence: "3",
+      idempotencyKey: "turn:turn-1:event:model-usage:prior-step",
+      payload: { taskId: "root-1", provider: "fixture", model: "test", usage: priorUsage } }
+    const marker = { id: "persisted-evidence-recovery", type: "final.rejected", actor: "orchestrator", userId: "user-1",
+      sessionId: "session-1", turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "prior-step", causationId: priorUsageEvent.id, sequence: "4",
+      idempotencyKey: "turn:turn-1:event:final-rejected:prior-step:evidence-recovery-once",
+      payload: { code: "evidence_missing", blocker: "No verifiable evidence is attached to the candidate final",
+        feedback: "Attach verified business or tool evidence before claiming completion", taskId: "root-1" } }
+    const priorStepCompleted = { id: "prior-step-close", type: "step.completed", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "prior-step", causationId: marker.id, sequence: "5",
+      idempotencyKey: "turn:turn-1:event:step-completed:prior-step", payload: { stepId: "prior-step", status: "completed", taskId: "root-1" } }
+    const resume = buildCanonicalTurnResumeState({ last: { ordinal: 0, inputThroughSequence: "0", consumedInputIds: [] }, maxOrdinal: 0,
+      steps: [{ id: "prior-step", taskId: "root-1", ordinal: 0, status: "completed", errorCode: null, ...priorUsage }],
+      items: [], events: [priorStarted, priorCompleted, priorUsageEvent, marker, priorStepCompleted], persistedToolCallCount: 0,
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" } })
+    if (!resume?.finalEvidenceRecoveryUsed) throw new Error("Persisted recovery marker should be restored")
+    root.options = { ...root.options,
+      snapshot: applyCompletionRecovery(root.options.snapshot, "restart", FINAL_EVIDENCE_RECOVERY_FEEDBACK),
+      resume,
+      budget: { maxSteps: 3 }, maxSteps: 3,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        if (root.requests.length === 1) yield { type: "tool_call_completed", callId: "restart-evidence-1", name: "jobs.search", arguments: { location: "Dublin" } }
+        else yield { type: "text_delta", text: "A current Dublin role is available." }
+        yield { type: "usage", inputTokens: 6, outputTokens: 3, estimatedCostUsd: 0.02 }
+        yield { type: "completed", finishReason: root.requests.length === 1 ? "tool_calls" : "stop" }
+      } },
+      executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+        output: { jobs: [{ id: "job-restart" }] }, errorCode: null }),
+      contextBuilder: { ...baseBuilder, build: async request => {
+        const context = await baseBuilder.build(request)
+        const systemBlocks = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+          role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+        return { ...context, blocks: [...systemBlocks, ...context.blocks] }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1, finalText: "A current Dublin role is available." })
+    expect(root.requests).toHaveLength(2)
+    expect(JSON.stringify(root.requests[0]?.messages)).toContain("Review any current evidence already visible in context")
+    expect(root.requests[1]?.messages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: [{ type: "tool_use", id: "restart-evidence-1", name: "jobs.search", input: { location: "Dublin" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "restart-evidence-1", content: '{"jobs":[{"id":"job-restart"}]}' }] },
+    ]))
+    expect(root.events.filter(event => event.type === "step.completed" && event.payload !== undefined)).toHaveLength(2)
+    expect(root.events.some(event => event.type === "final.rejected")).toBe(false)
+    expect(JSON.parse(root.finalResponses[0]!.slice("root-1:".length))).toMatchObject({
+      usage: { inputTokens: 16, outputTokens: 8, estimatedCostUsd: 0.05 }, evidenceRefs: ["read:job:job-restart", "restart-evidence-1"],
+    })
+  })
+
+  it("does not offer a second same-process recovery after another evidence-free final", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const baseBuilder = root.options.contextBuilder
+    root.options = { ...root.options, maxSteps: 5, budget: { maxSteps: 5 }, model: { ...root.options.model,
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text: "I found a role." }
+        yield { type: "usage", inputTokens: 2, outputTokens: 1, estimatedCostUsd: 0.01 }
+        yield { type: "completed", finishReason: "stop" }
+      } }, contextBuilder: { ...baseBuilder, build: async request => {
+        const context = await baseBuilder.build(request)
+        const systemBlocks = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+          role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+        return { ...context, blocks: [...systemBlocks, ...context.blocks] }
+      } },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", stepCount: 2 })
+    expect(root.requests).toHaveLength(2)
+    expect(root.stepStatuses).toEqual(["completed", "failed"])
+    const denials = root.events.filter(event => event.type === "final.rejected" && event.payload !== undefined)
+    expect(denials).toHaveLength(2)
+    expect(denials[0]?.idempotencyKey).toContain("evidence-recovery-once")
+    expect(denials[1]?.idempotencyKey).not.toContain("evidence-recovery-once")
+    expect(denials[1]?.payload).toMatchObject({ code: "evidence_missing" })
+    expect(JSON.stringify(root.requests[1]?.messages)).toContain("Do not repeat a final response without evidence")
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
   it("takes a fresh Root step after a steering reconciliation denial without charging semantic no-progress", async () => {

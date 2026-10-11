@@ -534,6 +534,38 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations).toEqual([expect.objectContaining({ id: "tool-result:call-1", content: expect.objectContaining({ toolName: "jobs.search" }) })])
   })
 
+  it("loads the durable final-evidence recovery marker into Root resume state", async () => {
+    const started = { id: "model-start", type: "model.started", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "step-0", sequence: "1",
+      idempotencyKey: "turn:turn-1:event:model-started:step-0", payload: { taskId: "root-1", provider: "fixture", model: "test" } }
+    const completed = { id: "model-done", type: "model.completed", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "step-0", causationId: started.id, sequence: "2",
+      idempotencyKey: "turn:turn-1:event:model-completed:step-0", payload: { taskId: "root-1", provider: "fixture", model: "test", toolCallCount: 0 } }
+    const usage = { inputTokens: 3, outputTokens: 1, estimatedCostUsd: 0.01 }
+    const usageEvent = { id: "model-usage", type: "model.usage", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "step-0", causationId: completed.id, sequence: "3",
+      idempotencyKey: "turn:turn-1:event:model-usage:step-0", payload: { taskId: "root-1", provider: "fixture", model: "test", usage } }
+    const marker = { id: "evidence-recovery", type: "final.rejected", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "step-0", causationId: usageEvent.id, sequence: "4",
+      idempotencyKey: "turn:turn-1:event:final-rejected:step-0:evidence-recovery-once",
+      payload: { code: "evidence_missing", blocker: "No verifiable evidence is attached to the candidate final",
+        feedback: "Attach verified business or tool evidence before claiming completion", taskId: "root-1" } }
+    const stepCompleted = { id: "step-close", type: "step.completed", actor: "orchestrator", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", itemId: null, correlationId: "step-0", causationId: marker.id, sequence: "5",
+      idempotencyKey: "turn:turn-1:event:step-completed:step-0", payload: { stepId: "step-0", status: "completed", taskId: "root-1" } }
+    const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ id: "step-0", taskId: "root-1", ordinal: 0, status: "completed", errorCode: null, inputTokens: 3, outputTokens: 1, estimatedCostUsd: 0.01 }],
+      events: [started, completed, usageEvent, marker, stepCompleted] })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.resume?.finalEvidenceRecoveryUsed).toBe(true)
+    const recoveredInstruction = value.snapshot.system.find(seed => seed.id === "completion-recovery:final-evidence-once")
+    expect(recoveredInstruction?.content).toContain("Review any current evidence already visible in context")
+    expect(recoveredInstruction?.content).toContain("currently visible read-only evidence tool")
+    expect(recoveredInstruction?.content).not.toContain("No verifiable evidence is attached to the candidate final")
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"') && sql.includes('event."payload"'))?.[0]
+    expect(eventQuery).toContain("'final.rejected'")
+  })
+
   it("fails closed when a pending tool call lacks persisted item identity", async () => {
     const call = { type: "tool_call", status: "completed", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed" } }
     const cases = [

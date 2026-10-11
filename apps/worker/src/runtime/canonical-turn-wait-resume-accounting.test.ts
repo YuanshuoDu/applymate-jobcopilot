@@ -207,6 +207,71 @@ describe("canonical resume accounting for archived waits", () => {
     expect(resumed?.usage).toEqual({ inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 })
   })
 
+  it("restores one exact root-scoped final evidence recovery marker and rejects malformed markers", () => {
+    const usage = { inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0.01 }
+    const closedRootSteps = [{ id: "step-1", taskId: scope.rootTaskId, ordinal: 4, status: "completed", errorCode: null, ...usage }]
+    const started = { id: "recovery-start", type: "model.started", actor: "orchestrator", userId: scope.userId,
+      sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, itemId: null, correlationId: "step-1",
+      idempotencyKey: `turn:${scope.turnId}:event:model-started:step-1`, sequence: "1",
+      payload: { taskId: scope.rootTaskId, provider: "fixture", model: "test" } }
+    const completed = { id: "recovery-model", type: "model.completed", actor: "orchestrator", userId: scope.userId,
+      sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, itemId: null, correlationId: "step-1",
+      causationId: started.id, idempotencyKey: `turn:${scope.turnId}:event:model-completed:step-1`, sequence: "2",
+      payload: { taskId: scope.rootTaskId, provider: "fixture", model: "test", toolCallCount: 0 } }
+    const usageEvent = { id: "recovery-usage", type: "model.usage", actor: "orchestrator", userId: scope.userId,
+      sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, itemId: null, correlationId: "step-1",
+      causationId: completed.id, idempotencyKey: `turn:${scope.turnId}:event:model-usage:step-1`, sequence: "3",
+      payload: { taskId: scope.rootTaskId, provider: "fixture", model: "test", usage } }
+    const marker = {
+      id: "evidence-recovery", type: "final.rejected", actor: "orchestrator", userId: scope.userId,
+      sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, itemId: null, causationId: usageEvent.id,
+      correlationId: "step-1", sequence: "4",
+      idempotencyKey: `turn:${scope.turnId}:event:final-rejected:step-1:evidence-recovery-once`,
+      payload: { code: "evidence_missing", blocker: "No verifiable evidence is attached to the candidate final",
+        feedback: "Attach verified business or tool evidence before claiming completion", taskId: scope.rootTaskId },
+    }
+    const stepCompleted = { id: "recovery-step-close", type: "step.completed", actor: "orchestrator", userId: scope.userId,
+      sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, itemId: null, correlationId: "step-1",
+      causationId: marker.id, idempotencyKey: `turn:${scope.turnId}:event:step-completed:step-1`, sequence: "5",
+      payload: { stepId: "step-1", status: "completed", taskId: scope.rootTaskId } }
+    const beforeMarkerEvents = [started, completed, usageEvent]
+    const recoveryEvents = [...beforeMarkerEvents, marker, stepCompleted]
+    const value = build({ steps: closedRootSteps, items: [], events: recoveryEvents })
+    expect(value?.finalEvidenceRecoveryUsed).toBe(true)
+    expect(build({ steps: closedRootSteps, items: [], events: [...beforeMarkerEvents, stepCompleted] })?.finalEvidenceRecoveryUsed).toBeUndefined()
+    expect(build({ steps: closedRootSteps, items: [], events: [...beforeMarkerEvents, { ...marker,
+      idempotencyKey: "turn:foreign-turn:event:final-rejected:step-1:evidence-recovery-once" }, stepCompleted] })?.finalEvidenceRecoveryUsed).toBeUndefined()
+    expect(build({ steps: closedRootSteps, items: [], events: [...beforeMarkerEvents,
+      { ...marker, idempotencyKey: `turn:${scope.turnId}:event:final-rejected:step-1:ordinary` }, stepCompleted] })?.finalEvidenceRecoveryUsed).toBeUndefined()
+
+    const malformed = [
+      { ...marker, actor: "user" },
+      { ...marker, sessionId: "other-session" },
+      { ...marker, idempotencyKey: `turn:${scope.turnId}:event:final-rejected:other-step:evidence-recovery-once` },
+      { ...marker, sequence: "0" },
+      { ...marker, payload: { ...marker.payload, privateFeedback: "do not trust" } },
+      { ...marker, payload: { ...marker.payload, taskId: "foreign-root" } },
+    ]
+    for (const changed of malformed) {
+      expect(() => build({ steps: closedRootSteps, items: [], events: [...beforeMarkerEvents, changed, stepCompleted] })).toThrow("final_evidence_recovery_marker_invalid")
+    }
+    expect(() => build({ steps: [...closedRootSteps, ...closedRootSteps], items: [], events: recoveryEvents }))
+      .toThrow("final_evidence_recovery_marker_invalid")
+    expect(() => build({ steps: closedRootSteps, items: [], events: [...recoveryEvents, { ...marker, id: "duplicate-evidence-recovery", sequence: "6" }] }))
+      .toThrow("final_evidence_recovery_marker_invalid")
+
+    expect(() => build({ steps: [{ ...closedRootSteps[0]!, status: "streaming", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      items: [], events: [...beforeMarkerEvents, marker] }))
+      .toThrow("final_evidence_recovery_marker_invalid")
+    expect(() => build({ steps: closedRootSteps, items: [], events: recoveryEvents.filter(event => event.type !== "model.usage") }))
+      .toThrow("final_evidence_recovery_marker_invalid")
+    expect(() => build({ steps: [{ ...closedRootSteps[0]!, inputTokens: 3 }], items: [], events: recoveryEvents }))
+      .toThrow("final_evidence_recovery_marker_invalid")
+    expect(() => build({ steps: closedRootSteps, items: [], events: recoveryEvents.map(event => event.type === "step.completed"
+      ? { ...event, causationId: "unrelated-event" } : event) }))
+      .toThrow("final_evidence_recovery_marker_invalid")
+  })
+
   it("rejects mismatched historical model and Step completion counts", () => {
     const mismatched = archivedEvents.map(event => event.type === "step.completed"
       ? { ...event, payload: { stepId: "step-1", status: "waiting_for_dependency", toolCallCount: 4, taskId: scope.rootTaskId } }

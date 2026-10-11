@@ -15,6 +15,7 @@ import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type Cognitiv
 import { hydrateNativeVerificationHistoricalAdvisories } from "./subagents/native-verification-historical-advisory.js"
 import { recoverCanonicalTurnQuestionContext } from "./turns/turn-question-runtime-support.js"
 import { buildCanonicalTurnResumeState } from "./canonical-turn-wait-resume-accounting.js"
+import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK } from "./turns/completion-recovery-context.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -135,7 +136,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4
        JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4
        WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3)
-          AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.completed', 'tool_call.failed', 'step.completed', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}')
+          AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.completed', 'tool_call.failed', 'step.completed', 'final.rejected', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}')
        ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
@@ -220,6 +221,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const resume = buildCanonicalTurnResumeState({ last, maxOrdinal, steps: stepsResult.rows,
       persistedToolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length, items: itemsResult.rows, events: eventsResult.rows,
       scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: rootTaskId ?? "" }, recoveredWaitControl })
+    if (resume?.finalEvidenceRecoveryUsed) snapshot = applyCompletionRecovery(snapshot, "resume", FINAL_EVIDENCE_RECOVERY_FEEDBACK)
     validateAgendaResumeFence(restoredAgenda, stepsResult.rows)
     const intent = turnIntent(turn.input)
     const result = {

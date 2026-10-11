@@ -12,6 +12,9 @@ const LEGACY_TEXT_PREFIX = "Durable TaskGraph verification blocked completion:"
 const VERSIONED_TEXT_PREFIX = "Durable TaskGraph verification blocked completion at graph revision "
 const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const GENERIC_FEEDBACK = "Durable TaskGraph verification was denied, but no validated graph revision is available. Inspect the refreshed current TaskGraph; no node or criterion ordinal from this denial is actionable."
+export const FINAL_EVIDENCE_RECOVERY_FEEDBACK = "final_evidence_missing_recovery_once"
+const FINAL_EVIDENCE_RECOVERY_SEED_ID = "completion-recovery:final-evidence-once"
+const FINAL_EVIDENCE_RECOVERY_INSTRUCTION = "The previous final response was rejected with evidence_missing because no verified evidence was attached. Review any current evidence already visible in context; if it does not support the goal, use a currently visible read-only evidence tool to gather current owned evidence, then provide a new final response supported by that evidence. Do not repeat a final response without evidence. If no relevant evidence is available, state uncertainty."
 const NATIVE_STATUS = /^Independent native verification is (failed|uncertain|pending|unavailable)\./
 const NATIVE_ACTIONS = [
   "evidence_missing: gather current owned evidence.",
@@ -126,6 +129,10 @@ export function tagTaskGraphRepairRecovery(feedback: string, graphRevision: numb
 }
 
 export function applyCompletionRecovery(snapshot: StepContextSnapshot, stepId: string, feedback: string): StepContextSnapshot {
+  if (feedback === FINAL_EVIDENCE_RECOVERY_FEEDBACK) {
+    return { ...snapshot, system: [...snapshot.system.filter(seed => seed.id !== FINAL_EVIDENCE_RECOVERY_SEED_ID),
+      { id: FINAL_EVIDENCE_RECOVERY_SEED_ID, content: FINAL_EVIDENCE_RECOVERY_INSTRUCTION }] }
+  }
   if (feedback === STEERING_RECONCILIATION_FEEDBACK) {
     return { ...snapshot, system: [...snapshot.system, {
       id: `completion-recovery:${stepId}`,
@@ -146,6 +153,10 @@ export function applyCompletionRecovery(snapshot: StepContextSnapshot, stepId: s
     ...snapshot,
     system: [...snapshot.system.filter(seed => !taskGraphSeed(seed)), { id: `${SEED_PREFIX}${suffix}`, content }],
   }
+}
+
+export function hasFinalEvidenceRecoveryMarker(snapshot: StepContextSnapshot): boolean {
+  return snapshot.system.some(seed => seed.id === FINAL_EVIDENCE_RECOVERY_SEED_ID)
 }
 
 const VERSIONED_TEXT_SUFFIX = " These ordinals apply only to this graph revision. Replan or repair the affected criteria, then verify again."

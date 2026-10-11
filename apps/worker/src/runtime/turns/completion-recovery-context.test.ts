@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
-import { applyCompletionRecovery, retireStaleTaskGraphRepair, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, retireStaleTaskGraphRepair, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 const feedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
@@ -8,6 +8,18 @@ const feedback = `${feedbackLead} issue=verification_report nodeOrdinal=2 criter
 const base: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
 
 describe("completion recovery context", () => {
+  it("adds one fixed evidence-only replan seed without carrying verifier details", () => {
+    const first = applyCompletionRecovery(base, "step-1", FINAL_EVIDENCE_RECOVERY_FEEDBACK)
+    const again = applyCompletionRecovery(first, "step-2", FINAL_EVIDENCE_RECOVERY_FEEDBACK)
+    expect(first.system).toHaveLength(1)
+    expect(again.system).toEqual(first.system)
+    expect(hasFinalEvidenceRecoveryMarker(again)).toBe(true)
+    expect(again.system[0]?.content).toContain("currently visible read-only evidence tool")
+    expect(again.system[0]?.content).toContain("Do not repeat a final response without evidence")
+    expect(again.system[0]?.content).not.toContain("private-tool-result")
+    expect(hasFinalEvidenceRecoveryMarker(base)).toBe(false)
+  })
+
   it("keeps ordinal guidance only with a validated revision and accepts revision zero", () => {
     const zero = applyCompletionRecovery(base, "step-1", tagTaskGraphRepairRecovery(feedback, 0))
     expect(zero.system).toHaveLength(1)
