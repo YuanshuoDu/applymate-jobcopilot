@@ -3,6 +3,7 @@ import type pg from "pg"
 import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 import { PAUSE_DEFERRED_MARKER, repairDeferredSubagentDispatches, runSubagentQueueJob } from "./subagent-pause-dispatch.js"
 import { dispatchPendingSubagentOutbox, subagentJobId } from "./subagent-queue.js"
+import { parseSubagentDispatchJobId, SUBAGENT_DISPATCH_IDENTITY_MISMATCH } from "../runtime/subagents/dispatch-identity.js"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
@@ -117,6 +118,55 @@ describe("pause-deferred subagent dispatch", () => {
     const lost = { run: vi.fn().mockResolvedValue({ taskId: "task-1", status: "lease_lost", reason: "expired" }) }
     await expect(runSubagentQueueJob(skipped.pool, lost as never, async () => ({ status: "completed" }), payload)).rejects.toThrow("expired")
     expect(skipped.pool.connect).not.toHaveBeenCalled()
+  })
+
+  it("forwards the private dispatch identity and never pause-defers an identity skip", async () => {
+    const fake = deferPool()
+    const identity = parseSubagentDispatchJobId(subagentJobId(payload.taskId, 2), payload.taskId)
+    if (!identity) throw new Error("Fixture job ID did not parse")
+    const manager = { run: vi.fn().mockResolvedValue({
+      taskId: payload.taskId, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH,
+    }) }
+    const execute = async () => ({ status: "completed" as const })
+
+    await expect(runSubagentQueueJob(fake.pool, manager as never, execute, payload, identity)).resolves.toMatchObject({
+      taskId: payload.taskId, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH,
+    })
+    expect(manager.run).toHaveBeenCalledWith(payload, execute, identity)
+    expect(Object.keys(payload).sort()).toEqual(["ownerId", "rootTaskId", "sessionId", "taskId"])
+    expect(fake.pool.connect).not.toHaveBeenCalled()
+    expect(fake.outbox).toMatchObject({ attemptCount: 3, publishedAt: expect.any(Date), lastError: null })
+  })
+
+  it("rejects a stale published generation during pause deferral without changing its owner tuple", async () => {
+    const fake = deferPool()
+    const staleIdentity = parseSubagentDispatchJobId(subagentJobId(payload.taskId, 1), payload.taskId)
+    if (!staleIdentity) throw new Error("Fixture stale dispatch ID did not parse")
+    const before = { ...fake.outbox, payload: { ...(fake.outbox.payload as SubagentJobPayload) } }
+    const manager = { run: vi.fn().mockResolvedValue({ taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }) }
+
+    await expect(runSubagentQueueJob(fake.pool, manager as never, async () => ({ status: "completed" }), payload, staleIdentity)).resolves.toMatchObject({
+      taskId: payload.taskId, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH,
+    })
+    expect(fake.outbox).toEqual(before)
+    expect(fake.task.attemptCount).toBe(0)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("still persists pause deferral for the matching published generation", async () => {
+    const fake = deferPool()
+    const identity = parseSubagentDispatchJobId(subagentJobId(payload.taskId, 2), payload.taskId)
+    if (!identity) throw new Error("Fixture current dispatch ID did not parse")
+    const manager = { run: vi.fn().mockResolvedValue({ taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }) }
+
+    await expect(runSubagentQueueJob(fake.pool, manager as never, async () => ({ status: "completed" }), payload, identity)).resolves.toMatchObject({
+      taskId: payload.taskId, status: "skipped", reason: "session_pause_requested",
+    })
+    expect(fake.outbox.lastError).toBe(PAUSE_DEFERRED_MARKER)
+    expect(fake.outbox.attemptCount).toBe(3)
+    expect(fake.outbox.payload).toEqual(payload)
+    expect(fake.task.attemptCount).toBe(0)
   })
 
   it("does not mark an active task that was already started", async () => {

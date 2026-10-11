@@ -1,26 +1,33 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { SessionPauseRequestedError } from "../session-gate.js"
-import { claimSubagentTask } from "./pg-store-claim.js"
+import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
 import { PAUSE_DEFERRED_MARKER, normalizeSubagentPolicy, type SubagentJobPayload } from "./types.js"
+import { parseSubagentDispatchJobId, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, subagentDispatchJobId } from "./dispatch-identity.js"
 
 const input = {
   taskId: "child-1", sessionId: "session-1", ownerId: "worker-1", rootTaskId: "root-1",
   policy: normalizeSubagentPolicy({ maxConcurrency: 2 }), now: new Date("2026-10-06T10:00:00Z"),
 }
 
-type DeferredFence = { lastError: string | null; payload?: unknown }
+type DeferredFence = { lastError: string | null; payload?: unknown; publishedAt?: unknown; attemptCount?: unknown }
 function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; outbox?: DeferredFence } = {}) {
   const calls: string[] = []
-  const outbox = options.outbox ? { ...options.outbox, payload: options.outbox.payload ?? { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" } } : null
+  const parameters: Array<unknown[] | undefined> = []
+  const outbox = options.outbox ? { id: "dispatch-1", ...options.outbox, payload: options.outbox.payload ?? { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" } } : null
   const task = { id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
     path: "/root-1/child-1", depth: 1, role: "analyst", taskType: "test", status: "running", goal: "inspect", constraints: [],
     successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {}, attemptCount: 1, maxAttempts: 3,
     leaseOwner: "worker-1", leaseExpiresAt: new Date("2026-10-06T10:01:00Z"), interruptRequestedAt: null }
   const client = {
-    query: vi.fn(async (sql: string) => {
+    query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push(sql)
+      parameters.push(params)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 1 }
+      if (sql.includes('SELECT "userId" FROM "agent_sessions"')) return { rows: [{ userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('JOIN "agent_sessions" AS session')) return outbox
+        ? { rows: [{ payload: outbox.payload, attemptCount: outbox.attemptCount, publishedAt: outbox.publishedAt }], rowCount: 1 }
+        : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
       if (sql.includes('SELECT set_config')) return { rows: [], rowCount: 1 }
       if (sql.includes('SELECT "turnId", "rootTaskId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1" }], rowCount: 1 }
@@ -30,7 +37,7 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
       if (sql.includes('SELECT "id", "turnId", "status", "interruptRequestedAt"')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: options.rootInterrupted ? new Date() : null }], rowCount: 1 }
       if (sql.includes('SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt"')) return { rows: [{ id: "child-1", turnId: "turn-1", rootTaskId: "root-1", status: "queued", interruptRequestedAt: null }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
-      if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return outbox ? { rows: [{ id: "dispatch-1", payload: outbox.payload, lastError: outbox.lastError }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return outbox ? { rows: [outbox], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
       if (sql.includes('SELECT task."turnId", task."rootTaskId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, attemptCount: 0, userId: "user-1" }], rowCount: 1 }
       if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: 1 }
@@ -40,7 +47,7 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
     }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, client, outbox }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, parameters, client, outbox }
 }
 
 describe("atomic child claim pause fence", () => {
@@ -107,5 +114,75 @@ describe("atomic child claim pause fence", () => {
     const fake = poolFixture({ outbox: { lastError: "queue_add_failed", payload: { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "normal-outbox-owner" } } })
     await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toMatchObject({ id: "child-1" })
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(true)
+  })
+
+  it("accepts only the exact published outbox generation before counting or mutating a task", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 2), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture({ outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 3 } })
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .resolves.toMatchObject({ id: "child-1", attemptCount: 1 })
+    const dispatch = fake.calls.findIndex(sql => sql.includes('FROM "agent_outbox" AS dispatch'))
+    const running = fake.calls.findIndex(sql => sql.includes("COUNT(*)::int"))
+    const update = fake.calls.findIndex(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))
+    expect(dispatch).toBeGreaterThan(-1)
+    expect(dispatch).toBeLessThan(running)
+    expect(running).toBeLessThan(update)
+    expect(fake.outbox).toMatchObject({ attemptCount: 3, lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z") })
+  })
+
+  it.each([
+    { label: "missing outbox", identityTaskId: input.taskId },
+    { label: "unpublished outbox", identityTaskId: input.taskId, outbox: { lastError: null, publishedAt: null, attemptCount: 3 } },
+    { label: "stale generation", identityTaskId: input.taskId, outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 2 } },
+    { label: "wrong published owner", identityTaskId: input.taskId, outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 3, payload: { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "other-worker" } } },
+    { label: "malformed published payload", identityTaskId: input.taskId, outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 3, payload: { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1", extra: true } } },
+    { label: "wrong task identity", identityTaskId: "other-task", outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 3 } },
+  ] as const)("rejects $label before claim writes", async ({ identityTaskId, outbox }) => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(identityTaskId, 2), identityTaskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture(outbox ? { outbox } : {})
+    const originalOutbox = fake.outbox ? { ...fake.outbox } : null
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .rejects.toMatchObject({ code: SUBAGENT_DISPATCH_IDENTITY_MISMATCH })
+    expect(fake.calls.some(sql => sql.includes("COUNT(*)::int"))).toBe(false)
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.outbox).toEqual(originalOutbox)
+    expect(fake.calls.at(-1)).toBe("ROLLBACK")
+  })
+
+  it("uses a SELECT-only owner-scoped read to recognize the current published generation", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 2), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture({ outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 3 } })
+    const payload: SubagentJobPayload = { taskId: input.taskId, sessionId: input.sessionId, rootTaskId: input.rootTaskId, ownerId: input.ownerId }
+
+    await expect(matchesPublishedSubagentDispatch(fake.pool, { payload, dispatchIdentity: identity })).resolves.toBe(true)
+    expect(fake.calls.some(sql => sql.includes('SELECT "userId" FROM "agent_sessions"'))).toBe(true)
+    const dispatchIndex = fake.calls.findIndex(sql => sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('JOIN "agent_sessions" AS session'))
+    expect(dispatchIndex).toBeGreaterThan(-1)
+    expect(fake.parameters[dispatchIndex]).toEqual([input.sessionId, input.taskId, input.rootTaskId, "user-1"])
+    expect(fake.calls[dispatchIndex]).toMatch(/JOIN "sub_agent_tasks" AS task[\s\S]*JOIN "agent_turns" AS turn/)
+    expect(fake.calls.every(sql => !/^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))).toBe(true)
+    expect(fake.calls.at(-1)).toBe("COMMIT")
+  })
+
+  it.each([
+    { label: "missing dispatch", outbox: undefined },
+    { label: "stale generation", outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 2 } },
+    { label: "unpublished dispatch", outbox: { lastError: null, publishedAt: null, attemptCount: 3 } },
+    { label: "different owner tuple", outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 3, payload: { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "other-worker" } } },
+    { label: "malformed payload", outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 3, payload: { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1", extra: true } } },
+  ] as const)("returns false for a read-only $label mismatch", async ({ outbox }) => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 2), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture(outbox ? { outbox } : {})
+    const payload: SubagentJobPayload = { taskId: input.taskId, sessionId: input.sessionId, rootTaskId: input.rootTaskId, ownerId: input.ownerId }
+
+    await expect(matchesPublishedSubagentDispatch(fake.pool, { payload, dispatchIdentity: identity })).resolves.toBe(false)
+    expect(fake.calls.every(sql => !/^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))).toBe(true)
+    expect(fake.calls.at(-1)).toBe("COMMIT")
   })
 })

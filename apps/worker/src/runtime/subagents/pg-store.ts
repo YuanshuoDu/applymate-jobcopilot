@@ -6,7 +6,8 @@ import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import { assertSessionWorkAdmission, RUNNABLE_SESSION } from "../session-gate.js"
 import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentSession, lockSubagentTurn, lockSubagentTurnForWork, readSubagentTask } from "./pg-store-create.js"
-import { claimSubagentTask } from "./pg-store-claim.js"
+import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
+import type { SubagentDispatchIdentity } from "./dispatch-identity.js"
 import { dateValue, json, rowToTask, SELECT_TASK, spawnKey, transaction, uniqueMessageIds } from "./pg-store-persistence.js"
 import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
 export class PgSubagentTaskStore implements SubagentStore {
@@ -60,8 +61,11 @@ export class PgSubagentTaskStore implements SubagentStore {
       throw error
     }
   }
-  async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
+  async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }): Promise<SubagentTaskRecord | null> {
     return claimSubagentTask(this.pool, input, this.leaseMs)
+  }
+  matchesPublishedDispatch(input: { payload: import("./types.js").SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean> {
+    return matchesPublishedSubagentDispatch(this.pool, input)
   }
   async heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost"> {
     return transaction(this.pool, async (client) => {

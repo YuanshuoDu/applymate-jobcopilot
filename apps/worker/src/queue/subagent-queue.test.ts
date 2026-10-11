@@ -5,6 +5,7 @@ vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnec
 import type pg from "pg"
 import { dispatchPendingSubagentOutbox, enqueueSubagentTask, persistSubagentDispatch, recoverSubagentQueue, repairMissingSubagentDispatches, startSubagentRecoveryScanner, subagentDispatchKey, subagentJobId, type SubagentExecutor } from "./subagent-queue.js"
 import type { AgentTreeManager } from "../runtime/subagents/manager.js"
+import { parseSubagentDispatchJobId } from "../runtime/subagents/dispatch-identity.js"
 import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
@@ -386,6 +387,11 @@ describe("Subagent queue", () => {
     const queue = { add: vi.fn().mockResolvedValue(undefined) }
     await dispatchPendingSubagentOutbox(fake.pool, queue)
     expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 2), attempts: 3 })
+    const [, , options] = queue.add.mock.calls[0]!
+    expect(parseSubagentDispatchJobId(options?.jobId, payload.taskId)).toEqual({
+      jobId: subagentJobId(payload.taskId, 2), taskId: payload.taskId, generation: 2,
+    })
+    expect(fake.outbox.attemptCount).toBe(3)
   })
 
   it("repairs a missing queued dispatch before the normal dispatcher publishes it", async () => {
@@ -497,7 +503,7 @@ describe("Subagent queue", () => {
 
 describe("subagent queue concurrency deferral wiring", () => {
   it("passes the BullMQ job and lock token through the processor before manager retry", async () => {
-    type Processor = (job: { data: unknown; moveToDelayed: (timestamp: number, token?: string) => Promise<void> }, token?: string) => Promise<unknown>
+    type Processor = (job: { id?: string; data: unknown; moveToDelayed: (timestamp: number, token?: string) => Promise<void> }, token?: string) => Promise<unknown>
     let processor: Processor | undefined
     const queue = { add: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined) }
     const worker = { close: vi.fn().mockResolvedValue(undefined) }
@@ -514,11 +520,78 @@ describe("subagent queue concurrency deferral wiring", () => {
       const manager = { run: vi.fn(async () => { throw new SubagentLimitError("concurrency", "session is full") }) } as unknown as AgentTreeManager
       const runtime = createSubagentQueue({ manager, execute: async () => ({ status: "completed" }), queue })
       const moveToDelayed = vi.fn(async (_timestamp: number, _token?: string) => undefined)
-      const job = { data: payload, moveToDelayed }
+      const job = { id: subagentJobId(payload.taskId, 3), data: payload, moveToDelayed }
       await expect(processor?.(job, "processor-lock-token")).rejects.toMatchObject({ name: "DelayedError" })
       expect(moveToDelayed).toHaveBeenCalledOnce()
       expect(moveToDelayed.mock.calls[0]?.[1]).toBe("processor-lock-token")
       expect(manager.run).toHaveBeenCalledOnce()
+      expect(manager.run).toHaveBeenCalledWith(payload, expect.any(Function), {
+        jobId: job.id, taskId: payload.taskId, generation: 3,
+      })
+      await runtime.close()
+    } finally {
+      vi.doUnmock("bullmq")
+      vi.doUnmock("../redis.js")
+      vi.doUnmock("../db/apply-results.js")
+      vi.resetModules()
+    }
+  })
+
+  it.each([undefined, "malformed", subagentJobId("another-task", 0)])("skips a Bull job with an invalid dispatch ID before concurrency deferral (%s)", async jobId => {
+    type Processor = (job: { id?: string; data: unknown; moveToDelayed: (timestamp: number, token?: string) => Promise<void> }, token?: string) => Promise<unknown>
+    let processor: Processor | undefined
+    const queue = { add: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined) }
+    const worker = { close: vi.fn().mockResolvedValue(undefined) }
+    vi.doMock("bullmq", async () => {
+      const actual = await vi.importActual<typeof import("bullmq")>("bullmq")
+      return { ...actual, Worker: vi.fn((_name: string, handler: unknown) => { processor = handler as Processor; return worker }) }
+    })
+    vi.doMock("../redis.js", () => ({ redisConnection: {} }))
+    vi.doMock("../db/apply-results.js", () => ({ getPool: () => ({}) }))
+    vi.resetModules()
+    try {
+      const { createSubagentQueue } = await import("./subagent-queue.js")
+      const manager = { run: vi.fn() } as unknown as AgentTreeManager
+      const runtime = createSubagentQueue({ manager, execute: async () => ({ status: "completed" }), queue })
+      const moveToDelayed = vi.fn(async (_timestamp: number, _token?: string) => undefined)
+      await expect(processor?.({ id: jobId, data: payload, moveToDelayed })).resolves.toMatchObject({
+        taskId: payload.taskId, status: "skipped", reason: "dispatch_identity_mismatch",
+      })
+      expect(manager.run).not.toHaveBeenCalled()
+      expect(moveToDelayed).not.toHaveBeenCalled()
+      await runtime.close()
+    } finally {
+      vi.doUnmock("bullmq")
+      vi.doUnmock("../redis.js")
+      vi.doUnmock("../db/apply-results.js")
+      vi.resetModules()
+    }
+  })
+
+  it("does not delay a valid Bull ID when manager classifies its published generation as stale", async () => {
+    type Processor = (job: { id?: string; data: unknown; moveToDelayed: (timestamp: number, token?: string) => Promise<void> }, token?: string) => Promise<unknown>
+    let processor: Processor | undefined
+    const queue = { add: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined) }
+    const worker = { close: vi.fn().mockResolvedValue(undefined) }
+    vi.doMock("bullmq", async () => {
+      const actual = await vi.importActual<typeof import("bullmq")>("bullmq")
+      return { ...actual, Worker: vi.fn((_name: string, handler: unknown) => { processor = handler as Processor; return worker }) }
+    })
+    vi.doMock("../redis.js", () => ({ redisConnection: {} }))
+    vi.doMock("../db/apply-results.js", () => ({ getPool: () => ({}) }))
+    vi.resetModules()
+    try {
+      const { createSubagentQueue } = await import("./subagent-queue.js")
+      const identity = { jobId: subagentJobId(payload.taskId, 1), taskId: payload.taskId, generation: 1 }
+      const manager = { run: vi.fn().mockResolvedValue({ taskId: payload.taskId, status: "skipped", reason: "dispatch_identity_mismatch" }) } as unknown as AgentTreeManager
+      const runtime = createSubagentQueue({ manager, execute: async () => ({ status: "completed" }), queue })
+      const moveToDelayed = vi.fn(async (_timestamp: number, _token?: string) => undefined)
+
+      await expect(processor?.({ id: identity.jobId, data: payload, moveToDelayed }, "processor-lock-token")).resolves.toMatchObject({
+        taskId: payload.taskId, status: "skipped", reason: "dispatch_identity_mismatch",
+      })
+      expect(manager.run).toHaveBeenCalledWith(payload, expect.any(Function), identity)
+      expect(moveToDelayed).not.toHaveBeenCalled()
       await runtime.close()
     } finally {
       vi.doUnmock("bullmq")

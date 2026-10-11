@@ -5,7 +5,8 @@ import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
-import type { SubagentPolicy, SubagentStore, SubagentTaskRecord, SubagentTaskSpec, SubagentLease, SubagentJobPayload } from "../runtime/subagents/types.js"
+import { parseSubagentJobPayload, type SubagentPolicy, type SubagentStore, type SubagentTaskRecord, type SubagentTaskSpec, type SubagentLease, type SubagentJobPayload } from "../runtime/subagents/types.js"
+import { parseSubagentDispatchIdentity } from "../runtime/subagents/dispatch-identity.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runtime/subagents/tree-budget-types.js"
 import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
 import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
@@ -71,8 +72,9 @@ type FixtureWait = {
 
 function taskNeverStarted(task: SubagentTaskRecord): boolean { return Reflect.get(task, "startedAt") == null }
 
-function createTaskStore(): { store: SubagentStore; tasks: Map<string, SubagentTaskRecord> } {
+function createTaskStore(): { store: SubagentStore; tasks: Map<string, SubagentTaskRecord>; bindOutbox: (rows: FixtureOutbox[]) => void } {
   const tasks = new Map<string, SubagentTaskRecord>()
+  let publishedOutbox: FixtureOutbox[] = []
   let sequence = 0
   const store: SubagentStore = {
     async create(input: SubagentTaskSpec & { policy: SubagentPolicy }) {
@@ -97,6 +99,19 @@ function createTaskStore(): { store: SubagentStore; tasks: Map<string, SubagentT
     async get(taskId, sessionId) {
       const task = tasks.get(taskId)
       return task?.sessionId === sessionId ? task : null
+    },
+    async matchesPublishedDispatch({ payload, dispatchIdentity }) {
+      const identity = parseSubagentDispatchIdentity(dispatchIdentity, payload.taskId)
+      const task = tasks.get(payload.taskId)
+      const dispatch = publishedOutbox.find(row => row.topic === "agent.subagent.dispatch"
+        && row.aggregateId === payload.sessionId && row.idempotencyKey === `subagent-dispatch:${payload.taskId}`)
+      const currentPayload = dispatch ? parseSubagentJobPayload(dispatch.payload) : null
+      return !!identity && !!task && !!dispatch && dispatch.publishedAt !== null
+        && Number.isSafeInteger(dispatch.attemptCount) && dispatch.attemptCount === identity.generation + 1
+        && task.sessionId === payload.sessionId && task.rootTaskId === payload.rootTaskId
+        && identity.taskId === payload.taskId && currentPayload?.taskId === payload.taskId
+        && currentPayload.sessionId === payload.sessionId && currentPayload.rootTaskId === payload.rootTaskId
+        && currentPayload.ownerId === payload.ownerId
     },
     async claim(input) {
       const task = tasks.get(input.taskId)
@@ -132,7 +147,7 @@ function createTaskStore(): { store: SubagentStore; tasks: Map<string, SubagentT
     async interruptTree() { return 0 },
     async recoverExpired() { return [] },
   }
-  return { store, tasks }
+  return { store, tasks, bindOutbox(rows) { publishedOutbox = rows } }
 }
 
 function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootTaskId: string; childTaskId: string; sessionId: string; turnId: string; userId: string }) {
@@ -634,7 +649,7 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
     const ids = { sessionId: "capacity-session-" + randomUUID(), turnId: "capacity-turn-" + randomUUID(), userId: "capacity-user-" + randomUUID() }
     const { AgentTreeManager } = await import("../runtime/subagents/manager.js")
     const { createSubagentQueue, dispatchPendingSubagentOutbox, persistSubagentDispatch, subagentJobId } = await import("./subagent-queue.js")
-    const { store, tasks } = createTaskStore()
+    const { store, tasks, bindOutbox } = createTaskStore()
     const manager = new AgentTreeManager(store, { heartbeatMs: 60_000 })
     const queueExecutions: string[] = []
     const runtime = createSubagentQueue({ manager, execute: async ({ lease }) => {
@@ -680,6 +695,7 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
       const firstTarget = await first.child("first target")
       const firstPayload: SubagentJobPayload = { taskId: firstTarget.id, sessionId: ids.sessionId, rootTaskId: first.root.id, ownerId: "first-dispatch" }
       const firstSql = createSqlFixture({ tasks, rootTaskId: first.root.id, childTaskId: firstTarget.id, ...ids })
+      bindOutbox(firstSql.outbox)
       const firstHold = holdFour(firstHolders)
       releaseFirst = firstHold.release
       await waitFor(() => manager.activeCount(ids.sessionId) === 4)
@@ -707,6 +723,7 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
       const cancelledTarget = await second.child("cancel before redelivery")
       const cancelledPayload: SubagentJobPayload = { taskId: cancelledTarget.id, sessionId: ids.sessionId, rootTaskId: second.root.id, ownerId: "cancelled-dispatch" }
       const secondSql = createSqlFixture({ tasks, rootTaskId: second.root.id, childTaskId: cancelledTarget.id, ...ids })
+      bindOutbox(secondSql.outbox)
       const secondHold = holdFour(secondHolders)
       releaseSecond = secondHold.release
       await waitFor(() => manager.activeCount(ids.sessionId) === 4)
