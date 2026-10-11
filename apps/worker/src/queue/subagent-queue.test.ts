@@ -494,3 +494,37 @@ describe("Subagent queue", () => {
     expect(manager.recover).toHaveBeenCalledTimes(1)
   })
 })
+
+describe("subagent queue concurrency deferral wiring", () => {
+  it("passes the BullMQ job and lock token through the processor before manager retry", async () => {
+    type Processor = (job: { data: unknown; moveToDelayed: (timestamp: number, token?: string) => Promise<void> }, token?: string) => Promise<unknown>
+    let processor: Processor | undefined
+    const queue = { add: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined) }
+    const worker = { close: vi.fn().mockResolvedValue(undefined) }
+    vi.doMock("bullmq", async () => {
+      const actual = await vi.importActual<typeof import("bullmq")>("bullmq")
+      return { ...actual, Worker: vi.fn((_name: string, handler: unknown) => { processor = handler as Processor; return worker }) }
+    })
+    vi.doMock("../redis.js", () => ({ redisConnection: {} }))
+    vi.doMock("../db/apply-results.js", () => ({ getPool: () => ({}) }))
+    vi.resetModules()
+    try {
+      const { SubagentLimitError } = await import("../runtime/subagents/types.js")
+      const { createSubagentQueue } = await import("./subagent-queue.js")
+      const manager = { run: vi.fn(async () => { throw new SubagentLimitError("concurrency", "session is full") }) } as unknown as AgentTreeManager
+      const runtime = createSubagentQueue({ manager, execute: async () => ({ status: "completed" }), queue })
+      const moveToDelayed = vi.fn(async (_timestamp: number, _token?: string) => undefined)
+      const job = { data: payload, moveToDelayed }
+      await expect(processor?.(job, "processor-lock-token")).rejects.toMatchObject({ name: "DelayedError" })
+      expect(moveToDelayed).toHaveBeenCalledOnce()
+      expect(moveToDelayed.mock.calls[0]?.[1]).toBe("processor-lock-token")
+      expect(manager.run).toHaveBeenCalledOnce()
+      await runtime.close()
+    } finally {
+      vi.doUnmock("bullmq")
+      vi.doUnmock("../redis.js")
+      vi.doUnmock("../db/apply-results.js")
+      vi.resetModules()
+    }
+  })
+})
