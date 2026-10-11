@@ -43,6 +43,12 @@ import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-histor
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 import type { SteeringReconciliationOperation } from "./subagents/steering-reconciliation-contract.js"
+import { buildTaskGraphPlanningFacts } from "./subagents/task-graph-planning-facts.js"
+import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
+import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
+import type { GraphTaskRow, LoadedGraph } from "./subagents/task-graph-pg-state.js"
+import type { TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -171,6 +177,28 @@ function failedRootHistoryOutcome(): ValidatedRootTaskHistoryOutcome {
         },
       }],
     },
+  }
+}
+
+function scoutGraphRow(id: string, jobIds: readonly string[]): GraphTaskRow {
+  const candidates = jobIds.map(jobId => ({ jobId, source: "greenhouse", url: `https://private.example/${jobId}`, evidenceIds: [`evidence:${jobId}`] }))
+  return {
+    id, role: "scout", taskType: "job_discovery", status: "completed", failureReason: null,
+    result: { status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult: {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates,
+      evidence: candidates.map(candidate => ({ id: `evidence:${candidate.jobId}`, kind: "job", ref: candidate.jobId, source: "private-source" })),
+      summary: "PRIVATE_SCOUT_RESULT",
+    } },
+  }
+}
+
+function loadedScoutGraph(revision: number, currentRows: readonly GraphTaskRow[], nonCurrentRows: readonly GraphTaskRow[] = []): LoadedGraph {
+  return {
+    rootTaskId: "root-1",
+    item: { id: "task-graph:root-1", revision, content: {}, createdAt: new Date(0) },
+    snapshot: { nodes: currentRows.map(task => ({ taskId: task.id })) } as unknown as TaskGraphSnapshot,
+    state: { revision } as LoadedGraph["state"],
+    tasks: new Map([...currentRows, ...nonCurrentRows].map(task => [task.id, task])),
   }
 }
 
@@ -714,23 +742,43 @@ describe("createCanonicalTurnRuntime", () => {
       key: "research", templateId: "scout", goal: "Find sourced roles", successCriteria: ["Return employer links"], dependsOn: [],
       taskId: "planned-child", status: "queued" as const, readiness: "ready" as const, resultSummary: null, failureReason: null,
     }
-    let planRevision = 0
+    const historyOnlyRow = scoutGraphRow("history-only-child", ["historical-job"])
+    const firstCurrentRows = [scoutGraphRow("prior-child", ["job-shared"])]
+    const nextCurrentRows = [...firstCurrentRows, scoutGraphRow("planned-child", ["job-shared", "job-current-2"])]
+    const firstLoadedGraph = loadedScoutGraph(1, firstCurrentRows, [historyOnlyRow])
+    const nextLoadedGraph = loadedScoutGraph(2, nextCurrentRows, [historyOnlyRow])
+    const currentNode = (key: string, taskId: string, jobIds: readonly string[]) => ({
+      key, templateId: "scout", goal: "Find sourced roles", successCriteria: ["Return employer links"], dependsOn: [], taskId,
+      status: "completed" as const, readiness: "terminal" as const, resultSummary: null, failureReason: null,
+      resultProjection: {
+        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "available" as const,
+        role: "scout" as const, status: "completed" as const, candidateCount: jobIds.length, evidenceCount: jobIds.length,
+        candidates: jobIds.map(jobId => ({ jobId, source: "greenhouse" as const, evidenceKinds: ["job" as const] })),
+      },
+    })
+    const graphStates = new Map<number, TaskGraphCurrentState>([
+      [1, { revision: 1, nodes: [currentNode("prior-research", "prior-child", ["job-shared"])], planningFacts: buildTaskGraphPlanningFacts(firstLoadedGraph) ?? undefined }],
+      [2, { revision: 2, nodes: [currentNode("prior-research", "prior-child", ["job-shared"]), currentNode("research", "planned-child", ["job-shared", "job-current-2"])], planningFacts: buildTaskGraphPlanningFacts(nextLoadedGraph) ?? undefined }],
+    ])
+    const finalSummaryBinding = buildTaskGraphFinalSummaryBinding(nextLoadedGraph)!
+    let planRevision = 1
     const appendAndScheduleWithReconciliation = vi.fn(async (_input: TaskGraphScheduleInput, _operation: SteeringReconciliationOperation) => {
-      planRevision = 1
+      planRevision = 2
       steerReconciled = true
-      return { status: "accepted" as const, revision: 1, nodes: [{ key: node.key, taskId: node.taskId, status: "queued" as const }], readyTaskIds: [node.taskId] }
+      return { status: "accepted" as const, revision: 2, nodes: [{ key: node.key, taskId: node.taskId, status: "queued" as const }], readyTaskIds: [node.taskId] }
     })
     const taskGraphCommandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => { throw new Error("raw planning command was used") }),
       appendAndScheduleWithReconciliation,
       reconcileSteering: vi.fn(async () => ({ decision: "keep" as const, revision: planRevision, reconciledInputCount: 0 })),
-      readCurrent: vi.fn(async (_scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> => ({ revision: planRevision, nodes: planRevision === 0 ? [] : [node] })),
+      readCurrent: vi.fn(async (_scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> => graphStates.get(planRevision)! ),
     }
     const resumed = state({
       rootInputId: originalInput.id,
       resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 3n, consumedInputIds: ["previous-step-steer"], usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 } },
       snapshot: {
         ...state().snapshot, goal: { id: "canonical-goal", content: "Find software engineering roles." },
+        businessRefs: [{ id: "verified-current-job", kind: "job", ownerId: "user-1", label: "Verified current job" }],
         steerHistory: [
           { id: "agent-question:question-item-2:question", content: { role: "assistant", type: "question", question: latestStepQuestionText, options: [{ label: "Germany", value: "de" }] } },
           { id: "agent-question:question-item-2:answer", content: { role: "user", type: "answer", questionId: "wait-2", text: latestStepAnswerText } },
@@ -747,7 +795,7 @@ describe("createCanonicalTurnRuntime", () => {
       },
     })
     const proposal = {
-      expectedRevision: 0,
+      expectedRevision: 1,
       nodes: [{ key: node.key, templateId: "scout", goal: node.goal, successCriteria: [...node.successCriteria], dependsOn: [],
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } }],
     }
@@ -767,12 +815,17 @@ describe("createCanonicalTurnRuntime", () => {
     const pastOutcome = failedRootHistoryOutcome()
     rootTaskHistory.load.mockReset().mockImplementation(async () => [pastOutcome])
     const verificationRuntime = nativeVerificationRuntime()
+    const rootTasks = {
+      ...rootStore(),
+      checkCompletion: vi.fn(async () => Object.assign({ ok: true as const }, { [TASK_GRAPH_FINAL_SUMMARY_BINDING]: finalSummaryBinding })),
+    }
+    const persistFinal = vi.spyOn(questionStore, "recordFinalResponse")
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
         ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
       }), nativeQuestionWaitEnabled: true, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
-      selectedJobPreparationLoader: async () => undefined, stateLoader: async () => resumed, rootTaskStore: rootStore() as never,
+      selectedJobPreparationLoader: async () => undefined, stateLoader: async () => resumed, rootTaskStore: rootTasks as never,
       nativeVerificationFactory: () => verificationRuntime, turnEngineStoreFactory: () => questionStore,
       contextBuilderFactory: () => ({ build: async request => { const context = await builder.build(request); contexts.push(context); return context } }),
       modelRuntimeFactory: async () => ({ adapter: modelAdapter, registry: {} as never, candidates: [] }),
@@ -784,13 +837,24 @@ describe("createCanonicalTurnRuntime", () => {
     expect(questionStore.readPendingQuestion).toHaveBeenCalledOnce()
     expect(appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
     const [scheduled, operation] = appendAndScheduleWithReconciliation.mock.calls[0]!
-    expect(scheduled.proposal.expectedRevision).toBe(0)
-    expect(operation).toMatchObject({ decision: "revise", expectedRevision: 0, callId: "plan-after-answer", rootInputId: originalInput.id })
+    expect(scheduled.proposal.expectedRevision).toBe(1)
+    expect(operation).toMatchObject({ decision: "revise", expectedRevision: 1, callId: "plan-after-answer", rootInputId: originalInput.id })
     expect(operation.scope.stepId).toBe(contexts[0]?.stepId)
     const tools = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
     expect(tools).toEqual(expect.arrayContaining(["agent.plan", "agent.reconcile", "agent.ask_user"]))
     expect(contexts).toHaveLength(2)
-    expect(contexts.map(context => context.taskGraphRevision)).toEqual([0, 1])
+    expect(contexts.map(context => context.taskGraphRevision)).toEqual([1, 2])
+    const currentGraphBlocks = contexts.map(context => context.blocks.find(block => block.content !== null
+      && typeof block.content === "object" && !Array.isArray(block.content) && block.content.kind === "task_graph_current"))
+    expect(currentGraphBlocks).toHaveLength(2)
+    expect(currentGraphBlocks.map(block => block?.trust)).toEqual(["external_untrusted", "external_untrusted"])
+    expect(currentGraphBlocks.map(block => (block?.content as { taskReportedCounts?: unknown }).taskReportedCounts)).toEqual([
+      buildTaskGraphPlanningFacts(firstLoadedGraph)?.counts,
+      buildTaskGraphPlanningFacts(nextLoadedGraph)?.counts,
+    ])
+    expect((currentGraphBlocks[0]?.content as { taskReportedCounts: { discoveredJobs: { knownCount: number } } }).taskReportedCounts.discoveredJobs.knownCount).toBe(1)
+    expect((currentGraphBlocks[1]?.content as { taskReportedCounts: { discoveredJobs: { knownCount: number } } }).taskReportedCounts.discoveredJobs.knownCount).toBe(2)
+    expect(JSON.stringify(currentGraphBlocks.map(block => (block?.content as { taskReportedCounts?: unknown }).taskReportedCounts))).not.toContain("historical-job")
     const historyBlocks = contexts.map(context => context.blocks.filter(block => block.content !== null
       && typeof block.content === "object" && !Array.isArray(block.content) && block.content.kind === "root_task_history"))
     expect(historyBlocks).toHaveLength(2)
@@ -814,6 +878,9 @@ describe("createCanonicalTurnRuntime", () => {
       expect(payload).toContain("criterion_not_met")
       expect(payload).not.toContain("PRIVATE_HISTORY")
       expect(payload).not.toContain("private-history")
+      expect(payload).not.toContain("PRIVATE_SCOUT_RESULT")
+      expect(payload).not.toContain("PRIVATE_FINAL_TEXT")
+      expect(payload).not.toContain("TASK_GRAPH_FINAL_SUMMARY_BINDING")
     }
     expect(rootTaskHistory.load).toHaveBeenCalledTimes(2)
     const historyStepIds = rootTaskHistory.load.mock.calls.map(([input]) => (input as { stepId?: unknown }).stepId)
@@ -837,6 +904,10 @@ describe("createCanonicalTurnRuntime", () => {
     expect(contexts.map(context => context.consumedInputIds)).toEqual([[], []])
     const requestMessages = requests.map(request => JSON.stringify(request.messages))
     expect(requestMessages).toHaveLength(2)
+    const requestText = requests.map(request => request.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n"))
+    expect(requestText[0]).toContain('"knownCount":1')
+    expect(requestText[1]).toContain('"knownCount":2')
     for (const messages of requestMessages) {
       expect(messages).toContain(originalText)
       expect(messages).toContain(questionText)
@@ -876,7 +947,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requestMessages[1]).not.toContain(steerParts[0])
     expect(requestMessages[1]).not.toContain(steerParts[1])
     const agendas = events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE).map(event => event.payload as { planRevision: number; signals: { pendingInputs: { ids: readonly string[] } } })
-    expect(agendas.map(agenda => agenda.planRevision)).toEqual([0, 1])
+    expect(agendas.map(agenda => agenda.planRevision)).toEqual([1, 2])
     expect(agendas.map(agenda => agenda.signals.pendingInputs.ids)).toEqual([[steer.id], []])
     expect(JSON.stringify(agendas)).not.toContain(originalInput.id)
     expect(JSON.stringify(events)).not.toContain(originalText)
@@ -884,6 +955,16 @@ describe("createCanonicalTurnRuntime", () => {
     expect(steerParts.every(part => !JSON.stringify(events).includes(part))).toBe(true)
     expect(checkpoints.map(checkpoint => checkpoint.consumedInputIds)).toEqual([[], []])
     expect(checkpoints.map(checkpoint => checkpoint.inputThroughSequence)).toEqual([3n, 3n])
+    expect(executionResult).toMatchObject({ status: "completed" })
+    expect(persistFinal).toHaveBeenCalledOnce()
+    const terminal = persistFinal.mock.calls[0]![0].terminal!
+    const terminalContent = terminal.finalContent as { text: string; final: { response: string; summary: string } }
+    expect(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toEqual(finalSummaryBinding)
+    expect(terminalContent).toMatchObject({ text: "I found sourced roles.", final: {
+      response: "I found sourced roles.", summary: formatTaskGraphFinalSummary(finalSummaryBinding.summary),
+    } })
+    expect(terminalContent.final.response).toBe(terminalContent.text)
+    expect(JSON.stringify(terminalContent)).not.toContain("TASK_GRAPH_FINAL_SUMMARY_BINDING")
   })
 
   it("keeps the native receipt graph gate on planner roots without a root-store graph checker", async () => {
