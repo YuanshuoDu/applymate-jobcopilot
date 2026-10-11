@@ -2110,7 +2110,8 @@ describe("createCanonicalTurnRuntime", () => {
     })
     if (!historicalProjection) throw new Error("historical_typed_failure_fixture_invalid")
     expect(historicalProjection.nodeLessons?.[0]).toMatchObject({ nodeOrdinal: 1, criterionFailures: [
-      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } },
     ] })
     const historicalOutcome: ValidatedRootTaskHistoryOutcome = {
       sourceTurnId: "PRIVATE_HISTORY_SOURCE_TURN", sourceRootTaskId: "PRIVATE_HISTORY_SOURCE_ROOT", terminalSequence: 11n,
@@ -2381,8 +2382,10 @@ describe("createCanonicalTurnRuntime", () => {
     for (const block of historyBlocks) {
       expect(block).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent",
         content: { kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
-          turns: [{ label: "earlier terminal attempt", nodes: [{ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"] }] }] } })
+          turns: [{ label: "earlier terminal attempt", nodes: [{ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"],
+            lesson: { criterionFailures: [{ check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] } }] }] } })
       expect(JSON.stringify(block?.content)).not.toMatch(/PRIVATE_HISTORY|private-history|evidenceDigest|resultDigest|verificationReport|PASS/)
+      expect(JSON.stringify(block?.content)).not.toContain("candidate-count")
     }
     for (const context of contexts) {
       const rootBlock = context.blocks.find(block => block.layer === "pending_input" && block.content !== null
@@ -2409,6 +2412,8 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).toContain('"graphRevisionAtAsk":7')
       expect(text).toContain("root_task_history")
       expect(text).toContain("criterion_not_met")
+      expect(text).toContain('"kind":"candidate_count_gte"')
+      expect(text).toContain('"minimum":1')
       expect(text).not.toMatch(/PRIVATE_HISTORY|private-history|private\.example|PRIVATE_RESULT_PROSE|PRIVATE_FINAL_TEXT|TASK_GRAPH_FINAL_SUMMARY_BINDING/)
       expect(text).toContain(index < 4 ? '"knownCount":4' : '"knownCount":5')
     }
@@ -2423,7 +2428,10 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).toContain("visible agent.list only for matching result pages")
       expect(text).toContain("complete current result pages")
       expect(text).toContain("preserve the valid plan")
+      expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only")
       expect(text).not.toMatch(/PRIVATE_HISTORY|historical-scout|candidate-count|nodeOrdinal|criterionOrdinal|reported count/i)
+      expect(text).not.toContain("candidate_count_gte")
+      expect(text).not.toContain('"minimum":1')
     }
     const visibleTools = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
     expect(visibleTools).toEqual(expect.arrayContaining(["agent.list", "agent.plan"]))

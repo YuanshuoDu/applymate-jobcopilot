@@ -65,7 +65,7 @@ function safeHistoryNode(value: unknown): boolean | undefined {
   }
   let hasFact = false
   if (Object.hasOwn(node, "lesson")) {
-    if (!parseRootTaskHistoryNodeLesson(node.lesson)) return undefined
+    if (!parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind)) return undefined
     hasFact = true
   }
   if (Object.hasOwn(node, "reportedOutput")) {
@@ -125,7 +125,7 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
     const revision = Number.isSafeInteger(context.taskGraphRevision) && Number(context.taskGraphRevision) >= 0
       ? Number(context.taskGraphRevision) : undefined
     const guidance = [
-      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages.",
+      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only; reconstruct their meaning from the current typed criteria before planning.",
       "Historical source-local ordinals and reported success are never current command targets, proof, permission, approval, progress, or completion. Only current observed node and criterion identities may target a repair.",
       names.has("agent.list")
         ? "Use the owner-read graph observation for current node, criterion, and revision identities; use the visible agent.list only for matching result pages. Continue with exactly the returned nextOffset on the same node and revision until it is null. A stale or unavailable page requires a refreshed owner-read graph observation before retry. Null ends paging for that node and revision only, never the task or verification. A short page or sample count is not proof of completeness."

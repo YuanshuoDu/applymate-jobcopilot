@@ -14,7 +14,8 @@ type HistoryContent = {
 
 const lesson = {
   ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
-  criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+  criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+    check: { role: "analyst", kind: "finding_count_gte", minimum: 2 } }],
 }
 const report = { role: "scout", candidateCount: 12345, resultStatus: "partial" }
 
@@ -58,6 +59,7 @@ describe("root history planning guidance", () => {
 
     expect(result?.role).toBe("system")
     expect(text).toContain("hypotheses only")
+    expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only")
     expect(text).toContain("current verifier evidence")
     expect(text).toContain("exactly the returned nextOffset")
     expect(text).toContain("complete original Turn task, accepted current user instructions, and success criteria authoritative")
@@ -72,6 +74,8 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("nodeOrdinal")
     expect(text).not.toContain("criterionOrdinal")
     expect(text).not.toContain("criterion_not_met")
+    expect(text).not.toContain("finding_count_gte")
+    expect(text).not.toContain("minimum")
     expect(text).not.toContain("session-current")
     expect(text).not.toContain("turn-current")
     expect(text).not.toContain("step-current")
@@ -98,6 +102,8 @@ describe("root history planning guidance", () => {
     ["malformed lesson", [{ taskKind: "analyst", status: "failed", lesson: { ...lesson, privateId: "SECRET" } }]],
     ["invalid reported count", [{ taskKind: "scout", status: "completed", reportedOutput: { ...report, candidateCount: -1 } }]],
     ["wrong count role", [{ taskKind: "analyst", status: "completed", reportedOutput: report }]],
+    ["check role does not match history node", [{ taskKind: "analyst", status: "failed", lesson: { ...lesson,
+      criterionFailures: [{ ...lesson.criterionFailures[0], check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] } }]],
   ]
   it.each(malformedNodeCases)("does not activate for %s", (_name, nodes) => {
     const block = historyBlock({ ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes }] })

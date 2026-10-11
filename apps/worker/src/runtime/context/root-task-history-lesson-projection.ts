@@ -13,15 +13,11 @@ import { validateTaskGraphVerificationContract, type TaskGraphVerificationReason
 import type { StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
 import { currentTaskGraph } from "../subagents/task-graph-pg-state.js"
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
+import { describeValidatedRootTaskHistoryChecks, filterRootTaskHistoryLessonsForEmittedNodes,
+  parseRootTaskHistoryNodeLesson, type RootTaskHistoryCheckDescriptor, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-schema.js"
 
-export type RootTaskHistoryNodeLesson = Readonly<{
-  ordinalScope: "source_graph_local"
-  advisoryOnly: true
-  notCurrentEvidence: true
-  nodeOrdinal: number
-  criterionFailures: readonly Readonly<{ criterionOrdinal: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>[]
-  successfulRepairs?: readonly Readonly<{ targetNodeOrdinal: number; targetCriterionOrdinals: readonly number[]; status: "passed" }>[]
-}>
+export { filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson }
+export type { RootTaskHistoryCheckDescriptor, RootTaskHistoryNodeLesson } from "./root-task-history-lesson-schema.js"
 
 export type LoadedRootTaskHistoryGraphProjection = Readonly<{
   taskGraph: TaskGraphCurrentState
@@ -39,94 +35,6 @@ const REASONS = new Set<TaskGraphVerificationReasonCode>([
   "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",
   "result_ambiguous", "result_evidence_unbound",
 ])
-
-function exactDataRecord(value: unknown, keys: string): Row | undefined {
-  try {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-    const prototype = Object.getPrototypeOf(value), own = Reflect.ownKeys(value)
-    if ((prototype !== Object.prototype && prototype !== null) || own.some(key => typeof key !== "string") || [...own].sort().join(",") !== keys) return undefined
-    const descriptors = Object.getOwnPropertyDescriptors(value), result: Row = Object.create(null) as Row
-    for (const key of own as string[]) {
-      const descriptor = descriptors[key]
-      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return undefined
-      result[key] = descriptor.value
-    }
-    return result
-  } catch { return undefined }
-}
-function safeArray(value: unknown, maximum: number, allowEmpty: boolean): unknown[] | undefined {
-  try {
-    if (!Array.isArray(value)) return undefined
-    const own = Reflect.ownKeys(value), length = Object.getOwnPropertyDescriptor(value, "length")?.value
-    if (!Number.isSafeInteger(length) || Number(length) < (allowEmpty ? 0 : 1) || Number(length) > maximum || own.length !== Number(length) + 1) return undefined
-    const result: unknown[] = []
-    for (let index = 0; index < Number(length); index++) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
-      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return undefined
-      result.push(descriptor.value)
-    }
-    return result
-  } catch { return undefined }
-}
-function ordinal(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= MAX_NODES }
-
-/** Strictly reconstructs the closed, privacy-safe history fact shape. */
-export function parseRootTaskHistoryNodeLesson(value: unknown): RootTaskHistoryNodeLesson | undefined {
-  const hasRepairs = exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope,successfulRepairs")
-  const row = hasRepairs ?? exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope")
-  if (!row || row.ordinalScope !== "source_graph_local" || row.advisoryOnly !== true || row.notCurrentEvidence !== true || !ordinal(row.nodeOrdinal)) return undefined
-  const failures = safeArray(row.criterionFailures, MAX_NODES, true)
-  if (!failures) return undefined
-  const criterionFailures: Array<RootTaskHistoryNodeLesson["criterionFailures"][number]> = []
-  const seenCriteria = new Set<number>()
-  for (const failure of failures) {
-    const item = exactDataRecord(failure, "criterionOrdinal,reasonCode,status")
-    const previous = criterionFailures.at(-1)
-    if (!item || !ordinal(item.criterionOrdinal) || (item.status !== "failed" && item.status !== "unverified")
-      || typeof item.reasonCode !== "string" || !REASONS.has(item.reasonCode as TaskGraphVerificationReasonCode)
-      || seenCriteria.has(item.criterionOrdinal) || (previous && previous.criterionOrdinal >= item.criterionOrdinal)) return undefined
-    seenCriteria.add(item.criterionOrdinal)
-    criterionFailures.push({ criterionOrdinal: item.criterionOrdinal, status: item.status, reasonCode: item.reasonCode as TaskGraphVerificationReasonCode })
-  }
-  const successfulRepairs: Array<{ targetNodeOrdinal: number; targetCriterionOrdinals: readonly number[]; status: "passed" }> = []
-  if (hasRepairs) {
-    const repairs = safeArray(row.successfulRepairs, 1, false)
-    if (!repairs) return undefined
-    for (const repair of repairs) {
-      const item = exactDataRecord(repair, "status,targetCriterionOrdinals,targetNodeOrdinal")
-      const targets = item && safeArray(item.targetCriterionOrdinals, MAX_NODES, false)
-      if (!item || item.status !== "passed" || !ordinal(item.targetNodeOrdinal) || item.targetNodeOrdinal >= row.nodeOrdinal
-        || !targets || targets.some((target, index) => !ordinal(target) || (index > 0 && Number(target) <= Number(targets[index - 1])))) return undefined
-      successfulRepairs.push({ targetNodeOrdinal: item.targetNodeOrdinal, targetCriterionOrdinals: targets as number[], status: "passed" })
-    }
-  }
-  if (!criterionFailures.length && !successfulRepairs.length) return undefined
-  return { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: row.nodeOrdinal,
-    criterionFailures, ...(successfulRepairs.length ? { successfulRepairs } : {}) }
-}
-
-/** Keeps only links whose repair, target and exact target criteria survived final node selection. */
-export function filterRootTaskHistoryLessonsForEmittedNodes(
-  lessons: readonly (RootTaskHistoryNodeLesson | undefined)[], emittedNodeOrdinals: readonly number[],
-): readonly (RootTaskHistoryNodeLesson | undefined)[] {
-  const input = safeArray(lessons, MAX_NODES, true)
-  if (!input) return []
-  const omitted = input.map(() => undefined), emitted = safeArray(emittedNodeOrdinals, MAX_NODES, true)
-  if (!emitted || emitted.some(value => !ordinal(value)) || new Set(emitted).size !== emitted.length) return omitted
-  const selected = new Set(emitted as number[]), parsed = input.map((value, index) => {
-    const lesson = value === undefined ? undefined : parseRootTaskHistoryNodeLesson(value)
-    return lesson?.nodeOrdinal === index + 1 ? lesson : undefined
-  })
-  return parsed.map((lesson, index) => {
-    if (!lesson || !selected.has(index + 1)) return undefined
-    const links = lesson.successfulRepairs?.filter(link => selected.has(index + 1) && selected.has(link.targetNodeOrdinal)
-      && parsed[link.targetNodeOrdinal - 1]?.criterionFailures && link.targetCriterionOrdinals.every(target =>
-        parsed[link.targetNodeOrdinal - 1]!.criterionFailures.some(failure => failure.criterionOrdinal === target))) ?? []
-    if (!lesson.criterionFailures.length && !links.length) return undefined
-    return { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-      nodeOrdinal: lesson.nodeOrdinal, criterionFailures: lesson.criterionFailures, ...(links.length ? { successfulRepairs: links } : {}) }
-  })
-}
 
 function parseResult(value: unknown): Row | null {
   try {
@@ -176,14 +84,16 @@ function pairSource(loaded: LoadedGraph, graph: TaskGraphCurrentState): Pair[] |
   return pairs
 }
 
-function criterionFailures(pair: Pair, ordinalBase: number): RootTaskHistoryNodeLesson["criterionFailures"] {
+function criterionFailures(pair: Pair, ordinalBase: number,
+  checks: readonly (RootTaskHistoryCheckDescriptor | undefined)[] = []): RootTaskHistoryNodeLesson["criterionFailures"] {
   const ids = pair.source.verification?.criteria.map(item => item.id)
   if (pair.source.verificationDisposition !== "typed" || !ids || !pair.current.verificationReport
     || !taskGraphVerificationReportMatchesStatus(pair.current.verificationReport, pair.status)
     || pair.current.verificationReport.status === "passed") return []
   return pair.current.verificationReport.criteria.flatMap((item, index) =>
     (item.status === "failed" || item.status === "unverified") && REASONS.has(item.reasonCode)
-      ? [{ criterionOrdinal: ordinalBase + index + 1, status: item.status, reasonCode: item.reasonCode }] : [])
+      ? [{ criterionOrdinal: ordinalBase + index + 1, status: item.status, reasonCode: item.reasonCode,
+        ...(checks[index] ? { check: checks[index] } : {}) }] : [])
 }
 
 function successfulRepair(pair: Pair, index: number, pairs: readonly Pair[], loaded: LoadedGraph, satisfiedTargets: ReadonlySet<string>): SuccessfulRepair | undefined {
@@ -210,12 +120,14 @@ export function deriveRootTaskHistoryLessonFacts(loaded: LoadedGraph, currentGra
   try {
     const pairs = pairSource(loaded, currentGraph)
     if (!pairs || !loaded.snapshot || !loaded.state) return []
+    const checkMatrix = describeValidatedRootTaskHistoryChecks(loaded.snapshot)
+    if (!checkMatrix || checkMatrix.length !== pairs.length) return []
     const coverage = resolveTaskGraphRepairDependencies(loaded.snapshot, loaded.tasks, loaded.rootTaskId)
     const satisfied = new Set(coverage.satisfied.filter(key => loaded.state!.repairSatisfiedNodeKeys?.includes(key)))
     return pairs.map((pair, index) => {
-      const failures = criterionFailures(pair, 0), repair = successfulRepair(pair, index, pairs, loaded, satisfied)
+      const failures = criterionFailures(pair, 0, checkMatrix[index] ?? []), repair = successfulRepair(pair, index, pairs, loaded, satisfied)
       return parseRootTaskHistoryNodeLesson({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-        nodeOrdinal: index + 1, criterionFailures: failures, ...(repair ? { successfulRepairs: [repair] } : {}) })
+        nodeOrdinal: index + 1, criterionFailures: failures, ...(repair ? { successfulRepairs: [repair] } : {}) }, pair.source.verification?.role)
     })
   } catch { return [] }
 }
