@@ -180,12 +180,13 @@ function turnStore(seed?: PersistedState, crashCut?: CrashCut, startStepStatus: 
   return { state, store, startedStepIds, updatedSteps, get beforeWaitClose() { return beforeWaitClose } }
 }
 
-function waitModel(requests: HarnessModelRequest[], input: unknown): ModelAdapter {
+function waitModel(requests: HarnessModelRequest[], input: unknown, appendUnexecutedTail = false): ModelAdapter {
   return {
     id: "fixture-model", profile,
     async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
       requests.push(request)
       yield { type: "tool_call_completed", callId: "wait-call-1", name: "agent.wait", arguments: input }
+      if (appendUnexecutedTail) yield { type: "tool_call_completed", callId: "tail-call-1", name: "agent.list", arguments: { includeTerminal: true } }
       yield { type: "usage", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }
       yield { type: "completed", finishReason: "tool_calls" }
     },
@@ -268,6 +269,7 @@ function createWaitEngine(input: {
   readonly snapshot?: StepContextSnapshot
   readonly recoveredWaitControl?: RecoveredArchivedWaitControl
   readonly resume?: TurnEngineOptions["resume"]
+  readonly appendUnexecutedTail?: boolean
   readonly wait: boolean
 }): {
   readonly engine: TurnEngine
@@ -289,7 +291,7 @@ function createWaitEngine(input: {
   const requests: HarnessModelRequest[] = []
   const engine = new TurnEngine(loopOptions({
     store: persisted.store, router: runtime.router, registry: runtime.registry,
-    model: input.wait ? waitModel(requests, runtime.input) : continuationModel(requests),
+    model: input.wait ? waitModel(requests, runtime.input, input.appendUnexecutedTail) : continuationModel(requests),
     reader: reads.reader, snapshot: input.snapshot ?? snapshot(), recoveredWaitControl: input.recoveredWaitControl, resume: input.resume,
   }))
   return { engine, persisted, runtime, requests, readerCalls: reads.calls, readerAdmissions: reads.admissions, readerObservations: reads.observations }
@@ -362,6 +364,62 @@ describe("archived durable wait recovery integration", () => {
     expect(fresh.runtime.archive.records[0]?.byteCount).toBeGreaterThan(8 * 1024)
     expect(fresh.runtime.archive.read).not.toHaveBeenCalled()
     expect(fresh.persisted.state.steps).toMatchObject([{ status: "waiting_for_tool", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }])
+  })
+
+  it("recovers a streaming archived wait from the full model batch without replaying its persisted prefix", async () => {
+    const first = createWaitEngine({ controlStatus: "waiting", startStepStatus: "streaming",
+      crashCut: "before-wait-step-update", appendUnexecutedTail: true, wait: true })
+    await expect(first.engine.run()).resolves.toMatchObject({ status: "waiting_for_dependency", waitId, stepCount: 1, toolCallCount: 1 })
+
+    const cut = first.persisted.beforeWaitClose
+    expect(cut?.steps).toMatchObject([{ status: "streaming", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }])
+    expect(cut?.events.filter(event => event.type.startsWith("model.")).map(event => event.type))
+      .toEqual(["model.started", "model.completed", "model.usage"])
+    expect(cut?.events.find(event => event.type === "model.completed")?.payload).toMatchObject({ toolCallCount: 2 })
+    expect(cut?.events.find(event => event.type === "model.usage")?.payload).toMatchObject({
+      usage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 },
+    })
+    expect(cut?.items.filter(item => item.type === "tool_call")).toHaveLength(1)
+    expect(cut?.items.filter(item => item.type === "tool_call")[0]?.content).toMatchObject({ toolCallId: "wait-call-1", toolName: "agent.wait" })
+    expect(cut?.items.filter(item => item.type === "tool_result")).toHaveLength(1)
+    expect(cut?.items.find(item => item.type === "tool_result")?.content).toMatchObject({
+      toolCallId: "wait-call-1", output: { $ref: referenceId, sizeBytes: first.runtime.archive.records[0]?.byteCount,
+        sha256: first.runtime.archive.records[0]?.sha256 },
+    })
+    expect(first.runtime.wait).toHaveBeenCalledOnce()
+    expect(first.runtime.archive.read).not.toHaveBeenCalled()
+
+    const restoredTools = restoreToolCallState(cut?.items ?? [], cut?.events ?? [])
+    const reads = controlReader("waiting")
+    const recovered = await recoverCanonicalArchivedWaitControl({
+      identity: executionOwnerFence(owner), steps: cut?.steps ?? [], items: cut?.items ?? [], events: cut?.events ?? [],
+      observations: restoredTools.observations, snapshot: snapshot(restoredTools.observations), reader: reads.reader,
+      now: new Date("2026-10-10T10:00:30.000Z"),
+    })
+    expect(recovered).toMatchObject({ waitId, status: "waiting", stepId: cut?.steps[0]?.id, stepStatus: "streaming",
+      inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003, toolCallCount: 2, persistedToolCallCount: 1,
+      usageDelta: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 },
+      stepCompletionRecorded: false, canonicalOutcomeResolved: false })
+    expect(reads.calls).toHaveLength(1)
+    expect(reads.admissions).toEqual(["restored_inflight_root"])
+
+    if (!recovered || !cut?.steps[0]) throw new Error("fixture_recovered_wait_missing")
+    const resumed = createWaitEngine({ controlStatus: "waiting", seed: structuredClone(cut),
+      snapshot: snapshot(restoredTools.observations), recoveredWaitControl: recovered,
+      resume: resumedState(1, 2, resumedUsage(cut.steps[0])), wait: true })
+    await expect(resumed.engine.run()).resolves.toMatchObject({ status: "waiting_for_dependency", waitId, stepCount: 1, toolCallCount: 2 })
+    expect(resumed.requests).toHaveLength(0)
+    expect(resumed.persisted.startedStepIds).toEqual([])
+    expect(resumed.runtime.wait).not.toHaveBeenCalled()
+    expect(resumed.persisted.state.steps).toHaveLength(1)
+    expect(resumed.persisted.state.steps[0]).toMatchObject({ id: cut.steps[0].id, status: "waiting_for_tool",
+      inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 })
+    expect(resumed.persisted.state.items.filter(item => item.type === "tool_call")).toHaveLength(1)
+    expect(resumed.persisted.state.items.filter(item => item.type === "tool_result")).toHaveLength(1)
+    expect(resumed.persisted.state.events.filter(event => event.type === "model.usage" && event.correlationId === cut.steps[0].id)).toHaveLength(1)
+    expect(resumed.persisted.state.events.filter(event => event.type === "step.completed" && event.correlationId === cut.steps[0].id))
+      .toMatchObject([{ payload: { status: "waiting_for_dependency", toolCallCount: 2 } }])
+    expect(resumed.runtime.archive.read).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -463,11 +521,13 @@ describe("archived durable wait recovery integration", () => {
     expect(Object.keys(projected.content.input as object).sort()).toEqual(["mode", "taskIds"])
     const loadedSnapshot = snapshot([...restoredTools.observations, observation])
     const reads = controlReader("ready")
-    await expect(recoverCanonicalArchivedWaitControl({
+    const recovered = await recoverCanonicalArchivedWaitControl({
       identity: executionOwnerFence(owner), steps: persisted.steps, items: persisted.items, events: persisted.events,
       observations: loadedSnapshot.toolObservations, snapshot: loadedSnapshot, reader: reads.reader,
       now: new Date("2026-10-10T10:01:00.000Z"),
-    })).resolves.toBeUndefined()
+    })
+    expect(recovered).toMatchObject({ waitId, status: "ready", stepId: persisted.steps[0]?.id,
+      stepStatus: "waiting_for_tool", toolCallCount: 1, persistedToolCallCount: 1, canonicalOutcomeResolved: true })
     expect(reads.calls).toHaveLength(1)
     expect(reads.admissions).toEqual(["restored_inflight_root"])
     expect(reads.calls[0]).toMatchObject({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: persisted.steps[0]?.id,
@@ -475,7 +535,7 @@ describe("archived durable wait recovery integration", () => {
 
     const continued = createWaitEngine({
       controlStatus: "ready", seed: structuredClone(persisted), snapshot: loadedSnapshot,
-      resume: resumedState(1, 1, resumedUsage(persisted.steps[0])), wait: false,
+      recoveredWaitControl: recovered, resume: resumedState(1, 1, resumedUsage(persisted.steps[0])), wait: false,
     })
     const resultAfterReady = await continued.engine.run()
     expect(resultAfterReady.status).toBe("completed")
@@ -513,11 +573,13 @@ describe("archived durable wait recovery integration", () => {
     const acceptedSteer = { id: "input-accepted-steer-1", content: steerText }
     const loadedSnapshot = snapshot([...restoredTools.observations, projected], [acceptedSteer])
     const reads = controlReader("interrupted")
-    await expect(recoverCanonicalArchivedWaitControl({
+    const recovered = await recoverCanonicalArchivedWaitControl({
       identity: executionOwnerFence(owner), steps: persisted.steps, items: persisted.items, events: persisted.events,
       observations: loadedSnapshot.toolObservations, snapshot: loadedSnapshot, reader: reads.reader,
       now: new Date("2026-10-10T10:00:30.000Z"),
-    })).resolves.toBeUndefined()
+    })
+    expect(recovered).toMatchObject({ waitId, status: "interrupted", stepId: persisted.steps[0]?.id,
+      stepStatus: "waiting_for_tool", toolCallCount: 1, persistedToolCallCount: 1, canonicalOutcomeResolved: true })
     expect(reads.calls).toHaveLength(1)
     expect(reads.admissions).toEqual(["restored_inflight_root"])
     expect(reads.calls[0]).toMatchObject({ stepId: persisted.steps[0]?.id, taskId: rootId, rootTaskId: rootId,
@@ -525,7 +587,7 @@ describe("archived durable wait recovery integration", () => {
 
     const continued = createWaitEngine({
       controlStatus: "interrupted", seed: structuredClone(persisted), snapshot: loadedSnapshot,
-      resume: resumedState(1, 1, resumedUsage(persisted.steps[0])), wait: false,
+      recoveredWaitControl: recovered, resume: resumedState(1, 1, resumedUsage(persisted.steps[0])), wait: false,
     })
     await expect(continued.engine.run()).resolves.toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
     expect(continued.requests).toHaveLength(1)
