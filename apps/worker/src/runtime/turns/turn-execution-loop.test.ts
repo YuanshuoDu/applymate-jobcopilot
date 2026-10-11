@@ -24,6 +24,9 @@ import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsa
 import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tools.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 import type { SteeringMarkerContext, SteeringMarkerWrite } from "../context/steering-marker-store.js"
+import type { HydrationScope } from "../context/steering-reconciliation-context.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import { steeringReconciliationRecoveryError } from "./turn-execution-completion-gate.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -204,11 +207,13 @@ class RootContextClaimStore implements InputClaimStore {
   readonly inputs: Array<StoredAgentInput & { status: StoredAgentInput["status"]; consumedByStepId: string | null; consumedAt: Date | null }>
   readonly claimCounts = new Map<string, number>()
   readonly observedSteeringMarkers: SteeringMarkerWrite[] = []
+  readonly reconciledSteeringInputIds = new Set<string>()
   readCount = 0
 
   constructor(input: StoredAgentInput) { this.inputs = [{ ...input }] }
   get input() { return this.inputs[0]! }
   addInput(input: StoredAgentInput): void { this.inputs.push({ ...input }) }
+  reconcileSteering(inputId: string): void { this.reconciledSteeringInputIds.add(inputId) }
   startStep(stepId: string, inputThroughSequence: bigint): void { this.checkpoints.set(stepId, { inputThroughSequence, consumedInputIds: [] }) }
 
   async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
@@ -231,6 +236,11 @@ class RootContextClaimStore implements InputClaimStore {
         return { inputs: [...existing, ...candidates], newlyClaimedInputIds: candidates.map(input => input.id) }
       },
       loadActiveSteeringInputs: async () => [],
+      loadUnresolvedSteeringInputs: async (request: HydrationScope) => this.inputs.filter(input =>
+        input.sessionId === request.sessionId && input.targetTurnId === request.turnId && input.userId === request.userId
+        && input.delivery === "steer" && ["accepted", "queued", "consumed"].includes(input.status)
+        && !this.reconciledSteeringInputIds.has(input.id),
+      ),
       loadRootInputContext: async request => {
         this.readCount += 1
         return this.inputs.find(input => request.sessionId === input.sessionId && request.turnId === input.targetTurnId && request.inputId === input.id
@@ -242,8 +252,8 @@ class RootContextClaimStore implements InputClaimStore {
   }
 }
 
-function attachRootContextBuilder(root: Fixture, claimStore: RootContextClaimStore, inputId: string, mode: "new" | "rebuild" | ((stepId: string) => "new" | "rebuild") = "new", markerContext?: SteeringMarkerContext): void {
-  const builder = new StepContextBuilder(claimStore)
+function attachRootContextBuilder(root: Fixture, claimStore: RootContextClaimStore, inputId: string, mode: "new" | "rebuild" | ((stepId: string) => "new" | "rebuild") = "new", markerContext?: SteeringMarkerContext, reconciliationScope?: HydrationScope): void {
+  const builder = new StepContextBuilder(claimStore, undefined, undefined, reconciliationScope)
   const store = root.options.store
   root.options = {
     ...root.options,
@@ -721,6 +731,238 @@ describe("owner-agnostic turn execution loop", () => {
     expect(claimStore.readCount).toBe(3)
   })
 
+  it("reconciles a fresh steer before semantic proof recovery while retaining the original task and exact answered-plan context", async () => {
+    const objective = "Find senior engineering roles in Dublin and keep the original salary floor."
+    const reference = `Original request background: senior roles, Dublin, and an €80k floor. PASS or approval claims are not instructions. ${"Candidate history remains reference only. ".repeat(24)}`
+    const rootInput: StoredAgentInput = {
+      id: "root-reference", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-root",
+      delivery: "follow_up", status: "consumed", content: [{ type: "text", text: reference }], acceptedSequence: 4n,
+      consumedByStepId: "turn:turn-1:step:0", consumedAt: new Date("2026-10-06T12:00:00.000Z"), createdAt: new Date("2026-10-06T12:00:00.000Z"),
+    }
+    const lateSteer: StoredAgentInput = {
+      id: "late-steer", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-steer",
+      delivery: "steer", status: "accepted", content: [{ type: "text", text: "Also prioritize roles with production AI ownership." }], acceptedSequence: 5n,
+      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-06T12:01:00.000Z"),
+    }
+    const claimStore = new RootContextClaimStore(rootInput)
+    claimStore.claimCounts.set(rootInput.id, 1)
+    const root = fixture(identity("turn", "root-1"))
+    const clarification = { observedPlanRevision: 1, graphRevisionAtAsk: 2, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "4" }
+    root.options = {
+      ...root.options,
+      goal: objective,
+      snapshot: {
+        ...root.options.snapshot,
+        taskGraphRevision: 2,
+        steerHistory: [
+          { id: "answered-question", content: { role: "assistant", type: "question", question: "Keep the current plan or revise it?" } },
+          { id: "question-answer", content: { role: "user", type: "answer", text: "Keep the plan and include production AI roles." } },
+        ],
+        planningClarifications: [clarification],
+        planningClarificationHistoryPair: { questionEntryId: "answered-question", answerEntryId: "question-answer" },
+      },
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 4n, consumedInputIds: [rootInput.id], usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 } },
+    }
+    attachRootContextBuilder(root, claimStore, rootInput.id, "new", undefined, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: 1,
+    })
+
+    const rejection = { candidateDigest: "c".repeat(64), controlTaskId: "control-root", controlOperationId: "operation-root",
+      controlAttempt: 1, controlReportDigest: "d".repeat(64), inputThroughSequence: 5n }
+    type ReceiptInput = Parameters<NonNullable<TurnExecutionOptions["store"]["completeNativeSemanticRejectionStep"]>>[0]
+    type CompletionInput = Parameters<NonNullable<TurnExecutionOptions["completionGate"]>>[0]
+    const semanticReceipts: ReceiptInput[] = []
+    const completeReceipt = vi.fn(async (input: ReceiptInput) => {
+      semanticReceipts.push(input)
+      return { inputThroughSequence: input.identity.inputThroughSequence, distinctStepCount: 1 }
+    })
+    const resetSemanticProgress = vi.fn()
+    let gateCalls = 0
+    const unresolvedAtGate: boolean[] = []
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = Object.assign(vi.fn(async (_input: CompletionInput) => {
+      gateCalls += 1
+      unresolvedAtGate.push(!claimStore.reconciledSteeringInputIds.has(lateSteer.id))
+      if (gateCalls === 1) return { ok: false as const, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
+      if (gateCalls === 2) return {
+        ok: false as const, blocker: "task_graph_verification_unverified", feedback: "criterion=salary-floor status=failed reason=current-evidence-missing",
+        [NATIVE_SEMANTIC_REJECTION]: rejection,
+      }
+      return { ok: true as const }
+    }), { [RESET_NATIVE_SEMANTIC_PROGRESS]: resetSemanticProgress })
+
+    const baseModel = root.options.model
+    let modelCalls = 0
+    root.options = {
+      ...root.options,
+      nativeSemanticProgressMode: "durable_v1",
+      completionGate,
+      store: { ...root.options.store, completeNativeSemanticRejectionStep: completeReceipt },
+      tools: [{ name: "jobs.search", version: "1" }, { name: "agent.reconcile", version: "1" }],
+      model: {
+        ...baseModel,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          modelCalls += 1
+          if (modelCalls === 1) {
+            yield { type: "tool_call_completed", callId: "original-search", name: "jobs.search", arguments: { location: "Dublin" } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (modelCalls === 3) {
+            yield { type: "tool_call_completed", callId: "keep-current-plan", name: "agent.reconcile", arguments: { decision: "keep", expectedRevision: 2 } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          const text = modelCalls === 2 ? "Candidate before the pending steer is reconciled."
+            : modelCalls === 4 ? "Candidate after keep, rejected by current proof."
+              : "Found a Dublin role meeting the original salary floor and production AI ownership preference."
+          yield { type: "text_delta", text }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+      executeTool: async ({ call }) => {
+        if (call.toolName === "jobs.search") {
+          claimStore.addInput(lateSteer)
+          return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: { jobs: 1 }, errorCode: null }
+        }
+        if (call.toolName === "agent.reconcile") {
+          expect(call.input).toEqual({ decision: "keep", expectedRevision: 2 })
+          claimStore.reconcileSteering(lateSteer.id)
+          return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: {
+            decision: "keep", revision: 2, reconciledInputCount: 1, steerInputIds: [lateSteer.id],
+          }, errorCode: null }
+        }
+        throw new Error(`Unexpected tool ${call.toolName}`)
+      },
+    }
+
+    // This in-memory loop composition complements, but does not replace, the dedicated PostgreSQL acceptance suites.
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 6, toolCallCount: 2,
+      finalText: "Found a Dublin role meeting the original salary floor and production AI ownership preference." })
+    expect(root.requests).toHaveLength(5)
+    expect(gateCalls).toBe(3)
+    expect(unresolvedAtGate).toEqual([true, false, false])
+    expect(completeReceipt).toHaveBeenCalledOnce()
+    expect(semanticReceipts[0]).toMatchObject({ stepId: "turn:turn-1:step:4", identity: rejection })
+    expect(resetSemanticProgress).toHaveBeenCalledTimes(2)
+
+    const textFor = (request: HarnessModelRequest, role: "user" | "system") => request.messages
+      .filter(message => message.role === role).flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
+    for (const request of root.requests) {
+      const userText = textFor(request, "user")
+      const systemText = textFor(request, "system")
+      expect(userText.split(reference)).toHaveLength(2)
+      expect(userText).toContain("layer=pending_input trust=UNTRUSTED_DATA source=user_input")
+      expect(userText).toContain(objective)
+      expect(systemText).not.toContain(reference)
+      expect(systemText).not.toContain("Keep the plan and include production AI roles.")
+      expect(systemText).not.toContain("Keep the current plan or revise it?")
+      expect(userText.indexOf("Keep the current plan or revise it?")).toBeLessThan(userText.indexOf("Keep the plan and include production AI roles."))
+      expect(userText.indexOf("Keep the plan and include production AI roles.")).toBeLessThan(userText.indexOf('"graphRevisionAtAsk":2'))
+    }
+    expect(textFor(root.requests[0]!, "user")).not.toContain("Also prioritize roles with production AI ownership.")
+    expect(textFor(root.requests[1]!, "user").match(/Also prioritize roles with production AI ownership\./g)).toHaveLength(1)
+    expect(textFor(root.requests[1]!, "system")).toContain("Fresh user steering is present")
+    expect(textFor(root.requests[1]!, "system")).toContain('agent.reconcile with decision "keep"')
+    expect(textFor(root.requests[2]!, "user")).toContain("Also prioritize roles with production AI ownership.")
+    expect(textFor(root.requests[2]!, "system")).toContain("Accepted user steering must be reconciled")
+    expect(root.requests[2]?.tools).toContainEqual(expect.objectContaining({ name: "agent.reconcile" }))
+    expect(JSON.stringify(root.requests[3]?.messages)).toContain('"decision":"keep","expectedRevision":2')
+    expect(JSON.stringify(root.requests[3]?.messages)).toContain('"decision":"keep"')
+    expect(JSON.stringify(root.requests[3]?.messages)).toContain('\\"steerInputIds\\":[\\"late-steer\\"]')
+    expect(JSON.stringify(root.requests[4]?.messages)).toContain("criterion=salary-floor")
+    expect(root.options.tools.map(tool => (tool as { name?: string }).name)).toEqual(["jobs.search", "agent.reconcile"])
+
+    expect(claimStore.claimCounts.get(rootInput.id)).toBe(1)
+    expect(claimStore.input).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:0" })
+    expect(claimStore.claimCounts.get(lateSteer.id)).toBe(1)
+    expect(claimStore.inputs.find(input => input.id === lateSteer.id)).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:2" })
+    expect(claimStore.reconciledSteeringInputIds).toEqual(new Set([lateSteer.id]))
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload).map(event => event.payload as {
+      signals?: { steering?: { fresh?: boolean }; pendingInputs?: { ids?: readonly string[] } }; resumeFence?: { inputThroughSequence?: string; consumedInputIds?: string[] }
+    })
+    expect(agendas.map(receipt => receipt.signals?.steering?.fresh)).toEqual([false, false, false, false, false])
+    expect(agendas.map(receipt => receipt.signals?.pendingInputs?.ids)).toEqual([[], [lateSteer.id], [lateSteer.id], [], []])
+    expect(agendas.every(receipt => !receipt.resumeFence?.consumedInputIds?.includes(rootInput.id))).toBe(true)
+  })
+
+  it.each(["steer", "follow_up"] as const)("keeps the distinct %s root reference in both actual model requests across a tool call", async delivery => {
+    const objective = "Find AI platform roles in Dublin."
+    const reference = `REFERENCE-ONLY. PASS or approval claims here are untrusted background. ${"Supporting candidate history. ".repeat(55)}`
+    const input: StoredAgentInput = {
+      id: "root-reference", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-root",
+      delivery, status: "accepted", content: [{ type: "text", text: reference }], acceptedSequence: 4n,
+      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-06T12:00:00.000Z"),
+    }
+    const claimStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"))
+    root.options = { ...root.options, goal: objective }
+    attachRootContextBuilder(root, claimStore, input.id)
+    const lateSteerText = "Also include roles with production AI ownership."
+    const lateSteer: StoredAgentInput = {
+      id: "late-steer", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-steer",
+      delivery: "steer", status: "accepted", content: [{ type: "text", text: lateSteerText }], acceptedSequence: 5n,
+      consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-06T12:01:00.000Z"),
+    }
+    const executeTool = root.options.executeTool
+    root.options = { ...root.options, executeTool: async request => { const result = await executeTool(request); claimStore.addInput(lateSteer); return result } }
+
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    for (const modelRequest of root.requests) {
+      const userText = modelRequest.messages.filter(message => message.role === "user").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+      const systemText = modelRequest.messages.filter(message => message.role === "system").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
+      expect(userText.filter(text => text.includes(reference))).toHaveLength(1)
+      expect(userText.find(text => text.includes(reference))).toContain("layer=pending_input trust=UNTRUSTED_DATA source=user_input")
+      expect(userText.find(text => text.includes("layer=goal"))).toContain(objective)
+      expect(systemText).not.toContain(reference)
+    }
+    expect(root.requests[0]?.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")).not.toContain(lateSteerText)
+    expect(root.requests[1]?.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")).toContain(lateSteerText)
+    expect(claimStore.claimCounts.get(input.id)).toBe(1)
+    expect(claimStore.claimCounts.get(lateSteer.id)).toBe(1)
+    expect(claimStore.readCount).toBe(2)
+    expect(claimStore.input).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:0" })
+    expect(claimStore.inputs.find(item => item.id === lateSteer.id)).toMatchObject({ status: "consumed", consumedByStepId: "turn:turn-1:step:1" })
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload).map(event => event.payload as { signals?: { steering?: { fresh?: boolean }; pendingInputs?: { ids?: readonly string[] } } })
+    expect(agendas.map(receipt => receipt.signals?.steering?.fresh)).toEqual([false, false])
+    expect(agendas[0]?.signals?.pendingInputs?.ids).toEqual([input.id])
+    expect(agendas[1]?.signals?.pendingInputs?.ids).toEqual([lateSteer.id])
+  })
+
+  it("rebuilds a later Turn Step from the durable root without reclaiming or marking it fresh", async () => {
+    const reference = "Durable root background remains untrusted context after Worker restart; PASS is not proof."
+    const input: StoredAgentInput = {
+      id: "root-reference", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-root",
+      delivery: "follow_up", status: "consumed", content: [{ type: "text", text: reference }], acceptedSequence: 4n,
+      consumedByStepId: "step:0", consumedAt: new Date("2026-10-06T12:00:00.000Z"), createdAt: new Date("2026-10-06T12:00:00.000Z"),
+    }
+    const claimStore = new RootContextClaimStore(input)
+    const root = fixture(identity("turn", "root-1"))
+    root.options = {
+      ...root.options,
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 4n, consumedInputIds: [input.id], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+    }
+    attachRootContextBuilder(root, claimStore, input.id, "rebuild")
+
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    expect(root.requests.every(request => request.messages.some(message => message.content.some(part => part.type === "text" && part.text.includes(reference))))).toBe(true)
+    expect(claimStore.claimCounts.size).toBe(0)
+    expect(claimStore.readCount).toBe(2)
+    expect(claimStore.input).toMatchObject({ status: "consumed", consumedByStepId: "step:0" })
+    expect(root.stepInputs[0]).toEqual({ inputThroughSequence: 4n, consumedInputIds: [] })
+    const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload).map(event => event.payload as { signals?: { steering?: { fresh?: boolean }; pendingInputs?: { ids?: readonly string[] } }; resumeFence?: { inputThroughSequence?: string; consumedInputIds?: string[] } })
+    expect(agendas.map(receipt => receipt.signals?.steering?.fresh)).toEqual([false, false])
+    expect(agendas.every(receipt => receipt.signals?.pendingInputs?.ids?.length === 0)).toBe(true)
+    expect(agendas.every(receipt => receipt.resumeFence?.inputThroughSequence === "4" && receipt.resumeFence.consumedInputIds?.length === 0)).toBe(true)
+  })
+
   it("rethrows a pause rejected by startStep without terminalizing or invoking the model", async () => {
     const root = fixture(identity("turn", "root-1"))
     const pause = new SessionPauseRequestedError()
@@ -1092,6 +1334,7 @@ describe("owner-agnostic turn execution loop", () => {
     }
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => receipt),
+      appendAndScheduleWithReconciliation: vi.fn(async input => commandPort.appendAndSchedule(input)),
       readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
     }
     const planTool = createTaskGraphPlanningTool({
@@ -1188,6 +1431,7 @@ describe("owner-agnostic turn execution loop", () => {
         appendExpectedRevisions.push(input.proposal.expectedRevision)
         return nextReceipt
       }),
+      appendAndScheduleWithReconciliation: vi.fn(async input => commandPort.appendAndSchedule(input)),
       readCurrent: vi.fn(async () => currentGraph),
     }
     const planTool = createTaskGraphPlanningTool({
@@ -1664,6 +1908,38 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
   })
 
+  it("takes a fresh Root step after a steering reconciliation denial without charging semantic no-progress", async () => {
+    let checks = 0
+    const reset = vi.fn()
+    const gate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ++checks === 1
+      ? ({ ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK })
+      : ({ ok: true })
+    gate[RESET_NATIVE_SEMANTIC_PROGRESS] = reset
+    const root = fixture(identity("turn", "root-1"), undefined, [], gate)
+    const build = root.options.contextBuilder.build
+    root.options.contextBuilder.build = async request => {
+      const context = await build(request)
+      const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+        role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+      return { ...context, blocks: [...system, ...context.blocks] }
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    expect(root.requests).toHaveLength(3)
+    expect(JSON.stringify(root.requests[2]?.messages)).toContain(STEERING_RECONCILIATION_FEEDBACK)
+    expect(JSON.stringify(root.requests[2]?.messages)).toContain("Review the current user instructions")
+    expect(root.events.find(event => event.type === "final.rejected")?.payload).toMatchObject({
+      code: STEERING_RECONCILIATION_BLOCKER, blocker: STEERING_RECONCILIATION_BLOCKER,
+      feedback: STEERING_RECONCILIATION_FEEDBACK,
+    })
+    expect(root.events.some(event => event.type === "turn.no_progress" || event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(reset).toHaveBeenCalledOnce()
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+  })
+
   it("finalizes the third unchanged semantic rejection before the fixed no-progress failure", async () => {
     const candidate = "unchanged candidate"
     let rejects = 0
@@ -1808,6 +2084,38 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "final.rejected" && event.id.includes("task-graph-race"))).toBe(true)
     expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+  })
+
+  it("recovers from the atomic unresolved-steering race and asks a fresh model step", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const reset = vi.fn()
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => ({ ok: true as const }))
+    completionGate[RESET_NATIVE_SEMANTIC_PROGRESS] = reset
+    root.options = { ...root.options, completionGate }
+    const build = root.options.contextBuilder.build
+    root.options.contextBuilder.build = async request => {
+      const context = await build(request)
+      const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+        role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+      return { ...context, blocks: [...system, ...context.blocks] }
+    }
+    let denyOnce = true
+    const persist = root.options.store.recordFinalResponse!
+    root.options.store.recordFinalResponse = async input => {
+      if (input.terminal && denyOnce) { denyOnce = false; throw steeringReconciliationRecoveryError() }
+      return persist(input)
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    expect(root.requests).toHaveLength(3)
+    expect(JSON.stringify(root.requests[2]?.messages)).toContain(STEERING_RECONCILIATION_FEEDBACK)
+    expect(root.events.some(event => event.type === "final.rejected" && event.id.includes("steering-reconciliation-race"))).toBe(true)
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.no_progress")).toBe(false)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(reset).toHaveBeenCalledOnce()
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
   })
 
   it("replans with a steer accepted during native finalization instead of publishing the old answer", async () => {

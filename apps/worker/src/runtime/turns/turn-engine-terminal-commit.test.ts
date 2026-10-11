@@ -5,6 +5,12 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 
+const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+vi.mock("../subagents/steering-reconciliation-ledger.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../subagents/steering-reconciliation-ledger.js")>(),
+  assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
+}))
+
 const now = new Date("2026-09-25T10:00:00.000Z")
 const owner = {
   kind: "turn" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1",
@@ -19,7 +25,7 @@ const input = {
 type Row = Record<string, unknown>
 type Call = { sql: string; values?: readonly unknown[] }
 
-function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: { pause?: boolean } = {}) {
+function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: { pause?: boolean; planningRoot?: boolean } = {}) {
   const calls: Call[] = []
   const events = new Map<string, Row>()
   const outboxes = new Map<string, Row>()
@@ -33,7 +39,8 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
   }))
   let sequence = 10n
   let turn: Row = { id: owner.turnId, status: "in_progress", finalResponse: null, source: "user", ...(currentTurnInput === undefined ? {} : { input: currentTurnInput }) }
-  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, interruptRequestedAt: null }
+  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, interruptRequestedAt: null,
+    allowedActions: options.planningRoot ? ["agent.plan"] : [] }
   const client = {
     query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
@@ -127,6 +134,21 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
 }
 
 describe("atomic Turn terminal commit", () => {
+  it("blocks native planning Root completion while steering remains unresolved", async () => {
+    const fake = makePool([], undefined, { planningRoot: true })
+    assertNoUnresolvedSteeringMock.mockReset().mockRejectedValueOnce(new Error("steering_reconciliation_pending"))
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toThrow("steering_reconciliation_pending")
+    expect(assertNoUnresolvedSteeringMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.taskId, parentTaskId: owner.taskId,
+      turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion, parentLeaseOwner: owner.ownerId, parentAttemptCount: 1,
+    }))
+    expect(fake.state.turn.status).toBe("in_progress")
+    expect(fake.state.root.status).toBe("running")
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+  })
+
   it("completes the Turn and promotes only the oldest pending session follow-up atomically", async () => {
     const fake = makePool([
       { id: "later", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId, acceptedSequence: 8 },

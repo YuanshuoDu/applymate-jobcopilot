@@ -1,7 +1,7 @@
 import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertCompletionAllowed, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
+import { assertCompletionAllowed, steeringReconciliationGateRecovery, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
 import { canEmitTurnCompleted, canPersistFinalResponse, totalTurnUsage, updateExecutionStep } from "./turn-engine-helpers.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
 import { verifyCandidateFinal, snapshotEvidence } from "../verifier.js"
@@ -10,6 +10,7 @@ import type { ModelStepResult } from "./turn-engine-model.js"
 import { publishFinalResponse } from "./turn-execution-events.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
+import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
 
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string }>
@@ -92,6 +93,14 @@ export async function completeTurnCandidate(input: Readonly<{
         terminal: { stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse) }),
           stepCount: input.stepCount, toolCallCount: input.toolCallCount, usage: finalResponse.usage } })
     } catch (error: unknown) {
+      const reconciliation = steeringReconciliationGateRecovery(error)
+      if (reconciliation) {
+        options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
+        await writer.append("final.rejected", step.id, null,
+          { code: STEERING_RECONCILIATION_BLOCKER, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: reconciliation.feedback, taskId: options.identity.taskId },
+          `final-rejected:${step.id}:steering-reconciliation-race`)
+        return { kind: "replan", feedback: reconciliation.feedback }
+      }
       const recovery = taskGraphGateRecovery(error)
       if (!recovery) throw error
       await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback: recovery.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}:task-graph-race`)

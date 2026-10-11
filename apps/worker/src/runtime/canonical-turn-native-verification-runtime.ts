@@ -24,6 +24,8 @@ import { createAgentArtifactRepository, type AgentArtifactDraftHead, type AgentA
 import { loadSelectedJobArtifactContext } from "./subagents/selected-job-artifact-context.js"
 import { selectedJobArtifactCompletionGateWithWitness, type SelectedJobCompletionGraphWitness, type SelectedJobArtifactCompletionGateWithWitnessResult } from "./selected-job-completion-gate.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
+import { hasPendingSteerOrInvalidResult, hasUnresolvedPlanningSteering } from "./canonical-turn-steering-reconciliation.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "./subagents/steering-reconciliation-contract.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 
@@ -41,20 +43,6 @@ export type NativeVerificationTerminalCheck = Readonly<{
   nativeVerificationPassed: boolean
   denial?: TurnEngineCompletionGateResult
 }>
-
-async function hasPendingSteerOrInvalidResult(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<boolean> {
-  const result = await client.query<{ hasPendingSteer: unknown }>(`SELECT EXISTS (
-    SELECT 1 FROM "agent_inputs"
-    WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3
-      AND "delivery" = 'steer' AND "status" IN ('accepted', 'queued')
-      AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL
-  ) AS "hasPendingSteer"`, [scope.sessionId, scope.userId, scope.turnId])
-  const rows: unknown = result?.rows
-  if (!Array.isArray(rows) || rows.length !== 1) return true
-  const row = rows[0]
-  if (!row || typeof row !== "object" || Array.isArray(row) || Object.keys(row).length !== 1 || !Object.hasOwn(row, "hasPendingSteer")) return true
-  return (row as Record<string, unknown>).hasPendingSteer !== false
-}
 
 /** Preserves the selected-job artifact gate as a server-owned sibling completion path. */
 export function createCanonicalSelectedJobCompletion(input: Readonly<{
@@ -205,6 +193,10 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
       acceptedCandidate = undefined
       let observedSemanticReject = false
       try {
+        if (input.enabled && await hasUnresolvedPlanningSteering(input.pool, input.coordination.executionScope(stepId))) {
+          semanticRejection.reset()
+          return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
+        }
         const result = await nativeVerificationCompletionGate({
           candidateText,
           scope: () => input.coordination.executionScope(stepId),
