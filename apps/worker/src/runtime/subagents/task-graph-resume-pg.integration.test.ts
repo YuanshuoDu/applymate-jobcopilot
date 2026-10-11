@@ -3081,6 +3081,32 @@ type RepairWaitFailureClass =
   | "digest_invalid" | "json_invalid" | "wait_call_mismatch" | "wait_receipt_mismatch"
   | "wait_outcome_missing" | "wait_target_mismatch" | "targets_missing" | "reader_not_visible"
   | "read_budget_exceeded" | "other"
+type RepairWaitFailureStage = "output_resolution" | "outcome_validation"
+type RepairWaitFailureErrorKind = "error" | "type_error" | "range_error" | "syntax_error" | "non_error"
+type RepairWaitOutcomeDiagnosticStatus = "ready" | "timed_out" | "waiting" | "unavailable" | "other"
+
+function boundedRepairWaitDiagnosticCount(value: unknown): number {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Math.min(8, Number(value)) : 0
+}
+
+function repairWaitOutcomeDiagnosticStatus(value: unknown): RepairWaitOutcomeDiagnosticStatus {
+  const status = record(value)?.status
+  if (status === "ready" || status === "timed_out" || status === "waiting") return status
+  return typeof status === "string" ? "other" : "unavailable"
+}
+
+function repairWaitFailureErrorKind(error: unknown): RepairWaitFailureErrorKind {
+  try {
+    if (error instanceof TypeError) return "type_error"
+    if (error instanceof RangeError) return "range_error"
+    if (error instanceof SyntaxError) return "syntax_error"
+    if (error instanceof Error) return "error"
+  } catch {
+    return "non_error"
+  }
+  return "non_error"
+}
+
 const REPAIR_WAIT_FAILURE_CLASSES: Readonly<Record<string, RepairWaitFailureClass>> = {
   repair_wait_reference_invalid: "reference_invalid",
   repair_wait_reference_read_limit: "read_limit",
@@ -6112,6 +6138,35 @@ describe("TaskGraph repair wait model-visible outcome fixture", () => {
     expect(repairWaitFailureClass(new Error("__proto__"))).toBe("other")
     expect(repairWaitFailureClass(new Error("constructor"))).toBe("other")
     expect(repairWaitFailureClass(new Error("private provider or result text"))).toBe("other")
+    expect(repairWaitFailureErrorKind(new Error("private message"))).toBe("error")
+    expect(repairWaitFailureErrorKind(new TypeError("private type message"))).toBe("type_error")
+    expect(repairWaitFailureErrorKind(new RangeError("private range message"))).toBe("range_error")
+    expect(repairWaitFailureErrorKind(new SyntaxError("private syntax message"))).toBe("syntax_error")
+    expect(repairWaitFailureErrorKind("private thrown value")).toBe("non_error")
+    const messageGuardedError = new Error()
+    Object.defineProperty(messageGuardedError, "message", { get: () => { throw new Error("private getter") } })
+    expect(repairWaitFailureErrorKind(messageGuardedError)).toBe("error")
+    const prototypeGuardedError = new Proxy(new Error("private proxy message"), {
+      getPrototypeOf: () => { throw new Error("private proxy trap") },
+    })
+    expect(repairWaitFailureErrorKind(prototypeGuardedError)).toBe("non_error")
+    expect(boundedRepairWaitDiagnosticCount(-1)).toBe(0)
+    expect(boundedRepairWaitDiagnosticCount(1.5)).toBe(0)
+    expect(boundedRepairWaitDiagnosticCount(0)).toBe(0)
+    expect(boundedRepairWaitDiagnosticCount(8)).toBe(8)
+    expect(boundedRepairWaitDiagnosticCount(9)).toBe(8)
+    expect(boundedRepairWaitDiagnosticCount("private count")).toBe(0)
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "ready" })).toBe("ready")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "timed_out" })).toBe("timed_out")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "waiting" })).toBe("waiting")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "private status and id" })).toBe("other")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: { private: "payload" } })).toBe("unavailable")
+    expect(JSON.stringify([
+      repairWaitOutcomeDiagnosticStatus({ status: "private status and id" }),
+      boundedRepairWaitDiagnosticCount("private count"),
+      repairWaitFailureErrorKind(new TypeError("private type message")),
+      repairWaitFailureErrorKind("private thrown value"),
+    ])).not.toContain("private")
   })
 
   it("reassembles the exact bounded wait JSON from model-visible reference reads", () => {
@@ -10941,6 +10996,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let repairWaitReferenceObserved = false
     let repairWaitReferenceSize: number | null = null
     let repairWaitFailure: RepairWaitFailureClass | null = null
+    let repairWaitFailureStage: RepairWaitFailureStage | null = null
+    let repairWaitFailureOrdinal: number | null = null
+    let repairWaitFailureReadCount: number | null = null
+    let repairWaitFailureOutcomeStatus: RepairWaitOutcomeDiagnosticStatus = "unavailable"
+    let repairWaitErrorKind: RepairWaitFailureErrorKind | null = null
     let repairWaitReaderVisible: boolean | null = null
     let repairWaitResolutionReturned = false
     let repairWaitResolvedOutcomeObserved = false
@@ -11006,10 +11066,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 throw new Error("repair fixture lost accepted wait targets")
               }
               const readCallIds = repairWaitReadCallIdsByWaitCall.get(previousRepairWaitCallId) ?? []
+              const waitOrdinal = boundedRepairWaitDiagnosticCount(repairWaitCallIds.indexOf(previousRepairWaitCallId) + 1)
+              const currentReadCount = boundedRepairWaitDiagnosticCount(readCallIds.length)
               repairWaitReferenceSize = repairWaitReferenceSizeBytes(latestToolResult(request, previousRepairWaitCallId))
               let resolution: RepairWaitOutputResolution
               try { resolution = repairWaitOutputResolutionFromRequest(request, previousRepairWaitCallId, readCallIds) }
-              catch (error: unknown) { repairWaitFailure = repairWaitFailureClass(error); throw error }
+              catch (error: unknown) {
+                repairWaitFailureStage = "output_resolution"
+                repairWaitFailureOrdinal = waitOrdinal
+                repairWaitFailureReadCount = currentReadCount
+                repairWaitFailureOutcomeStatus = "unavailable"
+                repairWaitErrorKind = repairWaitFailureErrorKind(error)
+                repairWaitFailure = repairWaitFailureClass(error)
+                throw error
+              }
               repairWaitResolutionReturned = true
               if (resolution.status === "read") {
                 repairWaitReferenceObserved = true
@@ -11038,7 +11108,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 previousRepairWait = repairWaitOutcomeFromRequest(
                   request, previousRepairWaitCallId, [...repairTaskIds, ...dependentTaskIds], resolution.output,
                 )
-              } catch (error: unknown) { repairWaitFailure = repairWaitFailureClass(error); throw error }
+              } catch (error: unknown) {
+                repairWaitFailureStage = "outcome_validation"
+                repairWaitFailureOrdinal = waitOrdinal
+                repairWaitFailureReadCount = currentReadCount
+                repairWaitFailureOutcomeStatus = repairWaitOutcomeDiagnosticStatus(resolution.output)
+                repairWaitErrorKind = repairWaitFailureErrorKind(error)
+                repairWaitFailure = repairWaitFailureClass(error)
+                throw error
+              }
               repairWaitResolvedOutcomeObserved = true
               repairWaitStatuses.push(String(previousRepairWait.status))
             }
@@ -11354,6 +11432,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
         { label: "repairWaitReferenceSizeBytes", value: "", safeValue: repairWaitReferenceSize === null ? "unknown" : String(repairWaitReferenceSize) },
         { label: "repairWaitFailureClass", value: "", safeValue: repairWaitFailure ?? "not_observed" },
+        { label: "repairWaitFailureStage", value: "", safeValue: repairWaitFailureStage ?? "not_observed" },
+        { label: "repairWaitFailureWaitOrdinal", value: "", safeValue: repairWaitFailureOrdinal === null ? "unavailable" : String(repairWaitFailureOrdinal) },
+        { label: "repairWaitFailureReadCount", value: "", safeValue: repairWaitFailureReadCount === null ? "unavailable" : String(repairWaitFailureReadCount) },
+        { label: "repairWaitFailureOutcomeStatus", value: "", safeValue: repairWaitFailureOutcomeStatus },
+        { label: "repairWaitFailureErrorKind", value: "", safeValue: repairWaitErrorKind ?? "not_observed" },
         { label: "repairWaitReaderVisible", value: "", safeValue: repairWaitReaderVisible === null ? "not_checked" : String(repairWaitReaderVisible) },
         { label: "repairWaitReadCallCount", value: "", safeValue: String(Math.min(VERIFICATION_REPAIR_MAX_REFERENCE_READS, repairWaitReadCallIds.length)) },
         { label: "repairWaitResolutionReturned", value: "", safeValue: String(repairWaitResolutionReturned) },

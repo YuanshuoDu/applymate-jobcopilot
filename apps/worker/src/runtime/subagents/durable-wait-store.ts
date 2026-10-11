@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 
-import type { DurableWaitPort, DurableWaitResult } from "../tools/coordination-types.js"
+import type { DurableWaitControlReader, DurableWaitPort, DurableWaitResult } from "../tools/coordination-types.js"
+import { createPgDurableWaitControlReader } from "./durable-wait-control-reader.js"
 import { suspendAndReleaseWait, type DurableWaitHandoffInput, type DurableWaitHandoffResult } from "./durable-wait-handoff.js"
 import { reconcileDurableWaits, type DurableWaitReconcileOptions, type DurableWaitReconcileReport } from "./durable-wait-resolver.js"
 
@@ -16,7 +17,7 @@ type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 
 export type DurableWaitResolveInput = { readonly userId: string; readonly sessionId: string; readonly waitId: string; readonly now?: Date }
-export type DurableWaitStore = DurableWaitPort & {
+export type DurableWaitStore = DurableWaitPort & DurableWaitControlReader & {
   resolve(input: DurableWaitResolveInput): Promise<DurableWaitResult | null>
   suspendAndRelease(input: DurableWaitHandoffInput): Promise<DurableWaitHandoffResult>
   reconcile(input?: DurableWaitReconcileOptions): Promise<DurableWaitReconcileReport>
@@ -83,21 +84,25 @@ function ensureScope(row: Row | undefined, message: string): Row {
   return row
 }
 function active(value: unknown, allowed: readonly string[]): boolean { return allowed.includes(String(value)) }
-function waitReplay(row: Row, input: Parameters<DurableWaitPort["wait"]>[0], normalized: ReturnType<typeof validateInput>): DurableWaitResult {
+function durableWaitReplayMatches(
+  row: Row, input: Parameters<DurableWaitPort["wait"]>[0], targetTaskIds: readonly string[],
+): boolean {
   const createdAt = date(row.createdAt, "createdAt")
   const deadlineAt = date(row.deadlineAt, "deadlineAt")
   const request = object(object(row.result).request)
   const timeoutMs = typeof request.timeoutMs === "number" ? request.timeoutMs : deadlineAt.getTime() - createdAt.getTime()
   const storedTargets = Array.isArray(request.targetTaskIds) ? request.targetTaskIds.filter((value): value is string => typeof value === "string") : ids(row.targetTaskIds)
   const storedMode = typeof request.mode === "string" ? request.mode : String(row.mode)
-  if (String(row.userId) !== input.userId || String(row.sessionId) !== input.sessionId || String(row.turnId) !== input.turnId || String(row.stepId) !== input.stepId
-    || storedMode !== input.mode || timeoutMs !== input.timeoutMs || !sameIds(storedTargets, normalized.targetTaskIds)) {
-    throw new DurableWaitStoreError("wait_conflict", "Wait idempotency key has conflicting payload")
-  }
+  return String(row.userId) === input.userId && String(row.sessionId) === input.sessionId && String(row.turnId) === input.turnId
+    && String(row.stepId) === input.stepId && storedMode === input.mode && timeoutMs === input.timeoutMs && sameIds(storedTargets, targetTaskIds)
+}
+function waitReplay(row: Row, input: Parameters<DurableWaitPort["wait"]>[0], normalized: ReturnType<typeof validateInput>): DurableWaitResult {
+  if (!durableWaitReplayMatches(row, input, normalized.targetTaskIds)) throw new DurableWaitStoreError("wait_conflict", "Wait idempotency key has conflicting payload")
   return result(row)
 }
 
 export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
+  const controlReader = createPgDurableWaitControlReader(pool, (row, input) => durableWaitReplayMatches(row, input, input.targetTaskIds))
   async function wait(input: Parameters<DurableWaitPort["wait"]>[0]): Promise<DurableWaitResult> {
     const normalized = validateInput(input)
     return transaction(pool, input.userId, async client => {
@@ -202,6 +207,7 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
 
   return {
     wait, resolve, cancel,
+    readByInvocation: input => controlReader.readByInvocation(input),
     suspendAndRelease: input => suspendAndReleaseWait(pool, input),
     reconcile: input => reconcileDurableWaits(pool, input),
   }
