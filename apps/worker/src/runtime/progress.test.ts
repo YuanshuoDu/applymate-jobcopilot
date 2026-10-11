@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { createProgressDetector, NoProgressError } from "./progress.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 import { stableJson } from "./turns/turn-engine-replay.js"
 
 const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
@@ -83,5 +84,36 @@ describe("no-progress detector", () => {
     const detector = createProgressDetector(2), baseline = checkpoint(0n, [], 0)
     detector.observe({ snapshot, toolCalls: calls }, baseline)
     expect(() => detector.observe({ snapshot, toolCalls: calls }, invalid)).toThrowError(NoProgressError)
+  })
+
+  it("uses a fixed semantic reason only after two persisted repair conflicts and preserves the default reason", () => {
+    const current = checkpoint(0n, [], 0)
+    const plan = (goal: string) => ({ id: `plan-${goal}`, name: "agent.plan", arguments: {
+      expectedRevision: 0,
+      nodes: [{ key: "repair", templateId: "scout", goal, successCriteria: [goal], dependsOn: [],
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+          { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        ] },
+        repairOf: { nodeKey: "target-private", taskId: "task-private", criterionIds: ["candidate-count"] },
+      }],
+    } })
+    const denial = (callId: string) => ({ id: `tool-result:${callId}`, content: {
+      toolCallId: callId, toolName: "agent.plan", input: plan("earlier prose").arguments, status: "failed",
+      output: { code: "task_graph_repair_conflict" }, errorCode: "task_graph_repair_conflict",
+    } })
+    const detector = createProgressDetector(2)
+    detector.observe({ snapshot, toolCalls: [plan("first prose")] }, current)
+    detector.observe({ snapshot: { ...snapshot, toolObservations: [denial("plan-1")] }, toolCalls: [plan("second prose")] }, current)
+
+    let caught: unknown
+    try {
+      detector.observe({ snapshot: { ...snapshot, toolObservations: [denial("plan-1"), denial("plan-2")] }, toolCalls: [plan("third prose")] }, current)
+    } catch (error: unknown) { caught = error }
+    expect(caught).toBeInstanceOf(NoProgressError)
+    expect(caught).toMatchObject({ code: "no_progress", reasonCode: "repeated_repair_conflict", observation: {
+      signature: "repair_conflict_retry", stateFingerprint: "unchanged_trusted_repair_epoch",
+    } })
+    expect(JSON.stringify((caught as NoProgressError).observation)).not.toContain("target-private")
+    expect(new NoProgressError({ signature: "ordinary", stateFingerprint: "ordinary-state" }).reasonCode).toBe("repeated_signature")
   })
 })

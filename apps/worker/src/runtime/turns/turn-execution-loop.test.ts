@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
+import { Value } from "@sinclair/typebox/value"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { AgentModelError, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
@@ -21,6 +22,7 @@ import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
 import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
@@ -2688,5 +2690,117 @@ describe("owner-agnostic turn execution loop", () => {
     expect(rejection).toMatchObject({ feedback })
   })
 
+  function repairConflictLoop() {
+    const root = fixture(identity("turn", "root-1"))
+    const conflict = Object.assign(new Error("private conflict detail"), { code: "task_graph_repair_conflict" })
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => { throw conflict }),
+      appendAndScheduleWithReconciliation: vi.fn(async () => { throw conflict }),
+      readCurrent: vi.fn(async () => ({ revision: 4, nodes: [] })),
+    }
+    const planTool = createTaskGraphPlanningTool({
+      commandPort, templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: () => 1,
+    })
+    const baseBuilder = root.options.contextBuilder
+    root.options = {
+      ...root.options,
+      snapshot: { ...root.options.snapshot, taskGraphRevision: 4 },
+      refreshTaskGraphBeforeStep: async snapshot => ({ ...snapshot, taskGraphRevision: 4 }),
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build(request)
+        return { ...context, taskGraphRevision: request.snapshot.taskGraphRevision }
+      } },
+      tools: [planTool, { name: "jobs.search", version: "1" }],
+      validateToolArguments: (toolName, input) => toolName === "agent.plan" ? Value.Check(planTool.inputSchema, input) : true,
+    }
+    return root
+  }
+
+  function repairProposal(goal: string, reverseCriteria = false) {
+    const candidates = { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }
+    const evidence = { id: "evidence", check: { kind: "evidence_count_gte", minimum: 1 } }
+    const criteria = reverseCriteria ? [evidence, candidates] : [candidates, evidence]
+    return {
+      expectedRevision: 4,
+      nodes: [{ key: "repair-candidates", templateId: "scout", goal, successCriteria: [`Evidence for ${goal}`], dependsOn: [],
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria },
+        repairOf: { nodeKey: "target-node-private", taskId: "target-task-private", criterionIds: criteria.map(criterion => criterion.id) },
+      }],
+    }
+  }
+
+  it("fails before dispatching a third prose-only retry after two fresh persisted conflict results", async () => {
+    const root = repairConflictLoop(), dispatches: string[] = []
+    let modelCalls = 0
+    root.options = {
+      ...root.options,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        const ordinal = ++modelCalls
+        yield { type: "tool_call_completed", callId: `repair-${ordinal}`, name: "agent.plan", arguments: repairProposal(`Prose revision ${ordinal}`, ordinal === 3) }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } },
+      executeTool: async ({ call }) => {
+        dispatches.push(call.id)
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "failed", errorCode: "task_graph_repair_conflict", output: { code: "task_graph_repair_conflict" } }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const noProgress = root.events.filter(event => event.type === "turn.no_progress")
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 3, toolCallCount: 2 })
+    expect(root.requests).toHaveLength(3)
+    expect(dispatches).toEqual(["repair-1", "repair-2"])
+    expect(new Set(root.events.filter(event => event.type === "tool_call.started").map(event => event.id)).size).toBe(2)
+    expect(new Set(noProgress.map(event => event.id)).size).toBe(1)
+    expect(noProgress[0]?.payload).toEqual({
+      reasonCode: "repeated_repair_conflict", signature: "repair_conflict_retry",
+      stateFingerprint: "unchanged_trusted_repair_epoch", taskId: "root-1",
+    })
+    expect(JSON.stringify([noProgress[0]?.payload, root.finalResponses])).not.toContain("target-node-private")
+    expect(JSON.stringify([noProgress[0]?.payload, root.finalResponses])).not.toContain("target-task-private")
+    expect(new Set(root.events.filter(event => event.type === "turn.failed").map(event => event.id)).size).toBe(1)
+  })
+
+  it("keeps a co-emitted useful call on the normal path after two repair denials", async () => {
+    const root = repairConflictLoop(), dispatches: string[] = []
+    let modelCalls = 0
+    root.options = {
+      ...root.options,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        const ordinal = ++modelCalls
+        if (ordinal < 3) {
+          yield { type: "tool_call_completed", callId: `repair-${ordinal}`, name: "agent.plan", arguments: repairProposal(`Prose revision ${ordinal}`) }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (ordinal === 3) {
+          yield { type: "tool_call_completed", callId: "repair-with-search", name: "agent.plan", arguments: repairProposal("same structure, changed prose") }
+          yield { type: "tool_call_completed", callId: "useful-search", name: "jobs.search", arguments: { location: "Dublin" } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: "I inspected the search result and can finish." }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+      executeTool: async ({ call }) => {
+        dispatches.push(call.id)
+        return call.toolName === "agent.plan"
+          ? { id: call.id, toolName: call.toolName, toolVersion: "1", status: "failed", errorCode: "task_graph_repair_conflict", output: { code: "task_graph_repair_conflict" } }
+          : { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", errorCode: null, output: { jobs: [{ id: "job-1" }] } }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(4)
+    expect(dispatches).toEqual(["repair-1", "repair-2", "repair-with-search", "useful-search"])
+    expect(root.events.some(event => event.type === "turn.no_progress")).toBe(false)
+    expect(root.events.some(event => event.type === "tool_call.started" && event.id.includes("useful-search"))).toBe(true)
+  })
 
 })
