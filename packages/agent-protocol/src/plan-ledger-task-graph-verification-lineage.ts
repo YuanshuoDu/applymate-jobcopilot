@@ -41,12 +41,14 @@ function currentBindings(reportValue: RawNode, expected: readonly (RawNode | nul
   digestCanonicalJson?: (canonicalJson: string) => string | null): boolean {
   const keys = expected.flatMap(item => {
     const check = item && record(item.check)
-    return check?.kind === "findings_from_scout_dependency" && typeof check.dependencyNodeKey === "string" ? [check.dependencyNodeKey] : []
+    return (check?.kind === "findings_from_scout_dependency" || check?.kind === "findings_cover_scout_candidates_gte")
+      && typeof check.dependencyNodeKey === "string" ? [check.dependencyNodeKey] : []
   })
   const unique = [...new Set(keys)].sort()
+  const requiresCurrentScout = expected.some(item => record(item?.check)?.kind === "findings_cover_scout_candidates_gte")
   if (unique.some(key => !node.dependsOn.includes(key))) return false
   const bindings = reportValue.dependencyBindings
-  if (bindings === undefined) return reportValue.status !== "passed" || unique.length === 0
+  if (bindings === undefined) return !requiresCurrentScout && (reportValue.status !== "passed" || unique.length === 0)
   if (!Array.isArray(bindings) || bindings.length !== unique.length) return false
   return bindings.every((rawBinding, index) => {
     const key = unique[index], binding = record(rawBinding), rawDependency = graphNodes.find(candidate => candidate?.key === key)

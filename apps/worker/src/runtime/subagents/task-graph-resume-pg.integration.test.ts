@@ -613,6 +613,10 @@ const LEASE_RECOVERY_ADAPTER_BRANCHES = new Set([
 const LEASE_RECOVERY_ADAPTER_STAGES = new Set([
   "not_started", "stream_entered", "branch_entered", "graph_checked", "outcome_checked",
   "database_checked", "tool_call_emitted", "completion_emitted", "final_output_emitted",
+  "final_proof_graph_nodes", "final_proof_node_statuses", "final_proof_dependent_identity",
+  "final_proof_dependent_report", "final_proof_repair_report", "final_proof_repair_receipt",
+  "final_proof_wait_outcome", "final_proof_wait_task_statuses", "final_proof_repair_wait_report",
+  "final_proof_dependent_wait_report",
 ])
 const LEASE_RECOVERY_STARTUP_STAGES = new Set([
   "not_started", "state_loading", "state_loaded", "selected_job_loading", "selected_job_loaded",
@@ -4808,6 +4812,10 @@ type LeaseRecoveryAdapterBranch = "not_started" | "initial_plan" | "initial_wait
 type LeaseRecoveryAdapterStage =
   | "not_started" | "stream_entered" | "branch_entered" | "graph_checked" | "outcome_checked"
   | "database_checked" | "tool_call_emitted" | "completion_emitted" | "final_output_emitted"
+  | "final_proof_graph_nodes" | "final_proof_node_statuses" | "final_proof_dependent_identity"
+  | "final_proof_dependent_report" | "final_proof_repair_report" | "final_proof_repair_receipt"
+  | "final_proof_wait_outcome" | "final_proof_wait_task_statuses" | "final_proof_repair_wait_report"
+  | "final_proof_dependent_wait_report"
 type LeaseRecoveryModelResult = {
   resultStatus: "completed" | "failed" | "missing" | "other"
   isError: boolean | null
@@ -5857,6 +5865,11 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
       adapterStage: "outcome_checked",
     })
+    const finalProofStage = leaseRecoveryFixtureDiagnosticProjection({
+      adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
+      adapterStage: "final_proof_repair_receipt",
+    })
+    expect(finalProofStage?.adapterStage).toBe("final_proof_repair_receipt")
     const invalid = leaseRecoveryFixtureDiagnosticProjection({
       adapterExecutionOrdinal: 8, adapterRoundOrdinal: -1, adapterBranch: secret, adapterStage: secret,
       startupStage: secret, runtimeExecuteFailureClass: secret, private: secret,
@@ -6667,7 +6680,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
-    await seed(pool, coverageRepairOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    await seed(pool, coverageRepairOwner, "waiting_for_user", { ...TASK_GRAPH_FIXTURE_TURN_LIMITS, maxSteps: 13 })
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
@@ -12050,7 +12063,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
     expect(initialTaskIds).toHaveLength(3)
     const taskStore = new PgSubagentTaskStore(pool!)
-    const executeChild = async (taskId: string, ownerId: string) => {
+    const executeChild = async (taskId: string, ownerId: string, expectedStatus: "completed" | "failed" = "completed") => {
       const claimed = await taskStore.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
       if (!claimed) throw new Error("Coverage fixture child did not acquire its scoped task")
       const leaseExpiresAt = claimed.leaseExpiresAt
@@ -12060,10 +12073,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const finished = await taskStore.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
         status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition,
         mailboxMessageIds: result.mailboxMessageIds, now: new Date() })
-      expect(finished).toBe("completed")
+      expect(finished).toBe(expectedStatus)
     }
     await executeChild(initialTaskIds[0]!, `p3-cohort-scout-${value.suffix}`)
-    await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`)
+    await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`, "failed")
     await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey)
     expect(failedCoverageObserved).toBe(true)
     expect(repairAccepted).toBe(true)
@@ -12701,26 +12714,36 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              fixtureInvocationCounters.adapterStage = "final_proof_graph_nodes"
               expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent", "scout-repair"])
               const scout = nodes.find(node => node?.key === "scout")
               const dependent = nodes.find(node => node?.key === "dependent")
               const repair = nodes.find(node => node?.key === "scout-repair")
+              fixtureInvocationCounters.adapterStage = "final_proof_node_statuses"
               expect(nodes.map(node => node?.status)).toEqual(["failed", "completed", "completed"])
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_identity"
               expect(dependent?.taskId).toBe(originalDependentTaskId)
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_report"
               expectPassedVerificationReport(dependent?.verificationReport, "finding-count")
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_report"
               expectPassedVerificationReport(repair?.verificationReport, "candidate-count")
               fixtureInvocationCounters.adapterStage = "graph_checked"
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_receipt"
               expect(record(repair?.repairReceipt)).toMatchObject({
                 targetNodeKey: "scout", targetTaskId: scout?.taskId, criterionIds: ["candidate-count"],
                 repairNodeKey: "scout-repair", repairTaskId: repair?.taskId,
               })
+              fixtureInvocationCounters.adapterStage = "final_proof_wait_outcome"
               const outcome = waitOutcomeFromRequest(request, 2)
               expect(outcome.status).toBe("ready")
               const waitTasks = outcome.tasks.map(record)
+              fixtureInvocationCounters.adapterStage = "final_proof_wait_task_statuses"
               expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed"])
               const repairWaitTask = waitTasks.find(task => task?.taskId === repair?.taskId)
               const dependentWaitTask = waitTasks.find(task => task?.taskId === originalDependentTaskId)
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_wait_report"
               expectPassedVerificationReport(repairWaitTask?.verificationReport, "candidate-count")
+              fixtureInvocationCounters.adapterStage = "final_proof_dependent_wait_report"
               expectPassedVerificationReport(dependentWaitTask?.verificationReport, "finding-count")
               fixtureInvocationCounters.adapterStage = "outcome_checked"
               rootCompletedAfterRepair = true
@@ -13611,7 +13634,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(completedTurn.rows).toHaveLength(1)
       expect(completedTurn.rows[0]).toMatchObject({
-        status: "completed", rootTaskId, finalResponse: "p3-process-archived-wait-resumed", inputTokens: 37, outputTokens: 17,
+        status: "completed", rootTaskId, inputTokens: 37, outputTokens: 17,
+      })
+      const persistedFinal = record(JSON.parse(completedTurn.rows[0]!.finalResponse ?? "null"))
+      expect(Object.keys(persistedFinal ?? {}).sort()).toEqual([
+        "blocker", "completed", "completedTasks", "evidenceRefs", "goal", "next", "notCompleted", "response",
+        "schemaVersion", "stepCount", "summary", "terminalReason", "toolCallCount", "usage",
+      ])
+      expect(persistedFinal).toMatchObject({
+        schemaVersion: "agent-harness.v2.final", completed: true, terminalReason: "goal_satisfied",
+        response: "p3-process-archived-wait-resumed",
       })
       expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
       const completedRoot = await pool!.query<{ status: string; result: unknown }>(

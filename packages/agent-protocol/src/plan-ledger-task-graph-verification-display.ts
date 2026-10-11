@@ -9,7 +9,8 @@ type CountCheck = Readonly<{ kind: "candidate_count_gte" | "finding_count_gte" |
 type EvidenceCheck = Readonly<{ kind: "all_candidates_have_evidence" | "all_findings_have_evidence"; minimumItems: number; status: CheckStatus }>
 type ScoreCheck = Readonly<{ kind: "reported_score_gte"; minimumScore: number; minimumFindings: number; aggregation: "any" | "all"; status: CheckStatus }>
 type DependencyCheck = Readonly<{ kind: "findings_from_scout_dependency"; status: CheckStatus }>
-export type TaskGraphVerificationDisplayCheck = CountCheck | EvidenceCheck | ScoreCheck | DependencyCheck
+type CoverageCheck = Readonly<{ kind: "findings_cover_scout_candidates_gte"; minimumPercent: number; status: CheckStatus }>
+export type TaskGraphVerificationDisplayCheck = CountCheck | EvidenceCheck | ScoreCheck | DependencyCheck | CoverageCheck
 export type TaskGraphVerificationDisplayNode = null | Readonly<{ status: "unavailable" }> | Readonly<{
   status: VerificationStatus
   checks: readonly TaskGraphVerificationDisplayCheck[]
@@ -113,6 +114,10 @@ function displayCheck(check: RawNode | null, status: unknown): TaskGraphVerifica
     && check.minimumScore >= 0 && check.minimumScore <= 10 && (check.aggregation === "any" || check.aggregation === "all")) {
     return { kind: "reported_score_gte", minimumScore: check.minimumScore, minimumFindings: check.minimumFindings as number, aggregation: check.aggregation, status }
   }
+  if (check.kind === "findings_cover_scout_candidates_gte" && exact(check, "dependencyNodeKey,kind,minimumPercent")
+    && id(check.dependencyNodeKey) && integer(check.minimumPercent, 100, 1)) {
+    return { kind: "findings_cover_scout_candidates_gte", minimumPercent: check.minimumPercent, status }
+  }
   return check.kind === "findings_from_scout_dependency" && exact(check, "dependencyNodeKey,kind")
     && id(check.dependencyNodeKey) ? { kind: "findings_from_scout_dependency", status } : null
 }
@@ -122,6 +127,11 @@ function parseDisplayCheck(value: unknown): TaskGraphVerificationDisplayCheck | 
   if (!check || typeof check.status !== "string") return null
   if (check.kind === "findings_from_scout_dependency" && exact(check, "kind,status")
     && ["passed", "failed", "unverified"].includes(check.status)) return { kind: check.kind, status: check.status as CheckStatus }
+  if (check.kind === "findings_cover_scout_candidates_gte") {
+    if (!exact(check, "kind,minimumPercent,status") || !["passed", "failed", "unverified"].includes(check.status)
+      || !integer(check.minimumPercent, 100, 1)) return null
+    return { kind: check.kind, minimumPercent: check.minimumPercent, status: check.status as CheckStatus }
+  }
   const { status, ...descriptor } = check
   return displayCheck(descriptor, status)
 }
