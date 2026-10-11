@@ -13153,6 +13153,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(rootTaskId).toBeTruthy()
       expect(taskIds).toHaveLength(7)
       expect(new Set(taskIds).size).toBe(7)
+      const orderedTaskIds = [...taskIds].sort()
+      const orderedInitiallyMatchedTaskIds = taskIds.slice(0, 6).sort()
       await waitForProcessLine(workerOne, "P3_ARCHIVED_WAIT_STEP_CLOSE_BARRIER", 45_000)
 
       const workerOwner = `p3-archived-wait-worker-${workerOne.pid}`
@@ -13243,8 +13245,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       waitId = pendingWait.id
       expect(pendingWait).toMatchObject({ parentTaskId: rootTaskId, stepId: originalStepId, idempotencyKey: waitKey,
         mode: "all", status: "waiting", suspendedAt: null, resolvedAt: null, consumedAt: null })
-      expect(pendingWait.targetTaskIds).toEqual(taskIds)
-      expect(pendingWait.matchedTaskIds).toEqual(taskIds.slice(0, 6))
+      expect(pendingWait.targetTaskIds).toEqual(orderedTaskIds)
+      expect(pendingWait.matchedTaskIds).toEqual(orderedInitiallyMatchedTaskIds)
       const childRows = await pool!.query<{ id: string; status: string; rootTaskId: string; parentTaskId: string; turnId: string; sessionId: string }>(
         `SELECT "id", "status", "rootTaskId", "parentTaskId", "turnId", "sessionId" FROM "sub_agent_tasks"
          WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
@@ -13282,8 +13284,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [waitId, value.userId, value.sessionId, value.turnId, rootTaskId, waitKey])
       expect(suspended.rows).toHaveLength(1)
       expect(suspended.rows[0]).toMatchObject({ status: "waiting", suspendedAt: expect.any(Date), resolvedAt: null, consumedAt: null })
-      expect(suspended.rows[0]?.targetTaskIds).toEqual(taskIds)
-      expect(suspended.rows[0]?.matchedTaskIds).toEqual(taskIds.slice(0, 6))
+      expect(suspended.rows[0]?.targetTaskIds).toEqual(orderedTaskIds)
+      expect(suspended.rows[0]?.matchedTaskIds).toEqual(orderedInitiallyMatchedTaskIds)
       const recoveredTurn = await pool!.query<{ status: string; rootTaskId: string; leaseOwnerId: string | null; leaseVersion: number }>(
         `SELECT "status", "rootTaskId", "leaseOwnerId", "leaseVersion" FROM "agent_turns"
          WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId],
@@ -13369,10 +13371,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [waitId, value.userId, value.sessionId, value.turnId],
       )
       expect(resolved.rows).toHaveLength(1)
-      expect(resolved.rows[0]).toMatchObject({ status: "ready", targetTaskIds: taskIds, matchedTaskIds: taskIds,
+      expect(resolved.rows[0]).toMatchObject({ status: "ready", targetTaskIds: orderedTaskIds, matchedTaskIds: orderedTaskIds,
         suspendedAt: expect.any(Date), consumedAt: expect.any(Date) })
       const outcome = record(record(resolved.rows[0]?.result)?.outcome)
-      expect(outcome).toMatchObject({ waitId, status: "ready", targetTaskIds: taskIds, matchedTaskIds: taskIds })
+      expect(outcome).toMatchObject({ waitId, status: "ready", targetTaskIds: orderedTaskIds, matchedTaskIds: orderedTaskIds })
       expect(Array.isArray(outcome?.tasks) ? outcome.tasks : []).toHaveLength(7)
       const allSteps = await pool!.query<{ id: string; status: string }>(
         `SELECT step."id", step."status" FROM "agent_steps" AS step
