@@ -8,6 +8,12 @@ be expanded without a reviewed issue and rollout evidence.
 > **Read this file completely before touching any code.**
 > This file is for Codex (the implementation executor). For Claude (PM + Reviewer) instructions, see `CLAUDE.md`.
 
+## GitHub bot mention policy
+
+Keep the GitHub connector available, but do not tag the Codex GitHub bot in Issue bodies, PR bodies, reviews, dispatches, status updates, or acknowledgements. Do not copy the bot handle into quotes or examples either: mentions can create cloud chats and bot notification emails even when automatic review is off.
+
+Continue execution in the existing development chat and read GitHub task briefs and review feedback directly. Sending a message to another chat requires explicit human authorization. Preserve the Claude review protocol and ordinary Git/GitHub CLI work. Only a new, explicit human request for a particular cloud run may override this rule.
+
 ---
 
 ## Part 1 — What Is ApplyMate?
