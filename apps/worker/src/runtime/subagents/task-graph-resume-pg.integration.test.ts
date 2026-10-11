@@ -12050,7 +12050,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
     expect(initialTaskIds).toHaveLength(3)
     const taskStore = new PgSubagentTaskStore(pool!)
-    const executeChild = async (taskId: string, ownerId: string) => {
+    const executeChild = async (taskId: string, ownerId: string, expectedStatus: "completed" | "failed" = "completed") => {
       const claimed = await taskStore.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
       if (!claimed) throw new Error("Coverage fixture child did not acquire its scoped task")
       const leaseExpiresAt = claimed.leaseExpiresAt
@@ -12060,10 +12060,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const finished = await taskStore.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
         status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition,
         mailboxMessageIds: result.mailboxMessageIds, now: new Date() })
-      expect(finished).toBe("completed")
+      expect(finished).toBe(expectedStatus)
     }
     await executeChild(initialTaskIds[0]!, `p3-cohort-scout-${value.suffix}`)
-    await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`)
+    await executeChild(targetTaskId, `p3-cohort-analyst-${value.suffix}`, "failed")
     await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey)
     expect(failedCoverageObserved).toBe(true)
     expect(repairAccepted).toBe(true)
