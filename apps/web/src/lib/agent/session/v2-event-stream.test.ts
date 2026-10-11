@@ -97,6 +97,132 @@ describe("V2 agent event stream", () => {
     await reader.cancel()
   })
 
+  it("omits private durable verification events and advances the database cursor", async () => {
+    const controller = new AbortController()
+    const marker = "native-private-control-marker"
+    const privateEvent = (sequence: bigint, type: string, suffix: string) => ({
+      id: "private-event-" + suffix, sessionId: "session_1", turnId: "turn_1",
+      itemId: "private-item-" + suffix, taskId: "private-task-" + suffix,
+      sequence, type, actor: "system", correlationId: "private-correlation-" + suffix,
+      causationId: "private-causation-" + suffix, idempotencyKey: "private-idempotency-" + suffix,
+      payload: {
+        stepId: "private-step-" + suffix, controlTaskId: "private-control-" + suffix,
+        controlOperationId: marker, goalDigest: marker, evidencePacketDigest: marker,
+        reference: marker, sentinel: marker,
+      },
+    })
+    const visible = {
+      id: "ordinary-event", sessionId: "session_1", turnId: "turn_1", itemId: "ordinary-item",
+      taskId: "ordinary-task", sequence: BigInt(5), type: "item.completed", actor: "orchestrator",
+      correlationId: "ordinary-correlation", causationId: null, idempotencyKey: "ordinary-idempotency",
+      payload: { text: "ordinary event remains visible" },
+    }
+    const database = db([])
+    const cursors: bigint[] = []
+    let calls = 0
+    database.agentEvent.findMany.mockImplementation(async (args: { where: { sequence: { gt: bigint } } }) => {
+      cursors.push(args.where.sequence.gt)
+      calls += 1
+      return calls === 1
+        ? [
+            privateEvent(BigInt(2), "native_verification.requested", "request"),
+            privateEvent(BigInt(3), "native_verification.future.v1", "future"),
+          ]
+        : [privateEvent(BigInt(4), "native_verification.result.v2", "result"), visible]
+    })
+    const pubsub = eventRedis()
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => pubsub.connection,
+      dbPollMs: 60_000, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      await waitFor(() => cursors.length === 1 && pubsub.connection.subscribe.mock.calls.length === 1)
+      pubsub.emit("agent:session:session_1:events", "wake")
+
+      const text = new TextDecoder().decode((await reader.read()).value)
+      expect(text).toContain("event: item.completed")
+      expect(text).toContain("ordinary event remains visible")
+      expect(text).toContain("ordinary-task")
+      expect(text).not.toContain("native_verification.")
+      expect(text).not.toContain(marker)
+      expect(text).not.toContain("private-event-")
+      expect(text).not.toContain("private-item-")
+      expect(text).not.toContain("private-task-")
+      expect(text).not.toContain("private-step-")
+      expect(text).not.toContain("private-idempotency-")
+      expect(cursors).toEqual([BigInt(0), BigInt(3)])
+    } finally {
+      controller.abort()
+      await reader.cancel()
+      await waitFor(() => pubsub.connection.disconnect.mock.calls.length === 1)
+    }
+    expect(pubsub.connection.unsubscribe).toHaveBeenCalledWith("agent:session:session_1:events")
+    expect(pubsub.connection.removeMessageListener).toHaveBeenCalledTimes(1)
+    expect(pubsub.connection.removeErrorListener).toHaveBeenCalledTimes(1)
+  })
+
+  it("skips private transient namespaces while advancing the Redis cursor", async () => {
+    const controller = new AbortController()
+    const marker = "native-private-delta-marker"
+    const privateEnvelope = {
+      schemaVersion: "agent-harness.v2", id: "private-delta-event", sessionId: "session_1",
+      turnId: "turn_1", itemId: "private-item", taskId: "private-task", type: "native_verification.future.requested",
+      actor: "system", correlationId: "private-correlation", causationId: "private-causation",
+      idempotencyKey: "private-idempotency", sequence: null,
+      payload: { stepId: "private-step", controlOperationId: marker, goalDigest: marker, evidencePacketDigest: marker },
+      kind: "snapshot", baseRevision: 0, revision: 1,
+    }
+    const visibleEnvelope = {
+      schemaVersion: "agent-harness.v2", id: "ordinary-delta-event", sessionId: "session_1",
+      turnId: "turn_1", itemId: "ordinary-item", taskId: "ordinary-task", type: "item.snapshot",
+      actor: "orchestrator", correlationId: "ordinary-correlation", causationId: null,
+      idempotencyKey: "ordinary-idempotency", sequence: null,
+      payload: { text: "ordinary transient event remains visible" },
+      kind: "snapshot", baseRevision: 0, revision: 1,
+    }
+    const entry = (streamId: string, envelope: unknown) => [streamId, ["payload", JSON.stringify(envelope)]]
+    const disconnect = vi.fn()
+    const connection: AgentStreamRedis = {
+      xread: vi.fn()
+        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("1-0", privateEnvelope)]]])
+        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("2-0", visibleEnvelope)]]])
+        .mockImplementation(() => new Promise(resolve => {
+          if (controller.signal.aborted) return resolve(null)
+          controller.signal.addEventListener("abort", () => resolve(null), { once: true })
+        })),
+      disconnect,
+    }
+    const stream = createV2EventStream(db([]) as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => connection, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      const text = new TextDecoder().decode((await reader.read()).value)
+      expect(text).toContain("event: item.snapshot")
+      expect(text).toContain('"streamId":"2-0"')
+      expect(text).toContain("ordinary transient event remains visible")
+      expect(text).not.toContain("native_verification.")
+      expect(text).not.toContain(marker)
+      expect(text).not.toContain("private-delta-event")
+      expect(text).not.toContain("private-item")
+      expect(text).not.toContain("private-task")
+      expect(text).not.toContain("private-step")
+      expect(text).not.toContain("private-idempotency")
+      expect(connection.xread).toHaveBeenNthCalledWith(
+        1, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "$",
+      )
+      expect(connection.xread).toHaveBeenNthCalledWith(
+        2, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "1-0",
+      )
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+    await waitFor(() => disconnect.mock.calls.length === 1)
+  })
   it("preserves a valid redacted TaskGraph item in a durable item.delta", async () => {
     const controller = new AbortController()
     const database = db([{

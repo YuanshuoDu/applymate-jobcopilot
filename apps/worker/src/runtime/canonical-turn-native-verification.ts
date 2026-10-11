@@ -3,7 +3,9 @@ import { digestNativeVerificationValue, type NativeVerificationDisposition, type
 import type { NativeVerificationEnsureResult, NativeVerificationFeedback, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitResult } from "./tools/coordination-types.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { parseNativeSemanticRejectionIdentity, type NativeSemanticRejectionIdentity } from "./turns/native-semantic-rejection-ledger.js"
+import { TurnEngineError } from "./turns/turn-engine-types.js"
 
 const HASH = /^[a-f0-9]{64}$/
 const REASONS: readonly NativeVerificationReasonCode[] = ["meets_criterion", "does_not_meet_criterion", "evidence_missing", "evidence_conflict", "ambiguous", "unsupported_claim"]
@@ -85,7 +87,7 @@ const REPAIR_ACTION: Readonly<Record<RepairReason, string>> = {
   evidence_conflict: "reconcile current owned sources and resolve contradictions",
   does_not_meet_criterion: "revise the answer against the criterion",
   unsupported_claim: "remove the claim or support it with current owned evidence",
-  ambiguous: "Resolve ambiguity from available evidence and seek user clarification when user-dependent, otherwise keep the uncertainty explicit.",
+  ambiguous: "Resolve ambiguity from current owned evidence; identify missing user facts and seek clarification when available, otherwise state uncertainty.",
 }
 const VALID_REASON_DISPOSITIONS: Readonly<Record<NativeVerificationDisposition, readonly NativeVerificationReasonCode[]>> = {
   passed: ["meets_criterion"],
@@ -94,7 +96,7 @@ const VALID_REASON_DISPOSITIONS: Readonly<Record<NativeVerificationDisposition, 
 }
 const GENERIC_REPAIR_GUIDANCE = "Revise the candidate or obtain new current owned evidence before retrying."
 const VERIFICATION_STATUSES = ["passed", "failed", "uncertain", "pending", "unavailable"] as const
-export function nativeVerificationFeedbackText(status: string, value: unknown = []): string {
+export function nativeVerificationFeedbackText(status: string, value: unknown = [], replanFallback = false): string {
   const parsed = parseNativeVerificationFeedback(value)
   const knownStatus = (VERIFICATION_STATUSES as readonly string[]).includes(status)
   const safeStatus = knownStatus ? status : "unavailable"
@@ -115,7 +117,8 @@ export function nativeVerificationFeedbackText(status: string, value: unknown = 
   if (actions.length) {
     if (output.length + actionBlock.length > 512) return output
     output += actionBlock
-  } else if (safeStatus === "failed" && rows.length > 0) output += ` ${GENERIC_REPAIR_GUIDANCE}`
+  } else if (replanFallback) output += " Replan against verified criteria using current owned evidence."
+  else if (safeStatus === "failed" && rows.length > 0) output += ` ${GENERIC_REPAIR_GUIDANCE}`
   for (const row of rows) if (output.length + row.length + 1 <= 512) output += ` ${row}`
   return output
 }
@@ -155,7 +158,7 @@ export async function verifyNativeRootCandidate(input: Readonly<{
     }
     if (goal.status !== "passed" || !goal.rootGoalWitness) {
       const semanticRejectionControlTaskId = goal.status === "failed" ? matchingFailedRootControl(goal, input.scope.rootTaskId) : undefined
-      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback)
+      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback, Boolean(semanticRejectionControlTaskId))
       return { kind: "blocked", feedback,
         ...(semanticRejectionControlTaskId ? { semanticRejectionControlTaskId } : {}) }
     }
@@ -172,7 +175,7 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   hasNativeTasks(): Promise<boolean>
   checkReceipt(): Promise<TurnEngineCompletionGateResult | null>
   wait: NativeVerificationWaiter
-  observeRootSemanticRejection?(controlTaskId: string): boolean
+  observeRootSemanticRejection?(input: Readonly<{ scope: TaskGraphExecutionScope; candidateText: string; controlTaskId: string }>): boolean | NativeSemanticRejectionIdentity | Promise<boolean | NativeSemanticRejectionIdentity>
   accept(witness: NativeVerificationRootGoalWitness, candidateText: string): void
 }>): Promise<TurnEngineCompletionGateResult | null> {
   const receipt = await input.checkReceipt()
@@ -182,11 +185,14 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   const scope = typeof input.scope === "function" ? input.scope() : input.scope
   const result = await verifyNativeRootCandidate({ port: input.port, scope, candidateText: input.candidateText, wait: input.wait })
   if (result.kind === "blocked") {
-    const stop = result.semanticRejectionControlTaskId
-      ? input.observeRootSemanticRejection?.(result.semanticRejectionControlTaskId) === true
-      : false
+    const observed = result.semanticRejectionControlTaskId ? await input.observeRootSemanticRejection?.({ scope,
+      candidateText: input.candidateText, controlTaskId: result.semanticRejectionControlTaskId }) : undefined
+    const identity = observed === undefined || typeof observed === "boolean" ? undefined : parseNativeSemanticRejectionIdentity(observed)
+    if (observed !== undefined && typeof observed !== "boolean" && !identity) throw new TurnEngineError("persistence_conflict", "Native semantic rejection identity is invalid")
+    const stop = observed === true
     return { ok: false, blocker: "task_graph_verification_unverified", feedback: result.feedback,
-      ...(stop ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}) }
+      ...(stop ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
+      ...(identity ? { [NATIVE_SEMANTIC_REJECTION]: identity } : {}) }
   }
   if (result.kind === "pending") return { ok: false, blocker: "native_verification_pending", feedback: "Independent native verification is waiting on durable child work.", waitId: result.waitId }
   input.accept(result.witness, input.candidateText)

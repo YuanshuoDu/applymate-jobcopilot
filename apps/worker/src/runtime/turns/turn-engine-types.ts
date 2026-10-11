@@ -117,7 +117,7 @@ export type TurnEngineStore = {
     now: Date
     terminal?: AtomicTurnCompletionInput
   }): Promise<void | AtomicTurnCompletionResult>
-} & Partial<TurnQuestionStore>
+} & import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore & Partial<TurnQuestionStore>
 
 export type TurnEngineToolExecutor = (input: {
   scope: TenantScope
@@ -188,7 +188,7 @@ export type TurnEngineOptions = {
   /** Server-classified restart repair for persisted tool calls, applied before another model request. */
   readonly toolCallRecovery?: readonly ToolCallRecovery[]
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
-} & Pick<TurnExecutionOptions, "refreshTaskGraphBeforeStep" | "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate">
+} & Pick<TurnExecutionOptions, "refreshTaskGraphBeforeStep" | "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate" | "nativeSemanticProgressMode">
 
 export type TurnResumeState = {
   readonly nextOrdinal: number

@@ -1,6 +1,6 @@
 import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertCompletionAllowed, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
 import { canEmitTurnCompleted, canPersistFinalResponse, totalTurnUsage, updateExecutionStep } from "./turn-engine-helpers.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
@@ -16,7 +16,23 @@ export type FinalCandidateOutcome =
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
   | Readonly<{ kind: "completed"; result: TurnEngineResult }>
 
-async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, now: () => Date, onStepClosed: () => void): Promise<void> {
+async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, now: () => Date, onStepClosed: (kind?: "native_semantic_receipt") => void, rejection?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity): Promise<number | undefined> {
+  if (rejection) {
+    const complete = options.store.completeNativeSemanticRejectionStep
+    if (options.nativeSemanticProgressMode !== "durable_v1" || options.identity.kind !== "turn" || !complete) {
+      throw new TurnEngineError("persistence_conflict", "Native semantic rejection receipt storage is unavailable")
+    }
+    const result = await complete({ executionIdentity: options.identity, stepId: step.id, finishReason: output.finishReason, errorCode: null,
+      inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+      estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(), identity: rejection })
+    onStepClosed("native_semantic_receipt")
+    if (typeof result.inputThroughSequence !== "bigint" || result.inputThroughSequence < 0n
+      || !Number.isSafeInteger(result.distinctStepCount) || result.distinctStepCount < 1 || result.distinctStepCount > 3) {
+      throw new TurnEngineError("persistence_conflict", "Native semantic rejection receipt is invalid")
+    }
+    await writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+    return result.distinctStepCount
+  }
   await Promise.all([
     updateExecutionStep(options, { stepId: step.id, status: "completed", finishReason: output.finishReason, errorCode: null,
       inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
@@ -24,6 +40,7 @@ async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEv
     writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", taskId: options.identity.taskId }, `step-completed:${step.id}`),
   ])
   onStepClosed()
+  return undefined
 }
 
 export async function completeTurnCandidate(input: Readonly<{
@@ -37,7 +54,7 @@ export async function completeTurnCandidate(input: Readonly<{
   usage: TurnUsage
   signal: AbortSignal
   now: () => Date
-  onStepClosed: () => void
+  onStepClosed: (kind?: "native_semantic_receipt") => void
 }>): Promise<FinalCandidateOutcome> {
   const { options, writer, step, output, snapshot, signal, now } = input
   const verification = verifyCandidateFinal({ goal: options.goal, candidate: { text: output.text, finishReason: output.finishReason },
@@ -57,7 +74,9 @@ export async function completeTurnCandidate(input: Readonly<{
     return { kind: "wait", result: { status: "waiting_for_dependency", waitId: gate.waitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
   }
   if (gate && "feedback" in gate) {
-    await finishStep(options, writer, step, output, now, input.onStepClosed)
+    const rejection = gate[NATIVE_SEMANTIC_REJECTION]
+    const distinctStepCount = await finishStep(options, writer, step, output, now, input.onStepClosed, rejection)
+    if (distinctStepCount === 3) throw nativeSemanticNoProgressError()
     if (gate[NATIVE_SEMANTIC_NO_PROGRESS] === true) throw nativeSemanticNoProgressError()
     return { kind: "replan", feedback: gate.feedback }
   }

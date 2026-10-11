@@ -51,6 +51,13 @@ describe("V2 transcript projector", () => {
     expect(transcriptProjectionMarker(projected.data)).toEqual({ eventId: "event_2", opaque: true, wrapped: false })
   })
 
+  it("rejects direct transcript projection of private native verification events", () => {
+    expect(() => projectV2EventToTranscript({
+      ...baseEvent, type: "native_verification.requested", taskId: "private-control-task",
+      payload: { controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
+    })).toThrow("private_native_verification_event_not_projectable")
+  })
+
   it.each(goldenCases)("keeps $flow golden transcript semantics stable", ({ flow, legacy }) => {
     const projected = projectV2EventToTranscript({
       ...baseEvent,
@@ -89,5 +96,34 @@ describe("V2 transcript projector", () => {
     await expect(projectV2EventsToTranscript(db as never, { sessionId: "session_1", userId: "user_1" })).resolves.toBe(0)
     expect(transcriptCreate).toHaveBeenCalledOnce()
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
+  })
+
+  it("omits private native verification receipts during transcript rebuild", async () => {
+    const privateEvent = {
+      ...baseEvent, id: "private-event", itemId: null, taskId: "private-control-task",
+      type: "native_verification.requested",
+      payload: { controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
+    }
+    const ordinaryEvent = {
+      ...baseEvent, id: "ordinary-event",
+      payload: { legacy: { type: "job_results", speaker: "Analyst", title: "Jobs", body: "N26", data: { jobs: 1 } } },
+    }
+    const transcriptCreate = vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ data }))
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1" }]),
+      agentEvent: { findMany: vi.fn().mockResolvedValue([privateEvent, ordinaryEvent]) },
+      agentTranscriptEvent: {
+        findMany: vi.fn().mockResolvedValue([]),
+        create: transcriptCreate,
+      },
+    }
+    const db = { $transaction: vi.fn(async <T>(work: (transaction: typeof tx) => Promise<T>) => work(tx)) }
+
+    await expect(projectV2EventsToTranscript(db as never, { sessionId: "session_1", userId: "user_1" })).resolves.toBe(1)
+    expect(transcriptCreate).toHaveBeenCalledOnce()
+    expect(transcriptCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ body: "N26" }),
+    }))
+    expect(JSON.stringify(transcriptCreate.mock.calls)).not.toContain("private-")
   })
 })

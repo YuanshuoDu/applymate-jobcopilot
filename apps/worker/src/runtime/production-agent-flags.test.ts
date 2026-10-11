@@ -11,6 +11,7 @@ describe("production agent flags", () => {
       consumeWaitOutcomes: false,
       canonicalAutomationEnabled: false,
       turnBoundaryCompactionEnabled: false,
+      nativeSemanticProgressMemoryEnabled: false,
     })
   })
 
@@ -95,6 +96,15 @@ describe("production agent flags", () => {
       consumeWaitOutcomes: true,
       canonicalAutomationEnabled: true,
       turnBoundaryCompactionEnabled: false,
+      nativeSemanticProgressMemoryEnabled: false,
     })
+  })
+
+  it("enables native semantic progress memory only with its exact server flag", () => {
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS_MEMORY: "1" }).nativeSemanticProgressMemoryEnabled).toBe(true)
+    for (const value of [undefined, "", "0", "false", "true", "01", " 1", "1 "]) {
+      expect(resolveProductionAgentFlags({ ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS_MEMORY: value }).nativeSemanticProgressMemoryEnabled).toBe(false)
+    }
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS: "1" }).nativeSemanticProgressMemoryEnabled).toBe(false)
   })
 })

@@ -1,6 +1,7 @@
 import { TurnEngineError, type TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { parseNativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
 import type pg from "pg"
 import type { TurnLease } from "./lease.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
@@ -159,21 +160,27 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
   } catch { return deny() }
 }
 
-export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<{ feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true } | { waitId: string } | undefined> {
+export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<{ feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity } | { waitId: string } | undefined> {
   if (!options.completionGate) return undefined
   let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
   try {
     decision = await options.completionGate({ identity: options.identity, scope: options.scope, rootTaskId: options.identity.rootTaskId, stepId: step.id, candidateText, signal, now: now() })
   } catch (error: unknown) {
     if (isSessionPauseRequestedError(error) || signalWasInterrupted(signal) || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
+    if (error instanceof TurnEngineError && error.code === "persistence_conflict") throw error
     throw new TurnEngineError("invalid_output", "Completion gate failed closed")
   }
   if (!decision || typeof decision !== "object" || typeof decision.ok !== "boolean") throw new TurnEngineError("invalid_output", "Completion gate returned an invalid decision")
   if (decision.ok) {
-    if (Object.hasOwn(decision, NATIVE_SEMANTIC_NO_PROGRESS)) throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic progress signal")
+    if (Object.hasOwn(decision, NATIVE_SEMANTIC_NO_PROGRESS) || Object.hasOwn(decision, NATIVE_SEMANTIC_REJECTION)) throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic progress signal")
     return undefined
   }
   const stopForSemanticNoProgress = decision[NATIVE_SEMANTIC_NO_PROGRESS]
+  const rawRejection = decision[NATIVE_SEMANTIC_REJECTION]
+  const rejection = rawRejection === undefined ? undefined : parseNativeSemanticRejectionIdentity(rawRejection)
+  if (rawRejection !== undefined && (!rejection || decision.blocker !== TASK_GRAPH_VERIFICATION_BLOCKER || stopForSemanticNoProgress === true)) {
+    throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic rejection identity")
+  }
   if (stopForSemanticNoProgress !== undefined && (stopForSemanticNoProgress !== true || decision.blocker !== TASK_GRAPH_VERIFICATION_BLOCKER)) {
     throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic progress signal")
   }
@@ -190,6 +197,7 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
   await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: decision.blocker, feedback: decision.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
   if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) return {
     feedback: decision.feedback, ...(stopForSemanticNoProgress ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
+    ...(rejection ? { [NATIVE_SEMANTIC_REJECTION]: rejection } : {}),
   }
   throw new TurnEngineError("business_precondition_failed", decision.blocker)
 }

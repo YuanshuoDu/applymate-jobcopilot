@@ -247,6 +247,8 @@ function cancellationDatabase(options: { readonly withCallRow?: boolean; readonl
     },
   }
   return { pool, state: () => database, metrics: () => ({ connections, commits, rollbacks, stepUpdates, eventSequenceUpdates, eventInserts, outboxInserts }) }
+function queryClient(rows: readonly Record<string, unknown>[]) {
+  return { query: vi.fn(async () => ({ rows, rowCount: rows.length })) } as never
 }
 
 describe("native question pause cancellation readback", () => {
