@@ -127,6 +127,18 @@ describe("TurnEngine", () => {
     expect(seen[0]).toBe("root-1")
   })
 
+  it("keeps claim identity at ordinal zero and forwards a separate root context identity on every Step", async () => {
+    const fixture = baseOptions({ rootInputId: "root-input" })
+    const seen: Array<Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]> = []
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: { build: async request => { seen.push(request); return contextBuilder([]).build(request) } },
+    }
+    await new TurnEngine(options).run()
+    expect(seen.map(request => request.rootInputId)).toEqual(["root-input", undefined, undefined])
+    expect(seen.map(request => request.rootContextInputId)).toEqual(["root-input", "root-input", "root-input"])
+  })
+
   it("forwards the active steering marker through the bound context builder", async () => {
     const fixture = baseOptions()
     const marker: SteeringMarkerPayload = {
