@@ -666,7 +666,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     try {
       await blocker.query("BEGIN")
       transactionOpen = true
-      const locked = await blocker.query(`SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`,
+      const locked = await blocker.query(`SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR SHARE`,
         [stepId, sessionId, turnId])
       expect(locked.rows).toHaveLength(1)
       request = complete(completeInput)
