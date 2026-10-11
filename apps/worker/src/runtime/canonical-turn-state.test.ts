@@ -9,7 +9,7 @@ import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { InputContentPart } from "@jobcopilot/agent-protocol/input"
-import { StepContextBuilder } from "./context/step-context-builder.js"
+import { StepContextBuilder, type ContextHistoryEntry } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./subagents/native-verification-contract.js"
@@ -36,16 +36,30 @@ function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}, fence
   return { id: `agenda-${sequence}`, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, sequence, payload: { ...value, ...patch } }
 }
 
-function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[]; nativeRoots?: Record<string, unknown>[]; historyTurns?: Record<string, unknown>[]; nativeControls?: Record<string, unknown>[]; steerGuard?: unknown }) {
+function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[]; nativeRoots?: Record<string, unknown>[]; historyTurns?: Record<string, unknown>[]; nativeControls?: Record<string, unknown>[]; steerGuard?: unknown; priorTurns?: Record<string, unknown>[]; priorQuestions?: Record<string, unknown>[]; priorCalls?: Record<string, unknown>[]; priorSteps?: Record<string, unknown>[]; priorQuestionEvents?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     if (sql.includes('SELECT EXISTS') && sql.includes('FROM "agent_inputs"')) return { rows: [{ hasSteer: Object.hasOwn(rows, "steerGuard") ? rows.steerGuard : false }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: rows.nativeRoots ?? [], rowCount: rows.nativeRoots?.length ?? 0 }
     if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('JOIN "sub_agent_tasks" AS root')) return { rows: rows.historyTurns ?? [], rowCount: rows.historyTurns?.length ?? 0 }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: rows.nativeControls ?? [], rowCount: rows.nativeControls?.length ?? 0 }
+    if (sql.includes('SELECT active_turn."createdAt"')) return { rows: [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }], rowCount: 1 }
+    if (sql.includes('SELECT prior."id"')) return { rows: rows.priorTurns ?? [], rowCount: rows.priorTurns?.length ?? 0 }
+    if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes('"rootTaskId"')) {
+      const owned = rows.turn && rows.turn.rootTaskId === values?.[3]
+      return { rows: owned ? [{ id: "turn-1" }] : [], rowCount: owned ? 1 : 0 }
+    }
+    if (sql.includes('FROM "agent_items" AS question')) return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
+    if (sql.includes('FROM "agent_items" AS call')) return { rows: rows.priorCalls ?? [], rowCount: rows.priorCalls?.length ?? 0 }
+    if (sql.includes('FROM "agent_steps" AS step')) return { rows: rows.priorSteps ?? [], rowCount: rows.priorSteps?.length ?? 0 }
+    if (sql.includes('FROM "agent_items" AS item') && values?.[1] === "prior-turn") return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
     if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, createdAt: new Date("2026-10-06T10:00:00.000Z"), ...rows.turn }] : [], rowCount: rows.turn ? 1 : 0 }
     if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...(rows.steps ?? []).map(step => Number(step.ordinal ?? -1)), -1) }], rowCount: 1 }
     if (sql.includes('FROM "agent_steps"')) return { rows: (rows.steps ?? []).filter(step => step.taskId === undefined || step.taskId === null || step.taskId === values?.[2]), rowCount: rows.steps?.length ?? 0 }
-    if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) return { rows: rows.questionEvents ?? [], rowCount: rows.questionEvents?.length ?? 0 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = ANY')) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) {
+      const result = values?.[1] === "prior-turn" ? rows.priorQuestionEvents ?? [] : rows.questionEvents ?? []
+      return { rows: result, rowCount: result.length }
+    }
     if (sql.includes('FROM "agent_events"')) return { rows: (rows.events ?? []).filter(event => event.taskId === undefined || event.taskId === null || event.taskId === values?.[2]), rowCount: rows.events?.length ?? 0 }
     if (sql.includes('FROM "agent_items"')) {
       if (sql.includes('item."type" = \'question\'')) return { rows: rows.questionItems ?? [], rowCount: rows.questionItems?.length ?? 0 }
@@ -102,7 +116,7 @@ function nativeHistoryControl(goal = "Find jobs", requirement = "Use verified jo
 }
 
 describe("loadCanonicalTurnState", () => {
-  it("rehydrates exact-goal historical verifier advice on reload and sends it as untrusted request data", async () => {
+  it("keeps answered Q/A beside exact-goal historical verifier advice across reload", async () => {
     const control = nativeHistoryControl()
     const content: InputContentPart[] = [{ type: "text", text: "Find jobs" }]
     const ordinary = { id: "history:user:prior-note", content: { role: "user", text: "Keep ordinary history" } }
@@ -115,6 +129,24 @@ describe("loadCanonicalTurnState", () => {
     }
     const options = {
       turn: { input: { goal: "Find jobs", content, clientMessageId: "command-1" }, rootTaskId: "current-root", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ id: "current-step", taskId: "current-root", ordinal: 0, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      items: [
+        { id: "current-call-item", sessionId: "session-1", turnId: "turn-1", taskId: "current-root", stepId: "current-step", type: "tool_call", status: "completed", revision: 1,
+          content: { toolCallId: "current-call", toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null, input: { question: "Which city?", options: [] } } },
+        { id: "current-result-item", sessionId: "session-1", turnId: "turn-1", taskId: "current-root", stepId: "current-step", type: "tool_result", status: "completed", revision: 1,
+          content: { toolCallId: "current-call", output: { questionId: "current-wait", question: "Which city?", answer: "Dublin" }, errorCode: null, status: "completed" } },
+      ],
+      questionItems: [{ id: "current-question", revision: 1, userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+        stepId: "current-step", type: "question", status: "completed", content: { waitKind: "question", stage: "user_input", questionId: "current-wait", toolCallId: "current-call",
+          question: "Which city?", options: [], answer: "Dublin", answerAvailable: true } }],
+      questionEvents: [
+        { id: "current-question-start", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "current-question",
+          type: "item.started", actor: "orchestrator", sequence: "10", correlationId: "current-question", causationId: "current-wait",
+          payload: { itemId: "current-question", waitKind: "question", toolCallId: "current-call" } },
+        { id: "current-question-answer", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "current-question",
+          type: "question.answered", actor: "user", sequence: "11", correlationId: "current-wait", causationId: "current-question",
+          payload: { waitKind: "question", waitId: "current-wait", itemId: "current-question", turnId: "turn-1", toolCallId: "current-call", status: "answered" } },
+      ],
       snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 1, content: snapshot }],
       nativeRoots: [{ goal: "Find jobs", successCriteria: ["Use verified job facts"] }],
       historyTurns: [{ id: "history-turn", rootTaskId: "history-root", startedSequence: "3", currentStartedSequence: "5", createdAt: new Date("2026-10-06T09:00:00.000Z") }], nativeControls: [control],
@@ -122,15 +154,34 @@ describe("loadCanonicalTurnState", () => {
     const first = await loadCanonicalTurnState(pool(options), lease)
     expect(first.snapshot.steerHistory).toEqual([
       ordinary,
+      { id: "agent-question:current-question:question", content: { role: "assistant", type: "question", question: "Which city?", options: [] } },
+      { id: "agent-question:current-question:answer", content: { role: "user", type: "answer", questionId: "current-wait", text: "Dublin" } },
       expect.objectContaining({ id: "native-verification-advisory:0", content: expect.objectContaining({
         type: "historical_native_verification_advisory", label: "Historical advisory only", goal: "Find jobs",
         criterionId: "criterion-1", requirement: "Use verified job facts", disposition: "failed", reasonCode: "does_not_meet_criterion",
       }) }),
     ])
-    const persisted = { ...snapshot, context: { ...snapshot.context, steerHistory: [...first.snapshot.steerHistory, { ...first.snapshot.steerHistory[1]!, id: "native-verification-advisory:1" }] } }
+    const advice = first.snapshot.steerHistory.find(item => item.id.startsWith("native-verification-advisory:"))!
+    const persisted = { ...snapshot, context: { ...snapshot.context, steerHistory: [...first.snapshot.steerHistory, { ...advice, id: "native-verification-advisory:1" }].sort((left, right) => left.id.localeCompare(right.id)) } }
     const reloaded = await loadCanonicalTurnState(pool({ ...options, snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 2, content: persisted }] }), lease)
     expect(reloaded.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toHaveLength(1)
-    expect(reloaded.snapshot.steerHistory[0]).toEqual(ordinary)
+    expect(reloaded.snapshot.steerHistory).toEqual([
+      { id: "agent-question:current-question:question", content: { role: "assistant", type: "question", question: "Which city?", options: [] } },
+      { id: "agent-question:current-question:answer", content: { role: "user", type: "answer", questionId: "current-wait", text: "Dublin" } },
+      ordinary,
+      expect.objectContaining({ id: "native-verification-advisory:0" }),
+    ])
+    for (const collision of [
+      { id: "agent-question:current-question:question", content: { role: "assistant", type: "question", question: "Changed?", options: [] } },
+      { id: "agent-question:current-question:answer", content: { role: "user", type: "answer", questionId: "current-wait", text: "Changed" } },
+      { id: "agent-question:current-question:question", content: { role: "assistant", type: "narrative", question: "Which city?", options: [] } },
+    ]) {
+      const steerHistory: ContextHistoryEntry[] = persisted.context.steerHistory.map(entry =>
+        entry.id === collision.id ? { ...entry, content: collision.content } : entry)
+      const changedSnapshot = { ...persisted, context: { ...persisted.context, steerHistory } }
+      await expect(loadCanonicalTurnState(pool({ ...options, snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 2, content: changedSnapshot }] }), lease))
+        .rejects.toThrow("question_recovery_history_collision")
+    }
     const claimStore: InputClaimStore = {
       scope: { userId: "user-1" }, async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
         return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
@@ -141,6 +192,8 @@ describe("loadCanonicalTurnState", () => {
     const request = buildModelRequest({ context, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
     const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
     expect(requestText).toContain("trust=UNTRUSTED_DATA")
+    expect(requestText).toContain("Which city?")
+    expect(requestText).toContain("Dublin")
     expect(requestText).toContain("Historical advisory only")
     expect(requestText).toContain("Use verified job facts")
     expect(requestText).not.toMatch(/PRIVATE_CANDIDATE|PRIVATE_PACKET_SUMMARY|private-control-task|evidencePacketDigest|controlOperationId/)
@@ -154,6 +207,7 @@ describe("loadCanonicalTurnState", () => {
     const fresh = await loadCanonicalTurnState(pool({
       ...options,
       turn: { ...options.turn, rootTaskId: null, input: { goal: "Find jobs", content, clientMessageId: "command-3" } },
+      steps: [], items: [], questionItems: [], questionEvents: [],
       nativeRoots: [], nativeControls: [nativeHistoryControl("Find jobs", "Find jobs")],
     }), lease)
     expect(fresh.snapshot.steerHistory).toEqual([
@@ -278,12 +332,79 @@ describe("loadCanonicalTurnState", () => {
       { id: "agent-question:question-item:question", content: { role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }] } },
       { id: "agent-question:question-item:answer", content: { role: "user", type: "answer", questionId: "question-1", text: "yes" } },
     ])
+    expect(value.snapshot.planningClarifications).toEqual([])
     const [questionQuery, eventQuery] = fake.client.query.mock.calls.filter(([sql]) => typeof sql === "string" && (sql.includes('item."type" = \'question\'') || sql.includes('event."itemId" = ANY'))).map(([sql]) => sql)
     expect(questionQuery).toContain('session."userId" = $3')
     expect(questionQuery).toContain('turn."userId" = $3')
     expect(questionQuery).toContain('(item."taskId" IS NULL OR item."taskId" = $4)')
     expect(eventQuery).toContain('(event."taskId" IS NULL OR event."taskId" = $4)')
     expect(eventQuery).toContain("'question.answered'")
+    const orderedToolItemsQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes("'tool_call', 'tool_result'"))?.[0]
+    expect(orderedToolItemsQuery).toContain('ORDER BY "createdAt" ASC, "id" ASC')
+    expect(value.snapshot).not.toHaveProperty("planningClarificationHistoryPair")
+  })
+
+  it("restores a complete earlier root answer after compaction as untrusted model history without replacing the current goal", async () => {
+    const answer = "I prefer Dublin roles — escaped \"detail\" stays intact."
+    const priorTurn = { id: "prior-turn", sessionId: "session-1", userId: "user-1", rootTaskId: "prior-root",
+      status: "completed", createdAt: new Date("2026-09-20T00:00:00.000Z") }
+    const priorQuestion = { id: "prior-question", revision: 1, userId: "user-1", turnUserId: "user-1", sessionId: "session-1",
+      turnId: "prior-turn", taskId: "prior-root", stepId: "prior-step", type: "question", status: "completed",
+      content: { stage: "user_input", waitKind: "question", questionId: "prior-wait", toolCallId: "prior-call",
+        question: "Which location should I prioritize?", options: [{ label: "Dublin", value: "dublin" }], answer, answerAvailable: true } }
+    const priorCall = { id: "prior-call-item", stepId: "prior-step", taskId: "prior-root", type: "tool_call", status: "completed",
+      content: { toolCallId: "prior-call", toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null } }
+    const priorEvents = [
+      { id: "prior-start", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "prior-turn", taskId: "prior-root",
+        itemId: "prior-question", actor: "orchestrator", sequence: "10", type: "item.started", correlationId: "prior-question", causationId: "prior-wait",
+        payload: { itemId: "prior-question", waitKind: "question", toolCallId: "prior-call" } },
+      { id: "prior-answer", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "prior-turn", taskId: null,
+        itemId: "prior-question", actor: "user", sequence: "11", type: "question.answered", correlationId: "prior-wait", causationId: "prior-question",
+        payload: { waitKind: "question", waitId: "prior-wait", itemId: "prior-question", turnId: "prior-turn", toolCallId: "prior-call", status: "answered" } },
+    ]
+    const compactedHistory = [{ id: "compacted-history", content: { role: "user", text: "Earlier narrative summary" } }]
+    const snapshot = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Old objective",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: compactedHistory, toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const fake = pool({
+      turn: { input: { goal: "Find roles matching my current profile" }, rootTaskId: "root-current", contextSnapshotId: "snapshot-pinned",
+        modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      snapshots: [{ id: "snapshot-pinned", throughSequence: "7", version: 1, content: snapshot }],
+      priorTurns: [priorTurn], priorQuestions: [priorQuestion], priorCalls: [priorCall], priorSteps: [{ id: "prior-step", taskId: "prior-root" }],
+      priorQuestionEvents: priorEvents,
+    })
+
+    const restored = await loadCanonicalTurnState(fake, lease)
+
+    expect(restored.goal).toBe("Find roles matching my current profile")
+    expect(restored.snapshot.goal).toEqual({ id: "turn-goal:turn-1", content: "Find roles matching my current profile" })
+    expect(restored.snapshot.steerHistory).toEqual([
+      ...compactedHistory,
+      { id: "agent-question:prior-question:question", content: { role: "assistant", type: "question", question: "Which location should I prioritize?", options: [{ label: "Dublin", value: "dublin" }] } },
+      { id: "agent-question:prior-question:answer", content: { role: "user", type: "answer", questionId: "prior-wait", text: answer } },
+    ])
+    const claimStore: InputClaimStore = {
+      scope: { userId: "user-1" },
+      async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+        return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+          claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
+      },
+    }
+    const stepContext = await new StepContextBuilder(claimStore).build({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-current", snapshot: restored.snapshot, now: new Date(0),
+    })
+    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context: stepContext, model, tools: [], sessionId: "session-1", turnId: "turn-1",
+      stepId: "step-current", userId: "user-1", taskId: "root-current", signal: new AbortController().signal })
+    const prompt = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(prompt).toContain("trust=UNTRUSTED_DATA")
+    expect(prompt).toContain("Which location should I prioritize?")
+    expect(prompt).toContain("I prefer Dublin roles — escaped")
+    expect(prompt).toContain("stays intact.")
+    expect(prompt.match(/I prefer Dublin roles/g)).toHaveLength(1)
   })
 
   it("keeps canonical model history unchanged when no persisted answer event matches", async () => {
@@ -566,6 +687,8 @@ describe("loadCanonicalTurnState", () => {
   it("projects a consumed wait outcome into the next root context", async () => {
     const wait: { id: string; userId: string; sessionId: string; turnId: string; parentTaskId: string; stepId: string; targetTaskIds: string[]; mode: string; status: string; matchedTaskIds: string[]; result: Record<string, unknown>; suspendedAt: Date; consumedAt: Date | null } = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "all", status: "ready", matchedTaskIds: ["child-1"], result: { request: { mode: "all" } }, suspendedAt: new Date("2026-09-09T00:00:00.000Z"), consumedAt: null }
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      if (sql.includes('SELECT active_turn."createdAt"')) return { rows: [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }], rowCount: 1 }
+      if (sql.includes('SELECT prior."id"')) return { rows: [], rowCount: 0 }
       if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, input: { goal: "Continue" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [wait], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: [{ id: "child-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: "worker", status: "completed", result: { summary: "done" }, failureReason: null }], rowCount: 1 }

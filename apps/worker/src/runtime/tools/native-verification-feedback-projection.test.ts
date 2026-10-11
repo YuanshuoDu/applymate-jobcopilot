@@ -62,6 +62,35 @@ describe("native verification feedback projection", () => {
     })
   })
 
+  it("suppresses only typed self-attestation references, including a report that cites only a private answer", () => {
+    const privateReference = `user-self-attestation:${"f".repeat(64)}`
+    const withPrivateAndOrdinary = projectNativeVerificationResult({ nativeVerificationReport: report({
+      criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+        evidenceReferenceIds: ["target-ref-1", privateReference] }],
+    }) })
+    expect(withPrivateAndOrdinary).toEqual({ nativeVerificationFeedback: {
+      disposition: "passed", criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+        evidenceReferenceIds: ["target-ref-1"] }],
+    } })
+
+    const malformedNamespace = projectNativeVerificationResult({ nativeVerificationReport: report({
+      criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+        evidenceReferenceIds: ["user-self-attestation:bad"] }],
+    }) })
+    expect(malformedNamespace).toMatchObject({ nativeVerificationFeedback: { criteria: [{ evidenceReferenceIds: ["user-self-attestation:bad"] }] } })
+
+    const privateOnly = projectNativeVerificationResult({ nativeVerificationReport: report({
+      criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+        evidenceReferenceIds: [privateReference] }],
+    }) })
+    expect(privateOnly).toEqual({ nativeVerificationFeedback: {
+      disposition: "passed", criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+        evidenceReferenceIds: [] }],
+    } })
+    const serialized = JSON.stringify({ withPrivateAndOrdinary, privateOnly })
+    expect(serialized).not.toContain(privateReference)
+  })
+
   it("omits malformed reports instead of leaking them or inventing feedback", () => {
     const valid = report()
     const invalidReports = [

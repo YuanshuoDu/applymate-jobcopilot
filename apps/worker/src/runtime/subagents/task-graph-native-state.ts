@@ -1,4 +1,5 @@
 import { TASK_GRAPH_LIMITS, type TaskGraphNode, type TaskGraphState } from "../planning/task-graph.js"
+import { taskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
 import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphNativeSourceProvenance } from "./task-graph-native-command.js"
 
 export const TASK_GRAPH_NATIVE_METADATA_VERSION = "agent-harness.v2.task-graph.native-delegation.v1" as const
@@ -112,8 +113,13 @@ export function appendTaskGraphNativeNode(input: Readonly<{
 }>): Readonly<{ state: TaskGraphState; node: TaskGraphNode }> {
   const { state, maxDepth, key, goal, successCriteria, dependsOn, metadata, verifiedSource = false } = input
   if (!parseTaskGraphNativeDelegation(metadata)) throw new TaskGraphNativeStateError("native_graph_metadata_invalid")
+  const capacity = Array.isArray(state.nodes) ? taskGraphNodeCapacity({
+    nodeCount: state.nodes.length,
+    hasTypedVerification: state.nodes.some(node => node.verificationDisposition === "typed" || (node.verification?.criteria.length ?? 0) > 0),
+    repairRecorded: state.nodes.some(node => node.repairOf !== undefined),
+  }) : undefined
   if (!Number.isSafeInteger(state.revision) || state.revision < 0 || state.revision >= 2_147_483_646
-    || !Array.isArray(state.nodes) || state.nodes.length >= TASK_GRAPH_LIMITS.maxNodes
+    || !Array.isArray(state.nodes) || state.nodes.length >= TASK_GRAPH_LIMITS.maxNodes || !capacity || capacity.ordinaryRemaining < 1
     || state.nodes.some(node => node.key === key) || !id(key) || !label(goal, 4_000)
     || !stringList(successCriteria, 32, 1_000) || !Array.isArray(dependsOn) || new Set(dependsOn).size !== dependsOn.length) {
     throw new TaskGraphNativeStateError("native_graph_node_invalid")

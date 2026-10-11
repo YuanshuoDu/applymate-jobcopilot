@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { rm, writeFile } from "node:fs/promises"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
@@ -38,7 +38,11 @@ import { createPgContextOwnerFence, StepContextBuilder } from "../context/step-c
 import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
+import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "./native-verification-contract.js"
+import { parseNativeVerificationPacket } from "./native-verification-packet.js"
+import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { ROLE_RESULT_SCHEMA, RoleResultValidationError, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import { parseTaskGraphVerificationReport, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
@@ -50,6 +54,8 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
+import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
@@ -101,6 +107,14 @@ const ANALYST_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "analyst",
   criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} as const
+const DISCOVERY_ANALYST_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [
+    { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    { id: "findings-from-scout", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
+  ],
 } as const
 
 function expectVerifiedDependencyProjectionItems(
@@ -1827,6 +1841,14 @@ type FixtureTurnLimits = { readonly maxSteps: number; readonly maxToolCalls: num
 const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCalls: 8 }
 // The discovery fixtures execute root planning/replanning and child turns under the same root-scoped ceiling.
 const DISCOVERY_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 16, maxToolCalls: 8 }
+const VERIFICATION_REPAIR_MAX_WAIT_POLLS = TASK_GRAPH_LIMITS.maxNodes
+const VERIFICATION_REPAIR_MAX_REFERENCE_READS = 8
+const VERIFICATION_REPAIR_BASELINE_STEPS = 22
+const VERIFICATION_REPAIR_BASELINE_TOOL_CALLS = 19
+const VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT = 18_432
+// Eight bounded 4 KiB-envelope reads cover the capped seven-target output; each adds one finite model step and tool call.
+const VERIFICATION_REPAIR_STEP_BUDGET = VERIFICATION_REPAIR_BASELINE_STEPS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1 + VERIFICATION_REPAIR_MAX_REFERENCE_READS
+const VERIFICATION_REPAIR_TOOL_BUDGET = VERIFICATION_REPAIR_BASELINE_TOOL_CALLS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1 + VERIFICATION_REPAIR_MAX_REFERENCE_READS
 // TaskGraph multi-round fixtures need 10-11 root and child model steps; retain bounded headroom.
 const TASK_GRAPH_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 12, maxToolCalls: 12 }
 
@@ -2999,18 +3021,226 @@ async function collectPlanReceiptFailureDiagnostics(
   }
 }
 
-function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number): RecordValue & { tasks: unknown[] } {
+function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number, requiredRole?: "scout" | "analyst"): RecordValue & { tasks: unknown[] } {
   const outcomes = request.messages.flatMap(message => message.content.flatMap(part => {
     if (part.type !== "tool_result" || !part.toolUseId.startsWith("wait:") || typeof part.content !== "string") return []
     try {
       const outcome = record(JSON.parse(part.content) as unknown)
-      return outcome && Array.isArray(outcome.tasks) && outcome.tasks.length === taskCount ? [outcome] : []
+      return outcome && Array.isArray(outcome.tasks) && outcome.tasks.length === taskCount
+        && (!requiredRole || outcome.tasks.some(task => record(task)?.role === requiredRole)) ? [outcome] : []
     } catch { return [] }
   }))
   const outcome = outcomes[0]
   if (!outcome) throw new Error(`Expected a hydrated wait result with ${taskCount} child task(s)`)
   if (Buffer.byteLength(JSON.stringify(outcome), "utf8") > 8 * 1024) throw new Error("Hydrated child wait result exceeded its byte limit")
   return outcome as RecordValue & { tasks: unknown[] }
+}
+
+function repairWaitOutcomeFromRequest(
+  request: HarnessModelRequest,
+  callId: string,
+  expectedTaskIds: readonly string[],
+  resolvedOriginal?: unknown,
+): RecordValue {
+  const waitCall = toolUseFromRequest(request, callId)
+  const waitInput = record(waitCall?.input)
+  if (waitCall?.name !== "agent.wait" || !waitInput
+    || !sameUniqueIds(stringIds(waitInput.taskIds) ?? [], expectedTaskIds) || waitInput.mode !== "all") {
+    throw new Error("Repair wait call did not match the accepted plan task IDs")
+  }
+  const original = record(resolvedOriginal === undefined ? latestToolResult(request, callId) : resolvedOriginal)
+  const originalTaskIds = stringIds(original?.taskIds)
+  if (!original || typeof original.waitId !== "string" || original.waitId.length === 0
+    || !originalTaskIds || !sameUniqueIds(originalTaskIds, expectedTaskIds)) {
+    throw new Error("Repair wait receipt did not match the accepted plan task IDs")
+  }
+  const waitId = original.waitId
+  const outcome = original.status === "waiting"
+    ? record(latestToolResult(request, `wait:${waitId}`))
+    : original
+  if (!outcome || outcome.waitId !== waitId
+    || (outcome.status !== "ready" && outcome.status !== "timed_out")) {
+    throw new Error("Repair wait did not expose its exact resolved wait outcome")
+  }
+  const targetIds = stringIds(outcome.targetTaskIds ?? outcome.taskIds)
+  const matchedIds = stringIds(outcome.matchedTaskIds, true)
+  const taskIds = Array.isArray(outcome.tasks)
+    ? stringIds(outcome.tasks.map(task => record(task)?.taskId)) : null
+  if (!targetIds || !sameUniqueIds(targetIds, expectedTaskIds)
+    || !matchedIds || matchedIds.some(id => !expectedTaskIds.includes(id))
+    || !taskIds || !sameUniqueIds(taskIds, expectedTaskIds)
+    || (outcome.status === "ready" && !sameUniqueIds(matchedIds, expectedTaskIds))) {
+    throw new Error("Resolved repair wait did not cover the exact accepted plan task IDs")
+  }
+  return outcome
+}
+
+type RepairWaitReference = { readonly id: string; readonly sizeBytes: number; readonly sha256: string }
+type RepairWaitFailureClass =
+  | "reference_invalid" | "read_limit" | "read_identity" | "chunk_invalid" | "cursor_invalid"
+  | "digest_invalid" | "json_invalid" | "wait_call_mismatch" | "wait_receipt_mismatch"
+  | "wait_outcome_missing" | "wait_target_mismatch" | "targets_missing" | "reader_not_visible"
+  | "read_budget_exceeded" | "other"
+type RepairWaitFailureStage = "output_resolution" | "outcome_validation"
+type RepairWaitFailureErrorKind = "error" | "type_error" | "range_error" | "syntax_error" | "non_error"
+type RepairWaitOutcomeDiagnosticStatus = "ready" | "timed_out" | "waiting" | "unavailable" | "other"
+
+function boundedRepairWaitDiagnosticCount(value: unknown): number {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Math.min(8, Number(value)) : 0
+}
+
+function repairWaitOutcomeDiagnosticStatus(value: unknown): RepairWaitOutcomeDiagnosticStatus {
+  const status = record(value)?.status
+  if (status === "ready" || status === "timed_out" || status === "waiting") return status
+  return typeof status === "string" ? "other" : "unavailable"
+}
+
+function repairWaitFailureErrorKind(error: unknown): RepairWaitFailureErrorKind {
+  try {
+    if (error instanceof TypeError) return "type_error"
+    if (error instanceof RangeError) return "range_error"
+    if (error instanceof SyntaxError) return "syntax_error"
+    if (error instanceof Error) return "error"
+  } catch {
+    return "non_error"
+  }
+  return "non_error"
+}
+
+const REPAIR_WAIT_FAILURE_CLASSES: Readonly<Record<string, RepairWaitFailureClass>> = {
+  repair_wait_reference_invalid: "reference_invalid",
+  repair_wait_reference_read_limit: "read_limit",
+  repair_wait_reference_read_identity: "read_identity",
+  repair_wait_reference_chunk_invalid: "chunk_invalid",
+  repair_wait_reference_cursor_invalid: "cursor_invalid",
+  repair_wait_reference_digest_invalid: "digest_invalid",
+  repair_wait_reference_json_invalid: "json_invalid",
+  "Repair wait call did not match the accepted plan task IDs": "wait_call_mismatch",
+  "Repair wait receipt did not match the accepted plan task IDs": "wait_receipt_mismatch",
+  "Repair wait did not expose its exact resolved wait outcome": "wait_outcome_missing",
+  "Resolved repair wait did not cover the exact accepted plan task IDs": "wait_target_mismatch",
+  "repair fixture lost accepted wait targets": "targets_missing",
+  "repair wait reference reader was not visible to the model": "reader_not_visible",
+  "repair wait reference exceeded its bounded read budget": "read_budget_exceeded",
+}
+
+function repairWaitFailureClass(error: unknown): RepairWaitFailureClass {
+  if (!(error instanceof Error) || !Object.prototype.hasOwnProperty.call(REPAIR_WAIT_FAILURE_CLASSES, error.message)) {
+    return "other"
+  }
+  return REPAIR_WAIT_FAILURE_CLASSES[error.message]
+}
+
+function repairWaitReferenceSizeBytes(value: unknown): number | null {
+  const size = record(value)?.sizeBytes
+  return Number.isSafeInteger(size) && Number(size) >= 0 && Number(size) <= 1024 * 1024 ? Number(size) : null
+}
+
+type RepairWaitOutputResolution =
+  | { readonly status: "inline"; readonly output: unknown }
+  | { readonly status: "read"; readonly reference: RepairWaitReference; readonly cursor?: string }
+  | { readonly status: "complete"; readonly reference: RepairWaitReference; readonly output: unknown; readonly readCount: number }
+
+const TOOL_RESULT_REFERENCE_ID = /^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function toolUseFromRequest(request: HarnessModelRequest, callId: string): { name: string; input: unknown } | null {
+  for (let messageIndex = request.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const content = request.messages[messageIndex]!.content
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]!
+      if (part.type !== "tool_use" || part.id !== callId || typeof part.name !== "string") continue
+      return { name: part.name, input: part.input }
+    }
+  }
+  return null
+}
+
+function repairWaitReference(value: unknown): RepairWaitReference | null {
+  const row = record(value)
+  if (!row) return null
+  if (!Object.hasOwn(row, "$ref")) {
+    if (Object.hasOwn(row, "sizeBytes") || Object.hasOwn(row, "sha256")) throw new Error("repair_wait_reference_invalid")
+    return null
+  }
+  if (Object.keys(row).sort().join(",") !== "$ref,sha256,sizeBytes"
+    || typeof row.$ref !== "string" || !TOOL_RESULT_REFERENCE_ID.test(row.$ref)
+    || !Number.isSafeInteger(row.sizeBytes) || Number(row.sizeBytes) <= 8 * 1024
+    || Number(row.sizeBytes) > VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT
+    || typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256)) {
+    throw new Error("repair_wait_reference_invalid")
+  }
+  return { id: row.$ref, sizeBytes: Number(row.sizeBytes), sha256: row.sha256 }
+}
+
+function repairWaitOutputResolutionFromRequest(
+  request: HarnessModelRequest,
+  callId: string,
+  readCallIds: readonly string[],
+): RepairWaitOutputResolution {
+  const original = latestToolResult(request, callId)
+  const reference = repairWaitReference(original)
+  if (!reference) return { status: "inline", output: original }
+  if (readCallIds.length > VERIFICATION_REPAIR_MAX_REFERENCE_READS) throw new Error("repair_wait_reference_read_limit")
+
+  let cursor: string | undefined
+  let offset = 0
+  const chunks: string[] = []
+  for (let index = 0; index < readCallIds.length; index += 1) {
+    const readCallId = readCallIds[index]!
+    const call = toolUseFromRequest(request, readCallId)
+    const input = record(call?.input)
+    const expectedInputKeys = cursor === undefined ? "referenceId" : "cursor,referenceId"
+    if (call?.name !== "tool_results.read" || !input
+      || Object.keys(input).sort().join(",") !== expectedInputKeys
+      || input.referenceId !== reference.id
+      || (cursor === undefined ? input.cursor !== undefined : input.cursor !== cursor)) {
+      throw new Error("repair_wait_reference_read_identity")
+    }
+    const chunk = record(latestToolResult(request, readCallId))
+    if (!chunk || Object.keys(chunk).sort().join(",") !== "byteCount,chunk,nextCursor,ref,sha256"
+      || chunk.ref !== reference.id || chunk.sha256 !== reference.sha256 || chunk.byteCount !== reference.sizeBytes
+      || typeof chunk.chunk !== "string" || chunk.chunk.length === 0
+      || Buffer.byteLength(chunk.chunk, "utf8") > 4_096
+      || Buffer.from(chunk.chunk, "utf8").toString("utf8") !== chunk.chunk
+      || Buffer.byteLength(JSON.stringify(chunk), "utf8") > 4_096) {
+      throw new Error("repair_wait_reference_chunk_invalid")
+    }
+    const chunkBytes = Buffer.byteLength(chunk.chunk, "utf8")
+    offset += chunkBytes
+    if (offset > reference.sizeBytes) throw new Error("repair_wait_reference_cursor_invalid")
+    chunks.push(chunk.chunk)
+    if (chunk.nextCursor === null) {
+      if (offset !== reference.sizeBytes || index !== readCallIds.length - 1) {
+        throw new Error("repair_wait_reference_cursor_invalid")
+      }
+      const encoded = chunks.join("")
+      if (Buffer.byteLength(encoded, "utf8") !== reference.sizeBytes
+        || createHash("sha256").update(encoded, "utf8").digest("hex") !== reference.sha256) {
+        throw new Error("repair_wait_reference_digest_invalid")
+      }
+      let output: unknown
+      try { output = JSON.parse(encoded) as unknown } catch { throw new Error("repair_wait_reference_json_invalid") }
+      return { status: "complete", reference, output, readCount: readCallIds.length }
+    }
+    if (typeof chunk.nextCursor !== "string" || !/^(0|[1-9][0-9]*)$/.test(chunk.nextCursor)
+      || Number(chunk.nextCursor) !== offset || offset >= reference.sizeBytes) {
+      throw new Error("repair_wait_reference_cursor_invalid")
+    }
+    cursor = chunk.nextCursor
+  }
+  if (readCallIds.length === 0) return { status: "read", reference }
+  if (cursor === undefined) throw new Error("repair_wait_reference_cursor_invalid")
+  return { status: "read", reference, cursor }
+}
+
+function stringIds(value: unknown, allowEmpty = false): string[] | null {
+  if (!Array.isArray(value) || value.length > 8 || (!allowEmpty && value.length === 0)) return null
+  const ids: string[] = []
+  for (const id of value) {
+    if (typeof id !== "string" || id.length === 0 || id.length > 256 || id.trim() !== id) return null
+    ids.push(id)
+  }
+  return new Set(ids).size === ids.length ? ids : null
 }
 
 function currentGraphFromRequest(request: HarnessModelRequest): RecordValue | null {
@@ -3026,13 +3256,13 @@ function currentGraphFromRequest(request: HarnessModelRequest): RecordValue | nu
   return null
 }
 
-function expectPassedVerificationReport(value: unknown, criterionId: string): void {
+function expectPassedVerificationReport(value: unknown, ...criterionIds: string[]): void {
   const report = record(value)
   expect(report).toMatchObject({
     verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
     status: "passed",
     reasonCode: "criteria_met",
-    criteria: [{ criterionId, status: "passed", reasonCode: "criteria_met" }],
+    criteria: criterionIds.map(criterionId => ({ criterionId, status: "passed", reasonCode: "criteria_met" })),
   })
   expect(typeof report?.evidenceDigest).toBe("string")
   expect(String(report?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
@@ -3947,9 +4177,11 @@ async function waitToolResultDiagnostic(pool: Pool, turnId: string, toolCallId: 
 async function scopedWaitToolResultDiagnostic(pool: Pool, owner: Fixture, toolCallId: string): Promise<RecordValue> {
   const result = await pool.query<{
     itemStatus: string; outputStatus: string | null; targetCount: number | null; matchedCount: number | null;
-    targetIdsRedacted: boolean | null; taskIdsRedacted: boolean | null
+    targetIdsRedacted: boolean | null; taskIdsRedacted: boolean | null; outputReferencePresent: boolean | null
   }>(
     `SELECT item."status" AS "itemStatus", item."content"->'output'->>'status' AS "outputStatus",
+       CASE WHEN jsonb_typeof(item."content"->'output') = 'object'
+         AND (item."content"->'output') ? '$ref' THEN true ELSE false END AS "outputReferencePresent",
        CASE WHEN jsonb_typeof(item."content"->'output'->'taskIds') = 'array'
          THEN jsonb_array_length(item."content"->'output'->'taskIds') ELSE NULL END AS "targetCount",
        CASE WHEN jsonb_typeof(item."content"->'output'->'matchedTaskIds') = 'array'
@@ -3980,6 +4212,7 @@ async function scopedWaitToolResultDiagnostic(pool: Pool, owner: Fixture, toolCa
     resultPresent: Boolean(row),
     resultStatus: row ? diagnosticEnum(row.itemStatus, ITEM_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
     outputStatus: diagnosticEnum(row?.outputStatus, PROCESS_FIXTURE_WAIT_OUTPUT_STATUSES) ?? (row?.outputStatus == null ? "missing" : "other"),
+    outputReferencePresent: row?.outputReferencePresent === true,
     targetTaskCount: diagnosticBoundedCount(row?.targetCount),
     matchedTaskCount: diagnosticBoundedCount(row?.matchedCount),
     targetIdsRedacted: row?.targetIdsRedacted ?? null,
@@ -5845,6 +6078,191 @@ describe("TaskGraph restart fixture service boundary", () => {
   }, 120_000)
 })
 
+describe("TaskGraph repair wait model-visible outcome fixture", () => {
+  const taskIds = ["repair-task", "analyst-1", "analyst-2", "analyst-3", "analyst-4", "analyst-5", "analyst-6"]
+  const requestWithResults = (results: readonly { toolUseId: string; value: unknown }[]) => ({
+    messages: results.flatMap(result => [
+      { role: "assistant", content: [{
+        type: "tool_use", id: result.toolUseId, name: "agent.wait", input: { taskIds, mode: "all" },
+      }] },
+      { role: "tool", content: [{
+        type: "tool_result", toolUseId: result.toolUseId, content: JSON.stringify(result.value),
+      }] },
+    ]),
+  } as unknown as HarnessModelRequest)
+
+  it("uses the exact hydrated wait channel instead of the immutable waiting receipt", () => {
+    const original = { waitId: "wait-repair-1", status: "waiting", taskIds, matchedTaskIds: [] }
+    const resolved = {
+      waitId: "wait-repair-1", status: "ready", targetTaskIds: taskIds, matchedTaskIds: taskIds,
+      tasks: taskIds.map(taskId => ({ taskId, status: "completed" })),
+    }
+    const request = requestWithResults([
+      { toolUseId: "repair-wait-call", value: original },
+      { toolUseId: "wait:wait-repair-1", value: resolved },
+    ])
+
+    expect(latestToolResult(request, "repair-wait-call")).toEqual(original)
+    expect(repairWaitOutcomeFromRequest(request, "repair-wait-call", taskIds)).toEqual(resolved)
+  })
+
+  it("keeps immediate ready outcomes and rejects missing or mismatched resumed identity", () => {
+    const directReady = {
+      waitId: "wait-ready-1", status: "ready", taskIds, matchedTaskIds: taskIds,
+      tasks: taskIds.map(taskId => ({ taskId, status: "completed" })),
+    }
+    expect(repairWaitOutcomeFromRequest(
+      requestWithResults([{ toolUseId: "ready-call", value: directReady }]), "ready-call", taskIds,
+    )).toEqual(directReady)
+
+    const waiting = { waitId: "wait-repair-2", status: "waiting", taskIds, matchedTaskIds: [] }
+    expect(() => repairWaitOutcomeFromRequest(
+      requestWithResults([{ toolUseId: "waiting-call", value: waiting }]), "waiting-call", taskIds,
+    )).toThrow("exact resolved wait outcome")
+    expect(() => repairWaitOutcomeFromRequest(
+      requestWithResults([
+        { toolUseId: "waiting-call", value: waiting },
+        { toolUseId: "wait:wait-repair-2", value: { ...directReady, waitId: "other-wait" } },
+      ]), "waiting-call", taskIds,
+    )).toThrow("exact resolved wait outcome")
+  })
+
+  it("projects only bounded wait-reference diagnostics", () => {
+    expect(repairWaitReferenceSizeBytes({ $ref: "private-reference-id", sizeBytes: 18_433, sha256: "private-digest" })).toBe(18_433)
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: -1 })).toBeNull()
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: 1.5 })).toBeNull()
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: 1_048_576 })).toBe(1_048_576)
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: 1_048_577 })).toBeNull()
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: "private-value" })).toBeNull()
+    expect(repairWaitFailureClass(new Error("repair_wait_reference_invalid"))).toBe("reference_invalid")
+    expect(repairWaitFailureClass(new Error("__proto__"))).toBe("other")
+    expect(repairWaitFailureClass(new Error("constructor"))).toBe("other")
+    expect(repairWaitFailureClass(new Error("private provider or result text"))).toBe("other")
+    expect(repairWaitFailureErrorKind(new Error("private message"))).toBe("error")
+    expect(repairWaitFailureErrorKind(new TypeError("private type message"))).toBe("type_error")
+    expect(repairWaitFailureErrorKind(new RangeError("private range message"))).toBe("range_error")
+    expect(repairWaitFailureErrorKind(new SyntaxError("private syntax message"))).toBe("syntax_error")
+    expect(repairWaitFailureErrorKind("private thrown value")).toBe("non_error")
+    const messageGuardedError = new Error()
+    Object.defineProperty(messageGuardedError, "message", { get: () => { throw new Error("private getter") } })
+    expect(repairWaitFailureErrorKind(messageGuardedError)).toBe("error")
+    const prototypeGuardedError = new Proxy(new Error("private proxy message"), {
+      getPrototypeOf: () => { throw new Error("private proxy trap") },
+    })
+    expect(repairWaitFailureErrorKind(prototypeGuardedError)).toBe("non_error")
+    expect(boundedRepairWaitDiagnosticCount(-1)).toBe(0)
+    expect(boundedRepairWaitDiagnosticCount(1.5)).toBe(0)
+    expect(boundedRepairWaitDiagnosticCount(0)).toBe(0)
+    expect(boundedRepairWaitDiagnosticCount(8)).toBe(8)
+    expect(boundedRepairWaitDiagnosticCount(9)).toBe(8)
+    expect(boundedRepairWaitDiagnosticCount("private count")).toBe(0)
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "ready" })).toBe("ready")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "timed_out" })).toBe("timed_out")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "waiting" })).toBe("waiting")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: "private status and id" })).toBe("other")
+    expect(repairWaitOutcomeDiagnosticStatus({ status: { private: "payload" } })).toBe("unavailable")
+    expect(JSON.stringify([
+      repairWaitOutcomeDiagnosticStatus({ status: "private status and id" }),
+      boundedRepairWaitDiagnosticCount("private count"),
+      repairWaitFailureErrorKind(new TypeError("private type message")),
+      repairWaitFailureErrorKind("private thrown value"),
+    ])).not.toContain("private")
+  })
+
+  it("reassembles the exact bounded wait JSON from model-visible reference reads", () => {
+    const output = {
+      waitId: "wait-ready-reference-1", status: "ready", taskIds,
+      targetTaskIds: taskIds, matchedTaskIds: taskIds,
+      tasks: taskIds.map((taskId, index) => ({
+        taskId, status: "completed", role: index === 0 ? "scout" : "analyst",
+        result: { truncated: true, summary: "Résumé evidence ".repeat(100) },
+      })),
+    }
+    const encoded = JSON.stringify(output)
+    const bytes = Buffer.from(encoded, "utf8")
+    const ref = "tool-result-00000000-0000-4000-8000-000000000001"
+    const sha256 = createHash("sha256").update(bytes).digest("hex")
+    expect(bytes.byteLength).toBeGreaterThan(8 * 1024)
+    expect(bytes.byteLength).toBeLessThanOrEqual(VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT)
+    const reference = { $ref: ref, sizeBytes: bytes.byteLength, sha256 }
+    const messages: unknown[] = [
+      { role: "assistant", content: [{ type: "tool_use", id: "repair-wait-call", name: "agent.wait", input: { taskIds, mode: "all" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "repair-wait-call", content: JSON.stringify(reference) }] },
+    ]
+    const readCallIds: string[] = []
+    let cursor = 0
+    while (cursor < bytes.length) {
+      let end = Math.min(bytes.length, cursor + 2_048)
+      while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1
+      const callId = `repair-wait-read-${readCallIds.length + 1}`
+      const chunk = bytes.subarray(cursor, end).toString("utf8")
+      const nextCursor = end < bytes.length ? String(end) : null
+      readCallIds.push(callId)
+      messages.push({ role: "assistant", content: [{
+        type: "tool_use", id: callId, name: "tool_results.read",
+        input: { referenceId: ref, ...(cursor === 0 ? {} : { cursor: String(cursor) }) },
+      }] })
+      messages.push({ role: "tool", content: [{ type: "tool_result", toolUseId: callId, content: JSON.stringify({
+        ref, sha256, byteCount: bytes.byteLength, chunk, nextCursor,
+      }) }] })
+      cursor = end
+    }
+    expect(readCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_REFERENCE_READS)
+    const request = { messages } as unknown as HarnessModelRequest
+    const resolution = repairWaitOutputResolutionFromRequest(request, "repair-wait-call", readCallIds)
+    expect(resolution).toMatchObject({
+      status: "complete", reference: { id: ref, sizeBytes: bytes.byteLength, sha256 }, readCount: readCallIds.length,
+    })
+    if (resolution.status !== "complete") throw new Error("synthetic wait reference was not completely read")
+    expect(resolution.output).toEqual(output)
+    expect(repairWaitOutcomeFromRequest(request, "repair-wait-call", taskIds, resolution.output)).toEqual(output)
+  })
+
+  it("rejects malformed references and foreign, replayed, or digest-mismatched reads", () => {
+    const output = { waitId: "wait-ready-reference-2", status: "ready", taskIds, targetTaskIds: taskIds, matchedTaskIds: taskIds, tasks: taskIds.map(taskId => ({ taskId, status: "completed", result: { truncated: true, summary: "Archived fixture evidence ".repeat(75) } })) }
+    const encoded = JSON.stringify(output)
+    const bytes = Buffer.from(encoded, "utf8")
+    const ref = "tool-result-00000000-0000-4000-8000-000000000002"
+    const sha256 = createHash("sha256").update(bytes).digest("hex")
+    const reference = { $ref: ref, sizeBytes: bytes.byteLength, sha256 }
+    expect(bytes.byteLength).toBeGreaterThan(8 * 1024)
+    expect(bytes.byteLength).toBeLessThanOrEqual(VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT)
+    const firstChunk = bytes.subarray(0, 32).toString("utf8")
+    const firstResult = { ref, sha256, byteCount: bytes.byteLength, chunk: firstChunk, nextCursor: "32" }
+    const requestFor = (readInput: RecordValue, readResult: unknown, referenceValue: unknown = reference) => ({
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "wait-call", name: "agent.wait", input: { taskIds, mode: "all" } }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "wait-call", content: JSON.stringify(referenceValue) }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "read-call", name: "tool_results.read", input: readInput }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "read-call", content: JSON.stringify(readResult) }] },
+      ],
+    } as unknown as HarnessModelRequest)
+    expect(() => repairWaitOutputResolutionFromRequest(requestFor(
+      { referenceId: ref }, firstResult, { ...reference, sizeBytes: VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT + 1 },
+    ), "wait-call", ["read-call"])).toThrow("repair_wait_reference_invalid")
+    expect(() => repairWaitOutputResolutionFromRequest(
+      requestFor({ referenceId: "tool-result-00000000-0000-4000-8000-000000000099" }, firstResult), "wait-call", ["read-call"],
+    )).toThrow("repair_wait_reference_read_identity")
+    expect(() => repairWaitOutputResolutionFromRequest(
+      requestFor({ referenceId: ref }, { ...firstResult, ref: "tool-result-00000000-0000-4000-8000-000000000099" }), "wait-call", ["read-call"],
+    )).toThrow("repair_wait_reference_chunk_invalid")
+    const replayedCursorRequest = {
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "wait-call", name: "agent.wait", input: { taskIds, mode: "all" } }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "wait-call", content: JSON.stringify(reference) }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "read-1", name: "tool_results.read", input: { referenceId: ref } }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "read-1", content: JSON.stringify(firstResult) }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "read-2", name: "tool_results.read", input: { referenceId: ref, cursor: "0" } }] },
+      ],
+    } as unknown as HarnessModelRequest
+    expect(() => repairWaitOutputResolutionFromRequest(replayedCursorRequest, "wait-call", ["read-1", "read-2"]))
+      .toThrow("repair_wait_reference_read_identity")
+    const digestMismatch = requestFor({ referenceId: ref }, { ...firstResult, sha256: "0".repeat(64) })
+    expect(() => repairWaitOutputResolutionFromRequest(digestMismatch, "wait-call", ["read-call"]))
+      .toThrow("repair_wait_reference_chunk_invalid")
+  })
+})
+
 describe("TaskGraph fixture lease guard unit", () => {
   it("rejects a mismatched lease identity before recording its goal", () => {
     const owner = fixture()
@@ -5918,8 +6336,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, discoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
-    // Repair flow uses four coordination calls and five exact job reads.
-    await seed(pool, verificationRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
+    // The existing one-poll witness uses 22 steps/19 tool calls; each additional bounded poll adds one of each.
+    await seed(pool, verificationRepairOwner, "waiting_for_user", {
+      ...DISCOVERY_FIXTURE_TURN_LIMITS,
+      maxSteps: VERIFICATION_REPAIR_STEP_BUDGET,
+      maxToolCalls: VERIFICATION_REPAIR_TOOL_BUDGET,
+    })
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
@@ -9038,9 +9460,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(root.rows).toHaveLength(1)
       expect(root.rows[0]?.status).toBe("completed")
-      expect(record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist).toEqual({
-        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
-      })
+      const persistedShortlist = record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist
       const children = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
         `SELECT "id", "role", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "role" = ANY($4::text[]) ORDER BY "role"`,
         [value.turnId, value.sessionId, root.rows[0]!.id, ["analyst", "scout"]],
@@ -9110,7 +9530,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [value.turnId, value.sessionId, value.userId],
       )
       expect(turn.rows[0]?.leaseVersion).toBeGreaterThan(checkpointTurn.rows[0]!.leaseVersion)
-      expect(turn.rows[0]?.finalResponse).toContain(jobId)
+      expect(persistedShortlist).toEqual({
+        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
+      })
       expect(workerTwo.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(false)
       expect(workerThree.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(true)
       expect(workerThree.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_SETTLED ${analyst!.id} analyst completed`))).toHaveLength(1)
@@ -9423,9 +9845,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           failures: Array.isArray(shortlist?.failures) ? shortlist.failures.filter((failure): failure is string => typeof failure === "string").slice(0, 12) : [],
         }
         const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
-        const finalShortlistText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
-        if (turn.rows[0]?.status !== "completed" || !finalShortlistText || JSON.stringify(JSON.parse(finalShortlistText)) !== JSON.stringify(safeShortlist)) {
-          throw new Error("Interactive discovery trace final outcome does not match its persisted shortlist")
+        const finalCandidateText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
+        if (turn.rows[0]?.status !== "completed" || finalCandidateText !== JSON.stringify({
+          schemaVersion: "agent-harness.v2.final", response: "p3-process-restart-discovery-shortlist-ready",
+        })) {
+          throw new Error("Interactive discovery trace final outcome does not preserve its verified model candidate")
         }
         await writeFile(interactiveDiscoveryTraceArtifactPath, JSON.stringify({
           schemaVersion: "agent-harness.v2.interactive-discovery-trace",
@@ -9438,7 +9862,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           tasks: safeTasks,
           planLedger,
           interactiveDiscoveryShortlist: safeShortlist,
-          finalOutcome: { turnStatus: turn.rows[0].status, response: finalShortlistText },
+          finalOutcome: { turnStatus: turn.rows[0].status, response: finalCandidateText },
         }), "utf8")
       }
     } finally {
@@ -9486,6 +9910,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     let rootExecution = 0
     let discoveryRootModelFailure: string | null = null
+    let discoveryScoutGraphRevision = -1
     let discoveryRootStage: "not_started" | "initial_plan" | "scout_wait" | "replan" | "analyst_plan_receipt" | "analyst_wait" | "final" = "not_started"
     let discoveryChildStage: "not_started" | "search_visibility" | "search_call_emitted" | "parent_wait" | "result_emitted" = "not_started"
     let discoveryJobsSearchAppeared = false
@@ -9544,9 +9969,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
               const revision = graph?.revision
               if (typeof revision !== "number") throw new Error("Discovery replan did not receive the durable graph revision")
+              discoveryScoutGraphRevision = revision
               yield { type: "tool_call_completed", callId: "p3-discovery-plan-analyst", name: "agent.plan", arguments: {
                 expectedRevision: revision,
-                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION }],
+                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"], verification: DISCOVERY_ANALYST_VERIFICATION }],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
@@ -9568,9 +9994,338 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(nodes.map(node => node?.key)).toEqual(["scout", "analyst"])
               expect(nodes.map(node => node?.status)).toEqual(["completed", "completed"])
               expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
-              expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count")
-              const wait = waitOutcomeFromRequest(request, 1)
+              expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count", "findings-from-scout")
+              expect(typeof graph?.revision).toBe("number")
+              expect(graph?.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              const publicReportKeys = ["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"]
+              const publicGraphReport = record(nodes[1]?.verificationReport)
+              expect(Object.keys(publicGraphReport ?? {}).sort()).toEqual(publicReportKeys)
+              expect(JSON.stringify(publicGraphReport)).not.toContain("dependencyBindings")
+              const wait = waitOutcomeFromRequest(request, 1, "analyst")
               expect(wait.status).toBe("ready")
+              const waitedAnalyst = record(wait.tasks[0])
+              const publicWaitReport = record(waitedAnalyst?.verificationReport)
+              expect(waitedAnalyst?.role).toBe("analyst")
+              expectPassedVerificationReport(publicWaitReport, "finding-count", "findings-from-scout")
+              expect(Object.keys(publicWaitReport ?? {}).sort()).toEqual(publicReportKeys)
+              expect(JSON.stringify(publicWaitReport)).not.toContain("dependencyBindings")
+
+              const ownerRows = await pool!.query<{
+                rootTaskId: string; turnLeaseOwner: string; turnLeaseVersion: number
+                turnLeaseStartedAt: Date; turnLeaseExpiresAt: Date; stepId: string
+                parentLeaseOwner: string; parentAttemptCount: number
+              }>(`SELECT turn."rootTaskId", turn."leaseOwnerId" AS "turnLeaseOwner", turn."leaseVersion" AS "turnLeaseVersion",
+                    turn."leaseStartedAt" AS "turnLeaseStartedAt", turn."leaseExpiresAt" AS "turnLeaseExpiresAt",
+                    (SELECT step."id" FROM "agent_steps" AS step WHERE step."sessionId" = turn."sessionId"
+                      AND step."turnId" = turn."id" AND step."taskId" = root."id" AND step."status" = 'streaming'
+                      ORDER BY step."ordinal" DESC LIMIT 1) AS "stepId",
+                    root."leaseOwner" AS "parentLeaseOwner", root."attemptCount" AS "parentAttemptCount"
+                 FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root
+                   ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+                 WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND root."status" = 'running'`,
+              [discoveryOwner.turnId, discoveryOwner.sessionId, discoveryOwner.userId])
+              const currentOwner = ownerRows.rows[0]
+              if (!currentOwner?.stepId) throw new Error("Discovery root lease or streaming step was unavailable for current graph readback")
+              const terminalGateLease: TurnLease = {
+                turnId: discoveryOwner.turnId, sessionId: discoveryOwner.sessionId, ownerId: currentOwner.turnLeaseOwner,
+                userId: discoveryOwner.userId, leaseVersion: currentOwner.turnLeaseVersion,
+                leaseStartedAt: currentOwner.turnLeaseStartedAt, leaseExpiresAt: currentOwner.turnLeaseExpiresAt,
+              }
+              const readScope = {
+                userId: discoveryOwner.userId, sessionId: discoveryOwner.sessionId, turnId: discoveryOwner.turnId,
+                rootTaskId: currentOwner.rootTaskId, parentTaskId: currentOwner.rootTaskId,
+                turnLeaseOwner: currentOwner.turnLeaseOwner, turnLeaseVersion: currentOwner.turnLeaseVersion,
+                parentLeaseOwner: currentOwner.parentLeaseOwner, parentAttemptCount: currentOwner.parentAttemptCount,
+              }
+              const nativeVerificationScope = { ...readScope, stepId: currentOwner.stepId }
+              const nativeVerificationPort = createPgNativeVerificationPort(pool!)
+              const currentGraphState = await discoveryCommandPort.readCurrent(readScope)
+              expect(currentGraphState.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              const currentScout = currentGraphState.nodes.find(node => node.key === "scout")
+              const currentAnalyst = currentGraphState.nodes.find(node => node.key === "analyst")
+              expectPassedVerificationReport(currentScout?.verificationReport, "candidate-count")
+              expectPassedVerificationReport(currentAnalyst?.verificationReport, "finding-count", "findings-from-scout")
+              await expect(checkTerminalTaskGraph(pool!, terminalGateLease, currentOwner.rootTaskId))
+                .resolves.toMatchObject({ ok: true })
+              const nativeCandidateText = "The verified shortlist remains current."
+              const acceptedNativeRoot = await nativeVerificationPort.ensureRootGoal({
+                scope: nativeVerificationScope, candidateText: nativeCandidateText,
+              })
+              expect(["pending", "passed"]).toContain(acceptedNativeRoot.status)
+              expect(acceptedNativeRoot.controlTaskIds).toHaveLength(1)
+              const acceptedNativeRootControlId = acceptedNativeRoot.controlTaskIds[0]
+              expect(acceptedNativeRootControlId).toBeTruthy()
+              if (acceptedNativeRoot.status === "pending") {
+                expect(acceptedNativeRoot.pendingControlTaskIds).toContain(acceptedNativeRootControlId)
+                expect(acceptedNativeRoot.pendingTaskIds).toContain(acceptedNativeRootControlId)
+              } else {
+                expect(acceptedNativeRoot.rootGoalWitness?.controlTaskId).toBe(acceptedNativeRootControlId)
+                expect(acceptedNativeRoot.rootGoalWitness?.candidateDigest).toMatch(/^[a-f0-9]{64}$/)
+              }
+              const nativeRootControl = await pool!.query<{
+                role: string; taskType: string; rootTaskId: string; parentTaskId: string; status: string; expectedOutputSchema: unknown
+              }>(`SELECT "role", "taskType", "rootTaskId", "parentTaskId", "status", "expectedOutputSchema"
+                  FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+              [acceptedNativeRootControlId, discoveryOwner.sessionId, discoveryOwner.turnId])
+              expect(nativeRootControl.rows).toHaveLength(1)
+              expect(nativeRootControl.rows[0]).toMatchObject({
+                role: "auditor", taskType: "native_verification", rootTaskId: currentOwner.rootTaskId,
+                parentTaskId: currentOwner.rootTaskId,
+              })
+              expect(parseNativeVerificationControl(nativeRootControl.rows[0]?.expectedOutputSchema)?.target.kind).toBe("root_goal")
+              const recoveredNativeRoot = await nativeVerificationPort.readRecoverableGoal(readScope)
+              expect(recoveredNativeRoot).toMatchObject({ controlTaskId: acceptedNativeRootControlId, candidateText: nativeCandidateText })
+              expect(["pending", "passed"]).toContain(recoveredNativeRoot?.status)
+              if (recoveredNativeRoot?.status === "passed") {
+                expect(recoveredNativeRoot.witness?.controlTaskId).toBe(acceptedNativeRootControlId)
+              }
+              const nativeControlDeadline = Date.now() + 30_000
+              let completedNativeRootControl: { status: string; attemptCount: number; failureReason: string | null } | undefined
+              while (Date.now() < nativeControlDeadline) {
+                const controlState = await pool!.query<{
+                  status: string; attemptCount: number; failureReason: string | null
+                }>(`SELECT "status", "attemptCount", "failureReason" FROM "sub_agent_tasks"
+                    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+                [acceptedNativeRootControlId, discoveryOwner.sessionId, discoveryOwner.turnId])
+                const currentControl = controlState.rows[0]
+                if (currentControl?.status === "completed") {
+                  completedNativeRootControl = currentControl
+                  break
+                }
+                if (currentControl && ["failed", "interrupted", "cancelled", "closed"].includes(currentControl.status)) {
+                  throw new Error(`Discovery native root control terminated as ${currentControl.status}`)
+                }
+                await new Promise(resolve => setTimeout(resolve, 25))
+              }
+              expect(completedNativeRootControl).toMatchObject({ status: "completed", failureReason: null })
+              expect(completedNativeRootControl?.attemptCount).toBeGreaterThan(0)
+              const passedNativeRoot = await nativeVerificationPort.readRecoverableGoal(readScope)
+              expect(passedNativeRoot).toMatchObject({ controlTaskId: acceptedNativeRootControlId,
+                candidateText: nativeCandidateText, status: "passed" })
+              expect(passedNativeRoot?.status === "passed" ? passedNativeRoot.witness?.controlTaskId : undefined)
+                .toBe(acceptedNativeRootControlId)
+
+              const childRows = await pool!.query<{ id: string; role: string; result: unknown }>(
+                `SELECT "id", "role", "result" FROM "sub_agent_tasks"
+                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "rootTaskId" = $3 AND "parentTaskId" = $3
+                   AND "role" = ANY($4::text[])`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId, ["analyst", "scout"]],
+              )
+              const scoutTask = childRows.rows.find(task => task.role === "scout")
+              const analystTask = childRows.rows.find(task => task.role === "analyst")
+              const scoutResult = record(scoutTask?.result)
+              const scoutStructured = record(scoutResult?.structuredResult)
+              const sourceCandidates = Array.isArray(scoutStructured?.candidates)
+                ? scoutStructured.candidates.map(record).filter((candidate): candidate is RecordValue => candidate !== null) : []
+              const analystResult = record(analystTask?.result)
+              const storedReport = record(analystResult?.taskGraphVerificationReport)
+              if (!scoutTask || !analystTask || !scoutResult || !scoutStructured || !sourceCandidates.length || !analystResult || !storedReport) {
+                throw new Error("Discovery source or Analyst verification result was missing")
+              }
+              expect(Object.keys(storedReport).sort()).toEqual([
+                "criteria", "dependencyBindings", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion",
+              ])
+              const parsedStoredReport = parseStoredTaskGraphVerificationReport(
+                storedReport, ["finding-count", "findings-from-scout"], ["scout"],
+              )
+              expect(parsedStoredReport?.status).toBe("passed")
+              const bindings = Array.isArray(parsedStoredReport?.dependencyBindings)
+                ? parsedStoredReport.dependencyBindings.map(record) : []
+              expect(bindings).toHaveLength(1)
+              const sourceBinding = bindings[0]
+              if (!sourceBinding) throw new Error("Discovery Analyst private dependency binding was invalid")
+              expect(Object.keys(sourceBinding ?? {}).sort()).toEqual([
+                "attemptCount", "evidenceDigest", "nodeDigest", "nodeKey", "reportDigest", "resultDigest", "taskId",
+              ])
+              expect(sourceBinding).toMatchObject({ nodeKey: "scout", taskId: scoutTask.id, attemptCount: 1 })
+              for (const key of ["nodeDigest", "resultDigest", "evidenceDigest", "reportDigest"] as const) {
+                expect(sourceBinding?.[key]).toMatch(/^[a-f0-9]{64}$/)
+              }
+              expect(JSON.stringify(sourceBinding)).not.toContain(jobId)
+
+              const expectReadbackRejectsMutation = async (taskId: string, original: RecordValue, changed: RecordValue) => {
+                const update = async (value: RecordValue) => pool!.query(
+                  `UPDATE "sub_agent_tasks" SET "result" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+                  [JSON.stringify(value), taskId, discoveryOwner.sessionId, discoveryOwner.turnId],
+                )
+                expect((await update(changed)).rowCount).toBe(1)
+                try {
+                  await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+                  await expect(checkTerminalTaskGraph(pool!, terminalGateLease, currentOwner.rootTaskId))
+                    .resolves.toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+                  await expect(nativeVerificationPort.ensureRootGoal({
+                    scope: nativeVerificationScope, candidateText: "The verified shortlist remains current.",
+                  })).resolves.toMatchObject({ status: "unavailable" })
+                  await expect(nativeVerificationPort.readRecoverableGoal(readScope)).resolves.toBeNull()
+                } finally {
+                  expect((await update(original)).rowCount).toBe(1)
+                }
+              }
+              const changedCandidates = sourceCandidates.map(candidate => ({ ...candidate, jobId: `${jobId}-changed` }))
+              await expectReadbackRejectsMutation(scoutTask.id, scoutResult, {
+                ...scoutResult, structuredResult: { ...scoutStructured, candidates: changedCandidates },
+              })
+              const missingBindingReport = { ...storedReport }
+              delete missingBindingReport.dependencyBindings
+              await expectReadbackRejectsMutation(analystTask.id, analystResult, {
+                ...analystResult, taskGraphVerificationReport: missingBindingReport,
+              })
+              await expectReadbackRejectsMutation(analystTask.id, analystResult, {
+                ...analystResult, taskGraphVerificationReport: {
+                  ...storedReport, dependencyBindings: [{ ...sourceBinding, taskId: `replaced-${scoutTask.id}` }],
+                },
+              })
+              const scoutReport = record(scoutResult.taskGraphVerificationReport)
+              if (!scoutReport) throw new Error("Discovery Scout report was unavailable for the private report mutation")
+              await expectReadbackRejectsMutation(scoutTask.id, scoutResult, {
+                ...scoutResult, taskGraphVerificationReport: { ...scoutReport, resultDigest: "0".repeat(64) },
+              })
+
+              const graphSnapshotRows = await pool!.query<{ revision: number; content: unknown }>(
+                `SELECT "revision", "content" FROM "agent_items"
+                 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
+                [taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId],
+              )
+              const graphSnapshotRevision = graphSnapshotRows.rows[0]?.revision
+              const graphSnapshot = record(graphSnapshotRows.rows[0]?.content)
+              const graphReceiptRows = await pool!.query<{ id: string; type: string; taskId: string | null; payload: unknown }>(
+                `SELECT "id", "type", "taskId", "payload" FROM "agent_events"
+                 WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
+                   AND "type" IN ('task_graph.lifecycle', 'item.started', 'item.delta')
+                   AND "payload"->>'kind' IN ('proposal', 'lifecycle')
+                   AND "payload"->>'revision' = $4::text`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, taskGraphItemId(currentOwner.rootTaskId), graphSnapshotRevision],
+              )
+              const graphReceiptRow = graphReceiptRows.rows[0]
+              const graphReceiptPayload = record(graphReceiptRow?.payload)
+              const graphReceiptItem = record(graphReceiptPayload?.item)
+              expect(graphSnapshotRows.rows, "Discovery TaskGraph snapshot row was missing").toHaveLength(1)
+              expect(Number.isSafeInteger(graphSnapshotRevision), "Discovery TaskGraph snapshot revision was invalid").toBe(true)
+              expect(graphReceiptRows.rows, "Discovery current-revision TaskGraph receipt was missing or ambiguous").toHaveLength(1)
+              if (!graphSnapshot || !graphReceiptRow || !graphReceiptPayload || !graphReceiptItem) {
+                throw new Error("Discovery current-revision TaskGraph receipt payload was invalid")
+              }
+              const graphNodes: unknown[] = Array.isArray(graphSnapshot.nodes) ? graphSnapshot.nodes : []
+              const graphTaskIds = new Set(graphNodes.map(value => record(value)?.taskId)
+                .filter((taskId): taskId is string => typeof taskId === "string"))
+              expect(graphReceiptPayload.revision, "Discovery receipt revision did not match the graph snapshot").toBe(graphSnapshotRevision)
+              expect(graphReceiptItem.revision, "Discovery receipt item revision did not match the graph snapshot").toBe(graphSnapshotRevision)
+              expect(graphReceiptItem.content, "Discovery receipt item content did not match the graph snapshot").toEqual(graphSnapshot)
+              if (graphReceiptPayload.kind === "proposal") {
+                expect(["item.started", "item.delta"]).toContain(graphReceiptRow.type)
+                expect(graphReceiptRow.taskId, "Discovery proposal receipt did not belong to the graph owner").toBe(currentOwner.rootTaskId)
+                if (Object.hasOwn(graphReceiptPayload, "content")) {
+                  expect(graphReceiptPayload.content, "Discovery proposal content did not match the graph snapshot").toEqual(graphSnapshot)
+                }
+                if (graphReceiptRow.type === "item.delta") expect(Object.hasOwn(graphReceiptPayload, "content")).toBe(true)
+              } else if (graphReceiptPayload.kind === "lifecycle") {
+                expect(["item.delta", "task_graph.lifecycle"]).toContain(graphReceiptRow.type)
+                expect(typeof graphReceiptRow.taskId, "Discovery lifecycle receipt task was missing").toBe("string")
+                expect(graphTaskIds, "Discovery lifecycle receipt task was outside the current graph").toContain(graphReceiptRow.taskId)
+              } else {
+                throw new Error("Discovery current-revision TaskGraph receipt kind was unsupported")
+              }
+              const scoutNode = graphNodes.map(record).find(node => node?.key === "scout")
+              const scoutVerification = record(scoutNode?.verification)
+              const scoutCriteria: RecordValue[] = Array.isArray(scoutVerification?.criteria)
+                ? scoutVerification.criteria.map(record).filter((criterion): criterion is RecordValue => criterion !== null) : []
+              const candidateCriterion = scoutCriteria.find(criterion => criterion.id === "candidate-count")
+              const candidateCheck = record(candidateCriterion?.check)
+              if (!scoutNode || !scoutVerification) {
+                throw new Error("Discovery Scout verification contract was unavailable for the persisted mutation")
+              }
+              if (candidateCheck?.kind !== "candidate_count_gte" || candidateCheck.minimum !== 1) {
+                throw new Error("Discovery Scout snapshot contract was unavailable for the persisted mutation")
+              }
+              const changedGraphSnapshot: RecordValue = {
+                ...graphSnapshot,
+                nodes: graphNodes.map(value => {
+                  const node = record(value)
+                  return node?.key === "scout" ? {
+                    ...node,
+                    verification: {
+                      ...scoutVerification,
+                      criteria: scoutCriteria.map(criterion => criterion.id === "candidate-count"
+                        ? { ...criterion, check: { kind: "all_candidates_have_evidence", minimumItems: 1 } }
+                        : criterion),
+                    },
+                  } : value
+                }),
+              }
+              const changedGraphReceiptPayload: RecordValue = {
+                ...graphReceiptPayload,
+                ...(Object.hasOwn(graphReceiptPayload, "content") ? { content: changedGraphSnapshot } : {}),
+                item: { ...graphReceiptItem, content: changedGraphSnapshot },
+              }
+              const updateGraphSnapshot = async (content: RecordValue) => pool!.query(
+                `UPDATE "agent_items" SET "content" = $1::jsonb
+                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "type" = 'task_graph' AND "revision" = $6`,
+                [JSON.stringify(content), taskGraphItemId(currentOwner.rootTaskId), discoveryOwner.sessionId, discoveryOwner.turnId, currentOwner.rootTaskId, graphSnapshotRevision],
+              )
+              const updateGraphReceipt = async (payload: RecordValue) => pool!.query(
+                `UPDATE "agent_events" SET "payload" = $1::jsonb
+                 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "itemId" = $5 AND "taskId" = $6
+                   AND "type" = $7 AND "payload"->>'kind' = $8 AND "payload"->>'revision' = $9::text`,
+                [JSON.stringify(payload), graphReceiptRow.id, discoveryOwner.sessionId, discoveryOwner.turnId,
+                  taskGraphItemId(currentOwner.rootTaskId), graphReceiptRow.taskId, graphReceiptRow.type,
+                  graphReceiptPayload.kind, graphSnapshotRevision],
+              )
+              try {
+                expect((await updateGraphReceipt(changedGraphReceiptPayload)).rowCount).toBe(1)
+                expect((await updateGraphSnapshot(changedGraphSnapshot)).rowCount).toBe(1)
+                await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+              } finally {
+                try {
+                  expect((await updateGraphReceipt(graphReceiptPayload)).rowCount).toBe(1)
+                } finally {
+                  expect((await updateGraphSnapshot(graphSnapshot)).rowCount).toBe(1)
+                }
+              }
+
+              const sourceReceiptRows = await pool!.query<{ id: string; content: unknown }>(
+                `SELECT result."id", result."content" FROM "agent_items" AS call
+                 JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+                   AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+                   AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+                 WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3
+                   AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'jobs.search'`,
+                [discoveryOwner.sessionId, discoveryOwner.turnId, scoutTask.id],
+              )
+              const sourceReceipt = sourceReceiptRows.rows[0]
+              const sourceReceiptContent = record(sourceReceipt?.content)
+              const sourceReceiptOutput = record(sourceReceiptContent?.output)
+              const sourceReceiptJobs = Array.isArray(sourceReceiptOutput?.jobs)
+                ? sourceReceiptOutput.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
+              if (sourceReceiptRows.rows.length !== 1 || !sourceReceipt || !sourceReceiptContent || !sourceReceiptOutput || !sourceReceiptJobs.length) {
+                throw new Error("Discovery Scout read receipt was unavailable for the persisted receipt mutation")
+              }
+              const receiptUpdate = async (content: RecordValue) => pool!.query(
+                `UPDATE "agent_items" SET "content" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+                [JSON.stringify(content), sourceReceipt.id, discoveryOwner.sessionId, discoveryOwner.turnId],
+              )
+              const changedReceipt: RecordValue = {
+                ...sourceReceiptContent,
+                output: { ...sourceReceiptOutput, jobs: sourceReceiptJobs.map((job, index) => ({
+                  ...job, ...(index === 0 ? { id: `${String(job.id)}-receipt-changed` } : {}),
+                })) },
+              }
+              expect((await receiptUpdate(changedReceipt)).rowCount).toBe(1)
+              try {
+                await expect(discoveryCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+                await expect(checkTerminalTaskGraph(pool!, terminalGateLease, currentOwner.rootTaskId))
+                  .resolves.toMatchObject({ ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER })
+                await expect(nativeVerificationPort.ensureRootGoal({
+                  scope: nativeVerificationScope, candidateText: "The verified shortlist remains current.",
+                })).resolves.toMatchObject({ status: "unavailable" })
+                await expect(nativeVerificationPort.readRecoverableGoal(readScope)).resolves.toBeNull()
+              } finally {
+                expect((await receiptUpdate(sourceReceiptContent)).rowCount).toBe(1)
+              }
+              const restoredGraphState = await discoveryCommandPort.readCurrent(readScope)
+              expect(restoredGraphState.revision).toBeGreaterThan(discoveryScoutGraphRevision)
+              expectPassedVerificationReport(restoredGraphState.nodes.find(node => node.key === "scout")?.verificationReport, "candidate-count")
+              expectPassedVerificationReport(restoredGraphState.nodes.find(node => node.key === "analyst")?.verificationReport,
+                "finding-count", "findings-from-scout")
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }) }
               yield { type: "completed", finishReason: "stop" }
               return
@@ -9590,6 +10345,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const productionChildExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
+        if (task.role === "auditor" && task.taskType === "native_verification") {
+          const control = parseNativeVerificationControl(task.expectedOutputSchema)
+          const packet = control ? parseNativeVerificationPacket(task.context, control) : null
+          if (!control || !packet) throw new Error("p3_discovery_native_control_unreadable")
+          const report = {
+            schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
+            criteria: packet.criteria.map(item => ({
+              criterionId: item.criterionId,
+              disposition: "passed" as const,
+              reasonCode: "meets_criterion" as const,
+              evidenceReferenceIds: item.requirement.includes("self-attestation")
+                ? packet.evidence.filter(evidence => evidence.kind === "user_self_attestation").map(evidence => evidence.referenceId)
+                : [packet.target.referenceId, ...packet.evidence.filter(evidence => evidence.kind === "tool_result").map(evidence => evidence.referenceId)],
+            })),
+          }
+          return {
+            id: "p3-interactive-discovery-native-verifier-fixture", profile,
+            async *stream() {
+              yield { type: "text_delta", text: JSON.stringify(report) }
+              yield { type: "completed", finishReason: "stop" }
+            },
+          } satisfies ModelAdapter
+        }
         let round = 0
         const adapter: ModelAdapter = {
           id: `p3-interactive-discovery-${task.role}-fixture`, profile,
@@ -9782,7 +10560,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "completed"], ["scout", "completed"]])
     expect(children.rows.map(child => record(record(child.result)?.structuredResult)?.role)).toEqual(["analyst", "scout"])
     expectPassedVerificationReport(record(children.rows.find(child => child.role === "scout")?.result)?.taskGraphVerificationReport, "candidate-count")
-    expectPassedVerificationReport(record(children.rows.find(child => child.role === "analyst")?.result)?.taskGraphVerificationReport, "finding-count")
+    expectPassedVerificationReport(record(children.rows.find(child => child.role === "analyst")?.result)?.taskGraphVerificationReport, "finding-count", "findings-from-scout")
     const dispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null }>(
       `SELECT "idempotencyKey", "publishedAt" FROM "agent_outbox"
        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
@@ -9798,7 +10576,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(waits.rows.every(wait => wait.consumedAt instanceof Date)).toBe(true)
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [discoveryOwner.turnId])
     const finalResponse = JSON.parse(final.rows[0]?.finalResponse ?? "null") as RecordValue
-    expect(finalResponse.response).toContain('"jobId":"' + jobId + '"')
+    expect(finalResponse.response).toBe(JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }))
+    expect(finalResponse.summary).toContain("discovered jobs: 1 (complete)")
   }, 90_000)
 
   it("fails an interactive shortlist when its Scout prerequisite fails and cancels dependent work", async () => {
@@ -10210,6 +10989,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let optimisticFinalAttempted = false
     let repairPlanSent = false
     let repairWaitSent = false
+    const repairWaitCallIds: string[] = []
+    const repairWaitStatuses: string[] = []
+    const repairWaitReadCallIds: string[] = []
+    const repairWaitReadCallIdsByWaitCall = new Map<string, string[]>()
+    let repairWaitReferenceObserved = false
+    let repairWaitReferenceSize: number | null = null
+    let repairWaitFailure: RepairWaitFailureClass | null = null
+    let repairWaitFailureStage: RepairWaitFailureStage | null = null
+    let repairWaitFailureOrdinal: number | null = null
+    let repairWaitFailureReadCount: number | null = null
+    let repairWaitFailureOutcomeStatus: RepairWaitOutcomeDiagnosticStatus = "unavailable"
+    let repairWaitErrorKind: RepairWaitFailureErrorKind | null = null
+    let repairWaitReaderVisible: boolean | null = null
+    let repairWaitResolutionReturned = false
+    let repairWaitResolvedOutcomeObserved = false
     let secondJobSeeded = false
     let initialPlanTaskIds: string[] | undefined
     let terminalGateLease: TurnLease | undefined
@@ -10234,11 +11028,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const dependent = nodes.find(node => node?.key === "analyst")
             if (!initialPlanSent) {
               initialPlanSent = true
+              const supplementalAnalysts = hardExecutorFailure ? [] : Array.from({ length: 5 }, (_, index) => ({
+                key: `analyst-capacity-${index + 1}`,
+                templateId: "analyst",
+                goal: `Score supplemental typed task ${index + 1} after Scout proof`,
+                successCriteria: ["Return an evidence-bound finding"],
+                dependsOn: ["scout"],
+                verification: ANALYST_VERIFICATION,
+              }))
               yield { type: "tool_call_completed", callId: initialPlanCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
                 nodes: [
                   { key: "scout", templateId: "scout", goal: "Find at least two owner jobs", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification },
                   { key: "analyst", templateId: "analyst", goal: "Score only after Scout proof", successCriteria: ["Return an evidence-bound finding"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION },
+                  ...supplementalAnalysts,
                 ],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -10246,25 +11049,126 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (initialPlanSent && !initialWaitSent) {
               initialWaitSent = true
-              initialPlanTaskIds = planTaskIds(request, initialPlanCallId, 2)
+              initialPlanTaskIds = planTaskIds(request, initialPlanCallId, hardExecutorFailure ? 2 : 7)
               yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: `p3-verifier-repair-initial-wait:${value.turnId}`, taskIds: [initialPlanTaskIds[0]!], mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (repairPlanSent && !repairWaitSent) {
+            const previousRepairWaitCallId = repairWaitCallIds.at(-1)
+            let previousRepairWait: RecordValue | null = null
+            if (previousRepairWaitCallId && !hardExecutorFailure) {
+              const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
+              const dependentTaskIds = initialPlanTaskIds?.slice(1) ?? []
+              const expectedDependentCount = hardExecutorFailure ? 1 : 6
+              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== expectedDependentCount || dependentTaskIds.some(id => !id)) {
+                throw new Error("repair fixture lost accepted wait targets")
+              }
+              const readCallIds = repairWaitReadCallIdsByWaitCall.get(previousRepairWaitCallId) ?? []
+              const waitOrdinal = boundedRepairWaitDiagnosticCount(repairWaitCallIds.indexOf(previousRepairWaitCallId) + 1)
+              const currentReadCount = boundedRepairWaitDiagnosticCount(readCallIds.length)
+              repairWaitReferenceSize = repairWaitReferenceSizeBytes(latestToolResult(request, previousRepairWaitCallId))
+              let resolution: RepairWaitOutputResolution
+              try { resolution = repairWaitOutputResolutionFromRequest(request, previousRepairWaitCallId, readCallIds) }
+              catch (error: unknown) {
+                repairWaitFailureStage = "output_resolution"
+                repairWaitFailureOrdinal = waitOrdinal
+                repairWaitFailureReadCount = currentReadCount
+                repairWaitFailureOutcomeStatus = "unavailable"
+                repairWaitErrorKind = repairWaitFailureErrorKind(error)
+                repairWaitFailure = repairWaitFailureClass(error)
+                throw error
+              }
+              repairWaitResolutionReturned = true
+              if (resolution.status === "read") {
+                repairWaitReferenceObserved = true
+                repairWaitReaderVisible = Array.isArray(request.tools) && request.tools.some(tool => record(tool)?.name === "tool_results.read")
+                if (!repairWaitReaderVisible) {
+                  repairWaitFailure = "reader_not_visible"
+                  throw new Error("repair wait reference reader was not visible to the model")
+                }
+                if (repairWaitReadCallIds.length >= VERIFICATION_REPAIR_MAX_REFERENCE_READS) {
+                  repairWaitFailure = "read_budget_exceeded"
+                  throw new Error("repair wait reference exceeded its bounded read budget")
+                }
+                const readCallId = `${previousRepairWaitCallId}:read:${readCallIds.length + 1}`
+                readCallIds.push(readCallId)
+                repairWaitReadCallIdsByWaitCall.set(previousRepairWaitCallId, readCallIds)
+                repairWaitReadCallIds.push(readCallId)
+                yield { type: "tool_call_completed", callId: readCallId, name: "tool_results.read", arguments: {
+                  referenceId: resolution.reference.id,
+                  ...(resolution.cursor === undefined ? {} : { cursor: resolution.cursor }),
+                } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (resolution.status === "complete") repairWaitReferenceObserved = true
+              try {
+                previousRepairWait = repairWaitOutcomeFromRequest(
+                  request, previousRepairWaitCallId, [...repairTaskIds, ...dependentTaskIds], resolution.output,
+                )
+              } catch (error: unknown) {
+                repairWaitFailureStage = "outcome_validation"
+                repairWaitFailureOrdinal = waitOrdinal
+                repairWaitFailureReadCount = currentReadCount
+                repairWaitFailureOutcomeStatus = repairWaitOutcomeDiagnosticStatus(resolution.output)
+                repairWaitErrorKind = repairWaitFailureErrorKind(error)
+                repairWaitFailure = repairWaitFailureClass(error)
+                throw error
+              }
+              repairWaitResolvedOutcomeObserved = true
+              repairWaitStatuses.push(String(previousRepairWait.status))
+            }
+            const repairWaitNeedsPoll = !previousRepairWaitCallId
+              || (!hardExecutorFailure && previousRepairWait?.status === "timed_out")
+            if (repairPlanSent && repairWaitNeedsPoll) {
+              if (repairWaitCallIds.length >= VERIFICATION_REPAIR_MAX_WAIT_POLLS) {
+                throw new Error("repair fixture exhausted its bounded wait polls")
+              }
               repairWaitSent = true
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
-              if (!initialPlanTaskIds?.[1]) throw new Error("repair fixture lost the original dependent task ID")
-              const taskIds = [...repairTaskIds, initialPlanTaskIds[1]]
-              yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
-                idempotencyKey: `p3-verifier-repair-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
+              const dependentTaskIds = initialPlanTaskIds?.slice(1) ?? []
+              const expectedDependentCount = hardExecutorFailure ? 1 : 6
+              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== expectedDependentCount || dependentTaskIds.some(id => !id)) {
+                throw new Error("repair fixture lost accepted wait targets")
+              }
+              if (!hardExecutorFailure) {
+                const repairedGraph = currentGraphFromRequest(request)
+                expect(repairedGraph?.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes)
+                expect(repairedGraph?.nodeCapacity).toEqual({
+                  nodeCount: 8, maxNodes: TASK_GRAPH_LIMITS.maxNodes, remaining: 0,
+                  ordinaryRemaining: 0, reserveActive: false, repairRecorded: true,
+                })
+                expect((Array.isArray(repairedGraph?.nodes) ? repairedGraph.nodes.map(record) : [])
+                  .map(node => node?.key)).toContain("scout-repair")
+              }
+              const taskIds = [...repairTaskIds, ...dependentTaskIds]
+              const pollIndex = repairWaitCallIds.length
+              const pollSuffix = pollIndex === 0 ? "" : `:poll:${pollIndex + 1}`
+              const callId = `${repairWaitCallId}${pollSuffix}`
+              repairWaitCallIds.push(callId)
+              yield { type: "tool_call_completed", callId, name: "agent.wait", arguments: {
+                idempotencyKey: `${repairWaitCallId}${pollSuffix}`, taskIds, mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             if (scout?.status === "failed" && !repair) {
+              if (!hardExecutorFailure) {
+                expect(nodes).toHaveLength(7)
+                expect(graph?.nodeCapacity).toEqual({
+                  nodeCount: 7, maxNodes: TASK_GRAPH_LIMITS.maxNodes, remaining: 1,
+                  ordinaryRemaining: 0, reserveActive: true, repairRecorded: false,
+                })
+                const serverTurn = await pool!.query<{ rootTaskId: string | null }>(
+                  `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+                  [value.turnId, value.sessionId, value.userId],
+                )
+                const hiddenRootTaskId = serverTurn.rows[0]?.rootTaskId
+                if (!hiddenRootTaskId) throw new Error("repair fixture could not read the server-owned root identity")
+                expect(JSON.stringify(graph)).not.toContain(hiddenRootTaskId)
+              }
               const dependentBeforeRepair = await pool!.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Score only after Scout proof"])
               expect(dependentBeforeRepair.rows).toHaveLength(1)
               expect(dependentBeforeRepair.rows[0]?.status).toBe("waiting")
@@ -10296,9 +11200,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               if (!repairPlanSent) {
                 if (!secondJobSeeded) { await insertJob(secondJobId); secondJobSeeded = true }
-                const turn = await pool!.query<{ rootTaskId: string | null }>(`SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId])
-                const graphRootTaskId = turn.rows[0]?.rootTaskId
-                if (!graphRootTaskId || !scout?.taskId || typeof graph?.revision !== "number") throw new Error("repair fixture lost its immutable root or target identity")
+                if (!scout?.taskId || typeof graph?.revision !== "number") throw new Error("repair fixture lost its current target identity")
                 const target = await pool!.query<{ result: unknown; status: string; failureReason: string | null }>(`SELECT "result", "status", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [scout.taskId, value.sessionId, value.turnId])
                 const taskResult = record(target.rows[0]?.result)
                 failedReportBeforeRepair = taskResult?.taskGraphVerificationReport
@@ -10313,16 +11215,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   expect(String(record(failedReportBeforeRepair)?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
                 }
                 repairPlanSent = true
+                const repairOf = { nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] }
+                expect(repairOf).not.toHaveProperty("graphRootTaskId")
                 yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
                   expectedRevision: graph.revision,
                   nodes: [{ key: "scout-repair", templateId: "scout", goal: "Recheck after new owner evidence is available", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification,
-                    repairOf: { graphRootTaskId, nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
+                    repairOf }],
                 } }
                 yield { type: "completed", finishReason: "tool_calls" }
                 return
               }
             }
             if (repair?.status === "completed" && dependent?.status === "completed") {
+              if (!hardExecutorFailure) expect(repairWaitStatuses.at(-1)).toBe("ready")
               expectPassedVerificationReport(repair.verificationReport, "candidate-count")
               expect(record(repair.repairReceipt)).toMatchObject({
                 graphRootTaskId: expect.any(String), targetNodeKey: "scout", targetTaskId: scout?.taskId,
@@ -10485,7 +11390,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
     try {
       await waitForTurnStatus(
-        pool!, value.turnId, "completed", 90_000, initialWaitCallId, [repairWaitCallId],
+        pool!, value.turnId, "completed", 90_000, initialWaitCallId, repairWaitCallIds,
       )
     } catch (error) {
       let progress = JSON.stringify({ available: false })
@@ -10496,7 +11401,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       try {
         const [initialWait, repairWait] = await Promise.all([
           scopedWaitToolResultDiagnostic(pool!, value, initialWaitCallId),
-          scopedWaitToolResultDiagnostic(pool!, value, repairWaitCallId),
+          scopedWaitToolResultDiagnostic(pool!, value, repairWaitCallIds.at(-1) ?? repairWaitCallId),
         ])
         waitResults = { initial: initialWait, repair: repairWait }
         const [failure, verdict] = await Promise.all([
@@ -10507,7 +11412,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         try { scoutResultDiagnostic = await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, value, [firstJobId, secondJobId]) } catch { /* keep the fixed unavailable projection */ }
         verification = verdict
         progress = await turnProgressDiagnostics(
-          pool!, value.turnId, initialWaitCallId, [repairWaitCallId],
+          pool!, value.turnId, initialWaitCallId, repairWaitCallIds,
         )
       } catch {
         // Keep only the fixed failure class if durable wait diagnostics are unavailable.
@@ -10525,6 +11430,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
+        { label: "repairWaitReferenceSizeBytes", value: "", safeValue: repairWaitReferenceSize === null ? "unknown" : String(repairWaitReferenceSize) },
+        { label: "repairWaitFailureClass", value: "", safeValue: repairWaitFailure ?? "not_observed" },
+        { label: "repairWaitFailureStage", value: "", safeValue: repairWaitFailureStage ?? "not_observed" },
+        { label: "repairWaitFailureWaitOrdinal", value: "", safeValue: repairWaitFailureOrdinal === null ? "unavailable" : String(repairWaitFailureOrdinal) },
+        { label: "repairWaitFailureReadCount", value: "", safeValue: repairWaitFailureReadCount === null ? "unavailable" : String(repairWaitFailureReadCount) },
+        { label: "repairWaitFailureOutcomeStatus", value: "", safeValue: repairWaitFailureOutcomeStatus },
+        { label: "repairWaitFailureErrorKind", value: "", safeValue: repairWaitErrorKind ?? "not_observed" },
+        { label: "repairWaitReaderVisible", value: "", safeValue: repairWaitReaderVisible === null ? "not_checked" : String(repairWaitReaderVisible) },
+        { label: "repairWaitReadCallCount", value: "", safeValue: String(Math.min(VERIFICATION_REPAIR_MAX_REFERENCE_READS, repairWaitReadCallIds.length)) },
+        { label: "repairWaitResolutionReturned", value: "", safeValue: String(repairWaitResolutionReturned) },
+        { label: "repairWaitResolvedOutcomeObserved", value: "", safeValue: String(repairWaitResolvedOutcomeObserved) },
+        { label: "repairWaitReferenceObserved", value: "", safeValue: String(repairWaitReferenceObserved) },
         { label: "waitToolResults", value: "", safeValue: JSON.stringify(waitResults) },
         { label: "rootFailureEvidence", value: "", safeValue: JSON.stringify(rootFailure) },
         { label: "taskGraphVerdictEvidence", value: "", safeValue: JSON.stringify(verification) },
@@ -10536,10 +11453,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(optimisticFinalAttempted).toBe(true)
     expect(repairPlanSent).toBe(true)
     expect(repairWaitSent).toBe(true)
+    if (!hardExecutorFailure) {
+      expect(repairWaitCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_WAIT_POLLS)
+      expect(repairWaitStatuses).toHaveLength(repairWaitCallIds.length)
+      expect(repairWaitStatuses.at(-1)).toBe("ready")
+      expect(repairWaitStatuses.every(status => status === "ready" || status === "timed_out")).toBe(true)
+      expect(repairWaitCallIds.length).toBe(repairWaitStatuses.filter(status => status === "timed_out").length + 1)
+      expect(repairWaitReadCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_REFERENCE_READS)
+      expect(repairWaitReferenceObserved).toBe(repairWaitReadCallIds.length > 0)
+    }
     expect(secondJobSeeded).toBe(true)
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
     expect(turn.rows[0]?.status).toBe("completed")
-    expect(turn.rows[0]?.finalResponse).toContain("verified shortlist")
+    const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue
+    expect(finalResponse.response).toBe(JSON.stringify({
+      schemaVersion: "agent-harness.v2.final", response: "The verified shortlist is ready",
+    }))
     const rootTaskId = turn.rows[0]?.rootTaskId
     expect(rootTaskId).toBeTruthy()
     const rejection = await pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected' AND "payload"->>'blocker' = 'task_graph_verification_unverified'`, [value.turnId, value.sessionId])
@@ -10548,6 +11477,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const original = tasks.rows.find(task => task.goal === "Find at least two owner jobs")
     const repaired = tasks.rows.find(task => task.goal === "Recheck after new owner evidence is available")
     const analyst = tasks.rows.find(task => task.goal === "Score only after Scout proof")
+    const supplementalAnalysts = tasks.rows.filter(task => task.goal.startsWith("Score supplemental typed task "))
     expect(original).toMatchObject({
       status: "failed",
       failureReason: hardExecutorFailure ? "task_graph_verification_unverified" : "task_graph_verification_failed",
@@ -10566,8 +11496,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(String(repairReceipt?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
     expect(analyst).toMatchObject({ status: "completed", failureReason: null })
     expectPassedVerificationReport(record(analyst?.result)?.taskGraphVerificationReport, "finding-count")
+    expect(supplementalAnalysts).toHaveLength(hardExecutorFailure ? 0 : 5)
+    for (const supplemental of supplementalAnalysts) {
+      expect(supplemental).toMatchObject({ status: "completed", failureReason: null })
+      expectPassedVerificationReport(record(supplemental.result)?.taskGraphVerificationReport, "finding-count")
+    }
     if (!terminalGateLease || !rootTaskId) throw new Error("repair fixture lost its terminal-gate identity")
-    expect(await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)).toEqual({ ok: true })
+    const persistedGraph = await pool!.query<{ revision: number }>(`SELECT "revision" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+    [taskGraphItemId(rootTaskId), value.sessionId, value.turnId])
+    const persistedRevision = Number(persistedGraph.rows[0]?.revision ?? 0)
+    const terminalDecision = await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)
+    expect(terminalDecision.ok).toBe(true)
+    if (!terminalDecision.ok) throw new Error("repaired current TaskGraph did not pass its terminal gate")
+    const binding = terminalDecision[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+    expect(binding).toBeDefined()
+    expect(persistedRevision).toBeGreaterThan(0)
+    expect(binding?.graphRevision).toBe(persistedRevision)
+    expect(binding?.summary.graphRevision).toBe(persistedRevision)
+    expect(JSON.stringify(terminalDecision)).toBe('{"ok":true}')
   }, 120_000)
 
   it("drains a fenced running TaskGraph child after root failure without changing root or Turn", async () => {

@@ -1,0 +1,164 @@
+import { describe, expect, it, vi } from "vitest"
+
+import { projectDurableWaitOutcome } from "./subagents/durable-wait-dependency-revalidation.js"
+import type { DurableWaitControlReader } from "./tools/coordination-types.js"
+import { toRepositoryJson } from "./turns/turn-engine-types.js"
+import type { TurnExecutionIdentity } from "./turns/turn-execution-types.js"
+import type { StepContextSnapshot } from "./context/step-context-builder.js"
+import { recoverCanonicalArchivedWaitControl } from "./canonical-turn-durable-wait-control.js"
+
+const waitId = "wait-00000000-0000-4000-8000-000000000001"
+const turnId = "turn-1"
+const rootTaskId = "root-1"
+const stepId = "step-1"
+const callId = "call-1"
+const reference = { $ref: "tool-result-00000000-0000-4000-8000-000000000002", sizeBytes: 9_000, sha256: "a".repeat(64) }
+const input = { idempotencyKey: "wait-key", taskIds: ["child-1"], mode: "all", timeoutMs: 10_000 }
+const identity: TurnExecutionIdentity = {
+  kind: "turn", userId: "user-1", sessionId: "session-1", turnId, taskId: rootTaskId, rootTaskId,
+  ownerId: "worker-1", leaseVersion: 7, leaseExpiresAt: new Date("2026-10-11T12:01:00.000Z"),
+}
+
+function state(options: { status?: string; stepUsage?: { inputTokens: number; outputTokens: number; estimatedCostUsd: number } } = {}) {
+  const step = {
+    id: stepId, taskId: rootTaskId, ordinal: 0, status: options.status ?? "running", finishReason: "tool_calls", errorCode: null,
+    inputTokens: options.stepUsage?.inputTokens ?? 0, outputTokens: options.stepUsage?.outputTokens ?? 0,
+    estimatedCostUsd: options.stepUsage?.estimatedCostUsd ?? 0,
+  }
+  const callItem = { id: "call-item", type: "tool_call", status: "completed", stepId, taskId: rootTaskId,
+    content: { toolCallId: callId, toolName: "agent.wait", input, status: "completed" } }
+  const resultItem = { id: "result-item", type: "tool_result", status: "completed", stepId, taskId: rootTaskId,
+    content: { toolCallId: callId, output: reference, errorCode: null } }
+  const events = [
+    { id: "model-start", type: "model.started", actor: "orchestrator", userId: identity.userId, sessionId: identity.sessionId,
+      turnId, taskId: rootTaskId, itemId: null, correlationId: stepId, causationId: null,
+      idempotencyKey: `turn:${turnId}:event:model-started:${stepId}`, sequence: "1", payload: { taskId: rootTaskId, provider: "fixture", model: "fixture" } },
+    { id: "model-done", type: "model.completed", actor: "orchestrator", userId: identity.userId, sessionId: identity.sessionId,
+      turnId, taskId: rootTaskId, itemId: null, correlationId: stepId, causationId: "model-start",
+      idempotencyKey: `turn:${turnId}:event:model-completed:${stepId}`, sequence: "2", payload: { taskId: rootTaskId, provider: "fixture", model: "fixture" } },
+    { id: "model-usage", type: "model.usage", actor: "orchestrator", userId: identity.userId, sessionId: identity.sessionId,
+      turnId, taskId: rootTaskId, itemId: null, correlationId: stepId, causationId: "model-done",
+      idempotencyKey: `turn:${turnId}:event:model-usage:${stepId}`, sequence: "3",
+      payload: { taskId: rootTaskId, provider: "fixture", model: "fixture", usage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 } } },
+    { id: "tool-done", type: "tool_call.completed", actor: "orchestrator", userId: identity.userId, sessionId: identity.sessionId,
+      turnId, taskId: rootTaskId, itemId: "call-item", correlationId: callId, causationId: "model-usage",
+      idempotencyKey: `turn:${turnId}:event:tool-finished:${callId}`, sequence: "4",
+      payload: { toolCallId: callId, toolName: "agent.wait", status: "completed", errorCode: null, taskId: rootTaskId } },
+  ]
+  const observations = [{ id: `tool-result:${callId}`, content: { toolCallId: callId, toolName: "agent.wait", input, status: "completed", output: reference, errorCode: null } }]
+  return { step, callItem, resultItem, items: [callItem, resultItem], events, observations }
+}
+
+function snapshot(toolObservations: StepContextSnapshot["toolObservations"]): StepContextSnapshot {
+  return { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations }
+}
+
+function reader(status: "waiting" | "ready" | "timed_out" | "interrupted" = "waiting") {
+  const readByInvocation = vi.fn(async () => ({ waitId, status }))
+  return { value: { readByInvocation } satisfies DurableWaitControlReader, readByInvocation }
+}
+
+function recover(value: ReturnType<typeof state>, options: {
+  status?: "waiting" | "ready" | "timed_out" | "interrupted"; observations?: StepContextSnapshot["toolObservations"]
+  step?: ReturnType<typeof state>["step"]; events?: ReturnType<typeof state>["events"]; reader?: DurableWaitControlReader
+} = {}) {
+  const observations = options.observations ?? value.observations
+  return recoverCanonicalArchivedWaitControl({ identity, steps: [options.step ?? value.step], items: value.items,
+    events: options.events ?? value.events, observations, snapshot: snapshot(observations),
+    reader: options.reader ?? reader(options.status).value, now: new Date("2026-10-11T12:00:30.000Z") })
+}
+
+describe("canonical archived-wait state recovery", () => {
+  it("recovers only the exact current root Step using its persisted model-usage receipt", async () => {
+    const value = state()
+    const reads = reader()
+    const recovered = await recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
+      observations: value.observations, snapshot: snapshot(value.observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") })
+    expect(recovered).toMatchObject({ waitId, status: "waiting", stepId, stepStatus: "running", inputTokens: 17, outputTokens: 5,
+      estimatedCostUsd: 0.003, toolCallCount: 1, stepCompletionRecorded: false })
+    expect(reads.readByInvocation).toHaveBeenCalledOnce()
+    expect(reads.readByInvocation).toHaveBeenCalledWith(expect.objectContaining({ userId: identity.userId, sessionId: identity.sessionId,
+      turnId, stepId, taskId: rootTaskId, rootTaskId, ownerId: identity.ownerId, leaseVersion: identity.leaseVersion,
+      targetTaskIds: ["child-1"], mode: "all", timeoutMs: 10_000, idempotencyKey: "wait-key" }))
+  })
+
+  it("does not recover when the exact canonical two-field outcome is already restored", async () => {
+    const value = state({ status: "waiting_for_tool", stepUsage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 } })
+    const result = { waitId, status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
+    const projection = projectDurableWaitOutcome(waitId, { value: toRepositoryJson(result), taskIds: ["child-1"], mode: "all" })
+    const observations = [...value.observations, projection]
+    const reads = reader("ready")
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
+      observations, snapshot: snapshot(observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") })).resolves.toBeUndefined()
+    expect(reads.readByInvocation).toHaveBeenCalledOnce()
+  })
+
+  it("accepts an exact consumed interrupted projection without suspending the resumed Step", async () => {
+    const value = state({ status: "waiting_for_tool", stepUsage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 } })
+    const result = {
+      waitId, status: "interrupted", targetTaskIds: ["child-1"], matchedTaskIds: [],
+      tasks: [{ taskId: "child-1", status: "running", role: "scout", result: null, failureReason: null }],
+    }
+    const projection = projectDurableWaitOutcome(waitId, { value: toRepositoryJson(result), taskIds: ["child-1"], mode: "all" })
+    const observations = [...value.observations, projection]
+    const reads = reader("interrupted")
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
+      observations, snapshot: snapshot(observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") })).resolves.toBeUndefined()
+    expect(reads.readByInvocation).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["missing interrupted projection", (_projection: ReturnType<typeof projectDurableWaitOutcome>, value: ReturnType<typeof state>) => value.observations],
+    ["wrong projection ID", (projection: ReturnType<typeof projectDurableWaitOutcome>, value: ReturnType<typeof state>) => [...value.observations, { ...projection, id: "wait-result:foreign" }]],
+    ["wrong projected targets", (projection: ReturnType<typeof projectDurableWaitOutcome>, value: ReturnType<typeof state>) => {
+      const content = projection.content as Record<string, unknown>
+      const output = content.output as Record<string, unknown>
+      return [...value.observations, { ...projection, content: { ...content, output: { ...output, targetTaskIds: ["child-other"] } } }]
+    }],
+    ["resolved rather than interrupted status", (projection: ReturnType<typeof projectDurableWaitOutcome>, value: ReturnType<typeof state>) => {
+      const content = projection.content as Record<string, unknown>
+      const output = content.output as Record<string, unknown>
+      return [...value.observations, { ...projection, content: { ...content, output: { ...output, status: "ready", matchedTaskIds: ["child-1"] } } }]
+    }],
+    ["interrupted all wait already fully matched", (projection: ReturnType<typeof projectDurableWaitOutcome>, value: ReturnType<typeof state>) => {
+      const content = projection.content as Record<string, unknown>
+      const output = content.output as Record<string, unknown>
+      return [...value.observations, { ...projection, content: { ...content, output: { ...output, matchedTaskIds: ["child-1"] } } }]
+    }],
+  ])("fails closed for %s", async (_name, buildObservations) => {
+    const value = state({ status: "waiting_for_tool", stepUsage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 } })
+    const result = {
+      waitId, status: "interrupted", targetTaskIds: ["child-1"], matchedTaskIds: [],
+      tasks: [{ taskId: "child-1", status: "running", role: "scout", result: null, failureReason: null }],
+    }
+    const projection = projectDurableWaitOutcome(waitId, { value: toRepositoryJson(result), taskIds: ["child-1"], mode: "all" })
+    const observations = buildObservations(projection, value)
+    await expect(recover(value, { status: "interrupted", observations })).rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+
+  it.each([
+    ["mismatched nonzero Step counters", state({ stepUsage: { inputTokens: 18, outputTokens: 5, estimatedCostUsd: 0.003 } })],
+    ["fractional token counters", state({ stepUsage: { inputTokens: 17.5, outputTokens: 5, estimatedCostUsd: 0.003 } })],
+  ])("fails closed for %s", async (_name, value) => {
+    await expect(recover(value)).rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+
+  it("rejects foreign, duplicated, or causally inconsistent usage receipts", async () => {
+    const value = state()
+    const cases = [
+      value.events.map(event => event.id === "model-usage" ? { ...event, userId: "other-user" } : event),
+      [...value.events, value.events[0]!],
+      value.events.map(event => event.id === "model-usage" ? { ...event, causationId: "foreign-event" } : event),
+    ]
+    for (const events of cases) await expect(recover(value, { events })).rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+
+  it("requires an exact reader before interpreting any matching outcome projection", async () => {
+    const value = state()
+    const result = { waitId, status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
+    const projection = projectDurableWaitOutcome(waitId, { value: toRepositoryJson(result), taskIds: ["child-1"], mode: "all" })
+    const observations = [...value.observations, projection]
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
+      observations, snapshot: snapshot(observations), now: new Date("2026-10-11T12:00:30.000Z") })).rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+})

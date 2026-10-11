@@ -6,7 +6,10 @@ import { assertSessionWorkAdmission } from "../session-gate.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
-import { TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
+import { steeringReconciliationRecoveryError, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
+import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import { assertPlanningRootHasNoUnresolvedSteering } from "../subagents/pg-store-create.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
@@ -142,7 +145,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     [owner.turnId, owner.sessionId, owner.userId, owner.ownerId, owner.leaseVersion, owner.taskId])
     const turnRow = turn.rows[0]
     if (!turnRow) throw conflict(`turn ${owner.turnId}`)
-    const root = await client.query<Row>(`SELECT "id", "status", "leaseOwner", "attemptCount", "result", "interruptRequestedAt" FROM "sub_agent_tasks"
+    const root = await client.query<Row>(`SELECT "id", "status", "leaseOwner", "attemptCount", "result", "interruptRequestedAt", "allowedActions" FROM "sub_agent_tasks"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 FOR UPDATE`, [owner.taskId, owner.sessionId, owner.turnId])
     const task = root.rows[0]
     if (!task) throw conflict(`root task ${owner.taskId}`)
@@ -156,6 +159,16 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     if (!committed) {
       await assertSessionWorkAdmission(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId })
       if (task.interruptRequestedAt != null) throw conflict(`root task ${owner.taskId} interrupted`)
+      try {
+        await assertPlanningRootHasNoUnresolvedSteering(client, task.allowedActions, {
+          userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.taskId, parentTaskId: owner.taskId,
+          turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion,
+          parentLeaseOwner: String(task.leaseOwner), parentAttemptCount: Number(task.attemptCount),
+        })
+      } catch (error: unknown) {
+        if (error instanceof Error && error.message === STEERING_RECONCILIATION_BLOCKER) throw steeringReconciliationRecoveryError()
+        throw error
+      }
     }
     let pendingFollowUp: Row | undefined
     if (!committed) pendingFollowUp = (await client.query<Row>(`SELECT "id", "targetTurnId", "clientMessageId", "content" FROM "agent_inputs"
@@ -169,7 +182,14 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       const decision = await finalizationGuard(client, input)
       if (!decision || typeof decision !== "object" || decision.ok !== true) {
         if (decision && decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER && typeof decision.feedback === "string" && decision.feedback.length <= 512) {
-          throw Object.assign(new Error(decision.blocker), { name: "TaskGraphVerificationRecovery", blocker: decision.blocker, feedback: decision.feedback })
+          const stamped: unknown = Reflect.get(decision, TASK_GRAPH_RECOVERY_REVISION)
+          const graphRevision = typeof stamped === "number" && Number.isSafeInteger(stamped) && stamped >= 0 ? stamped : null
+          const recovery = Object.assign(new Error(decision.blocker), { name: "TaskGraphVerificationRecovery", blocker: decision.blocker, feedback: decision.feedback })
+          Object.defineProperty(recovery, "recoveryFeedback", { value: tagTaskGraphRepairRecovery(decision.feedback, graphRevision) })
+          throw recovery
+        }
+        if (decision && decision.blocker === STEERING_RECONCILIATION_BLOCKER && decision.feedback === STEERING_RECONCILIATION_FEEDBACK) {
+          throw steeringReconciliationRecoveryError()
         }
         throw conflict(`selected-job finalization${decision && "blocker" in decision ? ` ${decision.blocker}` : ""}`)
       }

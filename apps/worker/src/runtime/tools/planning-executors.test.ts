@@ -26,7 +26,7 @@ const receipt: TaskGraphScheduleReceipt = {
 function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContext {
   return {
     scope: { userId: "runtime-user" }, sessionId: "runtime-session", turnId: "runtime-turn", stepId: "runtime-step",
-    taskId: "runtime-root", rootTaskId: "runtime-root", signal: new AbortController().signal,
+    toolCallId: "server-call-1", taskId: "runtime-root", rootTaskId: "runtime-root", signal: new AbortController().signal,
     remainingTurnSteps: 2, capabilities: ["canManageChildren"], reportProgress: async () => undefined,
     ...overrides,
   }
@@ -36,8 +36,12 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
   scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
 }) {
   let received: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0] | undefined
+  let operation: Parameters<NonNullable<TaskGraphCommandPort["appendAndScheduleWithReconciliation"]>>[1] | undefined
+  const appendAndSchedule = vi.fn(async (input: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0]) => { received = input; return receipt })
   const commandPort: TaskGraphCommandPort = {
-    appendAndSchedule: vi.fn(async input => { received = input; return receipt }),
+    appendAndSchedule,
+    appendAndScheduleWithReconciliation: vi.fn(async (input, value) => { operation = value; return appendAndSchedule(input) }),
+    reconcileSteering: vi.fn(async () => ({ decision: "keep" as const, revision: 0, reconciledInputCount: 0 })),
     readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
   }
   const tool = createTaskGraphPlanningTool({
@@ -48,7 +52,7 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
     parentLeaseOwner: "server-worker",
     parentAttemptCount: () => 1,
   })
-  return { tool, commandPort, getReceived: () => received }
+  return { tool, commandPort, getReceived: () => received, getOperation: () => operation }
 }
 
 describe("agent.plan tool executor", () => {
@@ -90,31 +94,99 @@ describe("agent.plan tool executor", () => {
         criteria: [{ id: "reported-score", check: { kind: "reported_score_gte", minimumScore: 7, minimumFindings: 1, aggregation: "any" } }],
       } }],
     }, "1")).toBe(true)
+    const scout = { ...proposal.nodes[0], key: "scout-source" }
+    const analyst = {
+      key: "analysis", templateId: "analyst", goal: "Analyze Scout jobs",
+      successCriteria: ["Analyze jobs from the selected Scout"], dependsOn: ["scout-source"],
+      verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [{ id: "source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } }],
+      },
+    }
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [scout, analyst] }, "1")).toBe(true)
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...analyst, verification: { ...analyst.verification, criteria: [{
+        id: "source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source", taskId: "forged" },
+      }] },
+    }] }, "1")).toEqual(expect.any(String))
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...scout, verification: { ...scout.verification, criteria: [{
+        id: "source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" },
+      }] },
+    }] }, "1")).toEqual(expect.any(String))
     expect(tool.description).toContain("successCriteria prose is explanatory and never proof")
     expect(tool.description).toContain("reported_score_gte checks an Analyst-reported number, not its correctness")
+    expect(tool.description).toContain("findings_from_scout_dependency")
   })
 
-  it("exposes and forwards the bounded repair relation only for typed roles", async () => {
-    const { tool, getReceived } = setup({
+  it("binds omitted repair roots at the executor and accepts only the matching legacy value", async () => {
+    const templates = {
       scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
       analyst: { role: "analyst", taskType: "analysis", allowedActions: ["persona.retrieve"] },
       cover_letter_writer: { role: "writer", taskType: "cover_letter", allowedActions: ["cover_letter.write"] },
-    })
-    const registry = new ToolRegistry([tool])
-    const repairOf = { graphRootTaskId: "runtime-root", nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] }
-    const input = { ...proposal, nodes: [{ ...proposal.nodes[0], repairOf }] }
-    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
-    expect(JSON.stringify(tool.inputSchema)).toContain("graphRootTaskId")
-    expect(tool.description).toContain("repeats exactly those criteria and checks")
-    expect(tool.description).toContain("must not add the target to dependsOn")
-    await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
-    expect(getReceived()?.proposal.nodes[0]?.repairOf).toEqual(repairOf)
-
-    const writer = {
-      ...proposal,
-      nodes: [{ key: "writer", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save draft"], dependsOn: [], repairOf }],
+    } as const
+    const repairOf = { nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] }
+    const inputs = [
+      { ...proposal, nodes: [{ ...proposal.nodes[0], repairOf }] },
+      { ...proposal, nodes: [{ ...proposal.nodes[0], repairOf: { ...repairOf, graphRootTaskId: "runtime-root" } }] },
+    ]
+    const normalized: Array<Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0]["proposal"] | undefined> = []
+    for (const input of inputs) {
+      const { tool, getReceived } = setup(templates)
+      const registry = new ToolRegistry([tool])
+      expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+      await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
+      normalized.push(getReceived()?.proposal)
     }
+    expect(normalized[0]).toEqual(normalized[1])
+    expect(normalized[0]?.nodes[0]?.repairOf).toEqual({ ...repairOf, graphRootTaskId: "runtime-root" })
+
+    const { tool: nonRepairTool, getReceived: getNonRepair } = setup(templates)
+    await expect(nonRepairTool.execute(context(), proposal)).resolves.toEqual(receipt)
+    expect(getNonRepair()?.proposal).toEqual(proposal)
+    const { tool: descriptionTool } = setup(templates)
+    expect(descriptionTool.description).toContain("Repeat exactly those criteria and checks")
+    expect(descriptionTool.description).toContain("omit graphRootTaskId because the server binds the active Root")
+    expect(descriptionTool.description).toContain("must not add the target to dependsOn")
+    expect(descriptionTool.description).toContain("eight-node lifetime history cap, separate from active-child concurrency")
+    expect(descriptionTool.description).toContain("task_graph_current.nodeCapacity")
+    expect(descriptionTool.description).toContain("may use the reserve in any node order")
+    expect(descriptionTool.description).toContain("it does not pass a criterion")
+    expect(descriptionTool.description).toContain("do not spend the reserve with agent.spawn or agent.followup")
+
+    const { tool: typedTool } = setup(templates)
+    const registry = new ToolRegistry([typedTool])
+    const writer = { ...proposal, nodes: [{ key: "writer", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save draft"], dependsOn: [], repairOf }] }
     expect(registry.validateArguments("agent.plan", writer, "1")).toEqual(expect.any(String))
+    for (const invalidRepairOf of [
+      { taskId: "target-task", criterionIds: ["candidate-count"] },
+      { nodeKey: "target", criterionIds: ["candidate-count"] },
+      { nodeKey: "target", taskId: "target-task" },
+      { nodeKey: "target", taskId: "target-task", criterionIds: [] },
+      { nodeKey: "target", taskId: "target-task", criterionIds: ["Not-an-id"] },
+      { nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"], extra: true },
+    ]) {
+      expect(registry.validateArguments("agent.plan", {
+        ...proposal, nodes: [{ ...proposal.nodes[0], repairOf: invalidRepairOf }],
+      }, "1")).toEqual(expect.any(String))
+    }
+  })
+
+  it("rejects a mismatched legacy repair root before any command-port call", async () => {
+    const { tool, commandPort } = setup()
+    const registry = new ToolRegistry([tool])
+    const input = { ...proposal, nodes: [{
+      ...proposal.nodes[0],
+      repairOf: { graphRootTaskId: "other-root", nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] },
+    }] }
+    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+    await expect(tool.execute(context(), input)).rejects.toMatchObject({
+      code: "task_graph_repair_root_mismatch",
+      safeOutput: { code: "task_graph_repair_root_mismatch" },
+    })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(commandPort.reconcileSteering).not.toHaveBeenCalled()
   })
 
   it("keeps Writer and Reviewer on specialized gates without generic verification fields", async () => {
@@ -255,7 +327,7 @@ describe("agent.plan tool executor", () => {
   })
 
   it("sources tenant, turn, and parent fence identity from runtime context", async () => {
-    const { tool, getReceived } = setup()
+    const { tool, getReceived, getOperation } = setup()
 
     await tool.execute(context(), proposal)
 
@@ -267,6 +339,7 @@ describe("agent.plan tool executor", () => {
         parentLeaseOwner: "server-worker", parentAttemptCount: 1,
       },
     })
+    expect(getOperation()).toMatchObject({ decision: "revise", expectedRevision: 0, callId: "server-call-1", scope: getReceived()?.scope })
     expect(Object.keys(proposal)).toEqual(["expectedRevision", "nodes"])
   })
 
@@ -275,6 +348,28 @@ describe("agent.plan tool executor", () => {
 
     await expect(tool.execute(context(), proposal)).resolves.toEqual(receipt)
     expect(commandPort.appendAndSchedule).toHaveBeenCalledTimes(1)
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledTimes(1)
+  })
+
+  it("surfaces the fixed repair-conflict code without the port's dynamic details", async () => {
+    const { tool, commandPort } = setup()
+    const privateDetail = "target-task-91 failed because criterion salary-floor is still pending"
+    vi.mocked(commandPort.appendAndSchedule).mockRejectedValue(Object.assign(new Error(privateDetail), {
+      code: "task_graph_repair_conflict", targetTaskId: "target-task-91",
+    }))
+
+    const error = await tool.execute(context(), proposal).then(() => undefined, failure => failure)
+    expect(error).toMatchObject({
+      code: "task_graph_repair_conflict",
+      message: "TaskGraph proposal could not be durably scheduled",
+      safeOutput: { code: "task_graph_repair_conflict" },
+    })
+    expect(JSON.stringify(error)).not.toContain(privateDetail)
+    expect(JSON.stringify(error)).not.toContain("target-task-91")
+    expect(tool.description).toContain("If agent.plan returns task_graph_repair_conflict, inspect or refresh the current owner-scoped graph")
+    expect(tool.description).toContain("if none is active, correct the rejected batch so each target/criterion has only one proposed attempt")
+    expect(tool.description).toContain("wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits")
+    expect(tool.description).toContain("An active repair is not evidence of success")
   })
 
   it("requires two remaining root steps before persisting a plan", async () => {

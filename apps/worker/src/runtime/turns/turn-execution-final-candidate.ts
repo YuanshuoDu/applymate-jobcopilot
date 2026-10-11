@@ -1,7 +1,7 @@
 import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertCompletionAllowed, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { assertCompletionAllowed, steeringReconciliationGateRecovery, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
 import { canEmitTurnCompleted, canPersistFinalResponse, totalTurnUsage, updateExecutionStep } from "./turn-engine-helpers.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
 import { verifyCandidateFinal, snapshotEvidence } from "../verifier.js"
@@ -10,13 +10,33 @@ import type { ModelStepResult } from "./turn-engine-model.js"
 import { publishFinalResponse } from "./turn-execution-events.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
+import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
+import { tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
+import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
   | Readonly<{ kind: "completed"; result: TurnEngineResult }>
 
-async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, now: () => Date, onStepClosed: () => void): Promise<void> {
+async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, now: () => Date, onStepClosed: (kind?: "native_semantic_receipt") => void, rejection?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity): Promise<number | undefined> {
+  if (rejection) {
+    const complete = options.store.completeNativeSemanticRejectionStep
+    if (options.nativeSemanticProgressMode !== "durable_v1" || options.identity.kind !== "turn" || !complete) {
+      throw new TurnEngineError("persistence_conflict", "Native semantic rejection receipt storage is unavailable")
+    }
+    const result = await complete({ executionIdentity: options.identity, stepId: step.id, finishReason: output.finishReason, errorCode: null,
+      inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+      estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(), identity: rejection })
+    onStepClosed("native_semantic_receipt")
+    if (typeof result.inputThroughSequence !== "bigint" || result.inputThroughSequence < 0n
+      || !Number.isSafeInteger(result.distinctStepCount) || result.distinctStepCount < 1 || result.distinctStepCount > 3) {
+      throw new TurnEngineError("persistence_conflict", "Native semantic rejection receipt is invalid")
+    }
+    await writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+    return result.distinctStepCount
+  }
   await Promise.all([
     updateExecutionStep(options, { stepId: step.id, status: "completed", finishReason: output.finishReason, errorCode: null,
       inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
@@ -24,6 +44,7 @@ async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEv
     writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", taskId: options.identity.taskId }, `step-completed:${step.id}`),
   ])
   onStepClosed()
+  return undefined
 }
 
 export async function completeTurnCandidate(input: Readonly<{
@@ -37,7 +58,7 @@ export async function completeTurnCandidate(input: Readonly<{
   usage: TurnUsage
   signal: AbortSignal
   now: () => Date
-  onStepClosed: () => void
+  onStepClosed: (kind?: "native_semantic_receipt") => void
 }>): Promise<FinalCandidateOutcome> {
   const { options, writer, step, output, snapshot, signal, now } = input
   const verification = verifyCandidateFinal({ goal: options.goal, candidate: { text: output.text, finishReason: output.finishReason },
@@ -57,12 +78,16 @@ export async function completeTurnCandidate(input: Readonly<{
     return { kind: "wait", result: { status: "waiting_for_dependency", waitId: gate.waitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
   }
   if (gate && "feedback" in gate) {
-    await finishStep(options, writer, step, output, now, input.onStepClosed)
+    const rejection = gate[NATIVE_SEMANTIC_REJECTION]
+    const distinctStepCount = await finishStep(options, writer, step, output, now, input.onStepClosed, rejection)
+    if (distinctStepCount === 3) throw nativeSemanticNoProgressError()
     if (gate[NATIVE_SEMANTIC_NO_PROGRESS] === true) throw nativeSemanticNoProgressError()
     return { kind: "replan", feedback: gate.feedback }
   }
   await finishStep(options, writer, step, output, now, input.onStepClosed)
+  const summaryBinding = gate as TaskGraphFinalSummaryBinding | undefined
   const finalResponse = finalizeTurn({ goal: options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
+    ...(summaryBinding ? { summaryOverride: formatTaskGraphFinalSummary(summaryBinding.summary) } : {}),
     usage: totalTurnUsage(options.resume?.usage, input.usage), stepCount: input.stepCount, toolCallCount: input.toolCallCount })
   if (canPersistFinalResponse(options)) {
     if (!options.store.recordFinalResponse) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion is unavailable")
@@ -71,12 +96,25 @@ export async function completeTurnCandidate(input: Readonly<{
     try {
       terminal = await options.store.recordFinalResponse({ identity: options.identity, response: serializeFinalResponse(finalResponse), now: now(),
         terminal: { stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse) }),
-          stepCount: input.stepCount, toolCallCount: input.toolCallCount, usage: finalResponse.usage } })
+          stepCount: input.stepCount, toolCallCount: input.toolCallCount, usage: finalResponse.usage,
+          ...(summaryBinding ? { [TASK_GRAPH_FINAL_SUMMARY_BINDING]: summaryBinding } : {}) } })
     } catch (error: unknown) {
+      const reconciliation = steeringReconciliationGateRecovery(error)
+      if (reconciliation) {
+        options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
+        await writer.append("final.rejected", step.id, null,
+          { code: STEERING_RECONCILIATION_BLOCKER, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: reconciliation.feedback, taskId: options.identity.taskId },
+          `final-rejected:${step.id}:steering-reconciliation-race`)
+        return { kind: "replan", feedback: reconciliation.feedback }
+      }
       const recovery = taskGraphGateRecovery(error)
       if (!recovery) throw error
+      const stampedRecovery = error && typeof error === "object" ? Reflect.get(error, "recoveryFeedback") : undefined
+      const recoveryFeedback = typeof stampedRecovery === "string" && stampedRecovery.length <= 2_048
+        ? stampedRecovery
+        : tagTaskGraphRepairRecovery(recovery.feedback, null)
       await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback: recovery.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}:task-graph-race`)
-      return { kind: "replan", feedback: recovery.feedback }
+      return { kind: "replan", feedback: recoveryFeedback }
     }
     if (!terminal) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned no receipt")
     for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)

@@ -1,4 +1,5 @@
 import {
+  isNativeVerificationUserSelfAttestationReference,
   NATIVE_VERIFICATION_REPORT_SCHEMA,
   type NativeVerificationDisposition,
   type NativeVerificationReasonCode,
@@ -95,11 +96,15 @@ function feedback(reportValue: unknown): NativeVerificationFeedback | null {
     if (!item || item.criterionId !== `criterion-${index + 1}` || !isDisposition(item.disposition) || !isReason(item.reasonCode)
       || !denseArray(item.evidenceReferenceIds, 8, 0)) return null
     const references: string[] = []
+    const seenReferences = new Set<string>()
+    let citedReferences = 0
     for (const reference of item.evidenceReferenceIds) {
-      if (!isId(reference) || references.includes(reference)) return null
-      references.push(reference)
+      if (!isId(reference) || seenReferences.has(reference)) return null
+      seenReferences.add(reference)
+      citedReferences += 1
+      if (!isNativeVerificationUserSelfAttestationReference(reference)) references.push(reference)
     }
-    if (item.disposition === "passed" && (item.reasonCode !== "meets_criterion" || references.length === 0)) return null
+    if (item.disposition === "passed" && (item.reasonCode !== "meets_criterion" || citedReferences === 0)) return null
     if (item.disposition === "failed" && !["does_not_meet_criterion", "evidence_conflict", "unsupported_claim"].includes(item.reasonCode)) return null
     if (item.disposition === "uncertain" && !["evidence_missing", "evidence_conflict", "ambiguous", "unsupported_claim"].includes(item.reasonCode)) return null
     criteria.push({ criterionId: item.criterionId, disposition: item.disposition, reasonCode: item.reasonCode, evidenceReferenceIds: references })

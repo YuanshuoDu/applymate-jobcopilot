@@ -130,6 +130,7 @@ model User {
   adminReauthGrants           AdminReauthGrant[]
   supportCases                SupportCase[]                @relation("SupportRequester")
   agentToolResultReferences   AgentToolResultReference[]
+  agentNativeSemanticRejections AgentNativeSemanticRejection[] @relation("AgentNativeSemanticRejectionUser")
   agentWaitConditions         AgentWaitCondition[]
   agentTreeBudgetReservations AgentTreeBudgetReservation[]
   agentMailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
@@ -1940,6 +1941,7 @@ model AgentSession {
   artifactVersions     AgentArtifactVersion[]
   waitConditions     AgentWaitCondition[]
   treeBudgetReservations AgentTreeBudgetReservation[]
+  nativeSemanticRejections AgentNativeSemanticRejection[] @relation("AgentNativeSemanticRejectionSession")
   mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
   execution          AgentExecution?
   automation         AgentAutomation?
@@ -1969,6 +1971,7 @@ model AgentTurn {
   toolPolicySnapshot   Json
   budgetSnapshot       Json
   revision             Int       @default(0)
+  nativeSemanticProgressMode String? @map("native_semantic_progress_mode")
   inputTokens          Int       @default(0)
   outputTokens         Int       @default(0)
   estimatedCostUsd     Decimal   @default(0) @db.Decimal(12, 8)
@@ -1995,6 +1998,7 @@ model AgentTurn {
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionTurn")
   treeBudgetReservations AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTurn")
   mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
+  nativeSemanticRejections AgentNativeSemanticRejection[] @relation("AgentNativeSemanticRejectionTurn")
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -2039,6 +2043,7 @@ model AgentStep {
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionStep")
   treeBudgetReservations AgentTreeBudgetReservation[]
   mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
+  nativeSemanticRejections AgentNativeSemanticRejection[] @relation("AgentNativeSemanticRejectionStep")
 
   @@unique([turnId, ordinal, attempt])
   @@index([turnId, status, createdAt])
@@ -2219,6 +2224,8 @@ model SubAgentTask {
   waitConditions           AgentWaitCondition[] @relation("AgentWaitConditionParentTask")
   treeBudgetReservationsAsRoot AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationRootTask")
   treeBudgetReservationsAsTask AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTask")
+  nativeSemanticRejectionsAsRoot AgentNativeSemanticRejection[] @relation("AgentNativeSemanticRejectionRootTask")
+  nativeSemanticRejectionsAsControl AgentNativeSemanticRejection[] @relation("AgentNativeSemanticRejectionControlTask")
 
   @@index([sessionId, status])
   @@index([status, nextAttemptAt, updatedAt])
@@ -2259,6 +2266,34 @@ model AgentTreeBudgetReservation {
   @@index([userId, sessionId, turnId, rootTaskId, status])
   @@index([rootTaskId, status, createdAt])
   @@map("agent_tree_budget_reservations")
+}
+
+// Private immutable record of a strict native Root semantic rejection.
+model AgentNativeSemanticRejection {
+  userId                String
+  sessionId             String
+  turnId                String
+  rootTaskId            String
+  stepId                String
+  attempt               Int
+  inputThroughSequence  BigInt
+  candidateDigest       String
+  controlTaskId         String
+  controlOperationId    String
+  controlAttempt        Int
+  controlReportDigest   String
+  createdAt             DateTime @default(now())
+
+  user        User        @relation("AgentNativeSemanticRejectionUser", fields: [userId], references: [id], onDelete: Cascade, map: "agent_native_semantic_rejections_user_fkey")
+  session     AgentSession @relation("AgentNativeSemanticRejectionSession", fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_native_semantic_rejections_session_user_fkey")
+  turn        AgentTurn   @relation("AgentNativeSemanticRejectionTurn", fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_native_semantic_rejections_turn_fkey")
+  rootTask    SubAgentTask @relation("AgentNativeSemanticRejectionRootTask", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_native_semantic_rejections_root_task_fkey")
+  controlTask SubAgentTask @relation("AgentNativeSemanticRejectionControlTask", fields: [controlTaskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_native_semantic_rejections_control_task_fkey")
+  step        AgentStep   @relation("AgentNativeSemanticRejectionStep", fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_native_semantic_rejections_step_fkey")
+
+  @@id([turnId, stepId])
+  @@index([userId, turnId, candidateDigest, controlReportDigest, inputThroughSequence], map: "agent_native_semantic_rejections_lookup_idx")
+  @@map("agent_native_semantic_rejections")
 }
 
 model AgentMailboxMessage {

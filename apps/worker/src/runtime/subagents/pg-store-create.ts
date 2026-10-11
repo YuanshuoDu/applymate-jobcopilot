@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto"
 import { isTerminalSubagentStatus, SubagentLimitError, type SubagentPolicy, type SubagentTaskRecord, type SubagentTaskSpec } from "./types.js"
 import { actionList, asObject, INSERT_TASK, json, rowToTask, SELECT_TASK, type Queryable } from "./pg-store-persistence.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
+import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
+import type { SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 
 export async function readSubagentTask(client: Queryable, taskId: string, sessionId: string): Promise<SubagentTaskRecord> {
   const result = await client.query(SELECT_TASK, [taskId, sessionId])
@@ -32,6 +34,13 @@ export async function lockSubagentTurn(client: Queryable, input: { sessionId: st
 export async function lockSubagentTurnForWork(client: Queryable, input: { sessionId: string; userId: string; turnId: string }): Promise<void> {
   await lockSubagentTurn(client, input)
   await assertSessionWorkAdmission(client, input)
+}
+
+export async function assertPlanningRootHasNoUnresolvedSteering(client: Queryable, allowedActions: unknown, scope: SteeringReconciliationScope): Promise<void> {
+  let actions = allowedActions
+  if (typeof actions === "string") { try { actions = JSON.parse(actions) as unknown } catch { throw new Error("steering_reconciliation_root_policy_invalid") } }
+  if (!Array.isArray(actions) || actions.some(action => typeof action !== "string")) throw new Error("steering_reconciliation_root_policy_invalid")
+  if (actions.includes("agent.plan")) await assertNoUnresolvedSteering(client, scope)
 }
 
 export async function createSubagentTask(
@@ -92,4 +101,55 @@ export async function createSubagentTask(
   ])
   if (!result.rows[0]?.id) throw new Error("Subagent task insert failed")
   return readSubagentTask(client, String(result.rows[0].id), input.sessionId)
+}
+
+/** Called only by fallback store dispatch wrappers after their Session and Turn locks. */
+export async function assertFallbackPlannerRootCanDispatch(client: Queryable, input: Pick<SubagentTaskSpec, "userId" | "sessionId" | "turnId" | "parentTaskId">): Promise<void> {
+  if (!input.parentTaskId || !input.turnId) return
+  const result = await client.query<{ allowedActions: unknown; rootLeaseOwner: unknown; rootAttemptCount: unknown; turnLeaseOwner: unknown; turnLeaseVersion: unknown }>(
+    `SELECT root."allowedActions", root."leaseOwner" AS "rootLeaseOwner", root."attemptCount" AS "rootAttemptCount",
+        turn."leaseOwnerId" AS "turnLeaseOwner", turn."leaseVersion" AS "turnLeaseVersion"
+      FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId" AND turn."sessionId" = root."sessionId"
+      JOIN "agent_sessions" AS session ON session."id" = root."sessionId"
+      WHERE root."id" = $1 AND root."sessionId" = $2 AND root."turnId" = $3 AND root."rootTaskId" = root."id"
+        AND root."parentTaskId" IS NULL AND turn."rootTaskId" = root."id" AND turn."status" = 'in_progress'
+        AND session."userId" = $4 AND turn."userId" = $4 FOR UPDATE OF root`,
+    [input.parentTaskId, input.sessionId, input.turnId, input.userId],
+  )
+  const root = result.rows[0]
+  if (!root) return
+  const scopeFields = {
+    userId: input.userId, sessionId: input.sessionId, turnId: input.turnId,
+    rootTaskId: input.parentTaskId, parentTaskId: input.parentTaskId,
+  }
+  let actions = root.allowedActions
+  if (typeof actions === "string") { try { actions = JSON.parse(actions) as unknown } catch { throw new Error("steering_reconciliation_root_policy_invalid") } }
+  if (!Array.isArray(actions) || actions.some(action => typeof action !== "string")) throw new Error("steering_reconciliation_root_policy_invalid")
+  if (!actions.includes("agent.plan")) return
+  if (typeof root.rootLeaseOwner !== "string" || !root.rootLeaseOwner.trim() || typeof root.turnLeaseOwner !== "string" || !root.turnLeaseOwner.trim()
+    || !Number.isSafeInteger(root.rootAttemptCount) || Number(root.rootAttemptCount) < 1
+    || !Number.isSafeInteger(root.turnLeaseVersion) || Number(root.turnLeaseVersion) < 1) throw new Error("steering_reconciliation_root_scope_invalid")
+  await assertPlanningRootHasNoUnresolvedSteering(client, actions, {
+    ...scopeFields,
+    turnLeaseOwner: root.turnLeaseOwner, turnLeaseVersion: Number(root.turnLeaseVersion),
+    parentLeaseOwner: root.rootLeaseOwner, parentAttemptCount: Number(root.rootAttemptCount),
+  })
+}
+
+export async function assertPlanningRootCanFinish(client: Queryable, input: {
+  userId: string; sessionId: string; turnId: string; ownerId: string; leaseVersion: number
+}, rootTaskId: string): Promise<void> {
+  const result = await client.query<{ allowedActions: unknown; leaseOwner: unknown; attemptCount: unknown }>(
+    `SELECT "allowedActions", "leaseOwner", "attemptCount" FROM "sub_agent_tasks"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1
+        AND "status" = 'running' AND "leaseOwner" = $4 AND "attemptCount" = 1 FOR UPDATE`,
+    [rootTaskId, input.sessionId, input.turnId, input.ownerId],
+  )
+  const root = result.rows[0]
+  if (!root) throw new Error("root_task_fenced")
+  await assertPlanningRootHasNoUnresolvedSteering(client, root.allowedActions, {
+    userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, rootTaskId, parentTaskId: rootTaskId,
+    turnLeaseOwner: input.ownerId, turnLeaseVersion: input.leaseVersion,
+    parentLeaseOwner: String(root.leaseOwner), parentAttemptCount: Number(root.attemptCount),
+  })
 }

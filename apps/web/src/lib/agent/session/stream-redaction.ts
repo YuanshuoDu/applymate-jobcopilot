@@ -31,7 +31,12 @@ export function redactStreamValue(value: unknown, key: string | null = null, dep
   return redactSensitiveValue(value, key, depth, 6)
 }
 
+export function isPrivateNativeVerificationEventType(type: string): boolean {
+  return type.startsWith('native_verification.')
+}
+
 export function redactStreamEventPayload(eventType: string, payload: unknown, identity: StreamItemIdentity): unknown {
+  if (isPrivateNativeVerificationEventType(eventType)) return {}
   const redacted = redactStreamValue(payload)
   if (eventType !== 'item.started' && eventType !== 'item.delta') return redacted
 

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { createPgDurableWaitPort, DurableWaitStoreError, type DurableWaitResolveInput } from "./durable-wait-store.js"
-import type { DurableWaitPort } from "../tools/coordination-types.js"
+import type { DurableWaitControlInvocation, DurableWaitPort } from "../tools/coordination-types.js"
 
 type Row = Record<string, unknown>
 type Response = { rows: Row[]; rowCount?: number }
@@ -52,6 +52,47 @@ function validation(targetRows: Row[], existing?: Row): Response[] {
 function inserted(row: Row): Response { return { rows: [row] } }
 
 describe("durable PostgreSQL wait port", () => {
+  it("uses the store replay contract for an exact archived-control invocation", async () => {
+    const createReaderPool = () => {
+      const calls: string[] = []
+      const client = {
+        query: vi.fn(async (sql: string): Promise<Response> => {
+          calls.push(sql)
+          if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql.trim()) || sql.includes("set_config")) return { rows: [] }
+          if (sql.includes('FROM "agent_sessions"') && sql.includes('SELECT "id"')) return { rows: [session()] }
+          if (sql.includes('FROM "agent_turns"')) return { rows: [{ rootTaskId: "root-a" }] }
+          if (sql.includes('FROM "agent_steps"')) return { rows: [{ taskId: "root-a" }] }
+          if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id" = $1')) {
+            return { rows: [{ id: "root-a", rootTaskId: null, turnId: "turn-a", status: "running" }] }
+          }
+          if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) {
+            return { rows: [{ id: "child-a", rootTaskId: "root-a", turnId: "turn-a" }] }
+          }
+          if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [{
+            id: "wait-00000000-0000-4000-8000-000000000009", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
+            parentTaskId: "root-a", stepId: "step-a", idempotencyKey: "archived-wait-key", targetTaskIds: ["child-a"], mode: "all",
+            status: "ready", createdAt: now, deadlineAt: new Date(now.getTime() + 10_000),
+            request: { targetTaskIds: ["child-a"], mode: "all", timeoutMs: 10_000 },
+          }] }
+          throw new Error("Unexpected query")
+        }),
+        release: vi.fn(),
+      }
+      return { calls, pool: { connect: vi.fn(async () => client) } }
+    }
+    const exact: DurableWaitControlInvocation = {
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", stepId: "step-a", taskId: "root-a", rootTaskId: "root-a",
+      ownerId: "worker-a", leaseVersion: 3, now, targetTaskIds: ["child-a"], mode: "all", timeoutMs: 10_000, idempotencyKey: "archived-wait-key",
+    }
+    const exactPool = createReaderPool()
+    await expect(createPgDurableWaitPort(exactPool.pool as never).readByInvocation(exact)).resolves.toEqual({
+      waitId: "wait-00000000-0000-4000-8000-000000000009", status: "ready",
+    })
+    const mismatchPool = createReaderPool()
+    await expect(createPgDurableWaitPort(mismatchPool.pool as never).readByInvocation({ ...exact, timeoutMs: 11_000 })).resolves.toBeNull()
+    expect(exactPool.calls.some(sql => sql.includes('wait."result"->\'request\''))).toBe(true)
+  })
+
   it("registers a first wait as waiting and sets the tenant inside the transaction", async () => {
     vi.setSystemTime(now)
     const row = waitRow("waiting")

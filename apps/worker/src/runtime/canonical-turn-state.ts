@@ -8,12 +8,12 @@ import type { TurnLease } from "./turns/lease.js"
 import type { TurnResumeState, PersistedToolCallRecovery } from "./turns/turn-engine-types.js"
 import { restoreToolCallState } from "./turns/persisted-tool-call-state.js"
 import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js"
+import { recoverCanonicalArchivedWaitControlForRoot } from "./canonical-turn-durable-wait-control.js"
 import { restoreCanonicalSteeringMarkers, priorConversation, type SteeringMarkerState } from "./canonical-steering-markers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type CognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
-import { recoverAnsweredQuestionHistory } from "./question-answer-recovery.js"
 import { hydrateNativeVerificationHistoricalAdvisories } from "./subagents/native-verification-historical-advisory.js"
-
+import { recoverCanonicalTurnQuestionContext } from "./turns/turn-question-runtime-support.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -34,11 +34,11 @@ export type CanonicalTurnState = {
   /** Latest validated agenda receipt; audit state only, never model context. */
   readonly cognitiveAgendaReceipt?: CognitiveAgendaReceipt
   readonly resume?: TurnResumeState
+  readonly recoveredWaitControl?: import("./turns/turn-execution-wait.js").RecoveredArchivedWaitControl
 }
 
 export type CanonicalTurnIntent = Readonly<{ kind: "interactive_discovery_shortlist"; version: 1 }>
 export const INTERACTIVE_DISCOVERY_INTENT: CanonicalTurnIntent = Object.freeze({ kind: "interactive_discovery_shortlist", version: 1 })
-
 type Row = Record<string, unknown>
 function object(value: unknown): Row {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
@@ -100,8 +100,7 @@ function validateAgendaResumeFence(receipt: CognitiveAgendaReceipt | undefined, 
   if (!last || last.id !== receipt.stepId || String(last.inputThroughSequence ?? "") !== fence.inputThroughSequence || !Array.isArray(last.consumedInputIds) || JSON.stringify(last.consumedInputIds) !== JSON.stringify(fence.consumedInputIds)) throw new Error("cognitive_agenda_resume_fence_invalid")
 }
 
-export type CanonicalTurnStateLoadOptions = { readonly consumeWaitOutcomes?: boolean }
-
+export type CanonicalTurnStateLoadOptions = { readonly consumeWaitOutcomes?: boolean; readonly durableWaitControlReader?: import("./tools/coordination-types.js").DurableWaitControlReader }
 export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lease: TurnLease, now = new Date(), options: CanonicalTurnStateLoadOptions = {}): Promise<CanonicalTurnState> {
   const client = await pool.connect()
   let committed = false
@@ -121,21 +120,21 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     if (!turn) throw new Error("turn_not_owned")
     const consumedWaits = options.consumeWaitOutcomes ? await consumeDurableWaitOutcomes({ client, lease, turn, now }) : []
     const stepsResult = await client.query<Row>(
-      `SELECT "id", "taskId", "ordinal", "attempt", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
+      `SELECT "id", "taskId", "ordinal", "attempt", "status", "finishReason", "errorCode", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
        FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 AND ("taskId" IS NULL OR "taskId" = $3)
        ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const itemsResult = await client.query<Row>(
       `SELECT "id", "stepId", "taskId", "type", "status", "revision", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
-       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
+       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC, "id" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-      `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload"
+       `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."correlationId", event."causationId", event."itemId", event."idempotencyKey", event."payload"
        FROM "agent_events" AS event
        JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4
        JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4
        WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3)
-         AND event."type" IN ('tool_call.completed', 'tool_call.failed', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}')
+          AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.completed', 'tool_call.failed', 'step.completed', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}')
        ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
@@ -200,20 +199,24 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         if (right.sequence === null) return -1
         return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : left.id.localeCompare(right.id)
       })
-    const questionHistory = await recoverAnsweredQuestionHistory(client, { lease, rootTaskId, steps: stepsResult.rows, toolItems: itemsResult.rows, existingHistory: snapshot.steerHistory })
+    snapshot = await recoverCanonicalTurnQuestionContext({ client, lease, rootTaskId, steps: stepsResult.rows,
+      toolItems: itemsResult.rows, snapshot, priorHistory: history })
     snapshot = {
       ...snapshot,
       goal: { id: `turn-goal:${lease.turnId}`, content: goal },
-      steerHistory: await hydrateNativeVerificationHistoricalAdvisories(client, { lease, currentTurnCreatedAt: turn.createdAt as Date, currentInput: turn.input, currentRootTaskId: rootTaskId, existingHistory: snapshot.steerHistory, additionalHistory: [...history, ...questionHistory] }),
+      steerHistory: await hydrateNativeVerificationHistoricalAdvisories(client, { lease, currentTurnCreatedAt: turn.createdAt as Date, currentInput: turn.input, currentRootTaskId: rootTaskId, existingHistory: snapshot.steerHistory, additionalHistory: history }),
       toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }
-    const steps = stepsResult.rows
-    const last = steps[steps.length - 1]
+    const recoveredWaitControl = rootTaskId ? await recoverCanonicalArchivedWaitControlForRoot({
+      lease, rootTaskId, steps: stepsResult.rows, items: itemsResult.rows, events: eventsResult.rows, observations: snapshot.toolObservations, snapshot,
+      reader: options.durableWaitControlReader, now,
+    }) : undefined
+    const last = stepsResult.rows[stepsResult.rows.length - 1]
     const ordinalResult = await client.query<Row>(
       `SELECT MAX("ordinal") AS "maxOrdinal" FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [lease.turnId, lease.sessionId],
     )
     const maxOrdinal = ordinalResult.rows[0]?.maxOrdinal === null || ordinalResult.rows[0]?.maxOrdinal === undefined ? null : Number(ordinalResult.rows[0].maxOrdinal)
-    const usage = steps.reduce<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>((total, step) => {
+    const usage = stepsResult.rows.reduce<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>((total, step) => {
       total.inputTokens += Number(step.inputTokens ?? 0)
       total.outputTokens += Number(step.outputTokens ?? 0)
       total.estimatedCostUsd += Number(step.estimatedCostUsd ?? 0)
@@ -221,20 +224,20 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     }, { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
     const resume = last || maxOrdinal !== null ? {
       nextOrdinal: (maxOrdinal ?? Number(last.ordinal)) + 1,
-      stepCount: steps.length,
+      stepCount: stepsResult.rows.length,
       toolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length,
       inputThroughSequence: BigInt(String(last?.inputThroughSequence ?? 0)),
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
-    validateAgendaResumeFence(restoredAgenda, steps)
+    validateAgendaResumeFence(restoredAgenda, stepsResult.rows)
     const intent = turnIntent(turn.input)
     const result = {
       scope, goal, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {},
       ...(intent ? { intent } : {}),
       contextSnapshotPinned: turn.contextSnapshotId !== null && turn.contextSnapshotId !== undefined,
       steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(restored.pending.length ? { pendingToolCalls: restored.pending } : {}), ...(rootTaskId ? { rootTaskId } : {}),
-      ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}),
+      ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}), ...(recoveredWaitControl ? { recoveredWaitControl } : {}),
       ...(selectedJobMemories ? { selectedJobMemories } : {}),
     }
     await client.query("COMMIT")

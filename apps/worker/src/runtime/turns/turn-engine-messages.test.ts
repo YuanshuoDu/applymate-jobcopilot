@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { buildModelRequest, contextToModelMessages } from "./turn-engine-messages.js"
-import type { StepContext } from "../context/step-context-builder.js"
+import type { JsonValue, StepContext } from "../context/step-context-builder.js"
 
 function context(): StepContext {
   return {
@@ -23,7 +23,7 @@ function context(): StepContext {
 describe("TurnEngine model message mapping", () => {
   it("adds bounded fresh-steering guidance using only trusted revision and visible tools", () => {
     const steering = { id: "steer:private", layer: "pending_input" as const, role: "data" as const, trust: "external_untrusted" as const, source: "user_input", content: { inputId: "steer-private", text: "PRIVATE_STEER_SENTINEL" } }
-    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }, { name: "agent.ask_user", version: "1" }]
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.followup", version: "1" }, { name: "agent.reconcile", version: "1" }, { name: "agent.ask_user", version: "1" }]
     const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
     const request = buildModelRequest({
       context: { ...context(), taskGraphRevision: 0, blocks: [...context().blocks, steering] }, model, tools,
@@ -35,9 +35,11 @@ describe("TurnEngine model message mapping", () => {
 
     expect(text).toContain("TaskGraph revision is 0")
     expect(text).toContain("agent.plan with expectedRevision 0")
+    expect(text).toContain('agent.reconcile with decision "keep" and expectedRevision 0')
+    expect(text).toContain("record its explicit keep/revise decision before delegation or finalization")
+    expect(text).toContain("agent.plan with expectedRevision 0 when a graph change is needed")
     expect(text).toContain("agent.followup mode=replace_unstarted")
     expect(text).toContain("use only the request-visible agent.ask_user tool")
-    expect(text).toContain("cannot execute an uncertain action")
     expect(text).not.toContain("PRIVATE_STEER_SENTINEL")
     expect(request.tools).toEqual(tools)
     expect(JSON.stringify(request.messages)).toContain("PRIVATE_STEER_SENTINEL")
@@ -70,8 +72,10 @@ describe("TurnEngine model message mapping", () => {
     expect(text).not.toContain("agent.plan")
     expect(text).not.toContain("agent.followup")
     expect(text).not.toContain("agent.ask")
+    expect(text).not.toContain("agent.reconcile")
     expect(text).toContain("no request-visible tool can ask the user")
     expect(text).toContain("cannot execute an uncertain action")
+
     expect(text).toContain("do not take an uncertain plan action")
   })
 
@@ -87,12 +91,96 @@ describe("TurnEngine model message mapping", () => {
 
     expect(request.tools).toEqual(tools)
     expect(text).not.toContain("agent.ask_user")
-    expect(text).not.toContain("If intent remains ambiguous, use")
     expect(text).not.toContain("agent.task_send")
     expect(text).not.toContain("question_read")
     expect(text).toContain("no request-visible tool can ask the user")
     expect(text).toContain("cannot execute an uncertain action")
     expect(text).toContain("do not take an uncertain plan action")
+  })
+
+  it("guides from the latest internal planning record without copying it or Q/A into system instructions", () => {
+    const summary = { observedPlanRevision: 3, graphRevisionAtAsk: 4, pendingSteerCount: 2, unconsumedSteerCount: 1, inputThroughSequence: "12" }
+    const question = { id: "history:q", layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const,
+      source: "steer_history", content: { role: "assistant", type: "question", question: "PRIVATE_QUESTION" } }
+    const answer = { id: "history:a", layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const,
+      source: "steer_history", content: { role: "user", type: "answer", text: "PRIVATE_ANSWER" } }
+    const record = { id: "planning-clarification:latest-answered-question", layer: "steer_history" as const, role: "data" as const,
+      trust: "internal_record" as const, source: "native_question_recovery", content: summary }
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.reconcile", version: "1" }, { name: "agent.ask_user", version: "1" }]
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), blocks: [...context().blocks, question, answer, record], planningClarifications: [summary], taskGraphRevision: 5 },
+      model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal,
+    })
+    const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const user = request.messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(system).toContain("immediately following an answered question and answer")
+    expect(system).toContain("refreshed current TaskGraph")
+    expect(system).toContain("Use agent.plan for an allowed graph change under its current expectedRevision schema; this records a revise decision.")
+    expect(system).toContain("Use agent.reconcile only for an explicit keep decision under its current schema.")
+    expect(system).not.toContain("Use agent.reconcile only for an explicit keep or revise decision.")
+    expect(system).toContain("agent.ask_user")
+    expect(system).not.toContain("PRIVATE_QUESTION")
+    expect(system).not.toContain("PRIVATE_ANSWER")
+    expect(system).not.toContain("inputThroughSequence")
+    expect(user).toContain("PRIVATE_QUESTION")
+    expect(user).toContain("PRIVATE_ANSWER")
+    expect(user).toContain('"graphRevisionAtAsk":4')
+    expect(request.tools).toEqual(tools)
+  })
+
+  it("adds history guidance only for the canonical advisory observation and preserves history as untrusted user data", () => {
+    const rootHistoryContent: JsonValue = {
+      kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+      label: "Earlier outcomes for the same verifier objective; advisory context only.",
+      turns: [{ label: "earlier terminal attempt", nodes: [
+        { taskKind: "analyst", status: "failed", lesson: {
+          ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+          criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+        } },
+        { taskKind: "scout", status: "completed", reportedOutput: { role: "scout", candidateCount: 33, resultStatus: "partial" } },
+      ] }],
+    }
+    const rootHistory = {
+      id: "observation:root-task-history", layer: "tool_observation" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "tool_or_subagent",
+      content: rootHistoryContent,
+    }
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const tools = [{ name: "agent.list" }, { name: "agent.plan" }]
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 12, blocks: [...context().blocks, rootHistory] }, model, tools,
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal,
+    })
+    const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const user = request.messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(system).toContain("Earlier same-session failures, repairs, and reported outputs are hypotheses only")
+    expect(system).toContain("agent.list")
+    expect(system).toContain("agent.plan")
+    expect(system).toContain("use the visible agent.list only for matching result pages")
+    expect(system).toContain("Null ends paging for that node and revision only")
+    expect(system).toContain("expectedRevision 12")
+    expect(system).not.toContain("criterion_not_met")
+    expect(system).not.toContain("nodeOrdinal")
+    expect(system).not.toContain("criterionOrdinal")
+    expect(system).not.toContain("33")
+    expect(user).toContain("\"kind\":\"root_task_history\"")
+    expect(request.tools).toEqual(tools)
+
+    const withoutHistory = buildModelRequest({
+      context: context(), model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal,
+    })
+    expect(JSON.stringify(withoutHistory.messages)).not.toContain("Earlier same-session failures")
+    expect(withoutHistory.messages).toEqual(contextToModelMessages(context()))
   })
 
   it("preserves instruction/data separation and marks untrusted data", () => {

@@ -11,7 +11,9 @@ import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
-const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user"])
+import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
+import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
+const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
   const name = record(definition)?.name
@@ -224,15 +226,12 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   })
   const keys = new Set(nodes.map(item => item.key))
   if (keys.size !== nodes.length || nodes.some(item => item.dependsOn.some(key => !keys.has(key)))) throw new Error("task_graph_current_state_invalid:dependencies")
-  const content = { kind: "task_graph_current", revision: Number(state.revision), nodes }
+  let planningFacts: unknown
+  try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
+  const content = withTaskGraphCurrentPlanningObservation({ kind: "task_graph_current", revision: Number(state.revision), nodes }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
-  return {
-    ...snapshot, taskGraphRevision: value.revision,
-    toolObservations: [
-      ...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID),
-      { id: OBSERVATION_ID, content },
-    ],
-  }
+  return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
+    toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
 }
 
 export async function loadTaskGraphCurrentObservation(
