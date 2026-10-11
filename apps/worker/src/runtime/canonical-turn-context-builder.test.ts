@@ -342,7 +342,7 @@ describe("canonical Turn context builder", () => {
     })
     const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
     const request = buildModelRequest({
-      context, model, tools: [{ name: "agent.plan", version: "1" }], sessionId: lease.sessionId, turnId: lease.turnId,
+      context, model, tools: [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }], sessionId: lease.sessionId, turnId: lease.turnId,
       stepId: "step-history-composition", userId: scope.userId, taskId: "current-root-task", signal: new AbortController().signal,
     })
     const requestMessages = request.messages.map(message => ({
@@ -404,7 +404,18 @@ describe("canonical Turn context builder", () => {
     expect(requestText).toContain('"findingCount":6')
     expect(requestText).toContain('"candidateCount":0')
     expect(requestText).not.toContain("CALLER_HISTORY_SPOOF")
-    expect(systemText).not.toContain("root_task_history")
+    const historyGuidance = requestMessages.filter(message => message.role === "system"
+      && message.text.includes("Earlier same-session failures, repairs, and reported outputs are hypotheses only"))
+    expect(historyGuidance).toHaveLength(1)
+    expect(historyGuidance[0]?.text).toContain("current verifier evidence, and complete current result pages")
+    expect(historyGuidance[0]?.text).toContain("owner-read graph observation for current node, criterion, and revision identities")
+    expect(historyGuidance[0]?.text).toContain("visible agent.list only for matching result pages")
+    expect(historyGuidance[0]?.text).toContain("expectedRevision 23")
+    expect(historyGuidance[0]?.text).toContain("preserve the valid plan")
+    expect(historyGuidance[0]?.text).not.toContain("root_task_history")
+    for (const historicalFact of ["source_graph_local", "nodeOrdinal", "criterionOrdinal", "targetNodeOrdinal", '"candidateCount":5', '"findingCount":6']) {
+      expect(historyGuidance[0]?.text).not.toContain(historicalFact)
+    }
     const privateValues = [
       HISTORY_ROOT_ID, "PRIVATE_HISTORY_SOURCE_TURN", "PRIVATE_HISTORY_GRAPH_ITEM", "PRIVATE_HISTORY_SCOUT_FAILURE", "PRIVATE_HISTORY_ANALYST_FAILURE",
       "PRIVATE_HISTORY_ANALYST_REPAIR", "PRIVATE_HISTORY_SCOUT_TASK", "PRIVATE_HISTORY_ANALYST_TASK", "PRIVATE_HISTORY_REPAIR_TASK",
@@ -417,6 +428,7 @@ describe("canonical Turn context builder", () => {
     for (const privateValue of privateValues) {
       expect(historyJson).not.toContain(privateValue)
       expect(requestText).not.toContain(privateValue)
+      expect(historyGuidance[0]?.text).not.toContain(privateValue)
     }
     const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
     expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))

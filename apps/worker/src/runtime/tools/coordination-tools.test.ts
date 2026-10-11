@@ -93,10 +93,10 @@ describe("coordination tool definitions", () => {
     const legacyList = definitions.find(definition => definition.name === "list_subagents")
     const canonicalList = definitions.find(definition => definition.name === "agent.list")
     expect(legacyList).toBeDefined()
+    expect(legacyList?.description).toBe("List visible tasks in the current session and task tree")
     expect(canonicalList).toMatchObject({
       schemaVersion: legacyList?.schemaVersion,
       version: legacyList?.version,
-      description: legacyList?.description,
       capabilities: legacyList?.capabilities,
       risk: legacyList?.risk,
       domain: legacyList?.domain,
@@ -131,6 +131,20 @@ describe("coordination tool definitions", () => {
       "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
     ])
     const registry = new ToolRegistry(definitions)
+    expect(registry.resolve("list_subagents", "1").description).toBe("List visible tasks in the current session and task tree")
+    const listDescription = registry.resolve("agent.list", "1").description
+    expect(listDescription).toContain("Choose exactly one mode")
+    expect(listDescription).toContain("offset 0")
+    expect(listDescription).toContain("exact returned nextOffset")
+    expect(listDescription).toContain("same nodeKey and expectedRevision")
+    expect(listDescription).toContain("exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null")
+    expect(listDescription).toContain("at most three items")
+    expect(listDescription).toContain("totalCount/evidenceCount describe only this node's source")
+    expect(listDescription).toContain("Use those reported counts rather than page length")
+    expect(listDescription).toContain("ends paging for this node at this revision only; it does not establish task or verification completion")
+    expect(listDescription).toContain("stale or unavailable, refresh current state")
+    expect(listDescription).toContain("Never invent offsets, silently switch modes")
+    expect(listDescription).toContain("verification proof")
     expect(registry.resolve("agent.send", "1").execute).toBe(registry.resolve("send_message", "1").execute)
     expect(registry.resolve("agent.spawn", "1").execute).toBe(registry.resolve("spawn_subagent", "1").execute)
     expect(registry.resolve("agent.wait", "1").execute).toBe(registry.resolve("wait_subagents", "1").execute)

@@ -41,6 +41,7 @@ import type { NativeVerificationRuntime } from "./canonical-turn-native-verifica
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
+import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 import type { SteeringReconciliationOperation } from "./subagents/steering-reconciliation-contract.js"
@@ -1873,6 +1874,44 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const graphAtSeven = loadedGraphAt(7)
     const graphAtEight = loadedGraphAt(8, true)
+    const historicalSnapshot = parseTaskGraphSnapshot({
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [{
+        key: "historical-scout", templateId: "scout", goal: "PRIVATE_HISTORICAL_GOAL",
+        successCriteria: ["Find a current role"], dependsOn: [], depth: 1, taskId: "historical-scout-task",
+        verificationDisposition: "typed",
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+          { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        ] },
+      }],
+    })
+    const historicalReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+    }
+    const historicalTask: GraphTaskRow = {
+      id: "historical-scout-task", role: "scout", taskType: "job_discovery", status: "failed",
+      failureReason: "task_graph_verification_failed", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+      result: { finalText: "PRIVATE_HISTORICAL_TEXT", taskGraphVerificationReport: historicalReport },
+    }
+    const historicalState = taskGraphState(historicalSnapshot, 3,
+      new Map([[historicalTask.id, { status: historicalTask.status, failureReason: historicalTask.failureReason }]]), [])
+    const historicalProjection = projectLoadedRootTaskHistoryGraph({
+      rootTaskId: "historical-root-task", snapshot: historicalSnapshot, state: historicalState,
+      item: { id: "task-graph:historical-root-task", revision: 3, content: historicalSnapshot, createdAt: new Date(0) },
+      tasks: new Map([[historicalTask.id, historicalTask]]),
+    })
+    if (!historicalProjection) throw new Error("historical_typed_failure_fixture_invalid")
+    expect(historicalProjection.nodeLessons?.[0]).toMatchObject({ nodeOrdinal: 1, criterionFailures: [
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+    ] })
+    const historicalOutcome: ValidatedRootTaskHistoryOutcome = {
+      sourceTurnId: "PRIVATE_HISTORY_SOURCE_TURN", sourceRootTaskId: "PRIVATE_HISTORY_SOURCE_ROOT", terminalSequence: 11n,
+      taskGraph: historicalProjection.taskGraph, sourceNodeOrdinals: historicalProjection.sourceNodeOrdinals,
+      ...(historicalProjection.nodeLessons ? { nodeLessons: historicalProjection.nodeLessons } : {}),
+      ...(historicalProjection.reportedOutputs ? { reportedOutputs: historicalProjection.reportedOutputs } : {}),
+    }
     let graphRevision = 7
     let currentGraph = graphAtSeven
     const pageReads: Array<{ scope: TaskGraphReadScope; request: TaskGraphResultPageRequest }> = []
@@ -1973,7 +2012,7 @@ describe("createCanonicalTurnRuntime", () => {
         steerHistory: questionHistory, planningClarifications: [planningSummary],
         planningClarificationHistoryPair: { questionEntryId, answerEntryId } },
     })
-    rootTaskHistory.load.mockReset().mockImplementation(async () => [failedRootHistoryOutcome()])
+    rootTaskHistory.load.mockReset().mockImplementation(async () => [historicalOutcome])
     const calls = [
       { callId: "scout-first-page", nodeKey: "scout-node", offset: 0 },
       { callId: "scout-next-page", nodeKey: "scout-node" },
@@ -2015,7 +2054,7 @@ describe("createCanonicalTurnRuntime", () => {
           requests.push(request)
           const call = calls[requests.length - 1]
           if (!call) {
-            yield { type: "text_delta", text: "Reviewed the current task results." }
+            yield { type: "text_delta", text: "The current owner-scoped graph and full pages contain no bound failing verification criterion, so the earlier failed attempt remains a hypothesis. Preserve the current plan; do not write a targeted repair without current evidence." }
             yield { type: "completed", finishReason: "stop" }
             return
           }
@@ -2112,6 +2151,9 @@ describe("createCanonicalTurnRuntime", () => {
     ])
     expect(expectedFactsByRevision.map(facts => facts.counts.discoveredJobs.knownCount)).toEqual([4, 5])
     expect(currentBlocks.map(block => (block?.content as { revision?: number }).revision)).toEqual([7, 7, 7, 7, 8, 8])
+    const currentGraphNodes = currentBlocks.map(block => (block?.content as { nodes?: Array<{ status?: string; verificationCriterionIds?: unknown }> }).nodes ?? [])
+    expect(currentGraphNodes.map(nodes => nodes.map(node => node.status))).toEqual(Array.from({ length: 6 }, () => ["completed", "completed"]))
+    expect(currentGraphNodes.flat().every(node => node.verificationCriterionIds === undefined)).toBe(true)
     const historyBlocks = contexts.map(context => context.blocks.find(block => block.content !== null && typeof block.content === "object"
       && !Array.isArray(block.content) && block.content.kind === "root_task_history"))
     expect(historyBlocks).toHaveLength(6)
@@ -2149,6 +2191,26 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).not.toMatch(/PRIVATE_HISTORY|private-history|private\.example|PRIVATE_RESULT_PROSE|PRIVATE_FINAL_TEXT|TASK_GRAPH_FINAL_SUMMARY_BINDING/)
       expect(text).toContain(index < 4 ? '"knownCount":4' : '"knownCount":5')
     }
+    const planningGuidance = requests.map(request => request.messages.filter(message => message.role === "system")
+      .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+      .find(text => text.includes("Earlier same-session failures, repairs, and reported outputs are hypotheses only")))
+    expect(planningGuidance).toHaveLength(6)
+    expect(planningGuidance.map(text => text?.match(/expectedRevision (\d+)/)?.[1])).toEqual(["7", "7", "7", "7", "8", "8"])
+    expect(new Set(planningGuidance.map(text => text?.replace(/expectedRevision \d+/g, "expectedRevision CURRENT"))).size).toBe(1)
+    for (const text of planningGuidance) {
+      expect(text).toContain("owner-read graph observation for current node, criterion, and revision identities")
+      expect(text).toContain("visible agent.list only for matching result pages")
+      expect(text).toContain("complete current result pages")
+      expect(text).toContain("preserve the valid plan")
+      expect(text).not.toMatch(/PRIVATE_HISTORY|historical-scout|candidate-count|nodeOrdinal|criterionOrdinal|reported count/i)
+    }
+    const visibleTools = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
+    expect(visibleTools).toEqual(expect.arrayContaining(["agent.list", "agent.plan"]))
+    const finalRequest = requests.at(-1)
+    for (const call of calls) {
+      expect(finalRequest?.messages.some(message => message.content.some(part => part.type === "tool_result" && part.toolUseId === call.callId))).toBe(true)
+    }
+    expect(JSON.stringify(events)).toContain("no bound failing verification criterion")
     expect(rootTaskHistory.load).toHaveBeenCalledTimes(6)
     expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
     expect(JSON.stringify(events)).not.toContain("nativeCoordination")

@@ -2,6 +2,7 @@ import type { HarnessModelRequest, ModelContinuation, ModelMessage } from "@jobc
 import type { ModelCapabilityProfile, ModelAdapter } from "@jobcopilot/agent-model"
 
 import type { StepContext } from "../context/step-context-builder.js"
+import { buildRootHistoryPlanningInstruction } from "./root-history-planning-guidance.js"
 
 const PLANNING_TOOLS = ["agent.plan", "agent.followup"] as const
 const SAFE_TOOL_NAME = /^[a-z][a-z0-9_.-]{0,63}$/i
@@ -124,7 +125,8 @@ function clarificationInstruction(context: StepContext, tools: readonly unknown[
 
 function messagesForRequest(context: StepContext, tools: readonly unknown[], freshSteering: boolean | undefined): ModelMessage[] {
   const messages = contextToModelMessages(context)
-  const instructions = [freshSteering ? freshSteeringInstruction(context, tools) : null, clarificationInstruction(context, tools)]
+  const instructions = [freshSteering ? freshSteeringInstruction(context, tools) : null,
+    buildRootHistoryPlanningInstruction(context, tools), clarificationInstruction(context, tools)]
     .filter((instruction): instruction is ModelMessage => instruction !== null)
   if (!instructions.length) return messages
   const firstNonSystem = messages.findIndex(message => message.role !== "system")

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { buildModelRequest, contextToModelMessages } from "./turn-engine-messages.js"
-import type { StepContext } from "../context/step-context-builder.js"
+import type { JsonValue, StepContext } from "../context/step-context-builder.js"
 
 function context(): StepContext {
   return {
@@ -132,6 +132,57 @@ describe("TurnEngine model message mapping", () => {
     expect(user).toContain('"graphRevisionAtAsk":4')
     expect(request.tools).toEqual(tools)
   })
+
+  it("adds history guidance only for the canonical advisory observation and preserves history as untrusted user data", () => {
+    const rootHistoryContent: JsonValue = {
+      kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+      label: "Earlier outcomes for the same verifier objective; advisory context only.",
+      turns: [{ label: "earlier terminal attempt", nodes: [
+        { taskKind: "analyst", status: "failed", lesson: {
+          ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+          criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+        } },
+        { taskKind: "scout", status: "completed", reportedOutput: { role: "scout", candidateCount: 33, resultStatus: "partial" } },
+      ] }],
+    }
+    const rootHistory = {
+      id: "observation:root-task-history", layer: "tool_observation" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "tool_or_subagent",
+      content: rootHistoryContent,
+    }
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const tools = [{ name: "agent.list" }, { name: "agent.plan" }]
+    const request = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 12, blocks: [...context().blocks, rootHistory] }, model, tools,
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal,
+    })
+    const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const user = request.messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(system).toContain("Earlier same-session failures, repairs, and reported outputs are hypotheses only")
+    expect(system).toContain("agent.list")
+    expect(system).toContain("agent.plan")
+    expect(system).toContain("use the visible agent.list only for matching result pages")
+    expect(system).toContain("Null ends paging for that node and revision only")
+    expect(system).toContain("expectedRevision 12")
+    expect(system).not.toContain("criterion_not_met")
+    expect(system).not.toContain("nodeOrdinal")
+    expect(system).not.toContain("criterionOrdinal")
+    expect(system).not.toContain("33")
+    expect(user).toContain("\"kind\":\"root_task_history\"")
+    expect(request.tools).toEqual(tools)
+
+    const withoutHistory = buildModelRequest({
+      context: context(), model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal,
+    })
+    expect(JSON.stringify(withoutHistory.messages)).not.toContain("Earlier same-session failures")
+    expect(withoutHistory.messages).toEqual(contextToModelMessages(context()))
+  })
+
   it("preserves instruction/data separation and marks untrusted data", () => {
     const messages = contextToModelMessages(context())
     expect(messages).toHaveLength(2)

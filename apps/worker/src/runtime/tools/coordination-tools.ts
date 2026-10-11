@@ -199,7 +199,7 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       execute: listExecutor,
     },
     {
-      ...metadata("agent.list", "List visible tasks in the current session and task tree", "read", "read_only"),
+      ...metadata("agent.list", "List visible tasks. Choose exactly one mode: legacy includeTerminal listing or paged current TaskGraph results. For pages, use offset 0 with a nodeKey and expectedRevision from the current owner-scoped graph observation; continue only with the exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null. Each page contains at most three items; totalCount/evidenceCount describe only this node's source, not aggregate graph or historical counts. Use those reported counts rather than page length. A null nextOffset ends paging for this node at this revision only; it does not establish task or verification completion. If results are stale or unavailable, refresh current state before retrying. Never invent offsets, silently switch modes, or treat page data as verification proof.", "read", "read_only"),
       inputSchema: AgentListInputSchema, outputSchema: AgentListOutputSchema,
       execute: (context, input) => executeAgentList(context, input, options),
     },
