@@ -387,7 +387,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
       () => pool!.query(`UPDATE "agent_steps" SET "status" = 'completed' WHERE "id" = $1 AND "sessionId" = $2`, [sourceStepId, source.sessionId]),
     )
     await checkMutation(
-      () => pool!.query(`UPDATE "agent_events" SET "payload" = jsonb_build_object('stepId', $1, 'status', 'completed', 'taskId', 'wrong-root') WHERE "id" = $2 AND "sessionId" = $3`,
+      () => pool!.query(`UPDATE "agent_events" SET "payload" = jsonb_build_object('stepId', $1::text, 'status', 'completed', 'taskId', 'wrong-root') WHERE "id" = $2 AND "sessionId" = $3`,
         [sourceStepId, stepEventId, source.sessionId]),
       () => pool!.query(`UPDATE "agent_events" SET "payload" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3`,
         [JSON.stringify({ stepId: sourceStepId, status: "completed", taskId: source.rootTaskId }), stepEventId, source.sessionId]),
