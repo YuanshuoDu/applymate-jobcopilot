@@ -61,6 +61,7 @@ let selectedJobWorker
 let sharedRedisModule
 let stdinBuffer = ""
 let initialWaitLineage = null
+let archivedWaitChildProgress = 0
 const queuedCommands = []
 const commandWaiters = new Map()
 process.stdin.setEncoding("utf8")
@@ -73,6 +74,29 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
+const ARCHIVED_WAIT_PROGRESS_PHASES = new Set([
+  "model_stream_entered", "tools_validated", "root_identity_validated", "child_create_started", "child_create_failed",
+  "child_created", "child_claim_started", "child_claim_failed", "child_claimed", "child_finish_started",
+  "child_finish_failed", "child_finished", "child_pending", "wait_call_emitted", "model_stream_failed",
+])
+const ARCHIVED_WAIT_ERROR_KINDS = new Set(["none", "error", "type_error", "range_error", "syntax_error", "non_error"])
+function archivedWaitFailureKind(error) {
+  try {
+    if (error instanceof TypeError) return "type_error"
+    if (error instanceof RangeError) return "range_error"
+    if (error instanceof SyntaxError) return "syntax_error"
+    return error instanceof Error ? "error" : "non_error"
+  } catch {
+    return "non_error"
+  }
+}
+function archivedWaitProgress(phase, progress = 0, errorKind = "none") {
+  const safePhase = ARCHIVED_WAIT_PROGRESS_PHASES.has(phase) ? phase : "other"
+  const safeProgress = Number.isSafeInteger(progress) && progress >= 0 && progress <= 7 ? progress : 0
+  const safeErrorKind = ARCHIVED_WAIT_ERROR_KINDS.has(errorKind)
+    ? errorKind : "other"
+  say("P3_ARCHIVED_WAIT_PROGRESS " + JSON.stringify({ phase: safePhase, progress: safeProgress, errorKind: safeErrorKind }))
+}
 function restoredGraphGuardMarker(error) {
   const message = error instanceof Error ? error.message : ""
   let marker = "other"
@@ -1442,22 +1466,53 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
 async function createArchivedWaitChildren(rootTaskId) {
   const store = new PgSubagentTaskStore(pool), policy = defaultSubagentPolicy(), taskIds = []
   for (let index = 0; index < 7; index++) {
-    const task = await store.create({
-      userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId, parentTaskId: rootTaskId,
-      role: "auditor", taskType: "research", goal: `Inspect archived wait fixture ${index + 1}`,
-      allowedActions: [], expectedOutputSchema: {}, policy,
-    })
+    const childProgress = index + 1
+    archivedWaitChildProgress = childProgress
+    archivedWaitProgress("child_create_started", childProgress)
+    let task
+    try {
+      task = await store.create({
+        userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId, parentTaskId: rootTaskId,
+        role: "auditor", taskType: "research", goal: `Inspect archived wait fixture ${childProgress}`,
+        allowedActions: [], expectedOutputSchema: {}, policy,
+      })
+    } catch (error) {
+      archivedWaitProgress("child_create_failed", childProgress, archivedWaitFailureKind(error))
+      throw error
+    }
     taskIds.push(task.id)
+    archivedWaitProgress("child_created", childProgress)
     if (index < 6) {
       const childOwner = `p3-archived-wait-child-${process.pid}-${index + 1}`
-      const lease = await store.claim({ taskId: task.id, sessionId: ids.sessionId, ownerId: childOwner, policy, now: new Date() })
-      if (!lease) throw new Error("p3_archived_wait_child_claim_missing")
-      const status = await store.finish({
-        taskId: task.id, sessionId: ids.sessionId, ownerId: childOwner, attemptCount: lease.attemptCount,
-        status: "completed", result: { summary: `bounded fixture result ${index + 1} ${"x".repeat(1_400)}` }, now: new Date(),
-      })
-      if (status !== "completed") throw new Error("p3_archived_wait_child_finish_missing")
-    }
+      archivedWaitProgress("child_claim_started", childProgress)
+      let lease
+      try { lease = await store.claim({ taskId: task.id, sessionId: ids.sessionId, ownerId: childOwner, policy, now: new Date() }) }
+      catch (error) {
+        archivedWaitProgress("child_claim_failed", childProgress, archivedWaitFailureKind(error))
+        throw error
+      }
+      if (!lease) {
+        archivedWaitProgress("child_claim_failed", childProgress, "error")
+        throw new Error("p3_archived_wait_child_claim_missing")
+      }
+      archivedWaitProgress("child_claimed", childProgress)
+      archivedWaitProgress("child_finish_started", childProgress)
+      let status
+      try {
+        status = await store.finish({
+          taskId: task.id, sessionId: ids.sessionId, ownerId: childOwner, attemptCount: lease.attemptCount,
+          status: "completed", result: { summary: `bounded fixture result ${childProgress} ${"x".repeat(1_400)}` }, now: new Date(),
+        })
+      } catch (error) {
+        archivedWaitProgress("child_finish_failed", childProgress, archivedWaitFailureKind(error))
+        throw error
+      }
+      if (status !== "completed") {
+        archivedWaitProgress("child_finish_failed", childProgress, "error")
+        throw new Error("p3_archived_wait_child_finish_missing")
+      }
+      archivedWaitProgress("child_finished", childProgress)
+    } else archivedWaitProgress("child_pending", childProgress)
   }
   return taskIds
 }
@@ -1483,21 +1538,25 @@ async function startArchivedWaitRuntime(workerOwnerId, resume) {
       } })
     },
     modelRuntimeFactory() {
-      return { adapter: {
+      const adapter = {
         id: resume ? "p3-archived-wait-resume-model" : "p3-archived-wait-first-model",
         profile: modelProfile(),
         async *stream(request) {
           rounds++
+          if (!resume) archivedWaitProgress("model_stream_entered", rounds)
           if (!resume) {
             if (rounds !== 1) throw new Error("p3_archived_wait_unexpected_first_model_round")
             if (!request.tools.some(tool => record(tool)?.name === "agent.wait")
               || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
               throw new Error("p3_archived_wait_fixture_tools_missing")
             }
+            archivedWaitProgress("tools_validated", rounds)
             const rootTaskId = record(request?.metadata)?.taskId
             if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("p3_archived_wait_root_identity_missing")
+            archivedWaitProgress("root_identity_validated", rounds)
             const taskIds = await createArchivedWaitChildren(rootTaskId)
             say("P3_ARCHIVED_WAIT_TASKS_CREATED " + JSON.stringify({ rootTaskId, taskIds }))
+            archivedWaitProgress("wait_call_emitted", taskIds.length)
             yield toolCall(archivedWaitCallId, "agent.wait", {
               idempotencyKey: `p3-process-archived-wait:${ids.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
             })
@@ -1541,7 +1600,13 @@ async function startArchivedWaitRuntime(workerOwnerId, resume) {
           yield { type: "usage", inputTokens: 9, outputTokens: 4, estimatedCostUsd: 0.001 }
           yield { type: "completed", finishReason: "stop" }
         },
-      }, registry: {}, candidates: [] }
+      }
+      return {
+        adapter: resume ? adapter : captureModelStreamFailure(adapter, error => {
+          archivedWaitProgress("model_stream_failed", archivedWaitChildProgress, archivedWaitFailureKind(error))
+        }),
+        registry: {}, candidates: [],
+      }
     },
   })
 }
