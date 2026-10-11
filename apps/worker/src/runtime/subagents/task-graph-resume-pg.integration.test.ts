@@ -3033,6 +3033,48 @@ function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number,
   return outcome as RecordValue & { tasks: unknown[] }
 }
 
+function repairWaitOutcomeFromRequest(
+  request: HarnessModelRequest,
+  callId: string,
+  expectedTaskIds: readonly string[],
+): RecordValue {
+  const original = record(latestToolResult(request, callId))
+  const originalTaskIds = stringIds(original?.taskIds)
+  if (!original || typeof original.waitId !== "string" || original.waitId.length === 0
+    || !originalTaskIds || !sameUniqueIds(originalTaskIds, expectedTaskIds)) {
+    throw new Error("Repair wait receipt did not match the accepted plan task IDs")
+  }
+  const waitId = original.waitId
+  const outcome = original.status === "waiting"
+    ? record(latestToolResult(request, `wait:${waitId}`))
+    : original
+  if (!outcome || outcome.waitId !== waitId
+    || (outcome.status !== "ready" && outcome.status !== "timed_out")) {
+    throw new Error("Repair wait did not expose its exact resolved wait outcome")
+  }
+  const targetIds = stringIds(outcome.targetTaskIds ?? outcome.taskIds)
+  const matchedIds = stringIds(outcome.matchedTaskIds, true)
+  const taskIds = Array.isArray(outcome.tasks)
+    ? stringIds(outcome.tasks.map(task => record(task)?.taskId)) : null
+  if (!targetIds || !sameUniqueIds(targetIds, expectedTaskIds)
+    || !matchedIds || matchedIds.some(id => !expectedTaskIds.includes(id))
+    || !taskIds || !sameUniqueIds(taskIds, expectedTaskIds)
+    || (outcome.status === "ready" && !sameUniqueIds(matchedIds, expectedTaskIds))) {
+    throw new Error("Resolved repair wait did not cover the exact accepted plan task IDs")
+  }
+  return outcome
+}
+
+function stringIds(value: unknown, allowEmpty = false): string[] | null {
+  if (!Array.isArray(value) || value.length > 8 || (!allowEmpty && value.length === 0)) return null
+  const ids: string[] = []
+  for (const id of value) {
+    if (typeof id !== "string" || id.length === 0 || id.length > 256 || id.trim() !== id) return null
+    ids.push(id)
+  }
+  return new Set(ids).size === ids.length ? ids : null
+}
+
 function currentGraphFromRequest(request: HarnessModelRequest): RecordValue | null {
   for (let messageIndex = request.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
     const content = request.messages[messageIndex]!.content
@@ -5863,6 +5905,51 @@ describe("TaskGraph restart fixture service boundary", () => {
       expect(worker.output).not.toContain("P3_FIRST_WORKER_START_RUNTIME_BEGIN")
     }
   }, 120_000)
+})
+
+describe("TaskGraph repair wait model-visible outcome fixture", () => {
+  const taskIds = ["repair-task", "analyst-1", "analyst-2", "analyst-3", "analyst-4", "analyst-5", "analyst-6"]
+  const requestWithResults = (results: readonly { toolUseId: string; value: unknown }[]) => ({
+    messages: [{ role: "assistant", content: results.map(result => ({
+      type: "tool_result", toolUseId: result.toolUseId, content: JSON.stringify(result.value),
+    })) }],
+  } as unknown as HarnessModelRequest)
+
+  it("uses the exact hydrated wait channel instead of the immutable waiting receipt", () => {
+    const original = { waitId: "wait-repair-1", status: "waiting", taskIds, matchedTaskIds: [] }
+    const resolved = {
+      waitId: "wait-repair-1", status: "ready", targetTaskIds: taskIds, matchedTaskIds: taskIds,
+      tasks: taskIds.map(taskId => ({ taskId, status: "completed" })),
+    }
+    const request = requestWithResults([
+      { toolUseId: "repair-wait-call", value: original },
+      { toolUseId: "wait:wait-repair-1", value: resolved },
+    ])
+
+    expect(latestToolResult(request, "repair-wait-call")).toEqual(original)
+    expect(repairWaitOutcomeFromRequest(request, "repair-wait-call", taskIds)).toEqual(resolved)
+  })
+
+  it("keeps immediate ready outcomes and rejects missing or mismatched resumed identity", () => {
+    const directReady = {
+      waitId: "wait-ready-1", status: "ready", taskIds, matchedTaskIds: taskIds,
+      tasks: taskIds.map(taskId => ({ taskId, status: "completed" })),
+    }
+    expect(repairWaitOutcomeFromRequest(
+      requestWithResults([{ toolUseId: "ready-call", value: directReady }]), "ready-call", taskIds,
+    )).toEqual(directReady)
+
+    const waiting = { waitId: "wait-repair-2", status: "waiting", taskIds, matchedTaskIds: [] }
+    expect(() => repairWaitOutcomeFromRequest(
+      requestWithResults([{ toolUseId: "waiting-call", value: waiting }]), "waiting-call", taskIds,
+    )).toThrow("exact resolved wait outcome")
+    expect(() => repairWaitOutcomeFromRequest(
+      requestWithResults([
+        { toolUseId: "waiting-call", value: waiting },
+        { toolUseId: "wait:wait-repair-2", value: { ...directReady, waitId: "other-wait" } },
+      ]), "waiting-call", taskIds,
+    )).toThrow("exact resolved wait outcome")
+  })
 })
 
 describe("TaskGraph fixture lease guard unit", () => {
@@ -10646,18 +10733,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             const previousRepairWaitCallId = repairWaitCallIds.at(-1)
-            const previousRepairWait = previousRepairWaitCallId
-              ? record(latestToolResult(request, previousRepairWaitCallId)) : null
-            if (typeof previousRepairWait?.status === "string") repairWaitStatuses.push(previousRepairWait.status)
+            let previousRepairWait: RecordValue | null = null
+            if (previousRepairWaitCallId && !hardExecutorFailure) {
+              const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
+              const dependentTaskIds = initialPlanTaskIds?.slice(1) ?? []
+              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== 6 || dependentTaskIds.some(id => !id)) {
+                throw new Error("repair fixture lost accepted wait targets")
+              }
+              previousRepairWait = repairWaitOutcomeFromRequest(
+                request, previousRepairWaitCallId, [...repairTaskIds, ...dependentTaskIds],
+              )
+              repairWaitStatuses.push(String(previousRepairWait.status))
+            }
             const repairWaitNeedsPoll = !previousRepairWaitCallId
-              || (!hardExecutorFailure && previousRepairWait?.status === "waiting")
+              || (!hardExecutorFailure && previousRepairWait?.status === "timed_out")
             if (repairPlanSent && repairWaitNeedsPoll) {
               if (repairWaitCallIds.length >= VERIFICATION_REPAIR_MAX_WAIT_POLLS) {
                 throw new Error("repair fixture exhausted its bounded wait polls")
               }
               repairWaitSent = true
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
-              if (!initialPlanTaskIds?.[1]) throw new Error("repair fixture lost the original dependent task ID")
+              const dependentTaskIds = initialPlanTaskIds?.slice(1) ?? []
+              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== 6 || dependentTaskIds.some(id => !id)) {
+                throw new Error("repair fixture lost accepted wait targets")
+              }
               if (!hardExecutorFailure) {
                 const repairedGraph = currentGraphFromRequest(request)
                 expect(repairedGraph?.nodes).toHaveLength(TASK_GRAPH_LIMITS.maxNodes)
@@ -10668,7 +10767,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 expect((Array.isArray(repairedGraph?.nodes) ? repairedGraph.nodes.map(record) : [])
                   .map(node => node?.key)).toContain("scout-repair")
               }
-              const taskIds = [...repairTaskIds, ...initialPlanTaskIds.slice(1)]
+              const taskIds = [...repairTaskIds, ...dependentTaskIds]
               const pollIndex = repairWaitCallIds.length
               const pollSuffix = pollIndex === 0 ? "" : `:poll:${pollIndex + 1}`
               const callId = `${repairWaitCallId}${pollSuffix}`
@@ -10752,6 +10851,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
             }
             if (repair?.status === "completed" && dependent?.status === "completed") {
+              if (!hardExecutorFailure) expect(repairWaitStatuses.at(-1)).toBe("ready")
               expectPassedVerificationReport(repair.verificationReport, "candidate-count")
               expect(record(repair.repairReceipt)).toMatchObject({
                 graphRootTaskId: expect.any(String), targetNodeKey: "scout", targetTaskId: scout?.taskId,
@@ -10969,7 +11069,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(repairWaitCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_WAIT_POLLS)
       expect(repairWaitStatuses).toHaveLength(repairWaitCallIds.length)
       expect(repairWaitStatuses.at(-1)).toBe("ready")
-      expect(repairWaitCallIds.length).toBe(repairWaitStatuses.filter(status => status === "waiting").length + 1)
+      expect(repairWaitStatuses.every(status => status === "ready" || status === "timed_out")).toBe(true)
+      expect(repairWaitCallIds.length).toBe(repairWaitStatuses.filter(status => status === "timed_out").length + 1)
     }
     expect(secondJobSeeded).toBe(true)
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
