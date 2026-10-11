@@ -14,7 +14,6 @@ export type {
   TaskGraphNativeSpawnRequest,
 } from "./task-graph-native-command.js"
 export type { TaskGraphNativeCommandInput, TaskGraphNativeFollowupRequest, TaskGraphNativeRequest, TaskGraphNativeReplacementRequest } from "./task-graph-native-request.js"
-
 export const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION = "agent-harness.v2.task-graph-repair-receipt.v1" as const
 const VERIFICATION_REASONS = new Set<TaskGraphVerificationReasonCode>([
   "criteria_met", "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid",
@@ -31,7 +30,6 @@ function denseArray(value: unknown, max: number): value is unknown[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > max || Reflect.ownKeys(value).length !== value.length + 1) return false
   return Reflect.ownKeys(value).every(key => key === "length" || (typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < value.length))
 }
-
 export type TaskGraphVerificationReport = Readonly<{
   verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode
   criteria: Array<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>
@@ -239,8 +237,11 @@ export class TaskGraphCommandError extends Error {
     this.name = "TaskGraphCommandError"
   }
 }
+export type TaskGraphKeepReconciliationReceipt = Readonly<{ decision: "keep"; revision: number; reconciledInputCount: number }>
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
+  appendAndScheduleWithReconciliation?(input: TaskGraphScheduleInput, operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt>
+  reconcileSteering?(operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphKeepReconciliationReceipt>
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */
   appendNativeCoordination?(input: TaskGraphNativeCommandInput): Promise<TaskGraphNativeCommandReceipt>
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>

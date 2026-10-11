@@ -1,6 +1,10 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { recoverAnsweredQuestionHistory } from "./question-answer-recovery.js"
+import { recoverAnsweredQuestionContext, recoverAnsweredQuestionHistory } from "./question-answer-recovery.js"
+import { readTurnQuestionPlanningHistory } from "./turns/turn-question-planning-history.js"
+import { questionId, questionItemId } from "./turns/turn-question-store-guards.js"
+
+vi.mock("./turns/turn-question-planning-history.js", () => ({ readTurnQuestionPlanningHistory: vi.fn() }))
 
 const lease = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-2", leaseVersion: 2,
   leaseStartedAt: new Date("2026-10-02T00:00:00.000Z"), leaseExpiresAt: new Date("2026-10-02T00:01:00.000Z") }
@@ -22,6 +26,15 @@ function events(startPatch: Record<string, unknown> = {}, answerPatch: Record<st
       payload: { waitKind: "question", waitId: "wait-1", itemId: "question-item", turnId: "turn-1", toolCallId: "call-1", status: "answered", answerAvailable: "[REDACTED]" }, ...answerPatch },
   ]
 }
+function questionEvents(itemId: string, waitId: string, callId: string, startSequence: string, answerSequence: string) {
+  const [start, answer] = events()
+  return [
+    { ...start!, id: `started-${itemId}`, itemId, sequence: startSequence, correlationId: itemId, causationId: waitId,
+      payload: { itemId, waitKind: "question", questionId: "[REDACTED]", toolCallId: callId } },
+    { ...answer!, id: `answered-${itemId}`, itemId, sequence: answerSequence, correlationId: waitId, causationId: itemId,
+      payload: { waitKind: "question", waitId, itemId, turnId: "turn-1", toolCallId: callId, status: "answered" } },
+  ]
+}
 function client(itemRows: Record<string, unknown>[] = [item()], eventRows: Record<string, unknown>[] = events(), queryLog: string[] = []) {
   const value = { query: async (sql: string) => {
     queryLog.push(sql)
@@ -38,6 +51,8 @@ function input(patch: Record<string, unknown> = {}) {
 }
 
 describe("recoverAnsweredQuestionHistory", () => {
+  beforeEach(() => vi.mocked(readTurnQuestionPlanningHistory).mockReset().mockResolvedValue([]))
+
   it("accepts broker-redacted event fields when the durable item and exact event lineage prove the answer", async () => {
     const redactedEvents = events()
     expect(redactedEvents[0].payload.questionId).toBe("[REDACTED]")
@@ -259,5 +274,70 @@ describe("recoverAnsweredQuestionHistory", () => {
     await expect(recoverAnsweredQuestionHistory(client(), input({ existingHistory: [
       { id: "agent-question:question-item:answer", content: { role: "user", type: "answer", questionId: "wait-1", text: "yes" } },
     ] }))).rejects.toThrow("question_recovery_history_pair_incomplete")
+  })
+
+  it("projects planning metadata only for the latest validated answered question", async () => {
+    const wait1 = questionId(lease, "step-1", "call-1"), wait2 = questionId(lease, "step-2", "call-2")
+    const first = item({ id: questionItemId(wait1), content: { ...item().content as object, questionId: wait1 } })
+    const second = item({ id: questionItemId(wait2), content: { ...item().content as object, questionId: wait2, toolCallId: "call-2" } })
+    const summary = { observedPlanRevision: 1, graphRevisionAtAsk: 2, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "5" }
+    vi.mocked(readTurnQuestionPlanningHistory).mockResolvedValueOnce([summary])
+
+    const recovered = await recoverAnsweredQuestionContext(client([first, second], [...questionEvents(first.id as string, wait1, "call-1", "10", "13"),
+      ...questionEvents(second.id as string, wait2, "call-2", "11", "12")]), input({
+      steps: [{ id: "step-1", taskId: "root-1", ordinal: 0, attempt: 1 }, { id: "step-2", taskId: "root-1", ordinal: 1, attempt: 1 }],
+      toolItems: [
+        { id: "call-item", stepId: "step-1", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } },
+        { id: "call-item-2", stepId: "step-2", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-2" } },
+      ],
+    }))
+
+    expect(recovered.history).toHaveLength(4)
+    expect(recovered.history.map(entry => entry.id)).toEqual([
+      `agent-question:${second.id}:question`, `agent-question:${second.id}:answer`,
+      `agent-question:${first.id}:question`, `agent-question:${first.id}:answer`,
+    ])
+    expect(recovered.planningClarifications).toEqual([summary])
+    expect(recovered.planningClarificationHistoryPair).toEqual({
+      questionEntryId: `agent-question:${second.id}:question`,
+      answerEntryId: `agent-question:${second.id}:answer`,
+    })
+    expect(readTurnQuestionPlanningHistory).toHaveBeenCalledWith(expect.anything(), {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+    }, [{ stepId: "step-2", toolCallId: "call-2", waitId: wait2, questionItemId: questionItemId(wait2) }])
+  })
+
+  it("does not fall back to an older receipt when the latest answered question is legacy", async () => {
+    const wait1 = questionId(lease, "step-1", "call-1")
+    vi.mocked(readTurnQuestionPlanningHistory).mockImplementation(async (_client, _owner, waits = []) =>
+      waits.some(wait => wait.waitId === wait1)
+        ? [{ observedPlanRevision: 0, graphRevisionAtAsk: 1, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "2" }]
+        : [])
+    const first = item({ id: questionItemId(wait1), content: { ...item().content as object, questionId: wait1 } })
+    const second = item({ id: "question-item-2", content: { ...item().content as object, questionId: "legacy-wait-2", toolCallId: "call-2" } })
+    const recovered = await recoverAnsweredQuestionContext(client([first, second], [...questionEvents(first.id as string, wait1, "call-1", "10", "13"),
+      ...questionEvents(second.id as string, "legacy-wait-2", "call-2", "11", "12")]), input({
+      steps: [{ id: "step-1", taskId: "root-1", ordinal: 0, attempt: 1 }, { id: "step-2", taskId: "root-1", ordinal: 1, attempt: 1 }],
+      toolItems: [
+        { id: "call-item", stepId: "step-1", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } },
+        { id: "call-item-2", stepId: "step-2", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-2" } },
+      ],
+    }))
+
+    expect(recovered.history).toHaveLength(4)
+    expect(recovered.planningClarifications).toEqual([])
+    expect(recovered).not.toHaveProperty("planningClarificationHistoryPair")
+    expect(readTurnQuestionPlanningHistory).toHaveBeenCalledOnce()
+    expect(vi.mocked(readTurnQuestionPlanningHistory).mock.calls[0]?.[2]).toEqual([
+      { stepId: "step-2", toolCallId: "call-2", waitId: "legacy-wait-2", questionItemId: "question-item-2" },
+    ])
+  })
+
+  it("fails closed when the latest legacy question has a present malformed planning receipt", async () => {
+    vi.mocked(readTurnQuestionPlanningHistory).mockRejectedValueOnce(new Error("question_conflict"))
+    await expect(recoverAnsweredQuestionContext(client([item()]), input())).rejects.toThrow("question_conflict")
+    expect(vi.mocked(readTurnQuestionPlanningHistory).mock.calls[0]?.[2]).toEqual([
+      { stepId: "step-1", toolCallId: "call-1", waitId: "wait-1", questionItemId: "question-item" },
+    ])
   })
 })

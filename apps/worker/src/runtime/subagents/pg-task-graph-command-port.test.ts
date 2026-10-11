@@ -1,10 +1,24 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { PgSubagentPool } from "./types.js"
+
+const reconciliationMocks = vi.hoisted(() => ({
+  prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
+}))
+vi.mock("./steering-reconciliation-ledger.js", () => ({
+  prepareSteeringReconciliation: reconciliationMocks.prepare,
+  writeSteeringReconciliationReceipt: reconciliationMocks.write,
+  assertNoUnresolvedSteering: reconciliationMocks.assertNoUnresolvedSteering,
+}))
+vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: reconciliationMocks.create }))
+vi.mock("./task-graph-pg-events.js", () => ({
+  appendTaskGraphReceipt: vi.fn(async () => undefined), writeTaskGraphSnapshot: vi.fn(async () => undefined),
+  writePlanReceipt: reconciliationMocks.writePlan,
+}))
 
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
@@ -26,7 +40,7 @@ function scheduleInput(expectedRevision = 1): TaskGraphScheduleInput {
   }
 }
 
-function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; includeReplay?: boolean; missingGraph?: boolean; persistedPlanReceipt?: boolean } = {}) {
+function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; includeReplay?: boolean; missingGraph?: boolean; persistedPlanReceipt?: boolean; allowedActions?: unknown } = {}) {
   const calls: QueryCall[] = []
   const itemId = taskGraphItemId(input.scope.parentTaskId)
   const snapshot = {
@@ -56,7 +70,7 @@ function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; i
         return options.failFence === "turn" ? empty : { rows: [{ id: input.scope.turnId }], rowCount: 1 }
       }
       if (sql.startsWith('SELECT task.*, session."userId" AS "userId"')) {
-        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, budgetSnapshot: {} }], rowCount: 1 }
+        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, budgetSnapshot: {}, allowedActions: options.allowedActions ?? ["agent.plan"] }], rowCount: 1 }
       }
       if (sql.startsWith('SELECT "id" FROM "agent_steps"')) {
         return { rows: [{ id: input.scope.stepId }], rowCount: 1 }
@@ -87,6 +101,7 @@ function fakePool(input: TaskGraphScheduleInput, options: { failFence?: Fence; i
 }
 
 describe("createPgTaskGraphCommandPort", () => {
+  beforeEach(() => { vi.clearAllMocks() })
   it("keeps a missing graph pristine when no durable proposal receipt exists", async () => {
     const input = scheduleInput()
     const fake = fakePool(input, { missingGraph: true })
@@ -198,6 +213,57 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
     expect(fake.client.release).toHaveBeenCalledOnce()
+  })
+
+  it("commits plan revise and private reconciliation through one client, in order", async () => {
+    const input = scheduleInput(2), fake = fakePool(input, { includeReplay: false })
+    const operation = { scope: input.scope, decision: "revise" as const, expectedRevision: 2, callId: "persisted-plan-call", rootInputId: "original-input" }
+    const prepared = { steerInputIds: ["private-steer"], resultingRevision: 3 }
+    const created = { state: { revision: 3 }, snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, created: [], readyTaskIds: [] }
+    reconciliationMocks.prepare.mockResolvedValue(prepared)
+    reconciliationMocks.create.mockResolvedValue(created)
+    const port = createPgTaskGraphCommandPort(fake.pool)
+
+    await expect(port.appendAndScheduleWithReconciliation!(input, operation)).resolves.toEqual({ status: "accepted", revision: 3, nodes: [], readyTaskIds: [] })
+    expect(reconciliationMocks.prepare).toHaveBeenCalledWith(fake.client, operation)
+    expect(reconciliationMocks.assertNoUnresolvedSteering).not.toHaveBeenCalled()
+    expect(reconciliationMocks.create).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.write).toHaveBeenCalledWith(fake.client, prepared, 3)
+    expect(reconciliationMocks.prepare.mock.invocationCallOrder[0]).toBeLessThan(reconciliationMocks.create.mock.invocationCallOrder[0] ?? 0)
+    expect(reconciliationMocks.create.mock.invocationCallOrder[0]).toBeLessThan(reconciliationMocks.writePlan.mock.invocationCallOrder[0] ?? 0)
+    expect(reconciliationMocks.writePlan.mock.invocationCallOrder[0]).toBeLessThan(reconciliationMocks.write.mock.invocationCallOrder[0] ?? 0)
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
+    expect(fake.client.release).toHaveBeenCalledOnce()
+  })
+
+  it("blocks a raw planning-root proposal while accepted steering remains unresolved", async () => {
+    const input = scheduleInput(2), fake = fakePool(input, { includeReplay: false })
+    reconciliationMocks.assertNoUnresolvedSteering.mockRejectedValueOnce(new Error("steering_reconciliation_pending"))
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toThrow("steering_reconciliation_pending")
+    expect(reconciliationMocks.assertNoUnresolvedSteering).toHaveBeenCalledWith(fake.client, input.scope)
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+  })
+
+  it("does not apply the planning-root steering gate to non-planning schedules", async () => {
+    const input = scheduleInput(), fake = fakePool(input, { allowedActions: ["jobs.search"] })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).resolves.toMatchObject({ status: "duplicate" })
+    expect(reconciliationMocks.assertNoUnresolvedSteering).not.toHaveBeenCalled()
+  })
+
+  it("returns an exact plan replay before preparing reconciliation and never writes a receipt", async () => {
+    const input = scheduleInput(), fake = fakePool(input)
+    const operation = { scope: input.scope, decision: "revise" as const, expectedRevision: 1, callId: "new-step-call", rootInputId: "original-input" }
+    reconciliationMocks.prepare.mockRejectedValue(new Error("replay must not prepare a new reconciliation"))
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, operation)).resolves.toMatchObject({ status: "duplicate", revision: 2 })
+    expect(reconciliationMocks.prepare).not.toHaveBeenCalled()
+    expect(reconciliationMocks.write).not.toHaveBeenCalled()
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
   })
 
   it("rejects a stale proposal with the current persisted revision", async () => {

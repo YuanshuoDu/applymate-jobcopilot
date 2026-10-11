@@ -11,15 +11,15 @@ import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngi
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
-import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
-import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
+import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
-import { contextForAgenda, hasNewlyAcceptedInput } from "../context/step-context-support.js"
+import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
+import { completionRecoverySnapshot } from "./turn-execution-completion-gate.js"
 const DEFAULT_MAX_STEPS = 32
-function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
+
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
   const now = options.now ?? (() => new Date())
@@ -77,7 +77,9 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
-        const agendaContext = contextForAgenda(context, ordinal, options.rootContextInputId)
+        // The model sees the durable root background, but later agenda receipts must not turn it into actionable pending input.
+        const agendaContext = excludeUnconsumedRootReferenceFromAgenda(context, ordinal > 0 ? options.rootContextInputId : undefined)
+
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
           inputThroughSequence, consumedInputIds,
@@ -163,7 +165,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
           } })
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
-        snapshot = taskGraphRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
+        snapshot = completionRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
       } catch (error: unknown) {
         if (receiptClosedSteps.has(step.id)) throw error
         if (isPreparedQuestionRetryError(error) || isTurnStateRefreshRetryError(error)) throw error

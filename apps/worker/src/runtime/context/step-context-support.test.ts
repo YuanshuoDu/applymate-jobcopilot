@@ -4,6 +4,7 @@ import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 import type { ContextBlock, ContextOwnerFence, StepContext } from "./step-context-builder.js"
 import type { InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
 import { checkpointWithInputs, contextForAgenda, hasNewlyAcceptedInput, mergeDurableRootContextInput, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
+import { ensureTurnInputs, safeTaskGraphRevision } from "./step-context-support.js"
 
 const now = new Date("2026-09-01T00:00:00.000Z")
 const scope: TenantScope = { userId: "user-1" }
@@ -16,6 +17,22 @@ const createBlock = (layer: ContextBlock["layer"], role: ContextBlock["role"], t
 const stepContext = (overrides: Partial<StepContext> = {}): StepContext => ({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "", ...overrides })
 
 describe("step context support", () => {
+  it("accepts only owner-scoped Turn steer and follow-up rows", () => {
+    const request = { sessionId: "session-1", turnId: "turn-1", scope }
+    const followUp = { ...input("follow-up", 2n, [{ type: "text", text: "More context" }]), delivery: "follow_up" as const }
+    const error = (inputId: string) => new Error(`AgentInput ${inputId} is outside the tenant Turn`)
+
+    expect(() => ensureTurnInputs([input("steer", 1n, []), followUp], request, error)).not.toThrow()
+    expect(() => ensureTurnInputs([{ ...followUp, targetTurnId: "other-turn" }], request, error)).toThrow("AgentInput follow-up is outside the tenant Turn")
+  })
+
+  it("accepts only safe nonnegative task graph revisions", () => {
+    expect(safeTaskGraphRevision(0)).toBe(0)
+    expect(safeTaskGraphRevision(12)).toBe(12)
+    for (const invalid of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN, Number.POSITIVE_INFINITY, "3"]) {
+      expect(safeTaskGraphRevision(invalid)).toBeUndefined()
+    }
+  })
   it("deduplicates only the complete ordered root text joined and trimmed to the exact goal", () => {
     const makeInput = (id: string, texts: readonly string[]) => input(id, 1n, texts.map(text => ({ type: "text" as const, text })))
     expect(rootInputTextMatchesGoal(makeInput("root", ["Find roles", "in Dublin"]), "root", "Find roles\nin Dublin")).toBe(true)
@@ -72,7 +89,6 @@ describe("step context support", () => {
     expect(hasNewlyAcceptedInput(stepContext({ steeringMarkerControl: { activeInputIds: [], newlyObservedInputIds: ["new-input"], newlyObservedMarkers: [marker] } }), [])).toBe(true)
     expect(hasNewlyAcceptedInput(stepContext({ steeringMarkerControl: { activeInputIds: [], newlyObservedInputIds: ["new-input"], newlyObservedMarkers: [marker] } }), ["new-input", "marker-input"])).toBe(false)
   })
-
   it("retains the cursor while adding only new checkpoint IDs in sequence order", () => {
     const checkpoint: StepCheckpoint = { inputThroughSequence: 3n, consumedInputIds: ["old"] }
     expect(checkpointWithInputs(checkpoint, [input("new-2", 5n, [{ type: "text", text: "two" }]), input("new-1", 4n, [{ type: "text", text: "one" }]), input("old", 2n, [{ type: "text", text: "old" }])])).toEqual({ inputThroughSequence: 5n, consumedInputIds: ["old", "new-1", "new-2"] })

@@ -487,7 +487,7 @@ describe("PostgreSQL TurnEngine store", () => {
       if (sql === "BEGIN" || sql.startsWith("BEGIN ISOLATION LEVEL") || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, status: "in_progress", finalResponse: null }], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, allowedActions: [] }], rowCount: 1 }
       if (sql.includes('FROM "agent_inputs"')) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_events"')) return { rows: [{ id: "step-completed-event" }], rowCount: 1 }
       return { rows: [], rowCount: 1 }
