@@ -11,6 +11,7 @@ import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
+import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -226,13 +227,8 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   if (keys.size !== nodes.length || nodes.some(item => item.dependsOn.some(key => !keys.has(key)))) throw new Error("task_graph_current_state_invalid:dependencies")
   const content = { kind: "task_graph_current", revision: Number(state.revision), nodes }
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
-  return {
-    ...snapshot, taskGraphRevision: value.revision,
-    toolObservations: [
-      ...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID),
-      { id: OBSERVATION_ID, content },
-    ],
-  }
+  return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
+    toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
 }
 
 export async function loadTaskGraphCurrentObservation(

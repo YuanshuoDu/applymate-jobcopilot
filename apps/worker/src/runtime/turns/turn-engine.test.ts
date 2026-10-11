@@ -60,7 +60,7 @@ function contextBuilder(seen: StepContextSnapshot[]) {
         { id: "goal", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: "Find jobs" },
         ...request.snapshot.toolObservations.map((observation) => ({ id: observation.id, layer: "tool_observation" as const, role: "data" as const, trust: "external_untrusted" as const, source: "tool_or_subagent", content: toRepositoryJson(observation.content) })),
       ]
-      return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: BigInt(seen.length), consumedInputIds: seen.length === 1 ? ["steer-1"] : ["steer-1"], blocks, canonicalJson: JSON.stringify(blocks) }
+      return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 1n, consumedInputIds: seen.length === 1 ? ["steer-1"] : ["steer-1"], blocks, canonicalJson: JSON.stringify(blocks) }
     },
   }
 }
