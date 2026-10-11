@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { rm, writeFile } from "node:fs/promises"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
@@ -1842,10 +1842,13 @@ const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCal
 // The discovery fixtures execute root planning/replanning and child turns under the same root-scoped ceiling.
 const DISCOVERY_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 16, maxToolCalls: 8 }
 const VERIFICATION_REPAIR_MAX_WAIT_POLLS = TASK_GRAPH_LIMITS.maxNodes
+const VERIFICATION_REPAIR_MAX_REFERENCE_READS = 8
 const VERIFICATION_REPAIR_BASELINE_STEPS = 22
 const VERIFICATION_REPAIR_BASELINE_TOOL_CALLS = 19
-const VERIFICATION_REPAIR_STEP_BUDGET = VERIFICATION_REPAIR_BASELINE_STEPS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1
-const VERIFICATION_REPAIR_TOOL_BUDGET = VERIFICATION_REPAIR_BASELINE_TOOL_CALLS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1
+const VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT = 18_432
+// Eight bounded 4 KiB-envelope reads cover the capped seven-target output; each adds one finite model step and tool call.
+const VERIFICATION_REPAIR_STEP_BUDGET = VERIFICATION_REPAIR_BASELINE_STEPS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1 + VERIFICATION_REPAIR_MAX_REFERENCE_READS
+const VERIFICATION_REPAIR_TOOL_BUDGET = VERIFICATION_REPAIR_BASELINE_TOOL_CALLS + VERIFICATION_REPAIR_MAX_WAIT_POLLS - 1 + VERIFICATION_REPAIR_MAX_REFERENCE_READS
 // TaskGraph multi-round fixtures need 10-11 root and child model steps; retain bounded headroom.
 const TASK_GRAPH_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 12, maxToolCalls: 12 }
 
@@ -3037,8 +3040,15 @@ function repairWaitOutcomeFromRequest(
   request: HarnessModelRequest,
   callId: string,
   expectedTaskIds: readonly string[],
+  resolvedOriginal?: unknown,
 ): RecordValue {
-  const original = record(latestToolResult(request, callId))
+  const waitCall = toolUseFromRequest(request, callId)
+  const waitInput = record(waitCall?.input)
+  if (waitCall?.name !== "agent.wait" || !waitInput
+    || !sameUniqueIds(stringIds(waitInput.taskIds) ?? [], expectedTaskIds) || waitInput.mode !== "all") {
+    throw new Error("Repair wait call did not match the accepted plan task IDs")
+  }
+  const original = record(resolvedOriginal === undefined ? latestToolResult(request, callId) : resolvedOriginal)
   const originalTaskIds = stringIds(original?.taskIds)
   if (!original || typeof original.waitId !== "string" || original.waitId.length === 0
     || !originalTaskIds || !sameUniqueIds(originalTaskIds, expectedTaskIds)) {
@@ -3063,6 +3073,104 @@ function repairWaitOutcomeFromRequest(
     throw new Error("Resolved repair wait did not cover the exact accepted plan task IDs")
   }
   return outcome
+}
+
+type RepairWaitReference = { readonly id: string; readonly sizeBytes: number; readonly sha256: string }
+type RepairWaitOutputResolution =
+  | { readonly status: "inline"; readonly output: unknown }
+  | { readonly status: "read"; readonly reference: RepairWaitReference; readonly cursor?: string }
+  | { readonly status: "complete"; readonly reference: RepairWaitReference; readonly output: unknown; readonly readCount: number }
+
+const TOOL_RESULT_REFERENCE_ID = /^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function toolUseFromRequest(request: HarnessModelRequest, callId: string): { name: string; input: unknown } | null {
+  for (let messageIndex = request.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const content = request.messages[messageIndex]!.content
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]!
+      if (part.type !== "tool_use" || part.id !== callId || typeof part.name !== "string") continue
+      return { name: part.name, input: part.input }
+    }
+  }
+  return null
+}
+
+function repairWaitReference(value: unknown): RepairWaitReference | null {
+  const row = record(value)
+  if (!row) return null
+  if (!Object.hasOwn(row, "$ref")) {
+    if (Object.hasOwn(row, "sizeBytes") || Object.hasOwn(row, "sha256")) throw new Error("repair_wait_reference_invalid")
+    return null
+  }
+  if (Object.keys(row).sort().join(",") !== "$ref,sha256,sizeBytes"
+    || typeof row.$ref !== "string" || !TOOL_RESULT_REFERENCE_ID.test(row.$ref)
+    || !Number.isSafeInteger(row.sizeBytes) || Number(row.sizeBytes) <= 8 * 1024
+    || Number(row.sizeBytes) > VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT
+    || typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256)) {
+    throw new Error("repair_wait_reference_invalid")
+  }
+  return { id: row.$ref, sizeBytes: Number(row.sizeBytes), sha256: row.sha256 }
+}
+
+function repairWaitOutputResolutionFromRequest(
+  request: HarnessModelRequest,
+  callId: string,
+  readCallIds: readonly string[],
+): RepairWaitOutputResolution {
+  const original = latestToolResult(request, callId)
+  const reference = repairWaitReference(original)
+  if (!reference) return { status: "inline", output: original }
+  if (readCallIds.length > VERIFICATION_REPAIR_MAX_REFERENCE_READS) throw new Error("repair_wait_reference_read_limit")
+
+  let cursor: string | undefined
+  let offset = 0
+  const chunks: string[] = []
+  for (let index = 0; index < readCallIds.length; index += 1) {
+    const readCallId = readCallIds[index]!
+    const call = toolUseFromRequest(request, readCallId)
+    const input = record(call?.input)
+    const expectedInputKeys = cursor === undefined ? "referenceId" : "cursor,referenceId"
+    if (call?.name !== "tool_results.read" || !input
+      || Object.keys(input).sort().join(",") !== expectedInputKeys
+      || input.referenceId !== reference.id
+      || (cursor === undefined ? input.cursor !== undefined : input.cursor !== cursor)) {
+      throw new Error("repair_wait_reference_read_identity")
+    }
+    const chunk = record(latestToolResult(request, readCallId))
+    if (!chunk || Object.keys(chunk).sort().join(",") !== "byteCount,chunk,nextCursor,ref,sha256"
+      || chunk.ref !== reference.id || chunk.sha256 !== reference.sha256 || chunk.byteCount !== reference.sizeBytes
+      || typeof chunk.chunk !== "string" || chunk.chunk.length === 0
+      || Buffer.byteLength(chunk.chunk, "utf8") > 4_096
+      || Buffer.from(chunk.chunk, "utf8").toString("utf8") !== chunk.chunk
+      || Buffer.byteLength(JSON.stringify(chunk), "utf8") > 4_096) {
+      throw new Error("repair_wait_reference_chunk_invalid")
+    }
+    const chunkBytes = Buffer.byteLength(chunk.chunk, "utf8")
+    offset += chunkBytes
+    if (offset > reference.sizeBytes) throw new Error("repair_wait_reference_cursor_invalid")
+    chunks.push(chunk.chunk)
+    if (chunk.nextCursor === null) {
+      if (offset !== reference.sizeBytes || index !== readCallIds.length - 1) {
+        throw new Error("repair_wait_reference_cursor_invalid")
+      }
+      const encoded = chunks.join("")
+      if (Buffer.byteLength(encoded, "utf8") !== reference.sizeBytes
+        || createHash("sha256").update(encoded, "utf8").digest("hex") !== reference.sha256) {
+        throw new Error("repair_wait_reference_digest_invalid")
+      }
+      let output: unknown
+      try { output = JSON.parse(encoded) as unknown } catch { throw new Error("repair_wait_reference_json_invalid") }
+      return { status: "complete", reference, output, readCount: readCallIds.length }
+    }
+    if (typeof chunk.nextCursor !== "string" || !/^(0|[1-9][0-9]*)$/.test(chunk.nextCursor)
+      || Number(chunk.nextCursor) !== offset || offset >= reference.sizeBytes) {
+      throw new Error("repair_wait_reference_cursor_invalid")
+    }
+    cursor = chunk.nextCursor
+  }
+  if (readCallIds.length === 0) return { status: "read", reference }
+  if (cursor === undefined) throw new Error("repair_wait_reference_cursor_invalid")
+  return { status: "read", reference, cursor }
 }
 
 function stringIds(value: unknown, allowEmpty = false): string[] | null {
@@ -4009,9 +4117,11 @@ async function waitToolResultDiagnostic(pool: Pool, turnId: string, toolCallId: 
 async function scopedWaitToolResultDiagnostic(pool: Pool, owner: Fixture, toolCallId: string): Promise<RecordValue> {
   const result = await pool.query<{
     itemStatus: string; outputStatus: string | null; targetCount: number | null; matchedCount: number | null;
-    targetIdsRedacted: boolean | null; taskIdsRedacted: boolean | null
+    targetIdsRedacted: boolean | null; taskIdsRedacted: boolean | null; outputReferencePresent: boolean | null
   }>(
     `SELECT item."status" AS "itemStatus", item."content"->'output'->>'status' AS "outputStatus",
+       CASE WHEN jsonb_typeof(item."content"->'output') = 'object'
+         AND (item."content"->'output') ? '$ref' THEN true ELSE false END AS "outputReferencePresent",
        CASE WHEN jsonb_typeof(item."content"->'output'->'taskIds') = 'array'
          THEN jsonb_array_length(item."content"->'output'->'taskIds') ELSE NULL END AS "targetCount",
        CASE WHEN jsonb_typeof(item."content"->'output'->'matchedTaskIds') = 'array'
@@ -4042,6 +4152,7 @@ async function scopedWaitToolResultDiagnostic(pool: Pool, owner: Fixture, toolCa
     resultPresent: Boolean(row),
     resultStatus: row ? diagnosticEnum(row.itemStatus, ITEM_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
     outputStatus: diagnosticEnum(row?.outputStatus, PROCESS_FIXTURE_WAIT_OUTPUT_STATUSES) ?? (row?.outputStatus == null ? "missing" : "other"),
+    outputReferencePresent: row?.outputReferencePresent === true,
     targetTaskCount: diagnosticBoundedCount(row?.targetCount),
     matchedTaskCount: diagnosticBoundedCount(row?.matchedCount),
     targetIdsRedacted: row?.targetIdsRedacted ?? null,
@@ -5910,9 +6021,14 @@ describe("TaskGraph restart fixture service boundary", () => {
 describe("TaskGraph repair wait model-visible outcome fixture", () => {
   const taskIds = ["repair-task", "analyst-1", "analyst-2", "analyst-3", "analyst-4", "analyst-5", "analyst-6"]
   const requestWithResults = (results: readonly { toolUseId: string; value: unknown }[]) => ({
-    messages: [{ role: "assistant", content: results.map(result => ({
-      type: "tool_result", toolUseId: result.toolUseId, content: JSON.stringify(result.value),
-    })) }],
+    messages: results.flatMap(result => [
+      { role: "assistant", content: [{
+        type: "tool_use", id: result.toolUseId, name: "agent.wait", input: { taskIds, mode: "all" },
+      }] },
+      { role: "tool", content: [{
+        type: "tool_result", toolUseId: result.toolUseId, content: JSON.stringify(result.value),
+      }] },
+    ]),
   } as unknown as HarnessModelRequest)
 
   it("uses the exact hydrated wait channel instead of the immutable waiting receipt", () => {
@@ -5949,6 +6065,99 @@ describe("TaskGraph repair wait model-visible outcome fixture", () => {
         { toolUseId: "wait:wait-repair-2", value: { ...directReady, waitId: "other-wait" } },
       ]), "waiting-call", taskIds,
     )).toThrow("exact resolved wait outcome")
+  })
+
+  it("reassembles the exact bounded wait JSON from model-visible reference reads", () => {
+    const output = {
+      waitId: "wait-ready-reference-1", status: "ready", taskIds,
+      targetTaskIds: taskIds, matchedTaskIds: taskIds,
+      tasks: taskIds.map((taskId, index) => ({
+        taskId, status: "completed", role: index === 0 ? "scout" : "analyst",
+        result: { truncated: true, summary: "Résumé evidence ".repeat(100) },
+      })),
+    }
+    const encoded = JSON.stringify(output)
+    const bytes = Buffer.from(encoded, "utf8")
+    const ref = "tool-result-00000000-0000-4000-8000-000000000001"
+    const sha256 = createHash("sha256").update(bytes).digest("hex")
+    expect(bytes.byteLength).toBeGreaterThan(8 * 1024)
+    expect(bytes.byteLength).toBeLessThanOrEqual(VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT)
+    const reference = { $ref: ref, sizeBytes: bytes.byteLength, sha256 }
+    const messages: unknown[] = [
+      { role: "assistant", content: [{ type: "tool_use", id: "repair-wait-call", name: "agent.wait", input: { taskIds, mode: "all" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "repair-wait-call", content: JSON.stringify(reference) }] },
+    ]
+    const readCallIds: string[] = []
+    let cursor = 0
+    while (cursor < bytes.length) {
+      let end = Math.min(bytes.length, cursor + 2_048)
+      while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1
+      const callId = `repair-wait-read-${readCallIds.length + 1}`
+      const chunk = bytes.subarray(cursor, end).toString("utf8")
+      const nextCursor = end < bytes.length ? String(end) : null
+      readCallIds.push(callId)
+      messages.push({ role: "assistant", content: [{
+        type: "tool_use", id: callId, name: "tool_results.read",
+        input: { referenceId: ref, ...(cursor === 0 ? {} : { cursor: String(cursor) }) },
+      }] })
+      messages.push({ role: "tool", content: [{ type: "tool_result", toolUseId: callId, content: JSON.stringify({
+        ref, sha256, byteCount: bytes.byteLength, chunk, nextCursor,
+      }) }] })
+      cursor = end
+    }
+    expect(readCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_REFERENCE_READS)
+    const request = { messages } as unknown as HarnessModelRequest
+    const resolution = repairWaitOutputResolutionFromRequest(request, "repair-wait-call", readCallIds)
+    expect(resolution).toMatchObject({
+      status: "complete", reference: { id: ref, sizeBytes: bytes.byteLength, sha256 }, readCount: readCallIds.length,
+    })
+    if (resolution.status !== "complete") throw new Error("synthetic wait reference was not completely read")
+    expect(resolution.output).toEqual(output)
+    expect(repairWaitOutcomeFromRequest(request, "repair-wait-call", taskIds, resolution.output)).toEqual(output)
+  })
+
+  it("rejects malformed references and foreign, replayed, or digest-mismatched reads", () => {
+    const output = { waitId: "wait-ready-reference-2", status: "ready", taskIds, targetTaskIds: taskIds, matchedTaskIds: taskIds, tasks: taskIds.map(taskId => ({ taskId, status: "completed", result: { truncated: true, summary: "Archived fixture evidence ".repeat(75) } })) }
+    const encoded = JSON.stringify(output)
+    const bytes = Buffer.from(encoded, "utf8")
+    const ref = "tool-result-00000000-0000-4000-8000-000000000002"
+    const sha256 = createHash("sha256").update(bytes).digest("hex")
+    const reference = { $ref: ref, sizeBytes: bytes.byteLength, sha256 }
+    expect(bytes.byteLength).toBeGreaterThan(8 * 1024)
+    expect(bytes.byteLength).toBeLessThanOrEqual(VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT)
+    const firstChunk = bytes.subarray(0, 32).toString("utf8")
+    const firstResult = { ref, sha256, byteCount: bytes.byteLength, chunk: firstChunk, nextCursor: "32" }
+    const requestFor = (readInput: RecordValue, readResult: unknown, referenceValue: unknown = reference) => ({
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "wait-call", name: "agent.wait", input: { taskIds, mode: "all" } }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "wait-call", content: JSON.stringify(referenceValue) }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "read-call", name: "tool_results.read", input: readInput }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "read-call", content: JSON.stringify(readResult) }] },
+      ],
+    } as unknown as HarnessModelRequest)
+    expect(() => repairWaitOutputResolutionFromRequest(requestFor(
+      { referenceId: ref }, firstResult, { ...reference, sizeBytes: VERIFICATION_REPAIR_WAIT_OUTPUT_BYTE_LIMIT + 1 },
+    ), "wait-call", ["read-call"])).toThrow("repair_wait_reference_invalid")
+    expect(() => repairWaitOutputResolutionFromRequest(
+      requestFor({ referenceId: "tool-result-00000000-0000-4000-8000-000000000099" }, firstResult), "wait-call", ["read-call"],
+    )).toThrow("repair_wait_reference_read_identity")
+    expect(() => repairWaitOutputResolutionFromRequest(
+      requestFor({ referenceId: ref }, { ...firstResult, ref: "tool-result-00000000-0000-4000-8000-000000000099" }), "wait-call", ["read-call"],
+    )).toThrow("repair_wait_reference_chunk_invalid")
+    const replayedCursorRequest = {
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "wait-call", name: "agent.wait", input: { taskIds, mode: "all" } }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "wait-call", content: JSON.stringify(reference) }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "read-1", name: "tool_results.read", input: { referenceId: ref } }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "read-1", content: JSON.stringify(firstResult) }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "read-2", name: "tool_results.read", input: { referenceId: ref, cursor: "0" } }] },
+      ],
+    } as unknown as HarnessModelRequest
+    expect(() => repairWaitOutputResolutionFromRequest(replayedCursorRequest, "wait-call", ["read-1", "read-2"]))
+      .toThrow("repair_wait_reference_read_identity")
+    const digestMismatch = requestFor({ referenceId: ref }, { ...firstResult, sha256: "0".repeat(64) })
+    expect(() => repairWaitOutputResolutionFromRequest(digestMismatch, "wait-call", ["read-call"]))
+      .toThrow("repair_wait_reference_chunk_invalid")
   })
 })
 
@@ -10680,6 +10889,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let repairWaitSent = false
     const repairWaitCallIds: string[] = []
     const repairWaitStatuses: string[] = []
+    const repairWaitReadCallIds: string[] = []
+    const repairWaitReadCallIdsByWaitCall = new Map<string, string[]>()
+    let repairWaitReferenceObserved = false
     let secondJobSeeded = false
     let initialPlanTaskIds: string[] | undefined
     let terminalGateLease: TurnLease | undefined
@@ -10737,11 +10949,34 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (previousRepairWaitCallId && !hardExecutorFailure) {
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               const dependentTaskIds = initialPlanTaskIds?.slice(1) ?? []
-              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== 6 || dependentTaskIds.some(id => !id)) {
+              const expectedDependentCount = hardExecutorFailure ? 1 : 6
+              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== expectedDependentCount || dependentTaskIds.some(id => !id)) {
                 throw new Error("repair fixture lost accepted wait targets")
               }
+              const readCallIds = repairWaitReadCallIdsByWaitCall.get(previousRepairWaitCallId) ?? []
+              const resolution = repairWaitOutputResolutionFromRequest(request, previousRepairWaitCallId, readCallIds)
+              if (resolution.status === "read") {
+                repairWaitReferenceObserved = true
+                if (!Array.isArray(request.tools) || !request.tools.some(tool => record(tool)?.name === "tool_results.read")) {
+                  throw new Error("repair wait reference reader was not visible to the model")
+                }
+                if (repairWaitReadCallIds.length >= VERIFICATION_REPAIR_MAX_REFERENCE_READS) {
+                  throw new Error("repair wait reference exceeded its bounded read budget")
+                }
+                const readCallId = `${previousRepairWaitCallId}:read:${readCallIds.length + 1}`
+                readCallIds.push(readCallId)
+                repairWaitReadCallIdsByWaitCall.set(previousRepairWaitCallId, readCallIds)
+                repairWaitReadCallIds.push(readCallId)
+                yield { type: "tool_call_completed", callId: readCallId, name: "tool_results.read", arguments: {
+                  referenceId: resolution.reference.id,
+                  ...(resolution.cursor === undefined ? {} : { cursor: resolution.cursor }),
+                } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (resolution.status === "complete") repairWaitReferenceObserved = true
               previousRepairWait = repairWaitOutcomeFromRequest(
-                request, previousRepairWaitCallId, [...repairTaskIds, ...dependentTaskIds],
+                request, previousRepairWaitCallId, [...repairTaskIds, ...dependentTaskIds], resolution.output,
               )
               repairWaitStatuses.push(String(previousRepairWait.status))
             }
@@ -10754,7 +10989,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               repairWaitSent = true
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               const dependentTaskIds = initialPlanTaskIds?.slice(1) ?? []
-              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== 6 || dependentTaskIds.some(id => !id)) {
+              const expectedDependentCount = hardExecutorFailure ? 1 : 6
+              if (repairTaskIds.length !== 1 || dependentTaskIds.length !== expectedDependentCount || dependentTaskIds.some(id => !id)) {
                 throw new Error("repair fixture lost accepted wait targets")
               }
               if (!hardExecutorFailure) {
@@ -11071,6 +11307,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(repairWaitStatuses.at(-1)).toBe("ready")
       expect(repairWaitStatuses.every(status => status === "ready" || status === "timed_out")).toBe(true)
       expect(repairWaitCallIds.length).toBe(repairWaitStatuses.filter(status => status === "timed_out").length + 1)
+      expect(repairWaitReadCallIds.length).toBeLessThanOrEqual(VERIFICATION_REPAIR_MAX_REFERENCE_READS)
+      expect(repairWaitReferenceObserved).toBe(repairWaitReadCallIds.length > 0)
     }
     expect(secondJobSeeded).toBe(true)
     const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(`SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
