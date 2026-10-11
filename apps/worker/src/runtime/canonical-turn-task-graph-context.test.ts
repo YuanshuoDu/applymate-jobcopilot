@@ -297,26 +297,17 @@ describe("TaskGraph turn observation", () => {
 
   it("rejects an oversized base observation even when fresh planning facts are supplied", () => {
     const keys = Array.from({ length: 16 }, (_, index) => "k".repeat(120) + String(index).padStart(8, "0"))
-    const criterionIds = Array.from({ length: 8 }, (_, index) => "c".repeat(62) + String(index).padStart(2, "0"))
-    const graphRootTaskId = "r".repeat(128)
     const nodes = keys.map((key, index) => ({
       key,
       templateId: "m".repeat(128),
-      goal: "g".repeat(1_200),
-      successCriteria: Array.from({ length: 8 }, () => "c".repeat(320)),
-      dependsOn: keys,
+      goal: "\"".repeat(1_200),
+      successCriteria: Array.from({ length: 8 }, () => "\"".repeat(320)),
+      dependsOn: keys.slice(Math.max(0, index - 8), index),
       taskId: "t".repeat(120) + String(index).padStart(8, "0"),
       status: "completed" as const,
       readiness: "terminal" as const,
-      verificationCriterionIds: criterionIds,
-      repairOf: {
-        graphRootTaskId,
-        nodeKey: "n".repeat(120) + String(index).padStart(8, "0"),
-        taskId: "s".repeat(120) + String(index).padStart(8, "0"),
-        criterionIds,
-      },
       native: {
-        operationKind: "followup" as const,
+        operationKind: "spawn" as const,
         operationId: "o".repeat(256),
         requestFingerprint: "a".repeat(64),
         callerTaskId: "p".repeat(128),
@@ -336,13 +327,6 @@ describe("TaskGraph turn observation", () => {
           graphNodeKey: "g".repeat(128),
           origin: "task_graph" as const,
         },
-      },
-      nativeResult: {
-        schemaVersion: "agent-harness.v2.task-graph.native-result.v1" as const,
-        role: "r".repeat(64),
-        taskStatus: "completed" as const,
-        disposition: "structured" as const,
-        resultDigest: "d".repeat(64),
       },
     }))
     const baseState = { revision: 3, nodes } as unknown as TaskGraphCurrentState
