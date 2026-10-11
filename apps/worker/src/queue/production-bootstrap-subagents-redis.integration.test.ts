@@ -6,13 +6,14 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { parseSubagentJobPayload, type SubagentPolicy, type SubagentStore, type SubagentTaskRecord, type SubagentTaskSpec, type SubagentLease, type SubagentJobPayload } from "../runtime/subagents/types.js"
-import { parseSubagentDispatchIdentity } from "../runtime/subagents/dispatch-identity.js"
+import { parseSubagentDispatchIdentity, subagentDispatchJobId } from "../runtime/subagents/dispatch-identity.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runtime/subagents/tree-budget-types.js"
 import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
 import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import { lockAndAdmitSubagentDispatch, PAUSE_DEFERRED_MARKER, repairDeferredSubagentDispatches } from "./subagent-pause-dispatch.js"
+import { lockAndAdmitSubagentDispatch, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches } from "./subagent-pause-dispatch.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
+import { recoverMissingPublishedSubagentDispatches } from "./subagent-published-dispatch-recovery.js"
 import { reconcileDurableWaits } from "../runtime/subagents/durable-wait-resolver.js"
 
 const RUN_REDIS_INTEGRATION = process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1"
@@ -163,6 +164,8 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
   }
   const outbox: FixtureOutbox[] = []
   const events: Array<Record<string, unknown>> = []
+  const transactionBoundaries: string[] = []
+  let transactionOpen = false
   const terminalTaskStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
   const terminalTurnStatuses = new Set(["completed", "failed", "interrupted", "cancelled"])
   const missingDispatchTasks = (sessionIds: readonly string[] = [session.id]) => [...input.tasks.values()].filter(task => {
@@ -179,9 +182,38 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
   const client = {
     async query(sql: string, values: unknown[] = []) {
       const none = { rows: [] as Array<Record<string, unknown>>, rowCount: 0 }
-      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql === "BEGIN") { transactionOpen = true; transactionBoundaries.push(sql); return { rows: [], rowCount: 1 } }
+      if (sql === "COMMIT" || sql === "ROLLBACK") { transactionOpen = false; transactionBoundaries.push(sql); return { rows: [], rowCount: 1 } }
+      if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
+
+      if (sql.includes('SELECT dispatch."id" AS "dispatchId"') && sql.includes('dispatch."publishedAt" <= CURRENT_TIMESTAMP')) {
+        const rows = outbox.flatMap(row => {
+          const taskId = row.idempotencyKey.replace(/^subagent-dispatch:/, "")
+          const task = input.tasks.get(taskId), root = task ? input.tasks.get(task.rootTaskId) : undefined
+          const publishedAt = row.publishedAt
+          if (row.topic !== values[0] || !task || !root || !publishedAt || publishedAt.getTime() > Date.now() - 30_000
+            || row.attemptCount < 1 || task.status !== "queued" || task.attemptCount !== 0
+            || task.sessionId !== session.id || task.turnId !== turn.id || task.rootTaskId !== input.rootTaskId
+            || turn.rootTaskId !== task.rootTaskId || root.status !== "running" || turn.status === "completed" || session.status !== "running") return []
+          return [{
+            dispatchId: row.id, topic: row.topic, aggregateId: row.aggregateId, idempotencyKey: row.idempotencyKey,
+            payload: row.payload, attemptCount: row.attemptCount, publishedAt, publishedAtText: publishedAt.toISOString(),
+            taskId: task.id, sessionId: task.sessionId, turnId: task.turnId, rootTaskId: task.rootTaskId,
+            taskStatus: task.status, taskAttemptCount: task.attemptCount, taskMaxAttempts: task.maxAttempts,
+            taskStartedAt: Reflect.get(task, "startedAt") ?? null, taskLeaseOwner: task.leaseOwner,
+            taskLeaseExpiresAt: task.leaseExpiresAt, taskInterruptRequestedAt: task.interruptRequestedAt,
+            taskNextAttemptAt: task.nextAttemptAt, userId: session.userId, sessionStatus: session.status,
+            turnStatus: turn.status, turnRootTaskId: turn.rootTaskId,
+            rootStatus: root.status, rootInterruptRequestedAt: root.interruptRequestedAt,
+          }]
+        })
+        return { rows: rows.slice(0, Number(values[3])), rowCount: rows.length }
+      }
 
       if (sql.includes('SELECT session."id", session."status", session."userId"')) {
+        return values[0] === session.id ? { rows: [{ ...session }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT session."id", session."userId", session."status"') && sql.includes("FOR UPDATE")) {
         return values[0] === session.id ? { rows: [{ ...session }], rowCount: 1 } : none
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session') && sql.includes("NOT EXISTS")) {
@@ -189,6 +221,18 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         return admitted ? { rows: [{ id: session.id }], rowCount: 1 } : none
       }
       if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes('"status" NOT IN') && sql.includes("FOR UPDATE")) {
+        const terminal = ["completed", "failed", "interrupted", "cancelled", "closed"].includes(turn.status)
+        return values[0] === turn.id && values[1] === turn.sessionId && values[2] === turn.userId && !terminal
+          ? { rows: [{ id: turn.id }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT turn."id", turn."status", turn."rootTaskId"')
+        && sql.includes('FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE")) {
+        const terminal = ["completed", "failed", "interrupted", "cancelled", "closed"].includes(turn.status)
+        return values[0] === turn.id && values[1] === turn.sessionId && values[2] === turn.userId
+          && values[4] === turn.rootTaskId && !terminal
+          ? { rows: [{ id: turn.id, status: turn.status, rootTaskId: turn.rootTaskId }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT turn."id" FROM "agent_turns"') && sql.includes("FOR UPDATE")) {
         const terminal = ["completed", "failed", "interrupted", "cancelled", "closed"].includes(turn.status)
         return values[0] === turn.id && values[1] === turn.sessionId && values[2] === turn.userId && !terminal
           ? { rows: [{ id: turn.id }], rowCount: 1 } : none
@@ -256,6 +300,32 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         const root = input.tasks.get(String(values[0]))
         return root && root.sessionId === values[1] && root.turnId === values[2]
           ? { rows: [{ id: root.id, status: root.status, interruptRequestedAt: root.interruptRequestedAt }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."status"')
+        && sql.includes('task."rootTaskId" = $4 FOR UPDATE')) {
+        const task = input.tasks.get(String(values[0]))
+        return task && task.sessionId === values[1] && task.turnId === values[2] && task.rootTaskId === values[3]
+          ? { rows: [{ id: task.id, sessionId: task.sessionId, turnId: task.turnId, rootTaskId: task.rootTaskId,
+            status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts,
+            startedAt: Reflect.get(task, "startedAt") ?? null, leaseOwner: task.leaseOwner, leaseExpiresAt: task.leaseExpiresAt,
+            interruptRequestedAt: task.interruptRequestedAt, nextAttemptAt: task.nextAttemptAt }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT dispatch."id", dispatch."topic", dispatch."aggregateId", dispatch."idempotencyKey"')
+        && sql.includes("FOR UPDATE")) {
+        const row = outbox.find(candidate => candidate.id === values[0] && candidate.aggregateId === values[1]
+          && candidate.topic === values[2] && candidate.idempotencyKey === values[3])
+        return row ? { rows: [{ id: row.id, topic: row.topic, aggregateId: row.aggregateId,
+          idempotencyKey: row.idempotencyKey, payload: row.payload, attemptCount: row.attemptCount,
+          publishedAtText: row.publishedAt?.toISOString() ?? null }], rowCount: 1 } : none
+      }
+      if (sql.includes('UPDATE "agent_outbox" AS dispatch SET "publishedAt" = NULL')) {
+        const row = outbox.find(candidate => candidate.id === values[0] && candidate.topic === values[1]
+          && candidate.aggregateId === values[2] && candidate.idempotencyKey === values[3]
+          && candidate.attemptCount === values[4] && candidate.publishedAt?.toISOString() === values[5]
+          && JSON.stringify(candidate.payload) === String(values[6]))
+        if (!row) return none
+        row.publishedAt = null
+        return { rows: [], rowCount: 1 }
       }
       if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", task."status", task."startedAt"')
         && sql.includes('task."rootTaskId" = $4 FOR UPDATE')) {
@@ -368,6 +438,7 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
     release() {},
   }
   return { pool: { async connect() { return client } }, turn, session, wait, outbox, events,
+    transactionOpen: () => transactionOpen, transactionBoundaries,
     setPauseRequested(value: boolean) { if (value) pauseSequence = turn.eventSequence + 1; else resumeSequence = turn.eventSequence + 2 } }
 }
 
@@ -422,6 +493,47 @@ describe("child queue SQL fixture", () => {
     await expect(repairMissingSubagentDispatches(fixture.pool as never, "missing-recovery-owner")).resolves.toBe(0)
     expect(fixture.outbox).toHaveLength(1)
     vi.resetModules()
+  })
+
+  it("clears a definitively missing publication with the recovery SQL fixture", async () => {
+    const ids = { sessionId: "published-recovery-session", turnId: "published-recovery-turn", userId: "published-recovery-user" }
+    const { store, tasks } = createTaskStore()
+    const root = await store.create({ ...ids, role: "planner", taskType: "root", goal: "fixture root", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    root.status = "running"
+    const child = await store.create({ ...ids, parentTaskId: root.id, role: "analyst", taskType: "research", goal: "fixture child", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 2 } })
+    const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: child.id, ...ids })
+    const payload: SubagentJobPayload = { taskId: child.id, sessionId: ids.sessionId, rootTaskId: root.id, ownerId: "published-recovery-owner" }
+    await persistSubagentDispatch(fixture.pool as never, payload)
+    const row = fixture.outbox[0]!
+    row.publishedAt = new Date(Date.now() - 31_000)
+    row.attemptCount = 1
+
+    const wrongRootProbe = vi.fn(async () => null)
+    fixture.turn.rootTaskId = "foreign-root"
+    await expect(recoverMissingPublishedSubagentDispatches(fixture.pool as never, { getJob: wrongRootProbe })).resolves.toBe(0)
+    expect(wrongRootProbe).not.toHaveBeenCalled()
+    expect(row).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1, payload })
+    fixture.turn.rootTaskId = root.id
+
+    const changedRootProbe = vi.fn(async () => {
+      fixture.turn.rootTaskId = "foreign-root"
+      return null
+    })
+    await expect(recoverMissingPublishedSubagentDispatches(fixture.pool as never, { getJob: changedRootProbe })).resolves.toBe(0)
+    expect(changedRootProbe).toHaveBeenCalledTimes(1)
+    expect(fixture.transactionOpen()).toBe(false)
+    expect(row).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1, payload })
+    fixture.turn.rootTaskId = root.id
+
+    const getJob = vi.fn(async (jobId: string) => {
+      expect(jobId).toBe(subagentDispatchJobId(child.id, 0))
+      expect(fixture.transactionOpen()).toBe(false)
+      return null
+    })
+    await expect(recoverMissingPublishedSubagentDispatches(fixture.pool as never, { getJob })).resolves.toBe(1)
+    expect(getJob).toHaveBeenCalledTimes(1)
+    expect(row).toMatchObject({ publishedAt: null, attemptCount: 1, payload })
+    expect(child).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null, leaseExpiresAt: null })
   })
 
   it("returns a task turn only for the matching session", async () => {
@@ -644,6 +756,72 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
     if (probeRedis && probeRedis.status !== "end") await probeRedis.quit().catch(() => probeRedis?.disconnect())
     vi.doUnmock("../redis.js")
   })
+
+  it("re-publishes only a definitively missing stale Bull generation", async () => {
+    const ids = { sessionId: `missing-job-session-${randomUUID()}`, turnId: `missing-job-turn-${randomUUID()}`, userId: `missing-job-user-${randomUUID()}` }
+    const { dispatchPendingSubagentOutbox, persistSubagentDispatch, subagentJobId } = await import("./subagent-queue.js")
+    const { store, tasks, bindOutbox } = createTaskStore()
+    const policy = { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 2 }
+    const root = await store.create({ ...ids, role: "planner", taskType: "root", goal: "missing dispatch fixture", policy })
+    root.status = "running"
+    const child = await store.create({ ...ids, parentTaskId: root.id, role: "scout", taskType: "research", goal: "recover one lost publication", policy })
+    const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: child.id, ...ids })
+    bindOutbox(fixture.outbox)
+    const payload: SubagentJobPayload = { taskId: child.id, sessionId: ids.sessionId, rootTaskId: root.id, ownerId: "redis-recovery-owner" }
+    const firstId = subagentJobId(child.id, 0)
+    const nextId = subagentJobId(child.id, 1)
+    try {
+      await persistSubagentDispatch(fixture.pool as never, payload)
+      await expect(dispatchPendingSubagentOutbox(fixture.pool as never, dispatchQueue!)).resolves.toBe(1)
+      const original = await observerQueue!.getJob(firstId)
+      expect(original).toBeDefined()
+      expect(original?.data).toEqual(payload)
+      expect(original?.attemptsMade).toBe(0)
+      fixture.outbox[0]!.publishedAt = new Date(Date.now() - 31_000)
+      const publishedAt = fixture.outbox[0]!.publishedAt
+      const attemptCount = fixture.outbox[0]!.attemptCount
+
+      await expect(recoverMissingPublishedSubagentDispatches(fixture.pool as never, {})).resolves.toBe(0)
+      await expect(recoverMissingPublishedSubagentDispatches(fixture.pool as never, {
+        getJob: async () => { throw new Error("Redis probe unavailable") },
+      })).resolves.toBe(0)
+      await expect(recoverMissingPublishedSubagentDispatches(fixture.pool as never, dispatchQueue!)).resolves.toBe(0)
+      expect(fixture.outbox[0]).toMatchObject({ publishedAt, attemptCount, payload })
+
+      await original!.remove()
+      await expect(observerQueue!.getJob(firstId)).resolves.toBeUndefined()
+      const lookedUp: string[] = []
+      await expect(recoverMissingPublishedSubagentDispatches(fixture.pool as never, {
+        getJob: async jobId => {
+          lookedUp.push(jobId)
+          expect(fixture.transactionOpen()).toBe(false)
+          expect(fixture.transactionBoundaries.at(-1)).toBe("COMMIT")
+          return observerQueue!.getJob(jobId)
+        },
+      })).resolves.toBe(1)
+      expect(lookedUp).toEqual([firstId])
+      expect(fixture.transactionOpen()).toBe(false)
+      expect(fixture.transactionBoundaries.slice(-2)).toEqual(["BEGIN", "COMMIT"])
+      expect(fixture.outbox[0]).toMatchObject({ publishedAt: null, attemptCount, payload })
+      expect(child).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null, leaseExpiresAt: null })
+      expect(root.status).toBe("running")
+
+      await expect(dispatchPendingSubagentOutbox(fixture.pool as never, dispatchQueue!)).resolves.toBe(1)
+      const next = await observerQueue!.getJob(nextId)
+      expect(next).toBeDefined()
+      expect(next?.data).toEqual(payload)
+      expect(next?.attemptsMade).toBe(0)
+      expect(await observerQueue!.getJob(firstId)).toBeUndefined()
+      const scopedJobs = (await observerQueue!.getJobs(["waiting", "active", "delayed", "completed", "failed"], 0, 100))
+        .filter(job => job.data.sessionId === ids.sessionId)
+      expect(scopedJobs.map(job => job.id)).toEqual([nextId])
+      expect(fixture.outbox[0]).toMatchObject({ publishedAt: expect.any(Date), attemptCount: attemptCount + 1, payload })
+      expect(child).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null, leaseExpiresAt: null })
+    } finally {
+      const remaining = await Promise.all([observerQueue!.getJob(firstId), observerQueue!.getJob(nextId)])
+      await Promise.all(remaining.filter((job): job is Job<SubagentJobPayload> => Boolean(job)).map(job => job.remove().catch(() => undefined)))
+    }
+  }, 25_000)
 
   it("defers a saturated same-session job without an attempt, then skips a cancelled redelivery", async () => {
     const ids = { sessionId: "capacity-session-" + randomUUID(), turnId: "capacity-turn-" + randomUUID(), userId: "capacity-user-" + randomUUID() }
