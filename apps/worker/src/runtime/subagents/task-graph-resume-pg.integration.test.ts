@@ -3509,13 +3509,15 @@ function parseFixtureQueueJobIdentity(value: unknown): FixtureQueueJobIdentity |
 }
 
 function fixtureJobPayloadMatches(identity: FixtureQueueJobIdentity, value: unknown): boolean {
+  // Historical IDs are already bounded by the owned outbox generation; bind their parsed owner only to that exact key.
   if (identity.kind === "turn") {
     const payload = parseTurnJobPayload(value)
-    return payload?.turnId === identity.turnId && payload.sessionId === identity.sessionId && payload.ownerId === identity.ownerId
+    return payload?.turnId === identity.turnId && payload.sessionId === identity.sessionId
+      && (!identity.currentGeneration || payload.ownerId === identity.ownerId)
   }
   const payload = parseSubagentJobPayload(value)
   return payload?.taskId === identity.taskId && payload.sessionId === identity.sessionId
-    && payload.rootTaskId === identity.rootTaskId && payload.ownerId === identity.ownerId
+    && payload.rootTaskId === identity.rootTaskId && (!identity.currentGeneration || payload.ownerId === identity.ownerId)
 }
 
 async function removeExactFixtureQueueJob(
@@ -3591,6 +3593,14 @@ function fixtureDispatchGenerations(attemptValue: unknown, publishedAt: Date | s
   return Array.from({ length: generationCount }, (_, generation) => ({ generation, currentGeneration: generation === current }))
 }
 
+function fixtureTurnDispatchPayloadForOwner(
+  value: unknown,
+  owner: Pick<Fixture, "sessionId" | "turnId">,
+): ReturnType<typeof parseTurnJobPayload> {
+  const payload = parseTurnJobPayload(value)
+  return payload?.turnId === owner.turnId && payload.sessionId === owner.sessionId ? payload : null
+}
+
 async function readExactFixtureQueueJobs(
   pool: Pool,
   owners: readonly Fixture[],
@@ -3613,8 +3623,8 @@ async function readExactFixtureQueueJobs(
     if (turnDispatches.rows.length > 1) throw new Error("Fixture Turn has ambiguous dispatch rows")
     const turnDispatch = turnDispatches.rows[0]
     if (turnDispatch) {
-      const payload = parseTurnJobPayload(turnDispatch.payload)
-      if (!payload || payload.turnId !== owner.turnId || payload.sessionId !== owner.sessionId || payload.ownerId !== owner.ownerId) {
+      const payload = fixtureTurnDispatchPayloadForOwner(turnDispatch.payload, owner)
+      if (!payload) {
         throw new Error("Fixture Turn dispatch does not match its owner row")
       }
       for (const { generation, currentGeneration } of fixtureDispatchGenerations(turnDispatch.attemptCount, turnDispatch.publishedAt)) {
@@ -6757,6 +6767,121 @@ describe("TaskGraph exact fixture queue cleanup", () => {
     })).rejects.toThrow("Fixture queue job identity is unrecognized")
     expect(redisConnection.del).not.toHaveBeenCalled()
     expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("cleans exact Turn jobs using the persisted resume or wakeup dispatch owner", async () => {
+    const resumedPayload = fixtureTurnDispatchPayloadForOwner({ ...payload, ownerId: "resume:accepted-steer-event" }, identity)
+    const wakeupPayload = fixtureTurnDispatchPayloadForOwner({ ...payload, ownerId: "wakeup:recovery-event" }, identity)
+    expect(resumedPayload).toEqual({ ...payload, ownerId: "resume:accepted-steer-event" })
+    expect(wakeupPayload).toEqual({ ...payload, ownerId: "wakeup:recovery-event" })
+
+    const job: FixtureCleanupJob = {
+      id: identity.jobId, name: "turn", data: resumedPayload,
+      getState: vi.fn(async () => "waiting"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis: redisConnection } = queueFixture(job)
+    await expect(removeExactFixtureQueueJob({ ...identity, ownerId: resumedPayload!.ownerId }, queue, redisConnection, {
+      allWorkersExited: true, exactSigkillOwner: false,
+    })).resolves.toBe("removed")
+    expect(queue.getJob).toHaveBeenCalledWith(identity.jobId)
+    expect(job.remove).toHaveBeenCalledTimes(1)
+    expect(redisConnection.del).not.toHaveBeenCalled()
+  })
+
+  it("binds prior owners only to already-derived historical Turn generations", async () => {
+    const historical = { ...identity, ownerId: "current-resume-owner", currentGeneration: false }
+    const priorOwnerJob: FixtureCleanupJob = {
+      id: historical.jobId, name: "turn", data: { ...payload, ownerId: "initial-owner" },
+      getState: vi.fn(async () => "waiting"), remove: vi.fn(async () => undefined),
+    }
+    const historicalFixture = queueFixture(priorOwnerJob)
+    await expect(removeExactFixtureQueueJob(historical, historicalFixture.queue, historicalFixture.redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+    })).resolves.toBe("removed")
+    expect(priorOwnerJob.remove).toHaveBeenCalledTimes(1)
+    expect(historicalFixture.redis.del).not.toHaveBeenCalled()
+
+    const current = { ...historical, currentGeneration: true }
+    const driftedCurrentJob: FixtureCleanupJob = {
+      id: current.jobId, name: "turn", data: { ...payload, ownerId: "initial-owner" },
+      getState: vi.fn(async () => "waiting"), remove: vi.fn(async () => undefined),
+    }
+    const currentFixture = queueFixture(driftedCurrentJob)
+    await expect(removeExactFixtureQueueJob(current, currentFixture.queue, currentFixture.redis, {
+      allWorkersExited: true, exactSigkillOwner: false,
+    })).rejects.toThrow("Fixture queue job does not match its owner-fenced identity")
+    expect(driftedCurrentJob.remove).not.toHaveBeenCalled()
+    expect(currentFixture.redis.del).not.toHaveBeenCalled()
+  })
+
+  it("does not infer active-lock permission from a historical Turn owner", async () => {
+    const historical = { ...identity, ownerId: "current-resume-owner", currentGeneration: false }
+    const job: FixtureCleanupJob = {
+      id: historical.jobId, name: "turn", data: { ...payload, ownerId: "initial-owner" },
+      getState: vi.fn(async () => "active"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis: redisConnection } = queueFixture(job)
+    await expect(removeExactFixtureQueueJob(historical, queue, redisConnection, {
+      allWorkersExited: true, exactSigkillOwner: false,
+    })).rejects.toThrow("Active fixture job has no exact exited SIGKILL owner proof")
+    expect(redisConnection.del).not.toHaveBeenCalled()
+    expect(job.remove).not.toHaveBeenCalled()
+  })
+
+  it("allows historical child owner drift only with exact task and root bindings", async () => {
+    const historical: FixtureQueueJobIdentity = {
+      queueName: "fixture-subagent-queue", kind: "subagent", jobId: subagentDispatchJobId("cleanup-task", 2),
+      sessionId: identity.sessionId, turnId: identity.turnId, taskId: "cleanup-task", rootTaskId: "cleanup-root",
+      ownerId: "current-child-owner", generation: 2, currentGeneration: false,
+    }
+    const job: FixtureCleanupJob = {
+      id: historical.jobId, name: "subagent",
+      data: { taskId: historical.taskId, sessionId: historical.sessionId, rootTaskId: historical.rootTaskId, ownerId: "prior-child-owner" },
+      getState: vi.fn(async () => "waiting"), remove: vi.fn(async () => undefined),
+    }
+    const queue: FixtureCleanupQueue = {
+      name: historical.queueName,
+      toKey: jobId => `bull:${historical.queueName}:${jobId}`,
+      getJob: vi.fn(async jobId => jobId === historical.jobId ? job : undefined),
+    }
+    const redisConnection = { del: vi.fn(async () => 1) }
+    await expect(removeExactFixtureQueueJob(historical, queue, redisConnection, {
+      allWorkersExited: true, exactSigkillOwner: false,
+    })).resolves.toBe("removed")
+    expect(job.remove).toHaveBeenCalledTimes(1)
+
+    const foreignRootJob: FixtureCleanupJob = {
+      ...job, data: { taskId: historical.taskId, sessionId: historical.sessionId, rootTaskId: "foreign-root", ownerId: "prior-child-owner" },
+      remove: vi.fn(async () => undefined),
+    }
+    const foreignRootQueue: FixtureCleanupQueue = {
+      ...queue, getJob: vi.fn(async jobId => jobId === historical.jobId ? foreignRootJob : undefined),
+    }
+    await expect(removeExactFixtureQueueJob(historical, foreignRootQueue, redisConnection, {
+      allWorkersExited: true, exactSigkillOwner: false,
+    })).rejects.toThrow("Fixture queue job does not match its owner-fenced identity")
+    expect(foreignRootJob.remove).not.toHaveBeenCalled()
+    expect(redisConnection.del).not.toHaveBeenCalled()
+  })
+
+  it("rejects malformed owner data on historical jobs instead of treating it as a match", async () => {
+    const historical = { ...identity, currentGeneration: false }
+    const job: FixtureCleanupJob = {
+      id: historical.jobId, name: "turn", data: { ...payload, ownerId: " " },
+      getState: vi.fn(async () => "waiting"), remove: vi.fn(async () => undefined),
+    }
+    const { queue, redis: redisConnection } = queueFixture(job)
+    await expect(removeExactFixtureQueueJob(historical, queue, redisConnection, {
+      allWorkersExited: true, exactSigkillOwner: false,
+    })).rejects.toThrow("Fixture queue job does not match its owner-fenced identity")
+    expect(job.remove).not.toHaveBeenCalled()
+    expect(redisConnection.del).not.toHaveBeenCalled()
+  })
+
+  it("rejects malformed or cross-Turn dispatch payloads when deriving cleanup ownership", () => {
+    expect(fixtureTurnDispatchPayloadForOwner({ ...payload, sessionId: "foreign-session" }, identity)).toBeNull()
+    expect(fixtureTurnDispatchPayloadForOwner({ ...payload, turnId: "foreign-turn" }, identity)).toBeNull()
+    expect(fixtureTurnDispatchPayloadForOwner({ ...payload, unexpected: true }, identity)).toBeNull()
   })
 
   it("refuses a job ID that does not encode the exact derived generation", async () => {

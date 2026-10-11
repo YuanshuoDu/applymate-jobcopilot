@@ -33,8 +33,12 @@ const NATIVE_FIXED = new Set([
 const GENERIC_NATIVE_REPAIR = "Revise the candidate or obtain new current owned evidence before retrying."
 const MAX_FEEDBACK = 512
 const MAX_ENVELOPE = 2_048
-type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
-type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
+export type TaskGraphRecoveryIssue = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
+export type TaskGraphRecoveryRepairState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
+export type TaskGraphRecoveryDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: TaskGraphRecoveryRepairState }>
+export type TaskGraphRecoverySummary = Readonly<{ issue?: TaskGraphRecoveryIssue; details: readonly TaskGraphRecoveryDetail[]; omitted: boolean }>
+type GateFeedbackCode = TaskGraphRecoveryIssue
+type RepairFeedbackState = TaskGraphRecoveryRepairState
 const GATE_FEEDBACK_CODES = { legacy_unverified: true, verification_report: true, repair_receipt: true, repair_criterion: true } satisfies Record<GateFeedbackCode, true>
 const TASK_GRAPH_REASON_CODES = {
   criteria_met: true, criterion_not_met: true, reported_score_below_minimum: true, contract_invalid: true,
@@ -46,8 +50,8 @@ const REPAIR_FEEDBACK_STATES = {
   missing: true, pending: true, terminal: true, unavailable: true, missing_receipt: true, rejected: true,
   invalid_receipt: true, invalid_report: true,
 } satisfies Record<RepairFeedbackState, true>
-const TASK_GRAPH_DETAIL = new RegExp(`^ nodeOrdinal=([1-9][0-9]*)(?: criterionOrdinal=([1-9][0-9]*))? status=(?:failed|unverified) reasonCode=(?:${Object.keys(TASK_GRAPH_REASON_CODES).join("|")})(?: repair=(?:${Object.keys(REPAIR_FEEDBACK_STATES).join("|")}))?(?= |$)`)
-const TASK_GRAPH_ISSUE = new RegExp(`^ issue=(?:${Object.keys(GATE_FEEDBACK_CODES).join("|")})`)
+const TASK_GRAPH_DETAIL = new RegExp(`^ nodeOrdinal=([1-9][0-9]*)(?: criterionOrdinal=([1-9][0-9]*))? status=(failed|unverified) reasonCode=(${Object.keys(TASK_GRAPH_REASON_CODES).join("|")})(?: repair=(${Object.keys(REPAIR_FEEDBACK_STATES).join("|")}))?(?= |$)`)
+const TASK_GRAPH_ISSUE = new RegExp(`^ issue=(${Object.keys(GATE_FEEDBACK_CODES).join("|")})`)
 const TASK_GRAPH_OMISSION = /^ \(([1-9][0-9]*) feedback items omitted; inspect TaskGraph before retrying\.\)$/
 const MAX_TASK_GRAPH_FEEDBACK_ITEMS = TASK_GRAPH_LIMITS.maxNodes * TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria * 2 + 1
 
@@ -170,6 +174,37 @@ function isCurrentTaskGraphRepairSeed(seed: StepContextSnapshot["system"][number
   if (!seed.content.startsWith(prefix) || !seed.content.endsWith(VERSIONED_TEXT_SUFFIX)) return false
   const feedback = seed.content.slice(prefix.length, -VERSIONED_TEXT_SUFFIX.length)
   return feedback.length <= MAX_FEEDBACK && validTaskGraphFeedback(feedback)
+}
+
+/** Exposes only the existing parser's fixed recovery vocabulary for request guidance. */
+export function currentTaskGraphRepairRecovery(seeds: StepContextSnapshot["system"], revision: number): TaskGraphRecoverySummary | undefined {
+  if (!validRevision(revision)) return undefined
+  const current = seeds.filter(seed => seed.id === `${SEED_PREFIX}${revision}`)
+  if (current.length !== 1 || !isCurrentTaskGraphRepairSeed(current[0]!, revision)) return undefined
+  const content = current[0]!.content
+  if (typeof content !== "string") return undefined
+  const prefix = `${VERSIONED_TEXT_PREFIX}${revision}: `
+  const feedback = content.slice(prefix.length, -VERSIONED_TEXT_SUFFIX.length)
+  let rest = feedback.slice(TASK_GRAPH_FEEDBACK.length)
+  const issueMatch = TASK_GRAPH_ISSUE.exec(rest)
+  const issue = issueMatch?.[1] as TaskGraphRecoveryIssue | undefined
+  if (issueMatch) rest = rest.slice(issueMatch[0].length)
+  const details: TaskGraphRecoveryDetail[] = [], seen = new Set<string>()
+  for (;;) {
+    const match = TASK_GRAPH_DETAIL.exec(rest)
+    if (!match) break
+    const nodeOrdinal = Number(match[1]), criterionOrdinal = match[2] === undefined ? undefined : Number(match[2])
+    const identity = `${nodeOrdinal}:${criterionOrdinal ?? 0}`
+    if (seen.has(identity)) return undefined
+    seen.add(identity)
+    details.push({ nodeOrdinal, ...(criterionOrdinal === undefined ? {} : { criterionOrdinal }),
+      status: match[3] as "failed" | "unverified", reasonCode: match[4] as TaskGraphVerificationReasonCode,
+      ...(match[5] === undefined ? {} : { repairState: match[5] as TaskGraphRecoveryRepairState }) })
+    rest = rest.slice(match[0].length)
+  }
+  const omission = rest ? TASK_GRAPH_OMISSION.exec(rest) : null
+  if (rest && !omission) return undefined
+  return { ...(issue ? { issue } : {}), details, omitted: omission !== null }
 }
 
 function isNativeRepairSeed(content: unknown): boolean {
