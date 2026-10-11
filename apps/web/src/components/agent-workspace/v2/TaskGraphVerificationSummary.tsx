@@ -35,6 +35,7 @@ function checkDetail(check: TaskGraphVerificationDisplayCheck, label: (key: Task
   if (check.kind === 'all_candidates_have_evidence' || check.kind === 'all_findings_have_evidence')
     return ` (${label('agent.taskGraph.verification.minimumItems')}: ${check.minimumItems})`
   if (check.kind === 'reported_score_gte') return `: ${check.minimumScore} / 10 (${label('agent.taskGraph.verification.minimumFindings')}: ${check.minimumFindings}, ${label(`agent.taskGraph.verification.aggregation.${check.aggregation}` as TaskGraphPlanLabelKey)})`
+  if (check.kind === 'findings_cover_scout_candidates_gte') return `: ${check.minimumPercent}%`
   return ''
 }
 

@@ -5,7 +5,7 @@ const taskGraphPlanLabelKeys = Object.keys(TASK_GRAPH_PLAN_LABELS.en) as TaskGra
 
 describe('TaskGraph plan labels', () => {
   it('keeps the English and Chinese label sets aligned', () => {
-    expect(taskGraphPlanLabelKeys).toHaveLength(43)
+    expect(taskGraphPlanLabelKeys).toHaveLength(44)
     expect(Object.keys(TASK_GRAPH_PLAN_LABELS.zh)).toEqual(taskGraphPlanLabelKeys)
   })
 
@@ -52,13 +52,16 @@ describe('TaskGraph plan labels', () => {
       'agent.taskGraph.verification.all_findings_have_evidence': ['All findings have evidence', '分析结果均有证据'],
       'agent.taskGraph.verification.reported_score_gte': ['Reported score threshold', '报告分数阈值'],
       'agent.taskGraph.verification.findings_from_scout_dependency': ['Analysis uses discovered jobs', '分析基于职位发现结果'],
+      'agent.taskGraph.verification.findings_cover_scout_candidates_gte': [
+        'Findings cover at least this percentage of the declared Scout cohort', '分析结果至少覆盖声明的 Scout 候选集合比例',
+      ],
       'agent.taskGraph.verification.minimumFindings': ['minimum findings', '最少分析结果'],
       'agent.taskGraph.verification.minimumItems': ['minimum items', '最少项目数'],
       'agent.taskGraph.verification.aggregation.any': ['any', '任一'],
       'agent.taskGraph.verification.aggregation.all': ['all', '全部'],
     }
 
-    expect(Object.keys(verificationLabels)).toHaveLength(20)
+    expect(Object.keys(verificationLabels)).toHaveLength(21)
     for (const [key, [english, chinese]] of Object.entries(verificationLabels)) {
       const labelKey = key as TaskGraphPlanLabelKey
       expect(taskGraphPlanLabel('en', labelKey), key).toBe(english)
