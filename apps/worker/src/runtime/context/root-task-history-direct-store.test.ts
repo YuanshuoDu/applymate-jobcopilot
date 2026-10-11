@@ -177,7 +177,8 @@ describe("direct Root-task history PostgreSQL store", () => {
     const failedOutcome = (await failed.store.load(failed.input))[0]
     expect(failedOutcome?.sourceNodeOrdinals).toEqual([1])
     expect(failedOutcome?.nodeLessons).toEqual([{ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-      nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] }])
+      nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { kind: "candidate_count_gte", role: "scout", minimum: 1 } }] }])
     expect(failedOutcome?.reportedOutputs).toBeUndefined()
 
     const reported = fixture({ reportedOutput: true })
