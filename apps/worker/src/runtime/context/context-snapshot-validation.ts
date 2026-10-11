@@ -7,6 +7,7 @@ import {
 } from "./context-snapshot-types.js"
 import { canonicalJson } from "./context-snapshot-json.js"
 import { validateSnapshotCompaction } from "./context-snapshot-working-state.js"
+import { parseSelectedJobMemories } from "./selected-job-memory.js"
 
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new ContextSnapshotError("store_conflict", "Snapshot content must be an object")
@@ -190,6 +191,12 @@ function validateContent(content: Record<string, unknown>): void {
   }
   validateContext(record(content.context))
   validateAccounting(content.tokenAccounting, "tokenAccounting")
+  if (content.compaction !== undefined) {
+    const compaction = record(content.compaction)
+    const state = compaction.state === undefined ? null : record(compaction.state)
+    if (state && Object.hasOwn(state, "selectedJobMemories")
+      && !parseSelectedJobMemories(state.selectedJobMemories)) throw new ContextSnapshotError("store_conflict", "Snapshot selected-job memory is invalid")
+  }
   validateSnapshotCompaction(content.compaction, String(content.ownerId), String(content.sessionId), String(content.throughSequence))
 }
 

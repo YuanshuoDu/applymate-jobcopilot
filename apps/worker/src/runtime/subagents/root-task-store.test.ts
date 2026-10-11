@@ -3,6 +3,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { createPgRootTaskStore } from "./root-task-store.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 3,
@@ -145,15 +146,23 @@ function graphTerminalPool(hasProposal = true) {
         return task ? [{ id, status: statuses.get(id) ?? task.status, attemptCount: 1 }] : []
       }), rowCount: requested.length }
     }
-    if (sql.includes('SELECT task."id", task."status", task."role", task."failureReason"')) {
+    if (sql.includes('SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema"')
+      && sql.includes('task."id" = ANY($1::text[])') && sql.includes('task."parentTaskId" = $5')) {
       const requested = values?.[0] as string[]
-      return { rows: requested.flatMap(id => { const task = tasks.get(id); return task ? [{ ...task, status: statuses.get(id) ?? task.status }] : [] }), rowCount: requested.length }
+      return { rows: requested.flatMap(id => {
+        const task = tasks.get(id)
+        return task ? [{ id, status: statuses.get(id) ?? task.status, role: task.role, taskType: task.taskType ?? "research",
+          expectedOutputSchema: task.expectedOutputSchema ?? {}, failureReason: task.failureReason ?? null, result: task.result ?? null }] : []
+      }), rowCount: requested.length }
     }
-    if (sql.includes('SELECT event."type", event."payload"')) {
-      return {
-        rows: [{ type: "item.delta", payload: proposal }, ...lifecycleReceipts.map(payload => ({ type: "item.delta", payload }))],
-        rowCount: lifecycleReceipts.length + 1,
-      }
+    if (sql.includes('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"')
+      && sql.includes('event."taskId" = $4')) {
+      const [sessionId, turnId, graphItemId, parentTaskId, userId] = values ?? []
+      const belongsToGraph = sessionId === "session-1" && turnId === "turn-1" && graphItemId === itemId && parentTaskId === "root-turn-1" && userId === "user-1"
+      return { rows: belongsToGraph ? [{ type: "item.delta", itemId, taskId: "root-turn-1", idempotencyKey: `${itemId}:proposal:1`, payload: proposal }] : [], rowCount: belongsToGraph ? 1 : 0 }
+    }
+    if (sql.includes('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"')) {
+      return { rows: [], rowCount: 0 }
     }
     if (sql.startsWith('UPDATE "agent_items"')) {
       revision = Number(values?.[5])
@@ -186,6 +195,47 @@ function graphTerminalPool(hasProposal = true) {
     return { rows: [], rowCount: 1 }
   }), release: vi.fn() }
   return { pool: { connect: vi.fn().mockResolvedValue(client) } as never, calls, statuses, tasks, dispatches, lifecycleReceipts, rootTask }
+}
+
+function verificationCompletionPool(nodes: readonly Record<string, unknown>[]) {
+  const content = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }
+  const rows = new Map(nodes.map(node => [String(node.taskId), {
+    id: String(node.taskId), status: "completed", role: node.nativeDelegation ? "scout" : "analyst",
+    taskType: node.nativeDelegation ? "research" : "analysis", expectedOutputSchema: {}, failureReason: null, result: null,
+  }] as const))
+  const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+    if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return { rows: [{ id: "turn-1", rootTaskId: "root-turn-1" }], rowCount: 1 }
+    if (sql.includes('SELECT task."id", task."status", task."sessionId"')) return { rows: [], rowCount: 0 }
+    if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-turn-1"), revision: 1, content, createdAt: new Date() }], rowCount: 1 }
+    if (sql.includes('task."id" = ANY($1::text[])') && sql.includes('task."parentTaskId" = $5')) {
+      const requested = values?.[0] as string[]
+      return { rows: requested.flatMap(id => rows.has(id) ? [rows.get(id)] : []), rowCount: requested.length }
+    }
+    if (sql.includes('SELECT event."type", event."itemId"')) return { rows: [], rowCount: 0 }
+    return { rows: [], rowCount: 1 }
+  }), release: vi.fn() }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) } as never, client }
+}
+
+function nativeGraphNode(taskId = "native-child") {
+  return {
+    key: "native-node", templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, goal: "Inspect delegated evidence", successCriteria: [],
+    dependsOn: [], depth: 1, taskId, verificationDisposition: "legacy_unverified",
+    nativeDelegation: {
+      schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "native-operation",
+      requestFingerprint: "a".repeat(64), callerTaskId: "root-turn-1", role: "scout", taskType: "research",
+      contextDigest: "b".repeat(64), contextBytes: 12,
+    },
+  }
+}
+
+function legacyGraphNode() {
+  return {
+    key: "legacy-node", templateId: "analyst", goal: "Inspect legacy evidence", successCriteria: ["Return one finding"],
+    dependsOn: [], depth: 1, taskId: "legacy-child", verificationDisposition: "legacy_unverified",
+  }
 }
 
 describe("createPgRootTaskStore", () => {
@@ -288,6 +338,18 @@ describe("createPgRootTaskStore", () => {
     expect(rootLock).toBeLessThan(graphRead)
     expect(fake.calls.filter(([sql]) => sql === "BEGIN")).toHaveLength(1)
     expect(fake.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1)
+  })
+
+  it("forwards the independent native proof only for native nodes and keeps legacy nodes fail-closed", async () => {
+    const nativeOnly = createPgRootTaskStore(verificationCompletionPool([nativeGraphNode()]).pool)
+    await expect(nativeOnly.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: true }))
+      .resolves.toEqual({ ok: true })
+    await expect(nativeOnly.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: false }))
+      .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified", feedback: expect.stringContaining("issue=legacy_unverified") })
+
+    const mixed = createPgRootTaskStore(verificationCompletionPool([nativeGraphNode(), legacyGraphNode()]).pool)
+    await expect(mixed.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, nativeVerificationPassed: true }))
+      .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified", feedback: expect.stringContaining("issue=legacy_unverified") })
   })
 
   it("does not authorize TaskGraph cleanup when failed root persistence is rejected", async () => {

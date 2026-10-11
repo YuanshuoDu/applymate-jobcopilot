@@ -1,12 +1,14 @@
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
-import type { TaskGraphCommandPort, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import type { NativeCoordinationRuntimeOptions } from "./tools/coordination-types.js"
 import { nativeCoordinationReceipts, nativeReceiptsMatchGraph } from "./canonical-turn-native-graph-context.js"
 import { mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
+import { isSessionPauseRequestedError } from "./session-gate.js"
 
 export type NativeGraphCompletionDecision = Readonly<{ ok: false; blocker: string; feedback: string }>
+const graphFences = new Set(["task_graph_session_fenced", "task_graph_turn_fenced", "task_graph_parent_fenced", "task_graph_step_fenced"])
 
 /** Shares root fencing, refresh and durable native-receipt requirements across one Turn. */
 export function createCanonicalTurnCoordination(input: Readonly<{
@@ -17,9 +19,13 @@ export function createCanonicalTurnCoordination(input: Readonly<{
   nativeOptions: NativeCoordinationRuntimeOptions
   bindRoot(root: Pick<SubagentTaskRecord, "id" | "attemptCount">): void
   refresh(snapshot: StepContextSnapshot): Promise<StepContextSnapshot>
+  readScope(): TaskGraphReadScope
+  executionScope(stepId: string): TaskGraphExecutionScope
+  hasNativeTasks(): Promise<boolean>
   checkNativeGraphCompletion(): Promise<NativeGraphCompletionDecision | null>
 }> {
   let root: Pick<SubagentTaskRecord, "id" | "attemptCount"> | undefined
+  let currentState: TaskGraphCurrentState | undefined
   const receipts = new Map<string, ReturnType<typeof nativeCoordinationReceipts>[number]>()
   const nativeOptions: NativeCoordinationRuntimeOptions = {
     enabled: input.enabled,
@@ -49,11 +55,21 @@ export function createCanonicalTurnCoordination(input: Readonly<{
   }
   async function currentGraph() {
     if (!input.commandPort) throw new Error("task_graph_runtime_dependencies_unavailable")
-    return input.commandPort.readCurrent(readScope())
+    currentState = await input.commandPort.readCurrent(readScope())
+    return currentState
   }
   return {
     nativeOptions,
     bindRoot(value) { root = value },
+    readScope,
+    executionScope(stepId) {
+      if (!stepId.trim()) throw new TypeError("task_graph_step_id_required")
+      return { ...readScope(), stepId }
+    },
+    async hasNativeTasks() {
+      const state = currentState ?? await currentGraph()
+      return state.nodes.some(node => node.native !== undefined)
+    },
     async refresh(snapshot) {
       remember(snapshot)
       const state = await currentGraph()
@@ -66,7 +82,10 @@ export function createCanonicalTurnCoordination(input: Readonly<{
       try {
         const state = await currentGraph()
         if (root && nativeReceiptsMatchGraph([...receipts.values()], state, root.id)) return null
-      } catch { /* The durable receipt keeps the graph requirement fail-closed. */ }
+      } catch (error: unknown) {
+        if (isSessionPauseRequestedError(error) || error instanceof Error && graphFences.has(error.message)) throw error
+        /* The durable receipt keeps ordinary graph read failures fail-closed. */
+      }
       return {
         ok: false,
         blocker: "task_graph_verification_unverified",

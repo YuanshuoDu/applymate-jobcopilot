@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest"
 
 import { cloneCompactionState, collectCompactionState } from "./context-compaction-collector.js"
 import type { CompactionSource, CompactionState } from "./context-compaction-types.js"
+import { projectSelectedJobMemory } from "./selected-job-memory.js"
+
+const selectedJobMemories = [projectSelectedJobMemory({
+  jobId: "job-a", sourceTurnId: "turn-a", sourceRootTaskId: "root-a", throughSequence: "7",
+  graph: { revision: 1, nodes: [{ templateId: "scout", status: "completed", readiness: "terminal" }] },
+})!]
 
 const state: CompactionState = {
   ownerId: "user-a", sessionId: "session-a", throughSequence: 7n, goal: "Find a role",
@@ -10,6 +16,7 @@ const state: CompactionState = {
   artifacts: [{ id: "artifact-1", type: "resume", hash: "sha256:resume" }],
   openTasks: [{ taskId: "task-1", status: "running", blocker: null }], doNotRepeat: ["retry submit"],
   facts: [{ factId: "fact-1", key: "role", source: "user" }],
+  selectedJobMemories,
 }
 
 function source(items: CompactionSource["items"]): CompactionSource { return { state, items } }
@@ -50,5 +57,13 @@ describe("deterministic compaction collector", () => {
     expect(cloned.approvals).not.toBe(state.approvals)
     expect(cloned.approvals[0]).not.toBe(state.approvals[0])
     expect(cloned.openTasks).not.toBe(state.openTasks)
+    expect(cloned.selectedJobMemories).toEqual(selectedJobMemories)
+    expect(cloned.selectedJobMemories).not.toBe(selectedJobMemories)
+  })
+
+  it("normalizes legacy missing memory and fails closed on invalid typed records", () => {
+    const collected = collectCompactionState({ state: { ...state, selectedJobMemories: undefined }, items: [] })
+    expect(collected.state.selectedJobMemories).toEqual([])
+    expect(() => collectCompactionState({ state: { ...state, selectedJobMemories: [{ ...selectedJobMemories[0], jobId: "tampered" }] }, items: [] })).toThrow("selectedJobMemories")
   })
 })

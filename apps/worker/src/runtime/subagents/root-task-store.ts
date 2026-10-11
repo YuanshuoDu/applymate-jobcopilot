@@ -13,7 +13,7 @@ export type RootTaskFinishMetadata = Readonly<{ interactiveDiscoveryShortlist: I
 export type RootTaskStore = {
   ensure(input: { lease: TurnLease; goal: string; modelProfileSnapshot?: unknown; toolPolicySnapshot?: unknown; budgetSnapshot?: unknown; allowedActions?: readonly string[]; now?: Date }): Promise<SubagentTaskRecord>
   reconcileTerminal?(input: { lease: TurnLease; now?: Date }): Promise<RootTaskReconciliation | null>
-  checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date; taskGraphVerification?: boolean; client?: pg.PoolClient }): Promise<TurnEngineCompletionGateResult>
+  checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date; taskGraphVerification?: boolean; /** Server-only result from the independent native verifier; never tool/model supplied. */ nativeVerificationPassed?: boolean; client?: pg.PoolClient }): Promise<TurnEngineCompletionGateResult>
   finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; metadata?: RootTaskFinishMetadata; now?: Date }): Promise<void>
 }
 type Row = Record<string, unknown>
@@ -162,7 +162,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         for (const row of descendants.rows) if (String(row.sessionId) !== input.lease.sessionId || String(row.turnId) !== input.lease.turnId || String(row.rootTaskId) !== input.rootTaskId || String(row.userId) !== input.lease.userId) throw new Error("root_task_fenced")
         const children = completionBlocker(descendants.rows)
         if (input.taskGraphVerification && (children.ok || descendants.rows.every(row => row.status === "waiting"))) {
-          const graph = await checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId)
+          const graph = await checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId, input.nativeVerificationPassed === true)
           if (!graph.ok) return graph
         }
         return children

@@ -186,7 +186,7 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       const source = emptySource(fixture)
       const started = createCompactionStartedItem({ sessionId: fixture.sessionId, turnId: fixture.turnId, throughSequence: 0n, source, reason: "manual", id: `rollback-compaction-${randomUUID()}` })
       const measurement = { beforeInputTokens: 100, afterInputTokens: 20, reductionTokens: 80, reductionRatio: 0.8 }
-      const report = { preserved: true, preservedFields: ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat"] as const, missingFields: [], changedFields: [], beforeDigest: "before", afterDigest: "after" }
+      const report = { preserved: true, preservedFields: ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat", "selected_job_memories"] as const, missingFields: [], changedFields: [], beforeDigest: "before", afterDigest: "after" }
       const completed = completeCompactionItem(started, { summary: "Rollback summary", measurement, report })
       const port = createPgContextSnapshotCompactionPort(pool!, fixture.owner)
       await port.recordStarted(started, fixture.scope)

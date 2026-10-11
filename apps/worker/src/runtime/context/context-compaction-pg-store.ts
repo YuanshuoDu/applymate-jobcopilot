@@ -36,7 +36,7 @@ export async function withCompactionOwner<T>(pool: CompactionPgPool, scope: Tena
       WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [owner.sessionId, owner.userId])
     if (!session.rows[0]) throw compactionConflict(`open session ${owner.sessionId}`)
     const fence = ownerFenceSql(owner, 1)
-    const turn = await client.query<CompactionPgRow>(`SELECT turn."id", turn."contextSnapshotId" FROM "agent_turns" AS turn
+    const turn = await client.query<CompactionPgRow>(`SELECT turn."id", turn."contextSnapshotId", turn."input", turn."rootTaskId" FROM "agent_turns" AS turn
       WHERE turn."id" = $5 AND turn."sessionId" = $6 AND ${fence.where} FOR UPDATE`, [...fence.values, owner.turnId, owner.sessionId])
     if (!turn.rows[0]) throw compactionConflict(`owned turn ${owner.turnId}`)
     const result = await work(client, turn.rows[0])

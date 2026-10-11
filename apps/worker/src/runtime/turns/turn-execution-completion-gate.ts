@@ -3,6 +3,8 @@ import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import type pg from "pg"
 import type { TurnLease } from "./lease.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
+import { signalWasInterrupted } from "../interrupt/registry.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
 import { taskGraphItemId, type StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
@@ -10,9 +12,10 @@ import { parseTaskGraphVerificationReport } from "../subagents/task-graph-comman
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { validateRoleResult } from "../subagents/role-results.js"
 
-type CompletionGateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
+type CompletionGateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate" | "isOwnershipLost">
 type CompletionGateWriter = Pick<TurnExecutionEventWriter, "append">
 export const TASK_GRAPH_VERIFICATION_BLOCKER = "task_graph_verification_unverified"
+export const NATIVE_VERIFICATION_PENDING_BLOCKER = "native_verification_pending"
 const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const REPAIR_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1"
 type GateCriterion = Readonly<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>
@@ -96,7 +99,7 @@ function repairIds(node: StoredTaskGraphNode, result: unknown, target: StoredTas
   return [...ids]
 }
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
-export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
+export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => ({ ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: feedbackText(code, details) })
   const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId, parentTaskId: rootTaskId }
   try {
@@ -107,7 +110,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
     }
     const { nodes } = loaded.snapshot, reports = new Map<string, GateReport>()
     for (const node of nodes) {
-      if (node.verificationDisposition === "legacy_unverified") return deny("legacy_unverified")
+      if (node.verificationDisposition === "legacy_unverified" && !(nativeVerificationPassed && node.nativeDelegation)) return deny("legacy_unverified")
       if (node.verificationDisposition !== "typed") continue
       const task = loaded.tasks.get(node.taskId), report = gateReport(node, task?.result, task?.role ?? "")
       if (!task || task.role !== node.verification?.role || !report) {
@@ -156,12 +159,13 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
   } catch { return deny() }
 }
 
-export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<{ feedback: string } | undefined> {
+export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<{ feedback: string } | { waitId: string } | undefined> {
   if (!options.completionGate) return undefined
   let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
   try {
-    decision = await options.completionGate({ identity: options.identity, scope: options.scope, rootTaskId: options.identity.rootTaskId, stepId: step.id, signal, now: now() })
-  } catch {
+    decision = await options.completionGate({ identity: options.identity, scope: options.scope, rootTaskId: options.identity.rootTaskId, stepId: step.id, candidateText, signal, now: now() })
+  } catch (error: unknown) {
+    if (isSessionPauseRequestedError(error) || signalWasInterrupted(signal) || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
     throw new TurnEngineError("invalid_output", "Completion gate failed closed")
   }
   if (!decision || typeof decision !== "object" || typeof decision.ok !== "boolean") throw new TurnEngineError("invalid_output", "Completion gate returned an invalid decision")
@@ -169,6 +173,13 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
   if (typeof decision.blocker !== "string" || typeof decision.feedback !== "string" || decision.blocker.length === 0 || decision.blocker.length > 256 || decision.feedback.length > 512) {
     throw new TurnEngineError("invalid_output", "Completion gate returned an invalid blocker")
   }
+  if (decision.waitId !== undefined) {
+    if (decision.blocker !== NATIVE_VERIFICATION_PENDING_BLOCKER || typeof decision.waitId !== "string" || !decision.waitId.trim() || decision.waitId.length > 128) {
+      throw new TurnEngineError("invalid_output", "Completion gate returned an invalid wait")
+    }
+    return { waitId: decision.waitId }
+  }
+  if (decision.blocker === NATIVE_VERIFICATION_PENDING_BLOCKER) throw new TurnEngineError("invalid_output", "Completion gate omitted a durable wait receipt")
   await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: decision.blocker, feedback: decision.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
   if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) return { feedback: decision.feedback }
   throw new TurnEngineError("business_precondition_failed", decision.blocker)

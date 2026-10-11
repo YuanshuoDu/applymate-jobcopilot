@@ -7,6 +7,7 @@ import type {
   CompactionOpenTask,
   CompactionTokenMeasurement,
 } from "./context-compaction-types.js"
+import type { SelectedJobMemoryRecord } from "./selected-job-memory.js"
 
 import type {
   BusinessReference,
@@ -116,6 +117,7 @@ export type ContextSnapshotCompactionState = {
   readonly openTasks: readonly CompactionOpenTask[]
   readonly doNotRepeat: readonly string[]
   readonly facts: readonly CompactionFact[]
+  readonly selectedJobMemories?: readonly SelectedJobMemoryRecord[]
 }
 
 export type ContextSnapshotCompaction = {

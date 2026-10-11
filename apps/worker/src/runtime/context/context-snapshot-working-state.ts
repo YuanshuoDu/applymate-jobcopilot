@@ -58,7 +58,7 @@ function uniqueIds(value: unknown, field: string): string[] {
 
 function validateCompactionState(extension: ContextSnapshotCompaction, ownerId: string, sessionId: string, throughSequence: string): void {
   const state = record(extension.state, "compaction.state")
-  exactKeys(state, ["ownerId", "sessionId", "throughSequence", "goal", "userConstraints", "approvals", "answers", "artifacts", "openTasks", "doNotRepeat", "facts"], "compaction.state")
+  exactKeys(state, ["ownerId", "sessionId", "throughSequence", "goal", "userConstraints", "approvals", "answers", "artifacts", "openTasks", "doNotRepeat", "facts", "selectedJobMemories"], "compaction.state")
   if (text(state.ownerId, "compaction.state.ownerId") !== ownerId || text(state.sessionId, "compaction.state.sessionId") !== sessionId) {
     throw new ContextSnapshotError("store_conflict", "Compaction state owner or session does not match its snapshot")
   }

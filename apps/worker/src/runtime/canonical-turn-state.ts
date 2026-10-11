@@ -1,9 +1,9 @@
 import type pg from "pg"
 import type { TenantScope, RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
-import { parseSnapshotContent } from "./context/context-snapshot-canonical.js"
+import { restoreCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-state.js"
+import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
-import { stepContextSnapshotFromContent } from "./context/context-snapshot-working-state.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import type { PersistedToolCallRecovery } from "./turns/turn-engine-types.js"
@@ -27,6 +27,8 @@ export type CanonicalTurnState = {
   /** Loaded Turns always provide this; optional for existing injected stateLoader fixtures. */
   readonly contextSnapshotPinned?: boolean
   readonly snapshot: StepContextSnapshot
+  /** Bounded server-owned TaskGraph projection; only an exact selected-job Turn may expose it to the model. */
+  readonly selectedJobMemories?: readonly SelectedJobMemoryRecord[]
   readonly steeringMarkers?: SteeringMarkerState
   readonly pendingToolCalls?: readonly PersistedToolCallRecovery[]
   /** Latest validated agenda receipt; audit state only, never model context. */
@@ -47,13 +49,6 @@ function json(value: unknown): RepositoryJsonValue {
   if (Array.isArray(value)) return value.map(json)
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined).map(([key, child]) => [key, json(child)]))
   return null
-}
-
-function snapshotFromContent(value: unknown, throughSequence: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
-  const content = parseSnapshotContent(value)
-  if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch")
-  if (content.throughSequence !== String(throughSequence)) throw new Error("context_snapshot_sequence_mismatch")
-  return stepContextSnapshotFromContent(content)
 }
 
 function eventPayload(value: unknown): Row { const payload = object(value); return object(payload.payload ?? payload) }
@@ -163,13 +158,15 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       [lease.turnId, lease.sessionId, lease.userId],
     )
     let snapshot: StepContextSnapshot = { system: [{ id: "canonical-runtime", content: "Use only scoped, policy-approved tools and continue until the stated goal is verifiably complete." }], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+    let selectedJobMemories: readonly SelectedJobMemoryRecord[] | undefined
     let snapshotThroughSequence: bigint | null = null
     if (turn.contextSnapshotId) {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
         JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
         WHERE snapshot."id" = $1 AND snapshot."sessionId" = $2 AND session."userId" = $3`, [turn.contextSnapshotId, lease.sessionId, lease.userId])
       if (!contextResult.rows[0]) throw new Error("context_snapshot_missing")
-      snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+      const restored = restoreCanonicalTurnSnapshot(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+      snapshot = restored.snapshot; selectedJobMemories = restored.selectedJobMemories
       snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
     } else {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
@@ -177,7 +174,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         WHERE snapshot."sessionId" = $1 AND session."userId" = $2
         ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1`, [lease.sessionId, lease.userId])
       if (contextResult.rows[0]) {
-        snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+        const restored = restoreCanonicalTurnSnapshot(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+        snapshot = restored.snapshot; selectedJobMemories = restored.selectedJobMemories
         snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
       }
     }
@@ -238,6 +236,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       contextSnapshotPinned: turn.contextSnapshotId !== null && turn.contextSnapshotId !== undefined,
       steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(restored.pending.length ? { pendingToolCalls: restored.pending } : {}), ...(rootTaskId ? { rootTaskId } : {}),
       ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}),
+      ...(selectedJobMemories ? { selectedJobMemories } : {}),
     }
     await client.query("COMMIT")
     committed = true

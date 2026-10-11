@@ -1,4 +1,5 @@
 import type { TenantScope } from "@jobcopilot/agent-protocol"
+import type { SelectedJobMemoryRecord } from "./selected-job-memory.js"
 
 export const COMPACTION_ITEM_TYPE = "context_compaction" as const
 
@@ -67,6 +68,8 @@ export type CompactionState = {
   readonly openTasks: readonly CompactionOpenTask[]
   readonly doNotRepeat: readonly string[]
   readonly facts: readonly CompactionFact[]
+  /** Typed server projection; optional only for pre-feature source fixtures and snapshots. */
+  readonly selectedJobMemories?: readonly SelectedJobMemoryRecord[]
 }
 
 export type CompactionInputItem = {
@@ -112,7 +115,7 @@ export type CompactionCollection = {
   readonly stateDigest: string
 }
 
-export type CompactionInvariantField = "goal" | "approvals" | "answers" | "artifact_hashes" | "open_tasks" | "do_not_repeat"
+export type CompactionInvariantField = "goal" | "approvals" | "answers" | "artifact_hashes" | "open_tasks" | "do_not_repeat" | "selected_job_memories"
 
 export type CompactionInvariantReport = {
   readonly preserved: boolean

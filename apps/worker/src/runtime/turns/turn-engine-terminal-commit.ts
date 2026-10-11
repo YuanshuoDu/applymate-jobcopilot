@@ -12,7 +12,7 @@ type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
 type TerminalInput = AtomicTurnCompletionInput & { readonly owner: TurnExecutionOwnerFence; readonly response: string; readonly now: Date }
-export type TurnEngineTerminalGuard = (client: pg.PoolClient) => Promise<TurnEngineCompletionGateResult>
+export type TurnEngineTerminalGuard = (client: pg.PoolClient, input: TerminalInput) => Promise<TurnEngineCompletionGateResult>
 const json = (value: unknown) => JSON.stringify(value)
 const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
 function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
@@ -166,7 +166,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])
     if (!prior.rows[0]) throw conflict(`completed step event ${input.stepId}`)
     if (!committed && finalizationGuard) {
-      const decision = await finalizationGuard(client)
+      const decision = await finalizationGuard(client, input)
       if (!decision || typeof decision !== "object" || decision.ok !== true) {
         if (decision && decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER && typeof decision.feedback === "string" && decision.feedback.length <= 512) {
           throw Object.assign(new Error(decision.blocker), { name: "TaskGraphVerificationRecovery", blocker: decision.blocker, feedback: decision.feedback })
