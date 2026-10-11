@@ -13248,9 +13248,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(pendingWait.targetTaskIds).toEqual(orderedTaskIds)
       expect(pendingWait.matchedTaskIds).toEqual(orderedInitiallyMatchedTaskIds)
       const childRows = await pool!.query<{ id: string; status: string; rootTaskId: string; parentTaskId: string; turnId: string; sessionId: string }>(
-        `SELECT "id", "status", "rootTaskId", "parentTaskId", "turnId", "sessionId" FROM "sub_agent_tasks"
-         WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
-           AND "id" = ANY($5::text[]) ORDER BY array_position($5::text[], "id")`,
+        `SELECT task."id", task."status", task."rootTaskId", task."parentTaskId", task."turnId", task."sessionId"
+           FROM "sub_agent_tasks" AS task
+           JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+          WHERE session."userId" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+            AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND task."id" = ANY($5::text[])
+          ORDER BY array_position($5::text[], task."id")`,
         [value.userId, value.sessionId, value.turnId, rootTaskId, taskIds],
       )
       expect(childRows.rows.map(row => row.id)).toEqual(taskIds)
@@ -13356,8 +13359,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       })
       expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
       const completedRoot = await pool!.query<{ status: string; result: unknown }>(
-        `SELECT "status", "result" FROM "sub_agent_tasks"
-         WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "rootTaskId" = $1`,
+        `SELECT task."status", task."result" FROM "sub_agent_tasks" AS task
+         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+         WHERE task."id" = $1 AND session."userId" = $2 AND task."sessionId" = $3
+           AND task."turnId" = $4 AND task."rootTaskId" = $1`,
         [rootTaskId, value.userId, value.sessionId, value.turnId],
       )
       expect(completedRoot.rows).toHaveLength(1)
