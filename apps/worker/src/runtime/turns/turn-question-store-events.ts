@@ -4,6 +4,7 @@ import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxP
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { TurnQuestionStoreError } from "./turn-question-contract.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
+import { parseModelCompletedReceipt } from "./model-completed-receipt.js"
 import { assertQuestionOwner, questionConflict, withQuestionTransaction, type TurnQuestionPool, type TurnQuestionQueryClient } from "./turn-question-store-guards.js"
 
 type Row = Record<string, unknown>
@@ -41,10 +42,11 @@ type ModelReceipt = { readonly sequence: bigint; readonly payload: Record<string
 function modelReceipt(row: Record<string, unknown> | undefined, owner: TurnExecutionOwnerFence, stepId: string, type: string, key: string): ModelReceipt | null {
   if (!row) return null
   const payload = record(row.payload), seq = sequence(row.sequence), keys = type === "model.usage" ? ["provider", "model", "usage", "taskId"] : ["taskId", "provider", "model"]
+  const payloadValid = type === "model.completed" ? !!parseModelCompletedReceipt(payload) : !!payload && exact(payload, keys)
   return typeof row.id === "string" && row.id.trim().length > 0 && row.sessionId === owner.sessionId && row.turnId === owner.turnId
     && row.taskId === owner.taskId && row.itemId === null
     && row.type === type && row.actor === "orchestrator" && row.correlationId === stepId && row.idempotencyKey === key
-    && payload && exact(payload, keys) && payload.taskId === owner.taskId && typeof payload.provider === "string" && !!payload.provider
+    && payload && payloadValid && payload.taskId === owner.taskId && typeof payload.provider === "string" && !!payload.provider
     && typeof payload.model === "string" && !!payload.model && seq !== null ? { sequence: seq, payload } : null
 }
 

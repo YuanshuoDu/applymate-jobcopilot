@@ -50,8 +50,9 @@ async function read(client: Queryable, input: DurableWaitControlInvocation, admi
         WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND "status" = 'streaming' AND "taskId" = $4`,
       [input.stepId, input.turnId, input.sessionId, input.rootTaskId])).rows[0]
     : (await client.query<Row>(`SELECT "taskId" FROM "agent_steps"
-        WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND "status" IN ('running', 'waiting_for_tool')
-          AND ("taskId" = $4 OR "taskId" IS NULL)`,
+        WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3
+          AND (("status" = 'streaming' AND "taskId" = $4)
+            OR ("status" IN ('running', 'waiting_for_tool') AND ("taskId" = $4 OR "taskId" IS NULL)))`,
       [input.stepId, input.turnId, input.sessionId, input.rootTaskId])).rows[0]
   if (!step) return null
   const targets = await client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId"

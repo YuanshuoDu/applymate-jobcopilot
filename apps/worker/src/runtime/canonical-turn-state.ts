@@ -14,6 +14,7 @@ import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type CognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
 import { hydrateNativeVerificationHistoricalAdvisories } from "./subagents/native-verification-historical-advisory.js"
 import { recoverCanonicalTurnQuestionContext } from "./turns/turn-question-runtime-support.js"
+import { buildCanonicalTurnResumeState } from "./canonical-turn-wait-resume-accounting.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -216,20 +217,9 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       `SELECT MAX("ordinal") AS "maxOrdinal" FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [lease.turnId, lease.sessionId],
     )
     const maxOrdinal = ordinalResult.rows[0]?.maxOrdinal === null || ordinalResult.rows[0]?.maxOrdinal === undefined ? null : Number(ordinalResult.rows[0].maxOrdinal)
-    const usage = stepsResult.rows.reduce<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>((total, step) => {
-      total.inputTokens += Number(step.inputTokens ?? 0)
-      total.outputTokens += Number(step.outputTokens ?? 0)
-      total.estimatedCostUsd += Number(step.estimatedCostUsd ?? 0)
-      return total
-    }, { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
-    const resume = last || maxOrdinal !== null ? {
-      nextOrdinal: (maxOrdinal ?? Number(last.ordinal)) + 1,
-      stepCount: stepsResult.rows.length,
-      toolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length,
-      inputThroughSequence: BigInt(String(last?.inputThroughSequence ?? 0)),
-      consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
-      usage,
-    } satisfies TurnResumeState : undefined
+    const resume = buildCanonicalTurnResumeState({ last, maxOrdinal, steps: stepsResult.rows,
+      persistedToolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length, items: itemsResult.rows, events: eventsResult.rows,
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: rootTaskId ?? "" }, recoveredWaitControl })
     validateAgendaResumeFence(restoredAgenda, stepsResult.rows)
     const intent = turnIntent(turn.input)
     const result = {

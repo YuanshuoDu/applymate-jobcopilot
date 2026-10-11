@@ -5,6 +5,7 @@ import { hasResolvedWaitOutcome, type RecoveredArchivedWaitControl } from "./tur
 import type { TurnExecutionIdentity } from "./turns/turn-execution-types.js"
 import { TurnEngineError } from "./turns/turn-engine-types.js"
 import type { TurnLease } from "./turns/lease.js"
+import { parseModelCompletedReceipt } from "./turns/model-completed-receipt.js"
 
 type Row = Record<string, unknown>
 type Observation = { readonly id: string; readonly content: unknown }
@@ -33,28 +34,57 @@ function jsonUsageValue(value: unknown, integer: boolean): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || integer && !Number.isSafeInteger(value)) return invalid()
   return value
 }
-function modelUsage(events: readonly Row[], stepId: string, identity: TurnExecutionIdentity): { inputTokens: number; outputTokens: number; estimatedCostUsd: number } {
+type ModelUsageReceipt = { readonly inputTokens: number; readonly outputTokens: number; readonly estimatedCostUsd: number; readonly sequence: bigint; readonly toolCallCount?: number }
+function modelUsage(events: readonly Row[], stepId: string, identity: TurnExecutionIdentity): ModelUsageReceipt {
   const { rootTaskId, turnId } = identity
   const rows = events.filter(event => ["model.started", "model.completed", "model.usage"].includes(String(event.type)) && event.correlationId === stepId)
   const started = rows.filter(event => event.type === "model.started"), completed = rows.filter(event => event.type === "model.completed"), usages = rows.filter(event => event.type === "model.usage")
-  const start = started[0], done = completed[0], event = usages[0], body = payload(event?.payload)
+  const start = started[0], done = completed[0], event = usages[0], startBody = payload(start?.payload), doneBody = payload(done?.payload)
+  const doneReceipt = parseModelCompletedReceipt(doneBody), body = payload(event?.payload)
   if (started.length !== 1 || completed.length !== 1 || usages.length !== 1 || !start || !done || !event
     || ![start, done, event].every(row => row.userId === identity.userId && row.sessionId === identity.sessionId && row.turnId === turnId
       && row.taskId === rootTaskId && row.actor === "orchestrator" && row.itemId === null && typeof row.id === "string" && !!row.id)
     || start.idempotencyKey !== "turn:" + turnId + ":event:model-started:" + stepId
     || done.idempotencyKey !== "turn:" + turnId + ":event:model-completed:" + stepId
     || event.idempotencyKey !== "turn:" + turnId + ":event:model-usage:" + stepId
-    || ![start, done].every(row => { const value = payload(row.payload); return exactKeys(value, ["provider", "model", "taskId"]) && value.taskId === rootTaskId && boundedString(value.provider, 128) && boundedString(value.model, 128) })
+    || !exactKeys(startBody, ["provider", "model", "taskId"]) || startBody.taskId !== rootTaskId
+    || !boundedString(startBody.provider, 128) || !boundedString(startBody.model, 128)
+    || !doneReceipt || doneReceipt.taskId !== rootTaskId || !boundedString(doneReceipt.provider, 128) || !boundedString(doneReceipt.model, 128)
     || !exactKeys(body, ["provider", "model", "usage", "taskId"]) || body.taskId !== rootTaskId
-    || body.provider !== payload(start.payload)?.provider || body.model !== payload(start.payload)?.model
-    || body.provider !== payload(done.payload)?.provider || body.model !== payload(done.payload)?.model
+    || body.provider !== startBody.provider || body.model !== startBody.model
+    || body.provider !== doneReceipt.provider || body.model !== doneReceipt.model
     || done.causationId !== start.id || event.causationId !== done.id) invalid()
   const startSequence = eventSequence(start.sequence), doneSequence = eventSequence(done.sequence), usageSequence = eventSequence(event.sequence)
   if (startSequence === null || doneSequence === null || usageSequence === null || startSequence >= doneSequence || doneSequence >= usageSequence) invalid()
-  if (body.usage === null) return { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+  if (body.usage === null) return { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, sequence: usageSequence!, ...(doneReceipt.toolCallCount === undefined ? {} : { toolCallCount: doneReceipt.toolCallCount }) }
   const usage = object(body.usage)
   if (!exactKeys(usage, ["inputTokens", "outputTokens", "estimatedCostUsd"])) invalid()
-  return { inputTokens: jsonUsageValue(usage.inputTokens, true), outputTokens: jsonUsageValue(usage.outputTokens, true), estimatedCostUsd: jsonUsageValue(usage.estimatedCostUsd, false) }
+  return { inputTokens: jsonUsageValue(usage.inputTokens, true), outputTokens: jsonUsageValue(usage.outputTokens, true), estimatedCostUsd: jsonUsageValue(usage.estimatedCostUsd, false), sequence: usageSequence!, ...(doneReceipt.toolCallCount === undefined ? {} : { toolCallCount: doneReceipt.toolCallCount }) }
+}
+
+function completedPrefix(callItems: readonly Row[], stepItems: readonly Row[], events: readonly Row[], identity: TurnExecutionIdentity, lastCallItem: Row,
+  usageSequence: bigint, requireExactTask: boolean): void {
+  if (callItems.length === 0 || callItems[callItems.length - 1] !== lastCallItem) invalid()
+  let previousSequence = usageSequence
+  for (const item of callItems) {
+    const call = object(item.content), id = call?.toolCallId, name = call?.toolName, status = call?.status
+    if ((requireExactTask ? item.taskId !== identity.rootTaskId : !scopedTask(item.taskId, identity.rootTaskId))
+      || item.status !== "completed" || typeof id !== "string" || typeof name !== "string"
+      || (status !== "completed" && status !== "failed" && status !== "cancelled")) invalid()
+    const resultItems = stepItems.filter(result => (requireExactTask ? result.taskId === identity.rootTaskId : scopedTask(result.taskId, identity.rootTaskId))
+      && result.type === "tool_result" && object(result.content)?.toolCallId === id)
+    if (resultItems.length !== 1 || resultItems[0]?.status !== "completed") invalid()
+    const eventType = status === "completed" ? "tool_call.completed" : "tool_call.failed"
+    const receipts = events.filter(event => event.type === eventType && event.correlationId === id && event.itemId === item.id
+      && event.idempotencyKey === `turn:${identity.turnId}:event:tool-finished:${id}`)
+    const event = receipts[0], data = payload(event?.payload)
+    const receiptSequence = eventSequence(event?.sequence)
+    if (receipts.length !== 1 || !event || event.userId !== identity.userId || event.sessionId !== identity.sessionId
+      || event.turnId !== identity.turnId || event.taskId !== identity.rootTaskId || event.actor !== "orchestrator"
+      || data?.toolCallId !== id || data.toolName !== name || data.status !== status || data.taskId !== identity.rootTaskId
+      || receiptSequence === null || receiptSequence <= previousSequence) invalid()
+    previousSequence = receiptSequence
+  }
 }
 
 /** Finds only a completed archived wait on the exact latest owner-loaded root Step. */
@@ -71,11 +101,12 @@ export async function recoverCanonicalArchivedWaitControl(input: {
   const { identity } = input
   if (identity.kind !== "turn" || identity.taskId !== identity.rootTaskId) return undefined
   const step = input.steps[input.steps.length - 1]
-  if (!step || typeof step.id !== "string" || !step.id || !scopedTask(step.taskId, identity.rootTaskId)
-    || (step.status !== "running" && step.status !== "waiting_for_tool")) return undefined
+  if (!step || typeof step.id !== "string" || !step.id
+    || (step.status === "streaming" ? step.taskId !== identity.rootTaskId : !scopedTask(step.taskId, identity.rootTaskId))
+    || (step.status !== "streaming" && step.status !== "running" && step.status !== "waiting_for_tool")) return undefined
   const stepItems = input.items.filter(item => item.stepId === step.id && scopedTask(item.taskId, identity.rootTaskId))
   const callItems = stepItems.filter(item => item.type === "tool_call")
-  const candidates: Array<{ call: Row; result: Row; resultItem: Row; event: Row; input: unknown; callId: string; toolName: string }> = []
+  const candidates: Array<{ callItem: Row; call: Row; result: Row; resultItem: Row; event: Row; input: unknown; callId: string; toolName: string }> = []
   for (const callItem of callItems) {
     const call = object(callItem.content), callId = call?.toolCallId, toolName = call?.toolName
     if (!call || typeof callId !== "string" || typeof toolName !== "string" || !["agent.wait", "wait_subagents"].includes(toolName)) continue
@@ -102,43 +133,52 @@ export async function recoverCanonicalArchivedWaitControl(input: {
     const observed = object(observation?.content)
     if (!observed || observed.toolCallId !== callId || observed.toolName !== toolName || observed.status !== "completed"
       || !isDeepStrictEqual(observed.input, call.input) || !isDeepStrictEqual(observed.output, result.output)) invalid()
-    candidates.push({ call, result, resultItem: resultItem!, event, input: call.input, callId, toolName })
+    candidates.push({ callItem, call, result, resultItem: resultItem!, event, input: call.input, callId, toolName })
   }
   if (candidates.length === 0) return undefined
   if (candidates.length !== 1) invalid()
   const candidate = candidates[0]!
+  const usage = modelUsage(input.events, String(step.id), identity)
+  const waitSequence = eventSequence(candidate.event.sequence)
+  if (waitSequence === null || usage.sequence >= waitSequence) invalid()
+  completedPrefix(callItems, stepItems, input.events, identity, candidate.callItem, usage.sequence, step.status === "streaming")
+  if (step.status === "streaming" && (step.taskId !== identity.rootTaskId || usage.toolCallCount === undefined)) invalid()
+  const completionEvents = input.events.filter(event => event.type === "step.completed" && event.correlationId === step.id)
+  if (completionEvents.length > 1) invalid()
+  const completion = completionEvents[0]
+  const completionPayload = payload(completion?.payload)
+  if (completion && (step.status !== "waiting_for_tool" || !scopedTask(completion.taskId, identity.rootTaskId)
+    || completionPayload?.stepId !== step.id || completionPayload.status !== "waiting_for_dependency"
+    || !scopedTask(completionPayload.taskId, identity.rootTaskId)
+    || !Number.isSafeInteger(completionPayload.toolCallCount) || Number(completionPayload.toolCallCount) < callItems.length
+    || (usage.toolCallCount !== undefined && Number(completionPayload.toolCallCount) !== usage.toolCallCount))) invalid()
+  if ((step.status === "streaming" || step.status === "running") && completion) invalid()
+  const toolCallCount = completion ? Number(completionPayload!.toolCallCount) : usage.toolCallCount ?? callItems.length
+  if (!Number.isSafeInteger(toolCallCount) || toolCallCount < callItems.length || (step.status === "streaming" && toolCallCount === 0)) invalid()
+  const stepUsage = { inputTokens: persistedNumber(step.inputTokens, true), outputTokens: persistedNumber(step.outputTokens, true), estimatedCostUsd: persistedNumber(step.estimatedCostUsd) }
+  const stepHasZeroUsage = stepUsage.inputTokens === 0 && stepUsage.outputTokens === 0 && stepUsage.estimatedCostUsd === 0
+  const stepMatchesUsage = stepUsage.inputTokens === usage.inputTokens && stepUsage.outputTokens === usage.outputTokens && stepUsage.estimatedCostUsd === usage.estimatedCostUsd
+  if (step.status === "waiting_for_tool" && !stepMatchesUsage
+    || (step.status === "running" || step.status === "streaming") && !stepHasZeroUsage && !stepMatchesUsage) invalid()
+  const usageDelta = (step.status === "running" || step.status === "streaming") && stepHasZeroUsage
+    ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, estimatedCostUsd: usage.estimatedCostUsd }
+    : { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
   const control = await lookupArchivedWaitControl({
     toolName: candidate.toolName, input: candidate.input, stepId: String(step.id), output: candidate.result.output,
     identity, now: input.now, reader: input.reader, stepAdmission: "restored_inflight_root", allowInterruptedRecovery: true,
   })
   if (!control) invalid()
-  if (control.status === "interrupted") {
-    if (!hasResolvedWaitOutcome(input.snapshot, control.waitId, candidate.input, "interrupted")) invalid()
-    return undefined
-  }
-  if (hasResolvedWaitOutcome(input.snapshot, control.waitId, candidate.input)) return undefined
-  const completionEvents = input.events.filter(event => event.type === "step.completed" && event.correlationId === step.id)
-  if (completionEvents.length > 1) invalid()
-  const completion = completionEvents[0]
-  const completionPayload = payload(completion?.payload)
-  let toolCallCount = callItems.length
-  if (completion) {
-    if (step.status !== "waiting_for_tool" || !scopedTask(completion.taskId, identity.rootTaskId)
-      || completionPayload?.stepId !== step.id || completionPayload.status !== "waiting_for_dependency"
-      || !scopedTask(completionPayload.taskId, identity.rootTaskId)
-      || !Number.isSafeInteger(completionPayload.toolCallCount) || Number(completionPayload.toolCallCount) !== callItems.length) invalid()
-    toolCallCount = Number(completionPayload.toolCallCount)
-  }
-  const usage = modelUsage(input.events, String(step.id), identity)
-  const stepUsage = { inputTokens: persistedNumber(step.inputTokens, true), outputTokens: persistedNumber(step.outputTokens, true), estimatedCostUsd: persistedNumber(step.estimatedCostUsd) }
-  const stepHasZeroUsage = stepUsage.inputTokens === 0 && stepUsage.outputTokens === 0 && stepUsage.estimatedCostUsd === 0
-  const stepMatchesUsage = stepUsage.inputTokens === usage.inputTokens && stepUsage.outputTokens === usage.outputTokens && stepUsage.estimatedCostUsd === usage.estimatedCostUsd
-  if (step.status === "waiting_for_tool" && !stepMatchesUsage || step.status === "running" && !stepHasZeroUsage && !stepMatchesUsage) invalid()
-  const recoveredUsage = step.status === "running" && stepHasZeroUsage ? usage : stepUsage
+  const canonicalOutcomeResolved = control.status === "interrupted"
+    ? hasResolvedWaitOutcome(input.snapshot, control.waitId, candidate.input, "interrupted")
+    : control.status !== "waiting" && hasResolvedWaitOutcome(input.snapshot, control.waitId, candidate.input, control.status)
+  if (control.status === "interrupted" && !canonicalOutcomeResolved) invalid()
+  if (control.status === "waiting" && hasResolvedWaitOutcome(input.snapshot, control.waitId, candidate.input)) invalid()
   return {
     ...control, stepId: String(step.id), stepStatus: step.status,
     finishReason: persistedText(step.finishReason), errorCode: persistedText(step.errorCode),
-    ...recoveredUsage, toolCallCount, stepCompletionRecorded: !!completion,
+    inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, estimatedCostUsd: usage.estimatedCostUsd,
+    usageDelta, toolCallCount, persistedToolCallCount: callItems.length,
+    stepCompletionRecorded: !!completion, canonicalOutcomeResolved,
   }
 }
 

@@ -20,11 +20,13 @@ function fakePool(options: { foreignTarget?: boolean; waitStatus?: string; stepS
       if (sql.includes('FROM "agent_sessions"') && sql.includes('SELECT "id"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('FROM "agent_turns"')) return { rows: [{ rootTaskId: "root-1" }] }
       if (sql.includes('FROM "agent_steps"')) {
-        const fresh = sql.includes(`"status" = 'streaming'`)
+        const fresh = !sql.includes(`"status" IN ('running', 'waiting_for_tool')`)
         const status = options.stepStatus ?? "waiting_for_tool"
-        const statusMatches = fresh ? status === "streaming" : status === "running" || status === "waiting_for_tool"
+        const statusMatches = status === "streaming" ? sql.includes(`"status" = 'streaming'`)
+          : fresh ? false : status === "running" || status === "waiting_for_tool"
         const taskId = options.stepTaskId === undefined ? "root-1" : options.stepTaskId
-        const taskMatches = sql.includes(`("taskId" = $4 OR "taskId" IS NULL)`) ? taskId === "root-1" || taskId === null : taskId === "root-1"
+        const taskMatches = status === "streaming" ? taskId === "root-1"
+          : sql.includes(`("taskId" = $4 OR "taskId" IS NULL)`) ? taskId === "root-1" || taskId === null : taskId === "root-1"
         return { rows: statusMatches && taskMatches ? [{ taskId }] : [] }
       }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id" = $1')) {
@@ -92,7 +94,7 @@ describe("read-only durable wait control lookup", () => {
     expect(db.calls.some(call => call.sql.includes('FROM "agent_wait_conditions"'))).toBe(true)
   })
 
-  it("admits a live streaming Root Step only for fresh control lookup", async () => {
+  it("admits streaming Root Steps only at the fresh call site or strict canonical recovery call site", async () => {
     const matcher = vi.fn(() => true)
     const fresh = fakePool({ stepStatus: "streaming" })
     await expect(createPgDurableWaitControlReader(fresh.pool as never, matcher).readByInvocation(base, "fresh_streaming_root"))
@@ -104,8 +106,10 @@ describe("read-only durable wait control lookup", () => {
 
     const recovery = fakePool({ stepStatus: "streaming" })
     await expect(createPgDurableWaitControlReader(recovery.pool as never, matcher).readByInvocation(base, "restored_inflight_root"))
-      .resolves.toBeNull()
-    expect(recovery.calls.some(call => call.sql.includes('FROM "agent_wait_conditions"'))).toBe(false)
+      .resolves.toEqual({ waitId: "wait-00000000-0000-4000-8000-000000000001", status: "waiting" })
+    const recoveryStepSql = recovery.calls.find(call => call.sql.includes('FROM "agent_steps"'))?.sql ?? ""
+    expect(recoveryStepSql).toContain(`"status" = 'streaming' AND "taskId" = $4`)
+    expect(recovery.calls.some(call => call.sql.includes('FROM "agent_wait_conditions"'))).toBe(true)
 
     for (const stepStatus of ["running", "waiting_for_tool"]) {
       const staleFresh = fakePool({ stepStatus })
@@ -118,6 +122,10 @@ describe("read-only durable wait control lookup", () => {
     await expect(createPgDurableWaitControlReader(foreignRoot.pool as never, matcher).readByInvocation(base, "fresh_streaming_root"))
       .resolves.toBeNull()
     expect(foreignRoot.calls.some(call => call.sql.includes('FROM "agent_wait_conditions"'))).toBe(false)
+    const unrootedRecovery = fakePool({ stepStatus: "streaming", stepTaskId: null })
+    await expect(createPgDurableWaitControlReader(unrootedRecovery.pool as never, matcher).readByInvocation(base, "restored_inflight_root"))
+      .resolves.toBeNull()
+    expect(unrootedRecovery.calls.some(call => call.sql.includes('FROM "agent_wait_conditions"'))).toBe(false)
   })
 
   it("fails closed on a missing or unknown admission before connecting", async () => {

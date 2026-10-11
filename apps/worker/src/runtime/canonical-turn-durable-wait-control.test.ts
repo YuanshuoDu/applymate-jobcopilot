@@ -19,9 +19,9 @@ const identity: TurnExecutionIdentity = {
   ownerId: "worker-1", leaseVersion: 7, leaseExpiresAt: new Date("2026-10-11T12:01:00.000Z"),
 }
 
-function state(options: { status?: string; stepUsage?: { inputTokens: number; outputTokens: number; estimatedCostUsd: number } } = {}) {
+function state(options: { status?: string; stepTaskId?: string | null; modelToolCallCount?: number | null; stepUsage?: { inputTokens: number; outputTokens: number; estimatedCostUsd: number } } = {}) {
   const step = {
-    id: stepId, taskId: rootTaskId, ordinal: 0, status: options.status ?? "running", finishReason: "tool_calls", errorCode: null,
+    id: stepId, taskId: options.stepTaskId === undefined ? rootTaskId : options.stepTaskId, ordinal: 0, status: options.status ?? "running", finishReason: "tool_calls", errorCode: null,
     inputTokens: options.stepUsage?.inputTokens ?? 0, outputTokens: options.stepUsage?.outputTokens ?? 0,
     estimatedCostUsd: options.stepUsage?.estimatedCostUsd ?? 0,
   }
@@ -29,13 +29,15 @@ function state(options: { status?: string; stepUsage?: { inputTokens: number; ou
     content: { toolCallId: callId, toolName: "agent.wait", input, status: "completed" } }
   const resultItem = { id: "result-item", type: "tool_result", status: "completed", stepId, taskId: rootTaskId,
     content: { toolCallId: callId, output: reference, errorCode: null } }
-  const events = [
+  const events: Array<Record<string, unknown>> = [
     { id: "model-start", type: "model.started", actor: "orchestrator", userId: identity.userId, sessionId: identity.sessionId,
       turnId, taskId: rootTaskId, itemId: null, correlationId: stepId, causationId: null,
       idempotencyKey: `turn:${turnId}:event:model-started:${stepId}`, sequence: "1", payload: { taskId: rootTaskId, provider: "fixture", model: "fixture" } },
     { id: "model-done", type: "model.completed", actor: "orchestrator", userId: identity.userId, sessionId: identity.sessionId,
       turnId, taskId: rootTaskId, itemId: null, correlationId: stepId, causationId: "model-start",
-      idempotencyKey: `turn:${turnId}:event:model-completed:${stepId}`, sequence: "2", payload: { taskId: rootTaskId, provider: "fixture", model: "fixture" } },
+      idempotencyKey: `turn:${turnId}:event:model-completed:${stepId}`, sequence: "2", payload: {
+        taskId: rootTaskId, provider: "fixture", model: "fixture", ...(options.modelToolCallCount === null ? {} : { toolCallCount: options.modelToolCallCount ?? 1 }),
+      } },
     { id: "model-usage", type: "model.usage", actor: "orchestrator", userId: identity.userId, sessionId: identity.sessionId,
       turnId, taskId: rootTaskId, itemId: null, correlationId: stepId, causationId: "model-done",
       idempotencyKey: `turn:${turnId}:event:model-usage:${stepId}`, sequence: "3",
@@ -75,25 +77,27 @@ describe("canonical archived-wait state recovery", () => {
     const recovered = await recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
       observations: value.observations, snapshot: snapshot(value.observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") })
     expect(recovered).toMatchObject({ waitId, status: "waiting", stepId, stepStatus: "running", inputTokens: 17, outputTokens: 5,
-      estimatedCostUsd: 0.003, toolCallCount: 1, stepCompletionRecorded: false })
+      estimatedCostUsd: 0.003, toolCallCount: 1, persistedToolCallCount: 1, usageDelta: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 },
+      stepCompletionRecorded: false, canonicalOutcomeResolved: false })
     expect(reads.readByInvocation).toHaveBeenCalledOnce()
     expect(reads.readByInvocation).toHaveBeenCalledWith(expect.objectContaining({ userId: identity.userId, sessionId: identity.sessionId,
       turnId, stepId, taskId: rootTaskId, rootTaskId, ownerId: identity.ownerId, leaseVersion: identity.leaseVersion,
       targetTaskIds: ["child-1"], mode: "all", timeoutMs: 10_000, idempotencyKey: "wait-key" }), "restored_inflight_root")
   })
 
-  it("does not recover when the exact canonical two-field outcome is already restored", async () => {
+  it("marks an exact ready projection resolved without losing its call or usage accounting", async () => {
     const value = state({ status: "waiting_for_tool", stepUsage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 } })
     const result = { waitId, status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
     const projection = projectDurableWaitOutcome(waitId, { value: toRepositoryJson(result), taskIds: ["child-1"], mode: "all" })
     const observations = [...value.observations, projection]
     const reads = reader("ready")
     await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
-      observations, snapshot: snapshot(observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") })).resolves.toBeUndefined()
+      observations, snapshot: snapshot(observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") }))
+      .resolves.toMatchObject({ status: "ready", canonicalOutcomeResolved: true, toolCallCount: 1, usageDelta: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } })
     expect(reads.readByInvocation).toHaveBeenCalledOnce()
   })
 
-  it("accepts an exact consumed interrupted projection without suspending the resumed Step", async () => {
+  it("marks an exact consumed interrupted projection resolved without another suspension", async () => {
     const value = state({ status: "waiting_for_tool", stepUsage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 } })
     const result = {
       waitId, status: "interrupted", targetTaskIds: ["child-1"], matchedTaskIds: [],
@@ -103,8 +107,72 @@ describe("canonical archived-wait state recovery", () => {
     const observations = [...value.observations, projection]
     const reads = reader("interrupted")
     await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
-      observations, snapshot: snapshot(observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") })).resolves.toBeUndefined()
+      observations, snapshot: snapshot(observations), reader: reads.value, now: new Date("2026-10-11T12:00:30.000Z") }))
+      .resolves.toMatchObject({ status: "interrupted", canonicalOutcomeResolved: true })
     expect(reads.readByInvocation).toHaveBeenCalledOnce()
+  })
+
+  it("admits only a receipt-counted streaming Root prefix ending at the exact archived wait", async () => {
+    const value = state({ status: "streaming", modelToolCallCount: 3 }), reads = reader()
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
+      observations: value.observations, snapshot: snapshot(value.observations), reader: reads.value,
+      now: new Date("2026-10-11T12:00:30.000Z") })).resolves.toMatchObject({
+      stepStatus: "streaming", toolCallCount: 3, persistedToolCallCount: 1,
+      usageDelta: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 },
+    })
+    expect(reads.readByInvocation).toHaveBeenCalledOnce()
+
+    const noCount = state({ status: "streaming", modelToolCallCount: null }), unread = reader()
+    await expect(recover(noCount, { reader: unread.value })).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(unread.readByInvocation).not.toHaveBeenCalled()
+    const underCount = state({ status: "streaming", modelToolCallCount: 0 })
+    await expect(recover(underCount)).rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+
+  it("requires exact Root identities throughout a streaming prefix but retains legacy running Step compatibility", async () => {
+    const streaming = state({ status: "streaming", modelToolCallCount: 1 })
+    const cases = [
+      { rejects: false, step: { ...streaming.step, taskId: null }, items: streaming.items, events: streaming.events },
+      { rejects: false, step: { ...streaming.step, taskId: "foreign-root" }, items: streaming.items, events: streaming.events },
+      { rejects: true, step: streaming.step, items: streaming.items.map(item => item.type === "tool_call" ? { ...item, taskId: null } : item), events: streaming.events },
+      { rejects: false, step: streaming.step, items: streaming.items.map(item => item.type === "tool_call" ? { ...item, taskId: "foreign-root" } : item), events: streaming.events },
+      { rejects: true, step: streaming.step, items: streaming.items.map(item => item.type === "tool_result" ? { ...item, taskId: null } : item), events: streaming.events },
+      { rejects: false, step: streaming.step, items: streaming.items.map(item => item.type === "tool_result" ? { ...item, taskId: "foreign-root" } : item), events: streaming.events },
+      { rejects: true, step: streaming.step, items: streaming.items, events: streaming.events.map(event => event.type === "tool_call.completed" ? { ...event, taskId: null } : event) },
+      { rejects: true, step: streaming.step, items: streaming.items, events: streaming.events.map(event => event.type === "tool_call.completed" ? { ...event, taskId: "foreign-root" } : event) },
+    ]
+    for (const value of cases) {
+      const reads = reader()
+      const recovered = recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: value.items, events: value.events,
+        observations: streaming.observations, snapshot: snapshot(streaming.observations), reader: reads.value,
+        now: new Date("2026-10-11T12:00:30.000Z") })
+      if (value.rejects) await expect(recovered).rejects.toMatchObject({ code: "persistence_conflict" })
+      else await expect(recovered).resolves.toBeUndefined()
+      expect(reads.readByInvocation).not.toHaveBeenCalled()
+    }
+
+    const legacyStep = state({ status: "running", stepTaskId: null })
+    const legacyItems = legacyStep.items.map(item => ({ ...item, taskId: null }))
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [legacyStep.step], items: legacyItems, events: legacyStep.events,
+      observations: legacyStep.observations, snapshot: snapshot(legacyStep.observations), reader: reader().value,
+      now: new Date("2026-10-11T12:00:30.000Z") })).resolves.toMatchObject({ stepStatus: "running", waitId })
+  })
+
+  it("accepts the server Step completion count for a persisted prefix and rejects a wait not at its end", async () => {
+    const value = state({ status: "waiting_for_tool", modelToolCallCount: 3,
+      stepUsage: { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 } })
+    const completion = { id: "step-completed", type: "step.completed", actor: "orchestrator", userId: identity.userId,
+      sessionId: identity.sessionId, turnId, taskId: rootTaskId, itemId: null, correlationId: stepId, causationId: "tool-done",
+      idempotencyKey: `turn:${turnId}:event:step-completed:${stepId}`, sequence: "5",
+      payload: { stepId, status: "waiting_for_dependency", toolCallCount: 3, taskId: rootTaskId } }
+    const completed = await recover(value, { events: [...value.events, completion] })
+    expect(completed).toMatchObject({ toolCallCount: 3, persistedToolCallCount: 1, stepCompletionRecorded: true })
+
+    const later = { id: "tail-call-item", type: "tool_call", status: "completed", stepId, taskId: rootTaskId,
+      content: { toolCallId: "tail-call", toolName: "agent.plan", input: {}, status: "completed" } }
+    await expect(recoverCanonicalArchivedWaitControl({ identity, steps: [value.step], items: [...value.items, later],
+      events: value.events, observations: value.observations, snapshot: snapshot(value.observations), reader: reader().value,
+      now: new Date("2026-10-11T12:00:30.000Z") })).rejects.toMatchObject({ code: "persistence_conflict" })
   })
 
   it.each([
@@ -151,6 +219,12 @@ describe("canonical archived-wait state recovery", () => {
       value.events.map(event => event.id === "model-usage" ? { ...event, causationId: "foreign-event" } : event),
     ]
     for (const events of cases) await expect(recover(value, { events })).rejects.toMatchObject({ code: "persistence_conflict" })
+  })
+
+  it("requires model usage to precede the archived wait completion event", async () => {
+    const value = state()
+    const events = value.events.map(event => event.id === "model-usage" ? { ...event, sequence: "5" } : event)
+    await expect(recover(value, { events })).rejects.toMatchObject({ code: "persistence_conflict" })
   })
 
   it("requires an exact reader before interpreting any matching outcome projection", async () => {

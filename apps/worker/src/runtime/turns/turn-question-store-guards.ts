@@ -5,6 +5,7 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertSessionWorkAdmission, OPEN_SESSION } from "../session-gate.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
 import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionUsageInput, type TurnQuestionWaitInput } from "./turn-question-contract.js"
+import { parseModelCompletedReceipt } from "./model-completed-receipt.js"
 
 export type TurnQuestionPool = Pick<pg.Pool, "connect">
 export type TurnQuestionClient = Pick<pg.PoolClient, "query" | "release">
@@ -164,9 +165,10 @@ async function questionModelUsage(client: TurnQuestionQueryClient, owner: TurnEx
   const receipts = types.map((type, index) => {
     const row = byType.get(type), payload = row && record(row.payload), sequence = eventSequence(row?.sequence)
     const expected = type === "model.usage" ? ["provider", "model", "usage", "taskId"] : ["taskId", "provider", "model"]
+    const payloadValid = type === "model.completed" ? !!parseModelCompletedReceipt(payload) : !!payload && exactKeys(payload, expected)
     if (!row || typeof row.id !== "string" || !row.id.trim() || row.sessionId !== owner.sessionId || row.turnId !== owner.turnId
       || row.taskId !== owner.taskId || row.itemId !== null || row.actor !== "orchestrator" || row.correlationId !== stepId
-      || row.idempotencyKey !== keys[index] || !payload || !exactKeys(payload, expected) || payload.taskId !== owner.taskId
+      || row.idempotencyKey !== keys[index] || !payload || !payloadValid || payload.taskId !== owner.taskId
       || typeof payload.provider !== "string" || !payload.provider || typeof payload.model !== "string" || !payload.model || sequence === null) {
       throw new TurnQuestionStoreError("question_usage_unavailable", "Persisted ask_user call has no exact model receipt chain")
     }
