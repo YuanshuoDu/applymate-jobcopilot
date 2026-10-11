@@ -3076,6 +3076,40 @@ function repairWaitOutcomeFromRequest(
 }
 
 type RepairWaitReference = { readonly id: string; readonly sizeBytes: number; readonly sha256: string }
+type RepairWaitFailureClass =
+  | "reference_invalid" | "read_limit" | "read_identity" | "chunk_invalid" | "cursor_invalid"
+  | "digest_invalid" | "json_invalid" | "wait_call_mismatch" | "wait_receipt_mismatch"
+  | "wait_outcome_missing" | "wait_target_mismatch" | "targets_missing" | "reader_not_visible"
+  | "read_budget_exceeded" | "other"
+const REPAIR_WAIT_FAILURE_CLASSES: Readonly<Record<string, RepairWaitFailureClass>> = {
+  repair_wait_reference_invalid: "reference_invalid",
+  repair_wait_reference_read_limit: "read_limit",
+  repair_wait_reference_read_identity: "read_identity",
+  repair_wait_reference_chunk_invalid: "chunk_invalid",
+  repair_wait_reference_cursor_invalid: "cursor_invalid",
+  repair_wait_reference_digest_invalid: "digest_invalid",
+  repair_wait_reference_json_invalid: "json_invalid",
+  "Repair wait call did not match the accepted plan task IDs": "wait_call_mismatch",
+  "Repair wait receipt did not match the accepted plan task IDs": "wait_receipt_mismatch",
+  "Repair wait did not expose its exact resolved wait outcome": "wait_outcome_missing",
+  "Resolved repair wait did not cover the exact accepted plan task IDs": "wait_target_mismatch",
+  "repair fixture lost accepted wait targets": "targets_missing",
+  "repair wait reference reader was not visible to the model": "reader_not_visible",
+  "repair wait reference exceeded its bounded read budget": "read_budget_exceeded",
+}
+
+function repairWaitFailureClass(error: unknown): RepairWaitFailureClass {
+  if (!(error instanceof Error) || !Object.prototype.hasOwnProperty.call(REPAIR_WAIT_FAILURE_CLASSES, error.message)) {
+    return "other"
+  }
+  return REPAIR_WAIT_FAILURE_CLASSES[error.message]
+}
+
+function repairWaitReferenceSizeBytes(value: unknown): number | null {
+  const size = record(value)?.sizeBytes
+  return Number.isSafeInteger(size) && Number(size) >= 0 && Number(size) <= 1024 * 1024 ? Number(size) : null
+}
+
 type RepairWaitOutputResolution =
   | { readonly status: "inline"; readonly output: unknown }
   | { readonly status: "read"; readonly reference: RepairWaitReference; readonly cursor?: string }
@@ -6065,6 +6099,19 @@ describe("TaskGraph repair wait model-visible outcome fixture", () => {
         { toolUseId: "wait:wait-repair-2", value: { ...directReady, waitId: "other-wait" } },
       ]), "waiting-call", taskIds,
     )).toThrow("exact resolved wait outcome")
+  })
+
+  it("projects only bounded wait-reference diagnostics", () => {
+    expect(repairWaitReferenceSizeBytes({ $ref: "private-reference-id", sizeBytes: 18_433, sha256: "private-digest" })).toBe(18_433)
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: -1 })).toBeNull()
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: 1.5 })).toBeNull()
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: 1_048_576 })).toBe(1_048_576)
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: 1_048_577 })).toBeNull()
+    expect(repairWaitReferenceSizeBytes({ sizeBytes: "private-value" })).toBeNull()
+    expect(repairWaitFailureClass(new Error("repair_wait_reference_invalid"))).toBe("reference_invalid")
+    expect(repairWaitFailureClass(new Error("__proto__"))).toBe("other")
+    expect(repairWaitFailureClass(new Error("constructor"))).toBe("other")
+    expect(repairWaitFailureClass(new Error("private provider or result text"))).toBe("other")
   })
 
   it("reassembles the exact bounded wait JSON from model-visible reference reads", () => {
@@ -10892,6 +10939,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const repairWaitReadCallIds: string[] = []
     const repairWaitReadCallIdsByWaitCall = new Map<string, string[]>()
     let repairWaitReferenceObserved = false
+    let repairWaitReferenceSize: number | null = null
+    let repairWaitFailure: RepairWaitFailureClass | null = null
+    let repairWaitReaderVisible: boolean | null = null
+    let repairWaitResolutionReturned = false
+    let repairWaitResolvedOutcomeObserved = false
     let secondJobSeeded = false
     let initialPlanTaskIds: string[] | undefined
     let terminalGateLease: TurnLease | undefined
@@ -10954,13 +11006,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 throw new Error("repair fixture lost accepted wait targets")
               }
               const readCallIds = repairWaitReadCallIdsByWaitCall.get(previousRepairWaitCallId) ?? []
-              const resolution = repairWaitOutputResolutionFromRequest(request, previousRepairWaitCallId, readCallIds)
+              repairWaitReferenceSize = repairWaitReferenceSizeBytes(latestToolResult(request, previousRepairWaitCallId))
+              let resolution: RepairWaitOutputResolution
+              try { resolution = repairWaitOutputResolutionFromRequest(request, previousRepairWaitCallId, readCallIds) }
+              catch (error: unknown) { repairWaitFailure = repairWaitFailureClass(error); throw error }
+              repairWaitResolutionReturned = true
               if (resolution.status === "read") {
                 repairWaitReferenceObserved = true
-                if (!Array.isArray(request.tools) || !request.tools.some(tool => record(tool)?.name === "tool_results.read")) {
+                repairWaitReaderVisible = Array.isArray(request.tools) && request.tools.some(tool => record(tool)?.name === "tool_results.read")
+                if (!repairWaitReaderVisible) {
+                  repairWaitFailure = "reader_not_visible"
                   throw new Error("repair wait reference reader was not visible to the model")
                 }
                 if (repairWaitReadCallIds.length >= VERIFICATION_REPAIR_MAX_REFERENCE_READS) {
+                  repairWaitFailure = "read_budget_exceeded"
                   throw new Error("repair wait reference exceeded its bounded read budget")
                 }
                 const readCallId = `${previousRepairWaitCallId}:read:${readCallIds.length + 1}`
@@ -10975,9 +11034,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 return
               }
               if (resolution.status === "complete") repairWaitReferenceObserved = true
-              previousRepairWait = repairWaitOutcomeFromRequest(
-                request, previousRepairWaitCallId, [...repairTaskIds, ...dependentTaskIds], resolution.output,
-              )
+              try {
+                previousRepairWait = repairWaitOutcomeFromRequest(
+                  request, previousRepairWaitCallId, [...repairTaskIds, ...dependentTaskIds], resolution.output,
+                )
+              } catch (error: unknown) { repairWaitFailure = repairWaitFailureClass(error); throw error }
+              repairWaitResolvedOutcomeObserved = true
               repairWaitStatuses.push(String(previousRepairWait.status))
             }
             const repairWaitNeedsPoll = !previousRepairWaitCallId
@@ -11290,6 +11352,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
+        { label: "repairWaitReferenceSizeBytes", value: "", safeValue: repairWaitReferenceSize === null ? "unknown" : String(repairWaitReferenceSize) },
+        { label: "repairWaitFailureClass", value: "", safeValue: repairWaitFailure ?? "not_observed" },
+        { label: "repairWaitReaderVisible", value: "", safeValue: repairWaitReaderVisible === null ? "not_checked" : String(repairWaitReaderVisible) },
+        { label: "repairWaitReadCallCount", value: "", safeValue: String(Math.min(VERIFICATION_REPAIR_MAX_REFERENCE_READS, repairWaitReadCallIds.length)) },
+        { label: "repairWaitResolutionReturned", value: "", safeValue: String(repairWaitResolutionReturned) },
+        { label: "repairWaitResolvedOutcomeObserved", value: "", safeValue: String(repairWaitResolvedOutcomeObserved) },
+        { label: "repairWaitReferenceObserved", value: "", safeValue: String(repairWaitReferenceObserved) },
         { label: "waitToolResults", value: "", safeValue: JSON.stringify(waitResults) },
         { label: "rootFailureEvidence", value: "", safeValue: JSON.stringify(rootFailure) },
         { label: "taskGraphVerdictEvidence", value: "", safeValue: JSON.stringify(verification) },
