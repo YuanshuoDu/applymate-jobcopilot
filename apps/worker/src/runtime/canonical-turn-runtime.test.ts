@@ -686,6 +686,202 @@ describe("createCanonicalTurnRuntime", () => {
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
+  it("authors a current typed repair without a Root ID and leaves completion gated until proof exists", async () => {
+    const serverRootId = "server-only-root-749"
+    const originalText = "Find one evidence-bound software role in Germany."
+    const questionText = "Should I prioritize Germany?"
+    const answerText = "Yes, Germany."
+    const steerText = "Prefer remote roles and keep the employer source link."
+    const originalInput: StoredAgentInput = {
+      id: "repair-original-root-input", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "repair-original-client", delivery: "follow_up", status: "consumed",
+      content: [{ type: "text", text: originalText }], acceptedSequence: 1n, consumedByStepId: "prior-step",
+      consumedAt: new Date("2026-09-07T00:00:00.000Z"), createdAt: new Date("2026-09-07T00:00:00.000Z"),
+    }
+    const steer: StoredAgentInput = {
+      id: "repair-current-steer-input", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "repair-steer-client", delivery: "steer", status: "consumed",
+      content: [{ type: "text", text: steerText }], acceptedSequence: 3n, consumedByStepId: "prior-step",
+      consumedAt: new Date("2026-09-07T00:00:01.000Z"), createdAt: new Date("2026-09-07T00:00:01.000Z"),
+    }
+    let steerReconciled = false
+    const transaction: InputClaimTransaction = {
+      getCheckpoint: async () => ({ inputThroughSequence: 3n, consumedInputIds: [] }),
+      claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+      persistCheckpoint: async () => undefined,
+      loadRootInputContext: async request => request.inputId === originalInput.id ? originalInput : null,
+      loadUnresolvedSteeringInputs: async () => steerReconciled ? [] : [steer],
+    }
+    const inputStore: InputClaimStore = { scope: { userId: lease.userId }, withTransaction: async work => work(transaction) }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const builder = new StepContextBuilder(inputStore, ownerFence, () => new Date("2026-09-07T00:00:02.000Z"), {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: serverRootId, parentTaskId: serverRootId,
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+      rootInputId: originalInput.id,
+    })
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+    } as const
+    const failedReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" as const, reasonCode: "criterion_not_met" as const,
+      criteria: [{ criterionId: "candidate-count", status: "failed" as const, reasonCode: "criterion_not_met" as const }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+    }
+    const target = {
+      key: "research", templateId: "scout", goal: "Find one evidence-bound software role in Germany.",
+      successCriteria: ["Return at least one employer source link"], dependsOn: [], taskId: "current-scout-task-749",
+      status: "failed" as const, readiness: "terminal" as const, resultSummary: null,
+      resultProjection: {
+        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "available" as const,
+        role: "scout" as const, status: "partial" as const, candidateCount: 0, evidenceCount: 0, candidates: [],
+      }, verificationCriterionIds: ["candidate-count"], verificationReport: failedReport, failureReason: null,
+    }
+    const repair = {
+      key: "research-repair", templateId: "scout", goal: "Find one new evidence-bound role after the criterion failure.",
+      successCriteria: ["Return at least one employer source link"], dependsOn: [], taskId: "queued-repair-task-749",
+      status: "queued" as const, readiness: "ready" as const, resultSummary: null,
+      resultProjection: {
+        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "unavailable" as const,
+      }, verificationCriterionIds: ["candidate-count"],
+      repairOf: { graphRootTaskId: serverRootId, nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-count"] },
+      failureReason: null,
+    }
+    const repairProposal = {
+      expectedRevision: 5,
+      nodes: [{ key: repair.key, templateId: "scout", goal: repair.goal, successCriteria: [...repair.successCriteria], dependsOn: [],
+        verification, repairOf: { nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-count"] } }],
+    }
+    const priorPlanInput = {
+      expectedRevision: 4,
+      nodes: [{ key: target.key, templateId: "scout", goal: target.goal, successCriteria: [...target.successCriteria], dependsOn: [], verification }],
+    }
+    const priorPlanObservation = {
+      id: "tool-result:prior-plan-749",
+      content: {
+        toolCallId: "prior-plan-call-749", toolName: "agent.plan", input: priorPlanInput, status: "completed",
+        output: { status: "accepted", revision: 5, nodes: [{ key: target.key, taskId: target.taskId, status: "queued" }], readyTaskIds: [target.taskId] },
+      },
+    }
+    let graphRevision = 5
+    const scopes: TaskGraphReadScope[] = []
+    const readCurrent = vi.fn(async (scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> => {
+      scopes.push(scope)
+      return { revision: graphRevision, nodes: graphRevision === 5 ? [target] : [target, repair] }
+    })
+    const appendAndScheduleWithReconciliation = vi.fn(async (input: TaskGraphScheduleInput, operation: SteeringReconciliationOperation) => {
+      steerReconciled = true
+      graphRevision = 6
+      return { status: "accepted" as const, revision: 6, nodes: input.proposal.nodes.map(node => ({ key: node.key, taskId: "queued-repair-task-749", status: "queued" as const })), readyTaskIds: ["queued-repair-task-749"] }
+    })
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => { throw new Error("raw planning port must not be used") }),
+      appendAndScheduleWithReconciliation,
+      reconcileSteering: vi.fn(async () => ({ decision: "keep" as const, revision: graphRevision, reconciledInputCount: 0 })),
+      readCurrent,
+    }
+    const questionId = "question-wait-749"
+    const questionEntryId = "agent-question:question-item-749:question"
+    const answerEntryId = "agent-question:question-item-749:answer"
+    const planningSummary = { observedPlanRevision: 4, graphRevisionAtAsk: 4, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "3" }
+    const requests: HarnessModelRequest[] = []
+    const stateLoader = async () => state({
+      goal: originalText, rootInputId: originalInput.id,
+      snapshot: {
+        system: [], profile: [], businessRefs: [],
+        toolObservations: [priorPlanObservation],
+        steerHistory: [
+          { id: questionEntryId, content: { role: "assistant", type: "question", question: questionText, options: [{ label: "Germany", value: "de" }] } },
+          { id: answerEntryId, content: { role: "user", type: "answer", questionId, text: answerText } },
+        ],
+        planningClarifications: [planningSummary],
+        planningClarificationHistoryPair: { questionEntryId, answerEntryId },
+      },
+    })
+    const roots = {
+      ...rootStore(),
+      ensure: vi.fn(async () => ({ id: serverRootId, attemptCount: 1 } as never)),
+      checkCompletion: vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "The current repair has no fresh verification proof." })),
+    }
+    const events: RuntimeEvent[] = []
+    const turnStore = store(events)
+    const persistFinal = vi.spyOn(turnStore, "recordFinalResponse")
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }), taskGraphCommandPort: commandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => undefined, stateLoader, rootTaskStore: roots as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(), turnEngineStoreFactory: () => turnStore,
+      contextBuilderFactory: () => ({ build: request => builder.build(request) }),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          if (requests.length === 1) {
+            yield { type: "tool_call_completed", callId: "model-repair-call-749", name: "agent.plan", arguments: repairProposal }
+            yield { type: "completed", finishReason: "tool_calls" }
+          } else {
+            yield { type: "text_delta", text: "The new repair task has no result yet." }
+            yield { type: "completed", finishReason: "stop" }
+          }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    const result = await runtime.execute({ lease, signal: new AbortController().signal })
+    expect(appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    const [scheduled, operation] = appendAndScheduleWithReconciliation.mock.calls[0]!
+    expect(scheduled.proposal.expectedRevision).toBe(5)
+    expect(scheduled.proposal.nodes[0]?.repairOf).toEqual({
+      graphRootTaskId: serverRootId, nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-count"],
+    })
+    expect(operation).toMatchObject({ decision: "revise", expectedRevision: 5, callId: "model-repair-call-749", rootInputId: originalInput.id })
+    expect(operation.scope.rootTaskId).toBe(serverRootId)
+    expect(scopes.every(scope => scope.rootTaskId === serverRootId)).toBe(true)
+    const firstRequest = requests[0]
+    expect(firstRequest).toBeDefined()
+    const firstMessages = JSON.stringify(firstRequest?.messages)
+    const firstText = firstRequest?.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const currentGraphPart = firstRequest?.messages.flatMap(message => message.content)
+      .find(part => part.type === "text" && part.text.includes('"kind":"task_graph_current"'))
+    if (!currentGraphPart || currentGraphPart.type !== "text") throw new Error("first model request omitted its current TaskGraph observation")
+    const currentGraphJson = currentGraphPart.text.slice(currentGraphPart.text.indexOf("\n") + 1)
+    const currentGraph: unknown = JSON.parse(currentGraphJson)
+    expect(currentGraph).toMatchObject({
+      kind: "task_graph_current", revision: 5,
+      nodes: expect.arrayContaining([expect.objectContaining({
+        key: target.key, taskId: target.taskId, verificationCriterionIds: ["candidate-count"],
+      })]),
+    })
+    expect(firstMessages).not.toContain(serverRootId)
+    expect(firstMessages).toContain(originalText)
+    expect(firstMessages).toContain(questionText)
+    expect(firstMessages).toContain(answerText)
+    expect(firstMessages).toContain(steerText)
+    expect(firstText).toContain('"graphRevisionAtAsk":4')
+    expect(firstText).toContain('"revision":5')
+    expect(firstText).toContain(target.taskId)
+    expect(firstText).toContain('"candidate-count"')
+    expect(firstMessages).toContain('"candidate-count"')
+    expect(firstMessages).toContain('"minimum":1')
+    const repairCall = repairProposal.nodes[0]!.repairOf
+    expect(Object.hasOwn(repairCall, "graphRootTaskId")).toBe(false)
+    expect(requests).toHaveLength(4)
+    expect(result.status).toBe("failed")
+    expect(roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: serverRootId, taskGraphVerification: true }))
+    expect(events.some(event => event.type === "final.rejected" && JSON.stringify(event.payload).includes("task_graph_verification_unverified"))).toBe(true)
+    expect(persistFinal).toHaveBeenCalledOnce()
+    expect(persistFinal.mock.calls[0]?.[0].response).toContain('"completed":false')
+    expect(persistFinal.mock.calls[0]?.[0].terminal).toBeUndefined()
+    expect(events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
   it("revises through the registered planner after question recovery while carrying untrusted root background", async () => {
     const originalText = "Original request: find English-first, remote engineering roles in Germany and cite each employer source."
     const steerParts = [

@@ -10667,9 +10667,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               if (!repairPlanSent) {
                 if (!secondJobSeeded) { await insertJob(secondJobId); secondJobSeeded = true }
-                const turn = await pool!.query<{ rootTaskId: string | null }>(`SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId])
-                const graphRootTaskId = turn.rows[0]?.rootTaskId
-                if (!graphRootTaskId || !scout?.taskId || typeof graph?.revision !== "number") throw new Error("repair fixture lost its immutable root or target identity")
+                if (!scout?.taskId || typeof graph?.revision !== "number") throw new Error("repair fixture lost its current target identity")
                 const target = await pool!.query<{ result: unknown; status: string; failureReason: string | null }>(`SELECT "result", "status", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [scout.taskId, value.sessionId, value.turnId])
                 const taskResult = record(target.rows[0]?.result)
                 failedReportBeforeRepair = taskResult?.taskGraphVerificationReport
@@ -10687,7 +10685,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
                   expectedRevision: graph.revision,
                   nodes: [{ key: "scout-repair", templateId: "scout", goal: "Recheck after new owner evidence is available", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification,
-                    repairOf: { graphRootTaskId, nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
+                    repairOf: { nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
                 } }
                 yield { type: "completed", finishReason: "tool_calls" }
                 return
