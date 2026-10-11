@@ -1,7 +1,18 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi.fn(async () => undefined) }))
+const selectedJobHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
+vi.mock("./context/selected-job-history-store.js", () => ({ createPgSelectedJobHistoryStore: () => selectedJobHistory }))
+const selectedJobDirectHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
+vi.mock("./context/selected-job-history-direct-store.js", () => ({ createPgDirectSelectedJobHistoryStore: () => selectedJobDirectHistory }))
+const rootTaskHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
+vi.mock("./context/root-task-history-direct-store.js", () => ({ createPgDirectRootTaskHistoryStore: () => rootTaskHistory }))
+beforeEach(() => {
+  selectedJobHistory.load.mockReset().mockImplementation(async () => [])
+  selectedJobDirectHistory.load.mockReset().mockImplementation(async () => [])
+  rootTaskHistory.load.mockReset().mockImplementation(async () => [])
+})
 
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
@@ -13,7 +24,8 @@ import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
-import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
+import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
+import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
@@ -26,6 +38,8 @@ import { digestNativeVerificationValue } from "./subagents/native-verification-c
 import type { NativeVerificationEnsureResult, NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
+import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 import type { SteeringReconciliationOperation } from "./subagents/steering-reconciliation-contract.js"
@@ -138,6 +152,26 @@ function nativeVerificationRuntime(childStatus: "passed" | "failed" = "passed"):
     readRecoverableGoal: async () => null,
   }
   return { port, readTerminalProof: async () => true }
+}
+
+function failedRootHistoryOutcome(): ValidatedRootTaskHistoryOutcome {
+  return {
+    sourceTurnId: "private-history-turn", sourceRootTaskId: "private-history-root", terminalSequence: 11n,
+    taskGraph: {
+      revision: 7,
+      nodes: [{
+        key: "private-history-node", templateId: "scout", goal: "PRIVATE_HISTORY_GOAL", successCriteria: ["PRIVATE_HISTORY_CRITERION"],
+        dependsOn: [], taskId: "private-history-task", status: "failed", readiness: "terminal",
+        resultSummary: "PRIVATE_HISTORY_RESULT", failureReason: "PRIVATE_HISTORY_FAILURE",
+        verificationCriterionIds: ["candidate-count"],
+        verificationReport: {
+          verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+          criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+          evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+        },
+      }],
+    },
+  }
 }
 
 function waitBoundary() {
@@ -593,6 +627,9 @@ describe("createCanonicalTurnRuntime", () => {
     const names = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
     expect(names).toContain("agent.plan")
     expect(readCurrent).toHaveBeenCalledTimes(2)
+    expect(rootTaskHistory.load).toHaveBeenCalledWith(expect.objectContaining({
+      lease, rootTaskId: "root-1", rootAttemptCount: 1, stepId: expect.any(String), now: expect.any(Date),
+    }))
     expect(modelSnapshots[0]?.toolObservations).toContainEqual({
       id: "task-graph-current",
       content: {
@@ -727,13 +764,16 @@ describe("createCanonicalTurnRuntime", () => {
         }
       },
     }
+    const pastOutcome = failedRootHistoryOutcome()
+    rootTaskHistory.load.mockReset().mockImplementation(async () => [pastOutcome])
+    const verificationRuntime = nativeVerificationRuntime()
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
         ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
       }), nativeQuestionWaitEnabled: true, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
       selectedJobPreparationLoader: async () => undefined, stateLoader: async () => resumed, rootTaskStore: rootStore() as never,
-      nativeVerificationFactory: () => nativeVerificationRuntime(), turnEngineStoreFactory: () => questionStore,
+      nativeVerificationFactory: () => verificationRuntime, turnEngineStoreFactory: () => questionStore,
       contextBuilderFactory: () => ({ build: async request => { const context = await builder.build(request); contexts.push(context); return context } }),
       modelRuntimeFactory: async () => ({ adapter: modelAdapter, registry: {} as never, candidates: [] }),
       authorizeUsage: async () => ({ settle: async () => undefined }),
@@ -751,6 +791,34 @@ describe("createCanonicalTurnRuntime", () => {
     expect(tools).toEqual(expect.arrayContaining(["agent.plan", "agent.reconcile", "agent.ask_user"]))
     expect(contexts).toHaveLength(2)
     expect(contexts.map(context => context.taskGraphRevision)).toEqual([0, 1])
+    const historyBlocks = contexts.map(context => context.blocks.filter(block => block.content !== null
+      && typeof block.content === "object" && !Array.isArray(block.content) && block.content.kind === "root_task_history"))
+    expect(historyBlocks).toHaveLength(2)
+    for (const blocks of historyBlocks) {
+      expect(blocks).toHaveLength(1)
+      expect(blocks[0]).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent",
+        content: { kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+          turns: [{ label: "earlier terminal attempt", nodes: [{ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"] }] }] } })
+      const projected = JSON.stringify(blocks[0]?.content)
+      for (const privateValue of ["private-history-turn", "private-history-root", "PRIVATE_HISTORY", "criterionId", "evidenceDigest", "resultDigest", "verificationReport"]) {
+        expect(projected).not.toContain(privateValue)
+      }
+      expect(projected).not.toContain("PASS")
+    }
+    const requestPayloads = requests.map(request => JSON.stringify(request.messages))
+    expect(requestPayloads).toHaveLength(2)
+    for (const payload of requestPayloads) {
+      expect(payload).toContain("root_task_history")
+      expect(payload).toContain("advisoryOnly")
+      expect(payload).toContain("negativeReasonHints")
+      expect(payload).toContain("criterion_not_met")
+      expect(payload).not.toContain("PRIVATE_HISTORY")
+      expect(payload).not.toContain("private-history")
+    }
+    expect(rootTaskHistory.load).toHaveBeenCalledTimes(2)
+    const historyStepIds = rootTaskHistory.load.mock.calls.map(([input]) => (input as { stepId?: unknown }).stepId)
+    expect(historyStepIds).toHaveLength(2)
+    expect(new Set(historyStepIds).size).toBe(2)
     for (const context of contexts) {
       const reference = context.blocks.find(block => block.layer === "pending_input" && block.content !== null && typeof block.content === "object" && !Array.isArray(block.content) && block.content.inputId === originalInput.id)
       expect(reference).toMatchObject({ trust: "external_untrusted", content: { inputId: originalInput.id, text: originalText } })
@@ -799,6 +867,10 @@ describe("createCanonicalTurnRuntime", () => {
       expect(system).not.toContain("inputThroughSequence")
       expect(system).not.toContain(originalText)
     }
+    const firstSystem = requests[0]!.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(firstSystem).toContain("records a revise decision")
+    expect(firstSystem).toContain("explicit keep decision")
     expect(requestMessages[0]).toContain(steerParts[0])
     expect(requestMessages[0]).toContain(steerParts[1])
     expect(requestMessages[1]).not.toContain(steerParts[0])
@@ -1118,11 +1190,11 @@ describe("createCanonicalTurnRuntime", () => {
       .toContain('"artifact.version.read"')
   })
 
-  it("injects only the compacted selected-job memory after filtering into the next captured model request", async () => {
+  it("recalls prior same-job outcomes without compaction records into the next captured model request", async () => {
     const graph = {
       revision: 4,
       nodes: [{
-        key: "analyst-key", taskId: "analyst-task", templateId: "analyst", goal: "Analyze selected job", successCriteria: [], dependsOn: [],
+        key: "analyst-key", taskId: "analyst-task", templateId: "analyst", goal: "CURRENT_GRAPH_RUNTIME_SENTINEL", successCriteria: [], dependsOn: [],
         status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
         resultProjection: {
           schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
@@ -1131,25 +1203,58 @@ describe("createCanonicalTurnRuntime", () => {
         },
       }],
     }
-    const selectedMemory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
-    const otherJobMemory = projectSelectedJobMemory({ jobId: "job-other", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
+    const priorGraph = { ...graph, nodes: graph.nodes.map(node => ({ ...node, resultProjection: {
+      ...node.resultProjection, findings: [{ jobId: "job-1", score: 6.5, evidenceKinds: ["job"] }],
+    } })) }
+    const priorHistory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", throughSequence: "9", graph: priorGraph })!
+    const failedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "failed", criteria: [
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+        { status: "failed", reasonCode: "criterion_not_met" },
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+      ] },
+    }
+    const unverifiedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "unverified", criteria: [
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+      ] },
+    }
+    const outcomes: ValidatedSelectedJobHistoryOutcome[] = [
+      { jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: [failedNode] },
+      { jobId: "job-1", sourceTurnId: "private-unverified-turn", sourceRootTaskId: "private-unverified-root", terminalSequence: 28n, nodes: [unverifiedNode] },
+    ]
     const currentGraph = graph as unknown as TaskGraphCurrentState
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 4, nodes: [], readyTaskIds: [] })),
       readCurrent: vi.fn(async () => currentGraph),
     }
     const requests: HarnessModelRequest[] = []
+    const events: RuntimeEvent[] = []
+    let eventTypesAtHistoryRead: string[] = []
+    selectedJobDirectHistory.load.mockReset()
+    selectedJobDirectHistory.load.mockImplementation(async () => {
+      eventTypesAtHistoryRead = events.map(event => event.type)
+      return outcomes
+    })
     const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+    const compactionRunner = vi.fn(async () => ({ status: "compacted" }))
     const planningTools = tools(true)
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", productionFlags: flags, coordinationEnabled: true, taskGraphCommandPort: commandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
       stateLoader: async () => ({
-        ...selectedJobState(), toolPolicySnapshot: {}, selectedJobMemories: [selectedMemory, otherJobMemory],
-        snapshot: { ...selectedJobState().snapshot, toolObservations: [{ id: "unrelated-search", content: { toolName: "jobs.search", output: "must be filtered" } }] },
+        ...selectedJobState(), toolPolicySnapshot: {}, selectedJobMemories: [],
+        snapshot: { ...selectedJobState().snapshot, toolObservations: [
+          { id: "task-graph-current", content: { kind: "task_graph_current", revision: graph.revision, nodes: graph.nodes } },
+          { id: "unrelated-search", content: { toolName: "jobs.search", output: "must be filtered" } },
+        ] },
       }),
       rootTaskStore: rootStore() as never, toolRuntimeFactory: () => ({ ...planningTools, registry: { ...planningTools.registry, register: vi.fn() } }) as never,
-      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+      turnBoundaryCompactionRunner: compactionRunner,
       modelRuntimeFactory: async () => ({ adapter: {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
@@ -1159,10 +1264,255 @@ describe("createCanonicalTurnRuntime", () => {
 
     await runtime.execute({ lease, signal: new AbortController().signal })
     const requestText = requests[0]?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
-    expect(requestText).toContain("selected_job_memory")
-    expect(requestText).toContain('"score":8')
-    expect(requestText).not.toContain("job-other")
+    expect(requestText).toContain("selected_job_history")
+    expect(requestText).toContain('"reasonHints":["criterion_not_met","reported_score_below_minimum"]')
+    expect(requestText).toContain('"reasonHints":["canonical_evidence_missing"]')
+    expect(requestText).toContain('"score":6.5')
+    expect(requestText).toContain("CURRENT_GRAPH_RUNTIME_SENTINEL")
+    expect(requestText).not.toContain("selected_job_memory")
+    expect(eventTypesAtHistoryRead).toContain("turn.started")
+    expect(eventTypesAtHistoryRead).toContain("step.started")
+    expect(eventTypesAtHistoryRead.indexOf("turn.started")).toBeLessThan(eventTypesAtHistoryRead.indexOf("step.started"))
+    const loadedStepId = (selectedJobDirectHistory.load.mock.calls[0]?.[0] as { stepId?: unknown } | undefined)?.stepId
+    const startedStep = events.find(event => event.type === "step.started")
+    expect(loadedStepId).toBe((startedStep?.payload as { stepId?: unknown } | undefined)?.stepId)
+    expect(selectedJobDirectHistory.load).toHaveBeenCalledTimes(1)
+    expect(selectedJobDirectHistory.load.mock.calls[0]?.[0]).not.toHaveProperty("records")
+    expect(selectedJobHistory.load).not.toHaveBeenCalled()
+    expect(compactionRunner).not.toHaveBeenCalled()
+    expect(flags.turnBoundaryCompactionEnabled).toBe(false)
+    expect(requestText).not.toContain("private-prior-turn")
+    expect(requestText).not.toContain("private-prior-root")
+    expect(requestText).not.toContain("private-unverified-turn")
+    expect(requestText).not.toContain("private-unverified-root")
+    expect(requestText).not.toContain("verification")
+    expect(requestText).not.toContain("criteria")
+    expect(requestText).not.toContain("criteria_met")
+    expect(requestText).not.toContain("criterionId")
+    expect(requestText).not.toContain("evidenceDigest")
+    expect(requestText).not.toContain("resultDigest")
+    expect(requestText).not.toContain("PASS")
     expect(requestText).not.toContain("must be filtered")
+  })
+
+  it("keeps selected-job history advisory across full current context and successive model requests", async () => {
+    const graph = {
+      revision: 4,
+      nodes: [{
+        key: "analyst-key", taskId: "analyst-task", templateId: "analyst", goal: "CURRENT_GRAPH_WITH_MEMORY", successCriteria: [], dependsOn: [],
+        status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+        resultProjection: {
+          schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+          role: "analyst", status: "completed", findingCount: 1, evidenceCount: 1,
+          findings: [{ jobId: "job-1", score: 8, evidenceKinds: ["job"] }],
+        },
+      }],
+    }
+    const sameTurnMemory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
+    const otherJobGraph = { ...graph, nodes: graph.nodes.map(node => ({ ...node, resultProjection: {
+      ...node.resultProjection, findings: [{ jobId: "other-job-559", score: 9, evidenceKinds: ["job"] }],
+    } })) }
+    const otherJobMemory = projectSelectedJobMemory({ jobId: "other-job-559", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "20", graph: otherJobGraph })!
+    const priorGraph = { ...graph, nodes: graph.nodes.map(node => ({ ...node, resultProjection: {
+      ...node.resultProjection, findings: [{ jobId: "job-1", score: 6.5, evidenceKinds: ["job"] }],
+    } })) }
+    const priorHistory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", throughSequence: "9", graph: priorGraph })!
+    const failedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "failed", criteria: [
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+        { status: "failed", reasonCode: "criterion_not_met" },
+        { status: "failed", reasonCode: "reported_score_below_minimum" },
+      ] },
+    }
+    const unverifiedNode: SelectedJobMemoryNode = {
+      ...priorHistory.nodes[0]!, status: "failed",
+      verification: { status: "unverified", criteria: [
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+        { status: "unverified", reasonCode: "canonical_evidence_missing" },
+      ] },
+    }
+    const outcomes: ValidatedSelectedJobHistoryOutcome[] = [
+      { jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: [failedNode] },
+      { jobId: "job-1", sourceTurnId: "private-unverified-turn", sourceRootTaskId: "private-unverified-root", terminalSequence: 28n, nodes: [unverifiedNode] },
+    ]
+    const freshSteer: StoredAgentInput = {
+      id: "accepted-fresh-steer", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "fresh-steer-message", delivery: "steer", status: "accepted",
+      content: [{ type: "text", text: "CURRENT_STEERING_MEMORY_SENTINEL: prioritize Dublin" }], acceptedSequence: 3n,
+      consumedByStepId: null, consumedAt: null, createdAt: lease.leaseStartedAt,
+    }
+    const originalText = "Original request: find English-first remote engineering roles across Germany and Ireland; verify employers and salary expectations before recommending any result."
+    const originalInput: StoredAgentInput = {
+      id: "selected-original-root", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "selected-original-client", delivery: "follow_up", status: "consumed",
+      content: [{ type: "text", text: originalText }], acceptedSequence: 1n,
+      consumedByStepId: "selected-prior-step", consumedAt: lease.leaseStartedAt, createdAt: lease.leaseStartedAt,
+    }
+    const questionEntryId = "agent-question:selected-question:question"
+    const answerEntryId = "agent-question:selected-question:answer"
+    const questionText = "Which country should I prioritize?"
+    const answerText = "Dublin, Ireland."
+    const planningSummary = { observedPlanRevision: 4, graphRevisionAtAsk: 4, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "2" }
+    const questionHistory = [
+      { id: questionEntryId, content: { role: "assistant", type: "question", question: questionText, options: [{ label: "Ireland", value: "ie" }] } },
+      { id: answerEntryId, content: { role: "user", type: "answer", questionId: "selected-wait", text: answerText } },
+    ]
+    let cursor = 2n, steerClaimed = false
+    const checkpoints: Array<{ inputThroughSequence: bigint; consumedInputIds: readonly string[] }> = []
+    const events: RuntimeEvent[] = []
+    const runtimeClaimStore: InputClaimStore = {
+      scope: { userId: lease.userId },
+      withTransaction: work => work({
+        getCheckpoint: async () => ({ inputThroughSequence: cursor, consumedInputIds: [] }),
+        claimInputs: async () => {
+          if (steerClaimed) return { inputs: [], newlyClaimedInputIds: [] }
+          steerClaimed = true
+          return { inputs: [freshSteer], newlyClaimedInputIds: [freshSteer.id] }
+        },
+        persistCheckpoint: async input => { cursor = input.checkpoint.inputThroughSequence; checkpoints.push(input.checkpoint) },
+        loadRootInputContext: async input => input.inputId === originalInput.id ? originalInput : null,
+        loadUnresolvedSteeringInputs: async () => [freshSteer],
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const contexts: StepContext[] = []
+    const baseContextBuilder = new StepContextBuilder(runtimeClaimStore, ownerFence, () => lease.leaseStartedAt, {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+    })
+    const requests: HarnessModelRequest[] = []
+    const compactionRunner = vi.fn(async () => ({ status: "compacted" as const }))
+    selectedJobDirectHistory.load.mockReset().mockImplementation(async () => outcomes)
+    const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+    const planningTools = tools(true)
+    const selectedModel: ModelAdapter = {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "selected-history-read", name: "agent.list", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags: flags, coordinationEnabled: true,
+      taskGraphCommandPort: {
+        appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 4, nodes: [], readyTaskIds: [] })),
+        readCurrent: vi.fn(async () => graph as unknown as TaskGraphCurrentState),
+      },
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      stateLoader: async () => ({
+        ...selectedJobState(), goal: "CURRENT_GOAL_MEMORY_SENTINEL: find Dublin roles", rootInputId: originalInput.id,
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 2n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+        toolPolicySnapshot: {}, selectedJobMemories: [sameTurnMemory, otherJobMemory],
+        snapshot: { ...selectedJobState().snapshot, goal: { id: "goal-current", content: "CURRENT_GOAL_MEMORY_SENTINEL: find Dublin roles" },
+          steerHistory: questionHistory, planningClarifications: [planningSummary],
+          planningClarificationHistoryPair: { questionEntryId, answerEntryId },
+          toolObservations: [
+          { id: "task-graph-current", content: { kind: "task_graph_current", revision: graph.revision, nodes: graph.nodes } },
+        ] },
+      }),
+      rootTaskStore: rootStore() as never,
+      toolRuntimeFactory: () => ({ ...planningTools, registry: { ...planningTools.registry, register: vi.fn() } }) as never,
+      turnEngineStoreFactory: () => store(events), turnBoundaryCompactionRunner: compactionRunner, contextBuilderFactory: () => ({
+        build: async request => {
+          const context = await baseContextBuilder.build(request)
+          contexts.push(context)
+          return context
+        },
+      }),
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      modelRuntimeFactory: async () => ({ adapter: selectedModel, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await runtime.execute({ lease, signal: new AbortController().signal })
+    expect(requests).toHaveLength(2)
+    expect(contexts).toHaveLength(2)
+    expect(contexts.map(context => context.taskGraphRevision)).toEqual([4, 4])
+    const requestTexts = requests.map(request => request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n"))
+    const selectedHistoryBlocks = contexts.map(context => context.blocks.filter(block => block.content !== null
+      && typeof block.content === "object" && !Array.isArray(block.content) && block.content.kind === "selected_job_history"))
+    expect(selectedHistoryBlocks).toHaveLength(2)
+    for (let index = 0; index < selectedHistoryBlocks.length; index += 1) {
+      const blocks = selectedHistoryBlocks[index]!
+      expect(blocks).toHaveLength(1)
+      expect(blocks[0]).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
+      expect(JSON.stringify(blocks[0]?.content)).not.toMatch(/private-prior-turn|private-prior-root|private-unverified-turn|private-unverified-root|evidenceDigest|resultDigest|PASS/)
+      expect(requestTexts[index]).toContain("selected_job_history")
+    }
+    for (const context of contexts) {
+      const rootReference = context.blocks.filter(block => block.layer === "pending_input" && block.content !== null
+        && typeof block.content === "object" && !Array.isArray(block.content) && block.content.inputId === originalInput.id)
+      expect(rootReference).toHaveLength(1)
+      expect(rootReference[0]).toMatchObject({ trust: "external_untrusted", content: { inputId: originalInput.id, text: originalText } })
+      expect(context.blocks).toContainEqual({ id: "planning-clarification:latest-answered-question", layer: "steer_history", role: "data",
+        trust: "internal_record", source: "native_question_recovery", content: planningSummary })
+      expect(context.planningClarifications).toEqual([planningSummary])
+      expect(context.blocks.some(block => block.layer === "pending_input" && JSON.stringify(block.content).includes(freshSteer.id))).toBe(true)
+    }
+    for (const requestText of requestTexts) {
+      expect(requestText).toContain(originalText)
+      expect(requestText).toContain(questionText)
+      expect(requestText).toContain(answerText)
+      expect(requestText).toContain("CURRENT_GOAL_MEMORY_SENTINEL")
+      expect(requestText).toContain("CURRENT_STEERING_MEMORY_SENTINEL")
+      expect(requestText).toContain("CURRENT_GRAPH_WITH_MEMORY")
+      expect(requestText).toContain('"graphRevisionAtAsk":4')
+    }
+    const historyReads = selectedJobDirectHistory.load.mock.calls.map(([input]) => input as { stepId?: unknown; jobId?: unknown })
+    expect(historyReads).toHaveLength(2)
+    expect(historyReads.map(input => input.jobId)).toEqual(["job-1", "job-1"])
+    expect(new Set(historyReads.map(input => input.stepId)).size).toBe(2)
+    expect(contexts.map(context => context.inputThroughSequence)).toEqual([3n, 3n])
+    expect(contexts.map(context => context.consumedInputIds)).toEqual([[freshSteer.id], []])
+    const agendas = events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE).map(event => event.payload as { planRevision: number; signals: { pendingInputs: { ids: readonly string[] } } })
+    expect(agendas.map(agenda => agenda.planRevision)).toEqual([4, 4])
+    expect(agendas.map(agenda => agenda.signals.pendingInputs.ids)).toEqual([[freshSteer.id], [freshSteer.id]])
+    expect(JSON.stringify(agendas)).not.toContain(originalInput.id)
+    expect(JSON.stringify(agendas)).not.toContain("criterion_not_met")
+    expect(checkpoints.map(checkpoint => checkpoint.consumedInputIds)).toEqual([[freshSteer.id], []])
+    expect(checkpoints.map(checkpoint => checkpoint.inputThroughSequence)).toEqual([3n, 3n])
+    expect(rootTaskHistory.load).not.toHaveBeenCalled()
+    expect(compactionRunner).not.toHaveBeenCalled()
+    expect(flags.turnBoundaryCompactionEnabled).toBe(false)
+    const requestText = requestTexts[0] ?? ""
+    const systemText = requests[0]?.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const historyBlocks = contexts[0]?.blocks.filter(block => block.id === "observation:selected-job-history") ?? []
+    const serializedHistory = JSON.stringify(historyBlocks[0]?.content)
+    expect(requestText).toContain("selected_job_history")
+    expect(requestText.split("selected_job_history").length - 1).toBe(1)
+    expect(requestText).toContain('"reasonHints":["criterion_not_met","reported_score_below_minimum"]')
+    expect(requestText).toContain('"reasonHints":["canonical_evidence_missing"]')
+    expect(requestText).toContain("selected_job_memory")
+    expect(requestText).toContain('"score":6.5')
+    expect(requestText).toContain('"score":8')
+    expect(requestText).toContain(questionText)
+    expect(requestText).toContain('"revision":4')
+    expect(historyBlocks).toHaveLength(1)
+    expect(historyBlocks[0]).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
+    expect(requestText).not.toContain("other-job-559")
+    expect(requestText).not.toContain("private-prior-turn")
+    expect(requestText).not.toContain("private-prior-root")
+    expect(requestText).not.toContain("private-unverified-turn")
+    expect(requestText).not.toContain("private-unverified-root")
+    for (const privateValue of ["verification", "criteria", "criteria_met", "criterionId", "evidenceDigest", "resultDigest", "PASS"]) {
+      expect(serializedHistory).not.toContain(privateValue)
+    }
+    expect(systemText).not.toContain("reported_score_below_minimum")
+    expect(systemText).not.toContain("canonical_evidence_missing")
+    expect(selectedJobDirectHistory.load).toHaveBeenCalledTimes(2)
+    expect(selectedJobDirectHistory.load.mock.calls[0]?.[0]).not.toHaveProperty("records")
+    expect(selectedJobHistory.load).not.toHaveBeenCalled()
   })
 
   it("does not inject selected-job memory into an ordinary Turn model request", async () => {
@@ -1187,6 +1537,7 @@ describe("createCanonicalTurnRuntime", () => {
 
     await runtime.execute({ lease, signal: new AbortController().signal })
     expect(requests).toHaveLength(1)
+    expect(selectedJobDirectHistory.load).not.toHaveBeenCalled()
     const requestText = JSON.stringify(requests[0]?.messages)
     expect(requestText).not.toContain("selected_job_memory")
     expect(requestText).not.toContain(JSON.stringify(selectedMemory))
