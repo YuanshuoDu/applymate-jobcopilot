@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto"
 import { NextRequest } from "next/server"
-import { parseTaskGraphSnapshot, projectPlanLedger } from "@jobcopilot/agent-protocol"
+import { parseTaskGraphSnapshot, projectPlanLedger, projectTaskGraphVerificationSummary } from "@jobcopilot/agent-protocol"
 
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { decoratePlanLedgerRepairTargets } from "@/lib/task-graph-repair-display"
 
 import {
   afterCursor,
@@ -20,7 +22,7 @@ const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "c
 const TASK_SELECT = {
   id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, path: true,
   role: true, taskType: true, status: true, goal: true, confidence: true,
-  failureReason: true, result: true, createdAt: true, updatedAt: true,
+  failureReason: true, result: true, attemptCount: true, createdAt: true, updatedAt: true,
 } as const
 
 function parseTaskIdLookup(request: Request): string[] | Response | null {
@@ -169,9 +171,14 @@ export async function GET(request: NextRequest, context: RouteContext) {
       const tasks = scopedRows.map(taskDto)
       const projection = projectPlanLedger({ sessionId, revision: graph.revision, rootTaskId: graph.taskId, graph: graph.content, tasks })
       const identity = { sessionId, graphItemId: graph.id, turnId: graph.turnId, rootTaskId: graph.taskId, revision: graph.revision }
-      const planLedger = projection ? {
+      const verificationSummary = projection ? projectTaskGraphVerificationSummary({ sessionId, turnId: graph.turnId, rootTaskId: graph.taskId,
+        revision: graph.revision, graph: graph.content, tasks: scopedRows,
+        digestCanonicalJson: (canonicalJson) => createHash("sha256").update(canonicalJson).digest("hex") }, projection) : null
+      const displayProjection = projection ? decoratePlanLedgerRepairTargets(projection, graph.content, graph.taskId) : null
+      const planLedger = displayProjection ? {
         identity,
-        projection,
+        projection: displayProjection,
+        ...(verificationSummary ? { verificationSummary } : {}),
       } : null
       const rootTask = scopedRows.find((row) => row.id === graph!.taskId && row.sessionId === sessionId
         && row.turnId === graph!.turnId && row.rootTaskId === graph!.taskId && row.parentTaskId === null
