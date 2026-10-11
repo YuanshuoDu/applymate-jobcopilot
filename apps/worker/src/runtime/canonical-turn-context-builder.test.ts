@@ -249,7 +249,7 @@ describe("canonical Turn context builder", () => {
     expect(requestText).toContain("root_task_history")
     expect(requestText).toContain('"kind":"finding_count_gte"')
     expect(requestText).toContain('"minimum":2')
-    expect(systemText).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only")
+    expect(systemText).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
     expect(systemText).not.toContain("finding_count_gte")
     expect(systemText).not.toContain('"minimum":2')
     expect(requestText).toContain('"taskKind":"analyst"')
@@ -430,7 +430,7 @@ describe("canonical Turn context builder", () => {
     expect(historyGuidance[0]?.text).toContain("visible agent.list only for matching result pages")
     expect(historyGuidance[0]?.text).toContain("expectedRevision 23")
     expect(historyGuidance[0]?.text).toContain("preserve the valid plan")
-    expect(historyGuidance[0]?.text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, and Scout-dependency failure shapes only")
+    expect(historyGuidance[0]?.text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
     expect(historyGuidance[0]?.text).not.toContain("root_task_history")
     for (const historicalFact of ["source_graph_local", "nodeOrdinal", "criterionOrdinal", "targetNodeOrdinal", "candidate_count_gte",
       '"minimum":8', '"candidateCount":5', '"findingCount":6']) {
