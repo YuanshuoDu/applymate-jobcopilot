@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { Buffer } from "node:buffer"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import { questionId, questionItemId } from "../turns/turn-question-store-guards.js"
 import { TURN_QUESTION_INTENT_SCHEMA } from "../turns/turn-question-contract.js"
@@ -91,6 +91,95 @@ function requiredStoreMethod<K extends "resolveNativeSemanticProgressMode" | "re
   const method = value[name]
   if (typeof method !== "function") throw new Error(`native_semantic_store_method_missing:${name}`)
   return method as NonNullable<TurnEngineStore[K]>
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
+
+async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 10_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label)), timeoutMs)
+    })])
+  } finally { if (timer) clearTimeout(timer) }
+}
+
+function observedCompletionStore(applicationName: string, stepId: string) {
+  const backendPid = deferred<number>(), stepLockSubmitted = deferred<void>()
+  const pool = {
+    async connect() {
+      const client = await runtimePool!.connect()
+      await client.query(`SET ROLE "${runtimeRole}"`)
+      await client.query("SELECT set_config('application_name', $1, false)", [applicationName])
+      const pid = await client.query<{ pid: number | string }>("SELECT pg_backend_pid() AS pid")
+      backendPid.resolve(Number(pid.rows[0]?.pid))
+      const query = client.query.bind(client) as unknown as (sql: string, values?: unknown[]) => Promise<unknown>
+      return {
+        query: (sql: string, values?: unknown[]) => {
+          if (sql.includes('FROM "agent_steps"') && sql.includes("FOR UPDATE") && values?.[0] === stepId) stepLockSubmitted.resolve()
+          return query(sql, values)
+        },
+        release: () => client.release(),
+      } as unknown as PoolClient
+    },
+  }
+  return { store: createPgTurnEngineStore(pool as unknown as Pick<Pool, "connect">), backendPid, stepLockSubmitted }
+}
+
+async function waitForExactStepLock(pid: number): Promise<void> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    const activity = await adminPool!.query<{ state: string; wait_event_type: string | null; query: string }>(
+      `SELECT state, wait_event_type, query FROM pg_stat_activity WHERE pid = $1`, [pid])
+    const row = activity.rows[0]
+    if (row?.state === "active" && row.wait_event_type === "Lock"
+      && row.query.includes('FROM "agent_steps"') && row.query.includes("FOR UPDATE")) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error("native_semantic_fixture_exact_step_lock_wait_not_observed")
+}
+
+async function waitForTurnExpiryWithRootLive(): Promise<void> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    const result = await adminPool!.query<{ turnExpired: boolean; rootLive: boolean }>(`SELECT
+        turn."leaseExpiresAt" <= clock_timestamp() AS "turnExpired",
+        root."leaseExpiresAt" > clock_timestamp() AS "rootLive"
+      FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root
+        ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+      WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND root."id" = $4`,
+    [turnId, sessionId, userId, rootTaskId])
+    const row = result.rows[0]
+    if (row && !row.rootLive) throw new Error("native_semantic_fixture_root_lease_expired")
+    if (row?.turnExpired && row.rootLive) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error("native_semantic_fixture_turn_expiry_not_observed")
+}
+
+async function setShortTurnLease(): Promise<void> {
+  const updated = await adminPool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = clock_timestamp() + interval '5 seconds'
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4 AND "status" = 'in_progress'
+    RETURNING "id"`, [turnId, sessionId, userId, rootTaskId])
+  if (updated.rowCount !== 1) throw new Error("native_semantic_fixture_turn_lease_setup_failed")
+}
+
+async function persistedStepAndReceiptSnapshot(stepId: string) {
+  const result = await adminPool!.query<{ step: unknown; stepCount: number; receiptCount: number; receipts: unknown }>(
+    `SELECT to_jsonb(step) AS "step",
+       (SELECT COUNT(*)::int FROM "agent_steps" AS observed WHERE observed."turnId" = step."turnId") AS "stepCount",
+       (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS exact
+         WHERE exact."turnId" = step."turnId" AND exact."stepId" = step."id") AS "receiptCount",
+       (SELECT COALESCE(jsonb_agg(to_jsonb(rejection) ORDER BY rejection."stepId"), '[]'::jsonb)
+         FROM "agent_native_semantic_rejections" AS rejection WHERE rejection."turnId" = step."turnId") AS "receipts"
+     FROM "agent_steps" AS step WHERE step."id" = $1 AND step."sessionId" = $2 AND step."turnId" = $3`,
+    [stepId, sessionId, turnId])
+  if (!result.rows[0]) throw new Error("native_semantic_fixture_step_missing")
+  return result.rows[0]
 }
 
 async function persistStrictFailedRootReport(candidateText: string, taskId: string, reportReason: "does_not_meet_criterion" | "evidence_conflict") {
@@ -554,5 +643,116 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
         OR ("stepId" = $3 AND "inputThroughSequence" = 11))`,
     [turnId, [evidenceStepId, replayStepTwoId, replayStepThreeId], newEpochStepId])
     expect(epochs.rows[0]?.count).toBe(4)
+  }, 60_000)
+
+  it("rejects fresh completion after a lock wait crosses only the Turn lease expiry", async () => {
+    const stepId = `native-semantic-expiry-fresh-${suffix}`
+    await requiredStoreMethod(store!, "resolveNativeSemanticProgressMode")({ owner, requestedEnabled: true, now: new Date() })
+    await seedStep(stepId, 20, "20")
+    const identity = await ensureRejectedCandidate(candidateA, stepId)
+    const completeInput = { owner, stepId, finishReason: "stop", errorCode: null as null,
+      inputTokens: 21, outputTokens: 8, estimatedCostUsd: 0.0021, now: new Date(), identity }
+    const before = await persistedStepAndReceiptSnapshot(stepId)
+    expect(before.step).toMatchObject({ status: "streaming" })
+    expect(before.receiptCount).toBe(0)
+    await setShortTurnLease()
+
+    const applicationName = `native_sem_exp_fresh_${suffix}`
+    const observed = observedCompletionStore(applicationName, stepId)
+    const complete = requiredStoreMethod(observed.store, "completeNativeSemanticRejectionStep")
+    const blocker = await adminPool!.connect()
+    let transactionOpen = false
+    let request: Promise<unknown> | undefined
+    try {
+      await blocker.query("BEGIN")
+      transactionOpen = true
+      const locked = await blocker.query(`SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`,
+        [stepId, sessionId, turnId])
+      expect(locked.rows).toHaveLength(1)
+      request = complete(completeInput)
+      const pid = await bounded(observed.backendPid.promise, "native_semantic_fixture_runtime_pid_missing")
+      await bounded(observed.stepLockSubmitted.promise, "native_semantic_fixture_step_lock_not_submitted")
+      await waitForExactStepLock(pid)
+      const leases = await adminPool!.query<{ turnLive: boolean; rootLive: boolean }>(`SELECT
+          turn."leaseExpiresAt" > clock_timestamp() AS "turnLive",
+          root."leaseExpiresAt" > clock_timestamp() AS "rootLive"
+        FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
+          AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND root."id" = $4`,
+      [turnId, sessionId, userId, rootTaskId])
+      expect(leases.rows[0]).toEqual({ turnLive: true, rootLive: true })
+      await waitForTurnExpiryWithRootLive()
+      await blocker.query("ROLLBACK")
+      transactionOpen = false
+      await expect(request).rejects.toMatchObject({ code: "persistence_conflict" })
+      expect(await persistedStepAndReceiptSnapshot(stepId)).toEqual(before)
+    } finally {
+      if (transactionOpen) {
+        if (request) await waitForTurnExpiryWithRootLive().catch(() => undefined)
+        await blocker.query("ROLLBACK").catch(() => undefined)
+      }
+      blocker.release()
+      if (request) await bounded(request.then(() => undefined, () => undefined), "native_semantic_fixture_fresh_completion_not_settled").catch(() => undefined)
+      await adminPool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = $2 WHERE "id" = $1`, [turnId, future]).catch(() => undefined)
+    }
+  }, 60_000)
+
+  it("rejects completed receipt replay after a lock wait crosses only the Turn lease expiry", async () => {
+    const stepId = `native-semantic-expiry-replay-${suffix}`
+    const newerStepId = `native-semantic-expiry-newer-${suffix}`
+    await seedStep(stepId, 22, "22")
+    const identity = await ensureRejectedCandidate(candidateB, stepId)
+    const completeInput = { owner, stepId, finishReason: "stop", errorCode: null as null,
+      inputTokens: 19, outputTokens: 6, estimatedCostUsd: 0.0019, now: new Date(), identity }
+    const complete = requiredStoreMethod(store!, "completeNativeSemanticRejectionStep")
+    await expect(complete(completeInput)).resolves.toMatchObject({ inputThroughSequence: 22n, distinctStepCount: 1 })
+    await seedStep(newerStepId, 23, "22")
+    const before = await persistedStepAndReceiptSnapshot(stepId)
+    expect(before.step).toMatchObject({ status: "completed" })
+    expect(before.receiptCount).toBe(1)
+    await expect(complete(completeInput)).resolves.toMatchObject({ inputThroughSequence: 22n, distinctStepCount: 1 })
+    expect(await persistedStepAndReceiptSnapshot(stepId)).toEqual(before)
+    await setShortTurnLease()
+
+    const observed = observedCompletionStore(`native_sem_exp_replay_${suffix}`, stepId)
+    const replay = requiredStoreMethod(observed.store, "completeNativeSemanticRejectionStep")
+    const blocker = await adminPool!.connect()
+    let transactionOpen = false
+    let request: Promise<unknown> | undefined
+    try {
+      await blocker.query("BEGIN")
+      transactionOpen = true
+      const locked = await blocker.query(`SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`,
+        [stepId, sessionId, turnId])
+      expect(locked.rows).toHaveLength(1)
+      request = replay(completeInput)
+      const pid = await bounded(observed.backendPid.promise, "native_semantic_fixture_replay_pid_missing")
+      await bounded(observed.stepLockSubmitted.promise, "native_semantic_fixture_replay_lock_not_submitted")
+      await waitForExactStepLock(pid)
+      const leases = await adminPool!.query<{ turnLive: boolean; rootLive: boolean }>(`SELECT
+          turn."leaseExpiresAt" > clock_timestamp() AS "turnLive",
+          root."leaseExpiresAt" > clock_timestamp() AS "rootLive"
+        FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
+          AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND root."id" = $4`,
+      [turnId, sessionId, userId, rootTaskId])
+      expect(leases.rows[0]).toEqual({ turnLive: true, rootLive: true })
+      await waitForTurnExpiryWithRootLive()
+      await blocker.query("ROLLBACK")
+      transactionOpen = false
+      await expect(request).rejects.toMatchObject({ code: "persistence_conflict" })
+      expect(await persistedStepAndReceiptSnapshot(stepId)).toEqual(before)
+      const newer = await persistedStepAndReceiptSnapshot(newerStepId)
+      expect(newer.step).toMatchObject({ status: "streaming" })
+      expect(newer.receiptCount).toBe(0)
+    } finally {
+      if (transactionOpen) {
+        if (request) await waitForTurnExpiryWithRootLive().catch(() => undefined)
+        await blocker.query("ROLLBACK").catch(() => undefined)
+      }
+      blocker.release()
+      if (request) await bounded(request.then(() => undefined, () => undefined), "native_semantic_fixture_replay_not_settled").catch(() => undefined)
+      await adminPool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = $2 WHERE "id" = $1`, [turnId, future]).catch(() => undefined)
+    }
   }, 60_000)
 })
