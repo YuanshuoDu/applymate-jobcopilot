@@ -120,9 +120,11 @@ export type DurableWaitControlInvocation = DurableWaitInvocation & {
   readonly now: Date
 }
 
+export type DurableWaitStepAdmission = "fresh_streaming_root" | "restored_inflight_root"
+
 /** Read-only lookup used only when a completed wait result is an archived reference. */
 export interface DurableWaitControlReader {
-  readByInvocation(input: DurableWaitControlInvocation): Promise<DurableWaitControl | null>
+  readByInvocation(input: DurableWaitControlInvocation, admission: DurableWaitStepAdmission): Promise<DurableWaitControl | null>
 }
 
 export type DurableWaitResult = {

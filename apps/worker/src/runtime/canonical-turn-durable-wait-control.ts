@@ -109,7 +109,7 @@ export async function recoverCanonicalArchivedWaitControl(input: {
   const candidate = candidates[0]!
   const control = await lookupArchivedWaitControl({
     toolName: candidate.toolName, input: candidate.input, stepId: String(step.id), output: candidate.result.output,
-    identity, now: input.now, reader: input.reader, allowInterruptedRecovery: true,
+    identity, now: input.now, reader: input.reader, stepAdmission: "restored_inflight_root", allowInterruptedRecovery: true,
   })
   if (!control) invalid()
   if (control.status === "interrupted") {

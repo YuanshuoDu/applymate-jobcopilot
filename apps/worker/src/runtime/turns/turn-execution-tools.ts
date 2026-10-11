@@ -139,7 +139,7 @@ export async function executeTools(
     snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, { id: `tool-result:${call.id}`, content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) }] }
     const archivedWait = await lookupArchivedWaitControl({
       toolName: call.name, input: call.arguments, stepId: step.id, output: result.status === "completed" ? result.output : null,
-      identity: options.identity, now: now(), reader: options.durableWaitControlReader,
+      identity: options.identity, now: now(), reader: options.durableWaitControlReader, stepAdmission: "fresh_streaming_root",
     })
     if (archivedWait) return { wait: { status: "waiting_for_dependency", waitId: archivedWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
     if (questionCall) return { wait: await questionWaitResult(options, questionCall.stepId, questionCall.toolCallId, now, 0, 0), snapshot, steeringMarkerState: markerState }

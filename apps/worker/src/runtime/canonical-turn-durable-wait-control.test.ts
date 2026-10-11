@@ -79,7 +79,7 @@ describe("canonical archived-wait state recovery", () => {
     expect(reads.readByInvocation).toHaveBeenCalledOnce()
     expect(reads.readByInvocation).toHaveBeenCalledWith(expect.objectContaining({ userId: identity.userId, sessionId: identity.sessionId,
       turnId, stepId, taskId: rootTaskId, rootTaskId, ownerId: identity.ownerId, leaseVersion: identity.leaseVersion,
-      targetTaskIds: ["child-1"], mode: "all", timeoutMs: 10_000, idempotencyKey: "wait-key" }))
+      targetTaskIds: ["child-1"], mode: "all", timeoutMs: 10_000, idempotencyKey: "wait-key" }), "restored_inflight_root")
   })
 
   it("does not recover when the exact canonical two-field outcome is already restored", async () => {

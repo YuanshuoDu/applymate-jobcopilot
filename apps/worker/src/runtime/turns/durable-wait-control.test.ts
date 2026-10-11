@@ -54,26 +54,30 @@ describe("archived durable wait control", () => {
   })
 
   it("reads only a bounded control and fails closed when the fenced reader is absent or invalid", async () => {
-    const readByInvocation = vi.fn(async (value: DurableWaitControlInvocation) => {
+    const readByInvocation = vi.fn(async (value: DurableWaitControlInvocation, admission: string) => {
       expect(value).toEqual(invocation())
+      expect(admission).toBe("fresh_streaming_root")
       return { waitId, status: "ready" as const }
     })
     await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference, identity, now,
-      reader: { readByInvocation } })).resolves.toEqual({ waitId, status: "ready" })
+      reader: { readByInvocation }, stepAdmission: "fresh_streaming_root" })).resolves.toEqual({ waitId, status: "ready" })
     expect(readByInvocation).toHaveBeenCalledTimes(1)
-    await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference, identity, now }))
+    await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference, identity, now,
+      stepAdmission: "fresh_streaming_root" }))
       .rejects.toMatchObject({ code: "persistence_conflict" })
     await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference, identity, now,
-      reader: { readByInvocation: async () => ({ waitId: "foreign", status: "ready" }) } })).rejects.toMatchObject({ code: "persistence_conflict" })
+      reader: { readByInvocation: async () => ({ waitId: "foreign", status: "ready" }) }, stepAdmission: "fresh_streaming_root" }))
+      .rejects.toMatchObject({ code: "persistence_conflict" })
   })
 
   it("keeps interrupted archived controls behind canonical-recovery-only opt-in", async () => {
-    const readByInvocation = vi.fn(async () => ({ waitId, status: "interrupted" as const }))
+    const readByInvocation = vi.fn(async (_value: DurableWaitControlInvocation, _admission: string) => ({ waitId, status: "interrupted" as const }))
     const reader = { readByInvocation }
     await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference,
-      identity, now, reader })).rejects.toMatchObject({ code: "persistence_conflict" })
+      identity, now, reader, stepAdmission: "fresh_streaming_root", allowInterruptedRecovery: true })).rejects.toMatchObject({ code: "persistence_conflict" })
     await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference,
-      identity, now, reader, allowInterruptedRecovery: true })).resolves.toEqual({ waitId, status: "interrupted" })
+      identity, now, reader, stepAdmission: "restored_inflight_root", allowInterruptedRecovery: true })).resolves.toEqual({ waitId, status: "interrupted" })
     expect(readByInvocation).toHaveBeenCalledTimes(2)
+    expect(readByInvocation.mock.calls.map(([, admission]) => admission)).toEqual(["fresh_streaming_root", "restored_inflight_root"])
   })
 })

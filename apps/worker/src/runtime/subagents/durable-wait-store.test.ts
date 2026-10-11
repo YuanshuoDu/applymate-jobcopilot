@@ -85,12 +85,13 @@ describe("durable PostgreSQL wait port", () => {
       ownerId: "worker-a", leaseVersion: 3, now, targetTaskIds: ["child-a"], mode: "all", timeoutMs: 10_000, idempotencyKey: "archived-wait-key",
     }
     const exactPool = createReaderPool()
-    await expect(createPgDurableWaitPort(exactPool.pool as never).readByInvocation(exact)).resolves.toEqual({
+    await expect(createPgDurableWaitPort(exactPool.pool as never).readByInvocation(exact, "restored_inflight_root")).resolves.toEqual({
       waitId: "wait-00000000-0000-4000-8000-000000000009", status: "ready",
     })
     const mismatchPool = createReaderPool()
-    await expect(createPgDurableWaitPort(mismatchPool.pool as never).readByInvocation({ ...exact, timeoutMs: 11_000 })).resolves.toBeNull()
+    await expect(createPgDurableWaitPort(mismatchPool.pool as never).readByInvocation({ ...exact, timeoutMs: 11_000 }, "restored_inflight_root")).resolves.toBeNull()
     expect(exactPool.calls.some(sql => sql.includes('wait."result"->\'request\''))).toBe(true)
+    expect(exactPool.calls.some(sql => sql.includes(`"status" IN ('running', 'waiting_for_tool')`))).toBe(true)
   })
 
   it("registers a first wait as waiting and sets the tenant inside the transaction", async () => {

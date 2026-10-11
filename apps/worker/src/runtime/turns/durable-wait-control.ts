@@ -1,4 +1,4 @@
-import type { DurableWaitControl, DurableWaitControlInvocation, DurableWaitControlReader } from "../tools/coordination-types.js"
+import type { DurableWaitControl, DurableWaitControlInvocation, DurableWaitControlReader, DurableWaitStepAdmission } from "../tools/coordination-types.js"
 import { isDurableWaitId } from "../tools/redaction.js"
 import type { TurnExecutionIdentity } from "./turn-execution-types.js"
 import { parseWaitRequest } from "./turn-execution-wait.js"
@@ -50,15 +50,19 @@ export function archivedWaitInvocation(input: {
 export async function lookupArchivedWaitControl(input: {
   readonly toolName: string; readonly input: unknown; readonly stepId: string; readonly output: unknown
   readonly identity: TurnExecutionIdentity; readonly now: Date; readonly reader?: DurableWaitControlReader
+  readonly stepAdmission: DurableWaitStepAdmission
   readonly allowInterruptedRecovery?: boolean
 }): Promise<DurableWaitControl | null> {
   if (!WAIT_TOOLS.has(input.toolName)) return null
   if (!parseArchivedWaitReference(input.output)) return null
+  if (input.stepAdmission !== "fresh_streaming_root" && input.stepAdmission !== "restored_inflight_root") {
+    throw new TurnEngineError("persistence_conflict", "Archived wait control is unavailable")
+  }
   const invocation = archivedWaitInvocation(input)
   if (!invocation || !input.reader) throw new TurnEngineError("persistence_conflict", "Archived wait control is unavailable")
-  const row = strictRecord(await input.reader.readByInvocation(invocation), ["waitId", "status"])
+  const row = strictRecord(await input.reader.readByInvocation(invocation, input.stepAdmission), ["waitId", "status"])
   const validStatus = ["waiting", "ready", "timed_out"].includes(String(row?.status))
-    || input.allowInterruptedRecovery === true && row?.status === "interrupted"
+    || input.stepAdmission === "restored_inflight_root" && input.allowInterruptedRecovery === true && row?.status === "interrupted"
   if (!row || !isDurableWaitId(row.waitId) || !validStatus) {
     throw new TurnEngineError("persistence_conflict", "Archived wait control is unavailable")
   }

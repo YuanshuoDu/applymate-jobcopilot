@@ -8,7 +8,7 @@ import { recoverCanonicalArchivedWaitControl } from "../canonical-turn-durable-w
 import { createCanonicalPolicy } from "../policy/canonical-policy.js"
 import { executionOwnerFence, type ExecutionOwner } from "../execution-owner.js"
 import { createCoordinationTools } from "../tools/coordination-tools.js"
-import type { CoordinationStore, CoordinationTaskView, DurableWaitControl, DurableWaitControlInvocation, DurableWaitControlReader, DurableWaitInvocation } from "../tools/coordination-types.js"
+import type { CoordinationStore, CoordinationTaskView, DurableWaitControl, DurableWaitControlInvocation, DurableWaitControlReader, DurableWaitInvocation, DurableWaitStepAdmission } from "../tools/coordination-types.js"
 import { projectDurableWaitOutcome } from "../subagents/durable-wait-dependency-revalidation.js"
 import { InMemoryToolLifecycleSink, ToolLifecycle, type ToolLifecycleSink } from "../tools/lifecycle.js"
 import { ToolRegistry } from "../tools/registry.js"
@@ -130,7 +130,7 @@ type PersistedEvent = TurnEngineEvent & {
 type PersistedState = { steps: PersistedStep[]; items: PersistedItem[]; events: PersistedEvent[] }
 
 type CrashCut = "before-wait-step-update" | "before-step-completion"
-function turnStore(seed?: PersistedState, crashCut?: CrashCut) {
+function turnStore(seed?: PersistedState, crashCut?: CrashCut, startStepStatus: "running" | "streaming" = "running") {
   const state: PersistedState = seed ?? { steps: [], items: [], events: [] }
   let beforeWaitClose: PersistedState | undefined
   const startedStepIds: string[] = []
@@ -141,7 +141,7 @@ function turnStore(seed?: PersistedState, crashCut?: CrashCut) {
   const store: TurnEngineStore = {
     startStep: async input => {
       startedStepIds.push(input.stepId)
-      state.steps.push({ id: input.stepId, taskId: input.owner.taskId, ordinal: input.ordinal, status: "running", finishReason: null, errorCode: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
+      state.steps.push({ id: input.stepId, taskId: input.owner.taskId, ordinal: input.ordinal, status: startStepStatus, finishReason: null, errorCode: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
       return { id: input.stepId, ordinal: input.ordinal }
     },
     updateStep: async input => {
@@ -233,9 +233,14 @@ function interruptedWaitProjection(ids: readonly string[] = taskIds) {
   return projectDurableWaitOutcome(waitId, { value: toRepositoryJson(output), taskIds: ids, mode: "all" })
 }
 
-function controlReader(status: DurableWaitControl["status"]): { reader: DurableWaitControlReader; calls: DurableWaitControlInvocation[] } {
+function controlReader(status: DurableWaitControl["status"], inspect?: () => unknown): {
+  reader: DurableWaitControlReader; calls: DurableWaitControlInvocation[]; admissions: DurableWaitStepAdmission[]; observations: unknown[]
+} {
   const calls: DurableWaitControlInvocation[] = []
-  return { calls, reader: { readByInvocation: async input => { calls.push(input); return { waitId, status } } } }
+  const admissions: DurableWaitStepAdmission[] = [], observations: unknown[] = []
+  return { calls, admissions, observations, reader: { readByInvocation: async (input, admission) => {
+    calls.push(input); admissions.push(admission); observations.push(inspect?.()); return { waitId, status }
+  } } }
 }
 
 function loopOptions(input: {
@@ -258,6 +263,7 @@ function createWaitEngine(input: {
   readonly controlStatus: DurableWaitControl["status"]
   readonly seed?: PersistedState
   readonly crashCut?: CrashCut
+  readonly startStepStatus?: "running" | "streaming"
   readonly largeResults?: boolean
   readonly snapshot?: StepContextSnapshot
   readonly recoveredWaitControl?: RecoveredArchivedWaitControl
@@ -269,18 +275,24 @@ function createWaitEngine(input: {
   readonly runtime: ReturnType<typeof largeWaitRuntime>
   readonly requests: HarnessModelRequest[]
   readonly readerCalls: DurableWaitControlInvocation[]
+  readonly readerAdmissions: DurableWaitStepAdmission[]
+  readonly readerObservations: unknown[]
 } {
-  const persisted = turnStore(input.seed, input.crashCut)
+  const persisted = turnStore(input.seed, input.crashCut, input.startStepStatus)
   const identity = executionOwnerFence(owner)
   const runtime = largeWaitRuntime({ largeResults: input.largeResults, sink: durableLifecycleSink(persisted.store, identity) })
-  const reads = controlReader(input.controlStatus)
+  const reads = controlReader(input.controlStatus, () => {
+    const step = persisted.state.steps.at(-1)
+    const toolResult = persisted.state.items.find(item => item.type === "tool_result")
+    return { step: step ? { id: step.id, status: step.status } : null, toolResult: toolResult ? { id: toolResult.id, status: toolResult.status, content: toolResult.content } : null }
+  })
   const requests: HarnessModelRequest[] = []
   const engine = new TurnEngine(loopOptions({
     store: persisted.store, router: runtime.router, registry: runtime.registry,
     model: input.wait ? waitModel(requests, runtime.input) : continuationModel(requests),
     reader: reads.reader, snapshot: input.snapshot ?? snapshot(), recoveredWaitControl: input.recoveredWaitControl, resume: input.resume,
   }))
-  return { engine, persisted, runtime, requests, readerCalls: reads.calls }
+  return { engine, persisted, runtime, requests, readerCalls: reads.calls, readerAdmissions: reads.admissions, readerObservations: reads.observations }
 }
 
 function resumedUsage(step: PersistedStep | undefined) {
@@ -332,6 +344,26 @@ describe("archived durable wait recovery integration", () => {
     })
   })
 
+  it("admits an oversized wait from the current streaming Step only after its result is persisted", async () => {
+    const fresh = createWaitEngine({ controlStatus: "waiting", startStepStatus: "streaming", wait: true })
+    await expect(fresh.engine.run()).resolves.toMatchObject({ status: "waiting_for_dependency", waitId, stepCount: 1, toolCallCount: 1 })
+    expect(fresh.readerAdmissions).toEqual(["fresh_streaming_root"])
+    expect(fresh.readerCalls[0]).toMatchObject({ userId: "user-1", sessionId: "session-1", turnId: "turn-1",
+      stepId: fresh.persisted.state.steps[0]?.id, taskId: rootId, rootTaskId: rootId, ownerId: "worker-1", leaseVersion: 1,
+      targetTaskIds: taskIds, mode: "all", timeoutMs: 30_000, idempotencyKey: "archive-wait-1" })
+    expect(Object.keys(fresh.readerCalls[0] ?? {}).sort()).toEqual([
+      "idempotencyKey", "leaseVersion", "mode", "now", "ownerId", "rootTaskId", "sessionId", "stepId", "targetTaskIds", "taskId", "timeoutMs", "turnId", "userId",
+    ])
+    expect(fresh.readerObservations).toMatchObject([{
+      step: { id: fresh.persisted.state.steps[0]?.id, status: "streaming" },
+      toolResult: { status: "completed", content: { toolCallId: "wait-call-1",
+        output: { $ref: referenceId, sizeBytes: fresh.runtime.archive.records[0]?.byteCount, sha256: fresh.runtime.archive.records[0]?.sha256 } } },
+    }])
+    expect(fresh.runtime.archive.records[0]?.byteCount).toBeGreaterThan(8 * 1024)
+    expect(fresh.runtime.archive.read).not.toHaveBeenCalled()
+    expect(fresh.persisted.state.steps).toMatchObject([{ status: "waiting_for_tool", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }])
+  })
+
   it.each([
     ["waiting", "before-step-completion", "waiting_for_tool"],
     ["ready", "before-wait-step-update", "running"],
@@ -341,6 +373,7 @@ describe("archived durable wait recovery integration", () => {
     await expect(first.engine.run()).resolves.toMatchObject({ status: "waiting_for_dependency", waitId, stepCount: 1, toolCallCount: 1 })
     expect(first.requests).toHaveLength(1)
     expect(first.readerCalls).toHaveLength(1)
+    expect(first.readerAdmissions).toEqual(["fresh_streaming_root"])
     expect(first.persisted.state.steps).toMatchObject([{ status: "waiting_for_tool", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }])
     expect(first.runtime.archive.records[0]?.byteCount).toBeGreaterThan(8 * 1024)
     expect(first.runtime.archive.read).not.toHaveBeenCalled()
@@ -374,6 +407,7 @@ describe("archived durable wait recovery integration", () => {
     })
     expect(recovered).toMatchObject({ waitId, status, stepId: cut?.steps[0]?.id, stepStatus: expectedStepStatus, inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003, toolCallCount: 1, stepCompletionRecorded: false })
     expect(reads.calls).toHaveLength(1)
+    expect(reads.admissions).toEqual(["restored_inflight_root"])
     expect(reads.calls[0]).toMatchObject({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: cut?.steps[0]?.id,
       taskId: rootId, rootTaskId: rootId, ownerId: "worker-1", leaseVersion: 1, targetTaskIds: taskIds, mode: "all", timeoutMs: 30_000, idempotencyKey: "archive-wait-1" })
 
@@ -384,11 +418,15 @@ describe("archived durable wait recovery integration", () => {
     await expect(restarted.engine.run()).resolves.toMatchObject({ status: "waiting_for_dependency", waitId, stepCount: 1, toolCallCount: 1 })
     expect(restarted.requests).toHaveLength(0)
     expect(restarted.persisted.startedStepIds).toEqual([])
+    expect(restarted.readerCalls).toEqual([])
     expect(restarted.persisted.updatedSteps).toEqual(expectedStepStatus === "running"
       ? [{ stepId: cut?.steps[0]?.id, status: "waiting_for_tool", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }]
       : [])
     expect(restarted.persisted.state.steps).toHaveLength(1)
     expect(restarted.persisted.state.steps[0]).toMatchObject({ id: cut?.steps[0]?.id, status: "waiting_for_tool", inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 })
+    expect(restarted.persisted.state.items.filter(item => item.type === "tool_call")).toHaveLength(1)
+    expect(restarted.persisted.state.items.filter(item => item.type === "tool_result")).toHaveLength(1)
+    expect(restarted.persisted.state.events.filter(event => event.type === "model.usage" && event.correlationId === cut?.steps[0]?.id)).toHaveLength(1)
     expect(resumedUsage(restarted.persisted.state.steps[0])).toEqual({ inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 })
     expect(restarted.persisted.state.events.filter(event => event.type === "step.completed" && event.correlationId === cut?.steps[0]?.id)).toHaveLength(1)
     expect(restarted.runtime.archive.read).not.toHaveBeenCalled()
@@ -415,6 +453,7 @@ describe("archived durable wait recovery integration", () => {
     })
     expect(unrelatedRecovery).toMatchObject({ waitId, status: "ready" })
     expect(unrelatedReads.calls).toHaveLength(1)
+    expect(unrelatedReads.admissions).toEqual(["restored_inflight_root"])
 
     const projected = projectDurableWaitOutcome(waitId, { value: toRepositoryJson(result), taskIds, mode: "all" })
     expect(projected.content).toMatchObject({ status: "completed", input: { taskIds, mode: "all" } })
@@ -430,6 +469,7 @@ describe("archived durable wait recovery integration", () => {
       now: new Date("2026-10-10T10:01:00.000Z"),
     })).resolves.toBeUndefined()
     expect(reads.calls).toHaveLength(1)
+    expect(reads.admissions).toEqual(["restored_inflight_root"])
     expect(reads.calls[0]).toMatchObject({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: persisted.steps[0]?.id,
       taskId: rootId, rootTaskId: rootId, ownerId: "worker-1", leaseVersion: 1, targetTaskIds: taskIds, mode: "all", timeoutMs: 30_000, idempotencyKey: "archive-wait-1" })
 
@@ -479,6 +519,7 @@ describe("archived durable wait recovery integration", () => {
       now: new Date("2026-10-10T10:00:30.000Z"),
     })).resolves.toBeUndefined()
     expect(reads.calls).toHaveLength(1)
+    expect(reads.admissions).toEqual(["restored_inflight_root"])
     expect(reads.calls[0]).toMatchObject({ stepId: persisted.steps[0]?.id, taskId: rootId, rootTaskId: rootId,
       targetTaskIds: taskIds, mode: "all", idempotencyKey: "archive-wait-1" })
 
@@ -536,6 +577,7 @@ describe("archived durable wait recovery integration", () => {
         return continuation.engine.run()
       }).rejects.toMatchObject({ code: "persistence_conflict" })
       expect(reads.calls).toHaveLength(1)
+      expect(reads.admissions).toEqual(["restored_inflight_root"])
       expect(continuation).toBeUndefined()
       expect(first.requests).toHaveLength(1)
       expect(first.persisted.startedStepIds).toEqual([first.persisted.state.steps[0]?.id])
