@@ -18,6 +18,7 @@ import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
 import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
 import { completionRecoverySnapshot } from "./turn-execution-completion-gate.js"
+import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
 const DEFAULT_MAX_STEPS = 32
 
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
@@ -44,6 +45,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       { goal: options.goal, taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId },
       "turn-started",
     )
+    if (options.recoveredWaitControl) return await handoffRecoveredArchivedWait(options, writer, options.recoveredWaitControl, { stepCount: steps, toolCallCount: toolCalls }, now)
     const recoveredToolObservations = await recoverPersistedToolCalls(executionOptions, writer, now)
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
     const recoveredQuestion = await recoverPendingNativeQuestion(executionOptions, now, steps, toolCalls)

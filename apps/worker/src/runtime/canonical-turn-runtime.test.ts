@@ -555,7 +555,13 @@ describe("createCanonicalTurnRuntime", () => {
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
     expect(runner).toHaveBeenCalledOnce()
     expect(runner).toHaveBeenCalledWith(expect.objectContaining({ taskGraphCommandPort: graph }))
-    expect(loadOptions).toEqual([{ consumeWaitOutcomes: true }, { consumeWaitOutcomes: false }])
+    const durableWaitControlReader = loadOptions[0]?.durableWaitControlReader
+    if (!durableWaitControlReader || typeof durableWaitControlReader.readByInvocation !== "function") throw new Error("fixture_wait_reader_missing")
+    expect(loadOptions[1]?.durableWaitControlReader).toBe(durableWaitControlReader)
+    expect(loadOptions).toEqual([
+      { consumeWaitOutcomes: true, durableWaitControlReader },
+      { consumeWaitOutcomes: false, durableWaitControlReader },
+    ])
     expect(graph.readCurrent).toHaveBeenCalledTimes(4)
     expect(observedSnapshots[0]?.goal).toEqual(initial.snapshot.goal)
     expect(observedSnapshots[0]?.steerHistory).toContainEqual({ id: "cursor-tail:9", content: "recent turn history" })
