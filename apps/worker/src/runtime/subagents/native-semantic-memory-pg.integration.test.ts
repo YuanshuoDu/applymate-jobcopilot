@@ -357,7 +357,7 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     } finally { await adminPool!.query(`GRANT INSERT ON "agent_native_semantic_rejections" TO "${runtimeRole}"`) }
   }, 30_000)
 
-  it("revalidates failed receipts with exact-Step question and steering evidence", async () => {
+  it("reuses exact-Step original, Q/A, and steer evidence across three failed Steps and rejects it after an input epoch change", async () => {
     const evidenceCandidate = "The question and steering candidate does not satisfy the persisted objective."
     const rootInputId = `native-semantic-root-input-${suffix}`
     const originalMessageId = `native-semantic-root-message-${suffix}`
@@ -365,6 +365,8 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     const questionStepId = `native-semantic-question-step-${suffix}`
     const evidenceStepId = `native-semantic-evidence-step-${suffix}`
     const supersedingStepId = `native-semantic-superseding-step-${suffix}`
+    const replayStepTwoId = `native-semantic-evidence-replay-step-two-${suffix}`
+    const replayStepThreeId = `native-semantic-evidence-replay-step-three-${suffix}`
     const newEpochStepId = `native-semantic-new-epoch-step-${suffix}`
     const steeringId = `native-semantic-steering-${suffix}`
     const newSteeringId = `native-semantic-steering-next-${suffix}`
@@ -502,11 +504,33 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
       if (!result.rows[0]) throw new Error("native_semantic_fixture_step_missing")
       return result.rows[0]
     }
-    const beforeReplay = await persistedStepSnapshot(evidenceStepId)
-    await expect(complete(receiptInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 1 })
-    expect(await persistedStepSnapshot(evidenceStepId)).toEqual(beforeReplay)
+    await seedStep(replayStepTwoId, 20, "10")
+    const read = requiredStoreMethod(store!, "readNativeSemanticRejections")
+    await expect(read({ owner, stepId: replayStepTwoId, identity })).resolves.toMatchObject({ inputThroughSequence: 10n, stepIds: [evidenceStepId] })
+    await expect(complete({ ...receiptInput, stepId: replayStepTwoId, now: new Date() })).resolves.toMatchObject({
+      inputThroughSequence: 10n, distinctStepCount: 2,
+    })
+    await seedStep(replayStepThreeId, 21, "10")
+    await expect(read({ owner, stepId: replayStepThreeId, identity })).resolves.toMatchObject({
+      inputThroughSequence: 10n, stepIds: [evidenceStepId, replayStepTwoId],
+    })
+    const replayStepThreeInput = { ...receiptInput, stepId: replayStepThreeId, now: new Date() }
+    await expect(complete(replayStepThreeInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 3 })
+    const beforeThirdStepReplay = await persistedStepSnapshot(replayStepThreeId)
+    await expect(complete(replayStepThreeInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 3 })
+    expect(await persistedStepSnapshot(replayStepThreeId)).toEqual(beforeThirdStepReplay)
+    const beforeOldReceiptReplay = await persistedStepSnapshot(evidenceStepId)
+    await expect(complete(receiptInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 3 })
+    expect(await persistedStepSnapshot(evidenceStepId)).toEqual(beforeOldReceiptReplay)
+    const sameEpochReceipts = await adminPool!.query<{ count: number; stepIds: string[] }>(
+      `SELECT COUNT(*)::int AS "count", array_agg("stepId" ORDER BY "stepId") AS "stepIds"
+       FROM "agent_native_semantic_rejections" WHERE "turnId" = $1 AND "candidateDigest" = $2
+         AND "controlTaskId" = $3 AND "controlOperationId" = $4 AND "controlAttempt" = $5
+         AND "controlReportDigest" = $6 AND "inputThroughSequence" = 10`,
+      [turnId, identity.candidateDigest, identity.controlTaskId, identity.controlOperationId, identity.controlAttempt, identity.controlReportDigest])
+    expect(sameEpochReceipts.rows[0]).toEqual({ count: 3, stepIds: [evidenceStepId, replayStepTwoId, replayStepThreeId].sort() })
 
-    await seedStep(newEpochStepId, 20, "11", [newSteeringId])
+    await seedStep(newEpochStepId, 22, "11", [newSteeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
       ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
        "consumedByStepId", "consumedAt", "cancelledAt")
@@ -521,14 +545,14 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     const newIdentity = await ensureRejectedCandidate(evidenceCandidate, newEpochStepId)
     expect(newIdentity.candidateDigest).toBe(identity.candidateDigest)
     expect(newIdentity.controlOperationId).not.toBe(identity.controlOperationId)
-    const read = requiredStoreMethod(store!, "readNativeSemanticRejections")
     await expect(read({ owner, stepId: newEpochStepId, identity: newIdentity })).resolves.toMatchObject({ inputThroughSequence: 11n, stepIds: [] })
     await expect(complete({ ...receiptInput, stepId: newEpochStepId, identity: newIdentity })).resolves.toMatchObject({
       inputThroughSequence: 11n, distinctStepCount: 1,
     })
     const epochs = await adminPool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_native_semantic_rejections"
-      WHERE "turnId" = $1 AND (("stepId" = $2 AND "inputThroughSequence" = 10)
-        OR ("stepId" = $3 AND "inputThroughSequence" = 11))`, [turnId, evidenceStepId, newEpochStepId])
-    expect(epochs.rows[0]?.count).toBe(2)
+      WHERE "turnId" = $1 AND (("stepId" = ANY($2::text[]) AND "inputThroughSequence" = 10)
+        OR ("stepId" = $3 AND "inputThroughSequence" = 11))`,
+    [turnId, [evidenceStepId, replayStepTwoId, replayStepThreeId], newEpochStepId])
+    expect(epochs.rows[0]?.count).toBe(4)
   }, 60_000)
 })

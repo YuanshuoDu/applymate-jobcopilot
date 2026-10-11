@@ -41,7 +41,7 @@ export function assertQuestionUsage(input: TurnQuestionUsageInput): void {
   }
 }
 
-export function questionId(owner: TurnQuestionReadIdentity, stepId: string, toolCallId: string): string {
+export function questionId(owner: Pick<TurnQuestionReadIdentity, "sessionId" | "turnId">, stepId: string, toolCallId: string): string {
   return createHash("sha256").update(JSON.stringify([owner.sessionId, owner.turnId, stepId, toolCallId])).digest("hex")
 }
 
