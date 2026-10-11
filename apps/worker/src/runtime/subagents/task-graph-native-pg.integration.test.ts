@@ -11,6 +11,7 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -285,7 +286,28 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
         await witnessClient.query("SELECT set_config('app.user_id', $1, true)", [ids.user])
         // This confirms the persisted graph gate accepts its trusted server-side native-pass input;
         // this fixture does not run a model verifier or claim a provider-generated proof.
-        expect(await passingGraphGuard(witnessClient)).toEqual({ ok: true })
+        const graphDecision = await passingGraphGuard(witnessClient)
+        expect(graphDecision.ok).toBe(true)
+        if (!graphDecision.ok) throw new Error("persisted graph gate rejected the trusted native-pass input")
+        const binding = graphDecision[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+        expect(binding).toBeDefined()
+        if (!binding) throw new Error("successful persisted graph gate omitted its private summary binding")
+        expect(revision).toBe(2)
+        expect(binding).toMatchObject({
+          graphRevision: revision,
+          summary: {
+            graphRevision: revision,
+            counts: {
+              discoveredJobs: { knownCount: null, coverage: "not_requested" },
+              analyzedJobs: { knownCount: null, coverage: "not_requested" },
+              artifactReferences: { knownCount: null, coverage: "not_requested" },
+              reviewOutcomes: { knownCount: null, coverage: "not_requested" },
+            },
+            discoveredJobs: [], analyzedJobs: [], artifactReferences: [], reviewOutcomes: [],
+          },
+        })
+        expect(binding.summary.taskOutcomes.every(outcome => outcome.role === "unsupported" && outcome.resultState === "unsupported_role")).toBe(true)
+        expect(JSON.stringify(graphDecision)).toBe('{"ok":true}')
         await witnessClient.query("ROLLBACK")
       } finally {
         await witnessClient.query("ROLLBACK").catch(() => undefined)

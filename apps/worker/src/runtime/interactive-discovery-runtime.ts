@@ -14,6 +14,7 @@ import { loadInteractiveDiscoveryShortlist } from "./interactive-discovery-persi
 import { failedInteractiveDiscoveryShortlist, interactiveDiscoveryRootToolAllowed, validInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "./interactive-discovery-contract.js"
 import { selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
 import type { DiscoveryShortlistResult } from "./subagents/discovery-shortlist.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 
 type Row = Record<string, unknown>
 
@@ -83,12 +84,17 @@ export function withInteractiveDiscoveryFinalResponse(store: TurnEngineStore, ge
       if (!shortlist || !validInteractiveDiscoveryShortlist(shortlist) || !input.terminal) throw new Error("interactive_discovery_shortlist_missing")
       const finalResponse = object(parseJson(input.response))
       if (finalResponse.schemaVersion !== "agent-harness.v2.final" || typeof finalResponse.response !== "string") throw new Error("interactive_discovery_final_response_invalid")
+      const hasSummaryBinding = input.terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING] !== undefined
       const response = JSON.stringify(shortlist), final = { ...finalResponse, response }
-      return store.recordFinalResponse({ ...input, response: JSON.stringify(final), terminal: {
-        ...input.terminal,
-        finalContent: toRepositoryJson({ text: response, final }),
-        interactiveDiscoveryShortlist: toRepositoryJson(shortlist),
-      } })
+      return store.recordFinalResponse({
+        ...input,
+        ...(!hasSummaryBinding ? { response: JSON.stringify(final) } : {}),
+        terminal: {
+          ...input.terminal,
+          ...(!hasSummaryBinding ? { finalContent: toRepositoryJson({ text: response, final }) } : {}),
+          interactiveDiscoveryShortlist: toRepositoryJson(shortlist),
+        },
+      })
     },
   }
 }
