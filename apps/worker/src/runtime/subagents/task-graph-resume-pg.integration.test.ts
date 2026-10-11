@@ -13085,11 +13085,28 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const readyLine = await waitForProcessLine(workerTwo, "P3_ARCHIVED_WAIT_READY_OUTCOME_SEEN ", 45_000)
       expect(readyLine).toMatch(/"status":"ready".*"targetCount":7.*"matchedCount":7/)
       await waitForProcessLine(workerTwo, "P3_ARCHIVED_WAIT_TURN_COMPLETED", 45_000)
-      const completedTurn = await pool!.query<{ status: string; rootTaskId: string; finalResponse: string | null }>(
-        `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns"
+      const completedTurn = await pool!.query<{
+        status: string; rootTaskId: string; finalResponse: string | null
+        inputTokens: number; outputTokens: number; estimatedCostUsd: string | number
+      }>(
+        `SELECT "status", "rootTaskId", "finalResponse", "inputTokens", "outputTokens", "estimatedCostUsd" FROM "agent_turns"
          WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId],
       )
-      expect(completedTurn.rows).toEqual([{ status: "completed", rootTaskId, finalResponse: "p3-process-archived-wait-resumed" }])
+      expect(completedTurn.rows).toHaveLength(1)
+      expect(completedTurn.rows[0]).toMatchObject({
+        status: "completed", rootTaskId, finalResponse: "p3-process-archived-wait-resumed", inputTokens: 37, outputTokens: 17,
+      })
+      expect(Number(completedTurn.rows[0]!.estimatedCostUsd)).toBeCloseTo(0.0052, 8)
+      const completedRoot = await pool!.query<{ status: string; result: unknown }>(
+        `SELECT "status", "result" FROM "sub_agent_tasks"
+         WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "rootTaskId" = $1`,
+        [rootTaskId, value.userId, value.sessionId, value.turnId],
+      )
+      expect(completedRoot.rows).toHaveLength(1)
+      expect(completedRoot.rows[0]?.status).toBe("completed")
+      expect(record(completedRoot.rows[0]?.result)).toMatchObject({
+        status: "completed", stepCount: 3, toolCallCount: 3,
+      })
       const resolved = await pool!.query<{ status: string; targetTaskIds: unknown; matchedTaskIds: unknown; result: unknown; suspendedAt: Date | null; consumedAt: Date | null }>(
         `SELECT "status", "targetTaskIds", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
          FROM "agent_wait_conditions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
