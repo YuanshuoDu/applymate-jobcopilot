@@ -179,8 +179,8 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
   const nodes: TaskGraphCurrentNode[] = read.map(node => {
     const task = taskByKey.get(node.key)!
     const stored = loaded.snapshot!.nodes.find(candidate => candidate.key === node.key)!
-    const verificationCriterionIds = stored.verificationDisposition === "typed" && stored.verification
-      ? stored.verification.criteria.map(criterion => criterion.id) : undefined
+    const verification = stored.verificationDisposition === "typed" ? stored.verification : undefined
+    const verificationCriterionIds = verification?.criteria.map(criterion => criterion.id)
     const taskResult = parseObject(task.result)
     const hasReport = Boolean(taskResult && Object.hasOwn(taskResult, "taskGraphVerificationReport"))
     const verificationReport = verificationCriterionIds
@@ -211,7 +211,7 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       dependsOn: node.dependsOn, taskId: stored.taskId,
       status: task.status, readiness: node.readiness, resultSummary: resultSummary(task.result),
       resultProjection,
-      ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
+      ...(verification ? { verification } : {}), ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
       ...(verificationReport ? { verificationReport } : {}),
       ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}),
       ...(stored.nativeDelegation ? taskGraphNativeCurrentView(stored.nativeDelegation, task) : {}),
