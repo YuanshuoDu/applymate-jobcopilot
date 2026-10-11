@@ -647,6 +647,105 @@ function diagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string | 
   return typeof value === "string" && allowed.has(value) ? value : null
 }
 
+type PrivateWaitReaderOrigin = "not_observed" | "same_execution" | "later_execution"
+type PrivateWaitReaderStage = "not_observed" | "first_lookup" | "subsequent_lookup"
+type PrivateWaitRowObservation =
+  | "not_called" | "private_row_waiting" | "private_row_ready" | "private_row_timed_out"
+  | "private_row_interrupted" | "empty" | "query_rejected"
+type PrivateWaitReaderAttempt = {
+  readonly invocationKey: string
+  readonly origin: Exclude<PrivateWaitReaderOrigin, "not_observed">
+  readonly stage: Exclude<PrivateWaitReaderStage, "not_observed">
+  rowObservation: PrivateWaitRowObservation
+}
+
+function instrumentPrivateWaitReader(pool: Pool, currentExecution: () => number) {
+  const attempts = new Map<string, { count: number; latest: PrivateWaitReaderAttempt | null }>()
+  let latestInvocation: { key: string; execution: number } | null = null
+  const beginSql = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+
+  const wrappedPool = new Proxy(pool, {
+    get(target, property) {
+      if (property === "connect") {
+        return async () => {
+          const client = await target.connect()
+          const query = client.query.bind(client) as unknown as (...queryArgs: unknown[]) => Promise<unknown>
+          let activeAttempt: PrivateWaitReaderAttempt | null = null
+          const wrappedClient = new Proxy(client, {
+            get(clientTarget, clientProperty) {
+              if (clientProperty === "query") {
+                return async (...queryArgs: unknown[]) => {
+                  const queryInput = queryArgs[0]
+                  const sql = typeof queryInput === "string" ? queryInput : String(record(queryInput)?.text ?? "")
+                  const normalizedSql = sql.trim().toUpperCase()
+                  if (normalizedSql === beginSql && latestInvocation) {
+                    const entry = attempts.get(latestInvocation.key) ?? { count: 0, latest: null }
+                    entry.count += 1
+                    activeAttempt = {
+                      invocationKey: latestInvocation.key,
+                      origin: currentExecution() === latestInvocation.execution ? "same_execution" : "later_execution",
+                      stage: entry.count === 1 ? "first_lookup" : "subsequent_lookup",
+                      rowObservation: "empty",
+                    }
+                    entry.latest = activeAttempt
+                    attempts.set(latestInvocation.key, entry)
+                  }
+                  if (!activeAttempt) return query(...queryArgs)
+                  try {
+                    const result = await query(...queryArgs)
+                    if (activeAttempt && sql.includes('FROM "agent_wait_conditions" AS wait')) {
+                      const queryValues = Array.isArray(queryArgs[1]) ? queryArgs[1] : record(queryInput)?.values
+                      const rows = record(result)?.rows
+                      const row = Array.isArray(rows) && rows.length === 1 ? record(rows[0]) : null
+                      const readInvocationKey = Array.isArray(queryValues) ? queryValues[1] : undefined
+                      if (row && readInvocationKey === activeAttempt.invocationKey
+                        && row.idempotencyKey === activeAttempt.invocationKey) {
+                        const status = row.status
+                        if (status === "waiting") activeAttempt.rowObservation = "private_row_waiting"
+                        else if (status === "ready") activeAttempt.rowObservation = "private_row_ready"
+                        else if (status === "timed_out") activeAttempt.rowObservation = "private_row_timed_out"
+                        else if (status === "interrupted") activeAttempt.rowObservation = "private_row_interrupted"
+                      }
+                    }
+                    if (activeAttempt && (normalizedSql === "COMMIT" || normalizedSql === "ROLLBACK")) {
+                      if (normalizedSql === "ROLLBACK") activeAttempt.rowObservation = "query_rejected"
+                      activeAttempt = null
+                    }
+                    return result
+                  } catch (error: unknown) {
+                    if (activeAttempt) activeAttempt.rowObservation = "query_rejected"
+                    throw error
+                  }
+                }
+              }
+              const value = Reflect.get(clientTarget, clientProperty, clientTarget)
+              return typeof value === "function" ? value.bind(clientTarget) : value
+            },
+          }) as PoolClient
+          return wrappedClient
+        }
+      }
+      const value = Reflect.get(target, property, target)
+      return typeof value === "function" ? value.bind(target) : value
+    },
+  }) as Pool
+
+  return {
+    pool: wrappedPool,
+    setLatestInvocation(invocationKey: string, execution: number): void {
+      latestInvocation = { key: invocationKey, execution }
+      if (!attempts.has(invocationKey)) attempts.set(invocationKey, { count: 0, latest: null })
+    },
+    latest(): { origin: PrivateWaitReaderOrigin; stage: PrivateWaitReaderStage; rowObservation: PrivateWaitRowObservation } {
+      if (!latestInvocation) return { origin: "not_observed", stage: "not_observed", rowObservation: "not_called" }
+      const latest = attempts.get(latestInvocation.key)?.latest
+      return latest
+        ? { origin: latest.origin, stage: latest.stage, rowObservation: latest.rowObservation }
+        : { origin: "not_observed", stage: "not_observed", rowObservation: "not_called" }
+    },
+  }
+}
+
 function processFixtureFailureCategory(output: readonly string[], prefix: string): string {
   const marker = output.find(line => line.startsWith(prefix))
   return diagnosticEnum(marker?.slice(prefix.length), PROCESS_FIXTURE_FAILURE_CATEGORIES) ?? "none"
@@ -11009,7 +11108,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let terminalGateLease: TurnLease | undefined
     let failedReportBeforeRepair: unknown
     let rootExecution = 0
-    const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
+    const privateWaitDiagnostics = instrumentPrivateWaitReader(pool!, () => rootExecution)
+    const rootRuntime = await canonical.createCanonicalTurnRuntime(privateWaitDiagnostics.pool, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
@@ -11148,6 +11248,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const pollSuffix = pollIndex === 0 ? "" : `:poll:${pollIndex + 1}`
               const callId = `${repairWaitCallId}${pollSuffix}`
               repairWaitCallIds.push(callId)
+              privateWaitDiagnostics.setLatestInvocation(callId, execution)
               yield { type: "tool_call_completed", callId, name: "agent.wait", arguments: {
                 idempotencyKey: `${repairWaitCallId}${pollSuffix}`, taskIds, mode: "all", timeoutMs: 30_000,
               } }
@@ -11425,11 +11526,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         : repairPlanSent ? "repair_plan_sent"
           : optimisticFinalAttempted ? "optimistic_final_attempted"
             : terminalGateLease ? "terminal_gate_preflight" : initialWaitSent ? "initial_wait_sent" : "initial_plan_sent"
+      const privateWaitRead = privateWaitDiagnostics.latest()
       throw new Error(combineFailureDiagnostics([
         { label: "repairStage", value: repairStage, safeValue: repairStage },
         { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
+        { label: "privateWaitReaderOrigin", value: "", safeValue: privateWaitRead.origin },
+        { label: "privateWaitReaderStage", value: "", safeValue: privateWaitRead.stage },
+        { label: "privateWaitRowObservation", value: "", safeValue: privateWaitRead.rowObservation },
         { label: "repairWaitReferenceSizeBytes", value: "", safeValue: repairWaitReferenceSize === null ? "unknown" : String(repairWaitReferenceSize) },
         { label: "repairWaitFailureClass", value: "", safeValue: repairWaitFailure ?? "not_observed" },
         { label: "repairWaitFailureStage", value: "", safeValue: repairWaitFailureStage ?? "not_observed" },
