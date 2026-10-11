@@ -110,8 +110,11 @@ export type CompactionCollection = {
   readonly state: CompactionState
   readonly narrativeItems: readonly CompactionNarrativeItem[]
   readonly narrativeText: string
+  readonly coveredThroughSequence: bigint | null
+  readonly coveredSourceItemIds: readonly string[]
   readonly sourceItemIds: readonly string[]
   readonly beforeInputTokens: number
+  readonly coveredInputTokens: number
   readonly stateDigest: string
 }
 

@@ -55,15 +55,23 @@ export class ContextCompactor {
       await this.port.recordStarted(started, request.scope)
       previousSnapshot = await this.port.loadLatest({ scope: request.scope, sessionId: collection.state.sessionId })
       previousSnapshotLoaded = true
-      const preservedState = cloneCompactionState(collection.state)
-      const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: preservedState.sessionId, throughSequence: preservedState.throughSequence, narrativeText: collection.narrativeText, state: cloneCompactionState(preservedState), itemCount: collection.sourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
+      if (collection.coveredThroughSequence === null) {
+        throw new CompactionError("invalid_source", "The first source sequence group exceeds the narrative input character limit")
+      }
+      const coveredThroughSequence = collection.coveredThroughSequence
+      if (previousSnapshot !== null && coveredThroughSequence <= previousSnapshot.throughSequence) {
+        throw new CompactionError("invalid_source", "The covered source prefix does not advance the previous snapshot cursor")
+      }
+      const preservedState = { ...cloneCompactionState(collection.state), throughSequence: coveredThroughSequence }
+      const narrativeSummary = boundedSummary(await this.summarizer({ sessionId: preservedState.sessionId, throughSequence: preservedState.throughSequence, narrativeText: collection.narrativeText, state: cloneCompactionState(preservedState), itemCount: collection.coveredSourceItemIds.length, maxOutputCharacters: limits.maxSummaryCharacters }), limits.maxSummaryCharacters)
       const candidateState = cloneCompactionState(preservedState)
       const report = assertCompactionInvariantsPreserved(preservedState, candidateState)
-      const measurement = tokenMeasurement(candidateState, narrativeSummary, collection.beforeInputTokens)
-      const draft = { scope: request.scope, turnId: request.turnId, state: candidateState, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.sourceItemIds, reason: trigger.reason }
+      const measurement = tokenMeasurement(candidateState, narrativeSummary, collection.coveredInputTokens)
+      const draft = { scope: request.scope, turnId: request.turnId, state: candidateState, narrativeSummary, tokenMeasurement: measurement, sourceItemIds: collection.coveredSourceItemIds, reason: trigger.reason }
       const completed = completeCompactionItem(started, { summary: narrativeSummary, measurement, report })
-      const snapshot = await this.port.publishAtomically({ scope: request.scope, previousSnapshot, draft, startedItem: started, completedItem: completed })
-      return { status: "compacted", trigger, item: completed, snapshot, invariantReport: report, tokenMeasurement: measurement, failureRecorded: false }
+      const coveredCompleted = { ...completed, data: { ...completed.data, throughSequence: coveredThroughSequence.toString() } }
+      const snapshot = await this.port.publishAtomically({ scope: request.scope, previousSnapshot, draft, startedItem: started, completedItem: coveredCompleted })
+      return { status: "compacted", trigger, item: coveredCompleted, snapshot, invariantReport: report, tokenMeasurement: measurement, failureRecorded: false }
     } catch (error: unknown) {
       const failure = error instanceof CompactionError ? error : new CompactionError("publish_failed", "Compaction failed")
       const failed = failCompactionItem(started, failure, previousSnapshotLoaded && previousSnapshot !== null)

@@ -3,6 +3,7 @@ import {
   type CompactionCollection,
   type CompactionFact,
   type CompactionInputItem,
+  type CompactionNarrativeItem,
   type CompactionOpenTask,
   type CompactionSource,
   type CompactionState,
@@ -142,19 +143,47 @@ export function estimateCompactionTokens(value: string): number {
   return Math.ceil(Array.from(value).length / 4)
 }
 
+function renderNarrativeItem(item: CompactionNarrativeItem): string {
+  return `[${item.sequence.toString()}] ${item.type} ${item.text}`
+}
+
 export function collectCompactionState(source: CompactionSource, maxNarrativeInputCharacters = DEFAULT_NARRATIVE_INPUT_CHARACTERS): CompactionCollection {
   if (!Number.isSafeInteger(maxNarrativeInputCharacters) || maxNarrativeInputCharacters < 1) throw new CompactionError("invalid_source", "maxNarrativeInputCharacters must be positive")
   const state = normalizeState(source.state)
   const items = normalizeItems(source.items, state.sessionId)
   const rendered = items.map((item) => ({ id: item.id, sequence: item.sequence, type: item.type, text: itemText(item) }))
-  const fullText = rendered.map((item) => `[${item.sequence.toString()}] ${item.type} ${item.text}`).join("\n")
+  const fullText = rendered.map(renderNarrativeItem).join("\n")
+  const groups: CompactionNarrativeItem[][] = []
+  for (const item of rendered) {
+    const previousGroup = groups[groups.length - 1]
+    if (previousGroup?.[0]?.sequence === item.sequence) previousGroup.push(item)
+    else groups.push([item])
+  }
+
+  let narrativeText = ""
+  let coveredThroughSequence: bigint | null = items.length === 0 ? state.throughSequence : null
+  const coveredSourceItemIds: string[] = []
+  for (const group of groups) {
+    const groupText = group.map(renderNarrativeItem).join("\n")
+    const candidate = narrativeText.length > 0 ? `${narrativeText}\n${groupText}` : groupText
+    if (candidate.length > maxNarrativeInputCharacters) break
+    narrativeText = candidate
+    coveredSourceItemIds.push(...group.map((item) => item.id))
+    coveredThroughSequence = group[group.length - 1]!.sequence
+  }
+
+  const collectedState = coveredThroughSequence === null ? state : { ...state, throughSequence: coveredThroughSequence }
+
   return {
-    state,
+    state: collectedState,
     narrativeItems: rendered,
-    narrativeText: fullText.slice(0, maxNarrativeInputCharacters),
+    narrativeText,
+    coveredThroughSequence,
+    coveredSourceItemIds,
     sourceItemIds: items.map((item) => item.id),
     beforeInputTokens: estimateCompactionTokens(fullText),
-    stateDigest: sha256Hex(state),
+    coveredInputTokens: estimateCompactionTokens(canonicalJson({ narrativeText, state: collectedState })),
+    stateDigest: sha256Hex(collectedState),
   }
 }
 

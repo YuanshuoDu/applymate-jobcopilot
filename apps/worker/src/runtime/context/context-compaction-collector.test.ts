@@ -19,7 +19,7 @@ const state: CompactionState = {
   selectedJobMemories,
 }
 
-function source(items: CompactionSource["items"]): CompactionSource { return { state, items } }
+function source(items: CompactionSource["items"], throughSequence = state.throughSequence): CompactionSource { return { state: { ...state, throughSequence }, items } }
 
 describe("deterministic compaction collector", () => {
   it("orders items and state without mutating the source", () => {
@@ -27,20 +27,81 @@ describe("deterministic compaction collector", () => {
       { id: "item-2", sessionId: "session-a", turnId: "turn-a", sequence: 2n, type: "agent_message", status: "completed", content: { z: 1, a: "second" } },
       { id: "item-1", sessionId: "session-a", turnId: "turn-a", sequence: 1n, type: "user_message", status: "completed", content: "first" },
     ] as const
-    const collected = collectCompactionState(source(items))
+    const collected = collectCompactionState(source(items, 2n))
     expect(collected.sourceItemIds).toEqual(["item-1", "item-2"])
+    expect(collected.coveredSourceItemIds).toEqual(["item-1", "item-2"])
+    expect(collected.coveredThroughSequence).toBe(2n)
+    expect(collected.state.throughSequence).toBe(2n)
     expect(collected.narrativeText.indexOf("first" /* content is intentionally data-only */)).toBeGreaterThanOrEqual(0)
     expect(state.userConstraints).toEqual(["remote", "EU"])
   })
 
-  it("keeps all 120 source IDs while bounding summarizer input", () => {
+  it("keeps all source IDs for thresholds while bounding the covered whole-item prefix", () => {
     const items = Array.from({ length: 120 }, (_, index) => ({
-      id: `item-${index.toString().padStart(3, "0")}`, sessionId: "session-a", turnId: "turn-a", sequence: BigInt(index), type: "agent_message", status: "completed", content: "narrative ".repeat(50),
+      id: `item-${index.toString().padStart(3, "0")}`, sessionId: "session-a", turnId: "turn-a", sequence: BigInt(index + 1), type: "agent_message", status: "completed", content: "narrative ".repeat(3),
     }))
-    const collected = collectCompactionState(source(items), 500)
+    const collected = collectCompactionState(source(items, 120n), 500)
+    const coveredCount = collected.coveredSourceItemIds.length
     expect(collected.sourceItemIds).toHaveLength(120)
-    expect(collected.narrativeText.length).toBe(500)
+    expect(coveredCount).toBeGreaterThan(0)
+    expect(coveredCount).toBeLessThan(120)
+    expect(collected.coveredSourceItemIds).toEqual(items.slice(0, coveredCount).map(({ id }) => id))
+    expect(collected.coveredThroughSequence).toBe(BigInt(coveredCount))
+    expect(collected.coveredThroughSequence).toBeLessThan(120n)
+    expect(collected.state.throughSequence).toBe(collected.coveredThroughSequence)
+    expect(collected.coveredInputTokens).toBeGreaterThan(0)
+    expect(collected.coveredInputTokens).toBeLessThan(collected.beforeInputTokens)
+    expect(collected.narrativeText.length).toBeLessThanOrEqual(500)
+    expect(collected.narrativeText).toBe(items.slice(0, coveredCount).map(item => `[${item.sequence.toString()}] ${item.type} ${item.content}`).join("\n"))
     expect(collected.beforeInputTokens).toBeGreaterThan(0)
+  })
+
+  it("includes an Item at the exact cap and excludes it whole when one character over", () => {
+    const item = { id: "item-8", sessionId: "session-a", turnId: "turn-a", sequence: 8n, type: "agent_message", status: "completed", content: "whole item" }
+    const rendered = "[8] agent_message whole item"
+    const itemSource = { state: { ...state, throughSequence: 8n }, items: [item] }
+    const exact = collectCompactionState(itemSource, rendered.length)
+    expect(exact.narrativeText).toBe(rendered)
+    expect(exact.coveredThroughSequence).toBe(8n)
+    expect(exact.state.throughSequence).toBe(8n)
+    expect(exact.coveredSourceItemIds).toEqual(["item-8"])
+
+    const tooSmall = collectCompactionState(itemSource, rendered.length - 1)
+    expect(tooSmall.narrativeText).toBe("")
+    expect(tooSmall.coveredThroughSequence).toBeNull()
+    expect(tooSmall.state).toEqual(collectCompactionState({ state: itemSource.state, items: [] }).state)
+    expect(tooSmall.state.throughSequence).toBe(8n)
+    expect(tooSmall.coveredSourceItemIds).toEqual([])
+    expect(tooSmall.sourceItemIds).toEqual(["item-8"])
+  })
+
+  it("preserves the existing cursor for an actually empty source", () => {
+    const collected = collectCompactionState(source([]))
+    expect(collected.coveredThroughSequence).toBe(state.throughSequence)
+    expect(collected.state.throughSequence).toBe(state.throughSequence)
+  })
+
+  it("keeps equal-sequence peers together when a cap would fit only part of their group", () => {
+    const before = { id: "before", sessionId: "session-a", turnId: "turn-a", sequence: 8n, type: "agent_message", status: "completed", content: "safe prefix" }
+    const peerA = { id: "peer-a", sessionId: "session-a", turnId: "turn-a", sequence: 9n, type: "agent_message", status: "completed", content: "peer A" }
+    const peerB = { id: "peer-b", sessionId: "session-a", turnId: "turn-a", sequence: 9n, type: "user_input", status: "completed", content: { answer: "peer B" } }
+    const beforeText = "[8] agent_message safe prefix"
+    const peerAText = "[9] agent_message peer A"
+    const sourceWithPeerAnswer = { state: { ...state, throughSequence: 9n, answers: [...state.answers, { id: "peer-b", question: "User input", answer: "peer B" }] }, items: [peerB, before, peerA] }
+    const partialGroup = collectCompactionState(sourceWithPeerAnswer, beforeText.length + 1 + peerAText.length)
+    expect(partialGroup.narrativeText).toBe(beforeText)
+    expect(partialGroup.coveredSourceItemIds).toEqual(["before"])
+    expect(partialGroup.coveredThroughSequence).toBe(8n)
+    expect(partialGroup.state.throughSequence).toBe(8n)
+    expect(partialGroup.state.answers.filter(answer => answer.id === "peer-b")).toEqual([{ id: "peer-b", question: "User input", answer: "peer B" }])
+
+    const completeText = `${beforeText}\n${peerAText}\n[9] user_input {"answer":"peer B"}`
+    const completeGroup = collectCompactionState(sourceWithPeerAnswer, completeText.length)
+    expect(completeGroup.narrativeText).toBe(completeText)
+    expect(completeGroup.coveredSourceItemIds).toEqual(["before", "peer-a", "peer-b"])
+    expect(completeGroup.coveredThroughSequence).toBe(9n)
+    expect(completeGroup.state.throughSequence).toBe(9n)
+    expect(completeGroup.state.answers.filter(answer => answer.id === "peer-b")).toEqual([{ id: "peer-b", question: "User input", answer: "peer B" }])
   })
 
   it("fails closed for duplicate items and missing invariant fields", () => {
