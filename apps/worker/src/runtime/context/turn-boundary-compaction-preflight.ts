@@ -76,7 +76,7 @@ export async function runTurnBoundaryContextCompaction(input: {
   const collection = collectCompactionState(source)
   const trigger = evaluateCompactionTrigger({
     inputTokens: collection.beforeInputTokens,
-    itemCount: collection.sourceItemIds.length,
+    itemCount: collection.sourceItemCount,
     atTurnBoundary: false,
     requested: false,
   }, DEFAULT_COMPACTION_POLICY)
