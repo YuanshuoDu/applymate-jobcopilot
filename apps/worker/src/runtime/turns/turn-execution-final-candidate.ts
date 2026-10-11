@@ -11,7 +11,7 @@ import { publishFinalResponse } from "./turn-execution-events.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
 import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
-import { tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 
@@ -19,6 +19,31 @@ export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
   | Readonly<{ kind: "completed"; result: TurnEngineResult }>
+
+const DEFAULT_MAX_STEPS = 32
+const READ_EVIDENCE_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
+function visibleEvidenceReader(tools: readonly unknown[]): boolean {
+  return tools.some(tool => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false
+    const name = Reflect.get(tool, "name")
+    return typeof name === "string" && READ_EVIDENCE_TOOLS.has(name)
+  })
+}
+function canRecoverMissingEvidence(input: {
+  options: TurnExecutionOptions; snapshot: StepContextSnapshot; evidenceCount: number
+  evidenceRefs: readonly string[]; blocker: string; stepCount: number
+}): boolean {
+  const { options } = input
+  const maxSteps = options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS
+  return options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId
+    && input.blocker === "No verifiable evidence is attached to the candidate final"
+    && input.evidenceCount === 0 && input.evidenceRefs.length === 0
+    && (!options.expectedEvidence || options.expectedEvidence.length === 0)
+    && (!options.businessChecks || options.businessChecks.every(check => check.ok))
+    && options.resume?.finalEvidenceRecoveryUsed !== true && !hasFinalEvidenceRecoveryMarker(input.snapshot)
+    && visibleEvidenceReader(options.tools) && Number.isSafeInteger(maxSteps) && Number.isSafeInteger(input.stepCount)
+    && maxSteps - input.stepCount >= 2
+}
 
 async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, now: () => Date, onStepClosed: (kind?: "native_semantic_receipt") => void, rejection?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity): Promise<number | undefined> {
   if (rejection) {
@@ -61,10 +86,19 @@ export async function completeTurnCandidate(input: Readonly<{
   onStepClosed: (kind?: "native_semantic_receipt") => void
 }>): Promise<FinalCandidateOutcome> {
   const { options, writer, step, output, snapshot, signal, now } = input
+  const evidence = snapshotEvidence(snapshot)
   const verification = verifyCandidateFinal({ goal: options.goal, candidate: { text: output.text, finishReason: output.finishReason },
-    evidence: snapshotEvidence(snapshot), expectedEvidence: options.expectedEvidence, businessChecks: options.businessChecks })
+    evidence, expectedEvidence: options.expectedEvidence, businessChecks: options.businessChecks })
   if (!verification.ok) {
     options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
+    if (verification.code === "evidence_missing" && canRecoverMissingEvidence({ options, snapshot, evidenceCount: evidence.length,
+      evidenceRefs: verification.evidenceRefs, blocker: verification.blocker, stepCount: input.stepCount })) {
+      await writer.append("final.rejected", step.id, null,
+        { code: verification.code, blocker: verification.blocker, feedback: verification.feedback, taskId: options.identity.taskId },
+        `final-rejected:${step.id}:evidence-recovery-once`)
+      await finishStep(options, writer, step, output, now, input.onStepClosed)
+      return { kind: "replan", feedback: FINAL_EVIDENCE_RECOVERY_FEEDBACK }
+    }
     await writer.append("final.rejected", step.id, null, { code: verification.code, blocker: verification.blocker, feedback: verification.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
     throw new TurnEngineError(verification.code, verification.blocker)
   }

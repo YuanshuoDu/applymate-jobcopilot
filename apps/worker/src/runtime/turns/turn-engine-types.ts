@@ -197,6 +197,7 @@ export type TurnResumeState = {
   readonly nextOrdinal: number
   readonly stepCount: number
   readonly toolCallCount: number
+  readonly finalEvidenceRecoveryUsed?: boolean
   readonly inputThroughSequence: bigint
   readonly consumedInputIds: readonly string[]
   readonly usage: {
