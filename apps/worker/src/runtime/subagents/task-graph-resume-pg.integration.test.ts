@@ -4808,6 +4808,12 @@ type LeaseRecoveryAdapterBranch = "not_started" | "initial_plan" | "initial_wait
 type LeaseRecoveryAdapterStage =
   | "not_started" | "stream_entered" | "branch_entered" | "graph_checked" | "outcome_checked"
   | "database_checked" | "tool_call_emitted" | "completion_emitted" | "final_output_emitted"
+type LeaseRecoveryModelResult = {
+  resultStatus: "completed" | "failed" | "missing" | "other"
+  isError: boolean | null
+  outputStatus: "accepted" | "duplicate" | "waiting" | "ready" | "timed_out" | "interrupted" | "closed" | "rejected" | "failed" | "completed" | "missing" | "other"
+  errorCategory: "none" | "database" | "invalid_output" | "tool_schema" | "wait_receipt" | "tool_replay" | "completion_gate" | "task_graph" | "execution" | "other"
+}
 type LeaseRecoveryFixtureDiagnostics = {
   modelRuntimeFactoryInvocations: number
   adapterStreamInvocations: number
@@ -4818,6 +4824,67 @@ type LeaseRecoveryFixtureDiagnostics = {
   adapterRoundOrdinal: number
   adapterBranch: LeaseRecoveryAdapterBranch
   adapterStage: LeaseRecoveryAdapterStage
+  repairPlanResult: LeaseRecoveryModelResult
+  repairWaitResult: LeaseRecoveryModelResult
+}
+
+const LEASE_RECOVERY_MODEL_RESULT_STATUSES = new Set(["completed", "failed", "missing", "other"])
+const LEASE_RECOVERY_MODEL_OUTPUT_STATUSES = new Set([
+  "accepted", "duplicate", "waiting", "ready", "timed_out", "interrupted", "closed", "rejected", "failed", "completed", "missing", "other",
+])
+const LEASE_RECOVERY_MODEL_ERROR_CATEGORIES = new Set([
+  "none", "database", "invalid_output", "tool_schema", "wait_receipt", "tool_replay", "completion_gate", "task_graph", "execution", "other",
+])
+
+function missingLeaseRecoveryModelResult(): LeaseRecoveryModelResult {
+  return { resultStatus: "missing", isError: null, outputStatus: "missing", errorCategory: "none" }
+}
+
+function leaseRecoveryModelResultFromRequest(request: HarnessModelRequest, callId: string): LeaseRecoveryModelResult {
+  let matched: { readonly isError?: boolean; readonly content: unknown } | null = null
+  for (let messageIndex = request.messages.length - 1; messageIndex >= 0 && !matched; messageIndex -= 1) {
+    const content = request.messages[messageIndex]!.content
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]!
+      if (part.type === "tool_result" && part.toolUseId === callId) {
+        matched = part
+        break
+      }
+    }
+  }
+  if (!matched) return missingLeaseRecoveryModelResult()
+
+  let output: RecordValue | null = null
+  if (typeof matched.content === "string") {
+    try { output = record(JSON.parse(matched.content) as unknown) } catch { output = null }
+  }
+  const resultStatus = matched.isError === true ? "failed"
+    : matched.isError === false || matched.isError === undefined ? "completed" : "other"
+  const outputStatus = typeof output?.status === "string"
+    && LEASE_RECOVERY_MODEL_OUTPUT_STATUSES.has(output.status)
+    ? output.status as LeaseRecoveryModelResult["outputStatus"]
+    : output?.status === undefined ? "missing" : "other"
+  const errorCode = output?.errorCode
+  const category = errorCode === null || errorCode === undefined ? "none" : diagnosticErrorClass(errorCode) ?? "other"
+  const errorCategory = LEASE_RECOVERY_MODEL_ERROR_CATEGORIES.has(category)
+    ? category as LeaseRecoveryModelResult["errorCategory"]
+    : "other"
+  return {
+    resultStatus,
+    isError: typeof matched.isError === "boolean" ? matched.isError : null,
+    outputStatus,
+    errorCategory,
+  }
+}
+
+function leaseRecoveryModelResultProjection(value: unknown): LeaseRecoveryModelResult {
+  const source = record(value)
+  return {
+    resultStatus: diagnosticEnum(source?.resultStatus, LEASE_RECOVERY_MODEL_RESULT_STATUSES) as LeaseRecoveryModelResult["resultStatus"] | null ?? "other",
+    isError: typeof source?.isError === "boolean" ? source.isError : null,
+    outputStatus: diagnosticEnum(source?.outputStatus, LEASE_RECOVERY_MODEL_OUTPUT_STATUSES) as LeaseRecoveryModelResult["outputStatus"] | null ?? "other",
+    errorCategory: diagnosticEnum(source?.errorCategory, LEASE_RECOVERY_MODEL_ERROR_CATEGORIES) as LeaseRecoveryModelResult["errorCategory"] | null ?? "other",
+  }
 }
 
 function leaseRecoveryFixtureDiagnosticProjection(value: unknown): RecordValue | null {
@@ -4835,6 +4902,8 @@ function leaseRecoveryFixtureDiagnosticProjection(value: unknown): RecordValue |
     adapterRoundOrdinal: ordinal(source.adapterRoundOrdinal),
     adapterBranch: diagnosticEnum(source.adapterBranch, LEASE_RECOVERY_ADAPTER_BRANCHES) ?? "other",
     adapterStage: diagnosticEnum(source.adapterStage, LEASE_RECOVERY_ADAPTER_STAGES) ?? "other",
+    ...(source.repairPlanResult === undefined ? {} : { repairPlanResult: leaseRecoveryModelResultProjection(source.repairPlanResult) }),
+    ...(source.repairWaitResult === undefined ? {} : { repairWaitResult: leaseRecoveryModelResultProjection(source.repairWaitResult) }),
   }
 }
 
@@ -5797,6 +5866,48 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       startupStage: "other", runtimeExecuteFailureClass: "other",
     })
     expect(JSON.stringify([projected, invalid])).not.toContain(secret)
+  })
+
+  it("projects only correlated repair plan and wait result status from captured model input", () => {
+    const secret = "private goal, result body, or error text"
+    const planCallId = "private-repair-plan-call"
+    const waitCallId = "private-repair-wait-call"
+    const request = {
+      messages: [
+        { role: "tool", content: [{ type: "tool_result", toolUseId: planCallId, isError: true,
+          content: JSON.stringify({ status: "rejected", errorCode: "task_graph_state_missing", goal: secret, taskId: secret }) }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: waitCallId,
+          content: JSON.stringify({ status: "waiting", errorCode: "unlisted_private_error", waitId: secret, tasks: [{ goal: secret }] }) }] },
+        { role: "tool", content: [{ type: "tool_result", toolUseId: "unrelated-private-call", isError: true,
+          content: JSON.stringify({ status: "failed", errorCode: "persistence_conflict", goal: secret }) }] },
+      ],
+    } as unknown as HarnessModelRequest
+    const planResult = leaseRecoveryModelResultFromRequest(request, planCallId)
+    const waitResult = leaseRecoveryModelResultFromRequest(request, waitCallId)
+    const missingResult = leaseRecoveryModelResultFromRequest(request, "not-present")
+    const projected = leaseRecoveryFixtureDiagnosticProjection({ repairPlanResult: planResult, repairWaitResult: waitResult })
+    const malformed = leaseRecoveryFixtureDiagnosticProjection({
+      repairPlanResult: { resultStatus: secret, isError: secret, outputStatus: secret, errorCategory: secret, body: secret },
+      repairWaitResult: secret,
+    })
+
+    expect(planResult).toEqual({ resultStatus: "failed", isError: true, outputStatus: "rejected", errorCategory: "task_graph" })
+    expect(waitResult).toEqual({ resultStatus: "completed", isError: null, outputStatus: "waiting", errorCategory: "other" })
+    expect(missingResult).toEqual(missingLeaseRecoveryModelResult())
+    expect(projected).toMatchObject({ repairPlanResult: planResult, repairWaitResult: waitResult })
+    expect(Object.keys(projected ?? {}).sort()).toEqual([
+      "adapterBranch", "adapterExecutionOrdinal", "adapterRoundOrdinal", "adapterStage", "adapterStreamInvocations",
+      "modelRuntimeFactoryInvocations", "repairPlanResult", "repairWaitResult", "runtimeExecuteFailureClass",
+      "runtimeExecuteInvocations", "startupStage",
+    ])
+    expect(malformed).toMatchObject({
+      repairPlanResult: { resultStatus: "other", isError: null, outputStatus: "other", errorCategory: "other" },
+      repairWaitResult: { resultStatus: "other", isError: null, outputStatus: "other", errorCategory: "other" },
+    })
+    expect(JSON.stringify([projected, malformed, missingResult])).not.toContain(secret)
+    expect(JSON.stringify([projected, malformed, missingResult])).not.toContain(planCallId)
+    expect(JSON.stringify([projected, malformed, missingResult])).not.toContain(waitCallId)
+    expect(JSON.stringify([projected, malformed, missingResult])).not.toContain("unrelated-private-call")
   })
 
   it("redacts proposal event lineage markers while retaining safe comparisons and mismatch keys", () => {
@@ -12165,6 +12276,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0,
       runtimeExecuteInvocations: 0, runtimeExecuteFailureClass: "none", startupStage: "not_started",
       adapterExecutionOrdinal: 0, adapterRoundOrdinal: 0, adapterBranch: "not_started", adapterStage: "not_started",
+      repairPlanResult: missingLeaseRecoveryModelResult(), repairWaitResult: missingLeaseRecoveryModelResult(),
     }
     let initialWaitReportSeen = false
     let originalDependentTaskId = ""
@@ -12216,6 +12328,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           id: "p3-taskgraph-lease-recovery-root-fixture", profile,
           async *stream(request) {
             fixtureInvocationCounters.adapterStreamInvocations += 1
+            fixtureInvocationCounters.repairPlanResult = leaseRecoveryModelResultFromRequest(request, repairPlanCallId)
+            fixtureInvocationCounters.repairWaitResult = leaseRecoveryModelResultFromRequest(request, repairWaitCallId)
             round += 1
             fixtureInvocationCounters.adapterRoundOrdinal = Math.min(round, 7)
             fixtureInvocationCounters.adapterBranch = "unexpected"
