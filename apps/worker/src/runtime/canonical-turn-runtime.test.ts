@@ -28,6 +28,7 @@ import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
+import { createWorkerToolRuntime, InMemoryToolLifecycleSink, type CoordinationStore, type CoordinationTaskView, type DurableWaitPort } from "./tools/index.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
 import { runTurnJob } from "./turns/turn-queue.js"
@@ -2892,6 +2893,161 @@ describe("createCanonicalTurnRuntime", () => {
     expect(enabledCalls.some(sql => sql.includes('FROM "agent_wait_conditions"'))).toBe(true)
     const disabledCalls = await run(resolveProductionAgentFlags())
     expect(disabledCalls.some(sql => sql.includes('FROM "agent_wait_conditions"'))).toBe(false)
+  })
+
+  it("uses the refreshed timed-out wait state in the next captured request and replays legacy output without invented fields", async () => {
+    const originalGoal = "Find engineering jobs in Ireland and preserve the user’s salary constraint."
+    const childId = "subagent-00000000-0000-4000-8000-000000000001"
+    const waitId = "wait-00000000-0000-4000-8000-000000000001"
+    const businessRef = { id: "job-ref", kind: "job" as const, ownerId: lease.userId, label: "Selected role", summary: "€70k–€90k engineering role" }
+    const inputClaimStore: InputClaimStore = {
+      scope: { userId: lease.userId },
+      withTransaction: async work => work({
+        getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+        persistCheckpoint: async () => undefined,
+        loadUnresolvedSteeringInputs: async () => [],
+        loadRootInputContext: async () => null,
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const requestBuilder = () => new StepContextBuilder(inputClaimStore, ownerFence, () => lease.leaseStartedAt)
+    const rootTask: CoordinationTaskView = {
+      id: "root-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: null,
+      path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: originalGoal,
+      attemptCount: 1, maxAttempts: 1, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt, interruptRequestedAt: null,
+    }
+    let childTask: CoordinationTaskView = {
+      id: childId, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      path: `/root-1/${childId}`, depth: 1, role: "scout", taskType: "job_discovery", status: "running", goal: "Find matching jobs",
+      attemptCount: 1, maxAttempts: 3, leaseOwner: lease.ownerId, leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"), interruptRequestedAt: null,
+    }
+    const childTaskReads: CoordinationTaskView[] = []
+    const coordinationStore: CoordinationStore = {
+      getTask: async ({ taskId }) => {
+        if (taskId === rootTask.id) return rootTask
+        if (taskId === childTask.id) { childTaskReads.push(childTask); return childTask }
+        return null
+      },
+      listTasks: async () => [],
+      sendMessage: async input => ({ message: {
+        id: "message-1", sessionId: input.sessionId, turnId: input.turnId, fromTaskId: input.fromTaskId,
+        toTaskId: input.toTaskId, kind: input.kind, idempotencyKey: input.idempotencyKey, createdAt: lease.leaseStartedAt,
+      }, duplicate: false }),
+      getSpawnReplay: async () => null,
+      recordSpawn: async () => true,
+      appendActivity: async () => undefined,
+    }
+    const refreshedLeaseExpiry = new Date("2026-09-07T00:04:00.000Z")
+    const refreshedInterruptAt = new Date("2026-09-07T00:03:00.000Z")
+    let waitCallCount = 0
+    const waitPort: DurableWaitPort = {
+      wait: vi.fn(async () => {
+        waitCallCount += 1
+        childTask = { ...childTask, attemptCount: 2, maxAttempts: 4, leaseExpiresAt: refreshedLeaseExpiry, interruptRequestedAt: refreshedInterruptAt }
+        return { waitId, status: "timed_out" as const, deadlineAt: "2026-09-07T00:02:00.000Z", matchedTaskIds: [] }
+      }),
+    }
+    const sink = new InMemoryToolLifecycleSink()
+    const requests: HarnessModelRequest[] = []
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: lease.ownerId,
+      productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }),
+      stateLoader: async () => state({ goal: originalGoal, snapshot: {
+        ...state().snapshot, goal: { id: "goal-1", content: originalGoal }, businessRefs: [businessRef],
+      } }),
+      rootTaskStore: rootStore() as never,
+      toolRuntimeFactory: ({ pool, policy, manager }) => createWorkerToolRuntime(pool, {
+        sink, resolveOwner: () => ({ kind: "turn", taskId: "root-1", lease }),
+      }, policy, { manager, store: coordinationStore, wait: waitPort }),
+      turnEngineStoreFactory: () => store(),
+      contextBuilderFactory: requestBuilder,
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          if (requests.length === 1) {
+            yield { type: "tool_call_completed", callId: "wait-timeout-call", name: "agent.wait", arguments: {
+              idempotencyKey: "wait-timeout-key", taskIds: [childId], mode: "all", timeoutMs: 2_000,
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "Continue with the refreshed task state." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(waitPort.wait).toHaveBeenCalledWith(expect.objectContaining({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, taskId: "root-1", rootTaskId: "root-1",
+      targetTaskIds: [childId], idempotencyKey: "wait-timeout-key",
+    }))
+    expect(waitCallCount).toBe(1)
+    expect(childTaskReads.map(task => [task.attemptCount, task.maxAttempts])).toEqual([[1, 3], [2, 4]])
+    expect(requests).toHaveLength(2)
+    const continuationResult = requests[1]?.messages.flatMap(message => message.content)
+      .find(part => part.type === "tool_result" && part.toolUseId === "wait-timeout-call")
+    const refreshedOutput = continuationResult && continuationResult.type === "tool_result" ? JSON.parse(continuationResult.content) as Record<string, unknown> : null
+    expect(refreshedOutput).toMatchObject({ status: "timed_out", tasks: [{
+        taskId: childId, status: "running", attemptCount: 2, maxAttempts: 4,
+        leaseExpiresAt: refreshedLeaseExpiry.toISOString(), interruptRequestedAt: refreshedInterruptAt.toISOString(),
+      }] })
+    const refreshedTask = (refreshedOutput?.tasks as Array<Record<string, unknown>> | undefined)?.[0]
+    expect(refreshedTask && Object.keys(refreshedTask).sort()).toEqual([
+      "attemptCount", "failureReason", "interruptRequestedAt", "leaseExpiresAt", "maxAttempts", "result", "role", "status", "taskId",
+    ])
+    expect(sink.events.find(event => event.eventType === "tool_call.completed")?.payload.output)
+      .toMatchObject({ status: "timed_out", tasks: [{ attemptCount: 2, maxAttempts: 4,
+        leaseExpiresAt: refreshedLeaseExpiry.toISOString(), interruptRequestedAt: refreshedInterruptAt.toISOString() }] })
+    const continuedText = requests[1]?.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    expect(continuedText).toContain(originalGoal)
+    expect(continuedText).toContain("Selected role")
+    expect(continuedText).toContain("€70k–€90k engineering role")
+
+    const legacyChildId = "subagent-00000000-0000-4000-8000-000000000002"
+    const legacyTask = { taskId: legacyChildId, status: "completed", role: "scout", result: { summary: "legacy result" }, failureReason: null }
+    const legacyOutput = { waitId: "wait-00000000-0000-4000-8000-000000000002", status: "ready", taskIds: [legacyChildId], deadlineAt: "2026-09-07T00:02:00.000Z",
+      matchedTaskIds: [legacyChildId], tasks: [legacyTask] }
+    const legacyState = state({ goal: originalGoal, snapshot: {
+      ...state().snapshot, goal: { id: "goal-legacy", content: originalGoal }, businessRefs: [businessRef],
+      toolObservations: [{ id: "legacy-wait-result", content: {
+        toolCallId: "legacy-wait-call", toolName: "agent.wait", status: "completed",
+        input: { idempotencyKey: "legacy-wait-key", taskIds: [legacyChildId], mode: "all", timeoutMs: 2_000 }, output: legacyOutput,
+      } }],
+    } })
+    const legacyRequests: HarnessModelRequest[] = []
+    const legacyRuntime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: lease.ownerId, stateLoader: async () => legacyState, rootTaskStore: rootStore() as never,
+      toolRuntimeFactory: ({ pool, policy, manager }) => createWorkerToolRuntime(pool, {
+        sink: new InMemoryToolLifecycleSink(), resolveOwner: () => ({ kind: "turn", taskId: "root-1", lease }),
+      }, policy, { manager, store: coordinationStore }),
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: requestBuilder,
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          legacyRequests.push(request)
+          yield { type: "text_delta", text: "Legacy wait receipt retained." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+    await expect(legacyRuntime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    const replayed = legacyRequests[0]?.messages.flatMap(message => message.content)
+      .find(part => part.type === "tool_result" && part.toolUseId === "legacy-wait-call")
+    expect(replayed && replayed.type === "tool_result" ? JSON.parse(replayed.content) : null).toEqual(legacyOutput)
+    expect(Object.keys(legacyTask).sort()).toEqual(["failureReason", "result", "role", "status", "taskId"])
+    const legacyText = legacyRequests[0]?.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    expect(legacyText).toContain(originalGoal)
+    expect(legacyText).toContain("€70k–€90k engineering role")
   })
 
   it("composes a real model/tool continuation with runtime-owned root identity", async () => {

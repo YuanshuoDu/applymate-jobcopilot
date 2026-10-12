@@ -180,6 +180,33 @@ describe("coordination tool definitions", () => {
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, page, "agent.list output")).not.toThrow()
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()
   })
+
+  it("accepts exact legacy or complete current wait task outputs, rejecting partial state and private fields", () => {
+    const registry = new ToolRegistry(createCoordinationTools(options))
+    const schema = registry.resolve("agent.wait", "1").outputSchema
+    const legacy = {
+      waitId: "wait-1", status: "timed_out", taskIds: ["task-1"], deadlineAt: "2026-10-12T10:15:00.000Z",
+      matchedTaskIds: [], tasks: [{ taskId: "task-1", status: "retrying", role: "scout", result: null, failureReason: null }],
+    }
+    const current = {
+      ...legacy,
+      tasks: [{ ...legacy.tasks[0]!, attemptCount: 2, maxAttempts: 4,
+        leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: null }],
+    }
+    expect(() => registry.validators.validate(schema, legacy, "agent.wait output")).not.toThrow()
+    expect(() => registry.validators.validate(schema, current, "agent.wait output")).not.toThrow()
+
+    for (const task of [
+      { ...current.tasks[0]!, interruptRequestedAt: undefined },
+      { ...current.tasks[0]!, attemptCount: -1 },
+      { ...current.tasks[0]!, maxAttempts: 0 },
+      { ...current.tasks[0]!, leaseExpiresAt: 123 },
+      { ...current.tasks[0]!, leaseOwner: "private-lease-owner" },
+    ]) {
+      expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).toThrow()
+    }
+  })
+
   it("rejects forged tenant, ownership, lineage, and unknown fields before execution", () => {
     const registry = new ToolRegistry(createCoordinationTools(options))
     const valid = { idempotencyKey: "spawn-1", role: "scout", taskType: "inspect", goal: "Inspect the job" }

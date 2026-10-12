@@ -102,10 +102,18 @@ const SpawnOutputSchema = Type.Object({
   status: StatusSchema, replay: Type.Boolean(), nativeCoordination: Type.Optional(NativeCoordinationOutputSchema),
 }, { additionalProperties: false })
 const SendOutputSchema = Type.Object({ taskId: IdSchema, messageId: IdSchema, status: Type.Union([Type.Literal("queued"), Type.Literal("duplicate")]) }, { additionalProperties: false })
-const WaitTaskOutputSchema = Type.Object({
+const WaitTaskBaseOutputProperties = {
   taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
   failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
-}, { additionalProperties: false })
+}
+const WaitTaskOutputSchema = Type.Union([
+  Type.Object(WaitTaskBaseOutputProperties, { additionalProperties: false }),
+  Type.Object({
+    ...WaitTaskBaseOutputProperties,
+    attemptCount: Type.Integer({ minimum: 0 }), maxAttempts: Type.Integer({ minimum: 1 }),
+    leaseExpiresAt: Type.Union([Type.String(), Type.Null()]), interruptRequestedAt: Type.Union([Type.String(), Type.Null()]),
+  }, { additionalProperties: false }),
+])
 const WaitAggregateSchema = Type.Object({
   status: Type.Union([Type.Literal("completed"), Type.Literal("partial"), Type.Literal("failed"), Type.Literal("pending")]),
   successfulRoles: Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 }),
