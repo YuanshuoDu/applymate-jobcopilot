@@ -6,7 +6,7 @@ import type { TurnUsage } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
-import type { TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
+import type { TaskGraphDenialProgress, TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import type { ToolCallRecovery, TurnEngineToolResult } from "./turn-engine-tool-types.js"
@@ -198,6 +198,7 @@ export type TurnResumeState = {
   readonly stepCount: number
   readonly toolCallCount: number
   readonly finalEvidenceRecoveryUsed?: boolean
+  readonly taskGraphDenialProgress?: TaskGraphDenialProgress
   readonly inputThroughSequence: bigint
   readonly consumedInputIds: readonly string[]
   readonly usage: {

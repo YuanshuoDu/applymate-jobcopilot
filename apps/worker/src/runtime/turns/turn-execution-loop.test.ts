@@ -13,7 +13,7 @@ import type { NativeVerificationFeedback } from "../subagents/native-verificatio
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
@@ -34,6 +34,7 @@ import type { HydrationScope } from "../context/steering-reconciliation-context.
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { steeringReconciliationRecoveryError } from "./turn-execution-completion-gate.js"
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -42,6 +43,14 @@ const profile = {
 }
 const lateSteerText = "Prioritize senior engineering roles in Dublin."
 const taskGraphFeedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
+function taskGraphCheckpoint(graphRevision: number, digest = "a"): TaskGraphDenialCheckpoint {
+  return { schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision, verificationDigest: digest.repeat(64) }
+}
+function checkpointedTaskGraphDenial(checkpoint: TaskGraphDenialCheckpoint) {
+  const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing` }
+  Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
+  return denial
+}
 const nativeSemanticFailure: NativeVerificationFeedback = {
   controlTaskId: "private-control-id", targetTaskId: "private-target-id", disposition: "failed",
   criteria: [{ criterionId: "private-criterion-id", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: ["private-evidence-id"] }],
@@ -2016,6 +2025,248 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "final.rejected")).toBe(true)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+  })
+
+  it("stops before a third provider call after two denials at the same accepted-input checkpoint", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    addSteeringInput(root)
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const inputBuilder = root.options.contextBuilder
+    let inputBuilds = 0
+    const builtInputFences: string[][] = []
+    const builtInputSequences: bigint[] = []
+    root.options = { ...root.options, contextBuilder: { build: async request => {
+      const built = await inputBuilder.build(request)
+      inputBuilds += 1
+      const context = inputBuilds === 1 ? { ...built, inputThroughSequence: 1n } : {
+        ...built, inputThroughSequence: 1n, consumedInputIds: [],
+        blocks: built.blocks.filter(block => block.id !== "steer-1:part:0"),
+      }
+      builtInputFences.push([...context.consumedInputIds])
+      builtInputSequences.push(context.inputThroughSequence)
+      return { ...context, taskGraphRevision: 4 }
+    } } }
+    const checkpoint = taskGraphCheckpoint(4)
+    const read = vi.fn(async () => checkpoint)
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => {
+      return checkpointedTaskGraphDenial(checkpoint)
+    })
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
+    const baseModel = root.options.model
+    const candidateBodies: string[] = []
+    root.options = { ...root.options, completionGate, budget: { maxSteps: 4 }, maxSteps: 4,
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        const candidate = `Candidate wording ${root.requests.length} still lacks the required proof.`
+        candidateBodies.push(candidate)
+        yield { type: "text_delta", text: candidate }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 3 })
+    expect(root.requests).toHaveLength(2)
+    expect(new Set(candidateBodies).size).toBe(2)
+    expect(completionGate).toHaveBeenCalledTimes(2)
+    expect(read).toHaveBeenCalledOnce()
+    expect(builtInputFences.slice(0, 3)).toEqual([["steer-1"], [], []])
+    expect(builtInputSequences.slice(0, 3)).toEqual([1n, 1n, 1n])
+    expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(2)
+    expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(2)
+    expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
+  })
+
+  it("reopens the model after accepted input and current TaskGraph checkpoint changes", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const baseBuilder = root.options.contextBuilder
+    let graphRevision = 4, buildCount = 0, denials = 0
+    const capturedContexts: Array<Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">> = []
+    const inputStates: Array<{ sequence: bigint; consumed: string[]; id?: string; text?: string }> = [
+      { sequence: 1n, consumed: ["steer-before"], id: "steer-before", text: "Initial accepted instruction" },
+      { sequence: 1n, consumed: [] },
+      { sequence: 2n, consumed: ["steer-after"], id: "steer-after", text: "New accepted instruction changes the cursor" },
+      { sequence: 2n, consumed: [] },
+      { sequence: 2n, consumed: [] },
+      { sequence: 2n, consumed: [] },
+      { sequence: 2n, consumed: [] },
+    ]
+    const read = vi.fn(async () => taskGraphCheckpoint(graphRevision, graphRevision === 4 ? "a" : "b"))
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => {
+      denials += 1
+      const denial = checkpointedTaskGraphDenial(taskGraphCheckpoint(graphRevision, graphRevision === 4 ? "a" : "b"))
+      if (denials === 4) graphRevision = 5
+      return denial
+    })
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
+    const baseModel = root.options.model
+    root.options = {
+      ...root.options,
+      completionGate,
+      maxSteps: 8,
+      budget: { maxSteps: 8 },
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: graphRevision, nodes: [] }),
+      contextBuilder: { build: async request => {
+        const built = await baseBuilder.build(request)
+        const state = inputStates[buildCount++]
+        if (!state) throw new Error("loop requested an unexpected context")
+        const blocks = [...built.blocks]
+        if (state.id && state.text) blocks.push({
+          id: `${state.id}:part:0`, layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input",
+          content: { inputId: state.id, partIndex: 0, text: state.text },
+        })
+        const context: StepContext = {
+          ...built,
+          taskGraphRevision: request.snapshot.taskGraphRevision,
+          inputThroughSequence: state.sequence,
+          consumedInputIds: [...state.consumed],
+          blocks,
+        }
+        capturedContexts.push({ taskGraphRevision: context.taskGraphRevision, inputThroughSequence: context.inputThroughSequence, consumedInputIds: context.consumedInputIds })
+        return context
+      } },
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text: `Candidate ${root.requests.length} under the current checkpoint.` }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const requestText = (index: number) => JSON.stringify(root.requests[index]?.messages).replaceAll("\\\"", "\"")
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 7, toolCallCount: 0 })
+    expect(root.requests).toHaveLength(6)
+    expect(completionGate).toHaveBeenCalledTimes(6)
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(capturedContexts.map(context => [context.taskGraphRevision, context.inputThroughSequence, context.consumedInputIds])).toEqual([
+      [4, 1n, ["steer-before"]], [4, 1n, []], [4, 2n, ["steer-after"]], [4, 2n, []],
+      [5, 2n, []], [5, 2n, []], [5, 2n, []],
+    ])
+    expect(requestText(0)).toContain("Initial accepted instruction")
+    expect(requestText(0)).not.toContain("New accepted instruction changes the cursor")
+    expect(requestText(1)).not.toContain("New accepted instruction changes the cursor")
+    expect(requestText(2)).toContain("New accepted instruction changes the cursor")
+    expect(requestText(2)).toContain('"revision":4')
+    expect(requestText(3)).toContain('"revision":4')
+    expect(requestText(4)).toContain('"revision":5')
+    expect(requestText(5)).toContain('"revision":5')
+    expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(6)
+    expect(new Set(root.events.filter(event => event.type === "turn.no_progress").map(event => event.id)).size).toBe(1)
+  })
+
+  it("breaks the TaskGraph denial streak across an intervening tool call", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const baseBuilder = root.options.contextBuilder
+    let buildCount = 0, denials = 0
+    const contexts: Array<Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">> = []
+    const checkpoint = taskGraphCheckpoint(4)
+    const read = vi.fn(async () => checkpoint)
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => {
+      denials += 1
+      return checkpointedTaskGraphDenial(checkpoint)
+    })
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
+    const baseModel = root.options.model
+    const dispatch = vi.fn(root.options.executeTool)
+    root.options = {
+      ...root.options,
+      completionGate,
+      maxSteps: 6,
+      budget: { maxSteps: 6 },
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: 4, nodes: [] }),
+      contextBuilder: { build: async request => {
+        const built = await baseBuilder.build(request)
+        const index = buildCount++
+        const context = { ...built, taskGraphRevision: 4, inputThroughSequence: 1n, consumedInputIds: index === 0 ? ["steer-before"] : [] }
+        contexts.push({ taskGraphRevision: context.taskGraphRevision, inputThroughSequence: context.inputThroughSequence, consumedInputIds: context.consumedInputIds })
+        return context
+      } },
+      executeTool: dispatch,
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        const call = root.requests.length
+        if (call === 2) {
+          yield { type: "tool_call_completed", callId: "intervening-search", name: "jobs.search", arguments: { location: "Dublin" } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: `TaskGraph denial candidate ${call}.` }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 5, toolCallCount: 1 })
+    expect(root.requests).toHaveLength(4)
+    expect(completionGate).toHaveBeenCalledTimes(3)
+    expect(read).toHaveBeenCalledOnce()
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ id: "intervening-search", toolName: "jobs.search" }) }))
+    expect(contexts.map(context => [context.taskGraphRevision, context.inputThroughSequence, context.consumedInputIds])).toEqual([
+      [4, 1n, ["steer-before"]], [4, 1n, []], [4, 1n, []], [4, 1n, []], [4, 1n, []],
+    ])
+    expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(3)
+    expect(new Set(root.events.filter(event => event.type === "tool_call.completed").map(event => event.id)).size).toBe(1)
+    expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(3)
+    expect(new Set(root.events.filter(event => event.type === "turn.no_progress").map(event => event.id)).size).toBe(1)
+  })
+
+  it("breaks the TaskGraph denial streak across an actual ready wait result", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const baseBuilder = root.options.contextBuilder
+    const checkpoint = taskGraphCheckpoint(4)
+    const read = vi.fn(async () => checkpoint)
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
+    const baseModel = root.options.model
+    const waitOutput = {
+      waitId: "wait-ready-between-denials", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z",
+      matchedTaskIds: ["child-1"], taskIds: ["child-1"],
+    }
+    let callCount = 0
+    root.options = {
+      ...root.options,
+      completionGate,
+      tools: [{ name: "agent.wait", version: "1" }],
+      maxSteps: 8,
+      budget: { maxSteps: 8 },
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: 4, nodes: [] }),
+      contextBuilder: { build: async request => ({ ...(await baseBuilder.build(request)), taskGraphRevision: 4 }) },
+      executeTool: async ({ call }) => ({
+        id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: waitOutput, errorCode: null,
+      }),
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        callCount += 1
+        if (callCount === 2) {
+          yield { type: "tool_call_completed", callId: "intervening-ready-wait", name: "agent.wait", arguments: { taskIds: ["child-1"], mode: "all", timeoutMs: 5_000 } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: `TaskGraph denial candidate ${callCount}.` }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const thirdRequest = JSON.stringify(root.requests[2]?.messages).replaceAll("\\\"", "\"")
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 5, toolCallCount: 1 })
+    expect(root.requests).toHaveLength(4)
+    expect(completionGate).toHaveBeenCalledTimes(3)
+    expect(read).toHaveBeenCalled()
+    expect(thirdRequest).toContain("wait-ready-between-denials")
+    expect(thirdRequest).toContain('"status":"ready"')
+    expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(3)
+    expect(new Set(root.events.filter(event => event.type === "tool_call.completed").map(event => event.id)).size).toBe(1)
+    expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(3)
+    expect(new Set(root.events.filter(event => event.type === "turn.no_progress").map(event => event.id)).size).toBe(1)
   })
 
   it("gathers read evidence after one premature final and verifies a fresh final in the same loop", async () => {

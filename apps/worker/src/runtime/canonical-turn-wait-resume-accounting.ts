@@ -1,5 +1,6 @@
 import { parseModelCompletedReceipt } from "./turns/model-completed-receipt.js"
 import type { TurnResumeState } from "./turns/turn-engine-types.js"
+import type { TaskGraphDenialProgress } from "./turns/turn-execution-types.js"
 import type { RecoveredArchivedWaitControl } from "./turns/turn-execution-wait.js"
 
 type Row = Record<string, unknown>
@@ -178,6 +179,7 @@ export function buildCanonicalTurnResumeState(input: {
   readonly last?: Row; readonly maxOrdinal: number | null; readonly steps: readonly Row[]
   readonly persistedToolCallCount: number; readonly items: readonly Row[]; readonly events: readonly Row[]; readonly scope: Scope
   readonly recoveredWaitControl?: RecoveredArchivedWaitControl
+  readonly taskGraphDenialProgress?: TaskGraphDenialProgress
 }): TurnResumeState | undefined {
   const evidenceRecoveryUsed = finalEvidenceRecoveryUsed(input.events, input.steps, input.scope)
   if (!input.last && input.maxOrdinal === null) return undefined
@@ -209,6 +211,7 @@ export function buildCanonicalTurnResumeState(input: {
   return {
     nextOrdinal: (input.maxOrdinal ?? Number(input.last?.ordinal)) + 1, stepCount: input.steps.length, toolCallCount,
     ...(evidenceRecoveryUsed ? { finalEvidenceRecoveryUsed: true } : {}),
+    ...(input.taskGraphDenialProgress ? { taskGraphDenialProgress: input.taskGraphDenialProgress } : {}),
     inputThroughSequence: BigInt(String(input.last?.inputThroughSequence ?? 0)),
     consumedInputIds: Array.isArray(input.last?.consumedInputIds) ? input.last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
     usage,

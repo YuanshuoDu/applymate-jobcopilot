@@ -24,15 +24,19 @@ import type { NativeSemanticProgressMode, NativeSemanticRejectionCount, NativeSe
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import type { DurableWaitControlReader } from "../tools/coordination-types.js"
 import type { RecoveredArchivedWaitControl } from "./turn-execution-wait.js"
+import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
 export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
 export const RESET_NATIVE_SEMANTIC_PROGRESS: unique symbol = Symbol("reset-native-semantic-progress")
+export const TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("task-graph-denial-checkpoint")
+export const READ_TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("read-task-graph-denial-checkpoint")
 
 export type TurnEngineCompletionGateResult =
   | ({ readonly ok: true } & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
   | ({ readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string
-      readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: NativeSemanticRejectionIdentity }
+      readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: NativeSemanticRejectionIdentity
+      readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint }
       & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
 
 export type TurnEngineCompletionGate = ((input: {
@@ -46,9 +50,18 @@ export type TurnEngineCompletionGate = ((input: {
   readonly now: Date
 }) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult) & {
   [RESET_NATIVE_SEMANTIC_PROGRESS]?: () => void
+  [READ_TASK_GRAPH_DENIAL_CHECKPOINT]?: () => Promise<TaskGraphDenialCheckpoint | null>
 }
 
 export type TurnExecutionStepBudget = { readonly remainingTurnSteps?: number }
+export type TaskGraphDenialProgress = Readonly<{
+  taskId: string
+  graphRevision: number
+  verificationDigest: string
+  inputThroughSequence: bigint
+  consumedInputIds: readonly string[]
+  count: 1 | 2
+}>
 
 /** Identity is owner normalized; the loop never receives a raw lease. */
 export type TurnExecutionIdentity = ExecutionOwnerFence

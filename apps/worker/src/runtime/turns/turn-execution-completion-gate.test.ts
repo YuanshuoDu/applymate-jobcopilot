@@ -3,13 +3,14 @@ import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
-import { RESET_NATIVE_SEMANTIC_PROGRESS } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT } from "./turn-execution-types.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
-import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState } from "./turn-execution-completion-gate.js"
+import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-assessment.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
@@ -72,6 +73,126 @@ describe("assertCompletionAllowed", () => {
       { code: "business_precondition_failed", blocker: "child_tasks_pending", feedback: "Child work is still running", taskId: identity.taskId },
       `final-rejected:${step.id}`,
     )
+  })
+
+  it("writes a private normalized checkpoint immediately before the unchanged public rejection", async () => {
+    const target = node("scout", "task-scout")
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target], [{
+      id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: storedResult("failed"),
+    }]), graphLease, "root-1")
+    if (decision.ok) throw new Error("expected TaskGraph verification denial")
+    expect(decision[TASK_GRAPH_DENIAL_CHECKPOINT]).toMatchObject({
+      schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision: 1,
+      verificationDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })
+    const append = vi.fn(async (..._args: Parameters<GateWriter["append"]>) => "event-1")
+    const writer = { append }
+    const rootIdentity = { ...identity, taskId: identity.rootTaskId }
+    const options = { ...gateOptions(async () => decision), identity: rootIdentity }
+
+    const recovery = await assertCompletionAllowed(options, writer, step, new AbortController().signal, () => nowValue, "candidate", true)
+
+    if (!recovery || !("feedback" in recovery)) throw new Error("expected TaskGraph recovery")
+    expect(append).toHaveBeenCalledTimes(2)
+    expect(append.mock.calls[0]).toEqual(["agent.plan.denial_checkpoint", step.id, null, {
+      schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA,
+      taskId: "root-1",
+      graphRevision: 1,
+      verificationDigest: decision[TASK_GRAPH_DENIAL_CHECKPOINT]?.verificationDigest,
+      stepId: step.id,
+    }, "task-graph-denial-checkpoint:" + step.id])
+    expect(append.mock.calls[1]).toEqual(["final.rejected", step.id, null, {
+      code: "business_precondition_failed",
+      blocker: "task_graph_verification_unverified",
+      feedback: decision.feedback,
+      taskId: "root-1",
+    }, "final-rejected:" + step.id])
+    expect(Object.keys(append.mock.calls[1]![3] as object).sort()).toEqual(["blocker", "code", "feedback", "taskId"])
+    expect(JSON.stringify(append.mock.calls[1]![3])).not.toContain(TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA)
+
+    const nonRootAppend = vi.fn(async (..._args: Parameters<GateWriter["append"]>) => "event-2")
+    await assertCompletionAllowed(gateOptions(async () => decision), { append: nonRootAppend }, step,
+      new AbortController().signal, () => nowValue, "candidate", true)
+    expect(nonRootAppend.mock.calls.map(call => call[0])).toEqual(["final.rejected"])
+  })
+
+  it("clears a checkpoint when a later gate assessment read fails", async () => {
+    const target = node("scout", "task-scout")
+    const result = storedResult("failed")
+    let reportReads = 0
+    Object.defineProperty(result, "taskGraphVerificationReport", {
+      configurable: true,
+      get() {
+        reportReads += 1
+        if (reportReads > 1) throw new Error("late assessment read failed")
+        return report("failed")
+      },
+    })
+    const client = graphClient([target], [{ id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result }])
+    const decision = await checkTaskGraphTerminalVerification(client, graphLease, "root-1")
+    if (decision.ok) throw new Error("expected fail-closed TaskGraph denial")
+    expect(Object.hasOwn(decision, TASK_GRAPH_DENIAL_CHECKPOINT)).toBe(false)
+
+    const append = vi.fn(async (..._args: Parameters<GateWriter["append"]>) => "event-1")
+    await assertCompletionAllowed({ ...gateOptions(async () => decision), identity: { ...identity, taskId: identity.rootTaskId } },
+      { append }, step, new AbortController().signal, () => nowValue, "candidate", true)
+    expect(append.mock.calls.map(call => call[0])).toEqual(["final.rejected"])
+  })
+
+  it("does not persist an ordinary denial checkpoint when native semantic signals are present", async () => {
+    const checkpoint = { schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision: 7, verificationDigest: "c".repeat(64) }
+    const nativeNoProgress = Object.defineProperty({ ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: taskGraphFeedbackLead },
+      NATIVE_SEMANTIC_NO_PROGRESS, { value: true })
+    Object.defineProperty(nativeNoProgress, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
+    const nativeRejection = Object.defineProperty({ ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: taskGraphFeedbackLead },
+      NATIVE_SEMANTIC_REJECTION, { value: {
+        candidateDigest: "d".repeat(64), inputThroughSequence: 0n, controlTaskId: "control-task",
+        controlOperationId: "control-operation", controlAttempt: 1, controlReportDigest: "e".repeat(64),
+      } })
+    Object.defineProperty(nativeRejection, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
+
+    for (const decision of [nativeNoProgress, nativeRejection]) {
+      const append = vi.fn(async (..._args: Parameters<GateWriter["append"]>) => "event-1")
+      await assertCompletionAllowed({ ...gateOptions(async () => decision), identity: { ...identity, taskId: identity.rootTaskId } },
+        { append }, step, new AbortController().signal, () => nowValue, "candidate", true)
+      expect(append.mock.calls.map(call => call[0])).toEqual(["final.rejected"])
+    }
+  })
+
+  it("does not emit a checkpoint for unavailable, native, steering, evidence, or unrelated denials", async () => {
+    const unavailableClient = { query: vi.fn(async (sql: string) => sql.includes('FROM "agent_items" AS item')
+      ? { rows: [], rowCount: 0 } : { rows: [{ id: "proposal" }], rowCount: 1 }) }
+    const unavailable = await checkTaskGraphTerminalVerification(unavailableClient as never, graphLease, "root-1")
+    if (unavailable.ok) throw new Error("expected unavailable graph denial")
+    const validCheckpoint = {
+      schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision: 7, verificationDigest: "b".repeat(64),
+    }
+    const cases = [
+      { decision: unavailable, blocker: "task_graph_verification_unverified", feedback: unavailable.feedback },
+      { decision: { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Current native proof is stale." },
+        blocker: "task_graph_verification_unverified", feedback: "Current native proof is stale." },
+      { decision: Object.defineProperty({ ok: false as const, blocker: STEERING_RECONCILIATION_BLOCKER,
+        feedback: STEERING_RECONCILIATION_FEEDBACK }, TASK_GRAPH_DENIAL_CHECKPOINT, { value: validCheckpoint }),
+        blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK },
+      { decision: Object.defineProperty({ ok: false as const, blocker: "evidence_missing", feedback: "Evidence is unavailable." },
+        TASK_GRAPH_DENIAL_CHECKPOINT, { value: validCheckpoint }), blocker: "evidence_missing", feedback: "Evidence is unavailable." },
+      { decision: Object.defineProperty({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Current typed criteria remain unresolved." },
+        TASK_GRAPH_DENIAL_CHECKPOINT, { value: validCheckpoint }), blocker: "task_graph_verification_unverified", feedback: "Current typed criteria remain unresolved." },
+      { decision: Object.defineProperty({ ok: false as const, blocker: "unrecognized_gate_failure", feedback: "bounded failure" },
+        TASK_GRAPH_DENIAL_CHECKPOINT, { value: validCheckpoint }), blocker: "unrecognized_gate_failure", feedback: "bounded failure" },
+    ]
+    const rootIdentity = { ...identity, taskId: identity.rootTaskId }
+    for (const item of cases) {
+      const append = vi.fn(async (..._args: Parameters<GateWriter["append"]>) => "event-1")
+      const options = { ...gateOptions(async () => item.decision), identity: rootIdentity }
+      if (item.blocker === "task_graph_verification_unverified" || item.blocker === STEERING_RECONCILIATION_BLOCKER) {
+        await assertCompletionAllowed(options, { append }, step, new AbortController().signal, () => nowValue, "candidate", true)
+      } else {
+        await expect(assertCompletionAllowed(options, { append }, step, new AbortController().signal, () => nowValue, "candidate", true))
+          .rejects.toMatchObject({ code: "business_precondition_failed" })
+      }
+      expect(append.mock.calls.map(call => call[0])).toEqual(["final.rejected"])
+    }
   })
 
   it("returns only redacted steering recovery feedback and resets semantic progress", async () => {

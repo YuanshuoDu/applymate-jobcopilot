@@ -45,6 +45,7 @@ import type { SubagentTaskRecord } from "./subagents/types.js"
 import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalSelectedJobCompletion, createCanonicalTurnTerminalGuard, loadNativeVerificationRootContext, prepareNativeVerificationRootContext, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 import { configureNativeSemanticProgress } from "./canonical-turn-native-semantic-rejection.js"
+import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
@@ -225,6 +226,10 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
         enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || taskGraphPlanningEnabled, nativeVerification,
         onCandidateStart: () => { acceptedGraphWitness = undefined },
         checkChildren: () => rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: nativeVerification.accepted() }),
+        readTaskGraphDenialCheckpoint: taskGraphPlanningEnabled && rootTasks.checkCompletion ? async () => {
+          const current = await rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: false })
+          return taskGraphDenialCheckpointFromDecision(current, root.id)
+        } : undefined,
         interactiveDiscovery: interactiveDiscoveryMode ? () => interactiveDiscoveryCompletionGate({ pool, lease, root, load: options.interactiveDiscoveryShortlistLoader, accept: shortlist => { acceptedDiscoveryShortlist = shortlist }, markUnavailable: () => { discoveryFailureCode = "discovery_runtime_unavailable" } }) : undefined,
         selectedJobMode, selectedJobCompletion,
       }),
