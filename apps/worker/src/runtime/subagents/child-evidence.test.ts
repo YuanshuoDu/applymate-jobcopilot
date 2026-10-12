@@ -95,6 +95,12 @@ describe("child evidence binding", () => {
       evidence: [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }],
       candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }],
     })
+    expect(JSON.stringify(result)).toBe(JSON.stringify({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["read:job:job-1"] }],
+      evidence: [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }],
+      summary: "one job",
+    }))
   })
 
   it("rejects unknown and duplicate canonical evidence claims", () => {

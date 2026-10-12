@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { Type } from "@sinclair/typebox"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi.fn(async () => undefined) }))
@@ -17,17 +19,21 @@ beforeEach(() => {
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type pg from "pg"
-import { StepContextBuilder, type ContextOwnerFence, type StepContext } from "./context/step-context-builder.js"
+import { StepContextBuilder, type ContextBlock, type ContextOwnerFence, type StepContext } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StoredAgentInput } from "./context/input-claim-store.js"
 import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
+import { createChildExecutor, type ChildPublicDefinition } from "./subagents/child-executor.js"
+import type { TreeBudgetReservationStore } from "./subagents/tree-budget-types.js"
+import type { SubagentLease } from "./subagents/types.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphResultPageRequest } from "./subagents/task-graph-result-page-contract.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
+import type { TurnExecutionStore } from "./turns/turn-execution-types.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
 import { runTurnJob } from "./turns/turn-queue.js"
@@ -53,6 +59,7 @@ import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
 import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
 import { projectTaskGraphResultPage } from "./subagents/task-graph-result-page.js"
+import { createWorkerToolRuntime, InMemoryToolLifecycleSink, type CoordinationStore, type CoordinationTaskView, type DurableWaitPort } from "./tools/index.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -100,6 +107,123 @@ function contextBuilder() {
       ...(request.snapshot.taskGraphRevision === undefined ? {} : { taskGraphRevision: request.snapshot.taskGraphRevision }),
     }),
   }
+}
+
+function childExecutionStore(): TurnExecutionStore {
+  return {
+    startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }),
+    updateStep: async () => undefined,
+    createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }),
+    updateItem: async input => ({ id: input.itemId, revision: input.expectedRevision + 1 }),
+    appendEvent: async ({ id }) => ({ id }),
+    recordFinalResponse: async () => undefined,
+  }
+}
+
+function childBudgetStore(): TreeBudgetReservationStore {
+  const timestamp = new Date("2026-09-07T00:00:00.000Z")
+  return {
+    reserve: async input => ({
+      id: `reservation:${input.stepId}`,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      rootTaskId: input.rootTaskId,
+      taskId: input.taskId,
+      stepId: input.stepId,
+      attempt: input.attempt,
+      units: 1,
+      status: "reserved",
+      idempotencyKey: input.idempotencyKey,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      settledAt: null,
+    }),
+    settle: async input => ({
+      id: input.id,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      rootTaskId: input.rootTaskId,
+      taskId: input.taskId,
+      stepId: input.stepId,
+      attempt: input.attempt,
+      units: 1,
+      status: input.status,
+      idempotencyKey: input.idempotencyKey,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      settledAt: timestamp,
+    }),
+  }
+}
+
+async function runStructuredScoutFailure(finalText: string) {
+  const childLease: SubagentLease = {
+    id: "subagent-12345678-1234-4234-9234-123456789012",
+    userId: "user-1",
+    sessionId: "session-1",
+    turnId: "turn-1",
+    rootTaskId: "root-1",
+    parentTaskId: "root-1",
+    path: "/root-1/subagent-12345678-1234-4234-9234-123456789012",
+    depth: 1,
+    role: "scout",
+    taskType: "job_discovery",
+    status: "running",
+    goal: "Inspect the current job result",
+    constraints: [],
+    successCriteria: [],
+    allowedActions: ["jobs.search"],
+    context: {},
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+    modelProfileSnapshot: { provider: "fixture", model: "fixture" },
+    result: null,
+    failureReason: null,
+    attemptCount: 1,
+    maxAttempts: 2,
+    leaseOwner: "child-worker",
+    leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
+    interruptRequestedAt: null,
+    budgetSnapshot: {},
+    toolPolicySnapshot: {},
+    ownerId: "child-worker",
+    signal: new AbortController().signal,
+  }
+  let modelCalls = 0
+  const childModel: ModelAdapter = {
+    ...model(() => []),
+    async *stream() {
+      modelCalls += 1
+      if (modelCalls === 1) {
+        yield { type: "tool_call_completed", callId: "scout-evidence-call", name: "jobs.search", arguments: {} }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } else {
+        yield { type: "text_delta", text: finalText }
+        yield { type: "completed", finishReason: "stop" }
+      }
+    },
+  }
+  const searchTool = {
+    schemaVersion, name: "jobs.search", version: "1", description: "Search current jobs",
+    capabilities: ["read"] as const, inputSchema: Type.Object({}), outputSchema: Type.Object({}),
+    risk: "read" as const, domain: "jobs" as const, idempotency: "read_only" as const,
+    timeoutMs: 1_000, requiredCapabilities: ["read"],
+  } satisfies ChildPublicDefinition
+  const executeChild = createChildExecutor({
+    store: childExecutionStore(),
+    treeBudget: childBudgetStore(),
+    authorizeUsage: async () => ({ settle: async () => undefined }),
+    modelRuntimeFactory: () => childModel,
+    toolRuntimeFactory: () => ({
+      definitions: [searchTool],
+      router: { execute: async (_context, request) => ({
+        ...request, status: "completed", output: { jobs: [{ id: "job-evidence-1" }] }, errorCode: null,
+      }) },
+      validateArguments: () => true,
+    }),
+  })
+  return { childLease, outcome: await executeChild({ lease: childLease }) }
 }
 
 function model(script: () => ModelStreamEvent[]): ModelAdapter {
@@ -3431,6 +3555,175 @@ describe("createCanonicalTurnRuntime", () => {
     expect(JSON.stringify(events)).not.toContain("sk-secretvalue123")
     expect(pg.pool.query).toHaveBeenCalledWith(expect.stringContaining('FROM "Job"'), expect.any(Array))
     expect(pg.calls.some(sql => sql === "BEGIN")).toBe(true)
+  })
+
+  it("carries an actual Scout structured-output failure through scoped agent.wait into the next Root request", async () => {
+    const rawRejectedOutput = '{"role":"scout","privateResult":"RAW_REJECTED_RESULT_SENTINEL"}'
+    const { childLease, outcome } = await runStructuredScoutFailure(rawRejectedOutput)
+    expect(outcome).toMatchObject({
+      status: "failed",
+      failureReason: "invalid_structured_result",
+      result: { status: "failed", structuredOutputFailureCategory: "result_shape_invalid" },
+    })
+    const failedChildResult = outcome.result
+    if (!failedChildResult || typeof failedChildResult !== "object" || Array.isArray(failedChildResult)) {
+      throw new Error("structured_scout_failure_result_missing")
+    }
+    const failedChildResultRecord = failedChildResult as Record<string, unknown>
+    const rawFinalItemId = failedChildResultRecord.finalItemId
+    if (typeof rawFinalItemId !== "string") throw new Error("structured_scout_final_item_id_missing")
+
+    const rootTask: CoordinationTaskView = {
+      id: "root-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+      rootTaskId: "root-1", parentTaskId: null, path: "/root-1", depth: 0, role: "root",
+      taskType: "root_turn", status: "running", goal: "Find matching roles GOAL_CANARY",
+      attemptCount: 1, maxAttempts: 3, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt,
+      interruptRequestedAt: null,
+    }
+    const failedChild: CoordinationTaskView = {
+      id: childLease.id, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+      rootTaskId: "root-1", parentTaskId: "root-1", path: childLease.path, depth: 1, role: "scout",
+      taskType: "job_discovery", status: "failed", goal: childLease.goal, attemptCount: 1, maxAttempts: 2,
+      leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+      result: failedChildResult, failureReason: outcome.failureReason ?? null,
+    }
+    const coordinationStore: CoordinationStore = {
+      getTask: vi.fn(async ({ taskId }) => taskId === rootTask.id ? rootTask : taskId === failedChild.id ? failedChild : null),
+      listTasks: vi.fn(async () => [failedChild]),
+      sendMessage: vi.fn(async input => ({
+        message: { id: "message-1", sessionId: input.sessionId, turnId: input.turnId, fromTaskId: input.fromTaskId,
+          toTaskId: input.toTaskId, kind: input.kind, idempotencyKey: input.idempotencyKey, createdAt: new Date("2026-09-07T00:00:00.000Z") },
+        duplicate: false,
+      })),
+      getSpawnReplay: vi.fn(async () => null),
+      recordSpawn: vi.fn(async () => true),
+      appendActivity: vi.fn(async () => undefined),
+    }
+    const waitResult: Awaited<ReturnType<DurableWaitPort["wait"]>> = {
+      waitId: "wait-12345678-1234-4234-9234-123456789012", status: "ready",
+      deadlineAt: "2026-09-07T00:01:00.000Z", matchedTaskIds: [failedChild.id],
+    }
+    const wait: DurableWaitPort = {
+      wait: vi.fn<DurableWaitPort["wait"]>(async () => waitResult),
+    }
+    const lifecycle = new InMemoryToolLifecycleSink()
+    const requests: HarnessModelRequest[] = []
+    const roots = rootStore()
+    const originalGoal = "Find matching roles GOAL_CANARY"
+    const originalReference = { id: canonicalJobId, kind: "job" as const, ownerId: lease.userId, label: "BUSINESS_REFERENCE_CANARY" }
+    const currentEvidence = {
+      toolCallId: "current-evidence-call", toolName: "jobs.get", input: { jobId: canonicalJobId },
+      status: "completed", output: { jobId: canonicalJobId, title: "CURRENT_EVIDENCE_CANARY" }, errorCode: null,
+    }
+    const inputClaimStore: InputClaimStore = {
+      scope: { userId: lease.userId },
+      withTransaction: async work => work({
+        getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+        persistCheckpoint: async () => undefined,
+        loadRootInputContext: async () => null,
+        loadUnresolvedSteeringInputs: async () => [],
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const contexts: StepContext[] = []
+    const contextBuilderFactory: NonNullable<CanonicalTurnRuntimeOptions["contextBuilderFactory"]> = () => {
+      const builder = new StepContextBuilder(inputClaimStore, ownerFence, () => lease.leaseStartedAt)
+      return {
+        build: async request => {
+          const built = await builder.build(request)
+          contexts.push(built)
+          return built
+        },
+      }
+    }
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: lease.ownerId,
+      coordinationEnabled: true,
+      stateLoader: async () => ({
+        ...state({ goal: originalGoal }),
+        snapshot: {
+          system: [], profile: [], goal: { id: "root-goal", content: originalGoal }, steerHistory: [],
+          businessRefs: [originalReference], toolObservations: [{ id: "jobs-get-current", content: currentEvidence }],
+        },
+      }),
+      selectedJobPreparationLoader: async () => undefined,
+      rootTaskStore: roots as never,
+      toolRuntimeFactory: ({ pool, policy, manager }) => createWorkerToolRuntime(
+        pool, { sink: lifecycle }, policy, { manager, store: coordinationStore, wait },
+      ),
+      turnEngineStoreFactory: () => store(),
+      contextBuilderFactory,
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          if (requests.length === 1) {
+            yield { type: "tool_call_completed", callId: "root-wait-call", name: "agent.wait", arguments: {
+              idempotencyKey: "root-wait-idempotency", taskIds: [failedChild.id], mode: "all", timeoutMs: 1_000,
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "I will use the available current evidence." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(requests).toHaveLength(2)
+    expect(contexts).toHaveLength(2)
+    for (const context of contexts) {
+      expect(context.blocks).toContainEqual(expect.objectContaining({ id: "goal:root-goal", layer: "goal", role: "data",
+        trust: "external_untrusted", source: "turn_goal", content: originalGoal }))
+      expect(context.blocks).toContainEqual(expect.objectContaining({ id: `business:job:${canonicalJobId}`, layer: "business", role: "data",
+        trust: "internal_record", source: "business_reference", content: {
+          referenceId: canonicalJobId, kind: "job", label: "BUSINESS_REFERENCE_CANARY",
+        } }))
+      expect(context.blocks).toContainEqual(expect.objectContaining({ id: "observation:jobs-get-current", layer: "tool_observation", role: "data",
+        trust: "external_untrusted", source: "tool_or_subagent", content: currentEvidence }))
+    }
+    expect(wait.wait).toHaveBeenCalledOnce()
+    expect(wait.wait).toHaveBeenCalledWith(expect.objectContaining({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, taskId: "root-1", rootTaskId: "root-1",
+      targetTaskIds: [failedChild.id], mode: "all", timeoutMs: 1_000, idempotencyKey: "root-wait-idempotency",
+    }))
+    expect(coordinationStore.getTask).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, taskId: failedChild.id })
+    expect(roots.checkCompletion).toHaveBeenCalledOnce()
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
+    expect(lifecycle.events.filter(event => event.eventType === "tool_call.completed").map(event => event.item.type === "tool_result" ? event.item.toolCallId : "")).toEqual(["root-wait-call"])
+
+    const requestText = JSON.stringify(requests[1]?.messages)
+    const waited = requests[1]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "root-wait-call")
+    if (!waited || waited.type !== "tool_result") throw new Error("scoped_wait_result_missing_from_next_request")
+    const waitEnvelope = JSON.parse(waited.content) as { tasks?: Array<{ taskId?: string; status?: string; role?: string; result?: Record<string, unknown>; failureReason?: string }> }
+    expect(waitEnvelope.tasks).toEqual([expect.objectContaining({
+      taskId: failedChild.id, status: "failed", role: "scout", failureReason: "invalid_structured_result",
+      result: expect.objectContaining({
+        status: "failed", stepCount: failedChildResultRecord.stepCount,
+        toolCallCount: failedChildResultRecord.toolCallCount,
+        finalItemId: redactSensitiveValue(rawFinalItemId),
+        structuredOutputFailureCategory: "result_shape_invalid",
+      }),
+    })])
+    expect(Object.keys(waitEnvelope.tasks?.[0]?.result ?? {}).sort()).toEqual([
+      "finalItemId", "status", "stepCount", "structuredOutputFailureCategory", "toolCallCount",
+    ])
+    expect(requestText).toContain("GOAL_CANARY")
+    expect(requestText).toContain("BUSINESS_REFERENCE_CANARY")
+    expect(requestText).toContain("CURRENT_EVIDENCE_CANARY")
+    expect(requestText).not.toContain("RAW_REJECTED_RESULT_SENTINEL")
+    expect(waited.content).not.toContain(rawFinalItemId)
+    const systemText = requests[1]?.messages.filter(message => message.role === "system").map(message => message.content.map(part => part.type === "text" ? part.text : "").join("")) ?? []
+    expect(systemText).toEqual(requests[0]?.messages.filter(message => message.role === "system").map(message => message.content.map(part => part.type === "text" ? part.text : "").join("")))
+    expect(systemText.join("\n")).not.toContain("result_shape_invalid")
+    expect(systemText.join("\n")).not.toContain("structuredOutputFailureCategory")
+    expect(JSON.stringify(lifecycle.events)).not.toContain("RAW_REJECTED_RESULT_SENTINEL")
   })
 
 

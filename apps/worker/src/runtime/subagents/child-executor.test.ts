@@ -264,7 +264,9 @@ describe("child executor composition", () => {
       }),
     })
 
-    await executor({ lease: child })
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "failed" })
+    expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
     expect(requests).toHaveLength(1)
     expect(requests[0]?.tools?.map(value => (value as { name: string }).name)).toEqual(expectedTools)
   })
@@ -585,7 +587,7 @@ describe("child executor composition", () => {
     ["marker mismatch", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, profile }],
     ["unsupported structured output", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, profile: { ...profile, structuredOutput: false } }],
     ["non-native structured output", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, profile: { ...profile, nativeTools: false, structuredOutput: true } }],
-  ] as const)("does not pass a role result schema for %s", (_label, overrides) => {
+  ] as const)("does not pass a role result schema for %s", async (_label, overrides) => {
     const child = { ...structuredLease("analyst"), expectedOutputSchema: overrides.expectedOutputSchema }
     const requests: HarnessModelRequest[] = []
     const model = textOnlyModel(_label === "marker mismatch" ? "done" : JSON.stringify(validAnalystResult()), request => requests.push(request))
@@ -594,7 +596,10 @@ describe("child executor composition", () => {
       modelRuntimeFactory: () => ({ ...model, profile: overrides.profile }),
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
     })
-    return expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed" }).then(() => expect(requests[0]?.outputSchema).toBeUndefined())
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "failed" })
+    expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
+    expect(requests[0]?.outputSchema).toBeUndefined()
   })
 
   it("fails closed before the provider when restored evidence is malformed", async () => {
@@ -811,6 +816,7 @@ describe("child executor composition", () => {
   ] as const)("projects a validated structured %s result with bound evidence", async (role, makeResult) => {
     const result = await finalTextExecutor(finalTextModel(JSON.stringify(makeResult())))({ lease: structuredLease(role) })
     expect(result).toMatchObject({ status: "completed", result: { status: "completed", finalText: expect.any(String), structuredResult: expect.any(Object) } })
+    expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
     const childOutput = result.result as { readonly structuredResult?: unknown }
     expect(childOutput.structuredResult).toMatchObject({
       evidence: [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }],
@@ -848,7 +854,7 @@ describe("child executor composition", () => {
       ? { ...original, candidates: [{ ...original.candidates[0], jobId: "job-fake" }], evidence: [{ ...original.evidence[0], ref: "job-fake" }] }
       : original
     const result = await finalTextExecutor(readSequenceModel(JSON.stringify(value), toolNames), outputs)({ lease: structuredLease("scout") })
-    expect(result).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
+    expect(result).toMatchObject({ status: "failed", result: { status: "failed", structuredOutputFailureCategory: "evidence_binding_invalid" }, failureReason: "invalid_structured_result" })
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
   })
@@ -864,7 +870,7 @@ describe("child executor composition", () => {
       ],
     }
     const output = await finalTextExecutor(finalTextModel(JSON.stringify(result)))({ lease: structuredLease("scout") })
-    expect(output).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
+    expect(output).toMatchObject({ status: "failed", result: { status: "failed", structuredOutputFailureCategory: "evidence_binding_invalid" }, failureReason: "invalid_structured_result" })
     expect(output.result).not.toHaveProperty("structuredResult")
   })
 
@@ -877,15 +883,15 @@ describe("child executor composition", () => {
   })
 
   it.each([
-    ["invalid JSON", "not-json"],
-    ["fenced markdown", `\`\`\`json\n${JSON.stringify(validScoutResult())}\n\`\`\``],
-    ["extra runtime key", JSON.stringify({ ...validScoutResult(), userId: "forged-user" })],
-    ["missing evidence", JSON.stringify({ ...validScoutResult(), candidates: [{ ...validScoutResult().candidates[0], evidenceIds: [] }] })],
-    ["duplicate evidence", JSON.stringify({ ...validScoutResult(), evidence: [validScoutResult().evidence[0], validScoutResult().evidence[0]] })],
-    ["cross-role result", JSON.stringify({ ...validScoutResult(), role: "analyst" })],
-  ] as const)("fails closed for %s structured output", async (_name, text) => {
+    ["invalid JSON", "not-json", "result_shape_invalid"],
+    ["fenced markdown", `\`\`\`json\n${JSON.stringify(validScoutResult())}\n\`\`\``, "result_shape_invalid"],
+    ["extra runtime key", JSON.stringify({ ...validScoutResult(), userId: "forged-user" }), "result_shape_invalid"],
+    ["missing evidence", JSON.stringify({ ...validScoutResult(), candidates: [{ ...validScoutResult().candidates[0], evidenceIds: [] }] }), "evidence_binding_invalid"],
+    ["duplicate evidence", JSON.stringify({ ...validScoutResult(), evidence: [validScoutResult().evidence[0], validScoutResult().evidence[0]] }), "result_shape_invalid"],
+    ["cross-role result", JSON.stringify({ ...validScoutResult(), role: "analyst" }), "result_shape_invalid"],
+  ] as const)("fails closed for %s structured output", async (_name, text, category) => {
     const result = await finalTextExecutor(finalTextModel(text))({ lease: structuredLease("scout") })
-    expect(result).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
+    expect(result).toMatchObject({ status: "failed", result: { status: "failed", structuredOutputFailureCategory: category }, failureReason: "invalid_structured_result" })
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
   })
@@ -894,7 +900,14 @@ describe("child executor composition", () => {
     const text = JSON.stringify({ ...validScoutResult(), summary: "x".repeat(9_000) })
     expect(Buffer.byteLength(text, "utf8")).toBeGreaterThan(8 * 1024)
     const result = await finalTextExecutor(finalTextModel(text))({ lease: structuredLease("scout") })
-    expect(result).toMatchObject({ status: "failed", result: { status: "failed" }, failureReason: "invalid_structured_result" })
+    expect(result).toMatchObject({ status: "failed", result: { status: "failed", structuredOutputFailureCategory: "result_too_large" }, failureReason: "invalid_structured_result" })
+    expect(result.result).not.toHaveProperty("finalText")
+    expect(result.result).not.toHaveProperty("structuredResult")
+  })
+
+  it("classifies invalid completed Analyst output with the same safe shape category", async () => {
+    const result = await finalTextExecutor(finalTextModel("not-json"))({ lease: structuredLease("analyst") })
+    expect(result).toMatchObject({ status: "failed", result: { status: "failed", structuredOutputFailureCategory: "result_shape_invalid" }, failureReason: "invalid_structured_result" })
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
   })
@@ -903,6 +916,7 @@ describe("child executor composition", () => {
     const result = await finalTextExecutor(finalTextModel(JSON.stringify(validScoutResult())))({ lease: lease() })
     expect(result).toMatchObject({ status: "completed", result: { status: "completed", finalText: JSON.stringify(validScoutResult()) } })
     expect(result.result).not.toHaveProperty("structuredResult")
+    expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
   })
 
   it("does not project final text while a child is waiting", async () => {
@@ -927,6 +941,7 @@ describe("child executor composition", () => {
     expect(result).not.toHaveProperty("mailboxMessageIds")
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
+    expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
   })
 
   it("releases before the provider when account admission fails", async () => {
@@ -1002,6 +1017,7 @@ describe("child executor composition", () => {
     const durableEvents = JSON.stringify(eventPayloads)
     const requestText = JSON.stringify(requests[0]?.messages)
     expect(result).toMatchObject({ status: "completed", result: { nativeVerificationReport: { disposition: "passed", controlTaskId: native.lease.id, controlAttempt: native.lease.attemptCount } } })
+    expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
     expect(result).not.toHaveProperty("mailboxMessageIds")
     expect(requests).toHaveLength(1)
     expect(requests[0]?.tools).toEqual([])
