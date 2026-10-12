@@ -6,7 +6,8 @@ import { readNativeVerificationTerminalProofWithClient } from "./subagents/nativ
 import type { NativeVerificationPort, NativeVerificationRootGoalWitness, NativeVerificationTerminalProofReader } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitPort } from "./tools/coordination-types.js"
-import { RESET_NATIVE_SEMANTIC_PROGRESS, type TurnEngineCompletionGate, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnEngineCompletionGate, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import type { TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
@@ -108,6 +109,7 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
   interactiveDiscovery?: () => Promise<TurnEngineCompletionGateResult>
   selectedJobMode: boolean
   selectedJobCompletion?: () => Promise<TurnEngineCompletionGateResult>
+  readTaskGraphDenialCheckpoint?: () => Promise<TaskGraphDenialCheckpoint | null>
 }>): TurnEngineCompletionGate | undefined {
   if (!input.enabled) return undefined
   const gate: TurnEngineCompletionGate = async ({ stepId, candidateText }) => {
@@ -125,6 +127,7 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
     })
   }
   if (input.nativeVerification.resetSemanticProgress) gate[RESET_NATIVE_SEMANTIC_PROGRESS] = input.nativeVerification.resetSemanticProgress
+  if (input.readTaskGraphDenialCheckpoint) gate[READ_TASK_GRAPH_DENIAL_CHECKPOINT] = input.readTaskGraphDenialCheckpoint
   return gate
 }
 

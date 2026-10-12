@@ -48,6 +48,7 @@ import type { SteeringReconciliationOperation } from "./subagents/steering-recon
 import { buildTaskGraphPlanningFacts } from "./subagents/task-graph-planning-facts.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT } from "./turns/turn-execution-types.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
 import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
@@ -2714,6 +2715,192 @@ describe("createCanonicalTurnRuntime", () => {
     await expect(fixture.runtime.then(runtime => runtime.execute({ lease, signal: new AbortController().signal })))
       .resolves.toMatchObject({ status: "completed" })
     expect(fixture.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", lease }))
+  })
+
+  it("uses a fresh root TaskGraph check before stopping unchanged terminal denials", async () => {
+    const checkpoint = { schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: "root-1", graphRevision: 4, verificationDigest: "a".repeat(64) }
+    const checkCompletion = vi.fn(async () => {
+      const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing." }
+      Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
+      return denial
+    })
+    const roots = { ...rootStore(), checkCompletion }
+    const requests: HarnessModelRequest[] = [], events: RuntimeEvent[] = []
+    const runtimeTools = tools(true)
+    const registeredTools = [...runtimeTools.registry.list()]
+    let modelCalls = 0
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 4, nodes: [], readyTaskIds: [] }),
+      readCurrent: async () => ({ revision: 4, nodes: [] }),
+    }
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: "worker-1", productionFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({ ...state(), snapshot: { ...state().snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }),
+      rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+      toolRuntimeFactory: () => ({
+        registry: {
+          ...runtimeTools.registry,
+          list: () => registeredTools,
+          register: (definition: { name: string; version: string }) => { registeredTools.push(definition) },
+        },
+        router: runtimeTools.router,
+      }) as never,
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          modelCalls += 1
+          yield { type: "text_delta", text: "The current candidate still lacks a typed criterion." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })
+
+    expect(modelCalls).toBe(2)
+    expect(requests).toHaveLength(2)
+    expect(checkCompletion).toHaveBeenCalledTimes(3)
+    expect(checkCompletion).toHaveBeenNthCalledWith(3, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true, nativeVerificationPassed: false }))
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed", errorCode: "no_progress" }) }))
+  })
+
+  it("stops a restored two-denial checkpoint before another model call and accounts only prior usage", async () => {
+    const checkpoint = { schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: "root-1", graphRevision: 4, verificationDigest: "a".repeat(64) }
+    const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing." }
+    Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
+    const checkCompletion = vi.fn(async () => denial)
+    const roots = { ...rootStore(), checkCompletion }
+    const requests: HarnessModelRequest[] = [], events: RuntimeEvent[] = [], stepUpdates: unknown[] = []
+    let modelCalls = 0, authorizations = 0, settlements = 0
+    const resumed = {
+      nextOrdinal: 2,
+      stepCount: 2,
+      toolCallCount: 4,
+      taskGraphDenialProgress: {
+        taskId: "root-1", graphRevision: 4, verificationDigest: "a".repeat(64), inputThroughSequence: 3n,
+        consumedInputIds: ["input-3"], count: 2 as const,
+      },
+      inputThroughSequence: 3n,
+      consumedInputIds: ["input-3"],
+      usage: { inputTokens: 12, outputTokens: 5, estimatedCostUsd: 0.01 },
+    }
+    const runtimeTools = tools(true)
+    const registeredTools = [...runtimeTools.registry.list()]
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 4, nodes: [], readyTaskIds: [] }),
+      readCurrent: async () => ({ revision: 4, nodes: [] }),
+    }
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: "worker-1", productionFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({ ...state({ resume: resumed }), snapshot: { ...state().snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }),
+      rootTaskStore: roots as never,
+      turnEngineStoreFactory: () => ({
+        ...store(events), updateStep: async input => { stepUpdates.push(input) },
+      }),
+      contextBuilderFactory: () => ({ build: async (request: Parameters<ReturnType<typeof contextBuilder>["build"]>[0]) => ({
+        schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+        inputThroughSequence: 3n, consumedInputIds: [], blocks: [], canonicalJson: "{}", taskGraphRevision: 4,
+      }) }) as never,
+      toolRuntimeFactory: () => ({
+        registry: { ...runtimeTools.registry, list: () => registeredTools,
+          register: (definition: { name: string; version: string }) => { registeredTools.push(definition) } },
+        router: runtimeTools.router,
+      }) as never,
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request); modelCalls += 1
+          yield { type: "text_delta", text: "The model must not be called after a restored repeated denial." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => { authorizations += 1; return { settle: async () => { settlements += 1 } } },
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })
+
+    expect(modelCalls).toBe(0)
+    expect(requests).toHaveLength(0)
+    expect(authorizations).toBe(0)
+    expect(settlements).toBe(0)
+    expect(checkCompletion).toHaveBeenCalledTimes(1)
+    expect(checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true, nativeVerificationPassed: false }))
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({
+      status: "failed", errorCode: "no_progress", stepCount: 3, toolCallCount: 4,
+    }) }))
+    expect(stepUpdates).toHaveLength(1)
+    expect(stepUpdates[0]).toEqual(expect.objectContaining({ status: "failed", errorCode: "no_progress", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }))
+    expect(events.filter(event => event.type === "model.usage")).toHaveLength(0)
+    expect(events).toContainEqual(expect.objectContaining({ type: "step.completed", payload: expect.objectContaining({ status: "failed", errorCode: "no_progress" }) }))
+    const turnFailed = events.find(event => event.type === "turn.failed")
+    expect(turnFailed?.payload).toEqual(expect.objectContaining({ final: expect.objectContaining({
+      completed: false, terminalReason: "no_progress", stepCount: 3, toolCallCount: 4,
+      usage: { inputTokens: 12, outputTokens: 5, estimatedCostUsd: 0.01 },
+    }) }))
+  })
+
+  it.each(["changed", "missing"] as const)("continues when the fresh root TaskGraph check is %s", async freshRead => {
+    const checkpoint = { schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: "root-1", graphRevision: 4, verificationDigest: "a".repeat(64) }
+    const denialFor = (digest?: string) => {
+      const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing." }
+      if (digest) Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: { ...checkpoint, verificationDigest: digest } })
+      return denial
+    }
+    let checks = 0
+    const checkCompletion = vi.fn(async () => {
+      checks += 1
+      if (checks <= 2) return denialFor(checkpoint.verificationDigest)
+      if (checks === 3) return freshRead === "changed" ? denialFor("b".repeat(64)) : denialFor()
+      return { ok: true as const }
+    })
+    const roots = { ...rootStore(), checkCompletion }
+    const requests: HarnessModelRequest[] = []
+    let modelCalls = 0
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 4, nodes: [], readyTaskIds: [] }),
+      readCurrent: async () => ({ revision: 4, nodes: [] }),
+    }
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtimeTools = tools(true)
+    const registeredTools = [...runtimeTools.registry.list()]
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: "worker-1", productionFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({ ...state(), snapshot: { ...state().snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }),
+      rootTaskStore: roots as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      toolRuntimeFactory: () => ({
+        registry: { ...runtimeTools.registry, list: () => registeredTools, register: (definition: { name: string; version: string }) => { registeredTools.push(definition) } },
+        router: runtimeTools.router,
+      }) as never,
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          modelCalls += 1
+          yield { type: "text_delta", text: "The model can continue after a changed or unavailable fresh check." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(modelCalls).toBe(3)
+    expect(requests).toHaveLength(3)
+    expect(checkCompletion).toHaveBeenCalledTimes(4)
+    expect(checkCompletion).toHaveBeenNthCalledWith(3, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true, nativeVerificationPassed: false }))
   })
 
   it("keeps generic Turns blocked while child tasks are pending", async () => {
