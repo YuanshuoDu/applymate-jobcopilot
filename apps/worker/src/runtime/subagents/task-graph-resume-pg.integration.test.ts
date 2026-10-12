@@ -159,6 +159,13 @@ const interactiveDiscoveryTraceArtifactPath = process.env.AGENT_INTERACTIVE_DISC
 const SELECTED_JOB_DRAFT_CALL_ID = "ac6-selected-job-draft-receipt"
 const SELECTED_JOB_REVIEW_READ_CALL_ID = "ac6-selected-job-review-read"
 const SELECTED_JOB_REVIEW_CALL_ID = "ac6-selected-job-review-receipt"
+const SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS = Object.freeze({
+  commandReceived: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_COMMAND_RECEIVED",
+  round1Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_1_ENTERED",
+  artifactVersionReadYieldReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ARTIFACT_VERSION_READ_YIELD_REACHED",
+  round2Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_2_ENTERED",
+  readyEmissionReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_READY_EMISSION_REACHED",
+})
 
 function selectedJobDraftCallId(attemptCount: number): string {
   return `${SELECTED_JOB_DRAFT_CALL_ID}:attempt:${attemptCount}`
@@ -2711,8 +2718,20 @@ async function reviewSelectedJobThroughRestartedWorker(
   }, reviewRef)).resolves.toBeNull()
 
   await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_QUEUED ${trace.stopReviewerTask.id}`, 30_000)
+  const stopReviewPhaseStart = worker.output.length
   worker.stdin?.write(`start-selected-job-review:${trace.stopReviewerTask.id}\n`)
-  await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
+  try {
+    await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
+  } catch {
+    const stopReviewPhaseLines = new Set(worker.output.slice(stopReviewPhaseStart))
+    throw new Error("Selected-job stop-review READY was not reached; phases=" + JSON.stringify({
+      commandReceived: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.commandReceived),
+      round1Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round1Entered),
+      artifactVersionReadYieldReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.artifactVersionReadYieldReached),
+      round2Entered: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round2Entered),
+      readyEmissionReached: stopReviewPhaseLines.has(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.readyEmissionReached),
+    }))
+  }
   const liveStopTask = await trace.store.get(trace.stopReviewerTask.id, value.sessionId)
   if (!liveStopTask?.leaseOwner || liveStopTask.status !== "running") throw new Error("Stop-review fixture did not hold a live Worker lease")
   const stopFence = selectedJobTaskFence(liveStopTask, liveStopTask.leaseOwner, liveStopTask.attemptCount)
