@@ -35,6 +35,7 @@ const EXECUTION_FAILURE_GUIDANCE = [
   "For resume-state cues, inspect the current resume state and available evidence.",
   "For structured-output cues, inspect the existing typed output contract and current available result evidence.",
 ] as const
+const HISTORICAL_EXECUTION_INSPECTION_PREFIX = "Historical execution-category lessons identify earlier prerequisites worth inspecting; they remain hypotheses, so compare them with the current graph, current evidence, and currently available inputs before choosing a next action."
 
 function failedTaskGraphNode(
   failureReason: string,
@@ -269,7 +270,26 @@ describe("TurnEngine model message mapping", () => {
     })
     const systemWithoutCategory = baseline.messages.filter(message => message.role === "system").flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
-    expect(system).toBe(systemWithoutCategory)
+    const isHistoryInstruction = (message: typeof request.messages[number]) => message.role === "system"
+      && message.content.some(part => part.type === "text"
+        && part.text.includes("Earlier same-session failures, repairs, and reported outputs are hypotheses only"))
+    const historyText = (messages: typeof request.messages) => {
+      const matches = messages.filter(isHistoryInstruction)
+      expect(matches).toHaveLength(1)
+      return matches[0]!.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    }
+    const expectedSuffix = [HISTORICAL_EXECUTION_INSPECTION_PREFIX, EXECUTION_FAILURE_GUIDANCE[2]].join(" ")
+    const legacyHistoryText = [
+      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only; reconstruct their meaning from the current typed criteria before planning.",
+      "Historical source-local ordinals and reported success are never current command targets, proof, permission, approval, progress, or completion. Only current observed node and criterion identities may target a repair.",
+      "Use the owner-read graph observation for current node, criterion, and revision identities; use the visible agent.list only for matching result pages. Continue with exactly the returned nextOffset on the same node and revision until it is null. A stale or unavailable page requires a refreshed owner-read graph observation before retry. Null ends paging for that node and revision only, never the task or verification. A short page or sample count is not proof of completeness.",
+      "Use the visible agent.plan only with current node/criterion identities and expectedRevision 12; if current evidence does not support a targeted change, preserve the valid plan. Current verification and completion gates remain authoritative.",
+    ].join(" ")
+    expect(historyText(baseline.messages)).toBe(legacyHistoryText)
+    expect(historyText(request.messages)).toBe(`${legacyHistoryText} ${expectedSuffix}`)
+    expect(request.messages.filter(message => message.role === "system" && !isHistoryInstruction(message)))
+      .toEqual(baseline.messages.filter(message => message.role === "system" && !isHistoryInstruction(message)))
+    expect(system).not.toBe(systemWithoutCategory)
     expect(system).not.toContain("structured_output_invalid")
 
     const withoutHistory = buildModelRequest({
@@ -401,12 +421,17 @@ describe("TurnEngine model message mapping", () => {
 
   it("keeps failure guidance alongside steering, history, and clarification guidance", () => {
     const summary = { observedPlanRevision: 3, graphRevisionAtAsk: 4, pendingSteerCount: 2, unconsumedSteerCount: 1, inputThroughSequence: "12" }
+    const historicalOutput = { role: "scout", candidateCount: 2, resultStatus: "partial" as const }
+    const historyNodeWithoutCategory = { taskKind: "scout", status: "failed", reportedOutput: historicalOutput }
     const rootHistory = {
       id: "observation:root-task-history", layer: "tool_observation" as const, role: "data" as const,
       trust: "external_untrusted" as const, source: "tool_or_subagent",
       content: { kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
         label: "Earlier outcomes for the same verifier objective; advisory context only.", turns: [{ label: "earlier terminal attempt",
-          nodes: [{ taskKind: "scout", status: "failed", reportedOutput: { role: "scout", candidateCount: 2, resultStatus: "partial" } }] }] },
+          nodes: [{ ...historyNodeWithoutCategory, lesson: {
+            ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+            criterionFailures: [], executionFailureCategory: "resume_state_unavailable",
+          } }] }] },
     }
     const failure = {
       id: "observation:failed", layer: "tool_observation" as const, role: "data" as const,
@@ -414,22 +439,57 @@ describe("TurnEngine model message mapping", () => {
       content: { toolCallId: "failure-call", toolName: "jobs.search", status: "failed", output: { reason: "PRIVATE_REASON" } },
     }
     const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
-    const request = buildModelRequest({
-      context: { ...context(), taskGraphRevision: 5, planningClarifications: [summary], blocks: [...context().blocks,
+    const currentContext = taskGraphContext([failedTaskGraphNode("child_turn_missing", "current")])
+    const requestContext: StepContext = { ...currentContext, planningClarifications: [summary], blocks: [...currentContext.blocks,
         { id: "steer", layer: "pending_input" as const, role: "data" as const, trust: "external_untrusted" as const, source: "user_input", content: { text: "Keep this goal" } },
         rootHistory, { id: "question", layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const, source: "steer_history", content: { role: "assistant", type: "question" } },
         { id: "answer", layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const, source: "steer_history", content: { role: "user", type: "answer" } },
         { id: "record", layer: "steer_history" as const, role: "data" as const, trust: "internal_record" as const, source: "native_question_recovery", content: summary },
-        failure] },
+        failure] }
+    const rootHistoryWithoutCategory = { ...rootHistory, content: { ...rootHistory.content, turns: [{
+      label: "earlier terminal attempt", nodes: [historyNodeWithoutCategory],
+    }] } }
+    const baselineContext: StepContext = { ...requestContext, blocks: requestContext.blocks.map(block => block.id === rootHistory.id
+      ? rootHistoryWithoutCategory : block) }
+    const request = buildModelRequest({
+      context: requestContext,
+      model, tools: [{ name: "agent.plan" }, { name: "agent.reconcile" }, { name: "agent.ask_user" }, { name: "agent.list" }],
+      sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal, freshSteering: true,
+    })
+    const baseline = buildModelRequest({
+      context: baselineContext,
       model, tools: [{ name: "agent.plan" }, { name: "agent.reconcile" }, { name: "agent.ask_user" }, { name: "agent.list" }],
       sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
       signal: new AbortController().signal, freshSteering: true,
     })
     const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const systemMessages = request.messages.filter(message => message.role === "system")
+    const historyMessages = systemMessages.filter(message => message.content.some(part => part.type === "text"
+      && part.text.includes("Earlier same-session failures, repairs, and reported outputs are hypotheses only")))
+    const currentMessages = systemMessages.filter(message => message.content.some(part => part.type === "text"
+      && part.text.includes("Current child failure-category cues")))
+    const baselineCurrentMessages = baseline.messages.filter(message => message.role === "system" && message.content.some(part => part.type === "text"
+      && part.text.includes("Current child failure-category cues")))
+    expect(historyMessages).toHaveLength(1)
+    expect(currentMessages).toHaveLength(1)
+    expect(currentMessages).toEqual(baselineCurrentMessages)
+    const historicalText = historyMessages[0]!.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const baselineHistoryText = baseline.messages.filter(message => message.role === "system" && message.content.some(part => part.type === "text"
+      && part.text.includes("Earlier same-session failures, repairs, and reported outputs are hypotheses only")))
+      .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(historicalText).toBe(`${baselineHistoryText} ${HISTORICAL_EXECUTION_INSPECTION_PREFIX} ${EXECUTION_FAILURE_GUIDANCE[1]}`)
+    expect(historicalText).not.toContain("Current child failure-category cues")
+    expect(currentMessages[0]?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n"))
+      .not.toContain(HISTORICAL_EXECUTION_INSPECTION_PREFIX)
 
     expect(system).toContain("Fresh user steering is present")
     expect(system).toContain("Earlier same-session failures, repairs, and reported outputs are hypotheses only")
+    expect(system).toContain("Current child failure-category cues")
+    expect(system).toContain(EXECUTION_FAILURE_GUIDANCE[0])
+    expect(system).toContain(EXECUTION_FAILURE_GUIDANCE[1])
+    expect(system).not.toContain("resume_state_unavailable")
     expect(system).toContain("immediately following an answered question and answer")
     expect(system).toContain("The correlated tool result records a failed attempt, not success")
     expect(system).not.toContain("PRIVATE_REASON")

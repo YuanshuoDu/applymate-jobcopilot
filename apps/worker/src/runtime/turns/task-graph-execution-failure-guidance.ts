@@ -18,6 +18,14 @@ const CATEGORY_GUIDANCE: ReadonlyArray<readonly [Category, string]> = [
 ]
 const CATEGORIES = new Set<Category>(CATEGORY_GUIDANCE.map(([category]) => category))
 
+export function getTaskGraphExecutionFailureInspectionAdvice(category: unknown): string | undefined {
+  if (typeof category !== "string") return undefined
+  for (const [knownCategory, advice] of CATEGORY_GUIDANCE) {
+    if (category === knownCategory) return advice
+  }
+  return undefined
+}
+
 function dataRecord(value: unknown): Row | undefined {
   try {
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined

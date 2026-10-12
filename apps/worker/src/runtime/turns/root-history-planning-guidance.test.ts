@@ -94,7 +94,7 @@ describe("root history planning guidance", () => {
     }
   })
 
-  it("accepts category-only failed lessons without changing fixed guidance bytes", () => {
+  it("adds one fixed prerequisite hint after unchanged guidance for a category-only failed lesson", () => {
     const categoryLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
       nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "resume_state_unavailable" }
     const categoryContent = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
@@ -103,7 +103,7 @@ describe("root history planning guidance", () => {
     const baseline = textOf(buildRootHistoryPlanningInstruction(context(), [{ name: "agent.list" }, { name: "agent.plan" }]))
     const withCategory = buildRootHistoryPlanningInstruction(context([historyBlock(categoryContent)]), [{ name: "agent.list" }, { name: "agent.plan" }])
     expect(withCategory).not.toBeNull()
-    expect(textOf(withCategory)).toBe(baseline)
+    expect(textOf(withCategory)).toBe(`${baseline} Historical execution-category lessons identify earlier prerequisites worth inspecting; they remain hypotheses, so compare them with the current graph, current evidence, and currently available inputs before choosing a next action. For resume-state cues, inspect the current resume state and available evidence.`)
     expect(textOf(withCategory)).not.toContain("resume_state_unavailable")
 
     const completedContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
@@ -118,6 +118,39 @@ describe("root history planning guidance", () => {
       { taskKind: "scout", lesson: categoryLesson },
     ] }] }
     expect(buildRootHistoryPlanningInstruction(context([historyBlock(missingStatusContent)]), [{ name: "agent.plan" }])).toBeNull()
+  })
+
+  it("deduplicates historical categories and emits their fixed advice in canonical order", () => {
+    const categoryNode = (taskKind: string, nodeOrdinal: number, category: string): JsonValue => ({
+      taskKind, status: "failed", lesson: { ordinalScope: "source_graph_local", advisoryOnly: true,
+        notCurrentEvidence: true, nodeOrdinal, criterionFailures: [], executionFailureCategory: category },
+    })
+    const categoryContent: HistoryContent = {
+      ...defaultHistoryContent(),
+      turns: [
+        { label: "earlier terminal attempt", nodes: [
+          categoryNode("scout", 1, "structured_output_invalid"),
+          categoryNode("analyst", 2, "execution_setup_unavailable"),
+          categoryNode("writer", 3, "resume_state_unavailable"),
+        ] },
+        { label: "earlier terminal attempt", nodes: [
+          categoryNode("scout", 1, "resume_state_unavailable"),
+          categoryNode("analyst", 2, "execution_setup_unavailable"),
+        ] },
+      ],
+    }
+    const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(categoryContent)]), [{ name: "agent.plan" }]))
+    const setup = "For execution-setup cues, inspect the existing execution prerequisites for the child."
+    const resume = "For resume-state cues, inspect the current resume state and available evidence."
+    const structured = "For structured-output cues, inspect the existing typed output contract and current available result evidence."
+    expect(text.indexOf(setup)).toBeGreaterThanOrEqual(0)
+    expect(text.indexOf(setup)).toBeLessThan(text.indexOf(resume))
+    expect(text.indexOf(resume)).toBeLessThan(text.indexOf(structured))
+    for (const advice of [setup, resume, structured]) expect(text.split(advice).length - 1).toBe(1)
+    expect(text).toContain("Historical execution-category lessons identify earlier prerequisites worth inspecting")
+    for (const category of ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"]) {
+      expect(text).not.toContain(category)
+    }
   })
 
   it.each([
@@ -139,6 +172,8 @@ describe("root history planning guidance", () => {
   const malformedNodeCases: Array<[string, JsonValue[]]> = [
     ["no lesson or count", [{ taskKind: "scout", status: "completed" }]],
     ["malformed lesson", [{ taskKind: "analyst", status: "failed", lesson: { ...lesson, privateId: "SECRET" } }]],
+    ["unknown execution category", [{ taskKind: "scout", status: "failed", lesson: { ordinalScope: "source_graph_local",
+      advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "private_reason" } }]],
     ["invalid reported count", [{ taskKind: "scout", status: "completed", reportedOutput: { ...report, candidateCount: -1 } }]],
     ["wrong count role", [{ taskKind: "analyst", status: "completed", reportedOutput: report }]],
     ["check role does not match history node", [{ taskKind: "analyst", status: "failed", lesson: { ...lesson,

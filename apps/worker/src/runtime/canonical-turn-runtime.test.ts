@@ -2733,12 +2733,20 @@ describe("createCanonicalTurnRuntime", () => {
     expect(planningGuidance).toHaveLength(6)
     expect(planningGuidance.map(text => text?.match(/expectedRevision (\d+)/)?.[1])).toEqual(["7", "7", "7", "7", "8", "8"])
     expect(new Set(planningGuidance.map(text => text?.replace(/expectedRevision \d+/g, "expectedRevision CURRENT"))).size).toBe(1)
+    const expectedHistoricalInspectionSuffix = [
+      "Historical execution-category lessons identify earlier prerequisites worth inspecting; they remain hypotheses, so compare them with the current graph, current evidence, and currently available inputs before choosing a next action.",
+      "For execution-setup cues, inspect the existing execution prerequisites for the child.",
+      "For resume-state cues, inspect the current resume state and available evidence.",
+      "For structured-output cues, inspect the existing typed output contract and current available result evidence.",
+    ].join(" ")
     for (const text of planningGuidance) {
       expect(text).toContain("owner-read graph observation for current node, criterion, and revision identities")
       expect(text).toContain("visible agent.list only for matching result pages")
       expect(text).toContain("complete current result pages")
       expect(text).toContain("preserve the valid plan")
       expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
+      expect(text?.endsWith(expectedHistoricalInspectionSuffix)).toBe(true)
+      expect(text?.split("Historical execution-category lessons identify").length).toBe(2)
       expect(text).not.toMatch(/PRIVATE_HISTORY|historical-scout|candidate-count|nodeOrdinal|criterionOrdinal|reported count/i)
       expect(text).not.toContain("candidate_count_gte")
       expect(text).not.toContain('"minimum":1')
