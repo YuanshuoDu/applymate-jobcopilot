@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 import type { StepContext } from "../context/step-context-builder.js"
-import { buildTaskGraphExecutionFailureInstruction } from "./task-graph-execution-failure-guidance.js"
+import {
+  buildTaskGraphExecutionFailureInstruction,
+  getTaskGraphExecutionFailureInspectionAdvice,
+} from "./task-graph-execution-failure-guidance.js"
 
 const graphId = "observation:task-graph-current"
 const categories = [
@@ -8,6 +11,33 @@ const categories = [
   ["resume_state_unavailable", "For resume-state cues, inspect the current resume state and available evidence."],
   ["structured_output_invalid", "For structured-output cues, inspect the existing typed output contract and current available result evidence."],
 ] as const
+
+describe("TaskGraph failure-category advice lookup", () => {
+  it.each(categories)("returns the fixed advice for exact category %s", (category, advice) => {
+    expect(getTaskGraphExecutionFailureInspectionAdvice(category)).toBe(advice)
+  })
+
+  it.each([
+    "Execution_setup_unavailable", " execution_setup_unavailable", "execution_setup_unavailable ",
+    "raw failure prose", "unknown_category", 7, null, undefined, new String("resume_state_unavailable"),
+  ])("omits advice for non-exact scalar inputs: %s", value => {
+    expect(getTaskGraphExecutionFailureInspectionAdvice(value)).toBeUndefined()
+  })
+
+  it("does not inspect or coerce accessor-backed category objects", () => {
+    let getterCalls = 0
+    const getter = () => {
+      getterCalls += 1
+      return "execution_setup_unavailable"
+    }
+    const value = Object.defineProperties({}, {
+      category: { enumerable: true, get: getter },
+      toString: { enumerable: true, get: getter },
+    })
+    expect(getTaskGraphExecutionFailureInspectionAdvice(value)).toBeUndefined()
+    expect(getterCalls).toBe(0)
+  })
+})
 
 function failedNode(category: unknown, extra: Record<string, unknown> = {}) {
   return { key: "private-node", taskId: "private-task", goal: "PRIVATE_GOAL", status: "failed",
