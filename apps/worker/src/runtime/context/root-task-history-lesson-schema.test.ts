@@ -114,3 +114,51 @@ describe("root history check descriptor schema", () => {
       check: { role: "scout", kind: "candidate_count_gte", minimum: 1, privateId: "secret" } }] })).toBeUndefined()
   })
 })
+
+describe("historical execution failure category lessons", () => {
+  const categories = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"] as const
+  const lesson = (executionFailureCategory: string) => ({ ordinalScope: "source_graph_local", advisoryOnly: true,
+    notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory })
+
+  it("accepts only the three exact categories in a failed category-only lesson", () => {
+    for (const category of categories) {
+      expect(parseRootTaskHistoryNodeLesson(lesson(category), undefined, "failed")).toEqual({
+        ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+        nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: category,
+      })
+    }
+    expect(parseRootTaskHistoryNodeLesson(lesson("setup_unavailable"), undefined, "failed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson(lesson(categories[0]), undefined, "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson(lesson(categories[0]), undefined, "running")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson(lesson(categories[0]))?.executionFailureCategory).toBe(categories[0])
+  })
+
+  it("rejects mixed, augmented, inherited, and accessor category shapes without invoking getters", () => {
+    const valid = lesson(categories[0])
+    expect(parseRootTaskHistoryNodeLesson({ ...valid, criterionFailures: [{ criterionOrdinal: 1,
+      status: "failed", reasonCode: "criterion_not_met" }] })).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...valid, successfulRepairs: [] })).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...valid, privateId: "private" })).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson(Object.assign(Object.create({ executionFailureCategory: categories[0] }), {
+      ordinalScope: valid.ordinalScope, advisoryOnly: valid.advisoryOnly, notCurrentEvidence: valid.notCurrentEvidence,
+      nodeOrdinal: valid.nodeOrdinal, criterionFailures: valid.criterionFailures,
+    }))).toBeUndefined()
+    let getterReads = 0
+    const accessor = Object.defineProperty({ ordinalScope: valid.ordinalScope, advisoryOnly: valid.advisoryOnly,
+      notCurrentEvidence: valid.notCurrentEvidence, nodeOrdinal: valid.nodeOrdinal, criterionFailures: [] },
+    "executionFailureCategory", { enumerable: true, get: () => { getterReads += 1; return categories[0] } })
+    expect(parseRootTaskHistoryNodeLesson(accessor)).toBeUndefined()
+    expect(getterReads).toBe(0)
+  })
+
+  it("preserves legacy lesson bytes and retains category-only facts only for emitted source ordinals", () => {
+    const legacy = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] }
+    const parsedLegacy = parseRootTaskHistoryNodeLesson(legacy, undefined, "completed")
+    expect(JSON.stringify(parsedLegacy)).toBe(JSON.stringify(legacy))
+    const categoryLesson = parseRootTaskHistoryNodeLesson(lesson(categories[1]), undefined, "failed")!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([categoryLesson], [1], [1])).toEqual([categoryLesson])
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([categoryLesson], [1], [])).toEqual([undefined])
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([categoryLesson], [], [1])).toEqual([undefined])
+  })
+})

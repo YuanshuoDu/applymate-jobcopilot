@@ -7,7 +7,8 @@ import {
   type TaskGraphVerificationReport,
 } from "../subagents/task-graph-command-port.js"
 import { resolveTaskGraphRepairDependencies } from "../subagents/task-graph-dependency-context.js"
-import type { LoadedGraph } from "../subagents/task-graph-pg-state.js"
+import { classifyCurrentTaskGraphExecutionFailure } from "../subagents/task-graph-failure-category.js"
+import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { isValidTaskGraphRepairRelation } from "../planning/task-graph.js"
 import { validateTaskGraphVerificationContract, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
@@ -26,7 +27,7 @@ export type LoadedRootTaskHistoryGraphProjection = Readonly<{
   reportedOutputs?: readonly (RootTaskHistoryReportedOutput | undefined)[]
 }>
 
-type Pair = Readonly<{ source: StoredTaskGraphNode; current: TaskGraphCurrentNode; status: string; failureReason: string | null; result: Record<string, unknown> | null }>
+type Pair = Readonly<{ source: StoredTaskGraphNode; current: TaskGraphCurrentNode; task: GraphTaskRow; status: string; failureReason: unknown; result: Record<string, unknown> | null }>
 type Row = Record<string, unknown>
 type SuccessfulRepair = NonNullable<RootTaskHistoryNodeLesson["successfulRepairs"]>[number]
 const MAX_NODES = 8
@@ -43,6 +44,12 @@ function parseResult(value: unknown): Row | null {
     const prototype = Object.getPrototypeOf(parsed)
     return prototype === Object.prototype || prototype === null ? parsed as Row : null
   } catch { return null }
+}
+function ownDataValue(value: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor?.enumerable === true && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined
+  } catch { return undefined }
 }
 function sameReport(left: TaskGraphVerificationReport | undefined, right: TaskGraphVerificationReport | undefined): boolean {
   return JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
@@ -79,7 +86,7 @@ function pairSource(loaded: LoadedGraph, graph: TaskGraphCurrentState): Pair[] |
     const result = parseResult(task.result)
     const report = ids ? parseTaskGraphVerificationReport(result?.taskGraphVerificationReport, ids) : undefined
     if (!sameReport(report, current.verificationReport)) return undefined
-    pairs.push({ source, current, status: task.status, failureReason: task.failureReason, result })
+    pairs.push({ source, current, task, status: task.status, failureReason: ownDataValue(task, "failureReason"), result })
   }
   return pairs
 }
@@ -94,6 +101,13 @@ function criterionFailures(pair: Pair, ordinalBase: number,
     (item.status === "failed" || item.status === "unverified") && REASONS.has(item.reasonCode)
       ? [{ criterionOrdinal: ordinalBase + index + 1, status: item.status, reasonCode: item.reasonCode,
         ...(checks[index] ? { check: checks[index] } : {}) }] : [])
+}
+
+function executionFailureCategory(pair: Pair) {
+  return classifyCurrentTaskGraphExecutionFailure(pair.task, {
+    hasVerifiedReport: Boolean(pair.current.verificationReport),
+    isNative: Boolean(pair.source.nativeDelegation || pair.current.native || pair.current.nativeResult),
+  })
 }
 
 function successfulRepair(pair: Pair, index: number, pairs: readonly Pair[], loaded: LoadedGraph, satisfiedTargets: ReadonlySet<string>): SuccessfulRepair | undefined {
@@ -126,8 +140,10 @@ export function deriveRootTaskHistoryLessonFacts(loaded: LoadedGraph, currentGra
     const satisfied = new Set(coverage.satisfied.filter(key => loaded.state!.repairSatisfiedNodeKeys?.includes(key)))
     return pairs.map((pair, index) => {
       const failures = criterionFailures(pair, 0, checkMatrix[index] ?? []), repair = successfulRepair(pair, index, pairs, loaded, satisfied)
+      const category = !failures.length && !repair ? executionFailureCategory(pair) : undefined
       return parseRootTaskHistoryNodeLesson({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-        nodeOrdinal: index + 1, criterionFailures: failures, ...(repair ? { successfulRepairs: [repair] } : {}) }, pair.source.verification?.role)
+        nodeOrdinal: index + 1, criterionFailures: failures, ...(repair ? { successfulRepairs: [repair] } : {}),
+        ...(category ? { executionFailureCategory: category } : {}) }, pair.source.verification?.role, pair.status)
     })
   } catch { return [] }
 }
