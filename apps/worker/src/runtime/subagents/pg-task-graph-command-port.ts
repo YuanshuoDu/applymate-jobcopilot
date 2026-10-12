@@ -16,6 +16,8 @@ import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } fro
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
 import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
+import { BudgetExceededError } from "../budget.js"
+import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -94,6 +96,17 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   }
   if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
+  try {
+    await enforceRootStepBudget(client, {
+      kind: "turn", taskId: input.scope.rootTaskId, rootTaskId: input.scope.rootTaskId,
+      userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
+    }, 2)
+  } catch (error) {
+    if (error instanceof BudgetExceededError && error.metric === "steps") {
+      throw new TaskGraphCommandError("task_graph_continuation_budget_required", "The Turn needs two remaining steps to supervise a TaskGraph plan")
+    }
+    throw error
+  }
   const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []))
   const snapshot = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
