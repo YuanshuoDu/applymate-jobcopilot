@@ -94,6 +94,32 @@ describe("root history planning guidance", () => {
     }
   })
 
+  it("accepts category-only failed lessons without changing fixed guidance bytes", () => {
+    const categoryLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "resume_state_unavailable" }
+    const categoryContent = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "failed", lesson: categoryLesson },
+    ] }] }
+    const baseline = textOf(buildRootHistoryPlanningInstruction(context(), [{ name: "agent.list" }, { name: "agent.plan" }]))
+    const withCategory = buildRootHistoryPlanningInstruction(context([historyBlock(categoryContent)]), [{ name: "agent.list" }, { name: "agent.plan" }])
+    expect(withCategory).not.toBeNull()
+    expect(textOf(withCategory)).toBe(baseline)
+    expect(textOf(withCategory)).not.toContain("resume_state_unavailable")
+
+    const completedContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "completed", lesson: categoryLesson },
+    ] }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(completedContent)]), [{ name: "agent.plan" }])).toBeNull()
+    const malformedStatusContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "not-a-task-status", lesson: categoryLesson },
+    ] }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(malformedStatusContent)]), [{ name: "agent.plan" }])).toBeNull()
+    const missingStatusContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", lesson: categoryLesson },
+    ] }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(missingStatusContent)]), [{ name: "agent.plan" }])).toBeNull()
+  })
+
   it.each([
     ["absent", []],
     ["wrong source", [{ ...historyBlock(), source: "caller" }]],

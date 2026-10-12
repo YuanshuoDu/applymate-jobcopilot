@@ -6,6 +6,7 @@ import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState, ty
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 import { resolveTaskGraphRepairDependencies } from "../subagents/task-graph-dependency-context.js"
+import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "../subagents/task-graph-native-state.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 const ROOT = "private-root-id"
@@ -56,6 +57,22 @@ function fixture(options: { repairCount?: number; targetStatuses?: readonly ("fa
   const state = { ...base, repairSatisfiedNodeKeys: coverage.satisfied, repairPendingNodeKeys: coverage.pending }
   const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot, state, tasks, item: { id: "private-item", revision: 7, content: snapshot, createdAt: new Date(0) } }
   return { loaded, graph: currentTaskGraph(loaded) }
+}
+
+function executionFailureFixture(reason: string, status: "failed" | "running" = "failed", native = false) {
+  const taskId = "failure-task-private", templateId = native ? TASK_GRAPH_NATIVE_TEMPLATE_ID : "scout"
+  const node = { key: "failure-node-private", templateId, goal: "private failure goal", successCriteria: ["private criterion"], dependsOn: [], depth: 1,
+    taskId, verificationDisposition: "legacy_unverified",
+    ...(native ? { nativeDelegation: { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "private-operation",
+      requestFingerprint: "b".repeat(64), callerTaskId: ROOT, role: "scout", taskType: "native-task", contextDigest: "c".repeat(64), contextBytes: 1 } } : {}) }
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [node] })
+  const task: GraphTaskRow = { id: taskId, status, role: "scout", ...(native ? { taskType: "native-task" } : {}), failureReason: reason,
+    result: { summary: "private result prose", errorCode: "private error code" } }
+  const tasks = new Map([[taskId, task]]), state = taskGraphState(snapshot, 7,
+    new Map([[taskId, { status, failureReason: reason }]]), [])
+  const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot, state, tasks,
+    item: { id: "failure-item-private", revision: 7, content: snapshot, createdAt: new Date(0) } }
+  return { loaded, graph: currentTaskGraph(loaded), task }
 }
 
 function overlappingCoverageFixture() {
@@ -137,6 +154,61 @@ describe("root history ordinal lessons", () => {
     for (const secret of ["scout-private-key", "scout-private-task", "analyst-private-key", "analyst-private-task", "coverage-private-id", "private analysis goal"]) {
       expect(serialized).not.toContain(secret)
     }
+  })
+
+  it("projects only the three exact ordinary execution categories from aligned failed task rows", () => {
+    const cases = [
+      ["child_turn_missing", "execution_setup_unavailable"],
+      ["child_resume_unavailable", "resume_state_unavailable"],
+      ["invalid_structured_result", "structured_output_invalid"],
+    ] as const
+    for (const [reason, category] of cases) {
+      const { loaded } = executionFailureFixture(reason)
+      const expected = [{ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+        criterionFailures: [], executionFailureCategory: category }]
+      expect(deriveRootTaskHistoryLessonFacts(loaded, currentTaskGraph(loaded))).toEqual(expected)
+      expect(projectLoadedRootTaskHistoryGraph(loaded)?.nodeLessons).toEqual(expected)
+      const safeLesson = JSON.stringify(expected)
+      for (const privateValue of [reason, "failure-task-private", "failure-node-private", ROOT, "private failure goal", "private result prose", "private error code"]) {
+        expect(safeLesson).not.toContain(privateValue)
+      }
+    }
+  })
+
+  it("omits categories for nonfailed, report-backed, native, forged, mismatched, or accessor task facts", () => {
+    const ordinary = executionFailureFixture("child_turn_missing")
+    const running = executionFailureFixture("child_turn_missing", "running")
+    expect(deriveRootTaskHistoryLessonFacts(running.loaded, running.graph)).toEqual([undefined])
+    expect(deriveRootTaskHistoryLessonFacts(ordinary.loaded,
+      running.graph)).toEqual([])
+
+    const typed = fixture({ repairCount: 0 }), typedNode = typed.loaded.snapshot!.nodes[0]!
+    const typedTask = typed.loaded.tasks.get(typedNode.taskId)!
+    const typedTasks = new Map(typed.loaded.tasks).set(typedNode.taskId, { ...typedTask, failureReason: "child_turn_missing" })
+    const typedState = taskGraphState(typed.loaded.snapshot!, 7,
+      new Map([[typedNode.taskId, { status: "failed", failureReason: "child_turn_missing" }]]), [])
+    const reportBacked = { ...typed.loaded, tasks: typedTasks, state: typedState }
+    const reportLessons = deriveRootTaskHistoryLessonFacts(reportBacked, currentTaskGraph(reportBacked))
+    expect(reportLessons[0]?.executionFailureCategory).toBeUndefined()
+    expect(reportLessons[0]?.criterionFailures).toHaveLength(2)
+
+    const native = executionFailureFixture("child_turn_missing", "failed", true)
+    expect(native.graph.nodes[0]?.native).toBeDefined()
+    expect(deriveRootTaskHistoryLessonFacts(native.loaded, native.graph)[0]?.executionFailureCategory).toBeUndefined()
+
+    const forged = { ...ordinary.graph, nodes: [{ ...ordinary.graph.nodes[0]!, executionFailureCategory: "resume_state_unavailable" as const }] }
+    const unknownTask = { ...ordinary.task, failureReason: "provider_error" }
+    const unknownLoaded = { ...ordinary.loaded, tasks: new Map([[unknownTask.id, unknownTask]]) }
+    expect(deriveRootTaskHistoryLessonFacts(unknownLoaded, forged)[0]?.executionFailureCategory).toBeUndefined()
+    expect(deriveRootTaskHistoryLessonFacts(ordinary.loaded,
+      { ...ordinary.graph, nodes: [{ ...ordinary.graph.nodes[0]!, status: "running" }] })).toEqual([])
+
+    let getterReads = 0
+    const accessorTask = { ...ordinary.task }
+    Object.defineProperty(accessorTask, "failureReason", { enumerable: true, get() { getterReads++; return "child_turn_missing" } })
+    const accessorLoaded = { ...ordinary.loaded, tasks: new Map([[accessorTask.id, accessorTask]]) }
+    expect(deriveRootTaskHistoryLessonFacts(accessorLoaded, ordinary.graph)[0]?.executionFailureCategory).toBeUndefined()
+    expect(getterReads).toBe(0)
   })
 
   it("derives separate same-reason failures and a receipt-backed one-to-one repair link", () => {

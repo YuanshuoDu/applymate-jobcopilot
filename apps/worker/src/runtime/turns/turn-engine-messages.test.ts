@@ -209,16 +209,21 @@ describe("TurnEngine model message mapping", () => {
   })
 
   it("adds history guidance only for the canonical advisory observation and preserves history as untrusted user data", () => {
+    const rootHistoryNodes: JsonValue[] = [
+      { taskKind: "analyst", status: "failed", lesson: {
+        ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+        criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+      } },
+      { taskKind: "scout", status: "completed", reportedOutput: { role: "scout", candidateCount: 33, resultStatus: "partial" } },
+    ]
+    const categoryNode: JsonValue = { taskKind: "writer", status: "failed", lesson: {
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 3,
+      criterionFailures: [], executionFailureCategory: "structured_output_invalid",
+    } }
     const rootHistoryContent: JsonValue = {
       kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
       label: "Earlier outcomes for the same verifier objective; advisory context only.",
-      turns: [{ label: "earlier terminal attempt", nodes: [
-        { taskKind: "analyst", status: "failed", lesson: {
-          ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
-          criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
-        } },
-        { taskKind: "scout", status: "completed", reportedOutput: { role: "scout", candidateCount: 33, resultStatus: "partial" } },
-      ] }],
+      turns: [{ label: "earlier terminal attempt", nodes: [...rootHistoryNodes, categoryNode] }],
     }
     const rootHistory = {
       id: "observation:root-task-history", layer: "tool_observation" as const, role: "data" as const,
@@ -248,7 +253,24 @@ describe("TurnEngine model message mapping", () => {
     expect(system).not.toContain("criterionOrdinal")
     expect(system).not.toContain("33")
     expect(user).toContain("\"kind\":\"root_task_history\"")
+    expect(user).toContain("executionFailureCategory")
+    expect(user).toContain("structured_output_invalid")
     expect(request.tools).toEqual(tools)
+
+    const historyWithoutCategory: JsonValue = {
+      kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+      label: "Earlier outcomes for the same verifier objective; advisory context only.",
+      turns: [{ label: "earlier terminal attempt", nodes: rootHistoryNodes }],
+    }
+    const baseline = buildModelRequest({
+      context: { ...context(), taskGraphRevision: 12, blocks: [...context().blocks, { ...rootHistory, content: historyWithoutCategory }] },
+      model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal,
+    })
+    const systemWithoutCategory = baseline.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(system).toBe(systemWithoutCategory)
+    expect(system).not.toContain("structured_output_invalid")
 
     const withoutHistory = buildModelRequest({
       context: context(), model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",

@@ -65,7 +65,7 @@ function safeHistoryNode(value: unknown): boolean | undefined {
   }
   let hasFact = false
   if (Object.hasOwn(node, "lesson")) {
-    if (!parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind)) return undefined
+    if (!parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind, node.status)) return undefined
     hasFact = true
   }
   if (Object.hasOwn(node, "reportedOutput")) {

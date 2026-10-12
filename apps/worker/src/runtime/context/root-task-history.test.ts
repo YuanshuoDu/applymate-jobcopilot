@@ -171,6 +171,28 @@ describe("root task history projection", () => {
     ] }])).toEqual(baseline)
   })
 
+  it("retains category-only lessons only for failed enclosing nodes", () => {
+    const failed = {
+      key: "ordinary-failed", templateId: "scout", goal: "PRIVATE_GOAL", successCriteria: [], dependsOn: [],
+      taskId: "PRIVATE_TASK_ID", status: "failed", readiness: "terminal", resultSummary: null,
+      failureReason: "PRIVATE_RAW_FAILURE_REASON",
+    } satisfies TaskGraphCurrentNode
+    const categoryLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" } as const
+    const accepted = projectRootTaskHistory([{ ...outcome("category-only", 23n, [failed]), sourceNodeOrdinals: [1], nodeLessons: [categoryLesson] }])
+    expect(accepted?.content).toMatchObject({ turns: [{ nodes: [{ status: "failed", lesson: {
+      nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable",
+    } }] }] })
+    expect(JSON.stringify(accepted)).not.toContain("PRIVATE_RAW_FAILURE_REASON")
+    expect(JSON.stringify(accepted)).not.toContain("PRIVATE_TASK_ID")
+
+    const completed = { ...failed, status: "completed" as const, failureReason: null }
+    const rejected = projectRootTaskHistory([{ ...outcome("category-on-completed", 24n, [completed]),
+      sourceNodeOrdinals: [1], nodeLessons: [categoryLesson] }])
+    expect(rejected?.content).toMatchObject({ turns: [{ nodes: [{ status: "completed" }] }] })
+    expect(JSON.stringify(rejected)).not.toContain("execution_setup_unavailable")
+  })
+
   it("keeps bounded eight-node/eight-criterion facts under the content cap", () => {
     const criterionIds = Array.from({ length: 8 }, (_, index) => "criterion-" + (index + 1))
     const unverified = {
