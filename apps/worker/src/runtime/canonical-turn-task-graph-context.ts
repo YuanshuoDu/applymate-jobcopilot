@@ -14,6 +14,7 @@ import type { SubagentTaskRecord } from "./subagents/types.js"
 import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
 import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
 import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
+import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -187,6 +188,10 @@ function node(value: unknown): TaskGraphCurrentNode {
   const templateId = text(row.templateId, 128, "templateId")
   const verification = parseTaskGraphCurrentVerificationMetadata(row, templateId, key, taskId)
   if (!verification) throw new Error("task_graph_current_state_invalid:verification")
+  const native = nativeGraphNodeFields(row)
+  const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, {
+    hasVerifiedReport: Boolean(verification.verificationReport), isNative: Boolean(native.native || native.nativeResult),
+  })
   return {
     key, templateId,
     goal: text(row.goal, 1200, "goal", true), successCriteria: stringList(row.successCriteria, 8, 320, "successCriteria"),
@@ -194,7 +199,7 @@ function node(value: unknown): TaskGraphCurrentNode {
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],
     resultSummary: null,
     resultProjection: projection(row.resultProjection),
-    ...verification, ...nativeGraphNodeFields(row),
+    ...verification, ...native, ...(executionFailureCategory ? { executionFailureCategory } : {}),
     failureReason: null,
   }
 }
