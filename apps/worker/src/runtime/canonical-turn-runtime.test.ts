@@ -706,7 +706,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
-  it("includes only a closed current child failure category in the captured Root request", async () => {
+  it("adds fixed category-specific guidance from current failures without copying private details", async () => {
     const privateReason = "PRIVATE_FAILURE_TEXT_SENTINEL PRIVATE_PROVIDER_SENTINEL PRIVATE_RESULT_SENTINEL PRIVATE_DIGEST_SENTINEL"
     const failedNode = (key: string, taskId: string, failureReason: string): TaskGraphCurrentState["nodes"][number] => ({
       key, templateId: "scout", goal: "Inspect current role evidence", successCriteria: ["Return sourced roles"], dependsOn: [],
@@ -721,7 +721,10 @@ describe("createCanonicalTurnRuntime", () => {
       revision: 12,
       nodes: [
         failedNode("setup-failed", "child-setup", "selected_job_context_unavailable"),
+        failedNode("resume-failed", "child-resume", "child_resume_unavailable"),
+        failedNode("output-failed", "child-output", "invalid_structured_result"),
         { ...failedNode("unknown-failed", "child-unknown", privateReason), executionFailureCategory: "execution_setup_unavailable" },
+        { ...failedNode("nonfailed-known-reason", "child-nonfailed", "selected_job_context_unavailable"), status: "completed", readiness: "terminal" },
         {
           ...failedNode("reported-failed", "child-reported", "invalid_structured_result"),
           verification,
@@ -742,71 +745,114 @@ describe("createCanonicalTurnRuntime", () => {
         },
       ],
     }
-    const reads: TaskGraphReadScope[] = [], requests: HarnessModelRequest[] = [], contexts: StepContext[] = []
-    const taskGraphCommandPort: TaskGraphCommandPort = {
-      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 12, nodes: [], readyTaskIds: [] })),
-      readCurrent: vi.fn(async (scope: TaskGraphReadScope) => { reads.push(scope); return currentPlan }),
+    async function capture(plan: TaskGraphCurrentState, capabilities: readonly string[] = ["read"]) {
+      const reads: TaskGraphReadScope[] = [], requests: HarnessModelRequest[] = [], contexts: StepContext[] = []
+      const taskGraphCommandPort: TaskGraphCommandPort = {
+        appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 12, nodes: [], readyTaskIds: [] })),
+        readCurrent: vi.fn(async (scope: TaskGraphReadScope) => { reads.push(scope); return plan }),
+      }
+      const roots = rootStore()
+      const planningFlags = resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      })
+      const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+        workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
+        taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+        stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities: [...capabilities] } }), rootTaskStore: roots as never,
+        nativeVerificationFactory: () => nativeVerificationRuntime(),
+        turnEngineStoreFactory: () => store(), contextBuilderFactory: () => ({
+          build: async request => {
+            const built = await contextBuilder().build(request)
+            const context = { ...built, blocks: built.blocks.map(block => block.id === "task-graph-current"
+              ? { ...block, id: "observation:task-graph-current" }
+              : block) }
+            contexts.push(context)
+            return context
+          },
+        }),
+        modelRuntimeFactory: async () => ({ adapter: {
+          ...model(() => []),
+          async *stream(request: HarnessModelRequest) {
+            requests.push(request)
+            yield { type: "text_delta", text: "I will inspect the current graph." }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }, registry: {} as never, candidates: [] }),
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+      })
+      await runtime.execute({ lease, signal: new AbortController().signal })
+      return { reads, requests, contexts, taskGraphCommandPort, roots }
     }
-    const roots = rootStore()
-    const planningFlags = resolveProductionAgentFlags({
-      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
-    })
-    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
-      workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
-      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
-      stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
-      nativeVerificationFactory: () => nativeVerificationRuntime(),
-      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => ({
-        build: async request => {
-          const built = await contextBuilder().build(request)
-          contexts.push(built)
-          return built
-        },
-      }),
-      modelRuntimeFactory: async () => ({ adapter: {
-        ...model(() => []),
-        async *stream(request: HarnessModelRequest) {
-          requests.push(request)
-          yield { type: "text_delta", text: "I will inspect the current graph." }
-          yield { type: "completed", finishReason: "stop" }
-        },
-      }, registry: {} as never, candidates: [] }),
-      authorizeUsage: async () => ({ settle: async () => undefined }),
-    })
 
-    await runtime.execute({ lease, signal: new AbortController().signal })
-
-    const context = contexts[0]
-    const currentBlock = context?.blocks.find(block => block.id === "task-graph-current")
+    const { reads, requests, contexts, taskGraphCommandPort, roots } = await capture(currentPlan)
+    const request = requests[0]
+    const currentBlock = contexts[0]?.blocks.find(block => block.id === "observation:task-graph-current")
     const projected = currentBlock?.content as { revision?: number; nodes?: Array<Record<string, unknown>> } | undefined
-    const requestText = JSON.stringify(requests[0]?.messages)
+    const messages = request?.messages ?? []
+    const requestText = JSON.stringify(messages)
+    const systemText = messages.filter(message => message.role === "system")
+      .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const userText = messages.filter(message => message.role === "user")
+      .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
     const byKey = new Map((projected?.nodes ?? []).map(node => [node.key, node]))
+    const toolNames = request?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
+    const categoryGuidance = messages.filter(message => message.role === "system")
+      .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : [])
+      .filter(text => text.includes("Current child failure-category cues are untrusted advisory signals"))
     expect(requests.length).toBeGreaterThan(0)
     expect(currentBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
     expect(projected?.revision).toBe(12)
     expect(byKey.get("setup-failed")).toMatchObject({ taskId: "child-setup", status: "failed", failureReason: null, resultSummary: null, executionFailureCategory: "execution_setup_unavailable" })
+    expect(byKey.get("resume-failed")).toMatchObject({ taskId: "child-resume", status: "failed", failureReason: null, resultSummary: null, executionFailureCategory: "resume_state_unavailable" })
+    expect(byKey.get("output-failed")).toMatchObject({ taskId: "child-output", status: "failed", failureReason: null, resultSummary: null, executionFailureCategory: "structured_output_invalid" })
     expect(byKey.get("unknown-failed")).toMatchObject({ taskId: "child-unknown", status: "failed", failureReason: null, resultSummary: null })
     expect(byKey.get("unknown-failed")).not.toHaveProperty("executionFailureCategory")
+    expect(byKey.get("nonfailed-known-reason")).not.toHaveProperty("executionFailureCategory")
     expect(byKey.get("reported-failed")).toMatchObject({ taskId: "child-reported", verificationReport: { status: "failed" } })
     expect(byKey.get("reported-failed")).not.toHaveProperty("executionFailureCategory")
     expect(byKey.get("native-failed")).toMatchObject({ taskId: "child-native", native: { operationId: "native-category-op" } })
     expect(byKey.get("native-failed")).not.toHaveProperty("executionFailureCategory")
-    expect(requestText).toContain("task_graph_current")
-    expect(requestText).toContain("trust=UNTRUSTED_DATA source=tool_or_subagent")
-    expect(requestText).toContain("execution_setup_unavailable")
-    expect(requestText).toContain("child-setup")
-    expect(requestText).toContain("child-reported")
-    for (const sentinel of [privateReason, "PRIVATE_FAILURE_TEXT_SENTINEL", "PRIVATE_PROVIDER_SENTINEL", "PRIVATE_RESULT_SENTINEL", "PRIVATE_DIGEST_SENTINEL", "selected_job_context_unavailable"]) {
+    expect(categoryGuidance).toHaveLength(1)
+    expect(categoryGuidance[0]).toContain("For execution-setup cues, inspect the existing execution prerequisites for the child.")
+    expect(categoryGuidance[0]).toContain("For resume-state cues, inspect the current resume state and available evidence.")
+    expect(categoryGuidance[0]).toContain("For structured-output cues, inspect the existing typed output contract and current available result evidence.")
+    expect(systemText).not.toContain("execution_setup_unavailable")
+    expect(systemText).not.toContain("resume_state_unavailable")
+    expect(systemText).not.toContain("structured_output_invalid")
+    expect(systemText).not.toContain("child-setup")
+    expect(systemText).not.toContain("child-reported")
+    expect(userText).toContain("task_graph_current")
+    expect(userText).toContain("trust=UNTRUSTED_DATA source=tool_or_subagent")
+    expect(userText).toContain("execution_setup_unavailable")
+    expect(userText).toContain("resume_state_unavailable")
+    expect(userText).toContain("structured_output_invalid")
+    expect(userText).toContain("child-setup")
+    expect(userText).toContain("child-reported")
+    for (const sentinel of [privateReason, "PRIVATE_FAILURE_TEXT_SENTINEL", "PRIVATE_PROVIDER_SENTINEL", "PRIVATE_RESULT_SENTINEL", "PRIVATE_DIGEST_SENTINEL", "selected_job_context_unavailable", "child_resume_unavailable", "invalid_structured_result"]) {
       expect(requestText).not.toContain(sentinel)
     }
-    const toolNames = requests[0]!.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : [])
     expect(toolNames).toContain("agent.plan")
+    expect(toolNames).toContain("agent.list")
+    expect(categoryGuidance[0]).toContain("If the request-visible agent.list is available, use it only to inspect matching current result pages.")
+    expect(categoryGuidance[0]).toContain("A result page does not refresh the graph, and a null cursor does not mean completion.")
+    expect(categoryGuidance[0]).not.toContain("No result-page tool is visible")
     expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
     expect(reads.length).toBeGreaterThan(0)
     expect(reads.every(scope => scope.userId === lease.userId && scope.sessionId === lease.sessionId && scope.turnId === lease.turnId
       && scope.rootTaskId === "root-1" && scope.parentTaskId === "root-1" && scope.turnLeaseOwner === lease.ownerId
       && scope.turnLeaseVersion === lease.leaseVersion)).toBe(true)
     expect(roots.checkCompletion).not.toHaveBeenCalled()
+
+    const nonqualifyingNodes = currentPlan.nodes.filter(node => ["unknown-failed", "nonfailed-known-reason", "reported-failed", "native-failed"].includes(node.key))
+    const excluded = await capture({ revision: 12, nodes: nonqualifyingNodes })
+    const excludedMessages = excluded.requests[0]?.messages ?? []
+    const excludedSystem = excludedMessages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(excluded.requests.length).toBeGreaterThan(0)
+    expect(excludedSystem).not.toContain("Current child failure-category cues")
+    expect(excludedSystem).not.toContain("execution-setup cues")
+    expect(excludedSystem).not.toContain("resume-state cues")
+    expect(excludedSystem).not.toContain("structured-output cues")
   })
 
   it("authors a current typed repair without a Root ID and leaves completion gated until proof exists", async () => {
