@@ -83,6 +83,21 @@ async function selectedJobModelRequest(value: StepContextSnapshot) {
   return buildModelRequest({ context, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
 }
 
+function ordinaryFailedNode(): Record<string, unknown> {
+  const ordinary = { ...state.nodes[0]! }
+  delete ordinary.verificationCriterionIds
+  delete ordinary.verificationReport
+  return { ...ordinary, status: "failed", readiness: "terminal", failureReason: "selected_job_context_unavailable",
+    resultSummary: "private provider detail person@example.test" }
+}
+
+function projectedNode(row: Record<string, unknown>): Record<string, unknown> {
+  const projected = mergeTaskGraphCurrentObservation(snapshot(), {
+    revision: state.revision, nodes: [row as unknown as TaskGraphCurrentState["nodes"][number]],
+  })
+  return (projected.toolObservations.at(-1)?.content as { nodes: Array<Record<string, unknown>> }).nodes[0]!
+}
+
 describe("TaskGraph turn observation", () => {
   it("keeps selected-job root observations scoped to coordination and the current graph", () => {
     const original = {
@@ -152,6 +167,59 @@ describe("TaskGraph turn observation", () => {
     const encoded = JSON.stringify(result.toolObservations.at(-1)?.content)
     expect(encoded).not.toContain("Alice Example")
     expect(encoded).not.toContain("private.example")
+  })
+
+  it("projects only a closed advisory category for an ordinary failed node", () => {
+    const node = projectedNode({ ...ordinaryFailedNode(), executionFailureCategory: "structured_output_invalid" })
+
+    expect(node).toMatchObject({
+      status: "failed", readiness: "terminal", executionFailureCategory: "execution_setup_unavailable",
+      failureReason: null, resultSummary: null,
+    })
+    expect(JSON.stringify(node)).not.toContain("selected_job_context_unavailable")
+    expect(JSON.stringify(node)).not.toContain("private provider detail")
+    expect(JSON.stringify(node)).not.toContain("person@example.test")
+  })
+
+  it("omits the category for unknown reasons, nonfailed tasks, verified failures, and native nodes", () => {
+    const unknown = projectedNode({ ...ordinaryFailedNode(), failureReason: "provider-private-secret", executionFailureCategory: "execution_setup_unavailable" })
+    const completed = projectedNode({ ...ordinaryFailedNode(), status: "completed" })
+    const reported = projectedNode({ ...ordinaryFailedNode(), verificationCriterionIds: ["candidate-count"], verificationReport: state.nodes[0]!.verificationReport })
+    const native = projectedNode({ ...ordinaryFailedNode(), native: {
+      operationKind: "spawn", operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1",
+      role: "scout", taskType: "research", contextDigest: "c".repeat(64),
+    } })
+
+    for (const node of [unknown, completed, reported, native]) {
+      expect(Object.hasOwn(node, "executionFailureCategory")).toBe(false)
+      expect(node.failureReason).toBeNull()
+      expect(node.resultSummary).toBeNull()
+    }
+    expect(JSON.stringify(unknown)).not.toContain("provider-private-secret")
+  })
+
+  it("ignores inherited and accessor failure reasons without invoking getters", () => {
+    const withoutReason = ordinaryFailedNode()
+    delete withoutReason.failureReason
+    const inherited = Object.assign(Object.create({ failureReason: "selected_job_context_unavailable" }), withoutReason) as Record<string, unknown>
+    const accessor = ordinaryFailedNode()
+    Object.defineProperty(accessor, "failureReason", {
+      enumerable: true, get: () => { throw new Error("failure getter must not run") },
+    })
+
+    expect(Object.hasOwn(projectedNode(inherited), "executionFailureCategory")).toBe(false)
+    expect(Object.hasOwn(projectedNode(accessor), "executionFailureCategory")).toBe(false)
+  })
+
+  it("rejects malformed verification before reading native fields", () => {
+    let nativeReads = 0
+    const malformed = { ...ordinaryFailedNode(), verificationCriterionIds: ["candidate-count"], verificationReport: {} }
+    Object.defineProperty(malformed, "native", {
+      enumerable: true, get: () => { nativeReads += 1; return {} },
+    })
+
+    expect(() => projectedNode(malformed)).toThrow("task_graph_current_state_invalid:verification")
+    expect(nativeReads).toBe(0)
   })
 
   it("replaces stale revision metadata from the typed read, including graph revision zero", () => {

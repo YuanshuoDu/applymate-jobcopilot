@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
@@ -7,9 +8,11 @@ import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "../subagents/task-graph-com
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { buildTaskGraphRecoveryInstruction } from "./task-graph-recovery-guidance.js"
+import { buildModelRequest } from "./turn-engine-messages.js"
 
 const REVISION = 5
 const ROOT_ID = "root-current"
+const CURRENT_GRAPH_ID = "task-graph-current"
 const FEEDBACK_LEAD = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const FEEDBACK = `${FEEDBACK_LEAD} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met repair=missing`
 const CHECK = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
@@ -36,6 +39,24 @@ function extraNode(index: number): TaskGraphCurrentNode {
   return { key: `other-${index}`, taskId: `task-${index}`, templateId: "other", goal: "Other node",
     successCriteria: ["Complete"], dependsOn: [], status: "queued", readiness: "ready", resultSummary: null,
     failureReason: null, resultProjection: UNAVAILABLE_PROJECTION }
+}
+
+function ordinaryFailedNode(failureReason: string | null = null): TaskGraphCurrentNode {
+  return { ...extraNode(99), key: "ordinary-failed", taskId: "ordinary-failed-task", status: "failed", readiness: "terminal", failureReason }
+}
+
+function replaceGraphNode(context: StepContext, index: number, node: unknown): StepContext {
+  const blocks = context.blocks.map(block => {
+    if (block.id !== `observation:${CURRENT_GRAPH_ID}`) return block
+    const content = block.content
+    if (!content || typeof content !== "object" || Array.isArray(content)) throw new Error("expected graph observation")
+    const graph = content as Record<string, unknown>, currentNodes = graph.nodes
+    if (!Array.isArray(currentNodes) || index < 0 || index >= currentNodes.length) throw new Error("expected graph node")
+    const nodes = [...currentNodes]
+    nodes[index] = node
+    return { ...block, content: { ...graph, nodes } as typeof block.content }
+  })
+  return { ...context, blocks }
 }
 
 function repairNode(status: "queued" | "failed" | "cancelled"): TaskGraphCurrentNode {
@@ -196,5 +217,67 @@ describe("TaskGraph recovery guidance", () => {
     ]) expect(buildTaskGraphRecoveryInstruction(contextFor(input), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
     const crossRootRepair = { ...repairNode("queued"), repairOf: { ...repairNode("queued").repairOf!, graphRootTaskId: "foreign-root" } }
     expect(buildTaskGraphRecoveryInstruction(contextFor({ nodes: [sourceNode(), crossRootRepair] }), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
+  })
+
+  it("preserves typed-denial guidance in the actual request beside an unrelated advisory failure category", () => {
+    const tools = [{ name: "agent.list" }, { name: "agent.wait" }, { name: "agent.plan" }]
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false,
+      streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const baselineGuidance = buildTaskGraphRecoveryInstruction(contextFor({ nodes: [sourceNode(), ordinaryFailedNode()] }), tools, ROOT_ID)
+    const examples = [
+      ["selected_job_context_unavailable", "execution_setup_unavailable"],
+      ["child_resume_unavailable", "resume_state_unavailable"],
+      ["invalid_structured_result", "structured_output_invalid"],
+    ] as const
+    for (const [reason, category] of examples) {
+      const context = contextFor({ nodes: [sourceNode(), ordinaryFailedNode(reason)] })
+      const expectedGuidance = buildTaskGraphRecoveryInstruction(context, tools, ROOT_ID)
+      const request = buildModelRequest({ context, model, tools, sessionId: "session", turnId: "turn", stepId: "step-resume",
+        userId: "user", taskId: ROOT_ID, signal: new AbortController().signal })
+      const systemText = request.messages.filter(message => message.role === "system")
+        .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+      const graphObservation = context.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)?.content
+
+      expect(JSON.stringify(graphObservation)).toContain(`"executionFailureCategory":"${category}"`)
+      expect(expectedGuidance).not.toBeNull()
+      expect(expectedGuidance).toEqual(baselineGuidance)
+      expect(request.messages).toContainEqual(expectedGuidance)
+      expect(systemText).toContain("The current owner-read TaskGraph denial is advisory feedback")
+      expect(systemText).toContain("node 1, criterion 1 failed for reason criterion_not_met")
+      expect(systemText).not.toContain(category)
+      expect(systemText).not.toContain(reason)
+      expect(systemText).not.toContain("ordinary-failed-task")
+      expect(systemText).not.toContain("private goal text")
+    }
+
+    const categoryContext = contextFor({ nodes: [ordinaryFailedNode("selected_job_context_unavailable")] })
+    const withoutMarker = { ...categoryContext, blocks: categoryContext.blocks.filter(block => !block.id.startsWith("system:completion-recovery:task-graph:")) }
+    expect(buildTaskGraphRecoveryInstruction(withoutMarker, tools, ROOT_ID)).toBeNull()
+  })
+
+  it("rejects malformed, nonfailed, verified, native, inherited, and accessor category fields", () => {
+    const context = contextFor({ nodes: [sourceNode(), ordinaryFailedNode()] })
+    const validCategory = "execution_setup_unavailable"
+    const cases: unknown[] = [
+      { ...ordinaryFailedNode(), executionFailureCategory: "provider-private-detail" },
+      { ...ordinaryFailedNode(), executionFailureCategory: 4 },
+      { ...ordinaryFailedNode(), status: "queued", readiness: "ready", executionFailureCategory: validCategory },
+      { ...sourceNode(), key: "reported-node", taskId: "reported-task", executionFailureCategory: validCategory },
+      { ...ordinaryFailedNode(), native: {}, executionFailureCategory: validCategory },
+    ]
+    for (const node of cases) {
+      expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, node), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
+    }
+
+    let getterCalled = false
+    const accessor = { ...ordinaryFailedNode() }
+    Object.defineProperty(accessor, "executionFailureCategory", {
+      enumerable: true, get: () => { getterCalled = true; return validCategory },
+    })
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, accessor), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
+    expect(getterCalled).toBe(false)
+
+    const inherited = Object.assign(Object.create({ executionFailureCategory: validCategory }), ordinaryFailedNode())
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, inherited), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
   })
 })

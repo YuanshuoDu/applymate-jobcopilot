@@ -706,6 +706,109 @@ describe("createCanonicalTurnRuntime", () => {
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
+  it("includes only a closed current child failure category in the captured Root request", async () => {
+    const privateReason = "PRIVATE_FAILURE_TEXT_SENTINEL PRIVATE_PROVIDER_SENTINEL PRIVATE_RESULT_SENTINEL PRIVATE_DIGEST_SENTINEL"
+    const failedNode = (key: string, taskId: string, failureReason: string): TaskGraphCurrentState["nodes"][number] => ({
+      key, templateId: "scout", goal: "Inspect current role evidence", successCriteria: ["Return sourced roles"], dependsOn: [],
+      taskId, status: "failed", readiness: "terminal", resultSummary: "PRIVATE_RESULT_SENTINEL", failureReason,
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" },
+    })
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }],
+    }
+    const currentPlan: TaskGraphCurrentState = {
+      revision: 12,
+      nodes: [
+        failedNode("setup-failed", "child-setup", "selected_job_context_unavailable"),
+        { ...failedNode("unknown-failed", "child-unknown", privateReason), executionFailureCategory: "execution_setup_unavailable" },
+        {
+          ...failedNode("reported-failed", "child-reported", "invalid_structured_result"),
+          verification,
+          verificationCriterionIds: ["candidate-count"],
+          verificationReport: {
+            verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+            criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+            evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+          },
+        },
+        {
+          ...failedNode("native-failed", "child-native", "invalid_structured_result"),
+          templateId: "native:scout",
+          native: {
+            operationKind: "spawn", operationId: "native-category-op", requestFingerprint: "c".repeat(64),
+            callerTaskId: "root-1", role: "scout", taskType: "job_discovery", contextDigest: "d".repeat(64),
+          },
+        },
+      ],
+    }
+    const reads: TaskGraphReadScope[] = [], requests: HarnessModelRequest[] = [], contexts: StepContext[] = []
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 12, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async (scope: TaskGraphReadScope) => { reads.push(scope); return currentPlan }),
+    }
+    const roots = rootStore()
+    const planningFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => ({
+        build: async request => {
+          const built = await contextBuilder().build(request)
+          contexts.push(built)
+          return built
+        },
+      }),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          yield { type: "text_delta", text: "I will inspect the current graph." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await runtime.execute({ lease, signal: new AbortController().signal })
+
+    const context = contexts[0]
+    const currentBlock = context?.blocks.find(block => block.id === "task-graph-current")
+    const projected = currentBlock?.content as { revision?: number; nodes?: Array<Record<string, unknown>> } | undefined
+    const requestText = JSON.stringify(requests[0]?.messages)
+    const byKey = new Map((projected?.nodes ?? []).map(node => [node.key, node]))
+    expect(requests.length).toBeGreaterThan(0)
+    expect(currentBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
+    expect(projected?.revision).toBe(12)
+    expect(byKey.get("setup-failed")).toMatchObject({ taskId: "child-setup", status: "failed", failureReason: null, resultSummary: null, executionFailureCategory: "execution_setup_unavailable" })
+    expect(byKey.get("unknown-failed")).toMatchObject({ taskId: "child-unknown", status: "failed", failureReason: null, resultSummary: null })
+    expect(byKey.get("unknown-failed")).not.toHaveProperty("executionFailureCategory")
+    expect(byKey.get("reported-failed")).toMatchObject({ taskId: "child-reported", verificationReport: { status: "failed" } })
+    expect(byKey.get("reported-failed")).not.toHaveProperty("executionFailureCategory")
+    expect(byKey.get("native-failed")).toMatchObject({ taskId: "child-native", native: { operationId: "native-category-op" } })
+    expect(byKey.get("native-failed")).not.toHaveProperty("executionFailureCategory")
+    expect(requestText).toContain("task_graph_current")
+    expect(requestText).toContain("trust=UNTRUSTED_DATA source=tool_or_subagent")
+    expect(requestText).toContain("execution_setup_unavailable")
+    expect(requestText).toContain("child-setup")
+    expect(requestText).toContain("child-reported")
+    for (const sentinel of [privateReason, "PRIVATE_FAILURE_TEXT_SENTINEL", "PRIVATE_PROVIDER_SENTINEL", "PRIVATE_RESULT_SENTINEL", "PRIVATE_DIGEST_SENTINEL", "selected_job_context_unavailable"]) {
+      expect(requestText).not.toContain(sentinel)
+    }
+    const toolNames = requests[0]!.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : [])
+    expect(toolNames).toContain("agent.plan")
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(reads.length).toBeGreaterThan(0)
+    expect(reads.every(scope => scope.userId === lease.userId && scope.sessionId === lease.sessionId && scope.turnId === lease.turnId
+      && scope.rootTaskId === "root-1" && scope.parentTaskId === "root-1" && scope.turnLeaseOwner === lease.ownerId
+      && scope.turnLeaseVersion === lease.leaseVersion)).toBe(true)
+    expect(roots.checkCompletion).not.toHaveBeenCalled()
+  })
+
   it("authors a current typed repair without a Root ID and leaves completion gated until proof exists", async () => {
     const serverRootId = "server-only-root-749"
     const originalText = "Find one evidence-bound software role in Germany."

@@ -13,6 +13,7 @@ import type { TaskGraphResultProjection } from "./task-graph-result-projection-c
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
+import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-category.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -186,6 +187,7 @@ export type TaskGraphCurrentNode = Readonly<{
   repairReceipt?: TaskGraphRepairReceipt
   native?: TaskGraphNativeNodeView
   nativeResult?: TaskGraphNativeResultReceipt
+  executionFailureCategory?: TaskGraphExecutionFailureCategory
   failureReason: string | null
 }>
 export type TaskGraphCurrentState = Readonly<{
