@@ -25,6 +25,7 @@ import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphResultPageRequest } from "./subagents/task-graph-result-page-contract.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { priorConversation } from "./canonical-steering-markers.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -1099,6 +1100,16 @@ describe("createCanonicalTurnRuntime", () => {
     const laterAnsweredOlderAnswerText = "Berlin, please."
     const planningSummary = { observedPlanRevision: 0, graphRevisionAtAsk: 1, pendingSteerCount: 1,
       unconsumedSteerCount: 1, inputThroughSequence: "3" }
+    const priorInputHistory = priorConversation([
+      { id: "prior-accepted-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_ACCEPTED_STEER" }, acceptedSequence: "10", historyRole: "user", historySequence: "10", delivery: "steer", status: "accepted" },
+      { id: "prior-queued-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_QUEUED_STEER" }, acceptedSequence: "11", historyRole: "user", historySequence: "11", delivery: "steer", status: "queued" },
+      { id: "prior-cancelled-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CANCELLED_FOLLOW_UP" }, acceptedSequence: "12", historyRole: "user", historySequence: "12", delivery: "follow_up", status: "cancelled" },
+      { id: "prior-rejected-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_REJECTED_FOLLOW_UP" }, acceptedSequence: "13", historyRole: "user", historySequence: "13", delivery: "follow_up", status: "rejected" },
+      { id: "prior-consumed-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CONSUMED_FOLLOW_UP" }, acceptedSequence: "14", historyRole: "user", historySequence: "14", delivery: "follow_up", status: "consumed" },
+      { id: "prior-pending-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_PENDING_FOLLOW_UP" }, acceptedSequence: "15", historyRole: "user", historySequence: "15", delivery: "follow_up", status: "accepted" },
+      { id: "prior-missing-status", targetTurnId: "prior-turn", content: { text: "PRIOR_MISSING_STATUS" }, acceptedSequence: "16", historyRole: "user", historySequence: "16", delivery: "steer" },
+      { id: "prior-assistant-reply", turnId: "prior-turn", content: { text: "PRIOR_ASSISTANT_REPLY" }, historyRole: "assistant", historySequence: "17" },
+    ], lease.turnId, null)
     const questionStore = {
       ...store(events),
       stageQuestionUsage: vi.fn(async () => undefined),
@@ -1150,6 +1161,7 @@ describe("createCanonicalTurnRuntime", () => {
         ...state().snapshot, goal: { id: "canonical-goal", content: "Find software engineering roles." },
         businessRefs: [{ id: "verified-current-job", kind: "job", ownerId: "user-1", label: "Verified current job" }],
         steerHistory: [
+          ...priorInputHistory,
           { id: "agent-question:question-item-2:question", content: { role: "assistant", type: "question", question: latestStepQuestionText, options: [{ label: "Germany", value: "de" }] } },
           { id: "agent-question:question-item-2:answer", content: { role: "user", type: "answer", questionId: "wait-2", text: latestStepAnswerText } },
           { id: "agent-question:question-item-1:question", content: { role: "assistant", type: "question", question: questionText, options: [{ label: "Germany", value: "de" }] } },
@@ -1252,6 +1264,43 @@ describe("createCanonicalTurnRuntime", () => {
       expect(payload).not.toContain("PRIVATE_FINAL_TEXT")
       expect(payload).not.toContain("TASK_GRAPH_FINAL_SUMMARY_BINDING")
     }
+    for (const request of requests) {
+      const modelText = request.messages.flatMap(message => message.content)
+        .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+      expect(modelText).toContain('"priorInputDisposition":"not_consumed"')
+      expect(modelText).toContain('"priorInputDisposition":"cancelled"')
+      expect(modelText).toContain('"priorInputDisposition":"rejected"')
+      expect(modelText).toContain('"text":"PRIOR_CONSUMED_FOLLOW_UP"')
+      expect(modelText).toContain('"role":"assistant","text":"PRIOR_ASSISTANT_REPLY"')
+      expect(modelText).not.toContain("PRIOR_PENDING_FOLLOW_UP")
+      expect(modelText).not.toContain("PRIOR_MISSING_STATUS")
+      expect(modelText).not.toContain('"delivery"')
+      expect(modelText).not.toContain('"acceptedSequence"')
+      for (const privateId of ["prior-accepted-steer", "prior-queued-steer", "prior-cancelled-follow-up", "prior-rejected-follow-up", "prior-consumed-follow-up", "prior-assistant-reply"]) {
+        expect(modelText).not.toContain(privateId)
+      }
+      const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+        .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+      expect(system).not.toContain("priorInputDisposition")
+    }
+    for (const context of contexts) {
+      expect(context.blocks).toContainEqual({ id: "goal:canonical-goal", layer: "goal", role: "data", trust: "external_untrusted",
+        source: "turn_goal", content: "Find software engineering roles." })
+      expect(context.blocks).toContainEqual({ id: "business:job:verified-current-job", layer: "business", role: "data", trust: "internal_record",
+        source: "business_reference", content: { referenceId: "verified-current-job", kind: "job", label: "Verified current job" } })
+      for (const [id, content] of [
+        ["history:history:user:prior-accepted-steer", { role: "user", text: "PRIOR_ACCEPTED_STEER", priorInputDisposition: "not_consumed" }],
+        ["history:history:user:prior-queued-steer", { role: "user", text: "PRIOR_QUEUED_STEER", priorInputDisposition: "not_consumed" }],
+        ["history:history:user:prior-cancelled-follow-up", { role: "user", text: "PRIOR_CANCELLED_FOLLOW_UP", priorInputDisposition: "cancelled" }],
+        ["history:history:user:prior-rejected-follow-up", { role: "user", text: "PRIOR_REJECTED_FOLLOW_UP", priorInputDisposition: "rejected" }],
+        ["history:history:user:prior-consumed-follow-up", { role: "user", text: "PRIOR_CONSUMED_FOLLOW_UP" }],
+        ["history:history:assistant:prior-assistant-reply", { role: "assistant", text: "PRIOR_ASSISTANT_REPLY" }],
+      ] as const) {
+        expect(context.blocks).toContainEqual({ id, layer: "steer_history", role: "data", trust: "external_untrusted", source: "steer_history", content })
+      }
+      expect(context.blocks.some(block => JSON.stringify(block.content).includes("PRIOR_PENDING_FOLLOW_UP"))).toBe(false)
+      expect(context.blocks.some(block => JSON.stringify(block.content).includes("PRIOR_MISSING_STATUS"))).toBe(false)
+    }
     expect(rootTaskHistory.load).toHaveBeenCalledTimes(2)
     const historyStepIds = rootTaskHistory.load.mock.calls.map(([input]) => (input as { stepId?: unknown }).stepId)
     expect(historyStepIds).toHaveLength(2)
@@ -1274,6 +1323,12 @@ describe("createCanonicalTurnRuntime", () => {
     expect(contexts.map(context => context.consumedInputIds)).toEqual([[], []])
     const requestMessages = requests.map(request => JSON.stringify(request.messages))
     expect(requestMessages).toHaveLength(2)
+    for (const request of requests) {
+      const modelText = request.messages.flatMap(message => message.content)
+        .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+      expect(modelText).toContain('[harness context layer=goal trust=UNTRUSTED_DATA source=turn_goal]\n"Find software engineering roles."')
+      expect(modelText).toContain('[harness context layer=business trust=internal_record source=business_reference]\n{"kind":"job","label":"Verified current job","referenceId":"verified-current-job"}')
+    }
     const requestText = requests.map(request => request.messages.flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n"))
     expect(requestText[0]).toContain('"knownCount":1')
