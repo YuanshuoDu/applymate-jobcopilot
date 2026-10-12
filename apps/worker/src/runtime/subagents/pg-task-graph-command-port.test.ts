@@ -32,6 +32,9 @@ type FakePoolOptions = {
   includeReplay?: boolean
   missingGraph?: boolean
   persistedPlanReceipt?: boolean
+  budgetSnapshot?: unknown
+  usedSteps?: number
+  budgetReadError?: Error
   allowedActions?: unknown
   graphContent?: unknown
   graphRevision?: number
@@ -108,6 +111,13 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
       }
       if (sql.startsWith('SELECT "id" FROM "agent_steps"')) {
         return { rows: [{ id: input.scope.stepId }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT root_task."budgetSnapshot"')) {
+        if (options.budgetReadError) throw options.budgetReadError
+        return { rows: [{ budgetSnapshot: options.budgetSnapshot ?? {} }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT COUNT(*)::bigint AS "used"') && sql.includes('FROM "agent_steps"')) {
+        return { rows: [{ used: options.usedSteps ?? 0 }], rowCount: 1 }
       }
       if (sql.startsWith("WITH wall_clock AS MATERIALIZED")) {
         return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
@@ -579,7 +589,7 @@ describe("createPgTaskGraphCommandPort", () => {
 
   it("returns the original receipt as a duplicate for an idempotent proposal replay", async () => {
     const input = scheduleInput()
-    const fake = fakePool(input)
+    const fake = fakePool(input, { budgetSnapshot: { maxSteps: 2 }, usedSteps: 2 })
     const port = createPgTaskGraphCommandPort(fake.pool)
 
     await expect(port.appendAndSchedule(input)).resolves.toEqual({
@@ -593,6 +603,7 @@ describe("createPgTaskGraphCommandPort", () => {
     ])
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))).toBe(false)
     expect(fake.client.release).toHaveBeenCalledOnce()
   })
 
@@ -626,6 +637,7 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(reconciliationMocks.assertNoUnresolvedSteering).toHaveBeenCalledWith(fake.client, input.scope)
     expect(reconciliationMocks.create).not.toHaveBeenCalled()
     expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))).toBe(false)
   })
 
   it("does not apply the planning-root steering gate to non-planning schedules", async () => {
@@ -657,6 +669,81 @@ describe("createPgTaskGraphCommandPort", () => {
     })
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_items"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))).toBe(false)
+  })
+
+  it.each([0, 1])("refuses a new plan with only %i shared Turn step(s) remaining and rolls back before writes", async remaining => {
+    const input = scheduleInput(1)
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, budgetSnapshot: { maxSteps: 2 }, usedSteps: 2 - remaining })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "task_graph_continuation_budget_required",
+      message: "The Turn needs two remaining steps to supervise a TaskGraph plan",
+    })
+
+    const lockIndex = fake.calls.findIndex(call => call.sql.startsWith('SELECT "id" FROM "agent_turns"'))
+    const snapshotIndex = fake.calls.findIndex(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))
+    const countIndex = fake.calls.findIndex(call => call.sql.startsWith('SELECT COUNT(*)::bigint AS "used"') && call.sql.includes('FROM "agent_steps"'))
+    expect(lockIndex).toBeGreaterThanOrEqual(0)
+    expect(snapshotIndex).toBeGreaterThan(lockIndex)
+    expect(countIndex).toBeGreaterThan(snapshotIndex)
+    expect(fake.calls[countIndex]?.values).toEqual([input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.userId])
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_items"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+  })
+
+  it("admits a new plan at exactly two shared Turn steps and checks immediately before task creation", async () => {
+    const input = scheduleInput(1)
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, budgetSnapshot: { maxSteps: 4 }, usedSteps: 2 })
+    reconciliationMocks.create.mockResolvedValueOnce({
+      state: { revision: 2, nodes: [] }, snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, created: [], readyTaskIds: [],
+    })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).resolves.toEqual({
+      status: "accepted", revision: 2, nodes: [], readyTaskIds: [],
+    })
+
+    const countIndex = fake.calls.findIndex(call => call.sql.startsWith('SELECT COUNT(*)::bigint AS "used"') && call.sql.includes('FROM "agent_steps"'))
+    const countOrder = fake.client.query.mock.invocationCallOrder[countIndex]
+    expect(countIndex).toBeGreaterThanOrEqual(0)
+    expect(countOrder).toBeLessThan(reconciliationMocks.create.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY)
+    expect(reconciliationMocks.create).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan).toHaveBeenCalledOnce()
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
+  })
+
+  it("does not publish plan or reconciliation receipts when a revised plan lacks two shared steps", async () => {
+    const input = scheduleInput(1), fake = fakePool(input, {
+      includeReplay: false, graphRevision: 1, budgetSnapshot: { maxSteps: 2 }, usedSteps: 1,
+    })
+    const operation = { scope: input.scope, decision: "revise" as const, expectedRevision: 1, callId: "steer-call", rootInputId: "accepted-input" }
+    reconciliationMocks.prepare.mockResolvedValueOnce({ steerInputIds: ["accepted-input"], resultingRevision: 2 })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, operation)).rejects.toMatchObject({
+      code: "task_graph_continuation_budget_required",
+      message: "The Turn needs two remaining steps to supervise a TaskGraph plan",
+    })
+
+    expect(reconciliationMocks.prepare).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(reconciliationMocks.write).not.toHaveBeenCalled()
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+  })
+
+  it("propagates unexpected shared-budget read failures without creating a generic refusal", async () => {
+    const input = scheduleInput(1), queryError = new Error("budget snapshot query failed")
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, budgetReadError: queryError })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toBe(queryError)
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
   })
 
   it.each([

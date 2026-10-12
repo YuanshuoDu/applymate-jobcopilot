@@ -42,6 +42,60 @@ describe("root budget persistence guards", () => {
     })
   })
 
+  it("preserves the default step ceiling for a malformed maxSteps value", async () => {
+    const db = client([
+      { rows: [{ budgetSnapshot: { limits: { maxSteps: "32" } } }] },
+      { rows: [{ used: "32" }] },
+    ])
+
+    await expect(enforceRootStepBudget(db as never, owner)).rejects.toMatchObject({
+      code: "budget_exhausted", metric: "steps", limit: 32, used: 32, attempted: 33,
+    })
+  })
+
+  it.each([
+    { maxSteps: 2, used: 2 },
+    { maxSteps: 3, used: 2 },
+  ])("requires both continuation steps with shared usage $used/$maxSteps", async ({ maxSteps, used }) => {
+    const db = client([
+      { rows: [{ budgetSnapshot: { limits: { maxSteps } } }] },
+      { rows: [{ used: String(used) }] },
+    ])
+
+    await expect(enforceRootStepBudget(db as never, owner, 2)).rejects.toMatchObject({
+      code: "budget_exhausted", metric: "steps", limit: maxSteps, used, attempted: used + 2,
+    })
+    expect(db.query).toHaveBeenCalledTimes(2)
+  })
+
+  it("admits exactly two shared steps from a locked root planning scope", async () => {
+    const db = client([
+      { rows: [{ budgetSnapshot: { limits: { maxSteps: 4 } } }] },
+      { rows: [{ used: "2" }] },
+    ])
+    const rootScope = {
+      kind: "turn" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1",
+      taskId: "root-1", rootTaskId: "root-1",
+    }
+
+    await expect(enforceRootStepBudget(db as never, rootScope, 2)).resolves.toBeUndefined()
+    expect(db.query).toHaveBeenCalledTimes(2)
+    expect(db.query.mock.calls[0]?.[1]).toEqual(["root-1", "session-1", "turn-1", "user-1"])
+    expect(db.query.mock.calls[1]?.[1]).toEqual(["session-1", "turn-1", "root-1", "user-1"])
+    expect(String(db.query.mock.calls[1]?.[0])).toContain('task."rootTaskId" = $3')
+    expect(String(db.query.mock.calls[1]?.[0])).toContain('session."userId" = $4')
+  })
+
+  it.each([0, 3, 1.5, null, "2"] as const)("rejects invalid requiredSteps %s before querying", async requiredSteps => {
+    const db = client([])
+    const callWithUnknownRequiredSteps = enforceRootStepBudget as unknown as (
+      queryClient: unknown, scope: typeof owner, steps: unknown,
+    ) => Promise<void>
+
+    await expect(callWithUnknownRequiredSteps(db, owner, requiredSteps)).rejects.toThrow("root_step_budget_required_steps_invalid")
+    expect(db.query).not.toHaveBeenCalled()
+  })
+
   it("caps root-wide tool-call creation and lets an idempotent item reach identity validation", async () => {
     const db = client([
       { rows: [] },

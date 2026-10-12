@@ -6,6 +6,7 @@ import { withRootBudgetTenantSnapshot } from "./turn-engine-root-budget-transact
 
 type QueryClient = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
+type RootStepBudgetOwner = Pick<ExecutionOwnerFence, "kind" | "userId" | "sessionId" | "turnId" | "taskId" | "rootTaskId">
 type BudgetMetric = "maxSteps" | "maxToolCalls"
 type UsageBudgetLimit = "maxInputTokens" | "maxOutputTokens" | "maxCostUsd"
 const DEFAULT_ROOT_MAX_STEPS = 32
@@ -27,7 +28,7 @@ export type CurrentRootBudgetObservation = Readonly<{
   budgets?: CurrentRootBudgetMap
 }>
 
-function rootTaskId(owner: ExecutionOwnerFence): string {
+function rootTaskId(owner: RootStepBudgetOwner): string {
   return owner.kind === "turn" ? owner.taskId : owner.rootTaskId
 }
 
@@ -35,12 +36,12 @@ function record(value: unknown): Row {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
 }
 
-async function rootSnapshot(client: QueryClient, owner: ExecutionOwnerFence): Promise<Row> {
+async function rootSnapshot(client: QueryClient, owner: RootStepBudgetOwner): Promise<Row> {
   const result = await ownedRootSnapshot(client, owner)
   return record(result.snapshot)
 }
 
-async function ownedRootSnapshot(client: QueryClient, owner: ExecutionOwnerFence): Promise<{ found: boolean; snapshot: unknown }> {
+async function ownedRootSnapshot(client: QueryClient, owner: RootStepBudgetOwner): Promise<{ found: boolean; snapshot: unknown }> {
   const rootId = rootTaskId(owner)
   const result = await client.query<{ budgetSnapshot: unknown }>(`SELECT root_task."budgetSnapshot"
     FROM "sub_agent_tasks" AS root_task
@@ -119,7 +120,7 @@ async function usageSums(
   return values
 }
 
-async function usageCount(client: QueryClient, owner: ExecutionOwnerFence, metric: "steps" | "tool_calls", strict = false): Promise<number> {
+async function usageCount(client: QueryClient, owner: RootStepBudgetOwner, metric: "steps" | "tool_calls", strict = false): Promise<number> {
   const rootId = rootTaskId(owner)
   const table = metric === "steps" ? `"agent_steps" AS usage_row` : `"agent_items" AS usage_row`
   const typeFilter = metric === "steps" ? "" : ` AND usage_row."type" = 'tool_call'`
@@ -188,12 +189,13 @@ export async function readCurrentRootBudget(client: QueryClient, owner: Executio
     return observation
   })
 }
-export async function enforceRootStepBudget(client: QueryClient, owner: ExecutionOwnerFence): Promise<void> {
+export async function enforceRootStepBudget(client: QueryClient, owner: RootStepBudgetOwner, requiredSteps: 1 | 2 = 1): Promise<void> {
+  if (requiredSteps !== 1 && requiredSteps !== 2) throw new Error("root_step_budget_required_steps_invalid")
   const snapshot = await rootSnapshot(client, owner)
   const limit = rootLimit(rootLimits(snapshot), "maxSteps")
   if (limit === undefined) return
   const used = await usageCount(client, owner, "steps")
-  if (used + 1 > limit) throw new BudgetExceededError("steps", limit, used + 1, used)
+  if (used + requiredSteps > limit) throw new BudgetExceededError("steps", limit, used + requiredSteps, used)
 }
 
 async function enforceRootUsageBudgetForSnapshot(
