@@ -129,7 +129,7 @@ function makeRuntime() {
     }),
   } as unknown as AgentTreeManager
   const wait = {
-    wait: vi.fn(async (input: { targetTaskIds: readonly string[] }) => ({ waitId: "wait-1", status: "ready" as const, deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [...input.targetTaskIds] })),
+    wait: vi.fn<DurableWaitPort["wait"]>(async input => ({ waitId: "wait-1", status: "ready", deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [...input.targetTaskIds] })),
     cancel: vi.fn(async () => undefined),
   } satisfies DurableWaitPort
   const options: CoordinationRuntimeOptions = { manager, store, wait }
@@ -656,12 +656,38 @@ describe("coordination executors", () => {
 
     const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-ready", taskIds: [child.id, large.id], mode: "any", timeoutMs: 5000 }, runtime.options)
     expect(result.tasks).toEqual([
-      { taskId: "child", status: "completed", role: "scout", result: { apiKey: "[REDACTED]", summary: "ready" }, failureReason: null },
-      { taskId: "large", status: "failed", role: "scout", result: expect.objectContaining({ $truncated: true }), failureReason: expect.any(String) },
+      { taskId: "child", status: "completed", role: "scout", attemptCount: 1, maxAttempts: 1, leaseExpiresAt: null, interruptRequestedAt: null, result: { apiKey: "[REDACTED]", summary: "ready" }, failureReason: null },
+      { taskId: "large", status: "failed", role: "scout", attemptCount: 1, maxAttempts: 1, leaseExpiresAt: null, interruptRequestedAt: null, result: expect.objectContaining({ $truncated: true }), failureReason: expect.any(String) },
     ])
     expect(result.tasks[0]).not.toHaveProperty("userId")
     expect(Buffer.byteLength(result.tasks[1]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
     expect(runtime.store.activities).toContain("wait_subagents")
+  })
+
+  it("refreshes timed-out targets and returns their current safe execution state", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "retrying-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/retrying-child", depth: 1,
+      role: "scout", status: "running", attemptCount: 1, maxAttempts: 4,
+      leaseExpiresAt: new Date("2026-10-12T10:10:00.000Z"), interruptRequestedAt: null })
+    runtime.store.tasks.set(child.id, child)
+    runtime.wait.wait = vi.fn(async () => {
+      runtime.store.tasks.set(child.id, makeTask({ ...child, status: "retrying", attemptCount: 2,
+        leaseExpiresAt: new Date("2026-10-12T10:15:30.000Z"),
+        interruptRequestedAt: new Date("2026-10-12T10:12:00.000Z") }))
+      return { waitId: "wait-timeout", status: "timed_out" as const, deadlineAt: "2026-10-12T10:15:00.000Z", matchedTaskIds: [] }
+    })
+
+    const output = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-timeout", taskIds: [child.id], mode: "all", timeoutMs: 1000,
+    }, runtime.options)
+
+    expect(output.status).toBe("timed_out")
+    expect(output.tasks).toEqual([{
+      taskId: child.id, status: "retrying", role: "scout", attemptCount: 2, maxAttempts: 4,
+      leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: "2026-10-12T10:12:00.000Z",
+      result: null, failureReason: null,
+    }])
+    expect(JSON.stringify(output)).not.toContain("leaseOwner")
   })
 
   it("projects the same verifier feedback for agent.list and immediate agent.wait", async () => {
@@ -730,7 +756,7 @@ describe("coordination executors", () => {
     } satisfies DurableWaitPort
 
     const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-pending", taskIds: [child.id], mode: "all", timeoutMs: 5000 }, { ...runtime.options, wait: pendingWait })
-    expect(result.tasks).toEqual([{ taskId: "child", status: "queued", role: "scout", result: { apiKey: "[REDACTED]", summary: "pending" }, failureReason: expect.any(String) }])
+    expect(result.tasks).toEqual([{ taskId: "child", status: "queued", role: "scout", attemptCount: 1, maxAttempts: 1, leaseExpiresAt: null, interruptRequestedAt: null, result: { apiKey: "[REDACTED]", summary: "pending" }, failureReason: expect.any(String) }])
     expect(result.tasks[0]).not.toHaveProperty("sessionId")
     expect(Buffer.byteLength(result.tasks[0]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
   })
