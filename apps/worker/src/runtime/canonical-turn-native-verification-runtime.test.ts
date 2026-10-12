@@ -7,7 +7,13 @@ import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/ta
 import type { DurableWaitPort } from "./tools/coordination-types.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS } from "./turns/turn-execution-types.js"
+import {
+  NATIVE_SEMANTIC_NO_PROGRESS,
+  READ_TASK_GRAPH_DENIAL_CHECKPOINT,
+  RESET_NATIVE_SEMANTIC_PROGRESS,
+  TASK_GRAPH_DENIAL_CHECKPOINT,
+} from "./turns/turn-execution-types.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskGraphDenialCheckpointFromDecision, type TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
@@ -225,6 +231,66 @@ describe("canonical native verification runtime composition", () => {
     expect(gate).toBeDefined()
     gate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
     expect(reset).toHaveBeenCalledOnce()
+  })
+
+  it("reads a fresh owner-bound TaskGraph checkpoint without invoking native verification", async () => {
+    const nowValue = new Date("2026-09-24T12:00:00.000Z")
+    const firstCheckpoint: TaskGraphDenialCheckpoint = {
+      schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision: 4, verificationDigest: "a".repeat(64),
+    }
+    const secondCheckpoint: TaskGraphDenialCheckpoint = {
+      schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: "root-1", graphRevision: 4, verificationDigest: "b".repeat(64),
+    }
+    const checkpoints: Array<TaskGraphDenialCheckpoint | null> = [
+      firstCheckpoint, secondCheckpoint,
+      null,
+    ]
+    let checkpointIndex = 0
+    const rootTasks = {
+      checkCompletion: vi.fn(async (_input: {
+        lease: typeof owner
+        rootTaskId: string
+        now: Date
+        taskGraphVerification: true
+        nativeVerificationPassed: false
+      }) => {
+        const checkpoint = checkpoints[checkpointIndex++] ?? null
+        if (!checkpoint) return null
+        const decision = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Current verification is unresolved." }
+        Object.defineProperty(decision, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
+        return decision
+      }),
+    }
+    const { port, factory } = runtimeFactory(vi.fn(async () => true))
+    const nativeVerification = createCanonicalNativeVerificationRuntime({
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    })
+    const onCandidateStart = vi.fn(), checkChildren = vi.fn()
+    const gate = createCanonicalRootCompletionGate({
+      enabled: true, nativeVerification, onCandidateStart, checkChildren, selectedJobMode: false,
+      readTaskGraphDenialCheckpoint: async () => taskGraphDenialCheckpointFromDecision(
+        await rootTasks.checkCompletion({
+          lease: owner, rootTaskId: owner.rootTaskId, now: nowValue,
+          taskGraphVerification: true, nativeVerificationPassed: false,
+        }), owner.rootTaskId,
+      ),
+    })
+    const read = gate?.[READ_TASK_GRAPH_DENIAL_CHECKPOINT]
+    expect(read).toBeTypeOf("function")
+    if (!read) throw new Error("expected the root gate to expose the fresh checkpoint reader")
+    await expect(read()).resolves.toEqual(firstCheckpoint)
+    await expect(read()).resolves.toEqual(secondCheckpoint)
+    await expect(read()).resolves.toBeNull()
+    expect(rootTasks.checkCompletion).toHaveBeenCalledTimes(3)
+    expect(rootTasks.checkCompletion.mock.calls).toEqual(Array.from({ length: 3 }, () => [{
+      lease: owner, rootTaskId: "root-1", now: nowValue, taskGraphVerification: true, nativeVerificationPassed: false,
+    }]))
+    expect(port.ensureChildren).not.toHaveBeenCalled()
+    expect(port.ensureRootGoal).not.toHaveBeenCalled()
+    expect(onCandidateStart).not.toHaveBeenCalled()
+    expect(checkChildren).not.toHaveBeenCalled()
+    expect(nativeVerification.accepted()).toBe(false)
+    expect(factory).toHaveBeenCalledOnce()
   })
 
   it("checks child completion and carries its summary after native proof passes", async () => {

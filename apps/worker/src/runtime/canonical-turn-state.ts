@@ -16,6 +16,7 @@ import { hydrateNativeVerificationHistoricalAdvisories } from "./subagents/nativ
 import { recoverCanonicalTurnQuestionContext } from "./turns/turn-question-runtime-support.js"
 import { buildCanonicalTurnResumeState } from "./canonical-turn-wait-resume-accounting.js"
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK } from "./turns/completion-recovery-context.js"
+import { restoreTaskGraphDenialProgress, TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE } from "./turns/task-graph-denial-resume.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -131,12 +132,12 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC, "id" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-       `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."correlationId", event."causationId", event."itemId", event."idempotencyKey", event."payload"
+       `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."correlationId", event."causationId", event."itemId", event."idempotencyKey", event_item."type" AS "eventItemType", event_item."stepId" AS "eventItemStepId", event_item."taskId" AS "eventItemTaskId", CASE WHEN event."type" IN ('item.started', 'item.delta', 'item.completed') THEN NULL ELSE event."payload" END AS "payload"
        FROM "agent_events" AS event
        JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4
-       JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4
+       JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 LEFT JOIN "agent_items" AS event_item ON event_item."id" = event."itemId" AND event_item."sessionId" = event."sessionId" AND event_item."turnId" = event."turnId" AND event_item."taskId" = $3
        WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3)
-          AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.completed', 'tool_call.failed', 'step.completed', 'final.rejected', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}')
+          AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.completed', 'tool_call.failed', 'step.completed', 'final.rejected', 'item.started', 'item.delta', 'item.completed', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}', '${TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE}')
        ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
@@ -214,13 +215,18 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       reader: options.durableWaitControlReader, now,
     }) : undefined
     const last = stepsResult.rows[stepsResult.rows.length - 1]
+    const taskGraphDenialProgress = rootTaskId ? restoreTaskGraphDenialProgress({
+      steps: stepsResult.rows, items: itemsResult.rows, events: eventsResult.rows,
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId },
+    }) : undefined
     const ordinalResult = await client.query<Row>(
       `SELECT MAX("ordinal") AS "maxOrdinal" FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [lease.turnId, lease.sessionId],
     )
     const maxOrdinal = ordinalResult.rows[0]?.maxOrdinal === null || ordinalResult.rows[0]?.maxOrdinal === undefined ? null : Number(ordinalResult.rows[0].maxOrdinal)
     const resume = buildCanonicalTurnResumeState({ last, maxOrdinal, steps: stepsResult.rows,
       persistedToolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length, items: itemsResult.rows, events: eventsResult.rows,
-      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: rootTaskId ?? "" }, recoveredWaitControl })
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: rootTaskId ?? "" }, recoveredWaitControl,
+      taskGraphDenialProgress })
     if (resume?.finalEvidenceRecoveryUsed) snapshot = applyCompletionRecovery(snapshot, "resume", FINAL_EVIDENCE_RECOVERY_FEEDBACK)
     validateAgendaResumeFence(restoredAgenda, stepsResult.rows)
     const intent = turnIntent(turn.input)

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { buildCanonicalTurnResumeState } from "./canonical-turn-wait-resume-accounting.js"
 import type { RecoveredArchivedWaitControl } from "./turns/turn-execution-wait.js"
+import type { TaskGraphDenialProgress } from "./turns/turn-execution-types.js"
 
 const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" }
 const recovered = {
@@ -94,14 +95,24 @@ function combinedNativeAndArchivedEvents(): Array<Record<string, unknown>> {
 
 function build(input: {
   steps?: readonly Record<string, unknown>[]; items?: readonly Record<string, unknown>[]; events?: readonly Record<string, unknown>[]
-  persistedToolCallCount?: number; recoveredWaitControl?: RecoveredArchivedWaitControl
+  persistedToolCallCount?: number; recoveredWaitControl?: RecoveredArchivedWaitControl; taskGraphDenialProgress?: TaskGraphDenialProgress
 }) {
   return buildCanonicalTurnResumeState({ last: { ordinal: 4, inputThroughSequence: "8", consumedInputIds: ["input-1"] }, maxOrdinal: 4,
     steps: input.steps ?? [{ ...archivedStep }], items: input.items ?? [call, result], events: input.events ?? archivedEvents,
-    persistedToolCallCount: input.persistedToolCallCount ?? 1, scope, recoveredWaitControl: input.recoveredWaitControl })
+    persistedToolCallCount: input.persistedToolCallCount ?? 1, scope, recoveredWaitControl: input.recoveredWaitControl,
+    taskGraphDenialProgress: input.taskGraphDenialProgress })
 }
 
 describe("canonical resume accounting for archived waits", () => {
+  it("carries restored private denial progress without changing ordinary counters", () => {
+    const progress: TaskGraphDenialProgress = { taskId: scope.rootTaskId, graphRevision: 4, verificationDigest: "a".repeat(64),
+      inputThroughSequence: 8n, consumedInputIds: ["input-1"], count: 2 }
+    const baseline = build({})
+    const resumed = build({ taskGraphDenialProgress: progress })
+    expect(resumed?.taskGraphDenialProgress).toEqual(progress)
+    expect(resumed).toMatchObject({ stepCount: baseline?.stepCount, toolCallCount: baseline?.toolCallCount, usage: baseline?.usage })
+  })
+
   it("leaves exact no-tool native gate waits on persisted usage with current and legacy model receipts", () => {
     const nativeGateStep = { ...archivedStep }
     const expectedUsage = { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }

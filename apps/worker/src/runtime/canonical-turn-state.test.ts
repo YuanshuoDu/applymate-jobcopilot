@@ -6,7 +6,9 @@ import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { contextToModelMessages } from "./turns/turn-engine-messages.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
-import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
+import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./turns/cognitive-agenda-receipt.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE } from "./turns/task-graph-denial-resume.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./turns/task-graph-terminal-assessment.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { InputContentPart } from "@jobcopilot/agent-protocol/input"
 import { StepContextBuilder, type ContextHistoryEntry } from "./context/step-context-builder.js"
@@ -532,6 +534,73 @@ describe("loadCanonicalTurnState", () => {
     }), lease)
     expect(value.resume).toMatchObject({ nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 4n, usage: { inputTokens: 5, outputTokens: 2 } })
     expect(value.snapshot.toolObservations).toEqual([expect.objectContaining({ id: "tool-result:call-1", content: expect.objectContaining({ toolName: "jobs.search" }) })])
+  })
+
+  it("restores only two owner-scoped closed denial checkpoints into private resume state", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" }
+    const digest = "a".repeat(64)
+    const makeDenial = (stepId: string, ordinal: number, offset: number, consumedInputIds: readonly string[] = ["input-3"]) => {
+      const agenda = buildCognitiveActionAgenda({ schemaVersion: "agent-harness.v2", sessionId: scope.sessionId,
+        turnId: scope.turnId, stepId, inputThroughSequence: 3n, consumedInputIds, taskGraphRevision: 4, canonicalJson: "{}", blocks: [] })
+      const receipt = buildCognitiveAgendaReceipt({ sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, stepId, inputThroughSequence: 3n,
+        consumedInputIds, agenda })
+      if (!receipt) throw new Error("denial agenda fixture should be valid")
+      const event = (id: string, type: string, key: string, sequence: number, payload: unknown, causationId: string | null = null) => ({
+        id, type, actor: "orchestrator", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+        taskId: scope.rootTaskId, itemId: null, correlationId: stepId, causationId,
+        idempotencyKey: `turn:${scope.turnId}:event:${key}`, sequence: String(offset + sequence), payload,
+      })
+      const agendaKey = cognitiveAgendaReceiptIdempotencyKey(stepId)
+      if (!agendaKey) throw new Error("denial agenda key should be valid")
+      const agendaEvent = event(`${stepId}-agenda`, COGNITIVE_AGENDA_EVENT_TYPE, agendaKey, 1, receipt)
+      const started = event(`${stepId}-started`, "model.started", `model-started:${stepId}`, 2,
+        { taskId: scope.rootTaskId, provider: "fixture", model: "fixture" }, agendaEvent.id)
+      const completed = event(`${stepId}-model`, "model.completed", `model-completed:${stepId}`, 3,
+        { taskId: scope.rootTaskId, provider: "fixture", model: "fixture", toolCallCount: 0 }, started.id)
+      const usage = event(`${stepId}-usage`, "model.usage", `model-usage:${stepId}`, 4,
+        { taskId: scope.rootTaskId, provider: "fixture", model: "fixture", usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } }, completed.id)
+      const summaryId = `${stepId}-summary`
+      const summaryStart = { ...event(`${stepId}-summary-start`, "item.started", `item-started:${summaryId}`, 5,
+        null, usage.id), itemId: summaryId, eventItemType: "reasoning_summary", eventItemStepId: stepId, eventItemTaskId: scope.rootTaskId }
+      const summaryDelta = { ...event(`${stepId}-summary-delta`, "item.delta", `reasoning-delta:${summaryId}:1`, 6,
+        null, summaryStart.id), itemId: summaryId, correlationId: summaryId,
+        eventItemType: "reasoning_summary", eventItemStepId: stepId, eventItemTaskId: scope.rootTaskId }
+      const summaryCompleted = { ...event(`${stepId}-summary-completed`, "item.completed", `reasoning-completed:${summaryId}:2`, 7,
+        null, summaryDelta.id), itemId: summaryId, correlationId: summaryId,
+        eventItemType: "reasoning_summary", eventItemStepId: stepId, eventItemTaskId: scope.rootTaskId }
+      const checkpoint = event(`${stepId}-checkpoint`, TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE,
+        `task-graph-denial-checkpoint:${stepId}`, 8,
+        { schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: scope.rootTaskId, stepId,
+          graphRevision: 4, verificationDigest: digest }, summaryCompleted.id)
+      const rejected = event(`${stepId}-rejected`, "final.rejected", `final-rejected:${stepId}`, 9,
+        { code: "business_precondition_failed", blocker: "task_graph_verification_unverified",
+          feedback: "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing.",
+          taskId: scope.rootTaskId }, checkpoint.id)
+      const closed = event(`${stepId}-closed`, "step.completed", `step-completed:${stepId}`, 10,
+        { stepId, status: "completed", taskId: scope.rootTaskId }, rejected.id)
+      return {
+        step: { id: stepId, taskId: scope.rootTaskId, ordinal, attempt: 1, status: "completed", errorCode: null,
+          inputThroughSequence: "3", consumedInputIds: [...consumedInputIds], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+        events: [agendaEvent, started, completed, usage, summaryStart, summaryDelta, summaryCompleted, checkpoint, rejected, closed],
+      }
+    }
+    const first = makeDenial("step-1", 0, 0), second = makeDenial("step-2", 1, 10, [])
+    const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: scope.rootTaskId, contextSnapshotId: null,
+      modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [first.step, second.step], events: [...first.events, ...second.events] })
+
+    const state = await loadCanonicalTurnState(fake, lease)
+
+    expect(state.resume?.taskGraphDenialProgress).toEqual({ taskId: scope.rootTaskId, graphRevision: 4,
+      verificationDigest: digest, inputThroughSequence: 3n, consumedInputIds: ["input-3"], count: 2 })
+    expect(JSON.stringify(state.snapshot)).not.toContain(digest)
+    const query = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"')
+      && sql.includes(`'${TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE}'`))?.[0]
+    expect(query).toContain('event_session."userId" AS "userId"')
+    expect(query).toContain('(event."taskId" IS NULL OR event."taskId" = $3)')
+    expect(query).toContain('LEFT JOIN "agent_items" AS event_item')
+    expect(query).toContain('CASE WHEN event."type" IN (\'item.started\', \'item.delta\', \'item.completed\') THEN NULL')
+    expect(query).not.toContain('event_item."content"')
+    expect(query).toContain(`'${COGNITIVE_AGENDA_EVENT_TYPE}'`)
   })
 
   it("loads the durable final-evidence recovery marker into Root resume state", async () => {

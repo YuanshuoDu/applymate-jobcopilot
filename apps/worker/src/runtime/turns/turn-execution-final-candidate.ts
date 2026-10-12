@@ -1,6 +1,6 @@
 import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertCompletionAllowed, steeringReconciliationGateRecovery, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
 import { canEmitTurnCompleted, canPersistFinalResponse, totalTurnUsage, updateExecutionStep } from "./turn-engine-helpers.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
@@ -14,9 +14,10 @@ import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconcili
 import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
+import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 
 export type FinalCandidateOutcome =
-  | Readonly<{ kind: "replan"; feedback: string }>
+  | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
   | Readonly<{ kind: "completed"; result: TurnEngineResult }>
 
@@ -102,7 +103,8 @@ export async function completeTurnCandidate(input: Readonly<{
     await writer.append("final.rejected", step.id, null, { code: verification.code, blocker: verification.blocker, feedback: verification.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
     throw new TurnEngineError(verification.code, verification.blocker)
   }
-  const gate = await assertCompletionAllowed(options, writer, step, signal, now, output.text)
+  const gate = await assertCompletionAllowed(options, writer, step, signal, now, output.text,
+    output.provider !== "recovered" && output.toolCalls.length === 0)
   if (gate && "waitId" in gate) {
     await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason, errorCode: null,
       inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
@@ -116,7 +118,8 @@ export async function completeTurnCandidate(input: Readonly<{
     const distinctStepCount = await finishStep(options, writer, step, output, now, input.onStepClosed, rejection)
     if (distinctStepCount === 3) throw nativeSemanticNoProgressError()
     if (gate[NATIVE_SEMANTIC_NO_PROGRESS] === true) throw nativeSemanticNoProgressError()
-    return { kind: "replan", feedback: gate.feedback }
+    const checkpoint = gate[TASK_GRAPH_DENIAL_CHECKPOINT]
+    return { kind: "replan", feedback: gate.feedback, ...(checkpoint ? { taskGraphDenialCheckpoint: checkpoint } : {}) }
   }
   await finishStep(options, writer, step, output, now, input.onStepClosed)
   const summaryBinding = gate as TaskGraphFinalSummaryBinding | undefined

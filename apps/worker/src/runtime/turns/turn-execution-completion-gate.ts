@@ -1,17 +1,15 @@
 import { TurnEngineError, type TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { parseNativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
 import type pg from "pg"
 import type { TurnLease } from "./lease.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { signalWasInterrupted } from "../interrupt/registry.js"
-import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { loadTaskGraph, type GraphIdentityScope } from "../subagents/task-graph-pg-state.js"
 import { taskGraphItemId, type StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
-import { parseTaskGraphVerificationReport } from "../subagents/task-graph-command-port.js"
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
-import { validateRoleResult } from "../subagents/role-results.js"
+import { buildTaskGraphDenialCheckpoint, gateReport, repairIds, parseTaskGraphDenialCheckpoint, type GateReport, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
@@ -25,9 +23,6 @@ export function completionRecoverySnapshot(snapshot: StepContextSnapshot, stepId
   return applyCompletionRecovery(snapshot, stepId, feedback)
 }
 const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
-const REPAIR_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1"
-type GateCriterion = Readonly<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>
-type GateReport = { status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; criteria: readonly GateCriterion[]; unresolved: Set<string>; digest: string | null }
 type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
 type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
 type GateFeedbackDetail = Readonly<{ nodeOrdinal: number; criterionOrdinal?: number; status: "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode; repairState?: RepairFeedbackState }>
@@ -80,34 +75,14 @@ function row(value: unknown): Record<string, unknown> {
   if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return {} } }
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
 }
-function exactKeys(value: Record<string, unknown>, keys: string): boolean { return Object.keys(value).sort().join(",") === keys }
-function gateReport(node: StoredTaskGraphNode, result: unknown, role: string): GateReport | null {
-  const stored = row(result), raw = stored.taskGraphVerificationReport, expected = node.verification?.criteria.map(item => item.id) ?? []
-  if (node.verificationDisposition !== "typed" || !node.verification || role !== node.verification.role) return null
-  const report = parseTaskGraphVerificationReport(raw, expected)
-  let resultDigest: string | null = null
-  try { if (Object.hasOwn(stored, "structuredResult")) resultDigest = taskGraphResultDigest(validateRoleResult(stored.structuredResult, role)) } catch { return null }
-  if (!report || report.resultDigest !== resultDigest) return null
-  if (report.reasonCode === "repair_target_unresolved") {
-    if (!node.repairOf || report.status !== "unverified" || report.evidenceDigest !== null || !report.criteria.every(item => item.status === "passed")) return null
-    return { status: "unverified", reasonCode: report.reasonCode, criteria: report.criteria, unresolved: new Set(node.repairOf.criterionIds), digest: null }
-  }
-  return { status: report.status, reasonCode: report.reasonCode, criteria: report.criteria, unresolved: new Set(report.criteria.filter(item => item.status !== "passed").map(item => item.criterionId)), digest: report.evidenceDigest }
-}
-function repairIds(node: StoredTaskGraphNode, result: unknown, target: StoredTaskGraphNode, report: GateReport): string[] | null {
-  const relation = node.repairOf, receipt = row(row(result).taskGraphRepairReceipt), ids = relation?.criterionIds
-  if (!relation || !ids?.length || !report.digest || receipt.schemaVersion !== REPAIR_SCHEMA || !exactKeys(receipt, "criterionIds,evidenceDigest,graphRootTaskId,repairNodeKey,repairTaskId,schemaVersion,targetNodeKey,targetTaskId,verifierVersion")
-    || receipt.graphRootTaskId !== relation.graphRootTaskId || receipt.targetNodeKey !== target.key || receipt.targetTaskId !== target.taskId
-    || receipt.repairNodeKey !== node.key || receipt.repairTaskId !== node.taskId || receipt.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION
-    || receipt.evidenceDigest !== report.digest || !Array.isArray(receipt.criterionIds) || JSON.stringify(receipt.criterionIds) !== JSON.stringify(ids)) return null
-  return [...ids]
-}
 /** Rechecks durable reports against the current immutable graph inside the caller's transaction. */
 export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, lease: TurnLease, rootTaskId: string, nativeVerificationPassed = false): Promise<Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>> {
   let graphRevision: number | null = null
+  let denialCheckpoint: TaskGraphDenialCheckpoint | null = null
   const deny = (code?: GateFeedbackCode, details: readonly GateFeedbackDetail[] = []) => {
     const decision = { ok: false as const, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: feedbackText(code, details) }
     if (graphRevision !== null) Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: graphRevision, enumerable: true })
+    if (denialCheckpoint) Object.defineProperty(decision, TASK_GRAPH_DENIAL_CHECKPOINT, { value: denialCheckpoint })
     return decision
   }
   const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId, parentTaskId: rootTaskId }
@@ -118,6 +93,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
       return plans.rows.length ? deny() : { ok: true }
     }
     graphRevision = loaded.item && Number.isSafeInteger(loaded.item.revision) && loaded.item.revision >= 1 ? loaded.item.revision : null
+    denialCheckpoint = buildTaskGraphDenialCheckpoint(loaded, rootTaskId)
     const { nodes } = loaded.snapshot, reports = new Map<string, GateReport>()
     for (const node of nodes) {
       if (node.verificationDisposition === "legacy_unverified" && !(nativeVerificationPassed && node.nativeDelegation)) return deny("legacy_unverified")
@@ -167,10 +143,10 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
     }
     const binding = buildTaskGraphFinalSummaryBinding(loaded)
     return binding ? { ok: true, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } : { ok: true }
-  } catch { graphRevision = null; return deny() }
+  } catch { graphRevision = null; denialCheckpoint = null; return deny() }
 }
 
-export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity } | { waitId: string } | undefined> {
+export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string, allowTaskGraphDenialCheckpoint = false): Promise<TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity; readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint } | { waitId: string } | undefined> {
   if (!options.completionGate) return undefined
   let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
   try {
@@ -212,6 +188,12 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
   }
   const feedback = decision.blocker === STEERING_RECONCILIATION_BLOCKER ? STEERING_RECONCILIATION_FEEDBACK : decision.feedback
   const code = decision.blocker === STEERING_RECONCILIATION_BLOCKER ? STEERING_RECONCILIATION_BLOCKER : "business_precondition_failed"
+  const denialCheckpoint = allowTaskGraphDenialCheckpoint && options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId
+    && decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER && decision.feedback.startsWith(TASK_GRAPH_FEEDBACK)
+    && stopForSemanticNoProgress !== true && rejection === undefined
+    ? parseTaskGraphDenialCheckpoint(Reflect.get(decision, TASK_GRAPH_DENIAL_CHECKPOINT), options.identity.rootTaskId) : null
+  if (denialCheckpoint) await writer.append("agent.plan.denial_checkpoint", step.id, null,
+    { ...denialCheckpoint, stepId: step.id }, `task-graph-denial-checkpoint:${step.id}`)
   await writer.append("final.rejected", step.id, null, { code, blocker: decision.blocker, feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
   if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) {
     const stamped: unknown = Reflect.get(decision, TASK_GRAPH_RECOVERY_REVISION)
@@ -219,6 +201,7 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
     return { feedback: tagTaskGraphRepairRecovery(feedback, revision),
     ...(stopForSemanticNoProgress ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
     ...(rejection ? { [NATIVE_SEMANTIC_REJECTION]: rejection } : {}),
+    ...(denialCheckpoint ? { [TASK_GRAPH_DENIAL_CHECKPOINT]: denialCheckpoint } : {}),
     }
   }
   if (decision.blocker === STEERING_RECONCILIATION_BLOCKER) {
