@@ -55,6 +55,13 @@ const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-w
 const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCallId = "p3-process-restart-follow-up-wait"
 const archivedWaitCallId = "p3-process-archived-wait-call", archivedWaitFinalMarker = "p3-process-archived-wait-resumed"
 const archivedWaitFreshListCallId = "p3-process-archived-wait-fresh-list"
+const SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS = Object.freeze({
+  commandReceived: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_COMMAND_RECEIVED",
+  round1Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_1_ENTERED",
+  artifactVersionReadYieldReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ARTIFACT_VERSION_READ_YIELD_REACHED",
+  round2Entered: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_ROUND_2_ENTERED",
+  readyEmissionReached: "P3_SELECTED_JOB_STOP_REVIEW_PHASE_READY_EMISSION_REACHED",
+})
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
 let selectedJobWorker
@@ -889,6 +896,7 @@ function selectedJobReviewerModel(selected, task, observations) {
     id: "ac6-disposable-pg-selected-job-model", profile: modelProfile(),
     async *stream(request) {
       rounds++
+      if (stopBeforeReview && rounds === 1) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round1Entered)
       if (rounds === 1) {
         observeSelectedJobSourceCanaries(request, selected, 2, observations)
         observations.advertisedTools = request.tools.map(tool => record(tool)?.name).filter(name => typeof name === "string")
@@ -898,10 +906,12 @@ function selectedJobReviewerModel(selected, task, observations) {
         observations.preReadContextHash = hashArtifactContent(preReadContext)
         observations.privateBodyAbsentBeforeRead = !preReadContext.includes(privateBodyCanary)
         if (!observations.privateBodyAbsentBeforeRead) throw new Error("p3_selected_job_reviewer_received_body_before_persisted_read")
+        if (stopBeforeReview) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.artifactVersionReadYieldReached)
         yield { type: "tool_call_completed", callId: readCallId, name: "artifact.version.read", arguments: { artifactRef } }
         yield { type: "completed", finishReason: "tool_calls" }
         return
       }
+      if (stopBeforeReview && rounds === 2) say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.round2Entered)
       if (rounds === 2) {
         const readResult = record(latestToolResult(request, readCallId))
         const readArtifactRef = record(readResult?.artifactRef)
@@ -913,6 +923,7 @@ function selectedJobReviewerModel(selected, task, observations) {
           && hashArtifactContent(readResult.content) === selected.expectedBodyHash
         if (!observations.sawBody) throw new Error("p3_selected_job_reviewer_did_not_receive_artifact_body")
         if (stopBeforeReview) {
+          say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.readyEmissionReached)
           say("P3_SELECTED_JOB_STOP_REVIEW_READY " + task.id)
           await waitForCommand("release-selected-job-review:" + task.id)
         }
@@ -961,6 +972,7 @@ async function startSelectedJobQueueWorker(runtime) {
     if (payload.taskId === selected.stopReviewerTaskId) {
       say("P3_SELECTED_JOB_STOP_REVIEW_QUEUED " + payload.taskId)
       await waitForCommand("start-selected-job-review:" + payload.taskId)
+      say(SELECTED_JOB_STOP_REVIEW_PHASE_MARKERS.commandReceived)
     }
     let leaseIdentity = null
     let childResult = null
