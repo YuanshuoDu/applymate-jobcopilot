@@ -132,6 +132,44 @@ describe("coordination executor support", () => {
     expect(storedReport.dependencyBindings).toHaveLength(1)
   })
 
+  it.each([
+    "missing_final_output",
+    "result_too_large",
+    "result_shape_invalid",
+    "evidence_binding_invalid",
+  ] as const)("preserves the fixed structured-output category in terminal task projections (%s)", category => {
+    const failedResult = {
+      status: "failed",
+      stepCount: 2,
+      toolCallCount: 1,
+      finalItemId: "child-final-item",
+      structuredOutputFailureCategory: category,
+    }
+    const failedTask: CoordinationTaskView = {
+      ...task,
+      status: "failed",
+      failureReason: "invalid_structured_result",
+      result: failedResult,
+    }
+
+    const listed = taskOutput(failedTask)
+    const waited = waitTaskOutput(failedTask)
+    expect(listed.result).toEqual(failedResult)
+    expect(waited).toMatchObject({
+      status: "failed",
+      failureReason: "invalid_structured_result",
+      result: failedResult,
+    })
+    expect(Object.keys(waited.result as Record<string, unknown>).sort()).toEqual([
+      "finalItemId", "status", "stepCount", "structuredOutputFailureCategory", "toolCallCount",
+    ])
+
+    const legacyResult = { status: "failed", stepCount: 1, toolCallCount: 0, finalItemId: "legacy-final-item" }
+    const legacyTask = { ...failedTask, result: legacyResult }
+    expect(taskOutput(legacyTask).result).toEqual(legacyResult)
+    expect(waitTaskOutput(legacyTask).result).toEqual(legacyResult)
+  })
+
   it("omits malformed serialized private TaskGraph results from terminal list and wait output", () => {
     const rawResult = String.raw`  {"taskGraph\u0056erificationReport":{"dependency\u0042indings":[{"taskId":"private-source","digest":"${"c".repeat(64)}"}]}`
     const rawDigest = digestNativeVerificationValue(rawResult)

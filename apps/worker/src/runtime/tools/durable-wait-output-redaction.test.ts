@@ -128,6 +128,55 @@ describe("durable wait output redaction", () => {
     expect(JSON.stringify(safe)).not.toContain("controlTaskId")
   })
 
+  it.each([
+    "missing_final_output",
+    "result_too_large",
+    "result_shape_invalid",
+    "evidence_binding_invalid",
+  ] as const)("preserves only the fixed category with the existing failed child result fields (%s)", category => {
+    const output = validOutput()
+    const failedOutput = {
+      ...output,
+      tasks: output.tasks.map(row => ({
+        ...row,
+        status: "failed",
+        failureReason: "invalid_structured_result",
+        result: {
+          ...row.result,
+          status: "failed",
+          stepCount: 2,
+          toolCallCount: 1,
+          finalItemId: "child-final-item",
+          structuredOutputFailureCategory: category,
+        },
+      })),
+    }
+
+    const safe = redactDurableWaitOutput(failedOutput) as Record<string, unknown>
+    const taskRows = safe.tasks as Array<Record<string, unknown>>
+    const safeRow = taskRows[0]
+    const safeResult = safeRow?.result as Record<string, unknown> | undefined
+    expect(safeRow).toMatchObject({ status: "failed", failureReason: "invalid_structured_result" })
+    expect(safeResult).toMatchObject({
+      status: "failed",
+      stepCount: 2,
+      toolCallCount: 1,
+      finalItemId: "child-final-item",
+      structuredOutputFailureCategory: category,
+    })
+    expect(safeResult && Object.keys(safeResult).sort()).toEqual([
+      "deepString", "description", "finalItemId", "privateData", "status", "stepCount", "structuredOutputFailureCategory", "taskId", "toolCallCount",
+    ])
+
+    const legacyResult = { status: "failed", summary: "Legacy child result" }
+    const legacyOutput = {
+      ...validOutput(),
+      tasks: [{ taskId, status: "failed", role: "scout", result: legacyResult, failureReason: "invalid_structured_result" }],
+    }
+    const legacySafe = redactDurableWaitOutput(legacyOutput) as Record<string, unknown>
+    expect((legacySafe.tasks as Array<Record<string, unknown>>)[0]?.result).toEqual(legacyResult)
+  })
+
   it("fails closed on invalid or contradictory IDs", () => {
     const invalid = [
       { ...validOutput(), waitId: "wait-123" },
