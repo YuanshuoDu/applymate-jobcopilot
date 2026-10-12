@@ -7,6 +7,7 @@ import {
 
 type Row = Record<string, unknown>
 export type PriorHistoryEntry = { readonly id: string; readonly content: unknown; readonly sequence: bigint | null }
+type PriorInputDisposition = "not_consumed" | "cancelled" | "rejected"
 export type CanonicalSteeringMarkerScope = {
   readonly userId: string
   readonly sessionId: string
@@ -38,6 +39,26 @@ export function textContent(value: unknown): string | null {
   return parts.length > 0 ? parts.join("\n").trim() : null
 }
 
+function ownString(row: Row, key: string): string | null {
+  const descriptor = Object.getOwnPropertyDescriptor(row, key)
+  return descriptor && descriptor.enumerable && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : null
+}
+
+function priorInputDisposition(row: Row): { readonly valid: boolean; readonly value?: PriorInputDisposition } {
+  const delivery = ownString(row, "delivery")
+  const status = ownString(row, "status")
+  if ((delivery !== "steer" && delivery !== "follow_up") || !status) return { valid: false }
+  if (status === "accepted" || status === "queued") {
+    if (delivery === "follow_up") return { valid: false }
+    return { valid: true, value: "not_consumed" }
+  }
+  if (status === "consumed") return { valid: true }
+  if (status === "cancelled" || status === "rejected") return { valid: true, value: status }
+  return { valid: false }
+}
+
 export function priorConversation(rows: readonly Row[], currentTurnId: string, throughSequence: bigint | null): PriorHistoryEntry[] {
   return rows.flatMap(row => {
     const id = typeof row.id === "string" ? row.id : null
@@ -50,7 +71,12 @@ export function priorConversation(rows: readonly Row[], currentTurnId: string, t
     } catch { return [] }
     if (throughSequence !== null && sequence !== null && sequence <= throughSequence) return []
     const role = row.historyRole === "assistant" ? "assistant" : "user"
-    return id && turnId !== currentTurnId && text ? [{ id: `history:${role}:${id}`, content: { role, text }, sequence }] : []
+    if (!id || turnId === currentTurnId || !text) return []
+    if (role === "assistant") return [{ id: `history:${role}:${id}`, content: { role, text }, sequence }]
+    const disposition = priorInputDisposition(row)
+    if (!disposition.valid) return []
+    const content = disposition.value ? { role, text, priorInputDisposition: disposition.value } : { role, text }
+    return [{ id: `history:${role}:${id}`, content, sequence }]
   })
 }
 

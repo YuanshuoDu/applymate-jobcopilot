@@ -680,9 +680,9 @@ describe("loadCanonicalTurnState", () => {
     const fake = pool({
       turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       inputs: [
-        { id: "current-input", targetTurnId: "turn-1", content: [{ type: "text", text: "Continue" }], acceptedSequence: "7" },
-        { id: "compacted-input", targetTurnId: "old-turn", content: [{ type: "text", text: "Already summarized" }], acceptedSequence: "3" },
-        { id: "new-input", targetTurnId: "old-turn", content: [{ type: "text", text: "Use Dublin" }], acceptedSequence: "5" },
+        { id: "current-input", targetTurnId: "turn-1", content: [{ type: "text", text: "Continue" }], acceptedSequence: "7", delivery: "follow_up", status: "consumed" },
+        { id: "compacted-input", targetTurnId: "old-turn", content: [{ type: "text", text: "Already summarized" }], acceptedSequence: "3", delivery: "steer", status: "consumed" },
+        { id: "new-input", targetTurnId: "old-turn", content: [{ type: "text", text: "Use Dublin" }], acceptedSequence: "5", delivery: "steer", status: "consumed" },
       ],
       items: [
         { id: "old-agent", turnId: "old-turn", type: "agent_message", status: "completed", content: { content: "Earlier reply" }, historyRole: "assistant", historySequence: "2" },
@@ -704,7 +704,7 @@ describe("loadCanonicalTurnState", () => {
     ])
   })
 
-  it("excludes pending follow-ups from prior history and preserves consumed, cancelled, rejected, and steering inputs", async () => {
+  it("excludes pending follow-ups and annotates only valid prior input lifecycle states", async () => {
     const fake = pool({
       turn: { input: { goal: "Continue with the first follow-up" }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       inputs: [
@@ -715,6 +715,7 @@ describe("loadCanonicalTurnState", () => {
         { id: "cancelled-follow-up", targetTurnId: "old-turn", content: [{ type: "text", text: "Cancelled request" }], acceptedSequence: "5", delivery: "follow_up", status: "cancelled", cancelledAt: new Date("2026-09-09T00:00:00.000Z") },
         { id: "rejected-follow-up", targetTurnId: "old-turn", content: [{ type: "text", text: "Rejected request" }], acceptedSequence: "6", delivery: "follow_up", status: "rejected" },
         { id: "pending-steer", targetTurnId: "old-turn", content: [{ type: "text", text: "Existing steering input" }], acceptedSequence: "7", delivery: "steer", status: "accepted" },
+        { id: "invalid-old-input", targetTurnId: "old-turn", content: [{ type: "text", text: "Must not be an unlabeled instruction" }], acceptedSequence: "8" },
       ],
     })
 
@@ -724,12 +725,13 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.goal).toEqual({ id: "turn-goal:turn-1", content: "Continue with the first follow-up" })
     expect(value.snapshot.steerHistory).toEqual([
       { id: "history:user:consumed-follow-up", content: { role: "user", text: "Earlier consumed request" } },
-      { id: "history:user:cancelled-follow-up", content: { role: "user", text: "Cancelled request" } },
-      { id: "history:user:rejected-follow-up", content: { role: "user", text: "Rejected request" } },
-      { id: "history:user:pending-steer", content: { role: "user", text: "Existing steering input" } },
+      { id: "history:user:cancelled-follow-up", content: { role: "user", text: "Cancelled request", priorInputDisposition: "cancelled" } },
+      { id: "history:user:rejected-follow-up", content: { role: "user", text: "Rejected request", priorInputDisposition: "rejected" } },
+      { id: "history:user:pending-steer", content: { role: "user", text: "Existing steering input", priorInputDisposition: "not_consumed" } },
     ])
     const priorInputQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('AS "historyRole"'))?.[0]
     expect(priorInputQuery).toContain(`AND NOT ("delivery" = 'follow_up' AND "status" IN ('accepted', 'queued')`)
+    expect(priorInputQuery).toContain('"delivery", "status"')
     expect(priorInputQuery).toContain('AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL)')
   })
 
@@ -744,8 +746,8 @@ describe("loadCanonicalTurnState", () => {
     const fake = pool({
       turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: "snapshot-pinned", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       inputs: [
-        { id: "before-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Summarized already" }], acceptedSequence: "3" },
-        { id: "after-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Keep this" }], acceptedSequence: "5" },
+        { id: "before-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Summarized already" }], acceptedSequence: "3", delivery: "steer", status: "consumed" },
+        { id: "after-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Keep this" }], acceptedSequence: "5", delivery: "steer", status: "consumed" },
       ],
       snapshots: [
         { id: "snapshot-pinned", throughSequence: "4", version: 1, content: pinnedContent },
