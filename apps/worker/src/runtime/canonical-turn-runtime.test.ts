@@ -2271,6 +2271,11 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const graphAtSeven = loadedGraphAt(7)
     const graphAtEight = loadedGraphAt(8, true)
+    const historicalFailureCases = [
+      { key: "historical-setup", templateId: "scout", role: "scout", taskType: "job_discovery", failureReason: "selected_job_context_unavailable" },
+      { key: "historical-resume", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" },
+      { key: "historical-output", templateId: "cover_letter_writer", role: "writer", taskType: "cover_letter", failureReason: "invalid_structured_result" },
+    ] as const
     const historicalSnapshot = parseTaskGraphSnapshot({
       schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
       nodes: [{
@@ -2280,7 +2285,11 @@ describe("createCanonicalTurnRuntime", () => {
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
           { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
         ] },
-      }],
+      }, ...historicalFailureCases.map((failure, index) => ({
+        key: failure.key, templateId: failure.templateId, goal: `PRIVATE_${failure.key.toUpperCase()}_GOAL`,
+        successCriteria: [`PRIVATE_${failure.key.toUpperCase()}_CRITERIA`], dependsOn: [], depth: 1,
+        taskId: `${failure.key}-task`, verificationDisposition: "legacy_unverified" as const,
+      }))],
     })
     const historicalReport = {
       verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
@@ -2292,18 +2301,32 @@ describe("createCanonicalTurnRuntime", () => {
       failureReason: "task_graph_verification_failed", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
       result: { finalText: "PRIVATE_HISTORICAL_TEXT", taskGraphVerificationReport: historicalReport },
     }
+    const historicalFailureTasks: GraphTaskRow[] = historicalFailureCases.map(failure => ({
+      id: `${failure.key}-task`, role: failure.role, taskType: failure.taskType, status: "failed",
+      failureReason: failure.failureReason, expectedOutputSchema: {},
+      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_TEXT`, error: `PRIVATE_${failure.key.toUpperCase()}_ERROR` },
+    }))
+    const historicalTasks = [historicalTask, ...historicalFailureTasks]
     const historicalState = taskGraphState(historicalSnapshot, 3,
-      new Map([[historicalTask.id, { status: historicalTask.status, failureReason: historicalTask.failureReason }]]), [])
+      new Map(historicalTasks.map(task => [task.id, { status: task.status, failureReason: task.failureReason }])), [])
     const historicalProjection = projectLoadedRootTaskHistoryGraph({
       rootTaskId: "historical-root-task", snapshot: historicalSnapshot, state: historicalState,
       item: { id: "task-graph:historical-root-task", revision: 3, content: historicalSnapshot, createdAt: new Date(0) },
-      tasks: new Map([[historicalTask.id, historicalTask]]),
+      tasks: new Map(historicalTasks.map(task => [task.id, task])),
     })
     if (!historicalProjection) throw new Error("historical_typed_failure_fixture_invalid")
     expect(historicalProjection.nodeLessons?.[0]).toMatchObject({ nodeOrdinal: 1, criterionFailures: [
       { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
         check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } },
     ] })
+    expect(historicalProjection.nodeLessons?.slice(1)).toEqual([
+      { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+        criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" },
+      { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 3,
+        criterionFailures: [], executionFailureCategory: "resume_state_unavailable" },
+      { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 4,
+        criterionFailures: [], executionFailureCategory: "structured_output_invalid" },
+    ])
     const historicalOutcome: ValidatedRootTaskHistoryOutcome = {
       sourceTurnId: "PRIVATE_HISTORY_SOURCE_TURN", sourceRootTaskId: "PRIVATE_HISTORY_SOURCE_ROOT", terminalSequence: 11n,
       taskGraph: historicalProjection.taskGraph, sourceNodeOrdinals: historicalProjection.sourceNodeOrdinals,
@@ -2621,8 +2644,9 @@ describe("createCanonicalTurnRuntime", () => {
     expect(capturedGraphObservations.every(observation => !Object.hasOwn(observation, "rootTaskId"))).toBe(true)
     expect(expectedFactsByRevision.map(facts => facts.counts.discoveredJobs.knownCount)).toEqual([4, 5])
     expect(currentBlocks.map(block => (block?.content as { revision?: number }).revision)).toEqual([7, 7, 7, 7, 8, 8])
-    const currentGraphNodes = currentBlocks.map(block => (block?.content as { nodes?: Array<{ status?: string; verificationCriterionIds?: unknown; verification?: unknown }> }).nodes ?? [])
+    const currentGraphNodes = currentBlocks.map(block => (block?.content as { nodes?: Array<{ status?: string; verificationCriterionIds?: unknown; verification?: unknown; executionFailureCategory?: unknown }> }).nodes ?? [])
     expect(currentGraphNodes.map(nodes => nodes.map(node => node.status))).toEqual(Array.from({ length: 6 }, () => ["completed", "completed"]))
+    expect(currentGraphNodes.flat().every(node => !Object.hasOwn(node, "executionFailureCategory"))).toBe(true)
     expect(currentGraphNodes.map(nodes => nodes.map(node => node.verificationCriterionIds))).toEqual(Array.from({ length: 6 }, () => [
       currentScoutVerification.criteria.map(item => item.id), currentAnalystVerification.criteria.map(item => item.id),
     ]))
@@ -2635,10 +2659,22 @@ describe("createCanonicalTurnRuntime", () => {
     for (const block of historyBlocks) {
       expect(block).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent",
         content: { kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
-          turns: [{ label: "earlier terminal attempt", nodes: [{ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"],
-            lesson: { ordinalScope: "source_graph_local", nodeOrdinal: 1,
-              criterionFailures: [{ criterionOrdinal: 1, check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] } }] }] } })
+          turns: [{ label: "earlier terminal attempt", nodes: expect.any(Array) }] } })
+      const historyNodes = (block?.content as { turns?: Array<{ nodes?: Array<Record<string, unknown>> }> })?.turns?.[0]?.nodes ?? []
+      expect(historyNodes).toHaveLength(4)
+      expect(historyNodes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"],
+          lesson: expect.objectContaining({ ordinalScope: "source_graph_local", nodeOrdinal: 1,
+            criterionFailures: [expect.objectContaining({ criterionOrdinal: 1, check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } })] }) }),
+        expect.objectContaining({ taskKind: "scout", status: "failed",
+          lesson: expect.objectContaining({ nodeOrdinal: 2, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" }) }),
+        expect.objectContaining({ taskKind: "analyst", status: "failed",
+          lesson: expect.objectContaining({ nodeOrdinal: 3, criterionFailures: [], executionFailureCategory: "resume_state_unavailable" }) }),
+        expect.objectContaining({ taskKind: "writer", status: "failed",
+          lesson: expect.objectContaining({ nodeOrdinal: 4, criterionFailures: [], executionFailureCategory: "structured_output_invalid" }) }),
+      ]))
       expect(JSON.stringify(block?.content)).not.toMatch(/PRIVATE_HISTORY|private-history|evidenceDigest|resultDigest|verificationReport|PASS/)
+      expect(JSON.stringify(block?.content)).not.toMatch(/PRIVATE_HISTORICAL|selected_job_context_unavailable|child_resume_unavailable|invalid_structured_result|PRIVATE_(SETUP|RESUME|OUTPUT)_(TEXT|ERROR)/)
       expect(JSON.stringify(block?.content)).not.toContain("candidate-count")
       expect(JSON.stringify(block?.content)).not.toContain("current-candidate-floor")
     }
@@ -2681,8 +2717,15 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).toContain('"dependencyNodeKey":"scout-node"')
       expect(text).toContain('"ordinalScope":"source_graph_local"')
       expect(text).toContain('"criterionOrdinal":1')
+      expect(text).toContain('"executionFailureCategory":"execution_setup_unavailable"')
+      expect(text).toContain('"executionFailureCategory":"resume_state_unavailable"')
+      expect(text).toContain('"executionFailureCategory":"structured_output_invalid"')
       expect(text).not.toMatch(/PRIVATE_HISTORY|private-history|private\.example|PRIVATE_RESULT_PROSE|PRIVATE_FINAL_TEXT|TASK_GRAPH_FINAL_SUMMARY_BINDING/)
+      expect(text).not.toMatch(/selected_job_context_unavailable|child_resume_unavailable|invalid_structured_result|PRIVATE_HISTORICAL|PRIVATE_HISTORICAL_(SETUP|RESUME|OUTPUT)_(TEXT|ERROR)/)
       expect(text).toContain(index < 4 ? '"knownCount":4' : '"knownCount":5')
+      const currentFailureGuidance = requests[index]!.messages.filter(message => message.role === "system")
+        .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+      expect(currentFailureGuidance).not.toContain("Current child failure-category cues")
     }
     const planningGuidance = requests.map(request => request.messages.filter(message => message.role === "system")
       .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
@@ -2699,6 +2742,7 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).not.toMatch(/PRIVATE_HISTORY|historical-scout|candidate-count|nodeOrdinal|criterionOrdinal|reported count/i)
       expect(text).not.toContain("candidate_count_gte")
       expect(text).not.toContain('"minimum":1')
+      expect(text).not.toMatch(/execution_setup_unavailable|resume_state_unavailable|structured_output_invalid/)
     }
     const visibleTools = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
     expect(visibleTools).toEqual(expect.arrayContaining(["agent.list", "agent.plan"]))

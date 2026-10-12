@@ -83,7 +83,7 @@ function nodeLessons(value: unknown, count: number, ordinals: readonly number[],
     const item = value[index]
     if (item === undefined) continue
     const templateId = record(nodes[index])?.templateId, role = typeof templateId === "string" ? TASK_KINDS.get(templateId) ?? "other" : "other"
-    const lesson = parseRootTaskHistoryNodeLesson(item, role)
+    const lesson = parseRootTaskHistoryNodeLesson(item, role, projectNode(nodes[index])?.status)
     if (!lesson || lesson.nodeOrdinal !== ordinals[index]) return undefined
     byOrdinal[lesson.nodeOrdinal - 1] = lesson
   }

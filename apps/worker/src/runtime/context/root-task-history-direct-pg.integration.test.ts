@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
+import { projectRootTaskHistory } from "./root-task-history.js"
 import type { TurnLease } from "../turns/lease.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -27,6 +28,7 @@ type Source = Readonly<{
   status?: "completed" | "failed" | "interrupted"; rootStatus?: "completed" | "failed" | "interrupted"
   correlationTargetId?: string; stepStatus?: "completed" | "streaming" | "failed"
   stepReceipt?: "missing" | "mismatched" | "duplicate"
+  failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
@@ -42,7 +44,12 @@ const matching: Source[] = [
     finalItemId: `root-history-final-a-${suffix}`, sessionId, userId, goal: objective, criteria, input: { goal: ` ${objective} `, successCriteria: criteria }, startSequence: 1 },
   { turnId: `root-history-source-b-${suffix}`, rootTaskId: `root-history-root-b-${suffix}`, childId: `root-history-child-b-${suffix}`,
     finalItemId: `root-history-final-b-${suffix}`, sessionId, userId, goal: objective, criteria,
-    input: { input: { goal: objective, successCriteria: criteria } }, startSequence: 5, status: "failed" },
+    input: { input: { goal: objective, successCriteria: criteria } }, startSequence: 5, status: "failed",
+    failureChildren: [
+      { key: "setup", templateId: "scout", role: "scout", taskType: "job_discovery", failureReason: "selected_job_context_unavailable" },
+      { key: "resume", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" },
+      { key: "output", templateId: "cover_letter_writer", role: "writer", taskType: "cover_letter", failureReason: "invalid_structured_result" },
+    ] },
 ]
 const mismatched: Source = { turnId: `root-history-mismatch-${suffix}`, rootTaskId: `root-history-mismatch-root-${suffix}`,
   childId: `root-history-mismatch-child-${suffix}`, finalItemId: `root-history-mismatch-final-${suffix}`, sessionId, userId,
@@ -55,14 +62,16 @@ const selectedJob: Source = { turnId: `root-history-selected-job-${suffix}`, roo
   goal: objective, criteria, input: { input: { goal: objective, successCriteria: criteria, selectedJobPreparation: null } }, startSequence: 16 }
 const otherSession: Source = { turnId: `root-history-other-session-turn-${suffix}`, rootTaskId: `root-history-other-session-root-${suffix}`,
   childId: `root-history-other-session-child-${suffix}`, finalItemId: `root-history-other-session-final-${suffix}`,
-  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
+  failureChildren: [{ key: "foreign-session", templateId: "scout", role: "scout", taskType: "job_discovery", failureReason: "selected_job_context_unavailable" }] }
 const foreignScopeCorrelation: Source = { turnId: `root-history-foreign-step-turn-${suffix}`, rootTaskId: `root-history-foreign-step-root-${suffix}`,
   childId: `root-history-foreign-step-child-${suffix}`, finalItemId: `root-history-foreign-step-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 24,
   correlationTargetId: `source-step-${otherSession.turnId}` }
 const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, rootTaskId: `root-history-other-user-root-${suffix}`,
   childId: `root-history-other-user-child-${suffix}`, finalItemId: `root-history-other-user-final-${suffix}`,
-  sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
+  sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
+  failureChildren: [{ key: "foreign-user", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" }] }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
   sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 101 }
@@ -100,8 +109,20 @@ async function insertSession(id: string, owner: string, sequence: number): Promi
 async function insertSource(source: Source): Promise<void> {
   const status = source.status ?? "completed"
   const rootStatus = source.rootStatus ?? status
-  const graph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "scout", templateId: "scout",
-    goal: "Find matching roles", successCriteria: ["Find one role"], dependsOn: [], depth: 1, taskId: source.childId }] })
+  const children = [
+    { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: "scout", status: "completed" as const,
+      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: null },
+    ...(source.failureChildren ?? []).map(failure => ({
+      id: `${source.childId}-${failure.key}`, key: `failure-${failure.key}`, templateId: failure.templateId,
+      role: failure.role, taskType: failure.taskType, status: "failed" as const, failureReason: failure.failureReason,
+      goal: `Inspect ${failure.key} prerequisites`, successCriteria: [`Complete ${failure.key} work`],
+      result: { finalText: `PRIVATE_${failure.key.toUpperCase()}_RESULT` },
+    })),
+  ]
+  const graph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: children.map(child => ({
+    key: child.key, templateId: child.templateId, goal: child.goal, successCriteria: child.successCriteria,
+    dependsOn: [], depth: 1, taskId: child.id,
+  })) })
   await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
     "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
     VALUES ($1, $2, $3, $4, 'user', $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6, NULL, NULL, NULL, 1, CURRENT_TIMESTAMP)`,
@@ -111,11 +132,15 @@ async function insertSource(source: Source): Promise<void> {
     VALUES ($1, $2, $3, $1, NULL, '/source', 0, 'orchestrator', 'root', $4, $5, '[]'::jsonb, $6::jsonb, '[]'::jsonb,
       '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [source.rootTaskId, source.sessionId, source.turnId, rootStatus, source.goal, JSON.stringify(source.criteria)])
-  await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
-    "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
-    VALUES ($1, $2, $3, $4, $4, '/source/scout', 1, 'scout', 'scout', 'completed', 'Find matching roles', '[]'::jsonb, '["Find one role"]'::jsonb,
-      '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP)`,
-  [source.childId, source.sessionId, source.turnId, source.rootTaskId])
+  for (const child of children) {
+    await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+      "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "result", "failureReason",
+      "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, $4, $5, 1, $6, $7, $8, $9, '[]'::jsonb, $10::jsonb, '[]'::jsonb,
+        '{}'::jsonb, '{}'::jsonb, $11::jsonb, $12, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [child.id, source.sessionId, source.turnId, source.rootTaskId, `/source/${child.key}`, child.role, child.taskType, child.status,
+      child.goal, JSON.stringify(child.successCriteria), child.result === null ? null : JSON.stringify(child.result), child.failureReason])
+  }
   await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
       ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
@@ -215,7 +240,22 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
     expect(history.map(item => item.sourceRootTaskId)).toEqual([matching[1]!.rootTaskId, matching[0]!.rootTaskId])
     expect(history.map(item => item.terminalSequence)).toEqual([7n, 4n])
-    expect(history.every(item => item.taskGraph.nodes.length === 1)).toBe(true)
+    expect(history.map(item => item.taskGraph.nodes.length)).toEqual([4, 1])
+    expect(history[0]?.nodeLessons?.map(lesson => lesson?.executionFailureCategory)).toEqual([
+      undefined, "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid",
+    ])
+    expect(history[0]?.nodeLessons?.slice(1).every(lesson => lesson?.criterionFailures.length === 0
+      && lesson.successfulRepairs === undefined)).toBe(true)
+    const projectedHistory = projectRootTaskHistory(history)
+    expect(projectedHistory?.content).toMatchObject({ kind: "root_task_history", advisoryOnly: true, notCurrentEvidence: true })
+    const projectedTurns = (projectedHistory?.content as { turns: Array<{ nodes: readonly unknown[] }> } | undefined)?.turns
+    expect(projectedTurns).toHaveLength(2)
+    expect(projectedTurns?.[0]?.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ lesson: expect.objectContaining({ executionFailureCategory: "execution_setup_unavailable" }) }),
+      expect.objectContaining({ lesson: expect.objectContaining({ executionFailureCategory: "resume_state_unavailable" }) }),
+      expect.objectContaining({ lesson: expect.objectContaining({ executionFailureCategory: "structured_output_invalid" }) }),
+    ]))
+    expect(JSON.stringify(projectedHistory)).not.toMatch(/selected_job_context_unavailable|child_resume_unavailable|invalid_structured_result|PRIVATE_(SETUP|RESUME|OUTPUT|FOREIGN-SESSION|FOREIGN-USER)_RESULT/)
     expect(history.some(item => item.sourceTurnId === matching[0]!.turnId)).toBe(true)
     expect(history.some(item => [mismatched.turnId, changedCriteria.turnId, selectedJob.turnId,
       otherSession.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId, inconsistentTerminal.turnId,

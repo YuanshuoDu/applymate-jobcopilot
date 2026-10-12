@@ -1,5 +1,6 @@
 import { TASK_GRAPH_VERIFICATION_LIMITS, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { parseTaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
+import type { TaskGraphExecutionFailureCategory } from "../subagents/task-graph-failure-category.js"
 
 export type RootTaskHistoryCheckDescriptor =
   | Readonly<{ role: "scout"; kind: "candidate_count_gte"; minimum: number }>
@@ -26,11 +27,15 @@ export type RootTaskHistoryNodeLesson = Readonly<{
   nodeOrdinal: number
   criterionFailures: readonly CriterionFailure[]
   successfulRepairs?: readonly SuccessfulRepair[]
+  executionFailureCategory?: TaskGraphExecutionFailureCategory
 }>
 
 type RootTaskHistoryCheckMatrix = readonly (readonly (RootTaskHistoryCheckDescriptor | undefined)[] | undefined)[]
 
 const MAX_NODES = 8
+const EXECUTION_FAILURE_CATEGORIES: ReadonlySet<string> = new Set([
+  "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid",
+])
 const REASONS = new Set<TaskGraphVerificationReasonCode>([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
   "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",
@@ -70,6 +75,9 @@ function safeArray(value: unknown, maximum: number, allowEmpty: boolean): unknow
 function ordinal(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= MAX_NODES }
 function count(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= TASK_GRAPH_VERIFICATION_LIMITS.maxItems }
 function percent(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= 100 }
+function executionFailureCategory(value: unknown): value is TaskGraphExecutionFailureCategory {
+  return typeof value === "string" && EXECUTION_FAILURE_CATEGORIES.has(value)
+}
 
 /** Reconstructs only the closed public check descriptor; IDs and unknown fields are rejected. */
 function parseRootTaskHistoryCheckDescriptor(value: unknown, expectedRole?: string): RootTaskHistoryCheckDescriptor | undefined {
@@ -132,12 +140,17 @@ export function describeValidatedRootTaskHistoryChecks(snapshotValue: unknown): 
 }
 
 /** Strictly reconstructs the current and legacy privacy-safe lesson shapes. */
-export function parseRootTaskHistoryNodeLesson(value: unknown, expectedRole?: string): RootTaskHistoryNodeLesson | undefined {
+export function parseRootTaskHistoryNodeLesson(value: unknown, expectedRole?: string, expectedStatus?: string): RootTaskHistoryNodeLesson | undefined {
+  const categoryShape = exactDataRecord(value, "advisoryOnly,criterionFailures,executionFailureCategory,nodeOrdinal,notCurrentEvidence,ordinalScope")
   const hasRepairs = exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope,successfulRepairs")
-  const row = hasRepairs ?? exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope")
+  const row = categoryShape ?? hasRepairs ?? exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope")
   if (!row || row.ordinalScope !== "source_graph_local" || row.advisoryOnly !== true || row.notCurrentEvidence !== true || !ordinal(row.nodeOrdinal)) return undefined
+  const hasExecutionFailureCategory = categoryShape !== undefined
+  const category = hasExecutionFailureCategory && executionFailureCategory(row.executionFailureCategory)
+    ? row.executionFailureCategory : undefined
+  if (hasExecutionFailureCategory && (!category || (expectedStatus !== undefined && expectedStatus !== "failed"))) return undefined
   const failures = safeArray(row.criterionFailures, MAX_NODES, true)
-  if (!failures) return undefined
+  if (!failures || hasExecutionFailureCategory && failures.length !== 0) return undefined
   const criterionFailures: CriterionFailure[] = []
   const seenCriteria = new Set<number>()
   for (const failure of failures) {
@@ -165,9 +178,10 @@ export function parseRootTaskHistoryNodeLesson(value: unknown, expectedRole?: st
       successfulRepairs.push({ targetNodeOrdinal: item.targetNodeOrdinal, targetCriterionOrdinals: targets as number[], status: "passed" })
     }
   }
-  if (!criterionFailures.length && !successfulRepairs.length) return undefined
+  if (!criterionFailures.length && !successfulRepairs.length && !category) return undefined
   return { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: row.nodeOrdinal,
-    criterionFailures, ...(successfulRepairs.length ? { successfulRepairs } : {}) }
+    criterionFailures, ...(successfulRepairs.length ? { successfulRepairs } : {}),
+    ...(category ? { executionFailureCategory: category } : {}) }
 }
 
 /** Keeps only links and dependency descriptors whose source nodes survived final selection. */
@@ -196,8 +210,9 @@ export function filterRootTaskHistoryLessonsForEmittedNodes(
     const links = lesson.successfulRepairs?.filter(link => selected.has(link.targetNodeOrdinal)
       && parsed[link.targetNodeOrdinal - 1]?.criterionFailures && link.targetCriterionOrdinals.every(target =>
         parsed[link.targetNodeOrdinal - 1]!.criterionFailures.some(failure => failure.criterionOrdinal === target))) ?? []
-    if (!criterionFailures.length && !links.length) return undefined
+    if (!criterionFailures.length && !links.length && !lesson.executionFailureCategory) return undefined
     return { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-      nodeOrdinal: lesson.nodeOrdinal, criterionFailures, ...(links.length ? { successfulRepairs: links } : {}) }
+      nodeOrdinal: lesson.nodeOrdinal, criterionFailures, ...(links.length ? { successfulRepairs: links } : {}),
+      ...(lesson.executionFailureCategory ? { executionFailureCategory: lesson.executionFailureCategory } : {}) }
   })
 }
