@@ -6,8 +6,7 @@ import {
   type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphProjectionEvidenceKind, type TaskGraphProjectionSource,
   type TaskGraphReadScope, type TaskGraphResultProjection, type TaskGraphScoutProjectionItem,
 } from "./subagents/task-graph-command-port.js"
-import { parseTaskGraphCurrentVerificationMetadata, taskGraphCurrentVerificationMetadataBytes,
-  validateTaskGraphCurrentVerificationGraph } from "./canonical-turn-task-graph-verification-context.js"
+import { parseTaskGraphCurrentVerificationMetadata, taskGraphCurrentVerificationMetadataBytes, validateTaskGraphCurrentVerificationGraph } from "./canonical-turn-task-graph-verification-context.js"
 import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
@@ -15,6 +14,7 @@ import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
 import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
 import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
 import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
+import { projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -189,9 +189,9 @@ function node(value: unknown): TaskGraphCurrentNode {
   const verification = parseTaskGraphCurrentVerificationMetadata(row, templateId, key, taskId)
   if (!verification) throw new Error("task_graph_current_state_invalid:verification")
   const native = nativeGraphNodeFields(row)
-  const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, {
-    hasVerifiedReport: Boolean(verification.verificationReport), isNative: Boolean(native.native || native.nativeResult),
-  })
+  const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, { hasVerifiedReport: Boolean(verification.verificationReport), isNative: Boolean(native.native || native.nativeResult) })
+  const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult ? undefined
+    : projectTaskGraphStructuredFailureCategory(row, { status: row.status, templateId, verification: verification.verification, verificationReport: verification.verificationReport })
   return {
     key, templateId,
     goal: text(row.goal, 1200, "goal", true), successCriteria: stringList(row.successCriteria, 8, 320, "successCriteria"),
@@ -199,7 +199,7 @@ function node(value: unknown): TaskGraphCurrentNode {
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],
     resultSummary: null,
     resultProjection: projection(row.resultProjection),
-    ...verification, ...native, ...(executionFailureCategory ? { executionFailureCategory } : {}),
+    ...verification, ...native, ...(executionFailureCategory ? { executionFailureCategory } : {}), ...(structuredOutputFailureCategory ? { structuredOutputFailureCategory } : {}),
     failureReason: null,
   }
 }
@@ -215,7 +215,7 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
     const item = node(value)
     const bytes = projectionBytes(item.resultProjection!)
     const count = projectionItems(item.resultProjection!)
-    verificationBytes += taskGraphCurrentVerificationMetadataBytes(item)
+    verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1)
     if (verificationBytes > MAX_VERIFICATION_CONTEXT_BYTES) throw new Error("task_graph_current_verification_too_large")
     if (projectedBytes + bytes > MAX_RESULT_PROJECTION_TOTAL_BYTES
       || projectedItems + count > MAX_RESULT_PROJECTION_TOTAL_ITEMS) {
