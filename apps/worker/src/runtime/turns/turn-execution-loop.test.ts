@@ -1504,6 +1504,63 @@ describe("owner-agnostic turn execution loop", () => {
     ])
   })
 
+  it.each([
+    { label: "fresh steering", action: "apply_fresh_steering", blocker: "fresh_steering", steering: true, expected: { activeSteering: 1, newlyObservedSteering: 1 } },
+    { label: "pending input", action: "resolve_pending_input", blocker: "pending_input", pending: true, expected: { pendingInputs: 1 } },
+    { label: "approval wait", action: "await_approval", blocker: "approval", observation: { id: "approval-private", content: { kind: "approval", status: "waiting_for_approval", approvalId: "PRIVATE_APPROVAL_ID" } }, expected: { approvals: 1 } },
+    { label: "child wait", action: "await_children", blocker: "child_wait", observation: { id: "wait-private", content: { kind: "wait_result", status: "waiting", waitId: "PRIVATE_WAIT_ID" } }, expected: { activeWaits: 1 } },
+    { label: "unresolved failure", action: "continue_turn", blocker: "unresolved_failure", observation: { id: "failure-private", content: { kind: "wait_result", status: "failed", failureNarrative: "PRIVATE_FAILURE_NARRATIVE" } }, expected: { unresolved: 1 } },
+  ] as const)("captures the current %s agenda as advisory request context", async scenario => {
+    const root = fixture(identity("turn", "root-1"), undefined, "observation" in scenario && scenario.observation ? [scenario.observation] : [])
+    const baseBuilder = root.options.contextBuilder
+    const dispatched: string[] = []
+    root.options = {
+      ...root.options,
+      contextBuilder: { build: async request => {
+        const built = await baseBuilder.build(request)
+        if ("steering" in scenario && scenario.steering) return { ...built, steeringMarkerControl: {
+          activeInputIds: ["PRIVATE_ACTIVE_STEER_ID"], newlyObservedInputIds: ["PRIVATE_NEW_STEER_ID"], newlyObservedMarkers: [],
+        } }
+        if ("pending" in scenario && scenario.pending) return { ...built, blocks: [...built.blocks, {
+          id: "pending:PRIVATE_PENDING_ID", layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input",
+          content: { inputId: "PRIVATE_PENDING_ID", text: "PRIVATE_USER_TEXT" },
+        }] }
+        return built
+      } },
+      executeTool: async ({ call }) => {
+        dispatched.push(call.toolName)
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: { job: "job-1" }, errorCode: null }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const request = root.requests[0]
+    const frame = request?.messages.find(message => message.role === "user" && message.content.some(part => part.type === "text" && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")))
+    const frameText = frame?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const projectionText = frameText.slice(frameText.indexOf("\n") + 1)
+    const projection = JSON.parse(projectionText) as Record<string, unknown>
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    expect(request?.metadata).toMatchObject({ sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "turn:turn-1:step:0" })
+    expect(frame?.role).toBe("user")
+    expect(projection).toMatchObject({ nextAction: scenario.action, blockedBy: scenario.blocker, signals: scenario.expected })
+    expect(frameText).not.toContain("PRIVATE_")
+    expect(request?.tools).toEqual(root.options.tools)
+    expect(dispatched).toEqual(["jobs.search"])
+  })
+
+  it("keeps agenda context Root-only at actual child request boundaries", async () => {
+    const child = fixture(identity("task", "child-1"))
+    const result = await runTurnExecutionLoop(child.options)
+    const text = child.requests.flatMap(request => request.messages.flatMap(message => message.content))
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(result.status).toBe("completed")
+    expect(child.requests).toHaveLength(2)
+    expect(text).not.toContain("source=cognitive_action_agenda")
+  })
+
   it("fails closed before the provider when the agenda receipt cannot persist", async () => {
     const root = fixture(identity("turn", "root-1"))
     const appendEvent = root.options.store.appendEvent
@@ -1806,12 +1863,18 @@ describe("owner-agnostic turn execution loop", () => {
 
     const result = await runTurnExecutionLoop(root.options)
     const secondRequest = root.requests[1]
+    const agendaFrameText = (request: HarnessModelRequest | undefined) => request?.messages
+      .find(message => message.role === "user" && message.content.some(part => part.type === "text" && part.text.startsWith("[harness request context trust=UNTRUSTED_DATA source=cognitive_action_agenda]")))
+      ?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
     const instruction = secondRequest?.messages.find(message => message.role === "system" && message.content.some(part => part.type === "text" && part.text.includes("Fresh user steering")))
     const instructionText = instruction?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
     const agendas = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload)
 
     expect(result).toMatchObject({ status: "completed", stepCount: 2 })
     expect(refresh).toHaveBeenCalledTimes(2)
+    expect(agendaFrameText(root.requests[0])).toContain('"planRevision":0')
+    expect(agendaFrameText(secondRequest)).toContain('"planRevision":7')
+    expect(agendaFrameText(secondRequest)).toContain('"pendingInputs":1')
     expect(instructionText).toContain("TaskGraph revision is 7")
     expect(instructionText).toContain("agent.plan with expectedRevision 7")
     expect(instructionText).toContain("use only the request-visible agent.ask_user tool")
