@@ -248,7 +248,6 @@ function cancellationDatabase(options: { readonly withCallRow?: boolean; readonl
   }
   return { pool, state: () => database, metrics: () => ({ connections, commits, rollbacks, stepUpdates, eventSequenceUpdates, eventInserts, outboxInserts }) }
 }
-
 describe("native question pause cancellation readback", () => {
   it.each([false, true])("accepts the exact server event chain (result present: %s)", async withResult => {
     const fixture = cancellationEvents(withResult)

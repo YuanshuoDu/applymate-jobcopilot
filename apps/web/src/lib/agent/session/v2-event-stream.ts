@@ -8,7 +8,7 @@ import {
 } from "@jobcopilot/agent-protocol"
 
 import { BoundedStreamBuffer, type StreamFrame } from "./stream-buffer"
-import { redactStreamEventPayload } from "./stream-redaction"
+import { isPrivateNativeVerificationEventType, redactStreamEventPayload } from "./stream-redaction"
 import { createDurablePollWakeup, startAgentEventWakeup, waitForDuration, type AgentEventPubSubFactory } from "./event-wakeup"
 const DEFAULT_DB_POLL_MS = 750
 const DEFAULT_HEARTBEAT_MS = 15_000
@@ -135,6 +135,7 @@ async function durableEventLoop(
       for (const row of rows) {
         const sequence = BigInt(row.sequence)
         if (sequence <= lastSequence) continue
+        if (isPrivateNativeVerificationEventType(row.type)) { lastSequence = sequence; continue }
         const result = buffer.push({ kind: "durable", body: durableFrame(row) })
         if (!result.accepted) {
           buffer.close()
@@ -166,6 +167,7 @@ async function deltaLoop(
       )
       for (const entry of readDeltaEntries(result, options.sessionId)) {
         streamId = entry.streamId
+        if (isPrivateNativeVerificationEventType(entry.envelope.type)) continue
         const itemId = entry.envelope.itemId
         if (!itemId) continue
         const previousRevision = revisions.get(itemId)

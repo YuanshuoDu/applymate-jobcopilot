@@ -25,6 +25,8 @@ function events(startPatch: Record<string, unknown> = {}, answerPatch: Record<st
 function client(itemRows: Record<string, unknown>[] = [item()], eventRows: Record<string, unknown>[] = events(), queryLog: string[] = []) {
   const value = { query: async (sql: string) => {
     queryLog.push(sql)
+    if (sql.includes('SELECT active_turn."createdAt"')) return { rows: [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }] }
+    if (sql.includes('SELECT prior."id"')) return { rows: [] }
     return { rows: sql.includes('FROM "agent_items"') ? itemRows : eventRows }
   } }
   return value as never

@@ -59,7 +59,6 @@ describe("recoverPersistedToolCalls", () => {
     expect(fixture.updates).toEqual([])
     expect(fixture.events).toEqual([])
   })
-
   it("keeps a recoverable ask_user intent pending when its idempotent replay throws", async () => {
     const arguments_ = { question: "Which city?", choices: [{ label: "Berlin", value: "berlin" }] }
     const ask: ToolCallRecovery = { ...pending, action: "replay", stepId: "step-1", callItem: { id: "ask-item", revision: 0 },

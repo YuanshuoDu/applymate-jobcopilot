@@ -53,6 +53,7 @@ describe("agent.ask_user", () => {
     const multibyteLimit = "é".repeat(1_000)
     await expect(tool.execute(root, { question: multibyteLimit })).resolves.toMatchObject({ question: multibyteLimit })
     await expect(tool.execute(root, { question: `${"a".repeat(1_999)}é` })).rejects.toMatchObject({ code: "ask_user_input_invalid" })
+    await expect(tool.execute(root, { question: "é".repeat(1_001) })).rejects.toMatchObject({ code: "ask_user_input_invalid" })
   })
 
   it("enforces choice byte boundaries and rejects duplicate values", async () => {
