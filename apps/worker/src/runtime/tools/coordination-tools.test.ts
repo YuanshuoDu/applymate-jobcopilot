@@ -205,6 +205,9 @@ describe("coordination tool definitions", () => {
       new Date("-000004-02-29T00:00:00.000Z").toISOString(),
       new Date("+275760-09-13T00:00:00.000Z").toISOString(),
       new Date("-271821-04-20T00:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T00:00:00.001Z").toISOString(),
+      new Date("-271821-04-20T12:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T23:59:59.999Z").toISOString(),
     ]
     expect(extendedTimestamps).toEqual([
       "+010000-01-01T00:00:00.000Z",
@@ -213,6 +216,9 @@ describe("coordination tool definitions", () => {
       "-000004-02-29T00:00:00.000Z",
       "+275760-09-13T00:00:00.000Z",
       "-271821-04-20T00:00:00.000Z",
+      "-271821-04-20T00:00:00.001Z",
+      "-271821-04-20T12:00:00.000Z",
+      "-271821-04-20T23:59:59.999Z",
     ])
 
     for (const field of ["leaseExpiresAt", "interruptRequestedAt"] as const) {
@@ -232,8 +238,6 @@ describe("coordination tool definitions", () => {
         "+275760-09-13T00:00:00.001Z",
         "-271822-04-20T00:00:00.000Z",
         "-271821-04-19T23:59:59.999Z",
-        "-271821-04-20T00:00:00.001Z",
-        "-271821-04-20T12:00:00.000Z",
         "2026-02-30T10:15:30.000Z",
         "2026-02-29T10:15:30.000Z",
         "1900-02-29T10:15:30.000Z",
