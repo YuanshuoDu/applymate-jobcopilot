@@ -102,7 +102,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
           freshSteering: options.identity.kind === "turn" && freshSteering,
-          outputSchema: options.outputSchema,
+          outputSchema: options.outputSchema, cognitiveAgendaReceipt: receipt, rootTaskId: options.identity.kind === "turn" ? options.identity.rootTaskId : undefined,
         })
         if (freshSteering) recoveredCandidate = undefined
         let output: ModelStepResult
