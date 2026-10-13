@@ -548,6 +548,15 @@ describe("createGraphTasks", () => {
     expect(insert).toBeGreaterThan(targetLock)
   })
 
+  it("rejects an overlapping in-flight repair before any database write with a fixed code", async () => {
+    const fixture = repairFixture({ priorRepairStatus: "running", mixedBatch: true })
+    await expect(createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds))
+      .rejects.toMatchObject({ code: "task_graph_repair_conflict" })
+    expect(fixture.query).not.toHaveBeenCalled()
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
   it("rejects a criterion already passed by the failed target report", async () => {
     const fixture = repairFixture({ resolved: true })
     await expect(createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds))
@@ -576,6 +585,12 @@ describe("createGraphTasks", () => {
     expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
   })
 
+  it("allows an unsuccessful terminal repair to be retried", async () => {
+    const fixture = repairFixture({ priorRepairStatus: "failed" })
+    const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds)
+    expect(result.created).toMatchObject([{ key: "repair-next", status: "queued" }])
+  })
+
   it("queues a newly planned dependent with the receipt-backed composite while the original row stays failed", async () => {
     const fixture = repairFixture({ priorReceipt: true, scheduleDependent: true })
     const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds)
@@ -596,7 +611,7 @@ const repairVerification = {
     { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
   ],
 } as const
-type RepairFixtureOptions = { resolved?: boolean; targetMissing?: boolean; rootId?: string; priorReceipt?: boolean; scheduleDependent?: boolean; additionalTypedNodes?: number; mixedBatch?: boolean; repairLast?: boolean; ordinaryOnly?: boolean }
+type RepairFixtureOptions = { resolved?: boolean; targetMissing?: boolean; rootId?: string; priorReceipt?: boolean; priorRepairStatus?: TaskGraphState["nodes"][number]["status"]; scheduleDependent?: boolean; additionalTypedNodes?: number; mixedBatch?: boolean; repairLast?: boolean; ordinaryOnly?: boolean }
 function repairFixture(options: RepairFixtureOptions = {}) {
   const relation = { graphRootTaskId: options.rootId ?? "root-1", nodeKey: "target", taskId: "target-1", criterionIds: ["finding-count"] }
   const report = {
@@ -607,13 +622,14 @@ function repairFixture(options: RepairFixtureOptions = {}) {
     ], evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
   }
   const target = { key: "target", templateId: "analyst", goal: "Find evidence", successCriteria: ["find evidence"], dependsOn: [], depth: 1, status: "failed" as const, taskId: "target-1", verificationDisposition: "typed" as const, verification: repairVerification }
-  const priorRepair = { key: "repair-old", templateId: "analyst", goal: "Repair finding", successCriteria: ["repair"], dependsOn: [], depth: 1, status: "completed" as const, taskId: "repair-old-1", verificationDisposition: "typed" as const, verification: analystVerification, repairOf: { ...relation, graphRootTaskId: "root-1" } }
+  const priorRepair = { key: "repair-old", templateId: "analyst", goal: "Repair finding", successCriteria: ["repair"], dependsOn: [], depth: 1, status: options.priorRepairStatus ?? "completed", taskId: "repair-old-1", verificationDisposition: "typed" as const, verification: analystVerification, repairOf: { ...relation, graphRootTaskId: "root-1" } }
   const fillers = Array.from({ length: options.additionalTypedNodes ?? 0 }, (_, index) => ({
     key: `filler-${index}`, templateId: "analyst", goal: "Prior typed work", successCriteria: ["done"], dependsOn: [],
     depth: 1, status: "completed" as const, taskId: `filler-task-${index}`, verificationDisposition: "typed" as const, verification: analystVerification,
   }))
-  const currentNodes = [target, ...fillers, ...(options.priorReceipt ? [priorRepair] : [])]
-  const current: TaskGraphState = { revision: options.priorReceipt ? 2 : 1, nodes: currentNodes, appliedEvents: [], repairSatisfiedNodeKeys: options.priorReceipt ? ["target"] : [] }
+  const hasPriorRepair = options.priorReceipt || options.priorRepairStatus !== undefined
+  const currentNodes = [target, ...fillers, ...(hasPriorRepair ? [priorRepair] : [])]
+  const current: TaskGraphState = { revision: hasPriorRepair ? 2 : 1, nodes: currentNodes, appliedEvents: [], repairSatisfiedNodeKeys: options.priorReceipt ? ["target"] : [] }
   const taskIds = new Map<string, string>(currentNodes.map(node => [node.key, node.taskId!] as const))
   const snapshot = taskGraphSnapshot(current, taskIds)
   const repairNode = { key: "repair-next", templateId: "analyst", goal: "Repair the missing finding", successCriteria: ["Resolve the finding"], dependsOn: [], verification: analystVerification, repairOf: relation }
@@ -653,7 +669,7 @@ function repairFixture(options: RepairFixtureOptions = {}) {
         { id: "target-1", status: "failed", failureReason: "task_graph_verification_failed", role: "analyst", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, result: targetResult, ...input.scope, userId: "user-1" },
         { id: "repair-old-1", status: "completed", failureReason: null, role: "analyst", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, result: priorResult, ...input.scope, userId: "user-1" },
       ], rowCount: 2 }
-      : { rows: [{ id: "repair-old-1", status: "completed", result: priorResult }], rowCount: 1 }
+      : { rows: [{ id: "repair-old-1", status: options.priorRepairStatus ?? "completed", result: options.priorReceipt ? priorResult : { ...priorResult, taskGraphRepairReceipt: undefined } }], rowCount: 1 }
     if (sql.includes('task."failureReason"')) return { rows: options.targetMissing ? [] : [{ id: "target-1", status: "failed", role: "analyst", failureReason: "task_graph_verification_failed", result: { taskGraphVerificationReport: report }, rootTaskId: "root-1", parentTaskId: "root-1", sessionId: "session-1", turnId: "turn-1" }], rowCount: options.targetMissing ? 0 : 1 }
     if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
     if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) return { rows: [{ id: `repair-next-${++insertedChildren}` }], rowCount: 1 }
