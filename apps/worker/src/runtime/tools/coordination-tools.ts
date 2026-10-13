@@ -49,7 +49,6 @@ export const SpawnSubagentInputSchema = Type.Object({
   parentTaskId: Type.Optional(IdSchema),
 }, { additionalProperties: false })
 export type SpawnSubagentInput = Static<typeof SpawnSubagentInputSchema>
-
 const LegacyFollowupInputSchema = Type.Object({
   idempotencyKey: Type.Optional(KeySchema),
   taskId: IdSchema,
@@ -65,7 +64,6 @@ const ReplaceUnstartedFollowupInputSchema = Type.Object({
 }, { additionalProperties: false })
 export const FollowupInputSchema = Type.Union([LegacyFollowupInputSchema, ReplaceUnstartedFollowupInputSchema])
 export type FollowupInput = Static<typeof FollowupInputSchema>
-
 export const SendMessageInputSchema = Type.Object({
   idempotencyKey: KeySchema,
   taskId: IdSchema,
@@ -73,7 +71,6 @@ export const SendMessageInputSchema = Type.Object({
   payload: Type.Unknown(),
 }, { additionalProperties: false })
 export type SendMessageInput = Static<typeof SendMessageInputSchema>
-
 export const WaitSubagentsInputSchema = Type.Object({
   idempotencyKey: KeySchema,
   taskIds: Type.Array(IdSchema, { minItems: 1, maxItems: 50 }),
@@ -106,15 +103,18 @@ const WaitTaskBaseOutputProperties = {
   taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
   failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }
-// Wait-output timestamps use four-digit protocol years from PostgreSQL/JS Dates;
-// signed six-digit extended ISO years are outside this contract and rejected.
+const EXTENDED_YEAR_PATTERN = "\\+(?:01[0-9]{4}|0[2-9][0-9]{4}|1[0-9]{5}|2[0-6][0-9]{4}|27[0-4][0-9]{3}|275[0-6][0-9]{2}|2757[0-5][0-9]|275760)" +
+  "|-(?:00000[1-9]|0000[1-9][0-9]|000[1-9][0-9]{2}|00[1-9][0-9]{3}|0[1-9][0-9]{4}|1[0-9]{5}|2[0-6][0-9]{4}|270[0-9]{3}|271[0-7][0-9]{2}|2718[01][0-9]|27182[01])"
+const CANONICAL_YEAR_PATTERN = "(?:[0-9]{4}|" + EXTENDED_YEAR_PATTERN + ")"
+const LEAP_SUFFIX_PATTERN = "(?:0[48]|[2468][048]|[13579][26])"
+const CENTURY_LEAP_PREFIX_PATTERN = "(?:00|04|08|12|16|20|24|28|32|36|40|44|48|52|56|60|64|68|72|76|80|84|88|92|96)"
+const EXTENDED_LEAP_YEAR_PATTERN = "(?=" + EXTENDED_YEAR_PATTERN + "-)(?:[+-][0-9]{4}" + LEAP_SUFFIX_PATTERN + "|[+-][0-9]{2}" + CENTURY_LEAP_PREFIX_PATTERN + "00)"
+const LEAP_YEAR_PATTERN = "(?:(?:[0-9]{2}" + LEAP_SUFFIX_PATTERN + "|" + CENTURY_LEAP_PREFIX_PATTERN + "00)|" + EXTENDED_LEAP_YEAR_PATTERN + ")"
+const OUT_OF_DATE_RANGE_PATTERN = "(?:\\+275760-(?:10|11|12)-|\\+275760-09-(?:1[4-9]|[23][0-9]|30)T|\\+275760-09-13T(?!00:00:00[.]000Z)|-271821-(?:01|02|03)-|-271821-04-(?:0[1-9]|1[0-9])T)"
 const CANONICAL_UTC_MILLIS_PATTERN = [
-  "^(?:[0-9]{4}-(?:",
-  "(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])",
-  "|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)",
-  "|02-(?:0[1-9]|1[0-9]|2[0-8])",
-  ")|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])",
-  "|(?:00|04|08|12|16|20|24|28|32|36|40|44|48|52|56|60|64|68|72|76|80|84|88|92|96)00)-02-29)",
+  "^(?!" + OUT_OF_DATE_RANGE_PATTERN + ")(?:" + CANONICAL_YEAR_PATTERN + "-(?:",
+  "(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])",
+  ")|" + LEAP_YEAR_PATTERN + "-02-29)",
   "T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{3}Z(?![\\s\\S])",
 ].join("")
 const CanonicalUtcTimestampOrNullSchema = Type.Union([
