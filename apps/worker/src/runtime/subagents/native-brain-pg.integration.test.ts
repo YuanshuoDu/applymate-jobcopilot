@@ -307,6 +307,30 @@ function boundedDiagnosticCount(value: unknown): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 99) : 0
 }
 
+function canonicalNativeBrainFailureDiagnostic(value: unknown) {
+  const source = isRecord(value) ? value : null
+  return {
+    turnStatus: safeDiagnosticEnum(source?.turnStatus, SAFE_TURN_STATUSES),
+    turnErrorCode: safeDiagnosticEnum(source?.turnErrorCode, SAFE_TURN_ERROR_CODES),
+    finalRejectedCount: boundedDiagnosticCount(source?.finalRejectedCount),
+  }
+}
+
+describe("canonical native brain failure diagnostics", () => {
+  it("keeps only closed Turn categories and a bounded final rejection count", () => {
+    const privateText = "private-goal-task-id-receipt-SQL-stack-provider-content"
+    const diagnostic = canonicalNativeBrainFailureDiagnostic({
+      turnStatus: privateText, turnErrorCode: privateText, finalRejectedCount: 10_000,
+      goal: privateText, taskId: privateText, receipt: privateText, query: privateText,
+      stack: privateText, providerContent: privateText,
+    })
+
+    expect(diagnostic).toEqual({ turnStatus: "other", turnErrorCode: "other", finalRejectedCount: 99 })
+    expect(Object.keys(diagnostic).sort()).toEqual(["finalRejectedCount", "turnErrorCode", "turnStatus"])
+    expect(JSON.stringify(diagnostic)).not.toContain(privateText)
+  })
+})
+
 function waitForDatabase<T>(label: string, load: () => Promise<T>, ready: (value: T) => boolean, timeoutMs = 90_000): Promise<T> {
   return new Promise((resolve, reject) => {
     const started = Date.now()
@@ -707,31 +731,6 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         LIMIT 2`, [output.waitId, canonical.userId, canonical.sessionId, canonical.turnId, rootTaskId, callId, JSON.stringify([taskId])])
       return wait.rows.length === 1 ? wait.rows[0]!.status : null
     }
-    const readChildRecoveryDiagnostics = async () => {
-      const taskIds = [...new Set([originalChildTaskId, failedChildTaskId].filter((id): id is string => typeof id === "string"))]
-      if (taskIds.length === 0) return []
-      const rootTaskId = (await pool!.query<{ rootTaskId: string | null }>(
-        `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [canonical.turnId, canonical.sessionId])).rows[0]?.rootTaskId
-      if (!rootTaskId) return []
-      const result = await pool!.query<{
-        phase: string; status: string; attemptCount: number; maxAttempts: number; modelStreamFailure: boolean; failureReason: string | null
-        dispatchPresent: boolean; dispatchPublished: boolean; dispatchAttempts: number | null; dispatchHasError: boolean
-      }>(`SELECT CASE WHEN task."id" = $4 THEN 'original' ELSE 'replacement' END AS "phase",
-          task."status", task."attemptCount", task."maxAttempts",
-          task."failureReason" = 'turn_execution_failed' AS "modelStreamFailure",
-          task."failureReason" AS "failureReason",
-          dispatch."id" IS NOT NULL AS "dispatchPresent", dispatch."publishedAt" IS NOT NULL AS "dispatchPublished",
-          dispatch."attemptCount" AS "dispatchAttempts", dispatch."lastError" IS NOT NULL AS "dispatchHasError"
-        FROM "sub_agent_tasks" AS task
-        LEFT JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = task."sessionId"
-          AND dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
-        WHERE task."id" = ANY($5::text[]) AND task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $3
-        ORDER BY task."createdAt" LIMIT 2`, [canonical.sessionId, canonical.turnId, rootTaskId, originalChildTaskId ?? null, taskIds])
-      return result.rows.map(({ failureReason, ...row }) => ({
-        ...row,
-        failureCategory: failureReason === null ? "none" : failureReason === "turn_execution_failed" ? failureReason : "other",
-      }))
-    }
     const activeChildStatus = (status: string) => status === "queued" || status === "retrying" || status === "running"
     let queuePauseGate: Queue<SubagentJobPayload, unknown, string> | undefined
     let acceptedCandidateReady!: () => void
@@ -994,44 +993,17 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         ORDER BY child."createdAt" LIMIT 1`, [canonical.sessionId, canonical.turnId, childGoal])).rows[0],
       value => value?.turnStatus === "waiting_for_dependency" && value.childStatus === "queued" && value.waitStatus === "waiting")
       await bootstrap.subagents.queue.worker.resume()
-      await Promise.race([acceptedCandidateEntered, delay(90_000).then(() => {
-        return Promise.all([
-          pool!.query<{ turnStatus: string | null; turnErrorCode: string | null; rootStepErrorCode: string | null; finalRejectedCount: number;
-            rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
+      await Promise.race([acceptedCandidateEntered, delay(90_000).then(async () => {
+        const state = (await pool!.query<{ turnStatus: string | null; turnErrorCode: string | null; finalRejectedCount: number }>(
           `SELECT turn."status" AS "turnStatus", turn."error" AS "turnErrorCode",
-             (SELECT step."errorCode" FROM "agent_steps" AS step
-               WHERE step."sessionId" = turn."sessionId" AND step."turnId" = turn."id" AND step."taskId" = turn."rootTaskId"
-               ORDER BY step."ordinal" DESC, step."attempt" DESC LIMIT 1) AS "rootStepErrorCode",
              (SELECT COUNT(*)::int FROM "agent_events" AS rejected
                WHERE rejected."sessionId" = turn."sessionId" AND rejected."turnId" = turn."id"
-                 AND rejected."taskId" = turn."rootTaskId" AND rejected."type" = 'final.rejected') AS "finalRejectedCount",
-             COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal')::int AS "rootControls",
-             COUNT(*) FILTER (WHERE task."result"->'nativeVerificationReport'->>'disposition' = 'failed')::int AS "failedReports",
-             COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal'
-               AND task."expectedOutputSchema"->'target'->>'candidateDigest' = $3)::int AS "rejectedControls",
-             COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal'
-               AND task."expectedOutputSchema"->'target'->>'candidateDigest' = $3
-               AND task."result"->'nativeVerificationReport'->>'disposition' = 'failed')::int AS "rejectedFailedReports"
-           FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task
-             ON task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
-             AND task."role" = 'auditor' AND task."taskType" = 'native_verification'
-           WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $4
-           GROUP BY turn."id", turn."sessionId", turn."rootTaskId", turn."status", turn."error"`,
-          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate), canonical.userId]),
-          readChildRecoveryDiagnostics(),
-        ]).then(([stateResult, childState]) => {
-          const state = stateResult.rows[0] ?? null
-          const rejectedCount = boundedDiagnosticCount(state?.finalRejectedCount)
-          const safeState = state ? {
-            turnStatus: safeDiagnosticEnum(state.turnStatus, SAFE_TURN_STATUSES),
-            turnErrorCode: safeDiagnosticEnum(state.turnErrorCode, SAFE_TURN_ERROR_CODES),
-            rootStepErrorCode: safeDiagnosticEnum(state.rootStepErrorCode, SAFE_TURN_ERROR_CODES),
-            finalRejectedCount: rejectedCount, hasFinalRejected: rejectedCount > 0,
-            rootControls: boundedDiagnosticCount(state.rootControls), failedReports: boundedDiagnosticCount(state.failedReports),
-            rejectedControls: boundedDiagnosticCount(state.rejectedControls), rejectedFailedReports: boundedDiagnosticCount(state.rejectedFailedReports),
-          } : null
-          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(safeState)}; childFixture=${JSON.stringify({ modelRequests: targetChildModelRequests, requestsWithSearch: targetChildRequestsWithSearch, searchCalls: targetChildSearchCalls, providerFailures: targetChildProviderFailures })}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
-        })
+                 AND rejected."taskId" = turn."rootTaskId" AND rejected."type" = 'final.rejected') AS "finalRejectedCount"
+           FROM "agent_turns" AS turn
+           WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3`,
+          [canonical.turnId, canonical.sessionId, canonical.userId])).rows[0]
+        const diagnostic = canonicalNativeBrainFailureDiagnostic(state)
+        throw new Error(`canonical root did not replan to the accepted candidate; persistedState=${JSON.stringify(diagnostic)}`)
       })])
       const { SUBAGENT_QUEUE_NAME } = await import("../../queue/subagent-queue.js")
       queuePauseGate = new Queue<SubagentJobPayload, unknown, string>(SUBAGENT_QUEUE_NAME, {
