@@ -137,7 +137,13 @@ describe("atomic TaskGraph finalization recovery", () => {
     ["a previously used recovery", { resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, finalEvidenceRecoveryUsed: true,
       inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }],
     ["an already-failing business check", { businessChecks: [{ name: "must_find_role", ok: false }] }],
-  ])("keeps evidence-free final rejection terminal for %s", async (_name, patch) => {
+    ["current evidence missing the configured expected evidence", {
+      snapshot: { system: [], profile: [], steerHistory: [],
+        businessRefs: [{ id: "current-role", kind: "job" as const, ownerId: "user-1" }],
+        toolObservations: [] },
+      expectedEvidence: ["expected-role"],
+    }],
+  ])("keeps ineligible evidence rejection terminal for %s", async (_name, patch) => {
     const options = {
       identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
       goal: "Find a role", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
