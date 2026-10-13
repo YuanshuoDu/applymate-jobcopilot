@@ -148,6 +148,11 @@ describe("agent.plan tool executor", () => {
     expect(descriptionTool.description).toContain("Repeat exactly those criteria and checks")
     expect(descriptionTool.description).toContain("omit graphRootTaskId because the server binds the active Root")
     expect(descriptionTool.description).toContain("must not add the target to dependsOn")
+    expect(descriptionTool.description).toContain("eight-node lifetime history cap, separate from active-child concurrency")
+    expect(descriptionTool.description).toContain("task_graph_current.nodeCapacity")
+    expect(descriptionTool.description).toContain("may use the reserve in any node order")
+    expect(descriptionTool.description).toContain("it does not pass a criterion")
+    expect(descriptionTool.description).toContain("do not spend the reserve with agent.spawn or agent.followup")
 
     const { tool: typedTool } = setup(templates)
     const registry = new ToolRegistry([typedTool])

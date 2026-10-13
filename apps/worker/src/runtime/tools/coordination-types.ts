@@ -90,7 +90,12 @@ export type CoordinationActivity = {
 
 /** AH2-025 adapter seam. Its implementation must durably suspend and release the Turn lease. */
 export interface DurableWaitPort {
-  wait(input: {
+  wait(input: DurableWaitInvocation): Promise<DurableWaitResult>
+  cancel?(input: { userId: string; sessionId: string; taskId: string; reason: "interrupted" | "closed" }): Promise<void>
+}
+
+/** Original, schema-validated wait request plus current server-owned execution fences. */
+export type DurableWaitInvocation = {
     userId: string
     sessionId: string
     turnId: string
@@ -101,8 +106,25 @@ export interface DurableWaitPort {
     mode: "any" | "all"
     timeoutMs: number
     idempotencyKey: string
-  }): Promise<DurableWaitResult>
-  cancel?(input: { userId: string; sessionId: string; taskId: string; reason: "interrupted" | "closed" }): Promise<void>
+}
+
+/** A bounded control projection; task details remain in the canonical wait outcome. */
+export type DurableWaitControl = {
+  readonly waitId: string
+  readonly status: "waiting" | "ready" | "timed_out" | "interrupted"
+}
+
+export type DurableWaitControlInvocation = DurableWaitInvocation & {
+  readonly ownerId: string
+  readonly leaseVersion: number
+  readonly now: Date
+}
+
+export type DurableWaitStepAdmission = "fresh_streaming_root" | "restored_inflight_root"
+
+/** Read-only lookup used only when a completed wait result is an archived reference. */
+export interface DurableWaitControlReader {
+  readByInvocation(input: DurableWaitControlInvocation, admission: DurableWaitStepAdmission): Promise<DurableWaitControl | null>
 }
 
 export type DurableWaitResult = {

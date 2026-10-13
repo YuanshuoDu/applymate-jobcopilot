@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
 
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
-import type { TaskGraphReadScope, TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import type { TaskGraphNativeCommandInput, TaskGraphReadScope, TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
@@ -11,6 +11,9 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
 import { transaction } from "./pg-store-persistence.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
+import { loadSelectedJobPreparation, type SelectedJobPreparation } from "../selected-job-preparation.js"
+import type { TurnLease } from "../turns/lease.js"
+import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -116,7 +119,10 @@ function fixture(): Fixture {
   }
 }
 
-function scheduleInput(value: Fixture): TaskGraphScheduleInput {
+function selectedJobId(value: Fixture): string { return `p3-task-graph-selected-job-${value.sessionId}` }
+
+function scheduleInput(value: Fixture, nodeCount = 8, typed = true, preparation?: SelectedJobPreparation): TaskGraphScheduleInput {
+  const templateId = typed ? "analyst" : "cover_letter_writer"
   return {
     scope: {
       userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
@@ -126,16 +132,18 @@ function scheduleInput(value: Fixture): TaskGraphScheduleInput {
     },
     proposal: {
       expectedRevision: 0,
-      nodes: Array.from({ length: 8 }, (_, index) => ({
+      nodes: Array.from({ length: nodeCount }, (_, index) => ({
         key: `task-${index + 1}`,
-        templateId: "analyst",
+        templateId,
         goal: `Complete graph task ${index + 1}`,
         successCriteria: [`Task ${index + 1} completed`],
-        verification: ANALYST_VERIFICATION,
+        ...(typed ? { verification: ANALYST_VERIFICATION } : {}),
         dependsOn: index === 0 ? [] : [`task-${index}`],
       })),
     },
-    templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+    templates: typed
+      ? { analyst: { role: "analyst", taskType: "research", allowedActions: [] } }
+      : taskGraphTemplatesForSelectedJob(preparation),
   }
 }
 
@@ -528,8 +536,25 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     if (failures.length > 0) throw new AggregateError(failures, "TaskGraph PostgreSQL integration cleanup was incomplete")
   })
 
-  it("persists and freshly reads an 8-node depth-8 graph, replays once, and fences foreign scope", async () => {
-    const input = scheduleInput(owner)
+  it("persists and freshly reads an 8-node untyped depth-8 graph, replays once, and fences foreign scope", async () => {
+    const selectedId = selectedJobId(owner)
+    await adminPool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [owner.turnId,
+      JSON.stringify({ selectedJobPreparation: { jobId: selectedId } })])
+    const actionGrant = await adminPool!.query(
+      `UPDATE "sub_agent_tasks" SET "allowedActions" = $4::jsonb
+       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1
+         AND "parentTaskId" IS NULL AND "leaseOwner" = $5 AND "attemptCount" = 1
+         AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`,
+      [owner.rootTaskId, owner.sessionId, owner.turnId, JSON.stringify(["cover_letter.draft"]), owner.parentLeaseOwner],
+    )
+    expect(actionGrant.rowCount).toBe(1)
+    const lease: TurnLease = {
+      turnId: owner.turnId, sessionId: owner.sessionId, userId: owner.userId, ownerId: owner.turnLeaseOwner,
+      leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 60_000),
+    }
+    const preparation = await loadSelectedJobPreparation(commandPool!, lease)
+    if (!preparation || preparation.jobId !== selectedId) throw new Error("selected-job preparation was not owner-validated")
+    const input = scheduleInput(owner, 8, false, preparation)
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, owner.userId))
     const emptyRows = await graphRows(adminPool!, owner)
 
@@ -652,6 +677,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const freshlyRead = await reopened.readCurrent(readScope(owner))
     expect(freshlyRead.revision).toBe(1)
     expect(freshlyRead.nodes).toHaveLength(8)
+    expect(freshlyRead.nodes.every(node => node.verificationCriterionIds === undefined)).toBe(true)
     expect(freshlyRead.nodes[0]).toMatchObject({ key: "task-1", taskId: accepted.nodes[0]!.taskId, status: "queued", readiness: "ready" })
     expect(freshlyRead.nodes[7]).toMatchObject({ key: "task-8", taskId: accepted.nodes[7]!.taskId, dependsOn: ["task-7"], status: "waiting", readiness: "waiting_for_dependencies" })
     const snapshotRow = await adminPool!.query<{ content: unknown }>(
@@ -671,6 +697,122 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     )
     expect(planEvents.rows).toHaveLength(1)
     expect(beforeReplay.item).toEqual([{ id: taskGraphItemId(owner.rootTaskId), revision: 1 }])
+  }, 60_000)
+
+  it("reserves the first typed repair slot across ordinary appends", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const emptyRows = await graphRows(adminPool!, value)
+
+    await expect(command.appendAndSchedule(scheduleInput(value, 8, true))).rejects.toMatchObject({ code: "node_limit" })
+    expect(await graphRows(adminPool!, value)).toEqual(emptyRows)
+    expect(await command.readCurrent(readScope(value))).toMatchObject({ revision: 0, nodes: [] })
+
+    const sevenInput = scheduleInput(value, 7, true)
+    const accepted = await command.appendAndSchedule(sevenInput)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 1 })
+    expect(accepted.nodes).toHaveLength(7)
+    expect(accepted.readyTaskIds).toEqual([accepted.nodes[0]!.taskId])
+    const sevenRows = await graphRows(adminPool!, value)
+
+    const ordinaryAppend: TaskGraphScheduleInput = {
+      ...sevenInput,
+      proposal: {
+        ...sevenInput.proposal,
+        expectedRevision: accepted.revision,
+        nodes: [{
+          key: "ordinary-eighth",
+          templateId: "analyst",
+          goal: "Add another ordinary typed task",
+          successCriteria: ["Return one finding"],
+          verification: ANALYST_VERIFICATION,
+          dependsOn: [],
+        }],
+      },
+    }
+    await expect(command.appendAndSchedule(ordinaryAppend)).rejects.toMatchObject({ code: "node_limit" })
+    expect(await graphRows(adminPool!, value)).toEqual(sevenRows)
+  }, 60_000)
+
+  it("rolls back a native replacement denied by the typed graph reserve", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const nativeSource = await command.appendNativeCoordination!({
+      scope: { ...readScope(value), stepId: value.stepId },
+      request: {
+        kind: "spawn", idempotencyKey: `reserved-native-source-${value.sessionId}`, role: "auditor", taskType: "audit",
+        goal: "Create an eligible queued native source", constraints: ["read only"],
+        successCriteria: ["Record findings"], context: { fixture: "reserved replacement source" },
+      },
+    })
+    expect(nativeSource).toMatchObject({ status: "accepted", child: { role: "auditor", taskType: "audit", status: "queued" } })
+
+    const sixInput = scheduleInput(value, 6, true)
+    const typedAppend: TaskGraphScheduleInput = {
+      ...sixInput, proposal: { ...sixInput.proposal, expectedRevision: nativeSource.graphRevision },
+    }
+    const accepted = await command.appendAndSchedule(typedAppend)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 2 })
+    expect(accepted.nodes).toHaveLength(6)
+    expect(await command.readCurrent(readScope(value))).toMatchObject({ revision: 2, nodes: expect.arrayContaining([
+      expect.objectContaining({ taskId: nativeSource.child.taskId, status: "queued" }),
+    ]) })
+    expect((await command.readCurrent(readScope(value))).nodes.filter(node => node.verificationCriterionIds !== undefined)).toHaveLength(6)
+    const beforeRows = await graphRows(adminPool!, value)
+    const beforeGraph = await command.readCurrent(readScope(value))
+    const beforeGraphItem = await adminPool!.query(
+      `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "type" = 'task_graph'`,
+      [taskGraphItemId(value.rootTaskId), value.sessionId],
+    )
+    const beforeNativeEvents = await adminPool!.query(
+      `SELECT "id", "type", "idempotencyKey", "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "payload"->>'kind' = 'native_command' ORDER BY "id"`,
+      [value.sessionId],
+    )
+    const beforeSequence = await adminPool!.query(
+      `SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [value.sessionId],
+    )
+    const beforeSource = await adminPool!.query(
+      `SELECT "status", "attemptCount", "goal", "startedAt", "leaseOwner", "leaseExpiresAt" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+      [nativeSource.child.taskId, value.sessionId],
+    )
+    const nativeReplacement: TaskGraphNativeCommandInput = {
+      scope: { ...readScope(value), stepId: value.stepId },
+      request: {
+        kind: "followup", idempotencyKey: `reserved-replacement-${value.sessionId}`,
+        sourceTaskId: nativeSource.child.taskId, goal: "Replace the queued native source",
+        mode: "replace_unstarted", expectedRevision: accepted.revision,
+      },
+    }
+    await expect(command.appendNativeCoordination!(nativeReplacement))
+      .rejects.toMatchObject({ code: "native_graph_node_invalid" })
+    expect(await graphRows(adminPool!, value)).toEqual(beforeRows)
+    expect(await command.readCurrent(readScope(value))).toEqual(beforeGraph)
+    expect((await adminPool!.query(
+      `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "type" = 'task_graph'`,
+      [taskGraphItemId(value.rootTaskId), value.sessionId],
+    )).rows).toEqual(beforeGraphItem.rows)
+    expect((await adminPool!.query(
+      `SELECT "id", "type", "idempotencyKey", "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "payload"->>'kind' = 'native_command' ORDER BY "id"`,
+      [value.sessionId],
+    )).rows).toEqual(beforeNativeEvents.rows)
+    expect((await adminPool!.query(
+      `SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [value.sessionId],
+    )).rows).toEqual(beforeSequence.rows)
+    expect((await adminPool!.query(
+      `SELECT "status", "attemptCount", "goal", "startedAt", "leaseOwner", "leaseExpiresAt" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+      [nativeSource.child.taskId, value.sessionId],
+    )).rows).toEqual(beforeSource.rows)
+    const successorRows = await adminPool!.query<{ id: string }>(
+      `SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "context"->'provenance'->>'sourceTaskId' = $2`,
+      [value.sessionId, nativeSource.child.taskId],
+    )
+    expect(successorRows.rows).toEqual([])
   }, 60_000)
 
   it("replays a no-steer revise before ledger preparation and leaves later accepted steer unresolved", async () => {
@@ -698,7 +840,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       id: value.stepId, sequence: agendaSequence, cursor: originalSequence, planRevision: 0, consumedInputIds: [value.originalInputId],
     })
     const callSequence = await nextEventSequence(adminPool!, value)
-    const input = scheduleInput(value)
+    const input = scheduleInput(value, 7, true)
     const operation = { scope: input.scope, decision: "revise" as const, expectedRevision: 0, callId: value.planCallId, rootInputId: value.originalInputId }
     await seedReconciliationToolCall(adminPool!, value, {
       id: value.planCallId, stepId: value.stepId, toolName: "agent.plan", input: input.proposal, sequence: callSequence,
@@ -760,7 +902,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       consumedInputIds: [value.originalInputId, value.firstSteerInputId],
     })
     const planCallSequence = await nextEventSequence(adminPool!, value)
-    const input = scheduleInput(value)
+    const input = scheduleInput(value, 7, true)
     const planOperation = {
       scope: input.scope, decision: "revise" as const, expectedRevision: 0, callId: value.planCallId, rootInputId: value.originalInputId,
     }
@@ -848,7 +990,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     ) WHERE "id" = $1`, [recoveryOwner.rootTaskId])
 
     const input = {
-      ...scheduleInput(recoveryOwner),
+      ...scheduleInput(recoveryOwner, 7, true),
       templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [], maxAttempts: 3 } },
     }
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, recoveryOwner.userId))
@@ -973,7 +1115,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const rollbackOwner = fixture()
     additionalFixtures.push(rollbackOwner)
     await seed(adminPool!, rollbackOwner)
-    const input = scheduleInput(rollbackOwner)
+    const input = scheduleInput(rollbackOwner, 7, true)
     const before = await graphRows(adminPool!, rollbackOwner)
     const sequenceBefore = await adminPool!.query<{ eventSequence: string }>(
       `SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [rollbackOwner.sessionId],
@@ -1015,7 +1157,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const concurrentOwner = fixture()
     additionalFixtures.push(concurrentOwner)
     await seed(adminPool!, concurrentOwner)
-    const input = scheduleInput(concurrentOwner)
+    const input = scheduleInput(concurrentOwner, 7, true)
     const racingPool = new PgPool({ connectionString: databaseUrl!, max: 2 })
     try {
       const command = createPgTaskGraphCommandPort(restrictedTransactionPool(racingPool, roleName, concurrentOwner.userId))

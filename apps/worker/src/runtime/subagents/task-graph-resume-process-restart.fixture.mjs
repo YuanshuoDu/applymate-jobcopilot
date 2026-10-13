@@ -1,14 +1,16 @@
 import { errorMonitor } from "node:events"
-import { Worker } from "bullmq"
+import { Queue, Worker } from "bullmq"
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { loadCanonicalTurnState } from "../canonical-turn-state.ts"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
 import { hashArtifactContent } from "./artifact-adapters.ts"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.ts"
-import { parseSubagentJobPayload } from "./types.ts"
+import { defaultSubagentPolicy, parseSubagentJobPayload } from "./types.ts"
+import { PgSubagentTaskStore } from "./pg-store.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.ts"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.ts"
@@ -51,12 +53,15 @@ const RESTORED_GRAPH_GUARD_MARKERS = new Set([
 const resultMarker = "p3-process-restart-source-result", finalMarker = "p3-process-restart-parent-resumed-after-follow-up"
 const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-wait"
 const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCallId = "p3-process-restart-follow-up-wait"
+const archivedWaitCallId = "p3-process-archived-wait-call", archivedWaitFinalMarker = "p3-process-archived-wait-resumed"
+const archivedWaitFreshListCallId = "p3-process-archived-wait-fresh-list"
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
 let selectedJobWorker
 let sharedRedisModule
 let stdinBuffer = ""
 let initialWaitLineage = null
+let archivedWaitChildProgress = 0
 const queuedCommands = []
 const commandWaiters = new Map()
 process.stdin.setEncoding("utf8")
@@ -69,6 +74,29 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
+const ARCHIVED_WAIT_PROGRESS_PHASES = new Set([
+  "model_stream_entered", "tools_validated", "root_identity_validated", "child_create_started", "child_create_failed",
+  "child_created", "child_claim_started", "child_claim_failed", "child_claimed", "child_finish_started",
+  "child_finish_failed", "child_finished", "child_pending", "wait_call_emitted", "model_stream_failed",
+])
+const ARCHIVED_WAIT_ERROR_KINDS = new Set(["none", "error", "type_error", "range_error", "syntax_error", "non_error"])
+function archivedWaitFailureKind(error) {
+  try {
+    if (error instanceof TypeError) return "type_error"
+    if (error instanceof RangeError) return "range_error"
+    if (error instanceof SyntaxError) return "syntax_error"
+    return error instanceof Error ? "error" : "non_error"
+  } catch {
+    return "non_error"
+  }
+}
+function archivedWaitProgress(phase, progress = 0, errorKind = "none") {
+  const safePhase = ARCHIVED_WAIT_PROGRESS_PHASES.has(phase) ? phase : "other"
+  const safeProgress = Number.isSafeInteger(progress) && progress >= 0 && progress <= 7 ? progress : 0
+  const safeErrorKind = ARCHIVED_WAIT_ERROR_KINDS.has(errorKind)
+    ? errorKind : "other"
+  say("P3_ARCHIVED_WAIT_PROGRESS " + JSON.stringify({ phase: safePhase, progress: safeProgress, errorKind: safeErrorKind }))
+}
 function restoredGraphGuardMarker(error) {
   const message = error instanceof Error ? error.message : ""
   let marker = "other"
@@ -1435,8 +1463,207 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
     },
   })
 }
+async function createArchivedWaitChildren(rootTaskId) {
+  const store = new PgSubagentTaskStore(pool), policy = defaultSubagentPolicy(), taskIds = []
+  for (let index = 0; index < 7; index++) {
+    const childProgress = index + 1
+    archivedWaitChildProgress = childProgress
+    archivedWaitProgress("child_create_started", childProgress)
+    let task
+    try {
+      task = await store.create({
+        userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId, parentTaskId: rootTaskId,
+        role: "auditor", taskType: "research", goal: `Inspect archived wait fixture ${childProgress}`,
+        allowedActions: [], expectedOutputSchema: {}, policy,
+      })
+    } catch (error) {
+      archivedWaitProgress("child_create_failed", childProgress, archivedWaitFailureKind(error))
+      throw error
+    }
+    taskIds.push(task.id)
+    archivedWaitProgress("child_created", childProgress)
+    if (index < 6) {
+      const childOwner = `p3-archived-wait-child-${process.pid}-${index + 1}`
+      archivedWaitProgress("child_claim_started", childProgress)
+      let lease
+      try { lease = await store.claim({ taskId: task.id, sessionId: ids.sessionId, ownerId: childOwner, policy, now: new Date() }) }
+      catch (error) {
+        archivedWaitProgress("child_claim_failed", childProgress, archivedWaitFailureKind(error))
+        throw error
+      }
+      if (!lease) {
+        archivedWaitProgress("child_claim_failed", childProgress, "error")
+        throw new Error("p3_archived_wait_child_claim_missing")
+      }
+      archivedWaitProgress("child_claimed", childProgress)
+      archivedWaitProgress("child_finish_started", childProgress)
+      let status
+      try {
+        status = await store.finish({
+          taskId: task.id, sessionId: ids.sessionId, ownerId: childOwner, attemptCount: lease.attemptCount,
+          status: "completed", result: { summary: `bounded fixture result ${childProgress} ${"x".repeat(1_400)}` }, now: new Date(),
+        })
+      } catch (error) {
+        archivedWaitProgress("child_finish_failed", childProgress, archivedWaitFailureKind(error))
+        throw error
+      }
+      if (status !== "completed") {
+        archivedWaitProgress("child_finish_failed", childProgress, "error")
+        throw new Error("p3_archived_wait_child_finish_missing")
+      }
+      archivedWaitProgress("child_finished", childProgress)
+    } else archivedWaitProgress("child_pending", childProgress)
+  }
+  return taskIds
+}
+async function startArchivedWaitRuntime(workerOwnerId, resume) {
+  let barrierReached = false, rounds = 0
+  return createCanonicalTurnRuntime(pool, {
+    workerId: workerOwnerId,
+    productionFlags: { ...flags(), taskGraphPlanningEnabled: false },
+    authorizeUsage: async () => ({ settle: async () => undefined }),
+    turnEngineStoreFactory(database, terminalGuard) {
+      const base = createPgTurnEngineStore(database, terminalGuard)
+      return new Proxy(base, { get(target, property, receiver) {
+        if (property === "updateStep") return async input => {
+          if (!resume && !barrierReached && input.owner.kind === "turn" && input.owner.turnId === ids.turnId
+            && input.status === "waiting_for_tool") {
+            barrierReached = true
+            say("P3_ARCHIVED_WAIT_STEP_CLOSE_BARRIER")
+            await waitForCommand("release-archived-wait-step-close")
+          }
+          return target.updateStep(input)
+        }
+        const value = Reflect.get(target, property, receiver)
+        return typeof value === "function" ? value.bind(target) : value
+      } })
+    },
+    modelRuntimeFactory() {
+      const adapter = {
+        id: resume ? "p3-archived-wait-resume-model" : "p3-archived-wait-first-model",
+        profile: modelProfile(),
+        async *stream(request) {
+          rounds++
+          if (!resume) archivedWaitProgress("model_stream_entered", rounds)
+          if (!resume) {
+            if (rounds !== 1) throw new Error("p3_archived_wait_unexpected_first_model_round")
+            if (!request.tools.some(tool => record(tool)?.name === "agent.wait")
+              || !request.tools.some(tool => record(tool)?.name === "agent.list")) {
+              throw new Error("p3_archived_wait_fixture_tools_missing")
+            }
+            archivedWaitProgress("tools_validated", rounds)
+            const rootTaskId = record(request?.metadata)?.taskId
+            if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("p3_archived_wait_root_identity_missing")
+            archivedWaitProgress("root_identity_validated", rounds)
+            const taskIds = await createArchivedWaitChildren(rootTaskId)
+            say("P3_ARCHIVED_WAIT_TASKS_CREATED " + JSON.stringify({ rootTaskId, taskIds }))
+            archivedWaitProgress("wait_call_emitted", taskIds.length)
+            yield toolCall(archivedWaitCallId, "agent.wait", {
+              idempotencyKey: `p3-process-archived-wait:${ids.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
+            })
+            yield toolCall("p3-process-archived-wait-unexecuted-tail", "agent.list", { includeTerminal: true })
+            yield { type: "usage", inputTokens: 23, outputTokens: 11, estimatedCostUsd: 0.004 }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          const expected = Array.isArray(ids.taskIds) ? ids.taskIds : []
+          if (expected.length !== 7 || expected.some(taskId => typeof taskId !== "string" || !taskId)
+            || new Set(expected).size !== expected.length || typeof ids.waitId !== "string" || !ids.waitId) {
+            throw new Error("p3_archived_wait_fixture_resume_identity_invalid")
+          }
+          const outcome = waitOutcomeFromRequest(request, value => value.waitId === ids.waitId && value.status === "ready"
+            && Array.isArray(value.targetTaskIds) && value.targetTaskIds.length === expected.length
+            && expected.every(taskId => value.targetTaskIds.includes(taskId))
+            && Array.isArray(value.matchedTaskIds) && value.matchedTaskIds.length === expected.length
+            && expected.every(taskId => value.matchedTaskIds.includes(taskId))
+            && Array.isArray(value.tasks) && value.tasks.length === expected.length
+            && value.tasks.every(task => record(task)?.status === "completed"))
+          say("P3_ARCHIVED_WAIT_READY_OUTCOME_SEEN " + JSON.stringify({ status: outcome.status, targetCount: expected.length, matchedCount: outcome.matchedTaskIds.length }))
+          if (rounds === 1) {
+            if (!request.tools.some(tool => record(tool)?.name === "agent.list")) throw new Error("p3_archived_wait_fresh_list_tool_missing")
+            yield toolCall(archivedWaitFreshListCallId, "agent.list", {})
+            yield { type: "usage", inputTokens: 5, outputTokens: 2, estimatedCostUsd: 0.0002 }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (rounds !== 2) throw new Error("p3_archived_wait_unexpected_resume_model_round")
+          const listResults = request.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+            .filter(part => part.type === "tool_result" && part.toolUseId === archivedWaitFreshListCallId)
+          if (listResults.length !== 1 || typeof listResults[0]?.content !== "string") {
+            throw new Error("p3_archived_wait_fresh_list_result_missing")
+          }
+          let listed
+          try { listed = record(JSON.parse(listResults[0].content)) } catch { listed = null }
+          if (!listed || !Array.isArray(listed.tasks) || listed.tasks.length !== 0) {
+            throw new Error("p3_archived_wait_fresh_list_result_invalid")
+          }
+          yield { type: "text_delta", text: archivedWaitFinalMarker }
+          yield { type: "usage", inputTokens: 9, outputTokens: 4, estimatedCostUsd: 0.001 }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }
+      return {
+        adapter: resume ? adapter : captureModelStreamFailure(adapter, error => {
+          archivedWaitProgress("model_stream_failed", archivedWaitChildProgress, archivedWaitFailureKind(error))
+        }),
+        registry: {}, candidates: [],
+      }
+    },
+  })
+}
 async function waitForStop() {
   await waitForCommand("shutdown"); process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
+}
+function pausedArchivedWaitSubagentQueueFactory(queueName, connection, pollingOptions) {
+  return options => {
+    const queue = options.queue ?? new Queue(queueName, { connection, skipVersionCheck: true })
+    const worker = new Worker(queueName, async () => {
+      throw new Error("p3_archived_wait_fixture_child_must_not_run")
+    }, { connection, skipVersionCheck: true, ...pollingOptions(), concurrency: 8, autorun: false })
+    return { queue, worker, async close() { await worker.close(); if (!options.queue) await queue.close() } }
+  }
+}
+async function runArchivedWaitFirstWorker() {
+  const ownerId = `p3-archived-wait-worker-${process.pid}`, runtime = await startArchivedWaitRuntime(ownerId, false)
+  const [{ createProductionWorkerBootstrap }, { SUBAGENT_QUEUE_NAME }, { redisConnection }, { workerPollingOptions }] = await Promise.all([
+    import("../../queue/production-bootstrap.ts"), import("../../queue/subagent-queue.ts"),
+    import("../../redis.ts"), import("../../queue/worker-polling-options.ts"),
+  ])
+  bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
+    waitResolver: { intervalMs: 10, ownerId: `p3-archived-wait-resolver-${process.pid}` },
+    subagents: { intervalMs: 10, queueFactory: pausedArchivedWaitSubagentQueueFactory(SUBAGENT_QUEUE_NAME, redisConnection, workerPollingOptions),
+      async execute() { throw new Error("p3_archived_wait_fixture_child_must_not_run") } } })
+  const activated = await pool.query(`UPDATE "agent_turns" SET "status" = 'queued', "completedAt" = NULL,
+      "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting_for_user'`, [ids.turnId, ids.sessionId, ids.userId])
+  if (activated.rowCount !== 1) throw new Error("p3_archived_wait_turn_not_parked")
+  const { enqueueTurn } = await import("../turns/turn-queue.ts")
+  await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
+  say("P3_ARCHIVED_WAIT_FIRST_WORKER_READY " + ownerId)
+  await waitForStop()
+}
+async function runArchivedWaitResumeWorker() {
+  const ownerId = `p3-archived-wait-resume-worker-${process.pid}`, runtime = await startArchivedWaitRuntime(ownerId, true)
+  const [{ createProductionWorkerBootstrap }, { SUBAGENT_QUEUE_NAME }, { redisConnection }, { workerPollingOptions }] = await Promise.all([
+    import("../../queue/production-bootstrap.ts"), import("../../queue/subagent-queue.ts"),
+    import("../../redis.ts"), import("../../queue/worker-polling-options.ts"),
+  ])
+  bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
+    waitResolver: { intervalMs: 10, ownerId: `p3-archived-wait-resolver-${process.pid}` },
+    subagents: { intervalMs: 10, queueFactory: pausedArchivedWaitSubagentQueueFactory(SUBAGENT_QUEUE_NAME, redisConnection, workerPollingOptions),
+      async execute() { throw new Error("p3_archived_wait_fixture_child_must_not_run") } } })
+  say("P3_ARCHIVED_WAIT_RESUME_WORKER_READY " + ownerId)
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    const status = await pool.query(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [ids.turnId, ids.sessionId, ids.userId])
+    if (status.rows[0]?.status === "completed") {
+      say("P3_ARCHIVED_WAIT_TURN_COMPLETED")
+      break
+    }
+    await sleep(20)
+  }
+  await waitForStop()
 }
 async function runFirstWorker() {
   say("P3_FIRST_WORKER_START_RUNTIME_BEGIN")
@@ -1741,13 +1968,16 @@ try {
     say("P3_PRIVATE_FIXTURE_GUARD_OK")
     process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
   }
-  else if (mode === "park-parent" || mode === "resume-parent" || mode === "park-discovery" || mode === "resume-discovery") {
+  else if (mode === "park-parent" || mode === "resume-parent" || mode === "park-discovery" || mode === "resume-discovery"
+    || mode === "crash-archived-wait" || mode === "resume-archived-wait") {
     assertDisposableServiceUrls()
     await loadSharedRedisModule()
     if (mode === "park-parent") await runFirstWorker()
     else if (mode === "resume-parent") await runSecondWorker()
     else if (mode === "park-discovery") await runDiscoveryFirstWorker()
-    else await runDiscoverySecondWorker()
+    else if (mode === "resume-discovery") await runDiscoverySecondWorker()
+    else if (mode === "crash-archived-wait") await runArchivedWaitFirstWorker()
+    else await runArchivedWaitResumeWorker()
   }
   else throw new Error("p3_unknown_process_restart_mode")
 } catch (error) {

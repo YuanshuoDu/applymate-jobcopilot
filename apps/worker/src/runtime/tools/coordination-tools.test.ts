@@ -145,6 +145,16 @@ describe("coordination tool definitions", () => {
     expect(listDescription).toContain("stale or unavailable, refresh current state")
     expect(listDescription).toContain("Never invent offsets, silently switch modes")
     expect(listDescription).toContain("verification proof")
+    const spawnDescription = registry.resolve("agent.spawn", "1").description
+    const followupDescription = registry.resolve("agent.followup", "1").description
+    expect(spawnDescription).toContain("eight-node lifetime cap separate from active-child concurrency")
+    expect(spawnDescription).toContain("task_graph_current.nodeCapacity")
+    expect(spawnDescription).toContain("nodeCount, maxNodes, remaining, ordinaryRemaining, reserveActive, and repairRecorded")
+    expect(spawnDescription).toContain("leave the final slot for one exact failed-criterion repair")
+    expect(spawnDescription).toContain("An accepted repair sets repairRecorded and consumes the reserve")
+    expect(followupDescription).toContain("replacement retains its canceled source and appends its successor")
+    expect(followupDescription).toContain("An accepted repair relation consumes the one reserve even if queued or failed")
+    expect(followupDescription).toContain("does not make its target successful or guarantee another retry")
     expect(registry.resolve("agent.send", "1").execute).toBe(registry.resolve("send_message", "1").execute)
     expect(registry.resolve("agent.spawn", "1").execute).toBe(registry.resolve("spawn_subagent", "1").execute)
     expect(registry.resolve("agent.wait", "1").execute).toBe(registry.resolve("wait_subagents", "1").execute)

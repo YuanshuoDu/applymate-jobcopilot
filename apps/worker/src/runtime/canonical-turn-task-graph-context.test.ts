@@ -125,7 +125,11 @@ describe("TaskGraph turn observation", () => {
     expect(result.taskGraphRevision).toBe(3)
     expect(result.toolObservations).toEqual([
       { id: "existing", content: { kept: true } },
-      { id: "task-graph-current", content: { kind: "task_graph_current", revision: 3, nodes: [{ ...state.nodes[0]!, resultSummary: null, failureReason: null }] } },
+      { id: "task-graph-current", content: {
+        kind: "task_graph_current", revision: 3,
+        nodes: [{ ...state.nodes[0]!, resultSummary: null, failureReason: null }],
+        nodeCapacity: { nodeCount: 1, maxNodes: 8, remaining: 7, ordinaryRemaining: 6, reserveActive: true, repairRecorded: false },
+      } },
     ])
     const encoded = JSON.stringify(result.toolObservations.at(-1)?.content)
     expect(encoded).not.toContain("Alice Example")
@@ -136,7 +140,25 @@ describe("TaskGraph turn observation", () => {
     const result = mergeTaskGraphCurrentObservation({ ...snapshot(), taskGraphRevision: 8 }, { revision: 0, nodes: [] })
 
     expect(result.taskGraphRevision).toBe(0)
-    expect(result.toolObservations.at(-1)?.content).toEqual({ kind: "task_graph_current", revision: 0, nodes: [] })
+    expect(result.toolObservations.at(-1)?.content).toEqual({
+      kind: "task_graph_current", revision: 0, nodes: [],
+      nodeCapacity: { nodeCount: 0, maxNodes: 8, remaining: 8, ordinaryRemaining: 8, reserveActive: false, repairRecorded: false },
+    })
+  })
+
+  it("projects only server-derived numeric capacity and ignores a caller-supplied field", () => {
+    const result = mergeTaskGraphCurrentObservation(snapshot(), {
+      ...state,
+      nodeCapacity: { nodeCount: 8, maxNodes: 8, remaining: 0, ordinaryRemaining: 0, reserveActive: false, repairRecorded: true },
+    } as unknown as TaskGraphCurrentState)
+    const observation = result.toolObservations.at(-1)?.content as Record<string, unknown>
+    const capacity = observation.nodeCapacity as Record<string, unknown>
+
+    expect(capacity).toEqual({ nodeCount: 1, maxNodes: 8, remaining: 7, ordinaryRemaining: 6, reserveActive: true, repairRecorded: false })
+    expect(Object.keys(capacity).sort()).toEqual([
+      "maxNodes", "nodeCount", "ordinaryRemaining", "remaining", "repairRecorded", "reserveActive",
+    ])
+    expect(JSON.stringify(capacity)).not.toContain("child-1")
   })
 
   it("retires stale ordinal recovery after a trusted refresh and keeps unrelated seeds", () => {

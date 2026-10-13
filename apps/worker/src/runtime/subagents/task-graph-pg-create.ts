@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
+import { taskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
 import { createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
@@ -50,6 +51,14 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   }
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
+  const capacity = taskGraphNodeCapacity({
+    nodeCount: current.nodes.length,
+    hasTypedVerification: appended.state.nodes.some(node => (node.verification?.criteria.length ?? 0) > 0),
+    repairRecorded: appended.state.nodes.some(node => node.repairOf !== undefined),
+  })
+  if (!capacity || input.proposal.nodes.length > capacity.ordinaryRemaining) {
+    throw Object.assign(new Error("TaskGraph node limit exceeded"), { code: "node_limit" })
+  }
   const existingIds = new Map(priorTaskIds)
   const previewTaskIds = new Map(existingIds)
   input.proposal.nodes.forEach((node, index) => previewTaskIds.set(node.key, `subagent-${String(index).padStart(36, "0")}`))
