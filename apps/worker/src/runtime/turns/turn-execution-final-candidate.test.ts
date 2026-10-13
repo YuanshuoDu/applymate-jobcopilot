@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
-import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { completeTurnCandidate, persistedFinalCandidate } from "./turn-execution-final-candidate.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
@@ -95,5 +95,70 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(recorded.terminal.finalContent.final.response).toBe(candidate)
     expect(recorded.terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
     expect(JSON.stringify(recorded)).not.toContain("task_graph_final_summary_binding")
+  })
+
+  it("replans once for an evidence-free Root final and closes its Step with usage", async () => {
+    const updateStep = vi.fn(async () => undefined), appended: Array<{ type: string; payload: unknown; key?: string }> = []
+    const append = vi.fn(async (type: string, _stepId: string, _itemId: string | null, payload: unknown, key?: string) => {
+      appended.push({ type, payload, key }); return { id: `event-${appended.length}` }
+    })
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+    const options = {
+      identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
+      goal: "Find a role", snapshot, tools: [{ name: "jobs.search", version: "1" }], budget: { maxSteps: 3 },
+      store: { updateStep }, idFactory: (value: string) => value,
+    } as unknown as TurnExecutionOptions
+    const onStepClosed = vi.fn()
+    const outcome = await completeTurnCandidate({
+      options, writer: { append } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-root-1", ordinal: 0 },
+      output: { text: "I found a role.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop",
+        usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, continuation: null } satisfies ModelStepResult,
+      snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 },
+      signal: new AbortController().signal, now: () => new Date("2026-10-11T10:00:00.000Z"), onStepClosed,
+    })
+
+    expect(outcome).toEqual({ kind: "replan", feedback: FINAL_EVIDENCE_RECOVERY_FEEDBACK })
+    expect(append).toHaveBeenCalledTimes(2)
+    expect(appended[0]).toEqual({ type: "final.rejected", payload: { code: "evidence_missing",
+      blocker: "No verifiable evidence is attached to the candidate final",
+      feedback: "Attach verified business or tool evidence before claiming completion", taskId: "root-1" },
+      key: "final-rejected:step-root-1:evidence-recovery-once" })
+    expect(appended[1]?.type).toBe("step.completed")
+    expect(updateStep).toHaveBeenCalledWith(expect.objectContaining({ status: "completed", finishReason: "stop", errorCode: null,
+      inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }))
+    expect(onStepClosed).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ["a child identity", { identity: { kind: "task", taskId: "child-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", attemptCount: 1 } }],
+    ["no visible evidence reader", { tools: [{ name: "agent.plan", version: "1" }] }],
+    ["one remaining Step", { budget: { maxSteps: 2 } }],
+    ["a previously used recovery", { resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, finalEvidenceRecoveryUsed: true,
+      inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }],
+    ["an already-failing business check", { businessChecks: [{ name: "must_find_role", ok: false }] }],
+    ["current evidence missing the configured expected evidence", {
+      snapshot: { system: [], profile: [], steerHistory: [],
+        businessRefs: [{ id: "current-role", kind: "job" as const, ownerId: "user-1" }],
+        toolObservations: [] },
+      expectedEvidence: ["expected-role"],
+    }],
+  ])("keeps ineligible evidence rejection terminal for %s", async (_name, patch) => {
+    const options = {
+      identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
+      goal: "Find a role", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+      tools: [{ name: "jobs.search", version: "1" }], store: { updateStep: vi.fn(async () => undefined) }, idFactory: (value: string) => value,
+      ...patch,
+    } as unknown as TurnExecutionOptions
+    const append = vi.fn(async () => ({ id: "event-1" }))
+    await expect(completeTurnCandidate({
+      options, writer: { append } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-root-1", ordinal: 0 },
+      output: { text: "I found a role.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
+      snapshot: options.snapshot, stepCount: 1, toolCallCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn(),
+    })).rejects.toMatchObject({ code: "evidence_missing" })
+    expect(append).toHaveBeenCalledTimes(1)
+    expect(append).toHaveBeenCalledWith("final.rejected", "step-root-1", null, expect.objectContaining({ code: "evidence_missing" }), "final-rejected:step-root-1")
   })
 })
