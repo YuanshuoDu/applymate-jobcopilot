@@ -105,6 +105,71 @@ describe("agent query DTO redaction", () => {
     expect(dto.content).toEqual({ title: "Resume ready", body: "Bearer [REDACTED]", data: { apiKey: "[REDACTED]", resume: "[REDACTED]", resumeText: "[REDACTED]" } })
   })
 
+  it("normalizes task graph timeline content through the strict public snapshot projection", () => {
+    const verification = {
+      schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+    }
+    const graph = {
+      schemaVersion: "agent-harness.v2.task-graph",
+      nodes: [
+        { key: "target", templateId: "scout", goal: "Find roles", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "private-target-task", verification, verificationDisposition: "typed" },
+        { key: "repair", templateId: "scout", goal: "Repair the evidence", successCriteria: ["Collect evidence"], dependsOn: ["target"], depth: 2, taskId: "private-repair-task", verification, verificationDisposition: "typed",
+          repairOf: { graphRootTaskId: "private-root", nodeKey: "target", taskId: "private-target-task", criterionIds: ["candidate-count"] } },
+      ],
+    }
+    const dto = itemDto({
+      id: "graph_item", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: "private-root",
+      type: "task_graph", status: "completed", phase: "commentary", revision: 4, content: graph,
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+
+    expect(dto.content).toEqual({
+      schemaVersion: "agent-harness.v2.task-graph",
+      nodes: [
+        { key: "target", templateId: "scout", goal: "Find roles", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "private-target-task" },
+        { key: "repair", templateId: "scout", goal: "Repair the evidence", successCriteria: ["Collect evidence"], dependsOn: ["target"], depth: 2, taskId: "private-repair-task" },
+      ],
+    })
+    for (const secret of ["repairOf", "graphRootTaskId", "verification", "verificationDisposition", "candidate-count", "taskGraphVerificationReport", "taskGraphRepairReceipt"]) {
+      expect(JSON.stringify(dto.content)).not.toContain(secret)
+    }
+    expect(dto).toMatchObject({ id: "graph_item", sessionId: "session_1", turnId: "turn_1", taskId: "private-root", type: "task_graph", revision: 4 })
+
+    const legacy = itemDto({
+      id: "legacy_graph", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: "legacy-root",
+      type: "task_graph", status: "completed", phase: "commentary", revision: 1,
+      content: { schemaVersion: "agent-harness.v2.task-graph", nodes: [
+        { key: "legacy", templateId: "scout", goal: "Find roles", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "legacy-child" },
+      ] },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+    expect(legacy.content).toEqual({
+      schemaVersion: "agent-harness.v2.task-graph",
+      nodes: [{ key: "legacy", templateId: "scout", goal: "Find roles", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "legacy-child" }],
+    })
+  })
+
+  it("fails closed for malformed task graph metadata without returning raw content", () => {
+    const dto = itemDto({
+      id: "graph_bad", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: "root_1",
+      type: "task_graph", status: "completed", phase: "commentary", revision: 4,
+      content: {
+        schemaVersion: "agent-harness.v2.task-graph",
+        nodes: [{ key: "node", templateId: "scout", goal: "Find roles", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "child_1",
+          verificationDisposition: "typed", verification: { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] },
+          taskGraphVerificationReport: { evidenceDigest: "PRIVATE_REPORT_DIGEST" }, taskGraphRepairReceipt: { evidenceDigest: "PRIVATE_RECEIPT_DIGEST" } }],
+      },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+
+    expect(dto.content).toBeNull()
+    const serialized = JSON.stringify(dto)
+    for (const secret of ["PRIVATE_REPORT_DIGEST", "PRIVATE_RECEIPT_DIGEST", "taskGraphVerificationReport", "taskGraphRepairReceipt"]) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
   it("projects only a bounded final agent summary beside redacted response text", () => {
     const row = {
       id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,

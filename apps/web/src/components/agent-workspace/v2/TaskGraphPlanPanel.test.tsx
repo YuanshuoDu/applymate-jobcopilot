@@ -1,7 +1,8 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
+import { I18nProvider } from '@/lib/i18n'
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
 import { projectCurrentTaskGraph } from './task-graph-plan'
 import { selectedTaskGraphIdentity } from './task-graph-plan-query'
@@ -59,6 +60,59 @@ describe('TaskGraphPlanPanel', () => {
     expect(html).toContain('Failed')
     expect(html).not.toMatch(/nativeDelegation|native-operation|requestFingerprint|contextDigest|resultDigest|PRIVATE_/)
     expect(html).not.toMatch(/Passed|Semantic pass/i)
+  })
+
+  it('shows only a same-identity server repair target in localized escaped text', () => {
+    const targetGoal = '<script>safe()</script>'
+    const verification = { schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'scout', criteria: [
+      { id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 1 } },
+    ] }
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'source', templateId: 'scout', goal: targetGoal, successCriteria: ['Find a public job'], dependsOn: [], depth: 1, taskId: 'target-task', verification, verificationDisposition: 'typed' },
+      { key: 'repair', templateId: 'scout', goal: 'Retry the search', successCriteria: ['Find a public job'], dependsOn: [], depth: 1, taskId: 'repair-task', verification, verificationDisposition: 'typed',
+        repairOf: { graphRootTaskId: 'root-task', nodeKey: 'source', taskId: 'target-task', criterionIds: ['candidate-count'] } },
+    ] })]
+    const ownedTasks: SupervisorTaskSummary[] = [
+      { ...tasks[0]!, goal: 'Root plan' },
+      { ...tasks[1]!, id: 'target-task', goal: targetGoal, role: 'scout', taskType: 'scout' },
+      { ...tasks[1]!, id: 'repair-task', goal: 'Retry the search', role: 'scout', taskType: 'scout' },
+    ]
+    const baseProjection = projectCurrentTaskGraph(graphItems, ownedTasks, 'session-1')!
+    const projection = { ...baseProjection, nodes: baseProjection.nodes.map(node => node.key === 'repair'
+      ? { ...node, repairTargetGoal: targetGoal } : node) }
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const panel = (ledger?: unknown) => <TaskGraphPlanPanel sessionId="session-1" items={graphItems} tasks={ownedTasks} ledger={ledger} />
+    const accepted = renderToStaticMarkup(panel({ identity, projection }))
+    expect(accepted).toContain(`Repair attempt for &lt;script&gt;safe()&lt;/script&gt;`)
+    expect(accepted.match(/data-task-graph-repair-target="true"/g)).toHaveLength(1)
+    expect(accepted).not.toContain('<script>')
+    expect(accepted).not.toMatch(/Passed|Fixed|Approved/i)
+    expect(accepted).not.toMatch(/repairOf|target-task|repair-task/)
+
+    const oldPayload = renderToStaticMarkup(panel({ identity, projection: baseProjection }))
+    const timelineOnly = renderToStaticMarkup(panel())
+    expect(oldPayload).not.toContain('data-task-graph-repair-target')
+    expect(timelineOnly).not.toContain('data-task-graph-repair-target')
+    expect(timelineOnly).toContain('Retry the search')
+
+    const mismatchedResponses = [
+      { identity: { ...identity, sessionId: 'session-2' }, projection: { ...projection, sessionId: 'session-2' } },
+      { identity: { ...identity, graphItemId: 'foreign-graph' }, projection },
+      { identity: { ...identity, turnId: 'turn-old' }, projection },
+      { identity: { ...identity, rootTaskId: 'foreign-root' }, projection },
+      { identity: { ...identity, revision: 2 }, projection: { ...projection, revision: 2 } },
+    ]
+    for (const response of mismatchedResponses) {
+      const html = renderToStaticMarkup(panel(response))
+      expect(html).not.toContain('data-task-graph-repair-target')
+    }
+
+    vi.stubGlobal('window', {})
+    vi.stubGlobal('localStorage', { getItem: () => 'zh' })
+    try {
+      const chinese = renderToStaticMarkup(<I18nProvider>{panel({ identity, projection })}</I18nProvider>)
+      expect(chinese).toContain(`修复尝试： &lt;script&gt;safe()&lt;/script&gt;`)
+    } finally { vi.unstubAllGlobals() }
   })
 
   it('rejects a valid but stale Plan Ledger from another session', () => {

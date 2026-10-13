@@ -24,6 +24,7 @@ export const TASK_GRAPH_PLAN_LABELS = {
     'agent.taskGraph.status.interrupted': 'Interrupted',
     'agent.taskGraph.status.cancelled': 'Cancelled',
     'agent.taskGraph.status.closed': 'Closed',
+    'agent.taskGraph.repairAttemptFor': 'Repair attempt for',
   },
   zh: {
     'agent.taskGraph.currentPlan': '当前计划',
@@ -48,6 +49,7 @@ export const TASK_GRAPH_PLAN_LABELS = {
     'agent.taskGraph.status.interrupted': '已中断',
     'agent.taskGraph.status.cancelled': '已取消',
     'agent.taskGraph.status.closed': '已关闭',
+    'agent.taskGraph.repairAttemptFor': '修复尝试：',
   },
 } as const satisfies Record<'en' | 'zh', Record<string, string>>
 

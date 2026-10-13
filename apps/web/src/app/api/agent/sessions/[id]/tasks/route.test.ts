@@ -117,10 +117,91 @@ describe("agent task query API", () => {
       nodes: [{ key: "scout", status: "completed", evidencePreview: { summary: "Scout completed: 1 candidate; 1 linked evidence item." } }],
       },
     })
+    expect(body.planLedger.projection.nodes[0]).not.toHaveProperty("repairTargetGoal")
     const serialized = JSON.stringify(body.planLedger)
     for (const secret of ["child_1", "private-job", "private-evidence", "private-final", "private.example", "PRIVATE_MODEL_TEXT"]) {
       expect(serialized).not.toContain(secret)
     }
+  })
+
+  it("labels a repair only with its same-root target's redacted ledger goal", async () => {
+    const verification = {
+      schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+    }
+    const graph = {
+      schemaVersion: "agent-harness.v2.task-graph",
+      nodes: [
+        { key: "target", templateId: "scout", goal: "Review https://private.example/job for alex@example.test", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "target_task", verification, verificationDisposition: "typed" },
+        { key: "repair", templateId: "scout", goal: "Retry current evidence", successCriteria: ["Collect evidence"], dependsOn: ["target"], depth: 2, taskId: "repair_task", verification, verificationDisposition: "typed",
+          repairOf: { graphRootTaskId: "root_1", nodeKey: "target", taskId: "target_task", criterionIds: ["candidate-count"] } },
+      ],
+    }
+    const timestamp = new Date("2026-08-31T00:01:00Z")
+    mocks.graphFindFirst.mockResolvedValueOnce({ id: "graph_repair", sessionId: "session_1", turnId: "turn_repair", taskId: "root_1", revision: 5, content: graph })
+    mocks.taskFindMany.mockResolvedValueOnce([
+      { id: "root_1", sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", parentTaskId: null, path: "root", role: "orchestrator", taskType: "root", status: "running", goal: "Review the role", confidence: null, failureReason: null, result: null, createdAt: timestamp, updatedAt: timestamp },
+      { id: "target_task", sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", parentTaskId: "root_1", path: "0", role: "scout", taskType: "scout", status: "failed", goal: "Review https://private.example/job for alex@example.test", confidence: null, failureReason: null, result: null, createdAt: timestamp, updatedAt: timestamp },
+      { id: "repair_task", sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", parentTaskId: "root_1", path: "1", role: "scout", taskType: "scout", status: "queued", goal: "Retry current evidence", confidence: null, failureReason: null, result: null, createdAt: timestamp, updatedAt: timestamp },
+    ])
+
+    const { GET } = await import("./route")
+    const response = await GET(request("?taskId=root_1&taskId=target_task&taskId=repair_task&graphItemId=graph_repair&graphTurnId=turn_repair&rootTaskId=root_1&graphRevision=5") as never, params)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
+    expect(mocks.graphFindFirst).toHaveBeenCalledWith({
+      where: { id: "graph_repair", sessionId: "session_1", type: "task_graph" },
+      select: { id: true, sessionId: true, turnId: true, taskId: true, revision: true, content: true },
+    })
+    expect(mocks.taskFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", id: { in: ["root_1", "target_task", "repair_task"] } },
+    }))
+    expect(mocks.graphFindFirst).toHaveBeenCalledTimes(1)
+    expect(mocks.graphFindMany).not.toHaveBeenCalled()
+    expect(mocks.taskFindMany).toHaveBeenCalledTimes(1)
+    expect(body.planLedger.identity).toEqual({ sessionId: "session_1", graphItemId: "graph_repair", turnId: "turn_repair", rootTaskId: "root_1", revision: 5 })
+    expect(body.planLedger.projection.nodes.find((node: { key: string }) => node.key === "repair")).toMatchObject({
+      goal: "Retry current evidence", repairTargetGoal: "Review [redacted] for [redacted]",
+    })
+    const serialized = JSON.stringify(body.planLedger)
+    for (const secret of ["target_task", "repair_task", "candidate-count", "repairOf", "graphRootTaskId", "private.example", "alex@example.test"]) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it("does not decorate a repair whose persisted relation names a different graph root", async () => {
+    const verification = {
+      schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+    }
+    const graph = {
+      schemaVersion: "agent-harness.v2.task-graph",
+      nodes: [
+        { key: "target", templateId: "scout", goal: "Find roles", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "target_task", verification, verificationDisposition: "typed" },
+        { key: "repair", templateId: "scout", goal: "Retry", successCriteria: ["Collect evidence"], dependsOn: ["target"], depth: 2, taskId: "repair_task", verification, verificationDisposition: "typed",
+          repairOf: { graphRootTaskId: "different_root", nodeKey: "target", taskId: "target_task", criterionIds: ["candidate-count"] } },
+      ],
+    }
+    const timestamp = new Date("2026-08-31T00:01:00Z")
+    mocks.graphFindFirst.mockResolvedValueOnce({ id: "graph_repair", sessionId: "session_1", turnId: "turn_repair", taskId: "root_1", revision: 5, content: graph })
+    mocks.taskFindMany.mockResolvedValueOnce([
+      { id: "root_1", sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", parentTaskId: null, path: "root", role: "orchestrator", taskType: "root", status: "running", goal: "Review the role", confidence: null, failureReason: null, result: null, createdAt: timestamp, updatedAt: timestamp },
+      { id: "target_task", sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", parentTaskId: "root_1", path: "0", role: "scout", taskType: "scout", status: "failed", goal: "Find roles", confidence: null, failureReason: null, result: null, createdAt: timestamp, updatedAt: timestamp },
+      { id: "repair_task", sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", parentTaskId: "root_1", path: "1", role: "scout", taskType: "scout", status: "queued", goal: "Retry", confidence: null, failureReason: null, result: null, createdAt: timestamp, updatedAt: timestamp },
+    ])
+
+    const { GET } = await import("./route")
+    const response = await GET(request("?taskId=root_1&taskId=target_task&taskId=repair_task&graphItemId=graph_repair&graphTurnId=turn_repair&rootTaskId=root_1&graphRevision=5") as never, params)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.planLedger.projection.nodes.find((node: { key: string }) => node.key === "repair")).not.toHaveProperty("repairTargetGoal")
+    expect(body.planLedger.identity.rootTaskId).toBe("root_1")
+    expect(mocks.taskFindMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", turnId: "turn_repair", rootTaskId: "root_1", id: { in: ["root_1", "target_task", "repair_task"] } },
+    }))
   })
 
   it("projects only the durable owner-scoped discovery shortlist in completed, partial, and failed states", async () => {
