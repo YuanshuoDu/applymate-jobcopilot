@@ -1,3 +1,5 @@
+BEGIN;
+
 ALTER TABLE "agent_turns"
   ADD COLUMN "objectiveDigest" VARCHAR(64),
   ADD COLUMN "canonicalOriginDigest" VARCHAR(64),
@@ -39,3 +41,5 @@ INSERT INTO "agent_objective_history_index_readiness" (
   "isReady"
 )
 VALUES ('agent_turns_objective_history', 1, FALSE);
+
+COMMIT;
