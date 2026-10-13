@@ -8,6 +8,7 @@ import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, loadSte
 import type { HydrationScope } from "./steering-reconciliation-context.js"
 import type { TurnQuestionPlanningSummary } from "../turns/turn-question-planning-contract.js"
 import { planningClarificationContext, type PlanningClarificationHistoryPair } from "./planning-clarification-context.js"
+import { rootTaskGoalCriteriaBlocks } from "./root-task-goal-criteria-context.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -31,6 +32,7 @@ export type StepContextSnapshot = {
   readonly system: readonly ContextSeedBlock[]
   readonly profile: readonly ContextSeedBlock[]
   readonly goal?: ContextSeedBlock
+  readonly rootTaskGoalCriteria?: readonly string[]
   readonly steerHistory: readonly ContextHistoryEntry[]
   readonly businessRefs: readonly BusinessReference[]
   readonly toolObservations: readonly ContextSeedBlock[]
@@ -212,6 +214,7 @@ export class StepContextBuilder {
     for (const seed of request.snapshot.system) blocks.push(block("system", "instruction", "system", "harness", `system:${seed.id}`, seed.content))
     for (const seed of request.snapshot.profile) blocks.push(block("profile", "data", "internal_record", "profile", `profile:${seed.id}`, seed.content))
     if (request.snapshot.goal) blocks.push(block("goal", "data", "external_untrusted", "turn_goal", `goal:${request.snapshot.goal.id}`, request.snapshot.goal.content))
+    blocks.push(...rootTaskGoalCriteriaBlocks(request.snapshot.rootTaskGoalCriteria))
     for (const entry of request.snapshot.steerHistory) {
       blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
       if (entry.id === clarification.afterAnswerEntryId) blocks.push(...clarification.blocks)
