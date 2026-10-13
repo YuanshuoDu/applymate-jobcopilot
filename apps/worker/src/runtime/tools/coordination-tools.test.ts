@@ -198,11 +198,25 @@ describe("coordination tool definitions", () => {
     expect(Object.keys(legacy.tasks[0]!)).toHaveLength(5)
     expect(Object.keys(current.tasks[0]!)).toHaveLength(9)
 
-    const extendedTimestamps = ["+010000-01-01T00:00:00.000Z", "-000001-01-01T00:00:00.000Z"]
-    for (const value of extendedTimestamps) expect(new Date(value).toISOString()).toBe(value)
+    const extendedTimestamps = [
+      new Date(Date.UTC(10_000, 0, 1)).toISOString(),
+      new Date("-000001-01-01T00:00:00.000Z").toISOString(),
+      new Date("+010000-02-29T00:00:00.000Z").toISOString(),
+      new Date("-000004-02-29T00:00:00.000Z").toISOString(),
+      new Date("+275760-09-13T00:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T00:00:00.000Z").toISOString(),
+    ]
+    expect(extendedTimestamps).toEqual([
+      "+010000-01-01T00:00:00.000Z",
+      "-000001-01-01T00:00:00.000Z",
+      "+010000-02-29T00:00:00.000Z",
+      "-000004-02-29T00:00:00.000Z",
+      "+275760-09-13T00:00:00.000Z",
+      "-271821-04-20T00:00:00.000Z",
+    ])
 
     for (const field of ["leaseExpiresAt", "interruptRequestedAt"] as const) {
-      for (const value of ["2026-10-12T10:15:30.000Z", "2024-02-29T10:15:30.000Z", "2000-02-29T10:15:30.000Z", null]) {
+      for (const value of ["2026-10-12T10:15:30.000Z", "2024-02-29T10:15:30.000Z", "2000-02-29T10:15:30.000Z", ...extendedTimestamps, null]) {
         const task = { ...current.tasks[0]!, [field]: value }
         expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).not.toThrow()
       }
@@ -211,7 +225,15 @@ describe("coordination tool definitions", () => {
         "2026-10-12T10:15:30Z",
         "2026-10-12T10:15:30.000+00:00",
         "2026-10-12T10:15:30.000Z\n",
-        ...extendedTimestamps,
+        "+000001-01-01T00:00:00.000Z",
+        "-000000-01-01T00:00:00.000Z",
+        "+010000-02-30T00:00:00.000Z",
+        "+275761-01-01T00:00:00.000Z",
+        "+275760-09-13T00:00:00.001Z",
+        "-271822-04-20T00:00:00.000Z",
+        "-271821-04-19T23:59:59.999Z",
+        "-271821-04-20T00:00:00.001Z",
+        "-271821-04-20T12:00:00.000Z",
         "2026-02-30T10:15:30.000Z",
         "2026-02-29T10:15:30.000Z",
         "1900-02-29T10:15:30.000Z",
