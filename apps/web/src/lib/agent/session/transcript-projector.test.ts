@@ -51,6 +51,54 @@ describe("V2 transcript projector", () => {
     expect(transcriptProjectionMarker(projected.data)).toEqual({ eventId: "event_2", opaque: true, wrapped: false })
   })
 
+  it("rejects direct transcript projection of private native verification events", () => {
+    expect(() => projectV2EventToTranscript({
+      ...baseEvent, type: "native_verification.requested", taskId: "private-control-task",
+      payload: { controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
+    })).toThrow("private_native_verification_event_not_projectable")
+  })
+
+  it("rejects direct transcript projection of private planning receipts", () => {
+    expect(() => projectV2EventToTranscript({
+      ...baseEvent, type: "agent.plan.clarification", itemId: null,
+      payload: { pendingSteers: [{ id: "private-steer-id" }], rationale: "private clarification receipt" },
+    })).toThrow("private_native_verification_event_not_projectable")
+  })
+
+  it("rejects direct transcript projection of private reconciliation receipts", () => {
+    expect(() => projectV2EventToTranscript({
+      ...baseEvent, type: "agent.plan.reconciliation", itemId: null, taskId: "root-task-1",
+      payload: {
+        schemaVersion: "agent-harness.v2.plan-reconciliation.v1",
+        sessionId: "session_1",
+        turnId: "turn_1",
+        rootTaskId: "root-task-1",
+        stepId: "step-1",
+        decision: "revise",
+        observedRevision: 4,
+        resultingRevision: 5,
+        steerInputIds: ["private-reconciliation-steer-input"],
+        inputCheckpoint: { throughSequence: "12" },
+      },
+    })).toThrow("private_native_verification_event_not_projectable")
+  })
+
+  it("rejects direct transcript projection of private denial checkpoints", () => {
+    expect(() => projectV2EventToTranscript({
+      ...baseEvent,
+      type: "agent.plan.denial_checkpoint",
+      itemId: null,
+      taskId: "private-denial-task",
+      payload: {
+        schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1",
+        taskId: "private-denial-task",
+        stepId: "private-denial-step",
+        graphRevision: 23,
+        verificationDigest: "private-verification-digest",
+      },
+    })).toThrow("private_native_verification_event_not_projectable")
+  })
+
   it.each(goldenCases)("keeps $flow golden transcript semantics stable", ({ flow, legacy }) => {
     const projected = projectV2EventToTranscript({
       ...baseEvent,
@@ -89,5 +137,100 @@ describe("V2 transcript projector", () => {
     await expect(projectV2EventsToTranscript(db as never, { sessionId: "session_1", userId: "user_1" })).resolves.toBe(0)
     expect(transcriptCreate).toHaveBeenCalledOnce()
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
+  })
+
+  it("omits private verification, planning, and reconciliation receipts during transcript rebuild", async () => {
+    const privateEvent = {
+      ...baseEvent, id: "private-event", itemId: null, taskId: "private-control-task",
+      type: "native_verification.requested",
+      payload: { controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
+    }
+    const ordinaryEvent = {
+      ...baseEvent, id: "ordinary-event",
+      payload: { legacy: { type: "job_results", speaker: "Analyst", title: "Jobs", body: "N26", data: { jobs: 1 } } },
+    }
+    const clarificationEvent = {
+      ...baseEvent, id: "private-clarification-event", itemId: null,
+      type: "agent.plan.clarification",
+      payload: { pendingSteerIds: ["private-steer-id"], rationale: "private clarification receipt" },
+    }
+    const reconciliationEvent = {
+      ...baseEvent, id: "private-reconciliation-event", itemId: null, taskId: "root-task-1",
+      type: "agent.plan.reconciliation",
+      payload: {
+        schemaVersion: "agent-harness.v2.plan-reconciliation.v1",
+        sessionId: "session_1",
+        turnId: "turn_1",
+        rootTaskId: "root-task-1",
+        stepId: "step-2",
+        decision: "revise",
+        observedRevision: 7,
+        resultingRevision: 8,
+        steerInputIds: ["private-reconciliation-steer-input-sentinel"],
+        inputCheckpoint: { throughSequence: "19" },
+      },
+    }
+    const denialCheckpointEvent = {
+      ...baseEvent,
+      id: "private-denial-checkpoint-event",
+      itemId: null,
+      taskId: "private-denial-task",
+      type: "agent.plan.denial_checkpoint",
+      payload: {
+        schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1",
+        taskId: "private-denial-task",
+        stepId: "private-denial-step",
+        graphRevision: 23,
+        verificationDigest: "private-denial-digest-sentinel",
+      },
+    }
+    const finalRejectionEvent = {
+      ...baseEvent,
+      id: "public-final-rejection-event",
+      itemId: null,
+      taskId: "public-root-task",
+      type: "final.rejected",
+      payload: {
+        code: "business_precondition_failed",
+        blocker: "task_graph_verification_unverified",
+        feedback: "Current task graph requirements are incomplete",
+        taskId: "public-root-task",
+      },
+    }
+    const transcriptCreate = vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ data }))
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1" }]),
+      agentEvent: { findMany: vi.fn().mockResolvedValue([
+        privateEvent, clarificationEvent, reconciliationEvent, denialCheckpointEvent, finalRejectionEvent, ordinaryEvent,
+      ]) },
+      agentTranscriptEvent: {
+        findMany: vi.fn().mockResolvedValue([]),
+        create: transcriptCreate,
+      },
+    }
+    const db = { $transaction: vi.fn(async <T>(work: (transaction: typeof tx) => Promise<T>) => work(tx)) }
+
+    await expect(projectV2EventsToTranscript(db as never, { sessionId: "session_1", userId: "user_1" })).resolves.toBe(2)
+    expect(transcriptCreate).toHaveBeenCalledTimes(2)
+    expect(transcriptCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ type: "job_results", speaker: "Analyst", body: "N26" }),
+    }))
+    const createdTranscriptRows = transcriptCreate.mock.calls.map(([input]) => input.data)
+    const serializedTranscriptRows = JSON.stringify(createdTranscriptRows)
+    expect(serializedTranscriptRows).toContain("final.rejected")
+    expect(serializedTranscriptRows).toContain("task_graph_verification_unverified")
+    expect(serializedTranscriptRows).toContain("Current task graph requirements are incomplete")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.denial_checkpoint")
+    expect(serializedTranscriptRows).not.toContain("private-denial-checkpoint-event")
+    expect(serializedTranscriptRows).not.toContain("private-denial-task")
+    expect(serializedTranscriptRows).not.toContain("private-denial-step")
+    expect(serializedTranscriptRows).not.toContain("private-denial-digest-sentinel")
+    expect(serializedTranscriptRows).not.toContain("task-graph-denial-checkpoint.v1")
+    expect(serializedTranscriptRows).not.toContain("private-event")
+    expect(serializedTranscriptRows).not.toContain("private-clarification-event")
+    expect(serializedTranscriptRows).not.toContain("private-reconciliation-event")
+    expect(serializedTranscriptRows).not.toContain("private-steer-id")
+    expect(serializedTranscriptRows).not.toContain("private-reconciliation-steer-input-sentinel")
+    expect(serializedTranscriptRows).not.toContain("root-task-1")
   })
 })

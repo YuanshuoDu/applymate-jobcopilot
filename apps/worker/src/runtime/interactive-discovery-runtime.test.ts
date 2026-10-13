@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { createCanonicalRootToolGuards, interactiveDiscoveryCompletionGate, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 
 const shortlist = { schemaVersion: 1 as const, status: "completed" as const, items: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }], failures: [] }
@@ -44,5 +46,26 @@ describe("interactive discovery runtime", () => {
     await expect(withInteractiveDiscoveryFinalResponse(underlying, () => undefined).recordFinalResponse({
       owner: { kind: "turn" } as never, response: "{}", now: new Date(), terminal: {} as never,
     })).rejects.toThrow("interactive_discovery_shortlist_missing")
+  })
+
+  it("preserves the verified model candidate when a private TaskGraph summary is bound", async () => {
+    const writes: unknown[] = []
+    const underlying = { recordFinalResponse: vi.fn(async (input: unknown) => { writes.push(input); return { status: "completed" as const, finalItemId: "final-1", events: [] } }) } as unknown as TurnEngineStore
+    const binding = { graphRevision: 1, summary: reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [] }) }
+    const response = JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "original verified candidate" })
+    const finalContent = { text: "original verified candidate", final: { schemaVersion: "agent-harness.v2.final", response: "original verified candidate", summary: "Task-reported results: discovered jobs: 1 (complete)." } }
+    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent, stepCount: 1, toolCallCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
+    const guarded = withInteractiveDiscoveryFinalResponse(underlying, () => shortlist)
+    await guarded.recordFinalResponse({
+      owner: { kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
+      response, now: new Date(), terminal,
+    })
+    const saved = writes[0] as { response: string; terminal: typeof terminal & { interactiveDiscoveryShortlist: unknown } }
+    expect(saved.response).toBe(response)
+    expect(saved.terminal.finalContent).toEqual(finalContent)
+    expect(saved.terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
+    expect(saved.terminal.interactiveDiscoveryShortlist).toEqual(shortlist)
+    expect(JSON.stringify(saved)).not.toContain("task_graph_final_summary_binding")
   })
 })

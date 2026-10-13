@@ -1,5 +1,5 @@
 import { materializeTaskGraphDependencyContext, isTaskGraphDependencyContextError } from "./task-graph-dependency-context.js"
-import { createSubagentTask } from "./pg-store-create.js"
+import { assertPlanningRootHasNoUnresolvedSteering, createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
 import { appendTaskGraphNativeNode, TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
@@ -72,6 +72,9 @@ export async function appendNativeGraphCommand(
   const allowedActions = source
     ? intersect(taskActions(source.allowedActions), taskActions(parent.allowedActions))
     : [...(operation.kind === "spawn" ? operation.allowedActions ?? [] : [])]
+  if (input.scope.parentTaskId === input.scope.rootTaskId) {
+    await assertPlanningRootHasNoUnresolvedSteering(client, parent.allowedActions, input.scope)
+  }
   const child = await createSubagentTask(client, {
     userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
     parentTaskId: input.scope.parentTaskId, role, taskType, goal: operation.goal,

@@ -20,13 +20,24 @@ import type {
 } from "./turn-engine-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
+import type { NativeSemanticProgressMode, NativeSemanticRejectionCount, NativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
+import type { DurableWaitControlReader } from "../tools/coordination-types.js"
+import type { RecoveredArchivedWaitControl } from "./turn-execution-wait.js"
+import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
+export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
 export const RESET_NATIVE_SEMANTIC_PROGRESS: unique symbol = Symbol("reset-native-semantic-progress")
+export const TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("task-graph-denial-checkpoint")
+export const READ_TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("read-task-graph-denial-checkpoint")
 
 export type TurnEngineCompletionGateResult =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true }
+  | ({ readonly ok: true } & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
+  | ({ readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string
+      readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: NativeSemanticRejectionIdentity
+      readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint }
+      & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
 
 export type TurnEngineCompletionGate = ((input: {
   readonly identity: TurnExecutionIdentity
@@ -39,9 +50,18 @@ export type TurnEngineCompletionGate = ((input: {
   readonly now: Date
 }) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult) & {
   [RESET_NATIVE_SEMANTIC_PROGRESS]?: () => void
+  [READ_TASK_GRAPH_DENIAL_CHECKPOINT]?: () => Promise<TaskGraphDenialCheckpoint | null>
 }
 
 export type TurnExecutionStepBudget = { readonly remainingTurnSteps?: number }
+export type TaskGraphDenialProgress = Readonly<{
+  taskId: string
+  graphRevision: number
+  verificationDigest: string
+  inputThroughSequence: bigint
+  consumedInputIds: readonly string[]
+  count: 1 | 2
+}>
 
 /** Identity is owner normalized; the loop never receives a raw lease. */
 export type TurnExecutionIdentity = ExecutionOwnerFence
@@ -51,6 +71,8 @@ type StoreInput<K extends keyof TurnEngineStore> = Omit<Parameters<NonNullable<T
 export type TurnExecutionStore = {
   startStep(input: StoreInput<"startStep">): Promise<TurnEngineStep>
   updateStep(input: StoreInput<"updateStep">): Promise<void>
+  completeNativeSemanticRejectionStep?(input: Omit<Parameters<NonNullable<import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore["completeNativeSemanticRejectionStep"]>>[0], "owner">
+    & { executionIdentity: TurnExecutionIdentity }): Promise<NativeSemanticRejectionCount>
   waitForUser?(input: StoreInput<"waitForUser">): Promise<void>
   stageQuestionUsage?(input: StoreInput<"stageQuestionUsage">): Promise<void>
   cancelPausedQuestion?(input: StoreInput<"cancelPausedQuestion">): ReturnType<NonNullable<TurnEngineStore["cancelPausedQuestion"]>>
@@ -118,6 +140,7 @@ export type TurnExecutionOptions = {
   /** Allows a root or child adapter to classify a lost owner without coupling the loop to a lease type. */
   readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
   readonly completionGate?: TurnEngineCompletionGate
+  readonly nativeSemanticProgressMode?: NativeSemanticProgressMode
   /** Server-restored exact candidate; it is never added to a model request. */
   readonly recoveredFinalCandidate?: string
   /** Canonical replay state used only for server-side marker hydration. */
@@ -128,6 +151,8 @@ export type TurnExecutionOptions = {
   readonly refreshTaskGraphAfterReadyWait?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
   /** Re-read durable TaskGraph state after an accepted agent.plan receipt. */
   readonly refreshTaskGraphAfterPlan?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
+  readonly durableWaitControlReader?: DurableWaitControlReader
+  readonly recoveredWaitControl?: RecoveredArchivedWaitControl
 }
 
 export type TurnExecutionOutcome = TurnEngineResult

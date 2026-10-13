@@ -26,7 +26,6 @@ export class TurnStateRefreshRetryError extends Error {
 export function isTurnStateRefreshRetryError(error: unknown): error is TurnStateRefreshRetryError {
   return error instanceof TurnStateRefreshRetryError
 }
-
 export function nativeQuestionCallId(output: ModelStepResult, identity: TurnExecutionIdentity): string | null {
   const asks = output.toolCalls.filter(call => call.name === "agent.ask_user")
   if (asks.length === 0) return null

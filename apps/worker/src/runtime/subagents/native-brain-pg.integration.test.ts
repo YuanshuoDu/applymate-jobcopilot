@@ -290,6 +290,23 @@ function verificationReport(
 
 type CanonicalFixture = Readonly<{ userId: string; sessionId: string; turnId: string; ownerId: string; jobId: string }>
 
+const SAFE_TURN_STATUSES = new Set([
+  "queued", "in_progress", "waiting_for_dependency", "waiting_for_user", "waiting_for_approval", "interrupted", "failed", "completed",
+])
+const SAFE_TURN_ERROR_CODES = new Set([
+  "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output", "budget_exhausted",
+  "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed", "turn_execution_failed", "model_execution_failed",
+])
+
+function safeDiagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string {
+  if (value === null || value === undefined) return "unavailable"
+  return typeof value === "string" && allowed.has(value) ? value : "other"
+}
+
+function boundedDiagnosticCount(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 99) : 0
+}
+
 function waitForDatabase<T>(label: string, load: () => Promise<T>, ready: (value: T) => boolean, timeoutMs = 90_000): Promise<T> {
   return new Promise((resolve, reject) => {
     const started = Date.now()
@@ -979,8 +996,15 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       await bootstrap.subagents.queue.worker.resume()
       await Promise.race([acceptedCandidateEntered, delay(90_000).then(() => {
         return Promise.all([
-          pool!.query<{ turnStatus: string | null; rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
-          `SELECT turn."status" AS "turnStatus",
+          pool!.query<{ turnStatus: string | null; turnErrorCode: string | null; rootStepErrorCode: string | null; finalRejectedCount: number;
+            rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
+          `SELECT turn."status" AS "turnStatus", turn."error" AS "turnErrorCode",
+             (SELECT step."errorCode" FROM "agent_steps" AS step
+               WHERE step."sessionId" = turn."sessionId" AND step."turnId" = turn."id" AND step."taskId" = turn."rootTaskId"
+               ORDER BY step."ordinal" DESC, step."attempt" DESC LIMIT 1) AS "rootStepErrorCode",
+             (SELECT COUNT(*)::int FROM "agent_events" AS rejected
+               WHERE rejected."sessionId" = turn."sessionId" AND rejected."turnId" = turn."id"
+                 AND rejected."taskId" = turn."rootTaskId" AND rejected."type" = 'final.rejected') AS "finalRejectedCount",
              COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal')::int AS "rootControls",
              COUNT(*) FILTER (WHERE task."result"->'nativeVerificationReport'->>'disposition' = 'failed')::int AS "failedReports",
              COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal'
@@ -991,12 +1015,22 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
            FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task
              ON task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
              AND task."role" = 'auditor' AND task."taskType" = 'native_verification'
-           WHERE turn."id" = $1 AND turn."sessionId" = $2 GROUP BY turn."status"`,
-          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate)]),
+           WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $4
+           GROUP BY turn."id", turn."sessionId", turn."rootTaskId", turn."status", turn."error"`,
+          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate), canonical.userId]),
           readChildRecoveryDiagnostics(),
         ]).then(([stateResult, childState]) => {
           const state = stateResult.rows[0] ?? null
-          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}; childFixture=${JSON.stringify({ modelRequests: targetChildModelRequests, requestsWithSearch: targetChildRequestsWithSearch, searchCalls: targetChildSearchCalls, providerFailures: targetChildProviderFailures })}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
+          const rejectedCount = boundedDiagnosticCount(state?.finalRejectedCount)
+          const safeState = state ? {
+            turnStatus: safeDiagnosticEnum(state.turnStatus, SAFE_TURN_STATUSES),
+            turnErrorCode: safeDiagnosticEnum(state.turnErrorCode, SAFE_TURN_ERROR_CODES),
+            rootStepErrorCode: safeDiagnosticEnum(state.rootStepErrorCode, SAFE_TURN_ERROR_CODES),
+            finalRejectedCount: rejectedCount, hasFinalRejected: rejectedCount > 0,
+            rootControls: boundedDiagnosticCount(state.rootControls), failedReports: boundedDiagnosticCount(state.failedReports),
+            rejectedControls: boundedDiagnosticCount(state.rejectedControls), rejectedFailedReports: boundedDiagnosticCount(state.rejectedFailedReports),
+          } : null
+          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(safeState)}; childFixture=${JSON.stringify({ modelRequests: targetChildModelRequests, requestsWithSearch: targetChildRequestsWithSearch, searchCalls: targetChildSearchCalls, providerFailures: targetChildProviderFailures })}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
         })
       })])
       const { SUBAGENT_QUEUE_NAME } = await import("../../queue/subagent-queue.js")

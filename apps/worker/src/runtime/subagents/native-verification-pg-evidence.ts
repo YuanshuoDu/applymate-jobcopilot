@@ -4,9 +4,9 @@ import { redactSensitiveText } from "@jobcopilot/shared"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationEvidence, type NativeVerificationPacket, type NativeVerificationPacketTarget } from "./native-verification-contract.js"
 import { nativeVerificationFrontier, type NativeVerificationOwnedState, type NativeVerificationTarget } from "./native-verification-pg-bindings.js"
+import { parseTaskGraphVerificationCriterionIds, parseTaskGraphVerificationReport } from "./task-graph-command-port.js"
 
-type Queryable = Pick<pg.PoolClient, "query">
-type Row = Record<string, unknown>
+type Queryable = Pick<pg.PoolClient, "query">; type Row = Record<string, unknown>
 export type NativeVerificationPacketContent = Readonly<{
   goal: string
   criteria: NativeVerificationPacket["criteria"]
@@ -32,15 +32,18 @@ export type NativeVerificationHistoryTarget = Readonly<{
   childBindingSetDigest?: string
 }>
 
-const MAX_TOOL_FACTS = 20
-const MAX_ARTIFACT_FACTS = 8
-const MAX_EVIDENCE = 32
-const MAX_SUMMARY_BYTES = 8 * 1024
-const SECRET_KEY = /api.?key|secret|password|(?:access|refresh).?token|authorization/i
-
+const MAX_TOOL_FACTS = 20, MAX_ARTIFACT_FACTS = 8, MAX_EVIDENCE = 32, MAX_SUMMARY_BYTES = 8 * 1024, SECRET_KEY = /api.?key|secret|password|(?:access|refresh).?token|authorization/i
 function record(value: unknown): Row | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Row : null
+}
+function publicTaskGraphResult(value: unknown): unknown {
+  if (typeof value === "string") { try { const parsed = JSON.parse(value) as unknown, safe = publicTaskGraphResult(parsed); return safe === parsed ? value : JSON.stringify(safe) } catch { const trimmed = value.trim(); return trimmed.startsWith("{") || trimmed.startsWith("[") || value.includes("taskGraphVerificationReport") || value.includes("dependencyBindings") ? null : value } }
+  const result = record(value)
+  if (!result || !Object.hasOwn(result, "taskGraphVerificationReport")) return value
+  const report = record(result.taskGraphVerificationReport), ids = report && Array.isArray(report.criteria) ? parseTaskGraphVerificationCriterionIds(report.criteria.map(item => record(item)?.criterionId)) : undefined
+  const parsed = ids && parseTaskGraphVerificationReport(report, ids)
+  const { taskGraphVerificationReport: _private, ...safe } = result; return parsed ? { ...safe, taskGraphVerificationReport: parsed } : safe
 }
 function evidenceRef(kind: string, ownedId: string): string { return `${kind}:${digestNativeVerificationValue(ownedId).slice(0, 32)}` }
 function criterionRows(values: readonly string[]): NativeVerificationPacket["criteria"] {
@@ -95,10 +98,9 @@ export function buildNativeRootPacketContent(input: Readonly<{
     if (!task) return null
     if (task.result !== null && containsSecretField(task.result)) return null
     let resultDigest: string | null = null
-    try { if (task.result !== null) resultDigest = digestNativeVerificationValue(task.result) } catch { return null }
     const safeFailure = task.failureReason === null ? null : redactSensitiveText(task.failureReason)
     let persistedResult: unknown = null
-    try { if (task.result !== null) persistedResult = JSON.parse(canonicalNativeVerificationJson(task.result)) as unknown } catch { return null }
+    try { if (task.result !== null) { persistedResult = publicTaskGraphResult(JSON.parse(canonicalNativeVerificationJson(task.result)) as unknown); resultDigest = digestNativeVerificationValue(persistedResult) } } catch { return null }
     const summary = JSON.stringify({
       kind: "graph_node_history", nodeId: node.key, taskId: node.taskId, goal: node.goal,
       criteria: node.successCriteria, dependsOn: node.dependsOn, status: task.status,
@@ -117,9 +119,8 @@ export function buildNativeRootPacketContent(input: Readonly<{
     if (nodes.some(node => node.taskId === task.id)) continue
     if (task.result !== null && containsSecretField(task.result)) return null
     let resultDigest: string | null = null
-    try { if (task.result !== null) resultDigest = digestNativeVerificationValue(task.result) } catch { return null }
     let result: unknown = null
-    try { if (task.result !== null) result = JSON.parse(canonicalNativeVerificationJson(task.result)) as unknown } catch { return null }
+    try { if (task.result !== null) { result = publicTaskGraphResult(JSON.parse(canonicalNativeVerificationJson(task.result)) as unknown); resultDigest = digestNativeVerificationValue(result) } } catch { return null }
     const criteria = sourceCriteria(task.successCriteria)
     if (!criteria || !task.goal.trim() || task.goal.trim() !== task.goal) return null
     const summary = JSON.stringify({ kind: "native_legacy_source_history", taskId: task.id, goal: task.goal,

@@ -6,6 +6,7 @@ import type { InputContentPart } from "@jobcopilot/agent-protocol"
 import { createRootTurn, acceptInputFacts, lockOwnedSession, type CommandTransaction } from "./transaction"
 import { forkBoundaryActive, forkBoundaryNotFound, forkIdempotencyConflict, invalidCommand, isUniqueViolation, sessionNotFound } from "./errors"
 import type { ForkCommand, ForkResult } from "./types"
+import { agentForkTurnSelect } from "../store/turn-select"
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 const SIDE_EFFECT_TYPES = /receipt|lease|reservation|pending/i
@@ -97,7 +98,7 @@ export class AgentForkService {
         where: { id: command.sessionId, userId: command.userId },
         select: {
           id: true, userId: true, goal: true, source: true, memorySummary: true,
-          turns: { orderBy: { createdAt: "asc" } },
+          turns: { select: agentForkTurnSelect, orderBy: { createdAt: "asc" } },
           items: { orderBy: { createdAt: "asc" } },
           events: { orderBy: { sequence: "asc" } },
           contextSnapshots: { orderBy: { throughSequence: "desc" }, take: 20 },

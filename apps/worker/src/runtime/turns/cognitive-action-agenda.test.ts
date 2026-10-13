@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { buildCognitiveActionAgenda, COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION, type CognitiveAction } from "./cognitive-action-agenda.js"
+import { buildCognitiveActionAgenda, COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION, excludeUnconsumedRootReferenceFromAgenda, type CognitiveAction } from "./cognitive-action-agenda.js"
 import type { StepContext } from "../context/step-context-builder.js"
 
 function context(blocks: StepContext["blocks"], steeringMarkerControl?: StepContext["steeringMarkerControl"], taskGraphRevision?: number): StepContext {
@@ -77,5 +77,20 @@ describe("cognitive action agenda", () => {
     expect(agenda.signals.pendingInputs.ids).toHaveLength(16)
     expect(JSON.stringify(agenda)).not.toContain("raw goal")
     expect(JSON.stringify(agenda)).not.toContain("candidate-private-prompt")
+  })
+
+  it("omits only an unconsumed root reference from the later-step agenda projection", () => {
+    const inputId = "root-reference"
+    const root = block(`${inputId}:part:0`, "pending_input", { inputId, text: "private background" })
+    const sameIdDifferentLayer = block("root-reference-observation", "tool_observation", { inputId, status: "completed" })
+    const steering = block("late-steer:part:0", "pending_input", { inputId: "late-steer", text: "new instruction" })
+    const original = context([root, sameIdDifferentLayer, steering])
+    const projected = excludeUnconsumedRootReferenceFromAgenda(original, inputId)
+    const consumed = { ...original, consumedInputIds: [inputId] }
+
+    expect(projected.blocks).toEqual([sameIdDifferentLayer, steering])
+    expect(original.blocks).toEqual([root, sameIdDifferentLayer, steering])
+    expect(excludeUnconsumedRootReferenceFromAgenda(original)).toBe(original)
+    expect(excludeUnconsumedRootReferenceFromAgenda(consumed, inputId)).toBe(consumed)
   })
 })

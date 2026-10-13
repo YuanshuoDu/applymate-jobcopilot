@@ -1,5 +1,7 @@
 import type { FinalVerification } from "./verifier.js"
 import type { TurnUsage } from "./budget.js"
+import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
+import { sameTaskGraphFinalSummaryBinding, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
 
 export type FinalTerminalReason = "goal_satisfied" | "partial_result" | "budget_exhausted" | "no_progress" | "unrecoverable_error" | "final_unverified"
 
@@ -30,6 +32,7 @@ export type FinalizeInput = {
   readonly blocker?: string | null
   readonly next?: readonly string[]
   readonly response?: string
+  readonly summaryOverride?: string
 }
 
 function sorted(values: readonly string[]): string[] {
@@ -44,12 +47,22 @@ export function finalizeTurn(input: FinalizeInput): FinalResponse {
   const next = sorted(input.next ?? (completed ? [] : ["Resolve the blocker and resume the Turn"]))
   const completedTasks = completed ? ["Turn goal"] : []
   const notCompleted = completed ? [] : [input.goal]
-  const summary = completed ? "The Turn goal was completed with verified evidence." : "The Turn did not complete the goal."
+  const summary = input.summaryOverride ?? (completed ? "The Turn goal was completed with verified evidence." : "The Turn did not complete the goal.")
   return {
     schemaVersion: "agent-harness.v2.final", goal: input.goal, completed, completedTasks, notCompleted,
     blocker: blocker ?? null, next, evidenceRefs: sorted(evidenceRefs), response: input.response ?? summary, usage: { ...input.usage },
     stepCount: input.stepCount, toolCallCount: input.toolCallCount, terminalReason: input.terminalReason, summary,
   }
+}
+
+function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
+export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummaryBinding | undefined, current: TaskGraphFinalSummaryBinding | undefined, finalContent: unknown, response: string): boolean {
+  if (!expected || !current) return expected === undefined && current === undefined
+  if (!sameTaskGraphFinalSummaryBinding(expected, current)) return false
+  let saved: unknown
+  try { saved = JSON.parse(response) as unknown } catch { return false }
+  const summary = formatTaskGraphFinalSummary(expected.summary)
+  return record(saved).summary === summary && record(record(finalContent).final).summary === summary
 }
 
 export function serializeFinalResponse(response: FinalResponse): string {

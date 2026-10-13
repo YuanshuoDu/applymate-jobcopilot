@@ -46,6 +46,8 @@ describe("internal agent runtime usage route", () => {
     mocks.resolveAiAccess.mockResolvedValue("allowed")
     mocks.loadWorkerAiConfig.mockResolvedValue({ provider: "openai", model: "gpt-5.5" })
     expect((await POST(request({ "x-agent-worker-secret": "secret" }))).status).toBe(403)
+    mocks.loadWorkerAiConfig.mockResolvedValue({ provider: "minimax", model: "MiniMax-M3" })
+    expect((await POST(request({ "x-agent-worker-secret": "secret" }, { operation: "authorize", input: { ...admission, provider: "anthropic", model: "claude-sonnet-5" } }))).status).toBe(403)
     expect(mocks.admitAiUsage).not.toHaveBeenCalled()
   })
 
@@ -70,6 +72,18 @@ describe("internal agent runtime usage route", () => {
     }) as never)
     expect(response.status).toBe(200)
     expect(mocks.settleAiUsage).toHaveBeenCalledOnce()
+    expect(mocks.loadWorkerAiConfig).not.toHaveBeenCalled()
+  })
+
+  it("releases a deterministic pre-provider route reservation through the authenticated endpoint", async () => {
+    const { POST } = await import("./route")
+    const response = await POST(new Request("http://localhost", {
+      method: "POST", headers: { "x-agent-worker-secret": "secret", "content-type": "application/json" },
+      body: JSON.stringify({ operation: "release", input: admission }),
+    }) as never)
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ status: "released" })
+    expect(mocks.settleAiUsage).toHaveBeenCalledWith(expect.anything(), { ...admission, status: "released" })
     expect(mocks.loadWorkerAiConfig).not.toHaveBeenCalled()
   })
 })

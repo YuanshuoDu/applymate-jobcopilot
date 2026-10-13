@@ -6,7 +6,8 @@ import { readNativeVerificationTerminalProofWithClient } from "./subagents/nativ
 import type { NativeVerificationPort, NativeVerificationRootGoalWitness, NativeVerificationTerminalProofReader } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitPort } from "./tools/coordination-types.js"
-import { RESET_NATIVE_SEMANTIC_PROGRESS, type TurnEngineCompletionGate, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnEngineCompletionGate, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import type { TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
@@ -15,6 +16,7 @@ import { withNativeVerificationFeedback } from "./canonical-turn-native-verifica
 import type { NativeVerificationRecovery } from "./canonical-turn-native-verification-recovery.js"
 import { nativeVerificationCompletionGate } from "./canonical-turn-native-verification.js"
 import { createNativeSemanticProgressTracker } from "./native-semantic-progress.js"
+import { createNativeSemanticRejectionObserver, type NativeSemanticProgressConfiguration } from "./canonical-turn-native-semantic-rejection.js"
 import { waitForNativeVerification } from "./canonical-turn-native-verification-wait.js"
 import { readNativeVerificationRecovery } from "./canonical-turn-native-verification-recovery.js"
 import { persistedFinalCandidate } from "./turns/turn-execution-final-candidate.js"
@@ -23,8 +25,13 @@ import { createAgentArtifactRepository, type AgentArtifactDraftHead, type AgentA
 import { loadSelectedJobArtifactContext } from "./subagents/selected-job-artifact-context.js"
 import { selectedJobArtifactCompletionGateWithWitness, type SelectedJobCompletionGraphWitness, type SelectedJobArtifactCompletionGateWithWitnessResult } from "./selected-job-completion-gate.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
+import { hasPendingSteerOrInvalidResult, hasUnresolvedPlanningSteering } from "./canonical-turn-steering-reconciliation.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "./subagents/steering-reconciliation-contract.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
+import { taskGraphFinalSummaryCopiesMatch } from "./finalizer.js"
+import type { AtomicTurnCompletionInput } from "./turns/turn-engine-types.js"
 
 export type NativeVerificationRuntime = Readonly<{
   port: NativeVerificationPort
@@ -40,20 +47,6 @@ export type NativeVerificationTerminalCheck = Readonly<{
   nativeVerificationPassed: boolean
   denial?: TurnEngineCompletionGateResult
 }>
-
-async function hasPendingSteerOrInvalidResult(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<boolean> {
-  const result = await client.query<{ hasPendingSteer: unknown }>(`SELECT EXISTS (
-    SELECT 1 FROM "agent_inputs"
-    WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3
-      AND "delivery" = 'steer' AND "status" IN ('accepted', 'queued')
-      AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL
-  ) AS "hasPendingSteer"`, [scope.sessionId, scope.userId, scope.turnId])
-  const rows: unknown = result?.rows
-  if (!Array.isArray(rows) || rows.length !== 1) return true
-  const row = rows[0]
-  if (!row || typeof row !== "object" || Array.isArray(row) || Object.keys(row).length !== 1 || !Object.hasOwn(row, "hasPendingSteer")) return true
-  return (row as Record<string, unknown>).hasPendingSteer !== false
-}
 
 /** Preserves the selected-job artifact gate as a server-owned sibling completion path. */
 export function createCanonicalSelectedJobCompletion(input: Readonly<{
@@ -93,13 +86,14 @@ export function createCanonicalTurnTerminalGuard(input: Readonly<{
   finalizeSelectedJob?: (client: PoolClient) => Promise<TurnEngineCompletionGateResult>
 }>): TurnEngineTerminalGuard | undefined {
   if (!input.enabled) return undefined
-  return async (client, terminal) => {
+  return async (client, terminal: AtomicTurnCompletionInput & Readonly<{ response: string }>) => {
     const native = await input.nativeVerification.checkTerminal(client, terminal)
     if (native.denial) return native.denial
-    if (input.checkRootGraph) {
-      const graph = await input.checkRootGraph(client, native.nativeVerificationPassed)
-      if (!graph) return { ok: false, blocker: "task_graph_verification_unverified", feedback: "TaskGraph completion verification is unavailable." }
-      if (!graph.ok) return graph
+    const graph = input.checkRootGraph ? await input.checkRootGraph(client, native.nativeVerificationPassed) : undefined
+    if (input.checkRootGraph && !graph) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph completion verification is unavailable." }
+    if (graph && !graph.ok) return graph
+    if (!taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph?.[TASK_GRAPH_FINAL_SUMMARY_BINDING], terminal.finalContent, terminal.response)) return {
+      ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph final summary is stale or unavailable. Re-read the current graph before completing.",
     }
     return input.finalizeSelectedJob ? input.finalizeSelectedJob(client) : { ok: true }
   }
@@ -115,6 +109,7 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
   interactiveDiscovery?: () => Promise<TurnEngineCompletionGateResult>
   selectedJobMode: boolean
   selectedJobCompletion?: () => Promise<TurnEngineCompletionGateResult>
+  readTaskGraphDenialCheckpoint?: () => Promise<TaskGraphDenialCheckpoint | null>
 }>): TurnEngineCompletionGate | undefined {
   if (!input.enabled) return undefined
   const gate: TurnEngineCompletionGate = async ({ stepId, candidateText }) => {
@@ -123,13 +118,16 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
     if (native) return native
     const children = await input.checkChildren()
     if (children && !children.ok) return children
-    if (input.interactiveDiscovery) return input.interactiveDiscovery()
+    const carryGraphSummary = (result: TurnEngineCompletionGateResult) => result.ok && children?.ok && children[TASK_GRAPH_FINAL_SUMMARY_BINDING]
+      ? { ...result, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: children[TASK_GRAPH_FINAL_SUMMARY_BINDING] } : result
+    if (input.interactiveDiscovery) return carryGraphSummary(await input.interactiveDiscovery())
     if (!input.selectedJobMode) return children ?? { ok: true }
-    return input.selectedJobCompletion ? input.selectedJobCompletion() : {
+    return carryGraphSummary(input.selectedJobCompletion ? await input.selectedJobCompletion() : {
       ok: false, blocker: "selected_job_draft_review_required", feedback: "Selected-job completion verification is unavailable.",
-    }
+    })
   }
   if (input.nativeVerification.resetSemanticProgress) gate[RESET_NATIVE_SEMANTIC_PROGRESS] = input.nativeVerification.resetSemanticProgress
+  if (input.readTaskGraphDenialCheckpoint) gate[READ_TASK_GRAPH_DENIAL_CHECKPOINT] = input.readTaskGraphDenialCheckpoint
   return gate
 }
 
@@ -175,10 +173,11 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
   enabled: boolean
 }>): Readonly<{
   port: NativeVerificationPort
+  configureSemanticProgress(input: NativeSemanticProgressConfiguration): void
   recover(): Promise<NativeVerificationRecovery>
   checkCompletion(stepId: string, candidateText: string): Promise<TurnEngineCompletionGateResult | null>
   resetSemanticProgress(): void
-  checkTerminal(client: Pick<PoolClient, "query">, terminal: Readonly<{ finalContent: unknown; response: unknown }>): Promise<NativeVerificationTerminalCheck>
+  checkTerminal(client: Pick<PoolClient, "query">, terminal: Readonly<{ stepId?: string; finalContent: unknown; response: unknown }>): Promise<NativeVerificationTerminalCheck>
   accepted(): boolean
 }> {
   const runtime = input.factory?.(input.pool) ?? {
@@ -188,10 +187,12 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
   let acceptedWitness: NativeVerificationRootGoalWitness | undefined
   let acceptedCandidate: string | undefined
   const semanticProgress = createNativeSemanticProgressTracker()
+  const semanticRejection = createNativeSemanticRejectionObserver({ tracker: semanticProgress, port: runtime.port })
   return {
     port: runtime.port,
+    configureSemanticProgress: semanticRejection.configure,
     accepted: () => acceptedWitness !== undefined,
-    resetSemanticProgress() { semanticProgress.reset() },
+    resetSemanticProgress() { semanticRejection.reset() },
     async recover() {
       if (!input.enabled || !await input.coordination.hasNativeTasks()) return {}
       return readNativeVerificationRecovery({ port: runtime.port, scope: input.coordination.readScope() })
@@ -201,6 +202,10 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
       acceptedCandidate = undefined
       let observedSemanticReject = false
       try {
+        if (input.enabled && await hasUnresolvedPlanningSteering(input.pool, input.coordination.executionScope(stepId))) {
+          semanticRejection.reset()
+          return { ok: false, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK }
+        }
         const result = await nativeVerificationCompletionGate({
           candidateText,
           scope: () => input.coordination.executionScope(stepId),
@@ -208,16 +213,16 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
           hasNativeTasks: input.enabled ? input.coordination.hasNativeTasks : async () => false,
           checkReceipt: input.coordination.checkNativeGraphCompletion,
           wait: (scope, targetTaskIds) => waitForNativeVerification({ port: input.durableWaitPort, scope, targetTaskIds }),
-          observeRootSemanticRejection: controlTaskId => {
+          observeRootSemanticRejection: ({ scope, candidateText, controlTaskId }) => {
             observedSemanticReject = true
-            return semanticProgress.observe({ candidateText, controlTaskId, stepId })
+            return semanticRejection.observe({ scope, stepId, candidateText, controlTaskId })
           },
           accept: (witness, candidate) => { acceptedWitness = witness; acceptedCandidate = candidate },
         })
-        if (!observedSemanticReject) semanticProgress.reset()
+        if (!observedSemanticReject) semanticRejection.reset()
         return result
       } catch (error: unknown) {
-        semanticProgress.reset()
+        semanticRejection.reset()
         throw error
       }
     },
@@ -233,7 +238,7 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
         denial: { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "Current native proof does not match the final content being persisted." },
       }
       const nativeVerificationPassed = await runtime.readTerminalProof(client, {
-        scope: input.coordination.readScope(), candidateText, witness: acceptedWitness,
+        scope: input.coordination.readScope(), candidateText, witness: acceptedWitness, stepId: terminal.stepId,
       })
       return nativeVerificationPassed ? { nativeVerificationPassed: true } : {
         nativeVerificationPassed: false,

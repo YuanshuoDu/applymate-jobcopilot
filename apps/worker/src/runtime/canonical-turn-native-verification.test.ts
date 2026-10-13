@@ -4,7 +4,7 @@ import type { NativeVerificationFeedback } from "./subagents/native-verification
 import type { NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitResult } from "./tools/coordination-types.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS } from "./turns/turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION } from "./turns/turn-execution-types.js"
 import { nativeVerificationCompletionGate, nativeVerificationFeedbackText, verifyNativeRootCandidate } from "./canonical-turn-native-verification.js"
 
 const scope: TaskGraphExecutionScope = {
@@ -78,7 +78,7 @@ describe("nativeVerificationFeedbackText", () => {
       "evidence_conflict: reconcile current owned sources and resolve contradictions.",
       "does_not_meet_criterion: revise the answer against the criterion.",
       "unsupported_claim: remove the claim or support it with current owned evidence.",
-      "ambiguous: Resolve ambiguity from available evidence and seek user clarification when user-dependent, otherwise keep the uncertainty explicit."]
+      "ambiguous: Resolve ambiguity from current owned evidence; identify missing user facts and seek clarification when available, otherwise state uncertainty."]
     let prior = -1
     for (const action of actions) {
       const position = output.indexOf(action)
@@ -136,6 +136,16 @@ describe("nativeVerificationFeedbackText", () => {
       expect(output.length).toBeLessThanOrEqual(512)
       expect(output).not.toContain(status)
     }
+    expect(nativeVerificationFeedbackText("failed", [{ controlTaskId: "review-1", targetTaskId: "root-1", disposition: "failed",
+      criteria: [{ criterionId: "criterion-1", disposition: "failed", reasonCode: "invented", evidenceReferenceIds: [] }] }], true))
+      .toBe("Independent native verification is failed.")
+    expect(nativeVerificationFeedbackText("failed", [criterionFeedback({ reasonCode: "evidence_missing", disposition: "failed" })], true))
+      .toBe("Independent native verification is failed.")
+    expect(nativeVerificationFeedbackText("uncertain", [criterionFeedback({ reasonCode: "does_not_meet_criterion", disposition: "uncertain" })], true))
+      .toBe("Independent native verification is uncertain.")
+    const fallback = nativeVerificationFeedbackText("failed", [], true)
+    expect(fallback).toContain("Replan against verified criteria using current owned evidence.")
+    expect(fallback.length).toBeLessThanOrEqual(512)
   })
 
   it("preserves maximal complete criterion rows and skips rows that cannot fit without blocking later short rows", () => {
@@ -264,7 +274,22 @@ describe("nativeVerificationCompletionGate", () => {
     expect(result.feedback).toContain("does_not_meet_criterion: revise the answer against the criterion.")
     expect(result.feedback).not.toContain("Replan against verified criteria using current owned evidence.")
     expect(JSON.stringify(result)).not.toContain("owned-root-control")
-    expect(observe).toHaveBeenCalledWith("owned-root-control")
+    expect(observe).toHaveBeenCalledWith({ scope, candidateText, controlTaskId: "owned-root-control" })
+  })
+
+  it("carries only a strict private identity for a current failed root control", async () => {
+    const identity = { candidateDigest: digestNativeVerificationValue(candidateText), controlTaskId: "owned-root-control",
+      controlOperationId: "owned-operation", controlAttempt: 2, controlReportDigest: "f".repeat(64), inputThroughSequence: 5n }
+    const port: NativeVerificationPort = {
+      ensureChildren: vi.fn(async () => passed), ensureRootGoal: vi.fn(async () => rootFailed()), readRecoverableGoal: vi.fn(async () => null),
+    }
+    const observe = vi.fn(async () => identity)
+    const result = await nativeVerificationCompletionGate({ candidateText, scope, port, hasNativeTasks: async () => true,
+      checkReceipt: async () => null, wait: vi.fn(), accept: vi.fn(), observeRootSemanticRejection: observe })
+    if (!result || result.ok) throw new Error("expected a rejected native verification decision")
+    expect(result[NATIVE_SEMANTIC_REJECTION]).toEqual(identity)
+    expect(JSON.stringify(result)).not.toContain("owned-operation")
+    expect(observe).toHaveBeenCalledWith({ scope, candidateText, controlTaskId: "owned-root-control" })
   })
 
   it("does not count foreign, duplicate, uncertain, or control-unowned root feedback", async () => {

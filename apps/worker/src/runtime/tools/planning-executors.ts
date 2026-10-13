@@ -1,16 +1,16 @@
 import { Type, type TSchema } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
-import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
+import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
 import type {
   TaskGraphCommandPort,
-  TaskGraphExecutionScope,
   TaskGraphScheduleReceipt,
   TaskGraphTaskTemplate,
 } from "../subagents/task-graph-command-port.js"
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
+import { createSteeringReconciliationTool, steeringReconciliationOperation, type ReconciliationFenceOptions } from "./steering-reconciliation.js"
 
 function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
   const evidence = Type.Object({ kind: Type.Literal("evidence_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false })
@@ -26,6 +26,15 @@ function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
         kind: Type.Literal("reported_score_gte"), minimumScore: Type.Number({ minimum: 0, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxScore }),
         minimumFindings: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }),
         aggregation: Type.Union([Type.Literal("any"), Type.Literal("all")]),
+      }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_from_scout_dependency"),
+        dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_cover_scout_candidates_gte"),
+        dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+        minimumPercent: Type.Integer({ minimum: 1, maximum: 100 }),
       }, { additionalProperties: false }),
     ]
   return Type.Union([evidence, ...roleChecks] as [TSchema, ...TSchema[]])
@@ -44,7 +53,7 @@ function verificationSchema(role: TaskGraphVerificationRole): TSchema {
 
 function repairOfSchema(): TSchema {
   return Type.Object({
-    graphRootTaskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    graphRootTaskId: Type.Optional(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength })),
     nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
     taskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
     criterionIds: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
@@ -82,22 +91,16 @@ function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?:
 
 export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ minLength: 1, maxLength: 128 }))
 
-export type TaskGraphProposalInput = TaskGraphProposal
+type ModelTaskGraphRepairOf = Omit<TaskGraphRepairOf, "graphRootTaskId"> & Readonly<{ graphRootTaskId?: string }>
+type ModelTaskGraphNodeProposal = Omit<TaskGraphNodeProposal, "repairOf"> & Readonly<{ repairOf?: ModelTaskGraphRepairOf }>
+export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{ nodes: readonly ModelTaskGraphNodeProposal[] }>
 
-export type PlanningExecutorOptions = Readonly<{
+export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
-  turnLeaseOwner: string
-  turnLeaseVersion: number
-  parentLeaseOwner: string
-  parentAttemptCount: () => number | null | undefined
 }>
 
-export type PlanningRegistrationOptions = Readonly<{
-  turnLeaseOwner: string
-  turnLeaseVersion: number
-  parentLeaseOwner: string
-  parentAttemptCount: () => number | null | undefined
+export type PlanningRegistrationOptions = ReconciliationFenceOptions & Readonly<{
   commandPort?: TaskGraphCommandPort
   templates?: Readonly<Record<string, TaskGraphTaskTemplate>>
 }>
@@ -115,30 +118,6 @@ const ReceiptSchema = Type.Object({
   nodes: Type.Array(Type.Object({ key: Id, taskId: Id, status: TaskStatusSchema }, { additionalProperties: false })),
   readyTaskIds: Type.Array(Id),
 }, { additionalProperties: false })
-
-function executionScope(context: ToolExecutionContext, options: PlanningExecutorOptions): TaskGraphExecutionScope {
-  const { rootTaskId, taskId } = context
-  const parentAttemptCount = options.parentAttemptCount()
-  if ([context.scope.userId, context.sessionId, context.turnId, context.stepId, options.parentLeaseOwner]
-    .some(value => !value.trim()) || typeof rootTaskId !== "string" || !rootTaskId.trim() ||
-    typeof taskId !== "string" || !taskId.trim() ||
-    taskId !== rootTaskId || !options.turnLeaseOwner.trim() || !Number.isSafeInteger(options.turnLeaseVersion) || options.turnLeaseVersion < 1 ||
-    typeof parentAttemptCount !== "number" || !Number.isSafeInteger(parentAttemptCount) || parentAttemptCount < 1) {
-    throw new ToolExecutionError("task_graph_scope_unavailable", "The server could not establish the active root task fence")
-  }
-  return {
-    userId: context.scope.userId,
-    sessionId: context.sessionId,
-    turnId: context.turnId,
-    stepId: context.stepId,
-    rootTaskId,
-    parentTaskId: taskId,
-    turnLeaseOwner: options.turnLeaseOwner,
-    turnLeaseVersion: options.turnLeaseVersion,
-    parentLeaseOwner: options.parentLeaseOwner,
-    parentAttemptCount: Number(parentAttemptCount),
-  }
-}
 
 function scheduleErrorCode(error: unknown): string {
   if (error && typeof error === "object" && "code" in error && typeof error.code === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(error.code)) {
@@ -179,23 +158,35 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
-    const scope = executionScope(context, options)
+    const operation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
+    const scope = operation.scope
+    const proposal: TaskGraphProposal = {
+      expectedRevision: input.expectedRevision,
+      nodes: input.nodes.map(node => {
+        const repairOf = node.repairOf
+        if (repairOf?.graphRootTaskId !== undefined && repairOf.graphRootTaskId !== scope.rootTaskId) {
+          throw new ToolExecutionError("task_graph_repair_root_mismatch", "The repair target does not belong to the active root task", { code: "task_graph_repair_root_mismatch" })
+        }
+        return {
+          key: node.key, templateId: node.templateId, goal: node.goal,
+          successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn],
+          ...(node.verification ? { verification: node.verification } : {}),
+          ...(repairOf ? { repairOf: { ...repairOf, graphRootTaskId: scope.rootTaskId, criterionIds: [...repairOf.criterionIds] } } : {}),
+        }
+      }),
+    }
     try {
-      const receipt = await options.commandPort.appendAndSchedule({
+      if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {
+        throw new ToolExecutionError("steering_reconciliation_unavailable", "TaskGraph revision requires an atomic reconciliation-capable port")
+      }
+      const receipt = await options.commandPort.appendAndScheduleWithReconciliation({
         scope,
-        proposal: {
-          expectedRevision: input.expectedRevision,
-          nodes: input.nodes.map(node => ({
-            key: node.key, templateId: node.templateId, goal: node.goal,
-            successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn],
-            ...(node.verification ? { verification: node.verification } : {}),
-            ...(node.repairOf ? { repairOf: { ...node.repairOf, criterionIds: [...node.repairOf.criterionIds] } } : {}),
-          })),
-        },
+        proposal,
         templates: options.templates,
-      })
+      }, operation)
       return receipt
     } catch (error: unknown) {
+      if (error instanceof ToolExecutionError) throw error
       const code = scheduleErrorCode(error)
       throw new ToolExecutionError(code, "TaskGraph proposal could not be durably scheduled", safeScheduleError(error, code))
     }
@@ -204,7 +195,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     schemaVersion,
     name: "agent.plan",
     version: "1",
-    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte. Use only checks allowed for that role. A repair uses repairOf={graphRootTaskId,nodeKey,taskId,criterionIds} for a prior typed same-template node, repeats exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
+    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte. Use only checks allowed for that role. findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. findings_cover_scout_candidates_gte is Analyst-only; use it only when the plan explicitly declares a cohort percentage, with a direct Scout dependency and minimumPercent from 1 to 100. Omitting it preserves normal top-N selection; do not infer a percentage or require processing of every candidate. A repair uses repairOf={nodeKey,taskId,criterionIds} for a prior typed same-template node; omit graphRootTaskId because the server binds the active Root. A matching legacy graphRootTaskId is accepted, but a mismatch is rejected. Repeat exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf.\nTaskGraph maxNodes is an eight-node lifetime history cap, separate from active-child concurrency. When present, read the current owner-scoped task_graph_current.nodeCapacity: remaining is total space; ordinaryRemaining is the ordinary-addition budget while reserveActive is true. In a typed graph before its first accepted repair, preserve one global final slot for a valid failed-target criterion repair. A valid proposal containing that repair may use the reserve in any node order but must fit remaining and the hard eight-node cap; the server still validates the exact current failed target and unresolved criteria. An accepted repair relation consumes the reserve even while queued or if it later fails; it does not pass a criterion, make the target successful, or promise another retry. Refresh current state and use remaining honestly; do not spend the reserve with agent.spawn or agent.followup.\nIf agent.plan returns task_graph_repair_conflict, inspect or refresh the current owner-scoped graph. If an overlapping repair is active, wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits; if none is active, correct the rejected batch so each target/criterion has only one proposed attempt, then replan. An active repair is not evidence of success.\nWait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
     capabilities: ["coordination"],
     inputSchema: proposalInputSchema(templateIdSchema, templates),
     outputSchema: ReceiptSchema,
@@ -225,4 +216,7 @@ export function registerTaskGraphPlanningTool(
   if (!enabled) return
   if (!options.commandPort || !options.templates || Object.keys(options.templates).length === 0 || !registry.register) throw new Error("task_graph_runtime_dependencies_unavailable")
   registry.register(createTaskGraphPlanningTool({ ...options, commandPort: options.commandPort, templates: options.templates }))
+  if (typeof options.commandPort.reconcileSteering === "function") {
+    registry.register(createSteeringReconciliationTool(options.commandPort, options))
+  }
 }

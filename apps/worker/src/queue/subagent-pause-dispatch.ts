@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { AgentTreeManager } from "../runtime/subagents/manager.js"
+import { parseSubagentDispatchIdentity, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, type SubagentDispatchIdentity } from "../runtime/subagents/dispatch-identity.js"
 import { assertSessionWorkAdmission, isSessionPauseRequestedError, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION } from "../runtime/session-gate.js"
 import { PAUSE_DEFERRED_MARKER, parseSubagentJobPayload, type PgSubagentPool, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
 
@@ -59,31 +60,35 @@ export async function markPauseAwareDispatchError(pool: PgSubagentPool, id: stri
 
 type Executor = (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>
 export async function runSubagentQueueJob(
-  pool: PgSubagentPool, manager: Pick<AgentTreeManager, "run">, execute: Executor, payload: SubagentJobPayload,
+  pool: PgSubagentPool, manager: Pick<AgentTreeManager, "run">, execute: Executor, payload: SubagentJobPayload, dispatchIdentity?: SubagentDispatchIdentity,
 ): Promise<Awaited<ReturnType<AgentTreeManager["run"]>>> {
-  const outcome = await manager.run(payload, execute)
+  const outcome = await manager.run(payload, execute, dispatchIdentity)
   if (outcome.status === "lease_lost") throw new Error(outcome.reason ?? "Subagent lease was lost")
-  if (outcome.status === "skipped" && outcome.reason === "session_pause_requested") await deferPauseDeniedDispatch(pool, payload)
+  if (outcome.status === "skipped" && outcome.reason === "session_pause_requested"
+    && await deferPauseDeniedDispatch(pool, payload, dispatchIdentity)) {
+    return { taskId: payload.taskId, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH }
+  }
   return outcome
 }
 
-async function deferPauseDeniedDispatch(pool: PgSubagentPool, payload: SubagentJobPayload): Promise<void> {
-  await transaction(pool, async client => {
+/** Returns true only when a supplied identity cannot bind the locked published dispatch. */
+async function deferPauseDeniedDispatch(pool: PgSubagentPool, payload: SubagentJobPayload, dispatchIdentity?: SubagentDispatchIdentity): Promise<boolean> {
+  return transaction(pool, async client => {
     const session = await client.query<{ id: string; userId: string }>(`SELECT session."id", session."userId" FROM "agent_sessions" AS session
       WHERE session."id" = $1 AND session."status" NOT IN ('aborted', 'archived') FOR UPDATE`, [payload.sessionId])
     const userId = session.rows[0]?.userId
-    if (!userId) return
+    if (!userId) return false
     await client.query("SELECT set_config('app.user_id', $1, true)", [userId])
     const binding = await client.query<{ turnId: string; rootTaskId: string }>(`SELECT task."turnId", task."rootTaskId" FROM "sub_agent_tasks" AS task
       WHERE task."id" = $1 AND task."sessionId" = $2`, [payload.taskId, payload.sessionId])
     const turnId = binding.rows[0]?.turnId
-    if (!turnId || binding.rows[0]?.rootTaskId !== payload.rootTaskId) return
+    if (!turnId || binding.rows[0]?.rootTaskId !== payload.rootTaskId) return false
     const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
       AND "status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled') FOR UPDATE`, [turnId, payload.sessionId, userId])
-    if (!turn.rows[0]) return
+    if (!turn.rows[0]) return false
     const root = await client.query<Record<string, unknown>>(`SELECT root."id", root."status", root."interruptRequestedAt" FROM "sub_agent_tasks" AS root
       WHERE root."id" = $1 AND root."sessionId" = $2 AND root."turnId" = $3 FOR UPDATE`, [payload.rootTaskId, payload.sessionId, turnId])
-    if (!root.rows[0] || root.rows[0].interruptRequestedAt != null || TERMINAL.includes(String(root.rows[0].status))) return
+    if (!root.rows[0] || root.rows[0].interruptRequestedAt != null || TERMINAL.includes(String(root.rows[0].status))) return false
     const task = await client.query<Record<string, unknown>>(`SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", task."status",
         task."startedAt", task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt"
       FROM "sub_agent_tasks" AS task
@@ -92,15 +97,20 @@ async function deferPauseDeniedDispatch(pool: PgSubagentPool, payload: SubagentJ
     const row = task.rows[0]
     if (!row || row.status !== "queued" || row.startedAt != null
       || row.leaseOwner != null || row.leaseExpiresAt != null || row.interruptRequestedAt != null
-      || Number(row.attemptCount) >= Number(row.maxAttempts)) return
-    const dispatch = await client.query<{ id: string; payload: unknown; publishedAt: Date | null; lastError: string | null }>(`SELECT dispatch."id", dispatch."payload", dispatch."publishedAt", dispatch."lastError"
+      || Number(row.attemptCount) >= Number(row.maxAttempts)) return false
+    const dispatch = await client.query<{ id: string; payload: unknown; publishedAt: Date | null; lastError: string | null; attemptCount: unknown }>(`SELECT dispatch."id", dispatch."payload", dispatch."publishedAt", dispatch."lastError", dispatch."attemptCount"
       FROM "agent_outbox" AS dispatch WHERE dispatch."topic" = $1 AND dispatch."aggregateId" = $2
         AND dispatch."idempotencyKey" = $3 FOR UPDATE`, [DISPATCH_TOPIC, payload.sessionId, `subagent-dispatch:${payload.taskId}`])
     const current = dispatch.rows[0]
     const currentPayload = current ? parseSubagentJobPayload(current.payload) : null
     if (!current || !currentPayload || currentPayload.ownerId !== payload.ownerId || currentPayload.taskId !== payload.taskId
-      || currentPayload.sessionId !== payload.sessionId || currentPayload.rootTaskId !== payload.rootTaskId) return
-    if (current.lastError === PAUSE_DEFERRED_MARKER && current.publishedAt !== null) return
+      || currentPayload.sessionId !== payload.sessionId || currentPayload.rootTaskId !== payload.rootTaskId) return dispatchIdentity !== undefined
+    if (dispatchIdentity) {
+      const identity = parseSubagentDispatchIdentity(dispatchIdentity, payload.taskId)
+      const attemptCount = Number(current.attemptCount)
+      if (!identity || current.publishedAt === null || !Number.isSafeInteger(attemptCount) || attemptCount !== identity.generation + 1) return true
+    }
+    if (current.lastError === PAUSE_DEFERRED_MARKER && current.publishedAt !== null) return false
     const nextPayload = current.publishedAt === null ? { ...currentPayload, ownerId: `deferred-${randomUUID()}` } : currentPayload
     await client.query(`UPDATE "agent_outbox" SET "lastError" = $2,
       "payload" = CASE WHEN "publishedAt" IS NULL THEN $3::jsonb ELSE "payload" END,
@@ -117,6 +127,7 @@ async function deferPauseDeniedDispatch(pool: PgSubagentPool, payload: SubagentJ
             AND root."interruptRequestedAt" IS NULL AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
     [current.id, PAUSE_DEFERRED_MARKER, JSON.stringify(nextPayload), payload.sessionId, DISPATCH_TOPIC, payload.taskId, payload.rootTaskId, userId])
+    return false
   })
 }
 
