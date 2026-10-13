@@ -20,6 +20,8 @@ import { restoreTaskGraphDenialProgress, TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
+  /** Original persisted Turn payload for canonical objective resolution only; never model context. */
+  readonly turnInput?: unknown
   readonly modelProfileSnapshot: RepositoryJsonValue
   readonly toolPolicySnapshot: unknown
   readonly budgetSnapshot: unknown
@@ -231,7 +233,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     validateAgendaResumeFence(restoredAgenda, stepsResult.rows)
     const intent = turnIntent(turn.input)
     const result = {
-      scope, goal, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {},
+      scope, goal, turnInput: turn.input, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {},
       ...(intent ? { intent } : {}),
       contextSnapshotPinned: turn.contextSnapshotId !== null && turn.contextSnapshotId !== undefined,
       steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(restored.pending.length ? { pendingToolCalls: restored.pending } : {}), ...(rootTaskId ? { rootTaskId } : {}),

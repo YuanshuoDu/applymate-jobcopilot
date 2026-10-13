@@ -197,6 +197,37 @@ describe("canonical Turn context builder", () => {
     expect(calls).toEqual([])
   })
 
+  it("adds only validated criteria to planning Root requests and preserves child/no-planning modes", async () => {
+    const goal = "Find EU roles"
+    const turnInput = { input: { goal, successCriteria: ["Turn criterion", "Shared criterion"], privateTurnId: "PRIVATE_TURN_ID" }, secret: "PRIVATE_TURN_SECRET" }
+    const rootTaskObjective = { goal, successCriteria: ["Root criterion", "Shared criterion"], id: "PRIVATE_ROOT_ID", context: "PRIVATE_ROOT_CONTEXT" }
+    const buildRequest = async (planningEnabled: boolean, selectedJobMode: boolean) => {
+      const calls: unknown[] = []
+      const inputStore = store(calls)
+      const builder = createCanonicalTurnContextBuilder({
+        pool: { connect: async () => { throw new Error("injected readers should avoid a client") } } as unknown as Pick<pg.Pool, "connect">,
+        store: inputStore, baseBuilder: new StepContextBuilder(inputStore), scope, lease, rootTaskId: "root-a", rootAttemptCount: 1,
+        planningEnabled, selectedJobMode, turnInput, rootTaskObjective,
+        rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
+      })
+      const context = await builder.build({
+        scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "criteria-step",
+        snapshot: { system: [], profile: [], goal: { id: "turn-goal", content: goal }, steerHistory: [], businessRefs: [], toolObservations: [] },
+      })
+      const model = { profile: { provider: "fixture", model: "fixture", nativeTools: false, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+      return buildModelRequest({ context, model, tools: [], sessionId: lease.sessionId, turnId: lease.turnId, stepId: "criteria-step", userId: scope.userId, taskId: "root-a", signal: new AbortController().signal })
+    }
+    const request = await buildRequest(true, false)
+    const criteriaBlock = request.messages.flatMap(message => message.content).find(part => part.type === "text" && part.text.includes("root_task_success_criteria"))
+    expect(criteriaBlock?.type).toBe("text")
+    if (criteriaBlock?.type !== "text") throw new Error("goal_criteria_block_missing")
+    expect(criteriaBlock.text).toContain('["Turn criterion","Shared criterion","Root criterion"]')
+    expect(request.messages.some(message => message.role === "system" && message.content.some(part => part.type === "text" && part.text.includes("Turn criterion")))).toBe(false)
+    expect(JSON.stringify(request.messages)).not.toMatch(/PRIVATE_TURN_ID|PRIVATE_TURN_SECRET|PRIVATE_ROOT_ID|PRIVATE_ROOT_CONTEXT/)
+    expect(JSON.stringify((await buildRequest(false, false)).messages)).not.toContain("root_task_success_criteria")
+    expect(JSON.stringify((await buildRequest(true, true)).messages)).not.toContain("root_task_success_criteria")
+  })
+
   it("adds bounded Root-task history as untrusted advisory context without changing current graph evidence", async () => {
     const outcomes: readonly ValidatedRootTaskHistoryOutcome[] = [{
       sourceTurnId: "private-earlier-turn", sourceRootTaskId: "private-earlier-root", terminalSequence: 12n,

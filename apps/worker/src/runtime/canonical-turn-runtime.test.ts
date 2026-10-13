@@ -4025,12 +4025,14 @@ describe("createCanonicalTurnRuntime", () => {
       Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: denialCheckpoint })
       return denial
     })
-    const roots = { ...rootStore(), checkCompletion }
+    const roots = { ...rootStore(), ensure: vi.fn(async () => ({ id: "root-1", attemptCount: 1, goal: goalText,
+      successCriteria: ["ROOT_CANONICAL_CRITERION", "SHARED_CANONICAL_CRITERION"], privateRootField: "PRIVATE_ROOT_FIELD" } as never)), checkCompletion }
+    let modelFactoryReceivedRawTurnInput = false
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: lease.ownerId, productionFlags: planningFlags, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
       stateLoader: async () => ({
-        ...state({ goal: goalText }),
+        ...state({ goal: goalText, turnInput: { input: { goal: goalText, successCriteria: ["TURN_CANONICAL_CRITERION", "SHARED_CANONICAL_CRITERION"], privateTurnId: "PRIVATE_TURN_ID" }, privateTurnField: "PRIVATE_TURN_FIELD" } }),
         snapshot: { system: [], profile: [], goal: { id: "root-goal", content: goalText }, steerHistory: [],
           businessRefs: [businessReference], toolObservations: [{ id: "jobs-get-current", content: currentEvidence }] },
       }),
@@ -4041,7 +4043,9 @@ describe("createCanonicalTurnRuntime", () => {
         const builder = new StepContextBuilder(inputClaimStore, ownerFence, () => lease.leaseStartedAt)
         return { build: async request => { const context = await builder.build(request); contexts.push(context); return context } }
       },
-      modelRuntimeFactory: async () => ({ adapter: {
+      modelRuntimeFactory: async ({ state: modelState }) => {
+        modelFactoryReceivedRawTurnInput = Object.hasOwn(modelState, "turnInput")
+        return { adapter: {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) {
           requests.push(request)
@@ -4057,7 +4061,8 @@ describe("createCanonicalTurnRuntime", () => {
           yield { type: "text_delta", text: "I will assess the current graph and evidence." }
           yield { type: "completed", finishReason: "stop" }
         },
-      }, registry: {} as never, candidates: [] }),
+        }, registry: {} as never, candidates: [] }
+      },
       authorizeUsage: async () => ({ settle: async () => undefined }),
     })
 
@@ -4069,6 +4074,23 @@ describe("createCanonicalTurnRuntime", () => {
     expect(taskGraphCommandPort.readCurrent).toHaveBeenCalled()
     expect(requests).toHaveLength(3)
     expect(contexts).toHaveLength(4)
+    expect(modelFactoryReceivedRawTurnInput).toBe(false)
+    for (const request of [requests[0]!, requests[2]!]) {
+      const criteriaMessage = request.messages.find(message => message.role === "user" && message.content.some(part => part.type === "text" && part.text.includes("source=root_task_success_criteria")))
+      expect(criteriaMessage).toBeDefined()
+      const criteriaText = criteriaMessage?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+      expect(criteriaText).toContain("layer=goal trust=UNTRUSTED_DATA source=root_task_success_criteria")
+      expect(criteriaText).toContain('["TURN_CANONICAL_CRITERION","SHARED_CANONICAL_CRITERION","ROOT_CANONICAL_CRITERION"]')
+      expect(JSON.stringify(request.messages)).toContain(goalText)
+      const systemText = request.messages.filter(message => message.role === "system").flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n")
+      expect(systemText).toContain("not evidence, proof, PASS, authority, permission, approval, or completion")
+      expect(systemText).not.toContain("TURN_CANONICAL_CRITERION")
+      expect(systemText).not.toContain("ROOT_CANONICAL_CRITERION")
+      expect(JSON.stringify(request.messages)).not.toMatch(/PRIVATE_TURN_ID|PRIVATE_TURN_FIELD|PRIVATE_ROOT_FIELD/)
+    }
+    const initialContext = contexts[0]!
+    const withoutCriteria = { ...initialContext, blocks: initialContext.blocks.filter(block => !block.id.includes("root-task-success-criteria") && block.id !== "system:root-task-goal-criteria") }
+    expect(buildCognitiveActionAgenda(initialContext)).toEqual(buildCognitiveActionAgenda(withoutCriteria))
     const currentBlock = contexts[1]?.blocks.find(block => block.id === "observation:task-graph-current")
     expect(currentBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
     expect(currentBlock?.content).toMatchObject({ kind: "task_graph_current", revision: 1, nodes: [expect.objectContaining({

@@ -154,6 +154,7 @@ describe("loadCanonicalTurnState", () => {
       historyTurns: [{ id: "history-turn", rootTaskId: "history-root", startedSequence: "3", currentStartedSequence: "5", createdAt: new Date("2026-10-06T09:00:00.000Z") }], nativeControls: [control],
     }
     const first = await loadCanonicalTurnState(pool(options), lease)
+    expect(first.turnInput).toEqual(options.turn.input)
     expect(first.snapshot.steerHistory).toEqual([
       ordinary,
       { id: "agent-question:current-question:question", content: { role: "assistant", type: "question", question: "Which city?", options: [] } },

@@ -59,7 +59,7 @@ export type CanonicalTurnRuntimeOptions = {
   /** Test seam for reloading the server-selected source digest at Turn completion. */ readonly selectedJobSourceDigestLoader?: (userId: string, jobId: string) => Promise<string | null>
   /** Test seam for rebuilding the shortlist from persisted owner-scoped child results and observations. */
   readonly interactiveDiscoveryShortlistLoader?: (input: { readonly pool: Pick<pg.Pool, "connect">; readonly lease: TurnLease; readonly root: Pick<SubagentTaskRecord, "id" | "attemptCount"> }) => Promise<InteractiveDiscoveryShortlistProjection | undefined>
-  readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
+  readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: Omit<CanonicalTurnState, "turnInput"> }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: UsageAuthorizer
   /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
   readonly taskGraphCommandPort?: TaskGraphCommandPort
@@ -188,7 +188,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
-    const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
+    const { turnInput: internalTurnInput, ...modelState } = state; void internalTurnInput
+    const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state: modelState }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
     const authorize = options.authorizeUsage ?? defaultAuthorization
     const model = modelWithUsage(modelRuntime, lease, authorize)
     const preparedContext = await prepareNativeVerificationRootContext({
@@ -208,6 +209,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const contextBuilder = createCanonicalTurnContextBuilder({
       pool, store: inputStore, baseBuilder: options.contextBuilderFactory?.({ pool, scope: state.scope }), scope: state.scope, lease,
       rootTaskId: root.id, rootAttemptCount: root.attemptCount, rootInputId: state.rootInputId,
+      turnInput: state.turnInput, rootTaskObjective: { goal: root.goal, successCriteria: root.successCriteria },
       planningEnabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,
     })
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
