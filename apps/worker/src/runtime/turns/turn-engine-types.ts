@@ -6,11 +6,12 @@ import type { TurnUsage } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
-import type { TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
+import type { TaskGraphDenialProgress, TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import type { ToolCallRecovery, TurnEngineToolResult } from "./turn-engine-tool-types.js"
 import type { TurnQuestionStore } from "./turn-question-contract.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -58,6 +59,7 @@ export type AtomicTurnCompletionInput = {
   readonly usage: TurnUsage
   /** Validated discovery output persisted in the root task's terminal receipt. */
   readonly interactiveDiscoveryShortlist?: RepositoryJsonValue
+  readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding
 }
 
 export type AtomicTurnCompletionResult =
@@ -117,7 +119,7 @@ export type TurnEngineStore = {
     now: Date
     terminal?: AtomicTurnCompletionInput
   }): Promise<void | AtomicTurnCompletionResult>
-} & Partial<TurnQuestionStore>
+} & import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore & Partial<TurnQuestionStore>
 
 export type TurnEngineToolExecutor = (input: {
   scope: TenantScope
@@ -189,12 +191,14 @@ export type TurnEngineOptions = {
   /** Server-classified restart repair for persisted tool calls, applied before another model request. */
   readonly toolCallRecovery?: readonly ToolCallRecovery[]
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
-} & Pick<TurnExecutionOptions, "refreshTaskGraphBeforeStep" | "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate">
+} & Pick<TurnExecutionOptions, "refreshTaskGraphBeforeStep" | "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate" | "nativeSemanticProgressMode" | "durableWaitControlReader" | "recoveredWaitControl">
 
 export type TurnResumeState = {
   readonly nextOrdinal: number
   readonly stepCount: number
   readonly toolCallCount: number
+  readonly finalEvidenceRecoveryUsed?: boolean
+  readonly taskGraphDenialProgress?: TaskGraphDenialProgress
   readonly inputThroughSequence: bigint
   readonly consumedInputIds: readonly string[]
   readonly usage: {

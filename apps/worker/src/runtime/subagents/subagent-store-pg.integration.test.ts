@@ -7,7 +7,10 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { RuntimeToolDefinition } from "../tools/types.js"
 
 import { PgSubagentTaskStore } from "./pg-store.js"
-import { defaultSubagentPolicy, type PgSubagentPool } from "./types.js"
+import { defaultSubagentPolicy, type PgSubagentPool, type SubagentJobPayload } from "./types.js"
+import { parseSubagentDispatchJobId, SubagentDispatchIdentityMismatchError, subagentDispatchJobId } from "./dispatch-identity.js"
+import { persistSubagentDispatch } from "../../queue/subagent-pause-dispatch.js"
+import { recoverMissingPublishedSubagentDispatches } from "../../queue/subagent-published-dispatch-recovery.js"
 import { createProductionChildExecutor } from "./production-child-runtime.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
@@ -144,6 +147,20 @@ const userA: UserFixture = {
       rootTaskId: `p1-subagent-root-a-usage-two-${suffix}`,
       taskId: `p1-subagent-task-a-usage-two-${suffix}`,
     },
+    {
+      sessionId: `p1-subagent-session-a-dispatch-${suffix}`,
+      turns: [{ id: `p1-subagent-turn-a-dispatch-${suffix}`, status: "in_progress" }],
+      turnId: `p1-subagent-turn-a-dispatch-${suffix}`,
+      rootTaskId: `p1-subagent-root-a-dispatch-${suffix}`,
+      taskId: `p1-subagent-task-a-dispatch-${suffix}`,
+    },
+    {
+      sessionId: `p1-subagent-session-a-recovery-${suffix}`,
+      turns: [{ id: `p1-subagent-turn-a-recovery-${suffix}`, status: "in_progress" }],
+      turnId: `p1-subagent-turn-a-recovery-${suffix}`,
+      rootTaskId: `p1-subagent-root-a-recovery-${suffix}`,
+      taskId: `p1-subagent-task-a-recovery-${suffix}`,
+    },
   ],
 }
 const userB: UserFixture = {
@@ -247,7 +264,7 @@ async function setRuntimeIdentity(client: PoolClient, userId: string): Promise<v
   await client.query("SELECT set_config('app.user_id', $1, false)", [userId])
 }
 
-function runtimePool(basePool: PgPool, userId: string, failures: PgQueryFailure[] = []): PgSubagentPool {
+function runtimePool(basePool: PgPool, userId: string, failures: PgQueryFailure[] = [], statements: string[] = []): PgSubagentPool {
   return {
     async connect() {
       const client = await basePool.connect()
@@ -256,6 +273,7 @@ function runtimePool(basePool: PgPool, userId: string, failures: PgQueryFailure[
           if (property === "query") {
             return (...args: unknown[]) => {
               const sql = queryText(args[0])
+              if (sql) statements.push(sql)
               try {
                 const result: unknown = Reflect.apply(target.query, target, args)
                 return Promise.resolve(result).catch(error => {
@@ -355,6 +373,8 @@ function utcMonth(date = new Date()): string {
 describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptance slice)", () => {
   const policy = { ...defaultSubagentPolicy(), maxConcurrency: 8 }
   const [fenceTree, treeA, treeAOther, usageTreeA, usageTreeB] = userA.trees
+  const dispatchTree = userA.trees[5]
+  const recoveryTree = userA.trees[6]
   const [treeB] = userB.trees
   let adminPool: PgPool | undefined
   let ownerAPool: PgPool | undefined
@@ -465,6 +485,187 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       [fenceTree!.taskId, fenceTree!.sessionId],
     )
     expect(completed.rows[0]).toMatchObject({ status: "completed", attemptCount: 2, result: { source: "current-attempt" } })
+  })
+
+  it("binds claims to the currently published Bull generation and exact outbox owner tuple", async () => {
+    const tree = dispatchTree!
+    const ownerId = `dispatch-owner-${suffix}`
+    const payload: SubagentJobPayload = { taskId: tree.taskId, sessionId: tree.sessionId, rootTaskId: tree.rootTaskId, ownerId }
+    const publicationPool = runtimePool(ownerAPool!, userA.userId)
+    const dispatchKey = `subagent-dispatch:${tree.taskId}`
+    const publishPersistedGeneration = async () => {
+      const published = await adminPool!.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
+        "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+        WHERE "aggregateId" = $1 AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`, [tree.sessionId, dispatchKey])
+      expect(published.rowCount).toBe(1)
+      const current = await adminPool!.query<{ attemptCount: number }>(`SELECT "attemptCount" FROM "agent_outbox"
+        WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey])
+      const attemptCount = Number(current.rows[0]?.attemptCount)
+      const identity = parseSubagentDispatchJobId(subagentDispatchJobId(tree.taskId, attemptCount - 1), tree.taskId)
+      if (!identity) throw new Error("The persisted published generation did not parse")
+      return identity
+    }
+    try {
+      await persistSubagentDispatch(publicationPool, payload)
+      const firstIdentity = await publishPersistedGeneration()
+      expect(firstIdentity).toEqual({ jobId: subagentDispatchJobId(tree.taskId, 0), taskId: tree.taskId, generation: 0 })
+
+      const firstLease = await ownerAStore.claim({ ...payload, dispatchIdentity: firstIdentity, policy, now: new Date() })
+      expect(firstLease).toMatchObject({ status: "running", leaseOwner: ownerId, attemptCount: 1 })
+      await expect(ownerAStore.release({ taskId: tree.taskId, sessionId: tree.sessionId, ownerId, attemptCount: 1, now: new Date() })).resolves.toBe(true)
+      const currentIdentity = await publishPersistedGeneration()
+      expect(currentIdentity).toEqual({ jobId: subagentDispatchJobId(tree.taskId, 2), taskId: tree.taskId, generation: 2 })
+
+      const readState = async () => {
+        const [task, dispatch, graphEvents] = await Promise.all([
+          adminPool!.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null }>(`SELECT "status", "attemptCount", "leaseOwner", "leaseExpiresAt" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [tree.taskId, tree.sessionId]),
+          adminPool!.query<{ payload: unknown; publishedAt: Date | null; attemptCount: number; lastError: string | null }>(`SELECT "payload", "publishedAt", "attemptCount", "lastError" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey]),
+          adminPool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`, [tree.sessionId, tree.turnId, tree.taskId]),
+        ])
+        return { task: task.rows[0], dispatch: dispatch.rows[0], graphEventCount: graphEvents.rows[0]?.count }
+      }
+
+      const beforeStale = await readState()
+      expect(beforeStale.task).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null, leaseExpiresAt: null })
+      expect(beforeStale.dispatch).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 3, lastError: null, payload })
+      await expect(ownerAStore.claim({ ...payload, dispatchIdentity: firstIdentity, policy, now: new Date() }))
+        .rejects.toBeInstanceOf(SubagentDispatchIdentityMismatchError)
+      await expect(ownerAStore.claim({ ...payload, ownerId: "wrong-owner", dispatchIdentity: currentIdentity, policy, now: new Date() }))
+        .rejects.toBeInstanceOf(SubagentDispatchIdentityMismatchError)
+      await expect(readState()).resolves.toEqual(beforeStale)
+
+      const publishedAt = beforeStale.dispatch?.publishedAt
+      await adminPool!.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey])
+      const unpublishedBefore = await readState()
+      await expect(ownerAStore.claim({ ...payload, dispatchIdentity: currentIdentity, policy, now: new Date() }))
+        .rejects.toBeInstanceOf(SubagentDispatchIdentityMismatchError)
+      await expect(readState()).resolves.toEqual(unpublishedBefore)
+      await adminPool!.query(`UPDATE "agent_outbox" SET "publishedAt" = $3 WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey, publishedAt])
+
+      const validPayload = beforeStale.dispatch?.payload
+      await adminPool!.query(`UPDATE "agent_outbox" SET "payload" = $3::jsonb WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey, JSON.stringify({ ...payload, extra: true })])
+      const malformedBefore = await readState()
+      await expect(ownerAStore.claim({ ...payload, dispatchIdentity: currentIdentity, policy, now: new Date() }))
+        .rejects.toBeInstanceOf(SubagentDispatchIdentityMismatchError)
+      await expect(readState()).resolves.toEqual(malformedBefore)
+      await adminPool!.query(`UPDATE "agent_outbox" SET "payload" = $3::jsonb WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey, JSON.stringify(validPayload)])
+
+      await expect(ownerAStore.claim({ ...payload, dispatchIdentity: currentIdentity, policy, now: new Date() }))
+        .resolves.toMatchObject({ status: "running", leaseOwner: ownerId, attemptCount: 2 })
+    } finally {
+      await adminPool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey])
+    }
+  })
+
+  it("clears only an old publication whose exact Bull job is missing and whose owner fence stays current", async () => {
+    const tree = recoveryTree!
+    const ownerId = `missing-job-owner-${suffix}`
+    const dispatchKey = `subagent-dispatch:${tree.taskId}`
+    const pauseKey = `missing-job-pause-${suffix}`
+    const payload: SubagentJobPayload = { taskId: tree.taskId, sessionId: tree.sessionId, rootTaskId: tree.rootTaskId, ownerId }
+    const workerStatements: string[] = []
+    const recoveryPool = runtimePool(ownerAPool!, userA.userId, [], workerStatements)
+
+    const resetCandidate = async () => {
+      await adminPool!.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [tree.sessionId, tree.turnId, pauseKey])
+      await adminPool!.query(`UPDATE "agent_sessions" SET "userId" = $2, "status" = 'running' WHERE "id" = $1`, [tree.sessionId, userA.userId])
+      await adminPool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $3, "status" = 'in_progress' WHERE "id" = $1 AND "sessionId" = $2`, [tree.turnId, tree.sessionId, tree.rootTaskId])
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "interruptRequestedAt" = NULL WHERE "id" = $1`, [tree.rootTaskId])
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'queued', "attemptCount" = 0, "startedAt" = NULL,
+        "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "interruptRequestedAt" = NULL, "nextAttemptAt" = NULL,
+        "result" = NULL, "failureReason" = NULL WHERE "id" = $1 AND "sessionId" = $2`, [tree.taskId, tree.sessionId])
+      const dispatch = await adminPool!.query(`UPDATE "agent_outbox" SET "payload" = $3::jsonb,
+        "publishedAt" = CURRENT_TIMESTAMP - INTERVAL '31 seconds', "attemptCount" = 1, "lastError" = NULL
+        WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey, JSON.stringify(payload)])
+      expect(dispatch.rowCount).toBe(1)
+    }
+    const readState = async () => {
+      const [session, turn, tasks, dispatch, events] = await Promise.all([
+        adminPool!.query(`SELECT "userId", "status" FROM "agent_sessions" WHERE "id" = $1`, [tree.sessionId]),
+        adminPool!.query(`SELECT "rootTaskId", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [tree.turnId, tree.sessionId]),
+        adminPool!.query(`SELECT "id", "status", "attemptCount", "startedAt", "leaseOwner", "leaseExpiresAt", "interruptRequestedAt", "result", "failureReason"
+          FROM "sub_agent_tasks" WHERE "sessionId" = $1 ORDER BY "id"`, [tree.sessionId]),
+        adminPool!.query(`SELECT "payload", "publishedAt", "attemptCount", "lastError" FROM "agent_outbox"
+          WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey]),
+        adminPool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2`, [tree.sessionId, tree.turnId]),
+      ])
+      return { session: session.rows[0], turn: turn.rows[0], tasks: tasks.rows, dispatch: dispatch.rows[0], eventCount: events.rows[0]?.count }
+    }
+
+    try {
+      await persistSubagentDispatch(recoveryPool, payload)
+      await resetCandidate()
+      const before = await readState()
+      expect(before.turn).toEqual({ rootTaskId: tree.rootTaskId, status: "in_progress" })
+      expect(before.dispatch).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1, payload })
+      let probeWasOutsideTransaction = false
+      const probes: string[] = []
+      const cleared = await recoverMissingPublishedSubagentDispatches(recoveryPool, {
+        getJob: async jobId => {
+          probes.push(jobId)
+          probeWasOutsideTransaction = workerStatements.at(-1) === "COMMIT"
+          return null
+        },
+      })
+      expect(cleared).toBe(1)
+      expect(probes).toEqual([subagentDispatchJobId(tree.taskId, 0)])
+      expect(probeWasOutsideTransaction).toBe(true)
+      expect(workerStatements.filter(sql => sql.startsWith('UPDATE "agent_outbox" AS dispatch SET "publishedAt" = NULL'))).toHaveLength(1)
+      const after = await readState()
+      expect(after).toEqual({ ...before, dispatch: { ...before.dispatch, publishedAt: null } })
+
+      const raceCases: Array<{ name: string; mutate: () => Promise<void> }> = [
+        { name: "payload owner", mutate: async () => { await adminPool!.query(`UPDATE "agent_outbox" SET "payload" = jsonb_set("payload", '{ownerId}', to_jsonb('new-owner'::text)) WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey]) } },
+        { name: "generation", mutate: async () => { await adminPool!.query(`UPDATE "agent_outbox" SET "attemptCount" = 2 WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey]) } },
+        { name: "publication", mutate: async () => { await adminPool!.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey]) } },
+        { name: "started", mutate: async () => { await adminPool!.query(`UPDATE "sub_agent_tasks" SET "startedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [tree.taskId]) } },
+        { name: "attempt", mutate: async () => { await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1 WHERE "id" = $1`, [tree.taskId]) } },
+        { name: "running", mutate: async () => { await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'running' WHERE "id" = $1`, [tree.taskId]) } },
+        { name: "paused session", mutate: async () => { await adminPool!.query(`UPDATE "agent_sessions" SET "status" = 'paused' WHERE "id" = $1`, [tree.sessionId]) } },
+        { name: "session owner", mutate: async () => { await adminPool!.query(`UPDATE "agent_sessions" SET "userId" = $2 WHERE "id" = $1`, [tree.sessionId, userB!.userId]) } },
+        { name: "terminal root", mutate: async () => { await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'failed' WHERE "id" = $1`, [tree.rootTaskId]) } },
+        { name: "root interrupt", mutate: async () => { await adminPool!.query(`UPDATE "sub_agent_tasks" SET "interruptRequestedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [tree.rootTaskId]) } },
+        { name: "terminal Turn", mutate: async () => { await adminPool!.query(`UPDATE "agent_turns" SET "status" = 'completed' WHERE "id" = $1`, [tree.turnId]) } },
+        { name: "Turn root binding", mutate: async () => { await adminPool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $3 WHERE "id" = $1 AND "sessionId" = $2`, [tree.turnId, tree.sessionId, tree.taskId]) } },
+        { name: "pause request", mutate: async () => {
+          const sequence = await adminPool!.query<{ sequence: string }>(`SELECT (COALESCE(MAX("sequence"), 0) + 1)::text AS "sequence" FROM "agent_events" WHERE "sessionId" = $1`, [tree.sessionId])
+          await adminPool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+            VALUES ($1, $2, $3, NULL, NULL, $4, 'session.pause_requested', 'user', $3, $5, '{}'::jsonb)`,
+          [randomUUID(), tree.sessionId, tree.turnId, sequence.rows[0]!.sequence, pauseKey])
+        } },
+      ]
+      for (const race of raceCases) {
+        await resetCandidate()
+        const calls: string[] = []
+        let stateAtProbe: unknown
+        let outsideTransaction = false
+        workerStatements.length = 0
+        const result = await recoverMissingPublishedSubagentDispatches(recoveryPool, {
+          getJob: async jobId => {
+            calls.push(jobId)
+            outsideTransaction = workerStatements.at(-1) === "COMMIT"
+            await race.mutate()
+            stateAtProbe = await readState()
+            return null
+          },
+        })
+        expect(result, race.name).toBe(0)
+        expect(calls, race.name).toEqual([subagentDispatchJobId(tree.taskId, 0)])
+        expect(outsideTransaction, race.name).toBe(true)
+        expect(stateAtProbe, race.name).toBeDefined()
+        expect(await readState(), race.name).toEqual(stateAtProbe)
+        expect(workerStatements.filter(sql => sql.startsWith('UPDATE "agent_outbox" AS dispatch SET "publishedAt" = NULL')), race.name).toHaveLength(0)
+      }
+    } finally {
+      await adminPool!.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [tree.sessionId, tree.turnId, pauseKey])
+      await adminPool!.query(`UPDATE "agent_sessions" SET "userId" = $2, "status" = 'running' WHERE "id" = $1`, [tree.sessionId, userA.userId])
+      await adminPool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $3, "status" = 'in_progress' WHERE "id" = $1 AND "sessionId" = $2`, [tree.turnId, tree.sessionId, tree.rootTaskId])
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "interruptRequestedAt" = NULL WHERE "id" = $1`, [tree.rootTaskId])
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'queued', "attemptCount" = 0, "startedAt" = NULL,
+        "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "interruptRequestedAt" = NULL, "nextAttemptAt" = NULL,
+        "result" = NULL, "failureReason" = NULL WHERE "id" = $1 AND "sessionId" = $2`, [tree.taskId, tree.sessionId])
+      await adminPool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [tree.sessionId, dispatchKey])
+    }
   })
 
   it("executes two real PostgreSQL child leases and preserves their separate root lineage", async () => {

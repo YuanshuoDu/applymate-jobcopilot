@@ -1,4 +1,6 @@
 import type { TurnExecutionResult } from "../turns/turn-queue.js"
+import type { TurnEngineResult } from "../turns/turn-engine-types.js"
+import { parseInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "../interactive-discovery-contract.js"
 
 export type RootTaskTerminalReconciliation = {
   readonly rootTaskId: string
@@ -7,6 +9,21 @@ export type RootTaskTerminalReconciliation = {
 type Row = Record<string, unknown>
 const ROOT_STATUSES = new Set(["completed", "failed", "interrupted", "waiting", "waiting_for_user"])
 const TURN_STATUSES = new Set(["completed", "failed", "interrupted", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
+
+export function parseRootTaskFinishMetadata(
+  metadata: Readonly<{ interactiveDiscoveryShortlist: unknown }> | undefined,
+  status: TurnEngineResult["status"],
+): InteractiveDiscoveryShortlistProjection | undefined {
+  const shortlist = metadata ? parseInteractiveDiscoveryShortlist(metadata.interactiveDiscoveryShortlist) : undefined
+  if (metadata && !shortlist) throw new Error("root_terminal_discovery_shortlist_invalid")
+  if (shortlist && (status === "waiting_for_dependency" || status === "waiting_for_approval" || status === "waiting_for_user"
+    || (status === "completed" && shortlist.status === "failed")
+    || ((status === "failed" || status === "interrupted") && shortlist.status !== "failed"
+      && !(shortlist.status === "partial" && shortlist.failures.includes("discovery_runtime_failed"))))) {
+    throw new Error("root_terminal_discovery_status_mismatch")
+  }
+  return shortlist
+}
 
 function object(value: unknown): Row { return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {} }
 function boundedText(value: unknown, name: string): string | undefined {

@@ -1,7 +1,6 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
-import { Value } from "@sinclair/typebox/value"
-import { InputContentPartSchema } from "@jobcopilot/agent-protocol"
+import { resolveRootTaskObjective } from "../context/root-task-objective.js"
 import { digestNativeVerificationValue, canonicalNativeVerificationJson } from "./native-verification-contract.js"
 import { parseTaskGraphSnapshot, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { TaskGraphNativeSourceProvenance, TaskGraphReadScope } from "./task-graph-command-port.js"
@@ -37,9 +36,6 @@ export type NativeVerificationTarget = Readonly<{
 
 type Row = Record<string, unknown>
 type Queryable = Pick<pg.PoolClient, "query">
-const MAX_GOAL_BYTES = 4 * 1024
-const MAX_CRITERIA = 32
-const MAX_CRITERION_BYTES = 2_000
 const MAX_RESULT_BYTES = 16 * 1024
 
 function record(value: unknown): Row | null {
@@ -47,20 +43,6 @@ function record(value: unknown): Row | null {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
   try { const prototype = Object.getPrototypeOf(parsed); return prototype === Object.prototype || prototype === null ? parsed as Row : null } catch { return null }
 }
-function cleanText(value: unknown, maxBytes: number): value is string {
-  return typeof value === "string" && value.trim() === value && value.length > 0 && Buffer.byteLength(value, "utf8") <= maxBytes
-}
-function validInputContentParts(value: unknown): value is unknown[] {
-  return Array.isArray(value) && value.length > 0 && Reflect.ownKeys(value).length === value.length + 1
-    && value.every((part, index) => Object.hasOwn(value, index) && Value.Check(InputContentPartSchema, part))
-}
-function criterionList(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length > MAX_CRITERIA || Reflect.ownKeys(value).length !== value.length + 1) return null
-  const output: string[] = []
-  for (const item of value) if (!cleanText(item, MAX_CRITERION_BYTES)) return null; else output.push(item)
-  return output
-}
-
 /** Loads only graph-owned tasks under the caller's locked root and Turn. */
 export async function loadNativeVerificationOwnedState(
   client: Queryable, scope: TaskGraphReadScope, snapshotValue: unknown, lockTargets = true,
@@ -74,8 +56,7 @@ export async function loadNativeVerificationOwnedState(
   [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])
   if (rootTurn.rows.length !== 1) throw new Error("native_verification_root_scope_invalid")
   const root = rootTurn.rows[0] as Row
-  const objective = objectiveState(root.input, { goal: root.goal, successCriteria: root.successCriteria })
-  const { goal, turnGoalConflict, criteria, criteriaValid } = objective
+  const { goal, criteria, criteriaValid, turnGoalConflict } = resolveRootTaskObjective(root.input, root)
   let turnInputDigest: string | null = null
   try { turnInputDigest = digestNativeVerificationValue(root.input) } catch { /* unavailable input is carried as a failed binding */ }
 
@@ -114,64 +95,23 @@ export async function loadNativeVerificationOwnedState(
   }
   const nativeSourcesValid = sources.every(source => nativeVerificationSourceIsCurrent(snapshot, source, sourceTasks.get(source.taskId), scope))
   return { snapshot, tasks, sourceTasks, goal, criteria,
-    criteriaValid: criteriaValid && criteria.length > 0 && criteria.every(item => Buffer.byteLength(item, "utf8") <= MAX_CRITERION_BYTES),
+    criteriaValid,
     nativeSourcesValid,
     turnGoalConflict, turnInputDigest, scope }
 }
 
-function canonicalTurnGoal(value: unknown): Readonly<{ value: string | null; valid: boolean }> {
-  const envelope = record(value)
-  if (!envelope) return { value: null, valid: false }
-  const nested = record(envelope.input)
-  const source = nested && Object.keys(nested).length > 0 ? nested : envelope
-  const hasGoal = Object.hasOwn(source, "goal"), hasContent = Object.hasOwn(source, "content")
-  const goal = source.goal, content = source.content
-  if (hasGoal && (typeof goal !== "string" || !goal.trim() || !cleanText(goal.trim(), MAX_GOAL_BYTES))) return { value: null, valid: false }
-  if (hasContent && (typeof content === "string"
-    ? !content.trim() || !cleanText(content.trim(), MAX_GOAL_BYTES)
-    : !validInputContentParts(content))) return { value: null, valid: false }
-  if (hasGoal && typeof content === "string" && (goal as string).trim() !== content.trim()) return { value: null, valid: false }
-  const selected = hasGoal ? goal : typeof content === "string" ? content : undefined
-  return typeof selected === "string" ? { value: selected.trim(), valid: true } : { value: null, valid: false }
-}
-
-function criteriaField(row: Row | null, key: string): Readonly<{ value: readonly string[]; valid: boolean }> {
-  if (!row || !Object.hasOwn(row, key)) return { value: [], valid: true }
-  const parsed = criterionList(row[key])
-  return parsed ? { value: parsed, valid: true } : { value: [], valid: false }
-}
-function mergeCriteria(turnCriteria: readonly string[], rootCriteria: readonly string[], goal: string | null): readonly string[] {
-  const merged = [...new Set([...turnCriteria, ...rootCriteria])]
-  if (merged.length > MAX_CRITERIA) return []
-  return merged.length ? merged : goal ? [goal] : []
-}
 export type NativeVerificationObjective = Readonly<{ goal: string; criteria: readonly string[] }>
 
 /** Shared exact objective derivation. Missing root means rootTaskStore.ensure's fresh-root goal/empty-criteria convention. */
 export function deriveNativeVerificationObjective(
   turnInput: unknown, root?: Readonly<{ goal: unknown; successCriteria: unknown }>,
 ): NativeVerificationObjective | null {
-  const objective = objectiveState(turnInput, root)
+  const objective = root === undefined
+    ? resolveRootTaskObjective(turnInput, undefined, { allowNativeFreshRootFallback: true })
+    : resolveRootTaskObjective(turnInput, root)
   return objective.goal && !objective.turnGoalConflict && objective.criteriaValid
     ? { goal: objective.goal, criteria: objective.criteria } : null
 }
-
-function objectiveState(turnInput: unknown, root?: Readonly<{ goal: unknown; successCriteria: unknown }>): {
-  goal: string | null; turnGoalConflict: boolean; criteria: readonly string[]; criteriaValid: boolean
-} {
-  const envelope = record(turnInput), nested = record(envelope?.input)
-  const canonicalInput = nested && Object.keys(nested).length > 0 ? nested : envelope
-  const parsedGoal = canonicalTurnGoal(turnInput), goal = parsedGoal.value
-  const rootGoal = root ? typeof root.goal === "string" && root.goal.trim() ? root.goal.trim() : null : goal
-  const turnCriteria = criteriaField(canonicalInput, "successCriteria")
-  const rootCriteria = root ? criteriaField(root, "successCriteria") : { value: [], valid: true }
-  const turnGoalConflict = !parsedGoal.valid || !goal || !rootGoal || goal !== rootGoal
-  const listsValid = turnCriteria.valid && rootCriteria.valid
-  const criteria = listsValid ? mergeCriteria(turnCriteria.value, rootCriteria.value, goal) : []
-  return { goal, turnGoalConflict, criteria, criteriaValid: listsValid && criteria.length > 0
-    && criteria.every(item => Buffer.byteLength(item, "utf8") <= MAX_CRITERION_BYTES) }
-}
-
 /** A predecessor leaves the active frontier only when an owned followup still proves its exact source. */
 export function nativeVerificationFrontier(state: NativeVerificationOwnedState): readonly StoredTaskGraphNode[] {
   const nodes = state.snapshot?.nodes.filter(node => node.nativeDelegation) ?? []

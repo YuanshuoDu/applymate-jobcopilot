@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { ownerFenceSql } from "./turn-engine-owner-sql.js"
+import { ownerFenceSql, turnEngineTenantTransaction, type TurnEnginePool } from "./turn-engine-owner-sql.js"
 
 const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T00:01:00Z") }
 
@@ -19,5 +19,21 @@ describe("turn owner SQL fence", () => {
     expect(fence.where).toContain('owner_task."leaseExpiresAt" > CURRENT_TIMESTAMP')
     expect(fence.where).toContain('owner_task."interruptRequestedAt" IS NULL')
     expect(fence.where).toContain("root_task.\"status\" NOT IN")
+  })
+
+  it("sets tenant scope on the borrowed client and rolls back failed work", async () => {
+    const calls: { sql: string; values?: readonly unknown[] }[] = []
+    const client = {
+      query: async (sql: string, values?: readonly unknown[]) => { calls.push({ sql, values }); return { rows: [], rowCount: 1 } },
+      release: () => undefined,
+    }
+    const pool = { connect: async () => client } as unknown as TurnEnginePool
+    const failure = new Error("work failed")
+    await expect(turnEngineTenantTransaction(pool, "user-1", async borrowed => {
+      expect(borrowed).toBe(client)
+      throw failure
+    })).rejects.toBe(failure)
+    expect(calls.map(call => call.sql)).toEqual(["BEGIN", "SELECT set_config($1, $2, true)", "ROLLBACK"])
+    expect(calls[1]?.values).toEqual(["app.user_id", "user-1"])
   })
 })

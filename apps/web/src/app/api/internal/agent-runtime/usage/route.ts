@@ -14,6 +14,7 @@ import type { UsageExecutionOwner } from "@/lib/agent/control-plane/usage-owner-
 
 type RequestBody =
   | { operation: "authorize"; input: UsageAdmissionInput }
+  | { operation: "release"; input: UsageAdmissionInput }
   | { operation: "settle"; input: UsageSettlementInput }
 
 function authorized(request: NextRequest): boolean {
@@ -63,13 +64,13 @@ function parseOwner(input: Record<string, unknown>): ParsedOwner | null {
 
 function parseInput(value: unknown): RequestBody | null {
   const row = record(value)
-  if (!row || (row.operation !== "authorize" && row.operation !== "settle")) return null
+  if (!row || (row.operation !== "authorize" && row.operation !== "settle" && row.operation !== "release")) return null
   const input = record(row.input)
   if (!input || !text(input.userId) || !text(input.provider) || !text(input.model)) return null
-  if (row.operation === "authorize") {
+  if (row.operation === "authorize" || row.operation === "release") {
     const owner = parseOwner(input)
     if (!text(input.sessionId) || !text(input.turnId) || !text(input.stepId) || !text(input.featureKey) || !owner) return null
-    return { operation: "authorize", input: {
+    return { operation: row.operation, input: {
       userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, ...owner,
       featureKey: input.featureKey,
       provider: input.provider, model: input.model, ...(text(input.attemptId) ? { attemptId: input.attemptId } : {}),
@@ -98,6 +99,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     if (body.operation === "settle") {
       await settleAiUsage(db, body.input)
       return NextResponse.json({ status: "settled" })
+    }
+    if (body.operation === "release") {
+      await settleAiUsage(db, { ...body.input, status: "released" })
+      return NextResponse.json({ status: "released" })
     }
     const access = await resolveAiAccess(body.input.userId)
     if (access === "disabled") return NextResponse.json({ error: "ai_credits_disabled", code: "ai_credits_disabled" }, { status: 403 })

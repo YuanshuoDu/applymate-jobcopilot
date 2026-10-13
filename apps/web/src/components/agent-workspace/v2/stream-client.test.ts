@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineAction, type TimelineState } from './timeline-reducer'
 import { hydrateTimeline, streamAgentTimeline } from './stream-client'
+import { redactStreamEventPayload } from '../../../lib/agent/session/stream-redaction'
 
 function item(id: string, revision = 0) {
   return {
@@ -124,6 +125,82 @@ function questionAnsweredEvent(sequence: string, questionId: string) {
 
 function sseEvent(value: unknown, type = 'item.started') {
   return `event: ${type}\ndata: ${JSON.stringify(value)}\n\n`
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+const FINAL_ITEM_ID = 'turn:turn-1:item:final:step-1'
+
+function finalMessageDto(overrides: Record<string, unknown> = {}) {
+  return {
+    ...item(FINAL_ITEM_ID, 1), taskId: 'root-task', stepId: 'step-1', status: 'completed', phase: 'final_answer',
+    content: { text: 'The final response stays unchanged.', summary: 'A short supported summary.' }, ...overrides,
+  }
+}
+
+type TestStreamEnvelope = {
+  schemaVersion: string
+  id: string
+  sessionId: string
+  turnId: string
+  itemId: string | null
+  taskId: string | null
+  type: string
+  actor: string
+  sequence: string
+  payload: unknown
+}
+
+function redactedEnvelope(event: TestStreamEnvelope): TestStreamEnvelope {
+  return {
+    ...event,
+    payload: redactStreamEventPayload(event.type, event.payload, {
+      sessionId: event.sessionId, turnId: event.turnId, itemId: event.itemId, taskId: event.taskId,
+    }),
+  }
+}
+
+function finalMessageDtoWithoutSchemaVersion(): Record<string, unknown> {
+  const dto: Record<string, unknown> = finalMessageDto()
+  delete dto.schemaVersion
+  return dto
+}
+
+function finalCompletionFrames() {
+  const started = redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'final-start', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
+    taskId: 'root-task', type: 'item.started', actor: 'orchestrator', sequence: '1',
+    payload: { item: finalMessageDto({ status: 'started', content: { text: 'PRIVATE_FINAL_RESPONSE' } }) } })
+  const completed = redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'final-completed', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
+    taskId: 'root-task', type: 'item.completed', actor: 'orchestrator', sequence: '2',
+    payload: { item: finalMessageDto({ content: { text: 'PRIVATE_FINAL_RESPONSE' } }) } })
+  const turnCompleted = redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'turn-completed', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
+    taskId: 'root-task', type: 'turn.completed', actor: 'orchestrator', sequence: '3',
+    payload: { turnId: 'turn-1', taskId: 'root-task', finalItemId: FINAL_ITEM_ID, usage: { inputTokens: 3, outputTokens: 2 } } })
+  expect(isRecord(completed.payload) && isRecord(completed.payload.item) ? completed.payload.item.content : null).toBe('[REDACTED]')
+  expect(isRecord(turnCompleted.payload) ? turnCompleted.payload.finalItemId : null).toBe(FINAL_ITEM_ID)
+  return [sseEvent(started, 'item.started'), sseEvent(completed, 'item.completed'), sseEvent(turnCompleted, 'turn.completed')].join('')
+}
+
+async function runFinalItemStream(items: unknown[]) {
+  const controller = new AbortController()
+  let state: TimelineState = createTimelineState('session-1')
+  let redactedContent: unknown
+  let finalHydrationCount = 0
+  const dispatch = (action: TimelineAction) => {
+    state = timelineReducer(state, action)
+    if (action.type === 'hydrate' && action.items.some(value => isRecord(value) && value.id === FINAL_ITEM_ID)) finalHydrationCount++
+    if (action.type === 'event' && isRecord(action.event) && action.event.type === 'item.completed') redactedContent = state.itemsById[FINAL_ITEM_ID]?.content
+    if (action.type === 'hydrate' && state.itemsById[FINAL_ITEM_ID]?.source === 'replay') controller.abort()
+    if (action.type === 'disconnected' && state.events.some(event => event.type === 'turn.completed')) controller.abort()
+  }
+  const fetcher = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+    .mockResolvedValueOnce(new Response(streamFrom(finalCompletionFrames()), { headers: { 'Content-Type': 'text/event-stream' } }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ items })))
+  await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+  return { state, redactedContent, finalHydrationCount, urls: fetcher.mock.calls.map(([url]) => String(url)) }
 }
 
 function deferred<T>() {
@@ -316,6 +393,49 @@ describe('V2 timeline stream client', () => {
       ...Array.from({ length: 8 }, (_, index) => `/api/agent/sessions/session-1/timeline?limit=100&cursor=cursor-${index + 1}`),
     ])
     expect(state.itemsById['question-item-long-session']).toMatchObject({ type: 'question', status: 'started' })
+  })
+
+  it('hydrates a completed final response directly and leaves the live reducer replay-identical', async () => {
+    const safeItem = finalMessageDto()
+    const live = await runFinalItemStream([safeItem])
+    const replay = timelineReducer(createTimelineState('session-1'), { type: 'replay', items: [safeItem] })
+
+    expect(live.redactedContent).toBe('[REDACTED]')
+    expect(live.finalHydrationCount).toBe(1)
+    expect(live.state.itemsById[FINAL_ITEM_ID]).toEqual(replay.itemsById[FINAL_ITEM_ID])
+    expect(live.state.itemsById[FINAL_ITEM_ID]?.content).toEqual({ text: 'The final response stays unchanged.', summary: 'A short supported summary.' })
+    expect(live.urls).toEqual([
+      '/api/agent/sessions/session-1/timeline?limit=100',
+      '/api/agent/sessions/session-1/events',
+      `/api/agent/sessions/session-1/timeline?itemId=${encodeURIComponent(FINAL_ITEM_ID)}`,
+    ])
+    expect(JSON.stringify(live.state.itemsById[FINAL_ITEM_ID]?.content)).not.toContain('PRIVATE')
+  })
+
+  it.each([
+    ['id', finalMessageDto({ id: 'other-item' })],
+    ['session', finalMessageDto({ sessionId: 'session-2' })],
+    ['turn', finalMessageDto({ turnId: 'turn-2' })],
+    ['schema version', finalMessageDto({ schemaVersion: 'agent-harness.v1' })],
+    ['missing schema version', finalMessageDtoWithoutSchemaVersion()],
+    ['kind', finalMessageDto({ type: 'user_message' })],
+    ['status', finalMessageDto({ status: 'started' })],
+    ['purpose', finalMessageDto({ phase: 'commentary' })],
+    ['private content', finalMessageDto({ content: { text: 'Safe text', summary: 'Safe summary', rawFinal: 'PRIVATE_FINAL_RESPONSE' } })],
+    ['private envelope', finalMessageDto({ rawFinalResponse: 'PRIVATE_FINAL_RESPONSE' })],
+    ['oversized summary', finalMessageDto({ content: { text: 'Safe text', summary: 'x'.repeat(1001) } })],
+  ])('ignores a final-item response with invalid %s without paging', async (_reason, invalidItem) => {
+    const live = await runFinalItemStream([invalidItem])
+
+    expect(live.urls).toEqual([
+      '/api/agent/sessions/session-1/timeline?limit=100',
+      '/api/agent/sessions/session-1/events',
+      `/api/agent/sessions/session-1/timeline?itemId=${encodeURIComponent(FINAL_ITEM_ID)}`,
+    ])
+    expect(live.finalHydrationCount).toBe(0)
+    expect(live.state.itemsById[FINAL_ITEM_ID]).toMatchObject({ type: 'agent_message', status: 'completed', source: 'durable' })
+    expect(live.state.itemsById[FINAL_ITEM_ID]?.content).not.toHaveProperty('text')
+    expect(live.state.itemsById[FINAL_ITEM_ID]?.content).not.toHaveProperty('summary')
   })
 
   it('coalesces question stubs received in one stream turn into one hydration', async () => {

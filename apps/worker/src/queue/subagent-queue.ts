@@ -5,24 +5,26 @@ import { getPool } from "../db/apply-results.js"
 import { redisConnection } from "../redis.js"
 import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
+import { recoverMissingPublishedSubagentDispatches } from "./subagent-published-dispatch-recovery.js"
 import { dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
 import { lockAndAdmitSubagentDispatch, markPauseAwareDispatchError, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches, runSubagentQueueJob } from "./subagent-pause-dispatch.js"
+import { runWithSubagentConcurrencyDeferral } from "./subagent-concurrency-deferral.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
+import { parseSubagentDispatchJobId, subagentDispatchJobId, SUBAGENT_DISPATCH_IDENTITY_MISMATCH } from "../runtime/subagents/dispatch-identity.js"
 import { OPEN_SESSION, RUNNABLE_SESSION } from "../runtime/session-gate.js"
 export const SUBAGENT_QUEUE_NAME = "agent-subagents"
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 export const SUBAGENT_DISPATCH_POLL_MS = 30_000
 export const SUBAGENT_MAX_BATCH = 50
 export { persistSubagentDispatch }
-export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; close?(): Promise<void> }
+export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; getJob?(jobId: string): Promise<unknown>; close?(): Promise<void> }
 /** Queue boundary preserves the complete runtime outcome for manager.run to persist. */
 export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>
 type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
 /** BullMQ custom IDs reject colon characters; encode user controlled IDs. */
 export function subagentJobId(taskId: string, generation = 0): string {
-  if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError("Subagent dispatch generation must be a non-negative integer")
-  return `agent-subagent-${Buffer.from(taskId, "utf8").toString("base64url")}-${generation}`
+  return subagentDispatchJobId(taskId, generation)
 }
 export function subagentDispatchKey(taskId: string): string { return `subagent-dispatch:${taskId}` }
 export async function enqueueSubagentTask(queue: SubagentQueueLike, payload: SubagentJobPayload, attempts = 3, generation = 0): Promise<void> {
@@ -208,6 +210,7 @@ export async function recoverSubagentQueue(pool: PgSubagentPool, queue: Subagent
   const repaired = await repairStaleSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
     + await repairMissingSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
     + await repairDeferredSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
+    + await recoverMissingPublishedSubagentDispatches(pool, queue, limit)
   const dispatched = await dispatchPendingSubagentOutbox(pool, queue, limit)
   return { reclaimed: report.reclaimed, terminal: report.terminal, repaired, dispatched }
 }
@@ -235,9 +238,11 @@ export function startSubagentRecoveryScanner(pool: PgSubagentPool = getPool(), q
 }
 export function createSubagentQueue(options: { manager: AgentTreeManager; execute: SubagentExecutor; queue?: SubagentQueueLike }): { queue: SubagentQueueLike; worker: Worker<SubagentJobPayload>; close: () => Promise<void> } {
   const queue = options.queue ?? new Queue<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
-  const worker = new Worker<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, async (job: Pick<Job<SubagentJobPayload>, "data">) => {
+  const worker = new Worker<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, async (job: Pick<Job<SubagentJobPayload>, "id" | "data" | "moveToDelayed">, token?: string) => {
     const payload = parseSubagentJobPayload(job.data); if (!payload) throw new TypeError("Invalid Subagent queue payload")
-    return runSubagentQueueJob(getPool(), options.manager, options.execute, payload)
+    const identity = parseSubagentDispatchJobId(job.id, payload.taskId)
+    if (!identity) return { taskId: payload.taskId, status: "skipped" as const, reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH }
+    return runWithSubagentConcurrencyDeferral({ job, token, run: () => runSubagentQueueJob(getPool(), options.manager, options.execute, payload, identity) })
   }, { connection: redisConnection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 8 })
   return { queue, worker, async close() { await worker.close(); await queue.close?.() } }
 }

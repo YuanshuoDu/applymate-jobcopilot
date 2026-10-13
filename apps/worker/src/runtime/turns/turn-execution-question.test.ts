@@ -79,7 +79,6 @@ describe("native question runtime decisions", () => {
     const lost = new Error("lost lease")
     await expect(questionWaitResult({ ...options({ waitForQuestion: async () => { throw lost } }), isOwnershipLost: () => true }, "step-1", "call-1", () => new Date(), 1, 1)).rejects.toBe(lost)
   })
-
   it("requests a canonical state refresh after orphan usage is durably repaired", async () => {
     const retry = await readPendingNativeQuestion(options({ readPendingQuestion: async () => { throw new OrphanPauseUsageRecoveredError() } }), () => new Date())
       .then(() => null, error => error as unknown)

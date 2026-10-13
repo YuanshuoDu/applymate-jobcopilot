@@ -1,7 +1,8 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
-import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
-import { createQuestionHydrationPump, filterQuestionHydrationValues } from './question-hydration'
+import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
+import { normalizeTimelineEvent, normalizeTimelineItem, type TimelineAction } from './timeline-reducer'
+import { createQuestionHydrationPump, filterQuestionHydrationValues, type FinalItemHydrationTarget } from './question-hydration'
 import { hasAllTimelineTargetItems, sortTimelineTailEvents } from './timeline-hydration-order'
 
 interface TimelinePageResponse {
@@ -26,13 +27,25 @@ export interface TimelineStreamClientOptions {
 
 const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_PAGE_SIZE = 100
+const SAFE_FINAL_ITEM_FIELDS = ['schemaVersion', 'id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'phase', 'revision', 'content', 'startedAt', 'completedAt', 'createdAt', 'updatedAt']
 type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'> & {
   targetItemIds?: readonly string[]
+  finalItemTarget?: FinalItemHydrationTarget
 }
 
 /** Hydrates the canonical item projection before a live stream is attached. */
 export async function hydrateTimeline(options: TimelineHydrationOptions): Promise<void> {
   const fetcher = options.fetcher ?? fetch
+  if (options.finalItemTarget) {
+    const query = new URLSearchParams({ itemId: options.finalItemTarget.itemId })
+    const response = await fetcher(`/api/agent/sessions/${encodeURIComponent(options.sessionId)}/timeline?${query}`, { signal: options.signal })
+    if (!response.ok) throw new Error(`Timeline restore failed (${response.status})`)
+    const page = await response.json() as TimelinePageResponse
+    if (options.signal?.aborted) return
+    const item = finalItemFromResponse(page.items, options.finalItemTarget, options.sessionId)
+    if (item) options.dispatch({ type: 'hydrate', items: [item] })
+    return
+  }
   const items: unknown[] = []
   let agenda: unknown = undefined
   let agendas: unknown[] | undefined
@@ -77,6 +90,7 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
     sessionId: options.sessionId,
     signal: options.signal,
     hydrate: targetItemIds => hydrateTimeline({ ...options, targetItemIds }),
+    hydrateFinalItem: target => hydrateTimeline({ ...options, finalItemTarget: target }),
   })
 
   await hydrateTimeline(options)
@@ -150,6 +164,25 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
     }
   }
 }
+
+function finalItemFromResponse(items: unknown[] | undefined, target: FinalItemHydrationTarget, sessionId: string) {
+  if (!items || items.length !== 1 || !isRecord(items[0]) || items[0].schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || !hasExactKeys(items[0], SAFE_FINAL_ITEM_FIELDS)) return null
+  const item = normalizeTimelineItem(items[0]), content = item?.content
+  if (!item || !safeId(target.itemId) || !safeId(target.turnId) || item.id !== target.itemId || item.sessionId !== sessionId ||
+    item.turnId !== target.turnId || item.type !== 'agent_message' || item.status !== 'completed' || item.phase !== 'final_answer' || !isRecord(content) || !safeFinalContent(content)) return null
+  return { ...item, content: { text: content.text, ...(content.summary === undefined ? {} : { summary: content.summary }) } }
+}
+
+function safeFinalContent(value: Record<string, unknown>): value is Record<string, unknown> & { text: string; summary?: string } {
+  const keys = Object.keys(value)
+  return keys.length >= 1 && keys.length <= 2 && keys.includes('text') && keys.every(key => key === 'text' || key === 'summary') && typeof value.text === 'string' && (!Object.prototype.hasOwnProperty.call(value, 'summary') || (typeof value.summary === 'string' && value.summary.length <= 1000))
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key)) }
+
+function safeId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.trim() === value && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) }
+
+function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value) }
 
 function isEventStream(response: Response): boolean {
   return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') === true

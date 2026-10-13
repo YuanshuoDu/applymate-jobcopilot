@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { DurableWaitStoreError } from "../subagents/durable-wait-store.js"
-import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
+import { digestNativeVerificationValue, NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "./coordination-types.js"
 import { createWorkerToolRuntime } from "./index.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
@@ -11,6 +12,8 @@ import {
   assertSpawnReplay,
   boundedFailureReason,
   currentTurnTask,
+  taskOutput,
+  waitTaskOutput,
   waitResult,
   toolSafeDurableWaitPort,
 } from "./coordination-executor-support.js"
@@ -64,6 +67,26 @@ describe("coordination executor support", () => {
     expect(waitResult(null)).toBeNull()
   })
 
+  it("projects the existing safe attempt and lease state without exposing the lease owner", () => {
+    const current = {
+      ...task, attemptCount: 2, maxAttempts: 4, leaseOwner: "private-lease-owner",
+      leaseExpiresAt: new Date("2026-10-12T10:15:30.000Z"),
+      interruptRequestedAt: new Date("2026-10-12T10:10:00.000Z"),
+    }
+    const output = waitTaskOutput(current)
+
+    expect(output).toMatchObject({
+      taskId: "task-1", status: "completed", role: "scout", attemptCount: 2, maxAttempts: 4,
+      leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: "2026-10-12T10:10:00.000Z",
+      result: null, failureReason: null,
+    })
+    expect(output).not.toHaveProperty("leaseOwner")
+    expect(JSON.stringify(output)).not.toContain("private-lease-owner")
+
+    const noLease = waitTaskOutput({ ...task, leaseExpiresAt: null, interruptRequestedAt: null })
+    expect(noLease).toMatchObject({ attemptCount: 1, maxAttempts: 2, leaseExpiresAt: null, interruptRequestedAt: null })
+  })
+
   it("projects native proof receipts to bounded feedback before exposing task results", () => {
     const nativeVerificationReport = {
       schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA, controlOperationId: "verify-op", controlTaskId: "verify-task", controlAttempt: 1,
@@ -82,6 +105,88 @@ describe("coordination executor support", () => {
     })
     expect(JSON.stringify(result)).not.toContain("controlOperationId")
     expect(JSON.stringify(result)).not.toContain("candidateDigest")
+  })
+
+  it("projects terminal agent.list results to the closed public TaskGraph report without changing storage", () => {
+    const storedReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "findings-from-scout", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+      dependencyBindings: [{ nodeKey: "scout-private", taskId: "task-private-source", attemptCount: 2,
+        nodeDigest: "c".repeat(64), resultDigest: "d".repeat(64), evidenceDigest: "e".repeat(64), reportDigest: "f".repeat(64) }],
+    }
+    const storedResult = { structuredResult: { status: "completed", summary: "Findings are supported" }, taskGraphVerificationReport: storedReport }
+    const terminalTask = { ...task, result: storedResult }
+
+    const output = taskOutput(terminalTask)
+    const publicResult = output.result as Record<string, unknown>
+    const publicReport = publicResult.taskGraphVerificationReport as Record<string, unknown>
+    expect(Object.keys(publicReport).sort()).toEqual([
+      "criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion",
+    ])
+    expect(publicReport).toMatchObject({ status: "passed", criteria: storedReport.criteria })
+    expect(JSON.stringify(output)).not.toContain("task-private-source")
+    expect(JSON.stringify(output)).not.toContain("dependencyBindings")
+    for (const digest of ["c", "d", "e", "f"]) expect(JSON.stringify(output)).not.toContain(digest.repeat(64))
+    expect(terminalTask.result).toEqual(storedResult)
+    expect(storedReport.dependencyBindings).toHaveLength(1)
+  })
+
+  it.each([
+    "missing_final_output",
+    "result_too_large",
+    "result_shape_invalid",
+    "evidence_binding_invalid",
+  ] as const)("preserves the fixed structured-output category in terminal task projections (%s)", category => {
+    const failedResult = {
+      status: "failed",
+      stepCount: 2,
+      toolCallCount: 1,
+      finalItemId: "child-final-item",
+      structuredOutputFailureCategory: category,
+    }
+    const failedTask: CoordinationTaskView = {
+      ...task,
+      status: "failed",
+      failureReason: "invalid_structured_result",
+      result: failedResult,
+    }
+
+    const listed = taskOutput(failedTask)
+    const waited = waitTaskOutput(failedTask)
+    expect(listed.result).toEqual(failedResult)
+    expect(waited).toMatchObject({
+      status: "failed",
+      failureReason: "invalid_structured_result",
+      result: failedResult,
+    })
+    expect(Object.keys(waited.result as Record<string, unknown>).sort()).toEqual([
+      "finalItemId", "status", "stepCount", "structuredOutputFailureCategory", "toolCallCount",
+    ])
+
+    const legacyResult = { status: "failed", stepCount: 1, toolCallCount: 0, finalItemId: "legacy-final-item" }
+    const legacyTask = { ...failedTask, result: legacyResult }
+    expect(taskOutput(legacyTask).result).toEqual(legacyResult)
+    expect(waitTaskOutput(legacyTask).result).toEqual(legacyResult)
+  })
+
+  it("omits malformed serialized private TaskGraph results from terminal list and wait output", () => {
+    const rawResult = String.raw`  {"taskGraph\u0056erificationReport":{"dependency\u0042indings":[{"taskId":"private-source","digest":"${"c".repeat(64)}"}]}`
+    const rawDigest = digestNativeVerificationValue(rawResult)
+    const terminalTask = { ...task, result: rawResult }
+    const output = taskOutput(terminalTask)
+    const waited = waitResult(rawResult)
+    const visible = JSON.stringify({ output, waited })
+
+    expect(output.result).toBeNull()
+    expect(waited).toBeNull()
+    expect(visible).not.toContain("taskGraphVerificationReport")
+    expect(visible).not.toContain("dependencyBindings")
+    expect(visible).not.toContain("private-source")
+    expect(visible).not.toContain("c".repeat(64))
+    expect(visible).not.toContain(rawDigest)
+    expect(terminalTask.result).toBe(rawResult)
+    expect(waitResult("ordinary task result")).toBe("ordinary task result")
   })
 
   it("bounds failure previews by UTF-8 bytes", () => {

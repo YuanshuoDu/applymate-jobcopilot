@@ -2,9 +2,11 @@ import type pg from "pg"
 
 import { BudgetExceededError } from "../budget.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
+import { withRootBudgetTenantSnapshot } from "./turn-engine-root-budget-transaction.js"
 
 type QueryClient = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
+type RootStepBudgetOwner = Pick<ExecutionOwnerFence, "kind" | "userId" | "sessionId" | "turnId" | "taskId" | "rootTaskId">
 type BudgetMetric = "maxSteps" | "maxToolCalls"
 type UsageBudgetLimit = "maxInputTokens" | "maxOutputTokens" | "maxCostUsd"
 const DEFAULT_ROOT_MAX_STEPS = 32
@@ -17,7 +19,16 @@ const USAGE_BUDGET_METRICS = [
 type UsageBudgetMetric = (typeof USAGE_BUDGET_METRICS)[number]
 type ConfiguredUsageBudgetMetric = UsageBudgetMetric & { threshold: number }
 
-function rootTaskId(owner: ExecutionOwnerFence): string {
+export type CurrentRootBudgetDimension = Readonly<{ limit: number | null; used: number; remaining: number | null }>
+type CurrentRootBudgetMap = Readonly<Record<"steps" | "toolCalls" | "inputTokens" | "outputTokens" | "costUsd", CurrentRootBudgetDimension>>
+export type CurrentRootBudgetObservation = Readonly<{
+  kind: "turn_budget_current"
+  status: "available" | "unavailable"
+  advisoryOnly: true; pointInTime: true; notPermission: true; notReservation: true; notCompletionEvidence: true
+  budgets?: CurrentRootBudgetMap
+}>
+
+function rootTaskId(owner: RootStepBudgetOwner): string {
   return owner.kind === "turn" ? owner.taskId : owner.rootTaskId
 }
 
@@ -25,14 +36,19 @@ function record(value: unknown): Row {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
 }
 
-async function rootSnapshot(client: QueryClient, owner: ExecutionOwnerFence): Promise<Row> {
+async function rootSnapshot(client: QueryClient, owner: RootStepBudgetOwner): Promise<Row> {
+  const result = await ownedRootSnapshot(client, owner)
+  return record(result.snapshot)
+}
+
+async function ownedRootSnapshot(client: QueryClient, owner: RootStepBudgetOwner): Promise<{ found: boolean; snapshot: unknown }> {
   const rootId = rootTaskId(owner)
   const result = await client.query<{ budgetSnapshot: unknown }>(`SELECT root_task."budgetSnapshot"
     FROM "sub_agent_tasks" AS root_task
     JOIN "agent_sessions" AS session ON session."id" = root_task."sessionId" AND session."userId" = $4
     WHERE root_task."id" = $1 AND root_task."sessionId" = $2 AND root_task."turnId" = $3
       AND root_task."rootTaskId" = root_task."id"`, [rootId, owner.sessionId, owner.turnId, owner.userId])
-  return record(result.rows[0]?.budgetSnapshot)
+  return result.rows[0] ? { found: true, snapshot: result.rows[0].budgetSnapshot } : { found: false, snapshot: undefined }
 }
 
 function rootLimits(snapshot: Row): Row {
@@ -104,7 +120,7 @@ async function usageSums(
   return values
 }
 
-async function usageCount(client: QueryClient, owner: ExecutionOwnerFence, metric: "steps" | "tool_calls"): Promise<number> {
+async function usageCount(client: QueryClient, owner: RootStepBudgetOwner, metric: "steps" | "tool_calls", strict = false): Promise<number> {
   const rootId = rootTaskId(owner)
   const table = metric === "steps" ? `"agent_steps" AS usage_row` : `"agent_items" AS usage_row`
   const typeFilter = metric === "steps" ? "" : ` AND usage_row."type" = 'tool_call'`
@@ -116,17 +132,70 @@ async function usageCount(client: QueryClient, owner: ExecutionOwnerFence, metri
     WHERE usage_row."sessionId" = $1 AND usage_row."turnId" = $2
       AND (usage_row."taskId" IS NULL OR task."rootTaskId" = $3)${typeFilter}`,
   [owner.sessionId, owner.turnId, rootId, owner.userId])
-  const used = Number(result.rows[0]?.used ?? 0)
+  const used = strict ? usageValue(result.rows[0]?.used, true) : Number(result.rows[0]?.used ?? 0)
   if (!Number.isSafeInteger(used) || used < 0) throw new Error("turn_budget_usage_invalid")
   return used
 }
 
-export async function enforceRootStepBudget(client: QueryClient, owner: ExecutionOwnerFence): Promise<void> {
+function currentBudgetDimension(limit: number | null, used: number): CurrentRootBudgetDimension {
+  return { limit, used, remaining: limit === null ? null : Math.max(0, limit - used) }
+}
+
+function currentBudgetObservation(budgets?: CurrentRootBudgetObservation["budgets"]): CurrentRootBudgetObservation {
+  return {
+    kind: "turn_budget_current", status: budgets ? "available" : "unavailable", advisoryOnly: true,
+    pointInTime: true, notPermission: true, notReservation: true, notCompletionEvidence: true,
+    ...(budgets ? { budgets } : {}),
+  }
+}
+
+function currentBudgetLimits(value: unknown): { limits: Row; dimensions: { steps: number; toolCalls: number | null } } | undefined {
+  if (value !== null && (!value || typeof value !== "object" || Array.isArray(value))) return undefined
+  const source = value === null ? {} : value as Row
+  let limits: Row
+  try { limits = rootUsageLimits(source) } catch { return undefined }
+  const valid = (metric: BudgetMetric) => !Object.hasOwn(limits, metric)
+    || (typeof limits[metric] === "number" && Number.isFinite(limits[metric]) && Number(limits[metric]) >= 0)
+  if (!valid("maxSteps") || !valid("maxToolCalls")) return undefined
+  return { limits, dimensions: { steps: rootLimit(limits, "maxSteps") ?? DEFAULT_ROOT_MAX_STEPS, toolCalls: rootLimit(limits, "maxToolCalls") ?? null } }
+}
+
+function currentBudgetFrom(limits: Row, dimensions: { steps: number; toolCalls: number | null }, counts: { steps: number; toolCalls: number }, sums: Map<string, number>): CurrentRootBudgetObservation {
+  return currentBudgetObservation({
+    steps: currentBudgetDimension(dimensions.steps, counts.steps),
+    toolCalls: currentBudgetDimension(dimensions.toolCalls, counts.toolCalls),
+    inputTokens: currentBudgetDimension(usageLimit(limits, "maxInputTokens") ?? null, sums.get("inputTokens")!),
+    outputTokens: currentBudgetDimension(usageLimit(limits, "maxOutputTokens") ?? null, sums.get("outputTokens")!),
+    costUsd: currentBudgetDimension(usageLimit(limits, "maxCostUsd") ?? null, sums.get("estimatedCostUsd")!),
+  })
+}
+
+/** Reuses the enforcement aggregates inside one repeatable, read-only snapshot. */
+export async function readCurrentRootBudget(client: QueryClient, owner: ExecutionOwnerFence): Promise<CurrentRootBudgetObservation> {
+  return withRootBudgetTenantSnapshot(client, owner.userId, async () => {
+    const root = await ownedRootSnapshot(client, owner)
+    let observation = currentBudgetObservation()
+    const parsed = root.found ? currentBudgetLimits(root.snapshot) : undefined
+    if (parsed) {
+      try {
+        const steps = await usageCount(client, owner, "steps", true)
+        const toolCalls = await usageCount(client, owner, "tool_calls", true)
+        const sums = await usageSums(client, owner, USAGE_BUDGET_METRICS)
+        observation = currentBudgetFrom(parsed.limits, parsed.dimensions, { steps, toolCalls }, sums)
+      } catch (error) {
+        if (!(error instanceof Error) || !["turn_budget_usage_invalid", "turn_budget_limit_invalid"].includes(error.message)) throw error
+      }
+    }
+    return observation
+  })
+}
+export async function enforceRootStepBudget(client: QueryClient, owner: RootStepBudgetOwner, requiredSteps: 1 | 2 = 1): Promise<void> {
+  if (requiredSteps !== 1 && requiredSteps !== 2) throw new Error("root_step_budget_required_steps_invalid")
   const snapshot = await rootSnapshot(client, owner)
   const limit = rootLimit(rootLimits(snapshot), "maxSteps")
   if (limit === undefined) return
   const used = await usageCount(client, owner, "steps")
-  if (used + 1 > limit) throw new BudgetExceededError("steps", limit, used + 1, used)
+  if (used + requiredSteps > limit) throw new BudgetExceededError("steps", limit, used + requiredSteps, used)
 }
 
 async function enforceRootUsageBudgetForSnapshot(

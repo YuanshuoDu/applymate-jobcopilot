@@ -1,6 +1,8 @@
 import type { TimelineItem } from './timeline-reducer'
 import { parseTaskGraphSnapshot, TASK_GRAPH_MAX_IDENTIFIER_LENGTH } from './task-graph-plan-snapshot'
 import { SELECTED_JOB_PREPARATION_MESSAGE_TEXT } from './selected-job-preparation-action'
+import type { SupervisorTaskSummary, SupervisorTurnSummary } from './task-tree-projection'
+import type { TaskTreeNode } from './types'
 
 const MAX_REFERENCED_TASK_IDS = 9
 
@@ -15,6 +17,76 @@ export interface TaskGraphIdentity {
 export interface SelectedJobPreparationIntent {
   readonly turnId: string
   readonly sequence: string | null
+}
+
+export type TaskGraphPlanInspectionSelection =
+  | { readonly kind: 'current' }
+  | { readonly kind: 'selected'; readonly turnId: string }
+  | { readonly kind: 'unavailable' }
+
+/** Resolves only a visible node backed by a Turn or timeline item in this session. */
+export function resolveTaskGraphPlanInspectionSelection(input: {
+  readonly sessionId: string
+  readonly selectedNodeId?: string
+  readonly selectedNode?: TaskTreeNode
+  readonly turns: readonly SupervisorTurnSummary[]
+  readonly tasks: readonly SupervisorTaskSummary[]
+  readonly items: readonly TimelineItem[]
+}): TaskGraphPlanInspectionSelection {
+  if (input.selectedNodeId === undefined) return { kind: 'current' }
+  const { sessionId, selectedNode: node } = input
+  if (!boundedIdentifier(sessionId) || !node || node.id !== input.selectedNodeId) return { kind: 'unavailable' }
+
+  let turnId: string | null = null
+  if (node.kind === 'turn') {
+    const matches = input.turns.filter(turn => turn.sessionId === sessionId && `turn:${turn.id}` === node.id)
+    if (matches.length === 1) turnId = matches[0]?.id ?? null
+  } else if (node.kind === 'task') {
+    const matches = input.tasks.filter(task => task.sessionId === sessionId && `task:${task.id}` === node.id)
+    const taskTurnId = matches.length === 1 ? matches[0]?.turnId : null
+    if (boundedIdentifier(taskTurnId) && ownedTurn(input.turns, sessionId, taskTurnId)) turnId = taskTurnId
+  } else if (node.kind === 'step') {
+    const item = uniqueSessionItem(input.items, sessionId, node.itemId)
+    const stepTurnId = item?.stepId && node.id === `step:${item.stepId}` ? item.turnId : null
+    const activeTurn = input.turns.filter(turn => turn.sessionId === sessionId && boundedIdentifier(turn.activeStepId)
+      && node.id === `step:${turn.activeStepId}`)
+    if (boundedIdentifier(stepTurnId) && ownedTurn(input.turns, sessionId, stepTurnId)) turnId = stepTurnId
+    else if (!node.itemId && activeTurn.length === 1) turnId = activeTurn[0]?.id ?? null
+  } else if (node.kind === 'tool') {
+    const item = uniqueSessionItem(input.items, sessionId, node.itemId)
+    if (item && (item.type === 'tool_call' || item.type === 'tool_result')) {
+      const key = toolNodeKey(item)
+      const matching = input.items.filter(candidate => candidate.sessionId === sessionId
+        && (candidate.type === 'tool_call' || candidate.type === 'tool_result') && toolNodeKey(candidate) === key)
+      const scopes = new Set(matching.map(candidate => JSON.stringify([candidate.turnId, candidate.stepId ?? ''])))
+      const calls = matching.filter(candidate => candidate.type === 'tool_call').length
+      const results = matching.filter(candidate => candidate.type === 'tool_result').length
+      if (key && node.id === `tool:${key}` && matching.some(candidate => candidate.id === item.id)
+        && scopes.size === 1 && scopes.has(JSON.stringify([item.turnId, item.stepId ?? ''])) && calls <= 1 && results <= 1
+        && ownedTurn(input.turns, sessionId, item.turnId)) turnId = item.turnId
+    }
+  }
+  return boundedIdentifier(turnId) ? { kind: 'selected', turnId } : { kind: 'unavailable' }
+}
+
+function ownedTurn(turns: readonly SupervisorTurnSummary[], sessionId: string, turnId: string): boolean {
+  return turns.filter(turn => turn.sessionId === sessionId && turn.id === turnId).length === 1
+}
+
+function uniqueSessionItem(items: readonly TimelineItem[], sessionId: string, itemId: string | undefined): TimelineItem | null {
+  if (!boundedIdentifier(itemId)) return null
+  const matches = items.filter(item => item.id === itemId && item.sessionId === sessionId)
+  return matches.length === 1 ? matches[0] ?? null : null
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function toolNodeKey(item: TimelineItem): string | null {
+  const callId = record(item.content).toolCallId
+  if (typeof callId === 'string' && callId.trim()) return boundedIdentifier(callId) ? callId : null
+  return boundedIdentifier(item.id) ? item.id : null
 }
 
 /** Reads the latest durable selected-job intent so old graphs stay hidden after reconnect. */

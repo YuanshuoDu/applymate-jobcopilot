@@ -3,23 +3,24 @@ import { signalWasInterrupted } from "../interrupt/registry.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { BudgetExceededError, createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
-import { NoProgressError, createProgressDetector } from "../progress.js"
+import { NoProgressError, createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
-import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
-import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
+import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
-import { contextForAgenda, hasNewlyAcceptedInput } from "../context/step-context-support.js"
+import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
+import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
+import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
 const DEFAULT_MAX_STEPS = 32
-function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
+
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
   const now = options.now ?? (() => new Date())
@@ -27,7 +28,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   const baseBudget: TurnBudgetLimits = { ...options.budget, maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS }
   const budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, options.resume) ?? {})
   const executionOptions = withRemainingTurnStepBudget(options, budget)
-  const progress = createProgressDetector(options.noProgressRepeatLimit ?? 2)
+  const progress = createProgressDetector(options.noProgressRepeatLimit ?? 2), denialProgress = createTaskGraphDenialProgressTracker(options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId ? options.resume?.taskGraphDenialProgress : undefined)
   let snapshot = options.snapshot
   let inputThroughSequence = options.resume?.inputThroughSequence ?? 0n
   let consumedInputIds: readonly string[] = options.resume?.consumedInputIds ?? []
@@ -37,13 +38,17 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let recoveredCandidate = options.recoveredFinalCandidate
   let steeringMarkerState = options.steeringMarkerState
   const seenCallIds = new Set<string>()
-  let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>()
+  let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>(), receiptClosedSteps = new Set<string>()
   try {
     await writer.append(
       "turn.started", options.identity.turnId, null,
       { goal: options.goal, taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId },
       "turn-started",
     )
+    if (options.recoveredWaitControl) {
+      const recoveredWait = await handoffRecoveredArchivedWait(options, writer, options.recoveredWaitControl, { stepCount: steps, toolCallCount: toolCalls }, now)
+      if (recoveredWait) return recoveredWait
+    }
     const recoveredToolObservations = await recoverPersistedToolCalls(executionOptions, writer, now)
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
     const recoveredQuestion = await recoverPendingNativeQuestion(executionOptions, now, steps, toolCalls)
@@ -72,12 +77,14 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           steeringMarkerState,
         })
         const freshSteering = hasFreshSteering(context, consumedInputIds)
-        if (hasNewlyAcceptedInput(context, consumedInputIds)) options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
+        if (hasNewlyAcceptedInput(context, consumedInputIds)) { options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.(); denialProgress.clear() }
         const newlyObservedMarkers = context.steeringMarkerControl?.newlyObservedMarkers ?? []
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
-        const agendaContext = contextForAgenda(context, ordinal, options.rootContextInputId)
+        // The model sees the durable root background, but later agenda receipts must not turn it into actionable pending input.
+        const agendaContext = excludeUnconsumedRootReferenceFromAgenda(context, ordinal > 0 ? options.rootContextInputId : undefined)
+        if (await denialProgress.shouldStop(context, options.identity.rootTaskId, options.completionGate?.[READ_TASK_GRAPH_DENIAL_CHECKPOINT])) throw new NoProgressError({ signature: "task_graph_terminal_denial", stateFingerprint: "task_graph_terminal_denial" })
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
           inputThroughSequence, consumedInputIds,
@@ -95,7 +102,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
           freshSteering: options.identity.kind === "turn" && freshSteering,
-          outputSchema: options.outputSchema,
+          outputSchema: options.outputSchema, cognitiveAgendaReceipt: receipt, rootTaskId: options.identity.kind === "turn" ? options.identity.rootTaskId : undefined,
         })
         if (freshSteering) recoveredCandidate = undefined
         let output: ModelStepResult
@@ -116,7 +123,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           const questionCallId = nativeQuestionCallId(output, options.identity)
           if (questionCallId && (!executionOptions.store.stageQuestionUsage || !executionOptions.store.cancelPausedQuestion)) throw new TurnEngineError("invalid_output", "Native question store is unavailable")
           questionIntentCallId = questionCallId
-          progress.observe({ snapshot, toolCalls: output.toolCalls })
+          denialProgress.clear(); progress.observe({ snapshot, toolCalls: output.toolCalls }, progressCheckpointFromStepContext(context))
           budget.reserveToolCalls(output.toolCalls.length)
           if (output.text) await publishCommentary(writer, options, step, output.text, now)
           let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof steeringMarkerState }
@@ -158,10 +165,14 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           continue
         }
         const outcome = await completeTurnCandidate({ options, writer, step, output, snapshot, stepCount: steps, toolCallCount: toolCalls,
-          usage: budget.usage(), signal, now, onStepClosed: () => closedSteps.add(step.id) })
+          usage: budget.usage(), signal, now, onStepClosed: kind => {
+            closedSteps.add(step.id)
+            if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
+          } })
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
-        snapshot = taskGraphRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
+        snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, context, options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId); continuation = undefined; continue
       } catch (error: unknown) {
+        if (receiptClosedSteps.has(step.id)) throw error
         if (isPreparedQuestionRetryError(error) || isTurnStateRefreshRetryError(error)) throw error
         if (questionIntentCallId && isSessionPauseRequestedError(error)) {
           const questionCall = stepOutput?.toolCalls.find(call => call.id === questionIntentCallId)

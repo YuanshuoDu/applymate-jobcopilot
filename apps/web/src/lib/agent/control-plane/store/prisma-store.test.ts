@@ -11,6 +11,7 @@ import {
 } from "@jobcopilot/agent-protocol"
 
 import { createPrismaAgentStore } from "./prisma-store"
+import { agentTurnProjectionSelect } from "./turn-select"
 
 type Where = Record<string, unknown>
 
@@ -154,6 +155,18 @@ function makeFakeDb(ownerId = "user_fixture", failOutbox = false, rawMode: "fixt
 }
 
 describe("Prisma agent repository", () => {
+  it("uses an explicit pre-migration-safe Turn selection for public projections", async () => {
+    const f = fixture()
+    const fake = makeFakeDb()
+    await createPrismaAgentStore(fake.db, f.scope).getProjection({ sessionId: f.sessionId, turnId: f.turnId })
+
+    expect(fake.tx.agentTurn.findFirst).toHaveBeenCalledWith({
+      where: { id: f.turnId, sessionId: f.sessionId, userId: f.scope.userId },
+      select: agentTurnProjectionSelect,
+    })
+    expect(Object.keys(agentTurnProjectionSelect)).not.toContain("nativeSemanticProgressMode")
+  })
+
   it("runs the shared fixture with the same projection contract", async () => {
     const f = fixture()
     const fake = makeFakeDb()

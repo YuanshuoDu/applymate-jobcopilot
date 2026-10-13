@@ -1,17 +1,21 @@
 import { Buffer } from "node:buffer"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
-  parseTaskGraphRepairOf, parseTaskGraphRepairReceipt, parseTaskGraphVerificationCriterionIds, parseTaskGraphVerificationReport,
   TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
   type TaskGraphAnalystProjectionItem, type TaskGraphArtifactProjectionReference, type TaskGraphCurrentNode,
   type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphProjectionEvidenceKind, type TaskGraphProjectionSource,
   type TaskGraphReadScope, type TaskGraphResultProjection, type TaskGraphScoutProjectionItem,
 } from "./subagents/task-graph-command-port.js"
+import { parseTaskGraphCurrentVerificationMetadata, taskGraphCurrentVerificationMetadataBytes, validateTaskGraphCurrentVerificationGraph } from "./canonical-turn-task-graph-verification-context.js"
 import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
-const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user"])
+import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
+import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
+import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
+import { projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
+const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
   const name = record(definition)?.name
@@ -180,23 +184,22 @@ function projectionBytes(value: TaskGraphResultProjection): number {
 function node(value: unknown): TaskGraphCurrentNode {
   const row = record(value)
   if (!row || typeof row.status !== "string" || !STATUSES.has(row.status) || typeof row.readiness !== "string" || !READINESS.has(row.readiness)) throw new Error("task_graph_current_state_invalid:node")
-  const hasIds = Object.hasOwn(row, "verificationCriterionIds"), hasReport = Object.hasOwn(row, "verificationReport")
-  const verificationCriterionIds = hasIds ? parseTaskGraphVerificationCriterionIds(row.verificationCriterionIds) : undefined
-  const verificationReport = hasReport && verificationCriterionIds ? parseTaskGraphVerificationReport(row.verificationReport, verificationCriterionIds) : undefined
-  const hasRelation = Object.hasOwn(row, "repairOf"), repairOf = hasRelation ? parseTaskGraphRepairOf(row.repairOf) : undefined
-  const hasReceipt = Object.hasOwn(row, "repairReceipt")
   const key = text(row.key, 128, "key"), taskId = text(row.taskId, 128, "taskId")
-  const repairReceipt = hasReceipt ? parseTaskGraphRepairReceipt(row.repairReceipt, { repairOf, repairNodeKey: key, repairTaskId: taskId, report: verificationReport }) : undefined
-  if (hasIds && !verificationCriterionIds || hasReport && !verificationReport || hasRelation && !repairOf || hasReceipt && !repairReceipt) throw new Error("task_graph_current_state_invalid:verification")
+  const templateId = text(row.templateId, 128, "templateId")
+  const verification = parseTaskGraphCurrentVerificationMetadata(row, templateId, key, taskId)
+  if (!verification) throw new Error("task_graph_current_state_invalid:verification")
+  const native = nativeGraphNodeFields(row)
+  const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, { hasVerifiedReport: Boolean(verification.verificationReport), isNative: Boolean(native.native || native.nativeResult) })
+  const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult ? undefined
+    : projectTaskGraphStructuredFailureCategory(row, { status: row.status, templateId, verification: verification.verification, verificationReport: verification.verificationReport })
   return {
-    key, templateId: text(row.templateId, 128, "templateId"),
+    key, templateId,
     goal: text(row.goal, 1200, "goal", true), successCriteria: stringList(row.successCriteria, 8, 320, "successCriteria"),
     dependsOn: stringList(row.dependsOn, MAX_NODES, 128, "dependsOn"), taskId,
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],
     resultSummary: null,
     resultProjection: projection(row.resultProjection),
-    ...(verificationCriterionIds ? { verificationCriterionIds } : {}), ...(verificationReport ? { verificationReport } : {}),
-    ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}), ...nativeGraphNodeFields(row),
+    ...verification, ...native, ...(executionFailureCategory ? { executionFailureCategory } : {}), ...(structuredOutputFailureCategory ? { structuredOutputFailureCategory } : {}),
     failureReason: null,
   }
 }
@@ -212,7 +215,7 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
     const item = node(value)
     const bytes = projectionBytes(item.resultProjection!)
     const count = projectionItems(item.resultProjection!)
-    verificationBytes += Buffer.byteLength(JSON.stringify({ verificationCriterionIds: item.verificationCriterionIds, verificationReport: item.verificationReport, repairOf: item.repairOf, repairReceipt: item.repairReceipt }), "utf8")
+    verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1)
     if (verificationBytes > MAX_VERIFICATION_CONTEXT_BYTES) throw new Error("task_graph_current_verification_too_large")
     if (projectedBytes + bytes > MAX_RESULT_PROJECTION_TOTAL_BYTES
       || projectedItems + count > MAX_RESULT_PROJECTION_TOTAL_ITEMS) {
@@ -223,16 +226,13 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
     return item
   })
   const keys = new Set(nodes.map(item => item.key))
-  if (keys.size !== nodes.length || nodes.some(item => item.dependsOn.some(key => !keys.has(key)))) throw new Error("task_graph_current_state_invalid:dependencies")
-  const content = { kind: "task_graph_current", revision: Number(state.revision), nodes }
+  if (keys.size !== nodes.length || !validateTaskGraphCurrentVerificationGraph(nodes)) throw new Error("task_graph_current_state_invalid:dependencies")
+  let planningFacts: unknown
+  try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
+  const content = withTaskGraphCurrentPlanningObservation({ kind: "task_graph_current", revision: Number(state.revision), nodes }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
-  return {
-    ...snapshot, taskGraphRevision: value.revision,
-    toolObservations: [
-      ...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID),
-      { id: OBSERVATION_ID, content },
-    ],
-  }
+  return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
+    toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
 }
 
 export async function loadTaskGraphCurrentObservation(

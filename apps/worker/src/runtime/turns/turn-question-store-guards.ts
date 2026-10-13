@@ -5,10 +5,12 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertSessionWorkAdmission, OPEN_SESSION } from "../session-gate.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
 import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionUsageInput, type TurnQuestionWaitInput } from "./turn-question-contract.js"
+import { parseModelCompletedReceipt } from "./model-completed-receipt.js"
 
 export type TurnQuestionPool = Pick<pg.Pool, "connect">
 export type TurnQuestionClient = Pick<pg.PoolClient, "query" | "release">
 export type TurnQuestionQueryClient = Pick<pg.PoolClient, "query">
+export type TurnQuestionReadIdentity = Pick<TurnExecutionOwnerFence, "sessionId" | "turnId" | "taskId">
 export type TurnQuestionTurnRow = { readonly id: string; readonly status: string; readonly revision: number | string }
 export type TurnQuestionStepRow = {
   readonly id: string; readonly status: string; readonly taskId: string; readonly attempt: number | string
@@ -40,7 +42,7 @@ export function assertQuestionUsage(input: TurnQuestionUsageInput): void {
   }
 }
 
-export function questionId(owner: TurnExecutionOwnerFence, stepId: string, toolCallId: string): string {
+export function questionId(owner: Pick<TurnQuestionReadIdentity, "sessionId" | "turnId">, stepId: string, toolCallId: string): string {
   return createHash("sha256").update(JSON.stringify([owner.sessionId, owner.turnId, stepId, toolCallId])).digest("hex")
 }
 
@@ -54,7 +56,7 @@ function record(value: unknown): Record<string, unknown> | null {
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).sort().join(",") === [...keys].sort().join(",") }
 
 /** Shared strict readback for the completed ask_user call/result pair. */
-export async function completedQuestionResult(client: TurnQuestionQueryClient, owner: TurnQuestionWaitInput["owner"], stepId: string, toolCallId: string, expectedArguments?: unknown): Promise<CompletedQuestionResult> {
+export async function completedQuestionResult(client: TurnQuestionQueryClient, owner: TurnQuestionReadIdentity, stepId: string, toolCallId: string, expectedArguments?: unknown): Promise<CompletedQuestionResult> {
   const calls = await client.query<Record<string, unknown>>(`SELECT "id", "status", "content" FROM "agent_items"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "stepId" = $3 AND "taskId" = $4 AND "type" = 'tool_call'
       AND "content"->>'toolCallId' = $5`, [owner.sessionId, owner.turnId, stepId, owner.taskId, toolCallId])
@@ -163,9 +165,10 @@ async function questionModelUsage(client: TurnQuestionQueryClient, owner: TurnEx
   const receipts = types.map((type, index) => {
     const row = byType.get(type), payload = row && record(row.payload), sequence = eventSequence(row?.sequence)
     const expected = type === "model.usage" ? ["provider", "model", "usage", "taskId"] : ["taskId", "provider", "model"]
+    const payloadValid = type === "model.completed" ? !!parseModelCompletedReceipt(payload) : !!payload && exactKeys(payload, expected)
     if (!row || typeof row.id !== "string" || !row.id.trim() || row.sessionId !== owner.sessionId || row.turnId !== owner.turnId
       || row.taskId !== owner.taskId || row.itemId !== null || row.actor !== "orchestrator" || row.correlationId !== stepId
-      || row.idempotencyKey !== keys[index] || !payload || !exactKeys(payload, expected) || payload.taskId !== owner.taskId
+      || row.idempotencyKey !== keys[index] || !payload || !payloadValid || payload.taskId !== owner.taskId
       || typeof payload.provider !== "string" || !payload.provider || typeof payload.model !== "string" || !payload.model || sequence === null) {
       throw new TurnQuestionStoreError("question_usage_unavailable", "Persisted ask_user call has no exact model receipt chain")
     }

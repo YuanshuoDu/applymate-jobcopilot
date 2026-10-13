@@ -5,9 +5,11 @@ import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGrap
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphState, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
 import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-command.js"
+import { classifyTaskGraphStructuredOutputFailure } from "./task-graph-structured-failure-category.js"
 import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { taskGraphNativeCurrentView } from "./task-graph-native-result.js"
+import { revalidateTaskGraphDependencyBindings } from "./task-graph-pg-dependency-binding-readback.js"
 import {
   projectTaskGraphResult,
   taskGraphResultProjectionBytes,
@@ -132,10 +134,9 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
   const baseState = taskGraphState(snapshot, revision, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), appliedEvents)
   const repairs = resolveTaskGraphRepairDependencies(snapshot, tasks, scope.rootTaskId)
   const state = { ...baseState, repairSatisfiedNodeKeys: repairs.satisfied, repairPendingNodeKeys: repairs.pending }
-  return { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks }
+  return revalidateTaskGraphDependencyBindings(client, scope, { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks })
 }
-/** Uses the durable proposal receipt to distinguish graph children from legacy tasks sharing a root. */
-export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
+/** Uses the durable proposal receipt to distinguish graph children from legacy tasks sharing a root. */ export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
   const result = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload" FROM "agent_events" AS event
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
@@ -179,11 +180,9 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
   const nodes: TaskGraphCurrentNode[] = read.map(node => {
     const task = taskByKey.get(node.key)!
     const stored = loaded.snapshot!.nodes.find(candidate => candidate.key === node.key)!
-    const verificationCriterionIds = stored.verificationDisposition === "typed" && stored.verification
-      ? stored.verification.criteria.map(criterion => criterion.id) : undefined
-    const taskResult = parseObject(task.result)
-    const hasReport = Boolean(taskResult && Object.hasOwn(taskResult, "taskGraphVerificationReport"))
-    const verificationReport = verificationCriterionIds
+    const verification = stored.verificationDisposition === "typed" ? stored.verification : undefined,
+      verificationCriterionIds = verification?.criteria.map(criterion => criterion.id), taskResult = parseObject(task.result)
+    const hasReport = Boolean(taskResult && Object.hasOwn(taskResult, "taskGraphVerificationReport")), verificationReport = verificationCriterionIds
       ? parseTaskGraphVerificationReport(taskResult?.taskGraphVerificationReport, verificationCriterionIds) : undefined
     const repairOf = stored.repairOf?.graphRootTaskId === loaded.rootTaskId ? stored.repairOf : undefined
     const hasReceipt = Boolean(taskResult && Object.hasOwn(taskResult, "taskGraphRepairReceipt"))
@@ -195,6 +194,7 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       || stored.verificationDisposition === "typed" && (task.status === "completed" || task.status === "failed") && !verificationReport
       || hasReceipt && !repairReceipt
       || stored.repairOf && task.status === "completed" && verificationReport?.status === "passed" && !repairReceipt) throw new Error("task_graph_verification_report_invalid")
+    const structuredOutputFailureCategory = classifyTaskGraphStructuredOutputFailure({ snapshotNode: stored, task, verificationReport, hasRepairReceipt: Boolean(repairReceipt) })
     const projectionSource = taskGraphProjectionSource(task.result, taskResult, Boolean(verificationReport), Boolean(repairReceipt))
     const proposedProjection = projectTaskGraphResult(task.role, task.status, projectionSource)
     const bytes = taskGraphResultProjectionBytes(proposedProjection)
@@ -211,11 +211,11 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       dependsOn: node.dependsOn, taskId: stored.taskId,
       status: task.status, readiness: node.readiness, resultSummary: resultSummary(task.result),
       resultProjection,
-      ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
+      ...(verification ? { verification } : {}), ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
       ...(verificationReport ? { verificationReport } : {}),
       ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}),
       ...(stored.nativeDelegation ? taskGraphNativeCurrentView(stored.nativeDelegation, task) : {}),
-      failureReason: safeText(task.failureReason, 500),
+      failureReason: safeText(task.failureReason, 500), ...(structuredOutputFailureCategory ? { structuredOutputFailureCategory } : {}),
     }
   })
   return { revision: loaded.state.revision, nodes }
