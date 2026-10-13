@@ -67,6 +67,38 @@ describe("durable wait output redaction", () => {
     expect(output.waitId).toBe(waitId)
   })
 
+  it("preserves complete execution state, accepts legacy task rows, and rejects partial or invalid state", () => {
+    const legacy = redactDurableWaitOutput(validOutput()) as Record<string, unknown>
+    const legacyTask = (legacy.tasks as Array<Record<string, unknown>>)[0]!
+    expect(Object.keys(legacyTask).sort()).toEqual(["failureReason", "result", "role", "status", "taskId"])
+
+    const legacyCurrent = validOutput()
+    const current = {
+      ...legacyCurrent,
+      tasks: [{
+        ...legacyCurrent.tasks[0]!, attemptCount: 2, maxAttempts: 4,
+        leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: null,
+      }],
+    }
+    const safe = redactDurableWaitOutput(current) as Record<string, unknown>
+    const safeTask = (safe.tasks as Array<Record<string, unknown>>)[0]!
+    expect(safeTask).toMatchObject({
+      taskId, attemptCount: 2, maxAttempts: 4,
+      leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: null,
+    })
+    expect(safeTask).not.toHaveProperty("leaseOwner")
+
+    const invalid = [
+      { ...current.tasks[0]!, attemptCount: -1 },
+      { ...current.tasks[0]!, maxAttempts: 0 },
+      { ...current.tasks[0]!, leaseExpiresAt: "not-a-timestamp" },
+      { ...current.tasks[0]!, interruptRequestedAt: 123 },
+      { ...current.tasks[0]!, leaseOwner: "private-owner" },
+      { taskId, status: "completed", role: "scout", result: null, failureReason: null, attemptCount: 2 },
+    ]
+    for (const task of invalid) expect(() => redactDurableWaitOutput({ ...current, tasks: [task] })).toThrow("durable_wait_receipt_invalid")
+  })
+
   it("projects resumed native wait results through the same feedback allowlist", () => {
     const output = validOutput()
     Object.assign(output.tasks[0]!.result, {

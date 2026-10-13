@@ -5,7 +5,8 @@ import { projectNativeVerificationResult } from "./native-verification-feedback-
 const WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const WAIT_FIELDS = ["waitId", "status", "taskIds", "deadlineAt", "matchedTaskIds", "tasks"] as const
-const TASK_FIELDS = ["taskId", "status", "role", "result", "failureReason"] as const
+const LEGACY_TASK_FIELDS = ["taskId", "status", "role", "result", "failureReason"] as const
+const TASK_STATE_FIELDS = ["attemptCount", "maxAttempts", "leaseExpiresAt", "interruptRequestedAt"] as const
 const WAIT_STATUSES = new Set(["waiting", "ready", "timed_out", "interrupted", "closed"])
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_WAIT_TARGETS = 50
@@ -29,12 +30,15 @@ export function redactDurableWaitOutput(value: unknown): RepositoryJsonValue {
     const taskRows = readArray(receipt.tasks, 1, MAX_WAIT_TARGETS)
     if (taskRows.length !== taskIds.length) throw invalidReceipt()
     taskRows.forEach((value, index) => {
-      const task = exactObject(value, TASK_FIELDS)
+      const task = exactObject(value, LEGACY_TASK_FIELDS, TASK_STATE_FIELDS)
+      const hasTaskState = TASK_STATE_FIELDS.some(field => Object.hasOwn(task, field))
       const expectedTaskId = taskIds[index]
       if (typeof task.taskId !== "string" || !TASK_ID.test(task.taskId) || task.taskId !== expectedTaskId
         || typeof task.status !== "string" || !TASK_STATUSES.has(task.status)
         || typeof task.role !== "string" || task.role.length < 1 || task.role.length > 256
-        || (task.failureReason !== null && typeof task.failureReason !== "string")) throw invalidReceipt()
+        || (task.failureReason !== null && typeof task.failureReason !== "string")
+        || (hasTaskState && !TASK_STATE_FIELDS.every(field => Object.hasOwn(task, field)))
+        || (hasTaskState && !validTaskState(task))) throw invalidReceipt()
     })
 
     const projected = {
@@ -112,6 +116,21 @@ function exactObject(
 function asRecord(value: RepositoryJsonValue | undefined): Record<string, RepositoryJsonValue> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw invalidReceipt()
   return value as Record<string, RepositoryJsonValue>
+}
+
+function validTaskState(task: Record<string, RepositoryJsonValue>): boolean {
+  const attemptCount = task.attemptCount
+  const maxAttempts = task.maxAttempts
+  return typeof attemptCount === "number" && Number.isInteger(attemptCount) && attemptCount >= 0
+    && typeof maxAttempts === "number" && Number.isInteger(maxAttempts) && maxAttempts >= 1
+    && validIsoOrNull(task.leaseExpiresAt) && validIsoOrNull(task.interruptRequestedAt)
+}
+
+function validIsoOrNull(value: RepositoryJsonValue | undefined): boolean {
+  if (value === null) return true
+  if (typeof value !== "string") return false
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
 }
 
 /** Copies the full JSON shape; depth handling remains the shared redactor's. */

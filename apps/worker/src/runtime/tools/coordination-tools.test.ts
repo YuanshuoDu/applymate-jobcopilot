@@ -180,6 +180,84 @@ describe("coordination tool definitions", () => {
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, page, "agent.list output")).not.toThrow()
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()
   })
+
+  it("accepts exact legacy or complete current wait task outputs with canonical timestamps", () => {
+    const registry = new ToolRegistry(createCoordinationTools(options))
+    const schema = registry.resolve("agent.wait", "1").outputSchema
+    const legacy = {
+      waitId: "wait-1", status: "timed_out", taskIds: ["task-1"], deadlineAt: "2026-10-12T10:15:00.000Z",
+      matchedTaskIds: [], tasks: [{ taskId: "task-1", status: "retrying", role: "scout", result: null, failureReason: null }],
+    }
+    const current = {
+      ...legacy,
+      tasks: [{ ...legacy.tasks[0]!, attemptCount: 2, maxAttempts: 4,
+        leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: null }],
+    }
+    expect(() => registry.validators.validate(schema, legacy, "agent.wait output")).not.toThrow()
+    expect(() => registry.validators.validate(schema, current, "agent.wait output")).not.toThrow()
+    expect(Object.keys(legacy.tasks[0]!)).toHaveLength(5)
+    expect(Object.keys(current.tasks[0]!)).toHaveLength(9)
+
+    const extendedTimestamps = [
+      new Date(Date.UTC(10_000, 0, 1)).toISOString(),
+      new Date("-000001-01-01T00:00:00.000Z").toISOString(),
+      new Date("+010000-02-29T00:00:00.000Z").toISOString(),
+      new Date("-000004-02-29T00:00:00.000Z").toISOString(),
+      new Date("+275760-09-13T00:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T00:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T00:00:00.001Z").toISOString(),
+      new Date("-271821-04-20T12:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T23:59:59.999Z").toISOString(),
+    ]
+    expect(extendedTimestamps).toEqual([
+      "+010000-01-01T00:00:00.000Z",
+      "-000001-01-01T00:00:00.000Z",
+      "+010000-02-29T00:00:00.000Z",
+      "-000004-02-29T00:00:00.000Z",
+      "+275760-09-13T00:00:00.000Z",
+      "-271821-04-20T00:00:00.000Z",
+      "-271821-04-20T00:00:00.001Z",
+      "-271821-04-20T12:00:00.000Z",
+      "-271821-04-20T23:59:59.999Z",
+    ])
+
+    for (const field of ["leaseExpiresAt", "interruptRequestedAt"] as const) {
+      for (const value of ["2026-10-12T10:15:30.000Z", "2024-02-29T10:15:30.000Z", "2000-02-29T10:15:30.000Z", ...extendedTimestamps, null]) {
+        const task = { ...current.tasks[0]!, [field]: value }
+        expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).not.toThrow()
+      }
+      for (const value of [
+        "not-a-date",
+        "2026-10-12T10:15:30Z",
+        "2026-10-12T10:15:30.000+00:00",
+        "2026-10-12T10:15:30.000Z\n",
+        "+000001-01-01T00:00:00.000Z",
+        "-000000-01-01T00:00:00.000Z",
+        "+010000-02-30T00:00:00.000Z",
+        "+275761-01-01T00:00:00.000Z",
+        "+275760-09-13T00:00:00.001Z",
+        "-271822-04-20T00:00:00.000Z",
+        "-271821-04-19T23:59:59.999Z",
+        "2026-02-30T10:15:30.000Z",
+        "2026-02-29T10:15:30.000Z",
+        "1900-02-29T10:15:30.000Z",
+      ]) {
+        const task = { ...current.tasks[0]!, [field]: value }
+        expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).toThrow()
+      }
+    }
+
+    for (const task of [
+      { ...current.tasks[0]!, interruptRequestedAt: undefined },
+      { ...current.tasks[0]!, attemptCount: -1 },
+      { ...current.tasks[0]!, maxAttempts: 0 },
+      { ...current.tasks[0]!, leaseExpiresAt: 123 },
+      { ...current.tasks[0]!, leaseOwner: "private-lease-owner" },
+    ]) {
+      expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).toThrow()
+    }
+  })
+
   it("rejects forged tenant, ownership, lineage, and unknown fields before execution", () => {
     const registry = new ToolRegistry(createCoordinationTools(options))
     const valid = { idempotencyKey: "spawn-1", role: "scout", taskType: "inspect", goal: "Inspect the job" }

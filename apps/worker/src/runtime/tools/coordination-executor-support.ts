@@ -70,7 +70,14 @@ export function taskOutput(task: CoordinationTaskView) {
 
 export function waitTaskOutput(task: CoordinationTaskView) {
   const checked = validatedStructuredResult(task)
-  return { taskId: task.id, status: task.status, role: task.role, result: checked.invalid ? null : waitResult(task.result), failureReason: boundedFailureReason(checked.invalid ? "invalid_structured_result" : task.failureReason) }
+  return {
+    taskId: task.id, status: task.status, role: task.role,
+    attemptCount: task.attemptCount, maxAttempts: task.maxAttempts,
+    leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null,
+    interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null,
+    result: checked.invalid ? null : waitResult(task.result),
+    failureReason: boundedFailureReason(checked.invalid ? "invalid_structured_result" : task.failureReason),
+  }
 }
 
 export function waitResult(value: unknown): ReturnType<typeof sanitizeLifecyclePreview> | null {

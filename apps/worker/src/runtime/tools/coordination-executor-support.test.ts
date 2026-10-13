@@ -13,6 +13,7 @@ import {
   boundedFailureReason,
   currentTurnTask,
   taskOutput,
+  waitTaskOutput,
   waitResult,
   toolSafeDurableWaitPort,
 } from "./coordination-executor-support.js"
@@ -64,6 +65,26 @@ describe("coordination executor support", () => {
   it("removes foreign identity keys from bounded wait results", () => {
     expect(waitResult({ taskId: "private-task", sessionId: "private-session", result: { safe: true } })).toEqual({ result: { safe: true } })
     expect(waitResult(null)).toBeNull()
+  })
+
+  it("projects the existing safe attempt and lease state without exposing the lease owner", () => {
+    const current = {
+      ...task, attemptCount: 2, maxAttempts: 4, leaseOwner: "private-lease-owner",
+      leaseExpiresAt: new Date("2026-10-12T10:15:30.000Z"),
+      interruptRequestedAt: new Date("2026-10-12T10:10:00.000Z"),
+    }
+    const output = waitTaskOutput(current)
+
+    expect(output).toMatchObject({
+      taskId: "task-1", status: "completed", role: "scout", attemptCount: 2, maxAttempts: 4,
+      leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: "2026-10-12T10:10:00.000Z",
+      result: null, failureReason: null,
+    })
+    expect(output).not.toHaveProperty("leaseOwner")
+    expect(JSON.stringify(output)).not.toContain("private-lease-owner")
+
+    const noLease = waitTaskOutput({ ...task, leaseExpiresAt: null, interruptRequestedAt: null })
+    expect(noLease).toMatchObject({ attemptCount: 1, maxAttempts: 2, leaseExpiresAt: null, interruptRequestedAt: null })
   })
 
   it("projects native proof receipts to bounded feedback before exposing task results", () => {
