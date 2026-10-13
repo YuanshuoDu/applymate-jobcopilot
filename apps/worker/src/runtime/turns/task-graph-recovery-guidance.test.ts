@@ -15,8 +15,11 @@ const ROOT_ID = "root-current"
 const CURRENT_GRAPH_ID = "task-graph-current"
 const FEEDBACK_LEAD = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const FEEDBACK = `${FEEDBACK_LEAD} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met repair=missing`
+const STRUCTURED_FAILURE_FEEDBACK = `${FEEDBACK_LEAD} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=result_invalid repair=missing`
 const CHECK = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
   criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 4 } }] }
+const ANALYST_CHECK = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const,
+  criteria: [{ id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 2 } }] }
 const UNAVAILABLE_PROJECTION = { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted" as const, availability: "unavailable" as const }
 const digest = "a".repeat(64)
 
@@ -43,6 +46,41 @@ function extraNode(index: number): TaskGraphCurrentNode {
 
 function ordinaryFailedNode(failureReason: string | null = null): TaskGraphCurrentNode {
   return { ...extraNode(99), key: "ordinary-failed", taskId: "ordinary-failed-task", status: "failed", readiness: "terminal", failureReason }
+}
+
+function structuredFailureNode(
+  category?: NonNullable<TaskGraphCurrentNode["structuredOutputFailureCategory"]>, role: "scout" | "analyst" = "scout",
+): TaskGraphCurrentNode {
+  const verification = role === "scout" ? CHECK : ANALYST_CHECK
+  const criterionId = role === "scout" ? "candidate-count" : "finding-count"
+  return {
+    key: "typed-failure", taskId: "structured-private-task", templateId: role, goal: "PRIVATE_STRUCTURED_GOAL",
+    successCriteria: ["PRIVATE_STRUCTURED_CRITERION"], dependsOn: [], status: "failed", readiness: "terminal",
+    resultSummary: null, failureReason: null, resultProjection: UNAVAILABLE_PROJECTION,
+    verificationCriterionIds: [criterionId], verification,
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null },
+    ...(category === undefined ? {} : { structuredOutputFailureCategory: category }),
+  }
+}
+
+const REQUEST_MODEL = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false,
+  streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+const RECOVERY_TOOLS = [{ name: "agent.list" }, { name: "agent.wait" }, { name: "agent.plan" }]
+
+function requestFor(context: StepContext, tools: readonly unknown[] = RECOVERY_TOOLS) {
+  return buildModelRequest({ context, model: REQUEST_MODEL, tools, sessionId: "session", turnId: "turn", stepId: "step-resume",
+    userId: "user", taskId: ROOT_ID, signal: new AbortController().signal })
+}
+
+function recoveryMessage(request: ReturnType<typeof requestFor>) {
+  return request.messages.find(message => message.role === "system" && message.content.some(part => part.type === "text"
+    && part.text.includes("The current owner-read TaskGraph denial is advisory feedback")))
+}
+
+function requestSystemText(request: ReturnType<typeof requestFor>): string {
+  return request.messages.filter(message => message.role === "system")
+    .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
 }
 
 function replaceGraphNode(context: StepContext, index: number, node: unknown): StepContext {
@@ -279,5 +317,129 @@ describe("TaskGraph recovery guidance", () => {
 
     const inherited = Object.assign(Object.create({ executionFailureCategory: validCategory }), ordinaryFailedNode())
     expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, inherited), [{ name: "agent.plan" }], ROOT_ID)).toBeNull()
+  })
+
+  it("keeps all recognized structured failure categories observable while preserving byte-identical matched-denial guidance", () => {
+    const categories = ["missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid"] as const
+    const noCategoryRequest = requestFor(contextFor({ nodes: [structuredFailureNode()], feedback: STRUCTURED_FAILURE_FEEDBACK }))
+    const noCategoryMessage = recoveryMessage(noCategoryRequest)
+    expect(noCategoryMessage).toBeDefined()
+
+    for (const category of categories) {
+      const context = contextFor({ nodes: [structuredFailureNode(category)], feedback: STRUCTURED_FAILURE_FEEDBACK })
+      const request = requestFor(context)
+      const message = recoveryMessage(request)
+      const graph = context.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)?.content
+      const systemText = requestSystemText(request)
+
+      expect(JSON.stringify(graph)).toContain(`"structuredOutputFailureCategory":"${category}"`)
+      expect(message).toBeDefined()
+      expect(JSON.stringify(message)).toBe(JSON.stringify(noCategoryMessage))
+      expect(systemText).toContain("The current owner-read TaskGraph denial is advisory feedback")
+      expect(systemText).toContain("node 1, criterion 1 unverified for reason result_invalid")
+      expect(systemText).toContain("agent.plan may evaluate one typed repair under its current expectedRevision 5 contract")
+      expect(systemText).toContain("The existing planner and completion gate decide validity")
+      expect(systemText).not.toContain(category)
+      expect(systemText).not.toContain("structuredOutputFailureCategory")
+      expect(systemText).not.toContain("structured-private-task")
+      expect(systemText).not.toContain("PRIVATE_STRUCTURED_GOAL")
+      expect(systemText).not.toContain("PRIVATE_STRUCTURED_CRITERION")
+      expect(systemText).not.toContain(digest)
+    }
+  })
+
+  it("accepts an analyst typed result-invalid report through the same matched denial", () => {
+    const context = contextFor({ nodes: [structuredFailureNode("evidence_binding_invalid", "analyst")],
+      feedback: STRUCTURED_FAILURE_FEEDBACK })
+    const request = requestFor(context)
+    const graph = context.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)?.content
+    const systemText = requestSystemText(request)
+
+    expect(JSON.stringify(graph)).toContain('"templateId":"analyst"')
+    expect(JSON.stringify(graph)).toContain('"structuredOutputFailureCategory":"evidence_binding_invalid"')
+    expect(recoveryMessage(request)).toBeDefined()
+    expect(systemText).toContain("agent.plan may evaluate one typed repair under its current expectedRevision 5 contract")
+    expect(systemText).not.toContain("evidence_binding_invalid")
+    expect(systemText).not.toContain("structured-private-task")
+  })
+
+  it("fails closed for invalid category ownership, eligibility, reports, criteria, digests, and native markers", () => {
+    const eligible = structuredFailureNode("result_shape_invalid")
+    const context = contextFor({ nodes: [eligible], feedback: STRUCTURED_FAILURE_FEEDBACK })
+    const validReport = eligible.verificationReport!
+    const invalidRows: unknown[] = [
+      { ...eligible, structuredOutputFailureCategory: "private_exception_text" },
+      { ...eligible, structuredOutputFailureCategory: 3 },
+      { ...eligible, structuredOutputFailureCategory: { category: "result_shape_invalid" } },
+      { ...eligible, status: "queued", readiness: "ready" },
+      { ...eligible, templateId: "analyst" },
+      (() => { const { verificationReport: _report, ...withoutReport } = eligible; return withoutReport })(),
+      { ...eligible, verificationReport: report("failed") },
+      { ...eligible, verificationReport: { ...validReport, reasonCode: "result_ambiguous",
+        criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "result_ambiguous" }] } },
+      { ...eligible, verificationReport: { ...validReport,
+        criteria: [{ criterionId: "different-criterion", status: "unverified", reasonCode: "result_invalid" }] } },
+      { ...eligible, verificationReport: { ...validReport, evidenceDigest: digest } },
+      { ...eligible, verificationReport: { ...validReport, resultDigest: digest } },
+      { ...eligible, native: {} },
+      { ...eligible, nativeResult: {} },
+    ]
+    for (const row of invalidRows) {
+      expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 0, row), RECOVERY_TOOLS, ROOT_ID)).toBeNull()
+    }
+
+    let getterCalled = false
+    const accessor = { ...eligible }
+    Object.defineProperty(accessor, "structuredOutputFailureCategory", {
+      enumerable: true, get: () => { getterCalled = true; return "result_shape_invalid" },
+    })
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 0, accessor), RECOVERY_TOOLS, ROOT_ID)).toBeNull()
+    expect(getterCalled).toBe(false)
+
+    const nonEnumerable = { ...eligible }
+    Object.defineProperty(nonEnumerable, "structuredOutputFailureCategory", { enumerable: false, value: "result_shape_invalid" })
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 0, nonEnumerable), RECOVERY_TOOLS, ROOT_ID)).toBeNull()
+
+    const { structuredOutputFailureCategory: _category, ...withoutCategory } = eligible
+    const inherited = Object.assign(Object.create({ structuredOutputFailureCategory: "result_shape_invalid" }), withoutCategory)
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 0, inherited), RECOVERY_TOOLS, ROOT_ID)).toBeNull()
+  })
+
+  it("rejects category-bearing repair markers, missing or stale denials, hidden actions, full capacity, and resolved reports", () => {
+    const eligible = structuredFailureNode("result_shape_invalid")
+    const matched = contextFor({ nodes: [eligible], feedback: STRUCTURED_FAILURE_FEEDBACK })
+    const repair = {
+      ...structuredFailureNode("result_shape_invalid"), key: "typed-repair", taskId: "typed-repair-task",
+      repairOf: { graphRootTaskId: ROOT_ID, nodeKey: eligible.key, taskId: eligible.taskId, criterionIds: ["candidate-count"] },
+    }
+    const withRepairCategory = replaceGraphNode(contextFor({ nodes: [eligible, ordinaryFailedNode()], feedback: STRUCTURED_FAILURE_FEEDBACK }), 1, repair)
+    expect(buildTaskGraphRecoveryInstruction(withRepairCategory, RECOVERY_TOOLS, ROOT_ID)).toBeNull()
+
+    const withoutMarker = { ...matched, blocks: matched.blocks.filter(block => !block.id.startsWith("system:completion-recovery:task-graph:")) }
+    expect(recoveryMessage(requestFor(withoutMarker))).toBeUndefined()
+    expect(recoveryMessage(requestFor(contextFor({ nodes: [eligible], markerRevision: REVISION - 1,
+      feedback: STRUCTURED_FAILURE_FEEDBACK })))).toBeUndefined()
+    expect(recoveryMessage(requestFor(contextFor({ nodes: [eligible], feedback: FEEDBACK })))).toBeUndefined()
+
+    const hiddenRequest = requestFor(matched, [])
+    const hiddenText = requestSystemText(hiddenRequest)
+    expect(recoveryMessage(hiddenRequest)).toBeDefined()
+    expect(hiddenText).toContain("No result-page tool is visible")
+    expect(hiddenText).toContain("No plan command is visible")
+    expect(hiddenText).not.toContain("agent.plan may evaluate")
+    expect(hiddenText).not.toContain("agent.list")
+    expect(hiddenText).not.toContain("agent.wait")
+
+    const fullGraph = [eligible, ...Array.from({ length: 7 }, (_, index) => extraNode(index))]
+    const fullText = requestSystemText(requestFor(contextFor({ nodes: fullGraph, feedback: STRUCTURED_FAILURE_FEEDBACK })))
+    expect(fullText).toContain("node 1, criterion 1 unverified for reason result_invalid")
+    expect(fullText).not.toContain("agent.plan may evaluate one typed repair")
+
+    const resolved = structuredFailureNode()
+    const passedReport = report("passed")
+    const resolvedWithoutCategory = { ...resolved, status: "completed" as const, verificationReport: passedReport }
+    const resolvedWithCategory = { ...resolvedWithoutCategory, structuredOutputFailureCategory: "result_shape_invalid" as const }
+    expect(recoveryMessage(requestFor(contextFor({ nodes: [resolvedWithoutCategory], feedback: STRUCTURED_FAILURE_FEEDBACK })))).toBeUndefined()
+    expect(recoveryMessage(requestFor(contextFor({ nodes: [resolvedWithCategory], feedback: STRUCTURED_FAILURE_FEEDBACK })))).toBeUndefined()
   })
 })
