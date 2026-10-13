@@ -3,6 +3,7 @@ import type { StepContext } from "../context/step-context-builder.js"
 import { parseTaskGraphCurrentVerificationMetadata, validateTaskGraphCurrentVerificationGraph } from "../canonical-turn-task-graph-verification-context.js"
 import { taskGraphNodeCapacity, type TaskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, taskGraphVerificationReportMatchesStatus, type TaskGraphCurrentNode } from "../subagents/task-graph-command-port.js"
+import { projectTaskGraphStructuredFailureCategory } from "../subagents/task-graph-structured-failure-category.js"
 import type { TaskGraphRecoveryDetail, TaskGraphRecoverySummary } from "./completion-recovery-context.js"
 import { currentTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 
@@ -59,7 +60,7 @@ function stringArray(value: unknown, maximum: number, itemLength: number): strin
 
 function parseNode(value: unknown, rootTaskId: string): TaskGraphCurrentNode | undefined {
   const row = record(value, ["dependsOn", "failureReason", "goal", "key", "readiness", "resultProjection", "resultSummary", "status", "successCriteria", "taskId", "templateId"],
-    ["executionFailureCategory", "native", "nativeResult", "repairOf", "repairReceipt", "verification", "verificationCriterionIds", "verificationReport"])
+    ["executionFailureCategory", "native", "nativeResult", "repairOf", "repairReceipt", "structuredOutputFailureCategory", "verification", "verificationCriterionIds", "verificationReport"])
   if (!row || !boundedText(row.key, 128) || !boundedText(row.taskId, 128) || !boundedText(row.templateId, 128)
     || !boundedText(row.goal, 1200) || row.failureReason !== null || row.resultSummary !== null
     || typeof row.status !== "string" || !TASK_STATUSES.has(row.status)
@@ -74,6 +75,14 @@ function parseNode(value: unknown, rootTaskId: string): TaskGraphCurrentNode | u
   if (!verification || verification.verificationCriterionIds && !verification.verification
     || verification.verificationReport && !taskGraphVerificationReportMatchesStatus(verification.verificationReport, row.status)
     || verification.repairOf && verification.repairOf.graphRootTaskId !== rootTaskId) return undefined
+  if (Object.hasOwn(row, "structuredOutputFailureCategory")
+    && (Object.hasOwn(row, "native") || Object.hasOwn(row, "nativeResult")
+      || !projectTaskGraphStructuredFailureCategory(row, {
+        status: row.status, templateId: row.templateId, verification: verification.verification,
+        verificationReport: verification.verificationReport,
+        ...(verification.repairOf ? { repairOf: verification.repairOf } : {}),
+        ...(verification.repairReceipt ? { repairReceipt: verification.repairReceipt } : {}),
+      }))) return undefined
   if (Object.hasOwn(row, "executionFailureCategory") && (row.status !== "failed"
     || typeof row.executionFailureCategory !== "string" || !EXECUTION_FAILURE_CATEGORIES.has(row.executionFailureCategory)
     || Object.hasOwn(row, "verificationReport") || Object.hasOwn(row, "native") || Object.hasOwn(row, "nativeResult"))) return undefined
