@@ -181,7 +181,7 @@ describe("coordination tool definitions", () => {
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()
   })
 
-  it("accepts exact legacy or complete current wait task outputs, rejecting partial state and private fields", () => {
+  it("accepts exact legacy or complete current wait task outputs with canonical timestamps", () => {
     const registry = new ToolRegistry(createCoordinationTools(options))
     const schema = registry.resolve("agent.wait", "1").outputSchema
     const legacy = {
@@ -195,6 +195,31 @@ describe("coordination tool definitions", () => {
     }
     expect(() => registry.validators.validate(schema, legacy, "agent.wait output")).not.toThrow()
     expect(() => registry.validators.validate(schema, current, "agent.wait output")).not.toThrow()
+    expect(Object.keys(legacy.tasks[0]!)).toHaveLength(5)
+    expect(Object.keys(current.tasks[0]!)).toHaveLength(9)
+
+    const extendedTimestamps = ["+010000-01-01T00:00:00.000Z", "-000001-01-01T00:00:00.000Z"]
+    for (const value of extendedTimestamps) expect(new Date(value).toISOString()).toBe(value)
+
+    for (const field of ["leaseExpiresAt", "interruptRequestedAt"] as const) {
+      for (const value of ["2026-10-12T10:15:30.000Z", "2024-02-29T10:15:30.000Z", "2000-02-29T10:15:30.000Z", null]) {
+        const task = { ...current.tasks[0]!, [field]: value }
+        expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).not.toThrow()
+      }
+      for (const value of [
+        "not-a-date",
+        "2026-10-12T10:15:30Z",
+        "2026-10-12T10:15:30.000+00:00",
+        "2026-10-12T10:15:30.000Z\n",
+        ...extendedTimestamps,
+        "2026-02-30T10:15:30.000Z",
+        "2026-02-29T10:15:30.000Z",
+        "1900-02-29T10:15:30.000Z",
+      ]) {
+        const task = { ...current.tasks[0]!, [field]: value }
+        expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).toThrow()
+      }
+    }
 
     for (const task of [
       { ...current.tasks[0]!, interruptRequestedAt: undefined },
