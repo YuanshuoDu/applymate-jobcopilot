@@ -106,12 +106,26 @@ const WaitTaskBaseOutputProperties = {
   taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
   failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }
+// Wait-output timestamps use four-digit protocol years from PostgreSQL/JS Dates;
+// signed six-digit extended ISO years are outside this contract and rejected.
+const CANONICAL_UTC_MILLIS_PATTERN = [
+  "^(?:[0-9]{4}-(?:",
+  "(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])",
+  "|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)",
+  "|02-(?:0[1-9]|1[0-9]|2[0-8])",
+  ")|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])",
+  "|(?:00|04|08|12|16|20|24|28|32|36|40|44|48|52|56|60|64|68|72|76|80|84|88|92|96)00)-02-29)",
+  "T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{3}Z(?![\\s\\S])",
+].join("")
+const CanonicalUtcTimestampOrNullSchema = Type.Union([
+  Type.String({ pattern: CANONICAL_UTC_MILLIS_PATTERN }), Type.Null(),
+])
 const WaitTaskOutputSchema = Type.Union([
   Type.Object(WaitTaskBaseOutputProperties, { additionalProperties: false }),
   Type.Object({
     ...WaitTaskBaseOutputProperties,
     attemptCount: Type.Integer({ minimum: 0 }), maxAttempts: Type.Integer({ minimum: 1 }),
-    leaseExpiresAt: Type.Union([Type.String(), Type.Null()]), interruptRequestedAt: Type.Union([Type.String(), Type.Null()]),
+    leaseExpiresAt: CanonicalUtcTimestampOrNullSchema, interruptRequestedAt: CanonicalUtcTimestampOrNullSchema,
   }, { additionalProperties: false }),
 ])
 const WaitAggregateSchema = Type.Object({
