@@ -1,0 +1,11 @@
+# Native semantic failure memory
+
+The durable semantic-progress mode remembers repeated rejection of the same current, independently verified Root candidate across Step completion, durable waits, lease recovery, and Worker restart. It does not change the Root goal, verifier criteria, model prompt, tool policy, budget, or final-response proof gate.
+
+Before a canonical Root starts its first Step, the owner-fenced Turn store pins `legacy_v1` or `durable_v1` on the Turn. With the feature flag off, an unpinned Turn remains legacy and does not need the new ledger. When enabled, a Turn with existing Steps pins legacy; a pristine Turn pins durable. A persisted mode remains authoritative after restart even if the flag later changes. Missing migration, table privileges, or required store methods fail closed as a persistence conflict rather than silently switching modes.
+
+Durable mode records one private immutable row per completed Root Step. Its key binds the owner, Turn, root task, locked Step checkpoint, candidate digest, and the current failed verifier control task, operation, attempt, and report digest. The candidate and report contents are never copied into this ledger. Before completing a Step, the same PostgreSQL transaction rederives the current failed proof from the owned TaskGraph and persisted control packet, then updates the Step and inserts its receipt atomically. Replays must match both the stored Step usage and receipt. Reads return at most three distinct completed Step IDs for the exact current key.
+
+Waits, resumptions, and runtime recreation do not erase receipts. A changed human-input checkpoint or a new candidate/control proof selects a different key; returning to a prior unchanged proof finds its prior receipts. The Root stops on the existing no-progress path at three matching completed rejections. Existing step, tool, token, cost, and terminal-proof limits remain in force.
+
+`agent_native_semantic_rejections` is tenant-scoped with row-level security and a narrow lookup index. The migration grants no privileges. Before enabling the feature, provision the Worker role with only the required `SELECT` and `INSERT` access under the existing tenant policy. The mode column and ledger are server-private and are excluded from public projections and model context.

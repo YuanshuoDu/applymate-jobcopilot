@@ -149,6 +149,19 @@ jobs:
             src/runtime/subagents/native-verification-history-pg.integration.test.ts \
             src/runtime/subagents/native-brain-pg.integration.test.ts \
             src/runtime/turns/turn-question-store-pg.integration.test.ts
+      - name: Verify native semantic rejection memory on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run \
+            src/runtime/subagents/native-semantic-memory-pg.integration.test.ts
       - name: Verify interactive discovery Stop recovery without subagent execution
         env:
           CI: "true"

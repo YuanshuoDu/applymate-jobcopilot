@@ -1,6 +1,7 @@
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import type pg from "pg"
 import type { NativeVerificationDisposition, NativeVerificationReasonCode } from "./native-verification-contract.js"
+import type { NativeSemanticRejectionIdentity } from "../turns/native-semantic-rejection-ledger.js"
 
 /** Safe, bounded feedback from independently executed native verification controls. */
 export type NativeVerificationFeedback = Readonly<{
@@ -51,6 +52,8 @@ export type NativeVerificationPort = Readonly<{
   ensureChildren(scope: TaskGraphExecutionScope): Promise<NativeVerificationEnsureResult>
   ensureRootGoal(input: Readonly<{ scope: TaskGraphExecutionScope; candidateText: string }>): Promise<NativeVerificationEnsureResult>
   readRecoverableGoal(scope: TaskGraphReadScope): Promise<NativeVerificationRecoverableGoal | null>
+  /** Private runtime read; never included in ensure/tool results or public feedback. */
+  readFailedRootSemanticRejection?(input: Readonly<{ scope: TaskGraphExecutionScope; candidateText: string; controlTaskId: string }>): Promise<NativeSemanticRejectionIdentity | null>
 }>
 
 /** Terminal-only proof read: caller supplies its already-open transaction client. */

@@ -29,7 +29,7 @@ import { readSelectedJobSourceDigestWithClient } from "./subagents/selected-job-
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
-import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } from "./execution-owner.js"
+import type { ExecutionOwner, ExecutionOwnerFence } from "./execution-owner.js"
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
@@ -45,6 +45,7 @@ import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurfac
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalSelectedJobCompletion, createCanonicalTurnTerminalGuard, loadNativeVerificationRootContext, prepareNativeVerificationRootContext, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
+import { configureNativeSemanticProgress } from "./canonical-turn-native-semantic-rejection.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
@@ -187,8 +188,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     let acceptedDiscoveryShortlist: InteractiveDiscoveryShortlistProjection | undefined
     let discoveryFailureCode: "discovery_runtime_unavailable" | "discovery_runtime_failed" = "discovery_runtime_failed"
     const turnStore = interactiveDiscoveryMode ? withInteractiveDiscoveryFinalResponse(baseTurnStore, () => acceptedDiscoveryShortlist) : baseTurnStore
-    const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
-    if (owner.kind !== "turn") throw new Error("turn_owner_fence_invalid")
+    const { owner, mode: nativeSemanticProgressMode } = await configureNativeSemanticProgress({ taskId: root.id, lease, store: turnStore, nativeVerification, featureEnabled: productionFlags?.nativeSemanticProgressMemoryEnabled === true, taskGraphPlanningEnabled, now: now() })
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
@@ -222,8 +222,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
       store: turnStore, model, tools: rootTools, ...rootToolGuards,
       rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
-      actorRole, capabilities: toolCapabilities,
-      signal,
+      actorRole, capabilities: toolCapabilities, signal,
+      nativeSemanticProgressMode,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphBeforeStep: turnCoordination.refresh, refreshTaskGraphAfterReadyWait: turnCoordination.refresh, refreshTaskGraphAfterPlan: turnCoordination.refresh } : {}),
       ...(nativeRecovery.candidateText !== undefined ? { recoveredFinalCandidate: nativeRecovery.candidateText } : {}),

@@ -15,6 +15,7 @@ import { withNativeVerificationFeedback } from "./canonical-turn-native-verifica
 import type { NativeVerificationRecovery } from "./canonical-turn-native-verification-recovery.js"
 import { nativeVerificationCompletionGate } from "./canonical-turn-native-verification.js"
 import { createNativeSemanticProgressTracker } from "./native-semantic-progress.js"
+import { createNativeSemanticRejectionObserver, type NativeSemanticProgressConfiguration } from "./canonical-turn-native-semantic-rejection.js"
 import { waitForNativeVerification } from "./canonical-turn-native-verification-wait.js"
 import { readNativeVerificationRecovery } from "./canonical-turn-native-verification-recovery.js"
 import { persistedFinalCandidate } from "./turns/turn-execution-final-candidate.js"
@@ -175,6 +176,7 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
   enabled: boolean
 }>): Readonly<{
   port: NativeVerificationPort
+  configureSemanticProgress(input: NativeSemanticProgressConfiguration): void
   recover(): Promise<NativeVerificationRecovery>
   checkCompletion(stepId: string, candidateText: string): Promise<TurnEngineCompletionGateResult | null>
   resetSemanticProgress(): void
@@ -188,10 +190,12 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
   let acceptedWitness: NativeVerificationRootGoalWitness | undefined
   let acceptedCandidate: string | undefined
   const semanticProgress = createNativeSemanticProgressTracker()
+  const semanticRejection = createNativeSemanticRejectionObserver({ tracker: semanticProgress, port: runtime.port })
   return {
     port: runtime.port,
+    configureSemanticProgress: semanticRejection.configure,
     accepted: () => acceptedWitness !== undefined,
-    resetSemanticProgress() { semanticProgress.reset() },
+    resetSemanticProgress() { semanticRejection.reset() },
     async recover() {
       if (!input.enabled || !await input.coordination.hasNativeTasks()) return {}
       return readNativeVerificationRecovery({ port: runtime.port, scope: input.coordination.readScope() })
@@ -208,16 +212,16 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
           hasNativeTasks: input.enabled ? input.coordination.hasNativeTasks : async () => false,
           checkReceipt: input.coordination.checkNativeGraphCompletion,
           wait: (scope, targetTaskIds) => waitForNativeVerification({ port: input.durableWaitPort, scope, targetTaskIds }),
-          observeRootSemanticRejection: controlTaskId => {
+          observeRootSemanticRejection: ({ scope, candidateText, controlTaskId }) => {
             observedSemanticReject = true
-            return semanticProgress.observe({ candidateText, controlTaskId, stepId })
+            return semanticRejection.observe({ scope, stepId, candidateText, controlTaskId })
           },
           accept: (witness, candidate) => { acceptedWitness = witness; acceptedCandidate = candidate },
         })
-        if (!observedSemanticReject) semanticProgress.reset()
+        if (!observedSemanticReject) semanticRejection.reset()
         return result
       } catch (error: unknown) {
-        semanticProgress.reset()
+        semanticRejection.reset()
         throw error
       }
     },

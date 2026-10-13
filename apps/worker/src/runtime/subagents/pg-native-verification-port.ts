@@ -12,7 +12,7 @@ import { ensureNativeVerificationControl, nativeVerificationControlContentMatche
 import {
   nativeVerificationControlMatchesCurrentTarget, nativeVerificationHistory,
   nativeVerificationTypedCriteriaReady, readNativeVerificationControlProofs,
-  type NativeVerificationControlProof,
+  readNativeVerificationFailedRootRejectionWithClient, type NativeVerificationControlProof,
 } from "./native-verification-pg-readback.js"
 import type {
   NativeVerificationEnsureResult, NativeVerificationFeedback, NativeVerificationPort,
@@ -99,6 +99,13 @@ export function createPgNativeVerificationPort(pool: PgSubagentPool): NativeVeri
         return { controlTaskId: root.task.taskId, candidateText: null, status: root.disposition,
           feedback: feedbackFor(root) }
       }) } catch (error) { if (isDataUnavailable(error)) return null; throw error }
+    },
+    async readFailedRootSemanticRejection(input) {
+      return transaction(pool, async client => {
+        await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
+        const locked = await lockAndLoad(client, input.scope, true)
+        return readNativeVerificationFailedRootRejectionWithClient(client, { ...input, graph: locked.graph, state: locked.state })
+      })
     },
   }
 }
