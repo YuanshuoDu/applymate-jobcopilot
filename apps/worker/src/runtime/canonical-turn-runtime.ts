@@ -7,6 +7,7 @@ import { createPgInputClaimStore } from "./context/input-claim-store.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
 import { createWorkerToolRuntime, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
+import { resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
 import type { TaskGraphCommandPort, TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import type { RuntimeToolDefinition, ToolIdempotency } from "./tools/types.js"
 import { createPgTurnEngineStore } from "./turns/turn-engine-store.js"
@@ -132,8 +133,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
         return failSelectedJobPreparationUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
       }
     }
-    const interactiveDiscoveryMode = state.intent?.kind === INTERACTIVE_DISCOVERY_INTENT.kind && state.intent.version === INTERACTIVE_DISCOVERY_INTENT.version && !selectedJobMode
-    const turnTaskGraphTemplates = interactiveDiscoveryMode ? INTERACTIVE_DISCOVERY_TEMPLATES : taskGraphTemplates
+    const interactiveDiscoveryMode = state.intent?.kind === INTERACTIVE_DISCOVERY_INTENT.kind && state.intent.version === INTERACTIVE_DISCOVERY_INTENT.version && !selectedJobMode, turnTaskGraphTemplates = interactiveDiscoveryMode ? INTERACTIVE_DISCOVERY_TEMPLATES : taskGraphTemplates
     if (interactiveDiscoveryMode && !taskGraphPlanningEnabled && !signal.aborted) return failInteractiveDiscoveryUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
     const turnCoordination = createCanonicalTurnCoordination({ enabled: taskGraphPlanningEnabled, commandPort: options.taskGraphCommandPort, lease })
     const nativeQuestionWaitEnabled = isNativeQuestionWaitEnabled({ coordination: coordinationEnabled, nativeRoot: turnCoordination.nativeOptions.enabled, requested: options.nativeQuestionWaitEnabled, customAdapters: !!options.turnEngineStoreFactory || !!options.toolRuntimeFactory })
@@ -156,7 +156,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       nativeCoordination: turnCoordination.nativeOptions, askUserEnabled: nativeQuestionWaitEnabled,
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
-    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null })
+    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, verificationRequirements: resolveRootTaskVerificationRequirements(state.turnInput), turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities); if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
     const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)
     const allowedActions = rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, taskGraphPlanningEnabled)
