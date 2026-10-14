@@ -6,7 +6,7 @@ import type { TaskGraphCommandPort } from "./task-graph-command-port.js"
 describe("TaskGraph server-owned templates", () => {
   it("registers structured read-only Scout and Analyst roles for evidence chaining", () => {
     expect(TASK_GRAPH_TEMPLATES.scout).toMatchObject({
-      role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get"],
+      role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"],
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
     })
     expect(TASK_GRAPH_TEMPLATES.analyst).toMatchObject({
@@ -40,6 +40,7 @@ describe("TaskGraph server-owned templates", () => {
       context: { selectedJobPreparation: { jobId: "job-1" } },
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
     })
+    expect(templates.scout.allowedActions).toEqual(["jobs.get"])
     expect(templates.analyst).toMatchObject({
       role: "analyst", taskType: "job_analysis",
       allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base"],
@@ -48,7 +49,9 @@ describe("TaskGraph server-owned templates", () => {
     })
     expect(Object.keys(templates)).toEqual(["scout", "analyst", "cover_letter_writer", "cover_letter_reviewer"])
     expect(templates.scout.allowedActions).not.toContain("jobs.search")
+    expect(templates.scout.allowedActions).not.toContain("jobs.discover")
     expect(templates.analyst.allowedActions).not.toContain("jobs.search")
+    expect(templates.analyst.allowedActions).not.toContain("jobs.discover")
     expect(templates.cover_letter_writer).toMatchObject({
       role: "writer", taskType: "cover_letter_draft",
       allowedActions: ["cover_letter.draft"],

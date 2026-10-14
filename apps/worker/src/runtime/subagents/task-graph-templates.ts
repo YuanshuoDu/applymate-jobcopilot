@@ -9,8 +9,8 @@ export const TASK_GRAPH_TEMPLATES = Object.freeze({
   scout: Object.freeze({
     role: "scout",
     taskType: "job_discovery",
-    allowedActions: Object.freeze(["jobs.search", "jobs.get"]),
-    constraints: Object.freeze(["Use approved job search and read tools only; do not submit applications or message employers."]),
+    allowedActions: Object.freeze(["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"]),
+    constraints: Object.freeze(["Use approved job discovery and read tools only; do not submit applications or message employers."]),
     expectedOutputSchema: Object.freeze({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }),
   }),
   analyst: Object.freeze({

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { createWorkerToolRuntime } from "./index.js"
+import { createJobDiscoveryClient } from "./job-discovery-client.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
 import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
@@ -30,6 +31,22 @@ describe("worker tool runtime entry point", () => {
     )
 
     expect(runtime.registry.resolve("application.submit", "1").risk).toBe("external_write")
+  })
+
+  it("registers jobs.discover only when a trusted Scout bridge is explicitly supplied", () => {
+    const disabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink() })
+    expect(() => disabled.registry.resolve("jobs.discover", "1")).toThrow("not registered")
+    const enabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink() }, undefined, undefined, undefined, undefined, undefined,
+      {
+        client: createJobDiscoveryClient({ endpointUrl: "https://web.example/discovery", secret: "secret", fetch: vi.fn(async () => Response.json({})) }),
+        fence: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1", rootTaskId: "root-1", role: "scout", leaseOwner: "worker-1", attemptCount: 1 },
+      },
+    )
+    expect(enabled.registry.resolve("jobs.discover", "1")).toMatchObject({
+      risk: "internal_write", domain: "jobs", capabilities: ["read", "write"], requiredCapabilities: ["read"],
+    })
+    expect(enabled.registry.validateArguments("jobs.discover", { targetRoles: ["Engineer"], targetLocations: [], userId: "forged" })).not.toBe(true)
   })
 
   it("registers the durable private-result read tool with the runtime owner resolver", () => {

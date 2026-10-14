@@ -88,7 +88,9 @@ export function visibleToolPolicy(
     && exactCapabilities(tool.capabilities, ["read", "write"])
     && tool.requiredCapabilities.length === 0
   if (tool.name === "artifact.review" && !boundedReviewReceipt) return { visible: false, reason: "role_risk_denied" }
-  if (!policy.allowedRisks.includes(tool.risk) && !boundedReviewReceipt) return { visible: false, reason: "role_risk_denied" }
+  const boundedDiscoveryWrite = isExactScoutDiscoveryWrite(role, tool)
+  if (tool.name === "jobs.discover" && !boundedDiscoveryWrite) return { visible: false, reason: "role_risk_denied" }
+  if (!policy.allowedRisks.includes(tool.risk) && !boundedReviewReceipt && !boundedDiscoveryWrite) return { visible: false, reason: "role_risk_denied" }
   if (!policy.allowedDomains.includes(tool.domain)) return { visible: false, reason: "role_domain_denied" }
   if (tool.requiredCapabilities.some(capability => !policy.capabilities.includes(capability))) return { visible: false, reason: "role_capability_denied" }
   return { visible: true, reason: boundedReviewReceipt ? "bounded_review_receipt_allowed" : "role_allowed" }
@@ -133,6 +135,13 @@ export function preflightSubagentTool(
 
 function looksLikeExternalAction(name: string): boolean {
   return /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i.test(name)
+}
+
+function isExactScoutDiscoveryWrite(role: string, tool: RoleToolMetadata): boolean {
+  return role === "scout" && tool.name === "jobs.discover" && tool.version === "1"
+    && tool.risk === "internal_write" && tool.domain === "jobs"
+    && exactCapabilities(tool.capabilities, ["read", "write"])
+    && exactCapabilities(tool.requiredCapabilities, ["read"])
 }
 
 function exactCapabilities(actual: readonly string[] | undefined, expected: readonly string[]): boolean {

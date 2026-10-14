@@ -19,6 +19,16 @@ describe("interactive discovery runtime", () => {
     expect(validateArguments).not.toHaveBeenCalled()
   })
 
+  it("keeps provider discovery unavailable on the root interactive tool surface", async () => {
+    const routeTool = vi.fn(async () => ({ id: "call-discover", toolName: "jobs.discover", toolVersion: "1", status: "completed" as const, errorCode: null }))
+    const guards = createCanonicalRootToolGuards({
+      interactiveDiscoveryMode: true, selectedJobMode: false, routeTool: routeTool as never, validateArguments: () => true,
+    })
+    const request = { call: { id: "call-discover", toolName: "jobs.discover", toolVersion: "1", input: {} } } as never
+    await expect(guards.executeTool(request)).resolves.toMatchObject({ status: "failed", errorCode: "interactive_discovery_root_tool_disabled" })
+    expect(routeTool).not.toHaveBeenCalled()
+  })
+
   it("blocks completion without an accepted ranked item", async () => {
     const gate = await interactiveDiscoveryCompletionGate({
       pool: {} as never, lease: {} as never, root: { id: "root-1", attemptCount: 1 },

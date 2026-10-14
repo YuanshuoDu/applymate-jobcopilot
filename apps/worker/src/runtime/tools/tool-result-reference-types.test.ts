@@ -41,6 +41,49 @@ describe("tool result reference runtime contract", () => {
     expect(canonicalJson(prepared.value)).toBe(prepared.encoded)
   })
 
+  it("preserves only canonical jobs.discover IDs in durable references", () => {
+    const source = "jobs.discover" as CanonicalToolSourceName
+    const jobId = "c123456789012345678901234"
+    const otherId = "00000000-0000-4000-8000-000000000000"
+    const raw = {
+      jobs: [{
+        id: jobId, title: "Engineer", company: "Example", location: "Dublin", url: "https://jobs.example/1",
+        description: `Reference ${otherId}`, fullDescription: "Full description", salary: null, logo: null,
+        source: "greenhouse", evidenceRefs: ["evidence-source-1"],
+      }],
+      evidence: [{
+        evidenceId: "evidence-source-1", jobId, kind: "source", source: "greenhouse",
+        url: "https://jobs.example/1", summary: "Source listing",
+      }],
+      nextCursor: null,
+      usage: {
+        ledgerKey: "ledger-discover", toolName: "jobs.discover", toolVersion: "1", toolCallId: "call-discover",
+        sessionId: "session-1", turnId: "turn-1", stepId: "step-1", requests: 1,
+        jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0, aiCalls: 0,
+        providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1,
+      },
+    }
+    const prepared = prepareToolResultJson(raw, source)
+    expect(prepared.value).toEqual({ ...raw, jobs: [{ ...raw.jobs[0], description: "Reference [REDACTED_PHONE]" }] })
+    const row = {
+      id: "tool-result-discover", userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", taskId: "root-1", toolCallId: "call-1",
+      sanitizedJson: prepared.value, sha256: prepared.sha256, byteCount: prepared.bytes, createdAt: new Date(0), updatedAt: new Date(0),
+    }
+    expect(verifyToolResultSanitization(row, source)).toEqual(prepared.value)
+
+    const genericJobId = otherId
+    const generic = prepareToolResultJson({
+      ...raw,
+      jobs: [{ ...raw.jobs[0], id: genericJobId }],
+      evidence: [{ ...raw.evidence[0], jobId: genericJobId }],
+    }, "notes.read" as CanonicalToolSourceName)
+    expect(generic.value).toEqual({
+      ...raw,
+      jobs: [{ ...raw.jobs[0], id: "[REDACTED_PHONE]", description: "Reference [REDACTED_PHONE]" }],
+      evidence: [{ ...raw.evidence[0], jobId: "[REDACTED_PHONE]" }],
+    })
+  })
+
   it("reads only exact generic-redacted legacy bytes and rejects unsanitized legacy bytes", () => {
     const source = "jobs.search" as CanonicalToolSourceName
     const raw = { jobs: [{ id: "00000000-0000-4000-8000-000000000001", description: "legacy@example.com" }], page: 1, hasMore: false }
