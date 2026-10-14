@@ -250,14 +250,12 @@ describe("canonical Turn context builder", () => {
       })
     }
     const turnInput = {
-      input: {
-        goal, successCriteria: ["Legacy prose criterion"],
-        verificationRequirements: {
-          schemaVersion: "agent-harness.v2.objective-requirements.v1",
-          requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
-        },
-        privateTurnId: "PRIVATE_TURN_ID",
+      goal, successCriteria: ["Legacy prose criterion"],
+      verificationRequirements: {
+        schemaVersion: "agent-harness.v2.objective-requirements.v1",
+        requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
       },
+      privateTurnId: "PRIVATE_TURN_ID",
       privateEnvelopeValue: "PRIVATE_ENVELOPE_VALUE",
     }
     const build = buildFor(turnInput)

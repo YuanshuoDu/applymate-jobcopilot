@@ -41,6 +41,29 @@ describe("canonical Root goal-criteria context", () => {
     expect(rootTaskGoalCriteriaBlocks(undefined)).toEqual([])
   })
 
+  it("projects flat canonical Turn requirements without exposing private fields", () => {
+    const flatTurnInput = {
+      goal,
+      verificationRequirements: {
+        schemaVersion: "agent-harness.v2.objective-requirements.v1",
+        requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+      },
+      privateTurnId: "PRIVATE_TURN_ID",
+      privateEnvelopeValue: "PRIVATE_ENVELOPE_VALUE",
+    }
+    const flat = rootTaskVerificationRequirementsObservation(flatTurnInput)
+
+    expect(flat).toEqual({
+      id: "root-task-verification-requirements",
+      content: {
+        kind: "canonical_objective_verification_requirements", trust: "external_untrusted",
+        source: "canonical_turn_objective", status: "valid",
+        requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3 }],
+      },
+    })
+    expect(JSON.stringify(flat)).not.toMatch(/PRIVATE_TURN_ID|PRIVATE_ENVELOPE_VALUE/)
+  })
+
   it("projects validated typed intent and keeps invalid presence as a fixed diagnostic", () => {
     const valid = rootTaskVerificationRequirementsObservation({ input: { verificationRequirements: {
       schemaVersion: "agent-harness.v2.objective-requirements.v1",

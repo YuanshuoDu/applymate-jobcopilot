@@ -110,6 +110,19 @@ describe("canonical root task objective", () => {
 })
 
 describe("canonical Turn verification requirements", () => {
+  it("accepts the flat canonical Turn input shape", () => {
+    expect(resolveRootTaskVerificationRequirements({
+      goal: "Find roles",
+      verificationRequirements: objectiveRequirements(),
+    })).toEqual({
+      status: "valid",
+      requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", minimum: 3 },
+        { id: "finding_count", kind: "finding_count_gte", minimum: 1 },
+      ],
+    })
+  })
+
   it("distinguishes an absent field from a valid nested objective block", () => {
     expect(resolveRootTaskVerificationRequirements({ input: { goal: "Find roles" } })).toEqual({ status: "absent" })
     expect(resolveRootTaskVerificationRequirements({ input: { goal: "Find roles", verificationRequirements: objectiveRequirements() } }))
