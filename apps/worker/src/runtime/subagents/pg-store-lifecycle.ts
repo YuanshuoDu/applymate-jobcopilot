@@ -1,8 +1,12 @@
 import type pg from "pg"
 import { appendInternalAcceptedInterrupt } from "./task-interrupt-outbox.js"
-import { TASK_GRAPH_VERIFIER_VERSION, verifyTaskGraphNodeEvidence, type TaskGraphVerificationReport } from "./task-graph-pg-verification.js"
+import { verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
-import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
+import { taskGraphVerificationDependencyNodeKeys } from "../planning/task-graph-verification.js"
+import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
+import { canonicalTaskGraphJson, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { json, transaction } from "./pg-store-persistence.js"
 import type { PgSubagentPool, SubagentTaskRecord } from "./types.js"
 import { recoverExpired as recoverExpiredImpl } from "./pg-store-expiry-recovery.js"
@@ -27,15 +31,27 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   }
   const envelope = plainObject(safeInputResult)
   const structuredResult = envelope?.structuredResult
+  const dependencyKeys = node.verification ? taskGraphVerificationDependencyNodeKeys(node.verification) : []
+  let dependencyProof: Awaited<ReturnType<typeof verifyCompletedScoutDependencies>> = null
+  if (dependencyKeys.length) {
+    const loaded = await loadTaskGraph(client, graph.scope, true)
+    if (loaded.item && loaded.snapshot && loaded.state && loaded.state.revision === graph.expectedRevision
+      && canonicalTaskGraphJson(loaded.snapshot) === canonicalTaskGraphJson(graph.snapshot)) {
+      dependencyProof = await verifyCompletedScoutDependencies(client, graph.scope, loaded.snapshot, node)
+    }
+  }
   const evidence = node.verificationDisposition === "typed" && node.verification
-    ? await verifyTaskGraphNodeEvidence(client, { scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot, node, structuredResult })
+    ? await verifyTaskGraphNodeEvidence(client, { scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot, node, structuredResult,
+      ...(dependencyKeys.length && dependencyProof ? { dependencies: dependencyProof.projections } : {}) })
     : { verified: false, report: unverifiedFailureReport(node) }
   const typedPass = node.verificationDisposition === "typed" && evidence.verified && evidence.report.status === "passed"
   const repairReceipt = typedPass && node.repairOf ? await validateRepairTarget(client, graph, node, input.taskId, evidence.report) : null
   const repairRejected = typedPass && Boolean(node.repairOf) && !repairReceipt
   const report = repairRejected ? { ...evidence.report, status: "unverified" as const, reasonCode: "repair_target_unresolved", evidenceDigest: null } : evidence.report
   const boundResult = "structuredResult" in evidence ? evidence.structuredResult : undefined
-  const safeResult = taskGraphVerificationResult(safeInputResult, report, boundResult, repairReceipt)
+  const reportWithDependencies = typedPass && !repairRejected && dependencyKeys.length && dependencyProof
+    ? { ...report, dependencyBindings: dependencyProof.bindings } : report
+  const safeResult = taskGraphVerificationResult(safeInputResult, reportWithDependencies, boundResult, repairReceipt)
   if (typedPass && !repairRejected) return { graph, status: input.status, failureReason: input.failureReason, result: safeResult, reconcileDependents: true }
   const failureReason = repairRejected ? "task_graph_repair_target_unresolved" : evidence.report.status === "failed" ? "task_graph_verification_failed" : "task_graph_verification_unverified"
   graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.failed", attemptCount: input.attemptCount, failureReason })

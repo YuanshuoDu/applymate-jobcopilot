@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_LIMITS, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 const queuedEvent = {
   type: "task.queued",
@@ -70,6 +71,12 @@ const scoutVerification = {
     { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
   ],
 } as const
+const registeredScoutEnvelope = {
+  role: "scout",
+  taskType: "research",
+  expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+  allowedActions: ["jobs.search"],
+} as const
 
 function boundedEightNodeSnapshot(useUnicode: boolean) {
   const keys = Array.from({ length: 8 }, (_, index) => `${"k".repeat(127)}${index}`)
@@ -115,6 +122,60 @@ describe("parseTaskGraphSnapshot", () => {
     const rewritten = taskGraphSnapshot(resumed, new Map([["old", "task-old"]]))
     expect(rewritten.nodes[0]).toMatchObject({ verificationDisposition: "legacy_unverified" })
     expect(rewritten.nodes[0]).not.toHaveProperty("verification")
+  })
+
+  it("strictly round-trips a registered Scout envelope while keeping undeclared legacy snapshots compatible", () => {
+    const typedScout = {
+      ...storedNode("registered-scout"), verification: scoutVerification, verificationDisposition: "typed",
+      registeredScoutEnvelope,
+    }
+    const snapshot = parseTaskGraphSnapshot(snapshotWithNodes([typedScout]))
+    expect(snapshot.nodes[0]?.registeredScoutEnvelope).toEqual(registeredScoutEnvelope)
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(snapshot))).toEqual(snapshot)
+
+    const legacy = parseTaskGraphSnapshot(snapshotWithNodes([storedNode("legacy-scout")]))
+    expect(legacy.nodes[0]).not.toHaveProperty("registeredScoutEnvelope")
+
+    const inheritedActions = parseTaskGraphSnapshot(snapshotWithNodes([{
+      ...typedScout, registeredScoutEnvelope: { ...registeredScoutEnvelope, allowedActions: [] },
+    }]))
+    expect(inheritedActions.nodes[0]?.registeredScoutEnvelope).toEqual({ ...registeredScoutEnvelope, allowedActions: [] })
+
+    const sparseActions = new Array<string>(1)
+    const malformed = [
+      { ...registeredScoutEnvelope, role: "analyst" },
+      { ...registeredScoutEnvelope, taskType: " " },
+      { ...registeredScoutEnvelope, expectedOutputSchema: { ...registeredScoutEnvelope.expectedOutputSchema, schemaVersion: "other" } },
+      { ...registeredScoutEnvelope, unexpected: true },
+      { ...registeredScoutEnvelope, allowedActions: sparseActions },
+      { ...registeredScoutEnvelope, allowedActions: Object.assign(["jobs.search"], { extra: true }) },
+    ]
+    for (const envelope of malformed) {
+      expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{ ...typedScout, registeredScoutEnvelope: envelope }]))).toThrow()
+    }
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{
+      ...typedScout, templateId: "analyst", verification: analystVerification,
+    }]))).toThrow()
+  })
+
+  it("requires a named findings source to be a direct typed registered Scout in the same snapshot", () => {
+    const check = { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" }
+    const scout = { ...storedNode("scout-source"), verification: scoutVerification, verificationDisposition: "typed" }
+    const analyst = {
+      ...storedNode("analyst", ["scout-source"]), templateId: "analyst",
+      verification: { ...analystVerification, criteria: [{ id: "in-scout", check }] }, verificationDisposition: "typed",
+    }
+    expect(parseTaskGraphSnapshot(snapshotWithNodes([scout, analyst])).nodes[1]).toMatchObject({ key: "analyst" })
+
+    const middle = { ...storedNode("middle", ["scout-source"]), templateId: "analyst", verification: analystVerification, verificationDisposition: "typed" }
+    const legacyScout = { ...storedNode("scout-source"), verificationDisposition: "legacy_unverified" }
+    for (const nodes of [
+      [scout, { ...analyst, dependsOn: ["middle"] }, middle],
+      [legacyScout, analyst],
+      [{ ...scout, templateId: "analyst", verification: analystVerification }, analyst],
+    ]) {
+      expect(() => parseTaskGraphSnapshot(snapshotWithNodes(nodes))).toThrow("task_graph_snapshot_verification_dependency_invalid")
+    }
   })
 
   it("rejects conflicting or invalid verification dispositions instead of upgrading legacy nodes", () => {
@@ -180,15 +241,16 @@ describe("parseTaskGraphSnapshot", () => {
 
   it("round-trips repair lineage without rewriting its target or marking it passed", () => {
     const target = {
-      ...storedNode("target"), verification: scoutVerification, verificationDisposition: "typed",
+      ...storedNode("target"), verification: scoutVerification, verificationDisposition: "typed", registeredScoutEnvelope,
     }
     const repairOf = { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"] }
     const repair = {
       ...storedNode("repair"), verification: { ...scoutVerification, criteria: [scoutVerification.criteria[0]] },
-      verificationDisposition: "typed", repairOf,
+      verificationDisposition: "typed", repairOf, registeredScoutEnvelope,
     }
     const snapshot = parseTaskGraphSnapshot(snapshotWithNodes([target, repair]))
     expect(snapshot.nodes[0]).toMatchObject({ verification: scoutVerification, verificationDisposition: "typed" })
+    expect(snapshot.nodes[0]?.registeredScoutEnvelope).toEqual(registeredScoutEnvelope)
     expect(snapshot.nodes[0]).not.toHaveProperty("repairOf")
     expect(snapshot.nodes[1]?.repairOf).toEqual(repairOf)
     expect(snapshot.nodes[1]).not.toHaveProperty("verdict")
@@ -200,6 +262,7 @@ describe("parseTaskGraphSnapshot", () => {
     ]), [])
     expect(state.nodes[0]?.taskId).toBe("task-target")
     expect(taskGraphSnapshot(state, new Map([ ["target", "task-target"], ["repair", "task-repair"] ]))).toEqual(snapshot)
+    expect(taskGraphSnapshot(state, new Map([ ["target", "task-target"], ["repair", "task-repair"] ])).nodes[0]?.registeredScoutEnvelope).toEqual(registeredScoutEnvelope)
   })
 
   it("rejects stale, future, mismatched, dependent, or untyped repair targets", () => {
