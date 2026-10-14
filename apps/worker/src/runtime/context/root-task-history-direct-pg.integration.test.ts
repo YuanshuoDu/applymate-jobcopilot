@@ -101,6 +101,10 @@ const otherSession: Source = { turnId: `root-history-other-session-turn-${suffix
   sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
   terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
   failureChildren: [{ key: "foreign-session", templateId: "scout", role: "scout", taskType: "job_discovery", failureReason: "selected_job_context_unavailable" }] }
+const crossEqualTimeHigherTurnId: Source = { turnId: `${otherSession.turnId}-z`, rootTaskId: `root-history-equal-time-root-${suffix}`,
+  childId: `root-history-equal-time-child-${suffix}`, finalItemId: `root-history-equal-time-final-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 17,
+  terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z") }
 const crossWrongSource: Source = { turnId: `root-history-cross-source-${suffix}`, rootTaskId: `root-history-cross-source-root-${suffix}`,
   childId: `root-history-cross-source-child-${suffix}`, finalItemId: `root-history-cross-source-final-${suffix}`,
   sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 5,
@@ -255,6 +259,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(changedCriteria)
     await insertSource(selectedJob)
     await insertSource(otherSession)
+    await insertSource(crossEqualTimeHigherTurnId)
     await insertSource(crossWrongSource)
     await insertSource(crossWrongOrigin)
     await insertSource(archivedSource)
@@ -331,12 +336,15 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
     const history = await createPgDirectRootTaskHistoryStore(pool!).load(input)
 
-    expect(history.map(item => item.sourceTurnId)).toEqual([otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId])
-    expect(history.map(item => item.terminalAt?.toISOString())).toEqual([
-      "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
+    expect(crossEqualTimeHigherTurnId.turnId.localeCompare(otherSession.turnId)).toBeGreaterThan(0)
+    expect(history.map(item => item.sourceTurnId)).toEqual([
+      crossEqualTimeHigherTurnId.turnId, otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId,
     ])
-    expect(history[0]?.taskGraph.nodes).toHaveLength(2)
-    expect(history[0]?.nodeLessons?.[1]?.executionFailureCategory).toBe("execution_setup_unavailable")
+    expect(history.map(item => item.terminalAt?.toISOString())).toEqual([
+      "2022-01-01T00:00:00.000Z", "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
+    ])
+    expect(history[1]?.taskGraph.nodes).toHaveLength(2)
+    expect(history[1]?.nodeLessons?.[1]?.executionFailureCategory).toBe("execution_setup_unavailable")
     expect(history.some(item => [crossWrongSource.turnId, crossWrongOrigin.turnId, archivedSource.turnId,
       equalCutoff.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
     expect(projectRootTaskHistory(history, true)?.content).toMatchObject({ kind: "root_task_history", advisoryOnly: true, notCurrentEvidence: true })
