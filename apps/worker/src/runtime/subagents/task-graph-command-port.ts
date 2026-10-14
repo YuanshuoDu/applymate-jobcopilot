@@ -5,6 +5,8 @@ import type { SubagentTaskStatus } from "./types.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphNativeResultReceipt } from "./task-graph-native-command.js"
 import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
+import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
+import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -14,6 +16,15 @@ export type {
   TaskGraphNativeSpawnRequest,
 } from "./task-graph-native-command.js"
 export type { TaskGraphNativeCommandInput, TaskGraphNativeFollowupRequest, TaskGraphNativeRequest, TaskGraphNativeReplacementRequest } from "./task-graph-native-request.js"
+export { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-result-projection-contract.js"
+export type {
+  TaskGraphProjectionSource,
+  TaskGraphProjectionEvidenceKind,
+  TaskGraphScoutProjectionItem,
+  TaskGraphAnalystProjectionItem,
+  TaskGraphArtifactProjectionReference,
+  TaskGraphResultProjection,
+} from "./task-graph-result-projection-contract.js"
 export const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION = "agent-harness.v2.task-graph-repair-receipt.v1" as const
 const VERIFICATION_REASONS = new Set<TaskGraphVerificationReasonCode>([
   "criteria_met", "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid",
@@ -148,65 +159,6 @@ export type TaskGraphScheduleInput = Readonly<{
 
 /** Ownership fence for reads; it is never populated from model-controlled input. */
 export type TaskGraphReadScope = Omit<TaskGraphExecutionScope, "stepId">
-export type TaskGraphProjectionSource = "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio" | "other"
-export type TaskGraphProjectionEvidenceKind = "job" | "persona" | "resume" | "source"
-export const TASK_GRAPH_RESULT_PROJECTION_SCHEMA = "agent-harness.v2.task-graph.result-projection" as const
-export type TaskGraphScoutProjectionItem = Readonly<{
-  jobId: string
-  source: TaskGraphProjectionSource
-  evidenceKinds: readonly TaskGraphProjectionEvidenceKind[]
-}>
-export type TaskGraphAnalystProjectionItem = Readonly<{
-  jobId: string
-  score: number
-  evidenceKinds: readonly TaskGraphProjectionEvidenceKind[]
-}>
-export type TaskGraphArtifactProjectionReference = Readonly<{
-  artifactId: string
-  version: number
-  contentHash: string
-  sourceDigest: string
-}>
-export type TaskGraphResultProjection =
-  | Readonly<{ schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA; trust: "untrusted"; availability: "unavailable" }>
-  | Readonly<{
-    schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA
-    trust: "untrusted"
-    availability: "available"
-    role: "scout"
-    status: "completed" | "partial"
-    candidateCount: number
-    evidenceCount: number
-    candidates: readonly TaskGraphScoutProjectionItem[]
-  }>
-  | Readonly<{
-    schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA
-    trust: "untrusted"
-    availability: "available"
-    role: "analyst"
-    status: "completed" | "partial"
-    findingCount: number
-    evidenceCount: number
-    findings: readonly TaskGraphAnalystProjectionItem[]
-  }>
-  | Readonly<{
-    schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA
-    trust: "untrusted"
-    availability: "available"
-    role: "writer"
-    status: "completed"
-    artifactRef: TaskGraphArtifactProjectionReference
-  }>
-  | Readonly<{
-    schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA
-    trust: "untrusted"
-    availability: "available"
-    role: "reviewer"
-    status: "completed"
-    artifactRef: TaskGraphArtifactProjectionReference
-    reviewStatus: "passed" | "needs_revision" | "rejected" | "stale"
-    reviewHash: string
-  }>
 export type TaskGraphCurrentNode = Readonly<{
   key: string
   templateId: string
@@ -247,4 +199,6 @@ export type TaskGraphCommandPort = Readonly<{
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads current graph state using a caller-owned transaction and client. */
   readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
+  /** Reads one bounded advisory page from the current owner-fenced graph. */
+  readCurrentResultPage?(scope: TaskGraphReadScope, request: TaskGraphResultPageRequest): Promise<TaskGraphResultPage>
 }>

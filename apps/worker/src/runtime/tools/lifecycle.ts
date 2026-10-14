@@ -10,20 +10,17 @@ import { prepareDurableWaitOutput, prepareLifecycleValue, prepareSafeValue, prep
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
-
+import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
-
 export interface ToolLifecycleEvent {
   readonly phase: ToolLifecyclePhase
   readonly eventType: string
   readonly item: ToolCallItem | ToolResultItem
   readonly payload: ToolLifecyclePayload
 }
-
 export interface ToolLifecycleSink {
   append(event: ToolLifecycleEvent): Promise<void>
 }
-
 export type ToolLifecycleOwnerContext = {
   readonly sessionId: string
   readonly turnId: string
@@ -32,9 +29,7 @@ export type ToolLifecycleOwnerContext = {
   readonly rootTaskId?: string
   readonly toolCallId?: string
 }
-
 export type ToolLifecycleOwnerResolver = (context: ToolLifecycleOwnerContext) => ExecutionOwner
-
 export class InMemoryToolLifecycleSink implements ToolLifecycleSink {
   readonly events: ToolLifecycleEvent[] = []
 
@@ -61,6 +56,7 @@ export class ToolLifecycle {
   private readonly now: () => string
   private readonly maxEventBytes: number
   private readonly inputs = new Map<string, unknown>()
+  private readonly pageCalls = new Set<string>()
 
   constructor(private readonly options: ToolLifecycleOptions) {
     this.now = options.now ?? (() => new Date().toISOString())
@@ -69,7 +65,10 @@ export class ToolLifecycle {
 
   async started(call: LifecycleCall, input: unknown): Promise<void> {
     const timestamp = this.now()
-    const safeInput = sanitizeLifecyclePreview(input, this.maxEventBytes)
+    const listInput = call.toolName === "agent.list" ? prepareAgentListLifecycleInput(input, this.maxEventBytes) : null
+    if (listInput?.pageRequest) this.pageCalls.add(call.id)
+    else this.pageCalls.delete(call.id)
+    const safeInput = listInput?.safeInput ?? sanitizeLifecyclePreview(input, this.maxEventBytes)
     this.inputs.set(call.id, safeInput)
     const item: ToolCallItem = {
       schemaVersion,
@@ -118,8 +117,9 @@ export class ToolLifecycle {
 
   private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown): Promise<unknown> {
     const timestamp = this.now()
+    const pageCall = this.pageCalls.delete(call.id)
     const safeOutput = phase === "completed"
-      ? await this.persistCompletedOutput(call, output ?? null)
+      ? await this.persistCompletedOutput(call, output ?? null, pageCall)
       : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
     const item: ToolResultItem = {
       schemaVersion,
@@ -140,10 +140,13 @@ export class ToolLifecycle {
     return safeOutput
   }
 
-  private async persistCompletedOutput(call: LifecycleCall, output: unknown): Promise<unknown> {
+  private async persistCompletedOutput(call: LifecycleCall, output: unknown, pageCall: boolean): Promise<unknown> {
     let prepared: ReturnType<typeof prepareLifecycleValue>
     const nativeFollowup = call.toolName === "agent.followup" && hasNativeCoordinationEnvelope(output)
-    if (call.toolName === "agent.plan") {
+    if (call.toolName === "agent.list" && (pageCall || isTaskGraphResultPageLike(output))) {
+      try { prepared = prepareTaskGraphResultPageOutput(output) }
+      catch { throw new ToolExecutionError("task_graph_result_page_invalid", "TaskGraph result page is invalid") }
+    } else if (call.toolName === "agent.plan") {
       try {
         prepared = prepareTaskGraphPlanReceipt(output)
       } catch {

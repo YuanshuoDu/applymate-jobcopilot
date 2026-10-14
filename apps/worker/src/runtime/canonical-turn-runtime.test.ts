@@ -23,6 +23,7 @@ import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canoni
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
+import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./subagents/task-graph-result-page-contract.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
@@ -1581,6 +1582,214 @@ describe("createCanonicalTurnRuntime", () => {
     const recovered = await taskGraphRootSurface(false, true, "agent.spawn", "jobs.get", true)
     expect(recovered.route).not.toHaveBeenCalled()
     expect(JSON.stringify(recovered.events)).toContain("interactive_discovery_root_tool_disabled")
+  })
+
+  it("delivers current typed TaskGraph result pages through persisted agent.list lifecycle into the next model request", async () => {
+    const numericUuid = "00000000-0000-4000-8000-000000000000"
+    const scoutCandidates: Array<{ jobId: string; source: "greenhouse" | "lever" | "workday" | "smartrecruiters" | "personio"; evidenceKinds: Array<"job" | "persona" | "resume" | "source"> }> = [
+      { jobId: "c0000000000000000000000001", source: "greenhouse", evidenceKinds: ["job"] },
+      { jobId: "c0000000000000000000000002", source: "lever", evidenceKinds: ["job"] },
+      { jobId: "c0000000000000000000000003", source: "workday", evidenceKinds: ["job"] },
+      { jobId: numericUuid, source: "personio", evidenceKinds: ["job"] },
+    ]
+    const analystFindings: Array<{ jobId: string; score: number; evidenceKinds: Array<"job" | "persona" | "resume" | "source"> }> = [
+      { jobId: "c0000000000000000000000004", score: 7.25, evidenceKinds: ["job"] },
+      { jobId: "c0000000000000000000000005", score: 8, evidenceKinds: ["job"] },
+      { jobId: "c0000000000000000000000006", score: 8.5, evidenceKinds: ["job"] },
+      { jobId: numericUuid, score: 9.25, evidenceKinds: ["job"] },
+    ]
+    let graphRevision = 7
+    const pageReads: Array<{ scope: TaskGraphReadScope; request: TaskGraphResultPageRequest }> = []
+    const readCurrentResultPage: NonNullable<TaskGraphCommandPort["readCurrentResultPage"]> = vi.fn(async (scope: TaskGraphReadScope, request: TaskGraphResultPageRequest): Promise<TaskGraphResultPage> => {
+      pageReads.push({ scope, request })
+      if (request.expectedRevision !== graphRevision) return {
+        schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "unavailable",
+        graphRevision, reason: "revision_mismatch",
+      }
+      if (request.nodeKey === "scout-node") {
+        const items = scoutCandidates.slice(request.offset, request.offset + 3)
+        return {
+          schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "available",
+          graphRevision, role: "scout", taskStatus: "completed", resultStatus: "completed", totalCount: scoutCandidates.length,
+          evidenceCount: 4, offset: request.offset, nextOffset: request.offset + items.length < scoutCandidates.length ? request.offset + items.length : null, items,
+        }
+      }
+      if (request.nodeKey === "analyst-node") {
+        const items = analystFindings.slice(request.offset, request.offset + 3)
+        const page = {
+          schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "available",
+          graphRevision, role: "analyst", taskStatus: "completed", resultStatus: "partial", totalCount: analystFindings.length,
+          evidenceCount: 6, offset: request.offset, nextOffset: request.offset + items.length < analystFindings.length ? request.offset + items.length : null, items,
+        } satisfies TaskGraphResultPage
+        graphRevision = 8
+        return page
+      }
+      return { schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "unavailable", graphRevision, reason: "node_unavailable" }
+    })
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: graphRevision, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: graphRevision, nodes: [] })),
+      readCurrentResultPage,
+    }
+    const activityClient = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT 1 FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+        if (sql.includes('WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3')) return { rows: [{
+          id: "root-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: null,
+          path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "Find jobs", context: {},
+          attemptCount: 1, maxAttempts: 1, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt,
+          interruptRequestedAt: null, result: null, failureReason: null,
+        }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
+    const requests: HarnessModelRequest[] = []
+    const events: RuntimeEvent[] = []
+    const calls = [
+      { callId: "scout-page-call", nodeKey: "scout-node" },
+      { callId: "analyst-page-call", nodeKey: "analyst-node" },
+      { callId: "stale-page-call", nodeKey: "analyst-node" },
+    ] as const
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(activityPool as never), {
+      workerId: "worker-1",
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      taskGraphCommandPort,
+      taskGraphTemplates: {
+        scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+        analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+      },
+      selectedJobPreparationLoader: async () => undefined,
+      stateLoader: async () => state({ budgetSnapshot: { limits: { maxSteps: 8 } }, toolPolicySnapshot: {} }),
+      rootTaskStore: rootStore() as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      turnEngineStoreFactory: () => store(events),
+      contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          const call = calls[requests.length - 1]
+          if (!call) {
+            yield { type: "text_delta", text: "Reviewed the current task results." }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          yield { type: "tool_call_completed", callId: call.callId, name: "agent.list", arguments: { nodeKey: call.nodeKey, expectedRevision: 7, offset: 3 } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    const expectedScoutPage = {
+      schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "available",
+      graphRevision: 7, role: "scout", taskStatus: "completed", resultStatus: "completed", totalCount: 4,
+      evidenceCount: 4, offset: 3, nextOffset: null, items: [scoutCandidates[3]],
+    }
+    const expectedAnalystPage = {
+      schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "available",
+      graphRevision: 7, role: "analyst", taskStatus: "completed", resultStatus: "partial", totalCount: 4,
+      evidenceCount: 6, offset: 3, nextOffset: null, items: [analystFindings[3]],
+    }
+    const expectedStalePage = {
+      schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "unavailable",
+      graphRevision: 8, reason: "revision_mismatch",
+    }
+    expect(pageReads.map(entry => entry.request)).toEqual(calls.map(call => ({ nodeKey: call.nodeKey, expectedRevision: 7, offset: 3 })))
+    expect(pageReads.map(entry => entry.scope)).toEqual(calls.map(() => ({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+    })))
+
+    for (const [callId, expected] of [[calls[0].callId, expectedScoutPage], [calls[1].callId, expectedAnalystPage], [calls[2].callId, expectedStalePage]] as const) {
+      const persisted = events.find(event => event.type === "tool_call.completed" && (event.payload as { toolCallId?: string }).toolCallId === callId)
+      expect(persisted?.payload).toMatchObject({ toolName: "agent.list", status: "completed", output: expected })
+      const request = requests.find(candidate => candidate.messages.some(message => message.content.some(part => part.type === "tool_result" && part.toolUseId === callId)))
+      const result = request?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === callId)
+      expect(result && result.type === "tool_result" ? JSON.parse(result.content) : null).toEqual(expected)
+    }
+    expect(JSON.stringify(events)).not.toContain("nativeCoordination")
+    expect(JSON.stringify(events)).not.toContain("privateTaskId")
+    expect(JSON.stringify(events)).not.toContain("evidenceReferenceId")
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_RESULT_PROSE")
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(readCurrentResultPage).toHaveBeenCalledTimes(3)
+    expect(requests).toHaveLength(4)
+    expect(JSON.stringify(requests[2]?.messages)).toContain(numericUuid)
+  })
+
+  it("fails page mode closed without an optional page port while keeping explicit legacy agent.list available", async () => {
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 1, nodes: [] })),
+    }
+    const activityClient = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT 1 FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+        if (sql.includes('WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3')) return { rows: [{
+          id: "root-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: null,
+          path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "Find jobs", context: {},
+          attemptCount: 1, maxAttempts: 1, leaseOwner: lease.ownerId, leaseExpiresAt: lease.leaseExpiresAt,
+          interruptRequestedAt: null, result: null, failureReason: null,
+        }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
+    const requests: HarnessModelRequest[] = []
+    const events: RuntimeEvent[] = []
+    const modelCalls = [
+      { callId: "unavailable-page", arguments: { nodeKey: "scout-node", expectedRevision: 1, offset: 0 } },
+      { callId: "legacy-list", arguments: {} },
+    ] as const
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(activityPool as never), {
+      workerId: "worker-1",
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => undefined,
+      stateLoader: async () => state({ budgetSnapshot: { limits: { maxSteps: 6 } }, toolPolicySnapshot: {} }),
+      rootTaskStore: rootStore() as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      turnEngineStoreFactory: () => store(events),
+      contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          const call = modelCalls[requests.length - 1]
+          if (!call) {
+            yield { type: "text_delta", text: "Legacy listing remains available." }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          yield { type: "tool_call_completed", callId: call.callId, name: "agent.list", arguments: call.arguments }
+          yield { type: "completed", finishReason: "tool_calls" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    const result = await runtime.execute({ lease, signal: new AbortController().signal })
+    expect(result).toMatchObject({ status: "failed", summary: "evidence_conflict" })
+    expect(events.find(event => event.type === "tool_call.failed" && (event.payload as { toolCallId?: string }).toolCallId === "unavailable-page")?.payload)
+      .toMatchObject({ errorCode: "coordination_task_graph_page_unavailable" })
+    expect(events.find(event => event.type === "tool_call.completed" && (event.payload as { toolCallId?: string }).toolCallId === "legacy-list")?.payload)
+      .toMatchObject({ toolName: "agent.list", output: { tasks: [] } })
+    const legacyResult = requests[2]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "legacy-list")
+    expect(legacyResult && legacyResult.type === "tool_result" ? JSON.parse(legacyResult.content) : null).toEqual({ tasks: [] })
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(requests).toHaveLength(3)
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {

@@ -5,6 +5,8 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import type { PgSubagentPool } from "./types.js"
 
 const reconciliationMocks = vi.hoisted(() => ({
@@ -213,6 +215,92 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(eventRead).toHaveLength(1)
   })
 
+  it("reads one current typed result page under the existing owner fence and one graph load", async () => {
+    const input = scheduleInput()
+    const graphContent = {
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [{ key: "planned", templateId: "analyst", goal: "Inspect the source", successCriteria: ["Evidence captured"],
+        dependsOn: [], depth: 1, taskId: "child-1" }],
+    }
+    const jobId = "00000000-0000-4000-8000-000000000000"
+    const taskRows = [{
+      id: "child-1", status: "failed", role: "analyst", taskType: "job_analysis",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, failureReason: "worker_stopped",
+      result: { status: "completed", finalItemId: "private-final", finalText: "PRIVATE_FINAL_TEXT", stepCount: 1, toolCallCount: 1,
+        structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "partial",
+          findings: [{ jobId, score: 8, evidenceIds: ["evidence-job"] }],
+          evidence: [{ id: "evidence-job", kind: "job", ref: jobId, source: "private-source" }], summary: "PRIVATE_SUMMARY" } },
+    }]
+    const fake = fakePool(input, { includeReplay: false, graphContent, graphRevision: 8, taskRows })
+    const { stepId: _stepId, ...scope } = input.scope
+    const port = createPgTaskGraphCommandPort(fake.pool)
+
+    await expect(port.readCurrentResultPage!(scope, { nodeKey: "planned", expectedRevision: 8, offset: 0 })).resolves.toEqual({
+      schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "available",
+      graphRevision: 8, role: "analyst", taskStatus: "failed", resultStatus: "partial", totalCount: 1,
+      evidenceCount: 1, offset: 0, nextOffset: null, items: [{ jobId, score: 8, evidenceKinds: ["job"] }],
+    })
+    expect(fake.calls[0]?.sql).toBe("BEGIN")
+    expect(fake.calls.at(-1)?.sql).toBe("COMMIT")
+    expect(fake.client.release).toHaveBeenCalledOnce()
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toBe(true)
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT event."type"'))).toHaveLength(1)
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+    expect(JSON.stringify(fake.calls.map(call => call.values))).not.toContain("PRIVATE_FINAL_TEXT")
+  })
+
+  it("preserves the durable-receipt error when paging a missing current graph", async () => {
+    const input = scheduleInput()
+    const fake = fakePool(input, { missingGraph: true, persistedPlanReceipt: true })
+    const { stepId: _stepId, ...scope } = input.scope
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 0, offset: 0 })).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "task_graph_state_missing",
+    })
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
+  })
+
+  it("preserves existing typed verification and native child-contract errors before returning pages", async () => {
+    const input = scheduleInput()
+    const { stepId: _stepId, ...scope } = input.scope
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] }
+    const typedContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "planned", templateId: "analyst",
+      goal: "Inspect the source", successCriteria: ["Evidence captured"], dependsOn: [], depth: 1, taskId: "child-1",
+      verificationDisposition: "typed", verification }] }
+    const typedResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence: [], summary: "" }
+    const invalidTyped = fakePool(input, { includeReplay: false, graphContent: typedContent, graphRevision: 8, taskRows: [{
+      id: "child-1", status: "completed", role: "analyst", taskType: "job_analysis",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, failureReason: null,
+      result: { status: "completed", finalItemId: null, finalText: "", stepCount: 1, toolCallCount: 1,
+        structuredResult: typedResult, taskGraphVerificationReport: { status: "passed", reasonCode: "criteria_met" } },
+    }] })
+
+    await expect(createPgTaskGraphCommandPort(invalidTyped.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 8, offset: 0 })).rejects.toThrow("task_graph_verification_report_invalid")
+    expect(invalidTyped.calls.at(-1)?.sql).toBe("ROLLBACK")
+    expect(invalidTyped.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+
+    const nativeContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "planned",
+      templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, goal: "Inspect the source", successCriteria: ["Evidence captured"],
+      dependsOn: [], depth: 1, taskId: "child-1", verificationDisposition: "legacy_unverified",
+      nativeDelegation: { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "native-page",
+        requestFingerprint: "a".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "job_discovery",
+        contextDigest: "b".repeat(64), contextBytes: 1 } }] }
+    const invalidNative = fakePool(input, { includeReplay: false, graphContent: nativeContent, graphRevision: 8, taskRows: [{
+      id: "child-1", status: "completed", role: "analyst", taskType: "job_analysis",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, failureReason: null, result: null,
+    }] })
+    await expect(createPgTaskGraphCommandPort(invalidNative.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 8, offset: 0 })).rejects.toThrow("task_graph_native_child_contract_invalid")
+    expect(invalidNative.calls.at(-1)?.sql).toBe("ROLLBACK")
+    expect(invalidNative.calls.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+  })
+
   it.each([
     ["session", "task_graph_session_fenced"], ["turn", "task_graph_turn_fenced"], ["parent", "task_graph_parent_fenced"],
   ] as const)("does not produce planning facts after a %s owner-scope fence", async (fence, error) => {
@@ -222,6 +310,19 @@ describe("createPgTaskGraphCommandPort", () => {
 
     await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentWithClient!(fake.client as unknown as pg.PoolClient, scope))
       .rejects.toThrow(error)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
+  })
+
+  it.each([
+    ["session", "task_graph_session_fenced"], ["turn", "task_graph_turn_fenced"], ["parent", "task_graph_parent_fenced"],
+  ] as const)("does not read result pages after a %s owner-scope fence", async (fence, error) => {
+    const input = scheduleInput()
+    const fake = fakePool(input, { includeReplay: false, failFence: fence })
+    const { stepId: _stepId, ...scope } = input.scope
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentResultPage!(scope,
+      { nodeKey: "planned", expectedRevision: 2, offset: 0 })).rejects.toThrow(error)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
   })
