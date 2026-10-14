@@ -135,6 +135,16 @@ describe("canonical Turn verification requirements", () => {
       })
   })
 
+  it("accepts a valid top-level objective block without a nested copy", () => {
+    expect(resolveRootTaskVerificationRequirements({ verificationRequirements: objectiveRequirements() })).toEqual({
+      status: "valid",
+      requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", minimum: 3 },
+        { id: "finding_count", kind: "finding_count_gte", minimum: 1 },
+      ],
+    })
+  })
+
   it.each([
     ["wrong schema version", { ...objectiveRequirements(), schemaVersion: "agent-harness.v2.objective-requirements.v2" }],
     ["unknown block key", { ...objectiveRequirements(), hidden: "private" }],
