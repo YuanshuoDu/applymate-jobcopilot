@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
+import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummaryNode } from "./task-graph-final-summary.js"
 
 const hash = (character: string) => `sha256:${character.repeat(64)}`
@@ -30,6 +32,33 @@ function reviewerResult(reviewStatus: "passed" | "needs_revision" | "rejected" |
 function node(taskId: string, role: string, taskStatus: string, structuredResult?: unknown, kind: "business" | "internal_control" = "business"): TaskGraphFinalSummaryNode {
   return structuredResult === undefined ? { kind, taskId, role, taskStatus } as TaskGraphFinalSummaryNode
     : { kind, taskId, role, taskStatus, structuredResult } as TaskGraphFinalSummaryNode
+}
+
+async function mapPersistedRowsToSummaryNodes(taskId: string, role: "scout" | "analyst", structuredResult: unknown): Promise<TaskGraphFinalSummaryNode[]> {
+  const identity = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+  const snapshot = {
+    schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+    nodes: [{ key: role, templateId: role, goal: "Read persisted result", successCriteria: ["Evidence captured"], dependsOn: [], depth: 1, taskId }],
+  }
+  const taskRows = [{ id: taskId, status: "completed", role, failureReason: null, result: { status: "completed", structuredResult } }]
+  const client = {
+    query: async (sql: string) => {
+      if (sql.startsWith('SELECT item."id"')) {
+        return { rows: [{ id: taskGraphItemId(identity.parentTaskId), revision: 1, content: snapshot, createdAt: new Date(0) }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT task."id", task."status"')) return { rows: taskRows, rowCount: taskRows.length }
+      if (sql.startsWith('SELECT event."type", event."itemId"')) return { rows: [], rowCount: 0 }
+      throw new Error("unexpected_task_graph_query")
+    },
+  }
+  const loaded = await loadTaskGraph(client as unknown as Parameters<typeof loadTaskGraph>[0], identity)
+  if (!loaded.snapshot) throw new Error("task_graph_snapshot_missing")
+  return loaded.snapshot.nodes.map(currentNode => {
+    const task = loaded.tasks.get(currentNode.taskId)
+    if (!task) throw new Error("task_graph_task_missing")
+    const result = task.result as { structuredResult?: unknown }
+    return node(task.id, task.role, task.status, result.structuredResult)
+  })
 }
 
 describe("TaskGraph final-summary reducer", () => {
@@ -111,32 +140,51 @@ describe("TaskGraph final-summary reducer", () => {
     expect(summary.taskOutcomes.map(item => item.resultState)).toEqual(["valid", "valid", "valid", "not_terminal"])
   })
 
-  it("marks sparse Scout candidates invalid instead of iterating a hole", () => {
-    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
-      node("sparse-scout", "scout", "completed", { ...scoutResult([]), candidates: new Array(1) }),
-    ] })
+  it("rejects Array(n) holes in Scout candidates after persisted-row mapping", async () => {
+    // JSONB cannot persist sparse arrays. The mock row injects this only in memory; loadTaskGraph maps the persisted row, then the current graph mapping builds reducer nodes.
+    const structuredResult = { ...scoutResult(["mapped-job"]), candidates: new Array<unknown>(1) }
+    const nodes = await mapPersistedRowsToSummaryNodes("sparse-scout", "scout", structuredResult)
+    const mappedResult = nodes[0]?.structuredResult as { candidates: unknown[] }
+    expect(mappedResult.candidates).toHaveLength(1)
+    expect(Reflect.ownKeys(mappedResult.candidates)).toEqual(["length"])
+
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes })
     expect(summary.discoveredJobs).toEqual([])
     expect(summary.counts.discoveredJobs).toEqual({ knownCount: null, coverage: "unavailable" })
     expect(summary.taskOutcomes).toEqual([{ taskId: "sparse-scout", role: "scout", taskStatus: "completed", resultState: "invalid" }])
   })
 
-  it("marks sparse Analyst findings invalid instead of iterating a hole", () => {
-    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
-      node("sparse-analyst", "analyst", "completed", { ...analystResult([]), findings: new Array(1) }),
-    ] })
+  it("rejects a deleted persisted Analyst finding index after row mapping", async () => {
+    const result = analystResult([{ jobId: "mapped-job", score: 7 }])
+    const findings: unknown[] = [result.findings[0]]
+    delete findings[0]
+    const nodes = await mapPersistedRowsToSummaryNodes("sparse-analyst", "analyst", { ...result, findings })
+    const mappedResult = nodes[0]?.structuredResult as { findings: unknown[] }
+    expect(mappedResult.findings).toHaveLength(1)
+    expect(Reflect.ownKeys(mappedResult.findings)).toEqual(["length"])
+
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes })
     expect(summary.analyzedJobs).toEqual([])
     expect(summary.counts.analyzedJobs).toEqual({ knownCount: null, coverage: "unavailable" })
     expect(summary.taskOutcomes).toEqual([{ taskId: "sparse-analyst", role: "analyst", taskStatus: "completed", resultState: "invalid" }])
   })
 
-  it("marks sparse arrays nested in an Analyst finding invalid", () => {
+  it("rejects persisted Analyst arrays whose length exceeds their own keys after row mapping", async () => {
     const result = analystResult([{ jobId: "nested-job", score: 7 }])
-    const findings = result.findings.map(finding => ({ ...finding, evidenceIds: new Array(1) }))
-    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
-      node("nested-sparse-analyst", "analyst", "completed", { ...result, findings }),
-    ] })
+    const finding = result.findings[0]!
+    const evidenceIds = [...finding.evidenceIds]
+    evidenceIds.length = 2
+    const nodes = await mapPersistedRowsToSummaryNodes("sparse-analyst", "analyst", {
+      ...result, findings: [{ ...finding, evidenceIds }],
+    })
+    const mappedResult = nodes[0]?.structuredResult as { findings: Array<{ evidenceIds: unknown[] }> }
+    expect(mappedResult.findings[0]?.evidenceIds).toHaveLength(2)
+    expect(Reflect.ownKeys(mappedResult.findings[0]!.evidenceIds)).toEqual(["0", "length"])
+
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes })
     expect(summary.analyzedJobs).toEqual([])
-    expect(summary.taskOutcomes).toEqual([{ taskId: "nested-sparse-analyst", role: "analyst", taskStatus: "completed", resultState: "invalid" }])
+    expect(summary.counts.analyzedJobs).toEqual({ knownCount: null, coverage: "unavailable" })
+    expect(summary.taskOutcomes).toEqual([{ taskId: "sparse-analyst", role: "analyst", taskStatus: "completed", resultState: "invalid" }])
   })
 
   it("excludes internal controls and omits prose, URLs, evidence, and review receipt hashes", () => {
