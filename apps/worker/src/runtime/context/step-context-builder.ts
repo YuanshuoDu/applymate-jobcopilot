@@ -8,6 +8,7 @@ import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, loadSte
 import type { HydrationScope } from "./steering-reconciliation-context.js"
 import type { TurnQuestionPlanningSummary } from "../turns/turn-question-planning-contract.js"
 import { planningClarificationContext, type PlanningClarificationHistoryPair } from "./planning-clarification-context.js"
+import { projectTaskGraphInputRelationAfterCheckpoint } from "../subagents/task-graph-source-intent-context.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -222,7 +223,7 @@ export class StepContextBuilder {
       if (entry.id === clarification.afterAnswerEntryId) blocks.push(...clarification.blocks)
     }
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
-    for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent", `observation:${observation.id}`, observation.content))
+    for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent", `observation:${observation.id}`, projectTaskGraphInputRelationAfterCheckpoint(observation.content, request.stepId, nextCheckpoint.inputThroughSequence, nextCheckpoint.consumedInputIds)))
     for (const input of renderInputs) {
       const duplicateRootText = rootInputTextMatchesGoal(input, request.rootContextInputId ?? request.rootInputId, request.snapshot.goal?.content)
       const pending = await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))

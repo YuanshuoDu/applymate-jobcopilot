@@ -188,6 +188,32 @@ describe("TaskGraph dependency result context", () => {
     expect(encoded).not.toContain("Alice Example")
   })
 
+  it("projects bounded untrusted source intent and drops provenance identifiers", () => {
+    const sourceIntent = { goal: "Find EU roles", successCriteria: ["Return matching postings"], inputRelation: "predates_current_inputs" } as const
+    const context = materializeTaskGraphDependencyContext({}, scope, ["source"], [dependency({ sourceIntent })]) as Record<string, unknown>
+    const item = ((context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }).items[0])!
+
+    expect(item.sourceIntent).toEqual({
+      trust: "untrusted", goal: "Find EU roles", successCriteria: ["Return matching postings"], inputRelation: "predates_current_inputs",
+    })
+  })
+
+  it("drops optional source intent when its aggregate would exceed the context cap", () => {
+    const dependencies = Array.from({ length: 8 }, (_, index) => dependency({
+      key: `source-${index}`,
+      sourceIntent: {
+        goal: "g".repeat(1200), successCriteria: Array.from({ length: 8 }, () => "c".repeat(320)),
+        inputRelation: "covers_current_inputs",
+      },
+    }))
+    const context = materializeTaskGraphDependencyContext({}, scope, dependencies.map(item => item.key), dependencies) as Record<string, unknown>
+    const items = (context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }).items
+
+    expect(items.every(item => !Object.hasOwn(item, "sourceIntent"))).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(context.taskGraphDependencyResults), "utf8"))
+      .toBeLessThanOrEqual(TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT)
+  })
+
   it("preserves a one-to-one dependency-key mapping for multiple completed predecessors", () => {
     const second = dependency({ key: "other-source", taskId: "subagent-2" })
     const context = materializeTaskGraphDependencyContext({}, scope, ["other-source", "source"], [dependency(), second]) as Record<string, unknown>

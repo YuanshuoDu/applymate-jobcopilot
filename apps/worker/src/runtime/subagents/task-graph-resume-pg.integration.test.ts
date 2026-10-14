@@ -87,6 +87,10 @@ const SOURCE_DEPENDENCY_PROJECTION_ITEM = {
 } as const
 const SUMMARY_DEPENDENCY_PROJECTION_ITEM = {
   dependencyKey: "summary", role: "analyst", taskStatus: "completed",
+  sourceIntent: {
+    trust: "untrusted", goal: "Summarize the fixture source", successCriteria: ["Write a source summary"],
+    inputRelation: "covers_current_inputs",
+  },
   result: {
     schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
     role: "analyst", status: "completed", findingCount: 1, evidenceCount: 1,
@@ -114,10 +118,13 @@ function expectVerifiedDependencyProjectionItems(
   expect(items).toHaveLength(1)
   const item = record(items[0])
   expect(item).not.toBeNull()
-  expect(Object.keys(item ?? {}).sort()).toEqual(["dependencyKey", "result", "role", "taskStatus", "verification"])
+  const expectedKeys = ["dependencyKey", "result", "role", "taskStatus", "verification",
+    ...("sourceIntent" in expected ? ["sourceIntent"] : [])].sort()
+  expect(Object.keys(item ?? {}).sort()).toEqual(expectedKeys)
   expect(item).toMatchObject({
     dependencyKey: expected.dependencyKey, role: expected.role, taskStatus: expected.taskStatus,
   })
+  if ("sourceIntent" in expected) expect(item?.sourceIntent).toEqual(expected.sourceIntent)
   expect(item?.result).toEqual(expected.result)
   const verification = record(item?.verification)
   expect(verification).not.toBeNull()
@@ -7123,6 +7130,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (lease.goal === FOLLOW_UP_GOAL) {
               const dependencyContext = record(record(lease.context)?.taskGraphDependencyResults)
+              const dependencyItems = Array.isArray(dependencyContext?.items) ? dependencyContext.items.map(record) : []
               stage = "follow_up_dependency_schema"
               expect(dependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
               stage = "follow_up_dependency_items"
@@ -7130,7 +7138,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const dependencyJson = JSON.stringify(dependencyContext)
               stage = "follow_up_dependency_redaction"
               expect(dependencyJson).not.toContain("fixture-job-evidence")
-              expect(dependencyJson).not.toContain("Summarize the fixture source")
+              // The bounded source goal is carried only by sourceIntent, never by the typed result projection.
+              expect(JSON.stringify(dependencyItems[0]?.result)).not.toContain("Summarize the fixture source")
               expect(dependencyJson).not.toContain("fixture-final-item")
             }
             if (lease.role === "scout" || lease.role === "analyst") {
@@ -7262,10 +7271,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
     const followUpDependencyContext = record(childByGoal.get(FOLLOW_UP_GOAL)?.context.taskGraphDependencyResults)
     expect(followUpDependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
+    const followUpDependencyItems = Array.isArray(followUpDependencyContext?.items) ? followUpDependencyContext.items.map(record) : []
     expectVerifiedDependencyProjectionItems(followUpDependencyContext?.items, SUMMARY_DEPENDENCY_PROJECTION_ITEM, "finding-count")
     const followUpDependencyJson = JSON.stringify(followUpDependencyContext)
     expect(followUpDependencyJson).not.toContain("fixture-job-evidence")
-    expect(followUpDependencyJson).not.toContain("Summarize the fixture source")
+    // The bounded source goal is carried only by sourceIntent, never by the typed result projection.
+    expect(JSON.stringify(followUpDependencyItems[0]?.result)).not.toContain("Summarize the fixture source")
     expect(followUpDependencyJson).not.toContain("fixture-final-item")
     const childDispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null; payload: RecordValue }>(
       `SELECT "idempotencyKey", "publishedAt", "payload" FROM "agent_outbox"
@@ -7598,7 +7609,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(preFinalChildResult.rows[0]).toMatchObject({ status: "completed", role: "analyst", goal: RESTART_FOLLOW_UP_GOAL })
       const preFinalContext = record(record(preFinalChildResult.rows[0]?.context)?.taskGraphDependencyResults)
       const preFinalDependencies = Array.isArray(preFinalContext?.items) ? preFinalContext.items.map(record) : []
-      expect(preFinalDependencies[0]).toMatchObject({ dependencyKey: "summary", role: "analyst", taskStatus: "completed" })
+      expect(preFinalDependencies[0]).toMatchObject({
+        dependencyKey: "summary", role: "analyst", taskStatus: "completed",
+        sourceIntent: {
+          trust: "untrusted", goal: "Summarize the restored TaskGraph source",
+          successCriteria: ["Use restored dependency evidence"], inputRelation: "covers_current_inputs",
+        },
+      })
       expect(record(preFinalDependencies[0]?.result)).toMatchObject({ availability: "available", role: "analyst" })
 
       const preFinalEvents = await pool!.query<{ taskId: string | null; idempotencyKey: string; payload: RecordValue }>(
@@ -7760,6 +7777,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         dependencyKey: "summary",
         role: "analyst",
         taskStatus: "completed",
+        sourceIntent: {
+          trust: "untrusted", goal: "Summarize the restored TaskGraph source",
+          successCriteria: ["Use restored dependency evidence"], inputRelation: "covers_current_inputs",
+        },
         result: {
           schemaVersion: "agent-harness.v2.task-graph.result-projection",
           trust: "untrusted",

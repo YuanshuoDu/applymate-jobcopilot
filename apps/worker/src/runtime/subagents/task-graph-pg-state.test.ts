@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { currentTaskGraph, loadTaskGraph, lockTaskGraphScope } from "./task-graph-pg-state.js"
 import type { GraphIdentityScope, GraphScope } from "./task-graph-pg-state.js"
-import { canonicalTaskGraphJson, taskGraphItemId, taskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, TASK_GRAPH_ITEM_TYPE, taskGraphItemId, taskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 
@@ -12,7 +13,8 @@ type QueryCall = { sql: string; values: readonly unknown[] }
 type ClientOptions = {
   itemContent?: unknown
   taskRows?: Array<Record<string, unknown>>
-  events?: Array<{ type: string; payload: unknown }>
+  events?: Array<{ type: string; payload: unknown; itemId?: unknown; taskId?: unknown; idempotencyKey?: unknown; causationId?: unknown }>
+  sourceRows?: Array<Record<string, unknown>>
   failFence?: "session" | "turn" | "parent" | "step"
   sessionLockWait?: () => Promise<void>
   expireDuringSessionLockWait?: "turn" | "parent"
@@ -121,6 +123,10 @@ function fakeClient(options: ClientOptions = {}) {
         const rows = options.events ?? []
         return { rows, rowCount: rows.length }
       }
+      if (sql.startsWith("WITH current_steps AS MATERIALIZED")) {
+        const rows = options.sourceRows ?? []
+        return { rows, rowCount: rows.length }
+      }
       return empty
     }),
   }
@@ -130,10 +136,13 @@ function fakeClient(options: ClientOptions = {}) {
 describe("TaskGraph PostgreSQL state loading", () => {
   it("restores a typed contract from persisted canonical content across a Worker restart", async () => {
     const persisted = canonicalTaskGraphJson(typedSnapshot())
-    const firstWorker = await loadTaskGraph(fakeClient({ itemContent: persisted }).client, identity)
+    const first = fakeClient({ itemContent: persisted })
+    const firstWorker = await loadTaskGraph(first.client, identity)
 
     expect(firstWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "typed", verification: analystVerification })
     expect(firstWorker.state?.nodes[0]?.verification).toEqual(analystVerification)
+    expect(first.calls.some(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))).toBe(false)
+    expect(currentTaskGraph(firstWorker).nodes[0]).not.toHaveProperty("inputRelation")
     const rewritten = taskGraphSnapshot(firstWorker.state!, new Map([["child", "child-1"]]))
     const restartedWorker = await loadTaskGraph(fakeClient({ itemContent: canonicalTaskGraphJson(rewritten) }).client, identity)
     expect(restartedWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "typed", verification: analystVerification })
@@ -162,6 +171,41 @@ describe("TaskGraph PostgreSQL state loading", () => {
       status: "completed", role: "analyst", result: { taskGraphVerificationReport: { ...findingReport, status: "passed", reasonCode: "criteria_met" } },
     })] })
     await expect(loadTaskGraph(incoherent.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+  })
+
+  it("restores advisory source checkpoint intent from a validated causal proposal receipt", async () => {
+    const content = validSnapshot()
+    const itemId = taskGraphItemId(identity.parentTaskId)
+    const payload = {
+      kind: "proposal", fingerprint: "a".repeat(64), revision: 1,
+      receipt: { status: "accepted", revision: 1, nodes: [{ key: "child", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"] },
+      item: {
+        schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: identity.sessionId, turnId: identity.turnId,
+        stepId: "cause-step", taskId: identity.parentTaskId, type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null,
+        revision: 1, content,
+      },
+    }
+    const fake = fakeClient({
+      itemContent: content,
+      events: [{
+        type: "item.started", itemId, taskId: identity.parentTaskId, idempotencyKey: `${itemId}:proposal:0`,
+        causationId: "cause-step", payload,
+      }],
+      sourceRows: [
+        { id: "cause-step", sessionId: identity.sessionId, turnId: identity.turnId, taskId: identity.parentTaskId,
+          rootTaskId: identity.rootTaskId, userId: identity.userId, inputThroughSequence: "1", consumedInputIds: ["input-before"], isCurrent: false },
+        { id: "current-step", sessionId: identity.sessionId, turnId: identity.turnId, taskId: identity.parentTaskId,
+          rootTaskId: identity.rootTaskId, userId: identity.userId, inputThroughSequence: "2", consumedInputIds: ["input-before", "input-after"], isCurrent: true },
+      ],
+    })
+    const graph = await loadTaskGraph(fake.client, { ...identity, stepId: "current-step" }, true, true)
+    const node = currentTaskGraph(graph).nodes[0]!
+    const provenanceReads = fake.calls.filter(call => call.sql.startsWith("WITH current_steps AS MATERIALIZED"))
+
+    expect(node).toMatchObject({ status: "queued", readiness: "ready", inputRelation: "predates_current_inputs" })
+    expect(node).toHaveProperty("inputRelation", "predates_current_inputs")
+    expect(provenanceReads).toHaveLength(1)
+    expect(provenanceReads[0]?.values).toEqual([ ["cause-step"], "current-step", "root-1", "session-1", "turn-1", "root-1", "user-1" ])
   })
 
   it("projects repair receipts separately and preserves the original failed target report", async () => {
