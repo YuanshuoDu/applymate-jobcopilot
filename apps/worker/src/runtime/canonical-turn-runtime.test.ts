@@ -3935,5 +3935,181 @@ describe("createCanonicalTurnRuntime", () => {
     expect(JSON.stringify(lifecycle.events)).not.toContain("RAW_REJECTED_RESULT_SENTINEL")
   })
 
+  it("projects an asynchronously failed typed child into the next current-graph request before wait/list delivery", async () => {
+    const rawRejectedOutput = '{"role":"scout","privateResult":"CURRENT_GRAPH_RAW_RESULT_SENTINEL"}'
+    const goalText = "Find evidence-bound roles for the selected position GOAL_CANARY"
+    const businessReference = { id: canonicalJobId, kind: "job" as const, ownerId: lease.userId, label: "BUSINESS_REFERENCE_CANARY" }
+    const currentEvidence = {
+      toolCallId: "current-evidence-call", toolName: "jobs.get", input: { jobId: canonicalJobId },
+      status: "completed", output: { jobId: canonicalJobId, title: "CURRENT_EVIDENCE_CANARY" }, errorCode: null,
+    }
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }],
+    }
+    const verificationReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified" as const, reasonCode: "result_invalid" as const,
+      criteria: [{ criterionId: "candidate-count", status: "unverified" as const, reasonCode: "result_invalid" as const }],
+      evidenceDigest: null, resultDigest: null,
+    }
+    const requests: HarnessModelRequest[] = []
+    const contexts: StepContext[] = []
+    const events: RuntimeEvent[] = []
+    const lifecycle = new InMemoryToolLifecycleSink()
+    let graphAfterScheduling: LoadedGraph | undefined
+    let childOutcome: Awaited<ReturnType<typeof runStructuredScoutFailure>>["outcome"] | undefined
+    const schedule = vi.fn(async (input: TaskGraphScheduleInput) => {
+      expect(input.proposal.expectedRevision).toBe(0)
+      expect(input.proposal.nodes).toHaveLength(1)
+      expect(input.proposal.nodes[0]).toMatchObject({ key: "research", templateId: "scout", verification })
+      const actual = await runStructuredScoutFailure(rawRejectedOutput)
+      childOutcome = actual.outcome
+      expect(actual.outcome).toMatchObject({
+        status: "failed", failureReason: "invalid_structured_result",
+        result: { status: "failed", structuredOutputFailureCategory: "result_shape_invalid" },
+      })
+      const rawChildResult = actual.outcome.result
+      if (!rawChildResult || typeof rawChildResult !== "object" || Array.isArray(rawChildResult)) {
+        throw new Error("current_graph_structured_failure_result_missing")
+      }
+      const snapshot = parseTaskGraphSnapshot({
+        schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+        nodes: [{ key: "research", templateId: "scout", goal: "Find evidence-bound roles", successCriteria: ["Return sourced roles"],
+          dependsOn: [], depth: 1, taskId: actual.childLease.id, verificationDisposition: "typed", verification }],
+      })
+      const statusMap = new Map([[actual.childLease.id, { status: "failed" as const, failureReason: "task_graph_verification_unverified" }]])
+      const graphTask: GraphTaskRow = {
+        id: actual.childLease.id, role: "scout", taskType: "job_discovery", status: "failed",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+        failureReason: "task_graph_verification_unverified",
+        result: { ...(rawChildResult as Record<string, unknown>), taskGraphVerificationReport: verificationReport },
+      }
+      graphAfterScheduling = {
+        rootTaskId: "root-1", snapshot, item: { id: "task-graph-root-1", revision: 1, content: snapshot, createdAt: new Date(0) },
+        state: taskGraphState(snapshot, 1, statusMap, []), tasks: new Map([[graphTask.id, graphTask]]),
+      }
+      return { status: "accepted" as const, revision: 1, nodes: [{ key: "research", taskId: actual.childLease.id, status: "queued" as const }], readyTaskIds: [actual.childLease.id] }
+    })
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => { throw new Error("legacy planning port must not be used") }),
+      appendAndScheduleWithReconciliation: vi.fn(async (input: TaskGraphScheduleInput, _operation: SteeringReconciliationOperation) => schedule(input)),
+      readCurrent: vi.fn(async () => graphAfterScheduling ? currentTaskGraph(graphAfterScheduling) : { revision: 0, nodes: [] }),
+    }
+    const inputClaimStore: InputClaimStore = {
+      scope: { userId: lease.userId },
+      withTransaction: async work => work({
+        getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+        persistCheckpoint: async () => undefined,
+        loadRootInputContext: async () => null,
+        loadUnresolvedSteeringInputs: async () => [],
+      }),
+    }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const planningFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const denialCheckpoint = {
+      schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1",
+      taskId: "root-1", graphRevision: 1, verificationDigest: "a".repeat(64),
+    }
+    const checkCompletion = vi.fn(async () => {
+      const denial = {
+        ok: false as const,
+        blocker: "task_graph_verification_unverified",
+        feedback: "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing.",
+      }
+      Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: denialCheckpoint })
+      return denial
+    })
+    const roots = { ...rootStore(), checkCompletion }
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: lease.ownerId, productionFlags: planningFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({
+        ...state({ goal: goalText }),
+        snapshot: { system: [], profile: [], goal: { id: "root-goal", content: goalText }, steerHistory: [],
+          businessRefs: [businessReference], toolObservations: [{ id: "jobs-get-current", content: currentEvidence }] },
+      }),
+      selectedJobPreparationLoader: async () => undefined,
+      rootTaskStore: roots as never,
+      turnEngineStoreFactory: () => store(events),
+      contextBuilderFactory: () => {
+        const builder = new StepContextBuilder(inputClaimStore, ownerFence, () => lease.leaseStartedAt)
+        return { build: async request => { const context = await builder.build(request); contexts.push(context); return context } }
+      },
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          if (requests.length === 1) {
+            yield { type: "tool_call_completed", callId: "root-plan-current-failure", name: "agent.plan", arguments: {
+              expectedRevision: 0,
+              nodes: [{ key: "research", templateId: "scout", goal: "Find evidence-bound roles", successCriteria: ["Return sourced roles"],
+                dependsOn: [], verification }],
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "I will assess the current graph and evidence." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })
+    expect(childOutcome).toMatchObject({ status: "failed", result: { structuredOutputFailureCategory: "result_shape_invalid" } })
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(taskGraphCommandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    expect(schedule).toHaveBeenCalledOnce()
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalled()
+    expect(requests).toHaveLength(3)
+    expect(contexts).toHaveLength(4)
+    const currentBlock = contexts[1]?.blocks.find(block => block.id === "observation:task-graph-current")
+    expect(currentBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
+    expect(currentBlock?.content).toMatchObject({ kind: "task_graph_current", revision: 1, nodes: [expect.objectContaining({
+      key: "research", status: "failed", verification, verificationCriterionIds: ["candidate-count"], verificationReport,
+      structuredOutputFailureCategory: "result_shape_invalid", resultSummary: null, failureReason: null,
+    })] })
+    const currentNode = (currentBlock?.content as { nodes: Array<Record<string, unknown>> } | undefined)?.nodes[0]
+    expect(currentNode).toBeDefined()
+    for (const privateField of ["result", "structuredResult", "finalText", "finalItemId", "taskGraphVerificationReport", "repairReceipt", "nativeDelegation"]) {
+      expect(currentNode).not.toHaveProperty(privateField)
+    }
+    const nextMessages = requests[1]?.messages ?? []
+    const toolResults = nextMessages.flatMap(message => message.content).filter(part => part.type === "tool_result")
+    expect(toolResults.map(part => part.type === "tool_result" ? part.toolUseId : "")).toEqual([
+      "current-evidence-call", "root-plan-current-failure",
+    ])
+    const requestText = JSON.stringify(nextMessages)
+    expect(requestText).toContain("GOAL_CANARY")
+    expect(requestText).toContain("BUSINESS_REFERENCE_CANARY")
+    expect(requestText).toContain("CURRENT_EVIDENCE_CANARY")
+    expect(requestText).toContain("result_shape_invalid")
+    expect(requestText).not.toContain("CURRENT_GRAPH_RAW_RESULT_SENTINEL")
+    const actualResult = childOutcome?.result as Record<string, unknown> | undefined
+    expect(typeof actualResult?.finalItemId).toBe("string")
+    expect(requestText).not.toContain(String(actualResult?.finalItemId))
+    const system = (request: HarnessModelRequest) => request.messages.filter(message => message.role === "system")
+      .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(system(requests[1]!)).toBe(system(requests[0]!))
+    expect(system(requests[1]!)).not.toContain("result_shape_invalid")
+    expect(system(requests[1]!)).not.toContain("structuredOutputFailureCategory")
+    expect(checkCompletion).toHaveBeenCalledTimes(3)
+    expect(checkCompletion).toHaveBeenNthCalledWith(1, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true }))
+    expect(checkCompletion).toHaveBeenNthCalledWith(2, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true }))
+    expect(checkCompletion).toHaveBeenNthCalledWith(3, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true, nativeVerificationPassed: false }))
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed", errorCode: "no_progress" }) }))
+    expect(roots.finish).not.toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
+    expect(events.some(event => event.type === "tool_call.completed" && event.correlationId === "root-plan-current-failure")).toBe(true)
+    const completedToolNames = events.filter(event => event.type === "tool_call.completed")
+      .map(event => (event.payload as { toolName?: string }).toolName)
+    expect(new Set(completedToolNames)).toEqual(new Set(["agent.plan"]))
+  })
+
 
 })

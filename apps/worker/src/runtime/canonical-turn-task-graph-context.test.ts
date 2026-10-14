@@ -3,7 +3,7 @@ import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
-import type { TaskGraphCurrentState } from "./subagents/task-graph-command-port.js"
+import type { TaskGraphCurrentNode, TaskGraphCurrentState, TaskGraphVerificationReport } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
 import { StepContextBuilder, type StepContextSnapshot } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
@@ -13,6 +13,7 @@ import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verificat
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "./planning/task-graph-verification.js"
+import { taskGraphCurrentVerificationMetadataBytes } from "./canonical-turn-task-graph-verification-context.js"
 
 const state: TaskGraphCurrentState = {
   revision: 3,
@@ -89,6 +90,18 @@ function ordinaryFailedNode(): Record<string, unknown> {
   delete ordinary.verificationReport
   return { ...ordinary, status: "failed", readiness: "terminal", failureReason: "selected_job_context_unavailable",
     resultSummary: "private provider detail person@example.test" }
+}
+
+function structuredOutputFailureNode(category: unknown): Record<string, unknown> {
+  const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+    criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
+  return {
+    ...ordinaryFailedNode(), failureReason: "task_graph_verification_unverified",
+    verificationCriterionIds: ["candidate-count"], verification,
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null },
+    structuredOutputFailureCategory: category,
+  }
 }
 
 function projectedNode(row: Record<string, unknown>): Record<string, unknown> {
@@ -196,6 +209,127 @@ describe("TaskGraph turn observation", () => {
       expect(node.resultSummary).toBeNull()
     }
     expect(JSON.stringify(unknown)).not.toContain("provider-private-secret")
+  })
+
+  it("projects only the four closed structured-output categories on eligible typed failures", () => {
+    const categories = ["missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid"]
+    for (const category of categories) {
+      const node = projectedNode(structuredOutputFailureNode(category))
+      expect(node).toMatchObject({ status: "failed", templateId: "scout", verificationReport: {
+        status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null,
+      }, structuredOutputFailureCategory: category, failureReason: null, resultSummary: null })
+    }
+  })
+
+  it("omits unknown, malformed, inherited, accessor, and non-enumerable subtype values", () => {
+    const eligible = structuredOutputFailureNode("result_shape_invalid")
+    const absentCategory = { ...structuredOutputFailureNode(undefined) }
+    delete absentCategory.structuredOutputFailureCategory
+    const undefinedCategory = structuredOutputFailureNode(undefined)
+    const unknownCategory = structuredOutputFailureNode("future_category")
+    expect(JSON.stringify(projectedNode(undefinedCategory))).toBe(JSON.stringify(projectedNode(absentCategory)))
+    expect(JSON.stringify(projectedNode(unknownCategory))).toBe(JSON.stringify(projectedNode(absentCategory)))
+    const wrongReport = { ...eligible, verificationReport: {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+    } }
+    const unknown = projectedNode({ ...eligible, structuredOutputFailureCategory: { code: "result_shape_invalid" } })
+    const completed = projectedNode({ ...eligible, status: "completed" })
+    const verified = projectedNode(wrongReport)
+    const unsupportedRole = projectedNode({ ...ordinaryFailedNode(), templateId: "writer", structuredOutputFailureCategory: "result_shape_invalid" })
+    const inherited = structuredOutputFailureNode(undefined)
+    delete inherited.structuredOutputFailureCategory
+    Object.setPrototypeOf(inherited, { structuredOutputFailureCategory: "result_shape_invalid" })
+    const accessor = structuredOutputFailureNode(undefined)
+    let reads = 0
+    Object.defineProperty(accessor, "structuredOutputFailureCategory", {
+      enumerable: true, get: () => { reads += 1; throw new Error("category getter must not run") },
+    })
+    const nonEnumerable = structuredOutputFailureNode(undefined)
+    Object.defineProperty(nonEnumerable, "structuredOutputFailureCategory", { enumerable: false, value: "result_shape_invalid" })
+
+    for (const node of [unknown, completed, verified, unsupportedRole, projectedNode(inherited), projectedNode(accessor), projectedNode(nonEnumerable)]) {
+      expect(Object.hasOwn(node, "structuredOutputFailureCategory")).toBe(false)
+    }
+    expect(reads).toBe(0)
+  })
+
+  it("rejects malformed repair and native markers before a subtype can enter current context", () => {
+    for (const key of ["repairOf", "repairReceipt"]) {
+      for (const value of [undefined, null, {}]) {
+        expect(() => projectedNode({ ...structuredOutputFailureNode("result_shape_invalid"), [key]: value }))
+          .toThrow("task_graph_current_state_invalid:verification")
+      }
+    }
+    for (const key of ["native", "nativeResult"]) {
+      for (const value of [undefined, null, {}]) {
+        expect(() => projectedNode({ ...structuredOutputFailureNode("result_shape_invalid"), [key]: value }))
+          .toThrow("task_graph_current_state_invalid:native")
+      }
+    }
+    const native = projectedNode({ ...structuredOutputFailureNode("result_shape_invalid"), native: {
+      operationKind: "spawn", operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1",
+      role: "scout", taskType: "research", contextDigest: "c".repeat(64),
+    } })
+    expect(Object.hasOwn(native, "structuredOutputFailureCategory")).toBe(false)
+
+    const repairVerification: TaskGraphVerificationContract = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+    }
+    const repairReport: TaskGraphVerificationReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "result_invalid" }],
+      evidenceDigest: null, resultDigest: null,
+    }
+    const target: TaskGraphCurrentNode = {
+      key: "original", templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"], dependsOn: [],
+      taskId: "target-1", status: "failed", readiness: "terminal", resultSummary: null,
+      failureReason: "task_graph_verification_unverified", verificationCriterionIds: ["candidate-count"],
+      verification: repairVerification, verificationReport: repairReport,
+    }
+    const repair: TaskGraphCurrentNode = {
+      ...target, key: "repair", taskId: "repair-1", structuredOutputFailureCategory: "result_shape_invalid",
+      repairOf: { graphRootTaskId: "root-1", nodeKey: "original", taskId: "target-1", criterionIds: ["candidate-count"] },
+    }
+    const repaired = mergeTaskGraphCurrentObservation(snapshot(), { revision: 3, nodes: [target, repair] })
+    const repairNode = (repaired.toolObservations.at(-1)?.content as { nodes: Array<Record<string, unknown>> }).nodes[1]!
+    expect(Object.hasOwn(repairNode, "structuredOutputFailureCategory")).toBe(false)
+  })
+
+  it("counts the optional structured subtype inside the existing 32 KiB verifier budget", () => {
+    const makeNodes = (width: number, includeCategory: boolean): TaskGraphCurrentState["nodes"] => Array.from({ length: 16 }, (_, index) => {
+      const criteria = Array.from({ length: 8 }, (_, criterionIndex) => ({
+        id: `c${criterionIndex}-${"x".repeat(width)}`,
+        check: { kind: "candidate_count_gte" as const, minimum: 1 },
+      }))
+      const ids = criteria.map(criterion => criterion.id)
+      return {
+        key: `typed-${index}`, taskId: `task-${index}`, templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"],
+        dependsOn: [], status: "failed", readiness: "terminal", resultSummary: null, failureReason: includeCategory ? "task_graph_verification_unverified" : null,
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria } as TaskGraphVerificationContract,
+        verificationCriterionIds: ids,
+        verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+          criteria: ids.map(criterionId => ({ criterionId, status: "unverified" as const, reasonCode: "result_invalid" as const })), evidenceDigest: null, resultDigest: null },
+        ...(includeCategory ? { structuredOutputFailureCategory: "result_shape_invalid" as const } : {}),
+      }
+    })
+    let categoryBytesCauseRejection = false
+    for (let width = 1; width <= 60 && !categoryBytesCauseRejection; width += 1) {
+      const withoutCategory = makeNodes(width, false)
+      const baseBytes = withoutCategory.reduce((total, item) => total + taskGraphCurrentVerificationMetadataBytes(item), 0)
+      if (baseBytes > 32 * 1024) continue
+      expect(() => mergeTaskGraphCurrentObservation(snapshot(), { revision: 3, nodes: withoutCategory })).not.toThrow()
+      const withCategory = makeNodes(width, true)
+      try {
+        mergeTaskGraphCurrentObservation(snapshot(), { revision: 3, nodes: withCategory })
+      } catch (error) {
+        if (error instanceof Error && error.message === "task_graph_current_verification_too_large") categoryBytesCauseRejection = true
+        else throw error
+      }
+    }
+    expect(categoryBytesCauseRejection).toBe(true)
   })
 
   it("ignores inherited and accessor failure reasons without invoking getters", () => {
