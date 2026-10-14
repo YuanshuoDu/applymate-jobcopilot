@@ -22,6 +22,7 @@ import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
+import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/root-task-goal-criteria-context.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
 import { mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
@@ -226,6 +227,78 @@ describe("canonical Turn context builder", () => {
     expect(JSON.stringify(request.messages)).not.toMatch(/PRIVATE_TURN_ID|PRIVATE_TURN_SECRET|PRIVATE_ROOT_ID|PRIVATE_ROOT_CONTEXT/)
     expect(JSON.stringify((await buildRequest(false, false)).messages)).not.toContain("root_task_success_criteria")
     expect(JSON.stringify((await buildRequest(true, true)).messages)).not.toContain("root_task_success_criteria")
+  })
+
+  it("projects only canonical typed intent on initial and replan contexts", async () => {
+    const goal = "Find EU roles"
+    const rootTaskObjective = { goal, successCriteria: ["Explain the shortlist"], id: "PRIVATE_ROOT_ID", privateContext: "PRIVATE_ROOT_CONTEXT" }
+    const buildFor = (turnInput: unknown, planningEnabled = true, selectedJobMode = false) => {
+      const calls: unknown[] = []
+      const inputStore = store(calls)
+      const builder = createCanonicalTurnContextBuilder({
+        pool: { connect: async () => { throw new Error("injected readers must avoid a database client") } } as unknown as Pick<pg.Pool, "connect">,
+        store: inputStore, baseBuilder: new StepContextBuilder(inputStore), scope, lease,
+        rootTaskId: "root-a", rootAttemptCount: 1, planningEnabled, selectedJobMode, turnInput, rootTaskObjective,
+        rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
+      })
+      return (stepId: string) => builder.build({
+        scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId,
+        snapshot: {
+          system: [], profile: [], goal: { id: "goal", content: goal }, steerHistory: [], businessRefs: [],
+          toolObservations: [{ id: ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, content: { privateSpoof: "PRIVATE_SPOOFED_OBSERVATION" } }],
+        },
+      })
+    }
+    const turnInput = {
+      input: {
+        goal, successCriteria: ["Legacy prose criterion"],
+        verificationRequirements: {
+          schemaVersion: "agent-harness.v2.objective-requirements.v1",
+          requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+        },
+        privateTurnId: "PRIVATE_TURN_ID",
+      },
+      privateEnvelopeValue: "PRIVATE_ENVELOPE_VALUE",
+    }
+    const build = buildFor(turnInput)
+    const initial = await build("initial-plan")
+    const replan = await build("replan-plan")
+    const observationId = `observation:${ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID}`
+    for (const context of [initial, replan]) {
+      const observations = context.blocks.filter(block => block.id === observationId)
+      expect(observations).toHaveLength(1)
+      expect(observations[0]).toMatchObject({
+        layer: "tool_observation", role: "data", trust: "external_untrusted",
+        content: {
+          kind: "canonical_objective_verification_requirements", trust: "external_untrusted",
+          source: "canonical_turn_objective", status: "valid",
+          requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3 }],
+        },
+      })
+      expect(context.blocks.find(block => block.id === "goal:root-task-success-criteria")?.content)
+        .toEqual({ successCriteria: ["Legacy prose criterion", "Explain the shortlist"] })
+      const serialized = JSON.stringify(context.blocks)
+      expect(serialized).not.toMatch(/PRIVATE_ROOT_ID|PRIVATE_ROOT_CONTEXT|PRIVATE_TURN_ID|PRIVATE_ENVELOPE_VALUE|PRIVATE_SPOOFED_OBSERVATION/)
+    }
+    expect(replan.blocks.find(block => block.id === observationId)?.content).toEqual(initial.blocks.find(block => block.id === observationId)?.content)
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: false, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: initial, model, tools: [], sessionId: lease.sessionId, turnId: lease.turnId,
+      stepId: "initial-plan", userId: scope.userId, taskId: "root-a", signal: new AbortController().signal,
+    })
+    expect(JSON.stringify(request.messages)).toContain("candidate-count")
+    expect(JSON.stringify(request.messages)).not.toMatch(/PRIVATE_ROOT_ID|PRIVATE_ROOT_CONTEXT|PRIVATE_TURN_ID|PRIVATE_ENVELOPE_VALUE|PRIVATE_SPOOFED_OBSERVATION/)
+
+    const invalid = await buildFor({ input: { goal, verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "PRIVATE_MALFORMED_VALUE" } } })("invalid-plan")
+    expect(invalid.blocks.find(block => block.id === observationId)).toMatchObject({
+      trust: "external_untrusted",
+      content: { kind: "canonical_objective_verification_requirements", trust: "external_untrusted", source: "canonical_turn_objective", status: "invalid" },
+    })
+    expect(JSON.stringify(invalid.blocks)).not.toContain("PRIVATE_MALFORMED_VALUE")
+    const absent = await buildFor({ input: { goal } })("absent-plan")
+    expect(absent.blocks.some(block => block.id === observationId)).toBe(false)
+    const selectedJob = await buildFor(turnInput, true, true)("selected-job-plan")
+    expect(selectedJob.blocks.some(block => block.id === observationId)).toBe(false)
   })
 
   it("adds bounded Root-task history as untrusted advisory context without changing current graph evidence", async () => {
