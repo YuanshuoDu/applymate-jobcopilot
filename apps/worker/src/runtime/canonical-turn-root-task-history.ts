@@ -14,7 +14,7 @@ export async function appendCanonicalRootTaskHistory(input: Readonly<{
 }>): Promise<StepContextSnapshot> {
   const observations = input.snapshot.toolObservations.filter(item => item.id !== "root-task-history")
   const outcomes = await input.reader.load(input.request)
-  const block: ContextSeedBlock | undefined = projectRootTaskHistory(outcomes)
+  const block: ContextSeedBlock | undefined = projectRootTaskHistory(outcomes, input.request.crossSessionRootTaskHistoryEnabled === true)
   return block
     ? { ...input.snapshot, toolObservations: [...observations, block] }
     : { ...input.snapshot, toolObservations: observations }

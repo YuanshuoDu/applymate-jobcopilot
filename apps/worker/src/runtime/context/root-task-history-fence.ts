@@ -2,7 +2,8 @@ import { Buffer } from "node:buffer"
 import type pg from "pg"
 import type { TurnLease } from "../turns/lease.js"
 import { lockTaskGraphScope, type GraphScope } from "../subagents/task-graph-pg-state.js"
-import { resolveRootTaskObjective, rootTaskObjectiveDigest } from "./root-task-objective.js"
+import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
+import { resolveRootTaskObjective, resolveRootTaskVerificationRequirements, rootTaskObjectiveDigest } from "./root-task-objective.js"
 
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
@@ -13,9 +14,15 @@ export type RootTaskHistoryFenceInput = Readonly<{
   rootAttemptCount: number
   stepId: string
   now: Date
+  crossSessionRootTaskHistoryEnabled?: boolean
 }>
 
-export type RootTaskHistoryFence = Readonly<{ currentStartSequence: bigint; objectiveDigest: string }>
+export type RootTaskHistoryFence = Readonly<{
+  currentStartSequence: bigint
+  objectiveDigest: string
+  currentStartCreatedAt?: Date
+  currentOrigin?: string
+}>
 
 type Queryable = Pick<pg.PoolClient, "query">
 
@@ -48,11 +55,30 @@ export function hasSelectedJobPreparation(turnInput: unknown): boolean {
   return Boolean(nested && Object.keys(nested).length > 0 && Object.hasOwn(nested, "selectedJobPreparation"))
 }
 
+/** Encodes only a validated persisted Turn source and its narrow origin discriminator. */
+export function rootTaskHistoryOrigin(source: unknown, turnInput: unknown): string | undefined {
+  if (!text(source)) return undefined
+  const envelope = object(turnInput)
+  if (!envelope) return undefined
+  const hasNested = Object.hasOwn(envelope, "input"), nested = hasNested ? object(envelope.input) : null
+  if (hasNested && !nested) return undefined
+  const copies = [envelope, ...(nested ? [nested] : [])]
+    .filter(value => Object.hasOwn(value, "intent"))
+  if (!copies.length) return JSON.stringify([source, "none"])
+  for (const copy of copies) {
+    const intent = object(copy.intent)
+    if (!intent || Object.keys(intent).sort().join(",") !== "kind,version"
+      || intent.kind !== "interactive_discovery_shortlist" || intent.version !== 1) return undefined
+  }
+  return JSON.stringify([source, "interactive_discovery_shortlist", 1])
+}
+
 export function validateRootTaskHistoryFenceInput(input: RootTaskHistoryFenceInput): void {
   const { lease } = input
   if (!text(lease.userId) || !text(lease.sessionId) || !text(lease.turnId) || !text(lease.ownerId)
     || !Number.isSafeInteger(lease.leaseVersion) || lease.leaseVersion < 1 || !text(input.rootTaskId)
     || !Number.isSafeInteger(input.rootAttemptCount) || input.rootAttemptCount < 1 || !text(input.stepId)
+    || (input.crossSessionRootTaskHistoryEnabled !== undefined && typeof input.crossSessionRootTaskHistoryEnabled !== "boolean")
     || !(input.now instanceof Date) || !Number.isFinite(input.now.getTime())) {
     throw new Error("root_task_history_input_invalid")
   }
@@ -67,19 +93,27 @@ function validRoot(row: Row, input: RootTaskHistoryFenceInput): boolean {
     && row.interruptRequestedAt == null
 }
 
-function verifierObjectiveDigest(turnInput: unknown, root: Row): string | undefined {
+export function rootTaskHistoryObjectiveDigest(turnInput: unknown, root: Row, includeVerificationRequirements = false): string | undefined {
   const resolved = resolveRootTaskObjective(turnInput, { goal: root.goal, successCriteria: root.successCriteria })
   if (!resolved.goal || resolved.turnGoalConflict || !resolved.criteriaValid || !resolved.criteria.length
     || resolved.criteria.some(requirement => Buffer.byteLength(requirement, "utf8") > 2_000)) return undefined
-  return rootTaskObjectiveDigest({ goal: resolved.goal, criteria: resolved.criteria.map((requirement, index) => ({
+  const criteria = resolved.criteria.map((requirement, index) => ({
     criterionId: `criterion-${index + 1}`, requirement,
-  })) })
+  }))
+  if (!includeVerificationRequirements) return rootTaskObjectiveDigest({ goal: resolved.goal, criteria })
+  const requirements = resolveRootTaskVerificationRequirements(turnInput)
+  if (requirements.status === "invalid") return undefined
+  return digestNativeVerificationValue({
+    goal: resolved.goal, criteria,
+    verificationRequirements: requirements.status === "valid"
+      ? requirements.requirements.map(({ id, kind, minimum }) => ({ id, kind, minimum })) : null,
+  })
 }
 
-async function currentStartSequence(client: Queryable, input: RootTaskHistoryFenceInput): Promise<bigint | undefined> {
+async function currentStart(client: Queryable, input: RootTaskHistoryFenceInput): Promise<Readonly<{ sequence: bigint; createdAt?: Date }> | undefined> {
   const { lease } = input
   const result = await client.query<Row>(`SELECT event."sessionId", event."turnId", event."taskId", event."itemId", event."sequence",
-      event."type", event."actor", event."correlationId", event."idempotencyKey", event."payload",
+      event."type", event."actor", event."correlationId", event."idempotencyKey", event."payload", event."createdAt",
       COUNT(*) OVER () AS "startEventCount"
     FROM "agent_events" AS event
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
@@ -90,11 +124,13 @@ async function currentStartSequence(client: Queryable, input: RootTaskHistoryFen
   [lease.sessionId, lease.turnId, input.rootTaskId, lease.userId])
   if (result.rows.length !== 1 || Number(result.rows[0]?.startEventCount) !== 1) return undefined
   const row = result.rows[0]!, payload = object(row.payload), value = sequence(row.sequence)
+  const createdAt = row.createdAt instanceof Date && Number.isFinite(row.createdAt.getTime()) ? row.createdAt : undefined
   return row.sessionId === lease.sessionId && row.turnId === lease.turnId && row.taskId === input.rootTaskId
     && row.itemId === null && row.type === "turn.started" && row.actor === "orchestrator"
     && row.correlationId === lease.turnId && row.idempotencyKey === `turn:${lease.turnId}:event:turn-started`
-    && payload?.taskId === input.rootTaskId && payload.rootTaskId === input.rootTaskId
-    ? value : undefined
+    && payload?.taskId === input.rootTaskId && payload.rootTaskId === input.rootTaskId && value
+    && (!input.crossSessionRootTaskHistoryEnabled || createdAt !== undefined)
+    ? { sequence: value, ...(createdAt ? { createdAt } : {}) } : undefined
 }
 
 /** Locks and validates the live ordinary Root, its current Step, Turn lease, objective, and unique start receipt. */
@@ -120,17 +156,23 @@ export async function readRootTaskHistoryFence(
     throw new Error("root_task_history_current_step_fenced")
   }
 
-  const turn = await client.query<Row>(`SELECT "id", "sessionId", "userId", "rootTaskId", "status", "input"
+  const turn = await client.query<Row>(`SELECT "id", "sessionId", "userId", "rootTaskId", "status", "source", "input"
     FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4
       AND "leaseOwnerId" = $5 AND "leaseVersion" = $6 AND "status" = 'in_progress' FOR UPDATE`,
   [lease.turnId, lease.sessionId, lease.userId, input.rootTaskId, lease.ownerId, lease.leaseVersion])
   const currentTurn = turn.rows[0]
   if (turn.rows.length !== 1 || !currentTurn) throw new Error("root_task_history_current_turn_fenced")
   if (hasSelectedJobPreparation(currentTurn.input)) return undefined
-  const objectiveDigest = verifierObjectiveDigest(currentTurn.input, root)
+  const currentOrigin = input.crossSessionRootTaskHistoryEnabled ? rootTaskHistoryOrigin(currentTurn.source, currentTurn.input) : undefined
+  if (input.crossSessionRootTaskHistoryEnabled && !currentOrigin) return undefined
+  const objectiveDigest = rootTaskHistoryObjectiveDigest(currentTurn.input, root, input.crossSessionRootTaskHistoryEnabled === true)
   if (!objectiveDigest) return undefined
-  const start = await currentStartSequence(client, input)
-  return start === undefined ? undefined : { currentStartSequence: start, objectiveDigest }
+  const start = await currentStart(client, input)
+  return start === undefined ? undefined : {
+    currentStartSequence: start.sequence, objectiveDigest,
+    ...(input.crossSessionRootTaskHistoryEnabled && start.createdAt ? { currentStartCreatedAt: start.createdAt } : {}),
+    ...(currentOrigin ? { currentOrigin } : {}),
+  }
 }
 
 export async function withRootTaskHistoryTransaction<T>(

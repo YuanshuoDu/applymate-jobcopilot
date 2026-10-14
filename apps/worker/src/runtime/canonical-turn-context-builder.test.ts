@@ -198,6 +198,25 @@ describe("canonical Turn context builder", () => {
     expect(calls).toEqual([])
   })
 
+  it("passes opt-in history scope only through a planning ordinary-root builder", async () => {
+    const load = vi.fn(async () => [])
+    const reader: DirectRootTaskHistoryReader = { load }
+    const pool = { connect: async () => { throw new Error("injected readers avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">
+    const build = (planningEnabled: boolean, selectedJobMode: boolean) => createCanonicalTurnContextBuilder({
+      pool, store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+      planningEnabled, selectedJobMode, crossSessionRootTaskHistoryEnabled: true, rootTaskHistoryDirectReader: reader,
+      currentRootBudgetReader: async () => unavailableBudget,
+    }).build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-opt-in",
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, now })
+
+    await build(true, false)
+    expect(load).toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: true }))
+    load.mockClear()
+    await build(false, false)
+    await build(true, true)
+    expect(load).not.toHaveBeenCalled()
+  })
+
   it("adds only validated criteria to planning Root requests and preserves child/no-planning modes", async () => {
     const goal = "Find EU roles"
     const turnInput = { input: { goal, successCriteria: ["Turn criterion", "Shared criterion"], privateTurnId: "PRIVATE_TURN_ID" }, secret: "PRIVATE_TURN_SECRET" }

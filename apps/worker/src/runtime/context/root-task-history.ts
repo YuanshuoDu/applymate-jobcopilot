@@ -14,13 +14,12 @@ import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput 
 export type ValidatedRootTaskHistoryOutcome = Readonly<{
   sourceTurnId: string
   sourceRootTaskId: string
-  terminalSequence: bigint
+  terminalSequence: bigint; terminalAt?: Date
   taskGraph: TaskGraphCurrentState
   sourceNodeOrdinals?: readonly number[]
   nodeLessons?: readonly (RootTaskHistoryNodeLesson | undefined)[]
   reportedOutputs?: readonly (RootTaskHistoryReportedOutput | undefined)[]
 }>
-
 type TaskKind = "scout" | "analyst" | "writer" | "reviewer" | "other"
 type SafeNode = Readonly<{
   taskKind: TaskKind
@@ -30,11 +29,10 @@ type SafeNode = Readonly<{
   reportedOutput?: RootTaskHistoryReportedOutput
 }>
 type CandidateNode = Readonly<{ nodeOrdinal: number; projection: Omit<SafeNode, "lesson" | "reportedOutput">; lesson?: RootTaskHistoryNodeLesson; reportedOutput?: RootTaskHistoryReportedOutput }>
-type Candidate = Readonly<{ sourceTurnId: string; sourceRootTaskId: string; terminalSequence: bigint; safeNodes: readonly CandidateNode[];
+type Candidate = Readonly<{ sourceTurnId: string; sourceRootTaskId: string; terminalSequence: bigint; terminalAt?: Date; safeNodes: readonly CandidateNode[];
   lessonsBySourceOrdinal?: readonly (RootTaskHistoryNodeLesson | undefined)[]; identity: string }>
 type SelectedTurn = { label: string; candidate: Candidate; nodes: CandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number> }
 type Row = Record<string, unknown>
-
 const MAX_CANDIDATES = 64
 const MAX_TURNS = 2
 const MAX_NODES = 8
@@ -54,7 +52,6 @@ const NEGATIVE_REASON_CODES = new Set<TaskGraphVerificationReasonCode>([
   "canonical_evidence_ambiguous", "result_invalid", "result_ambiguous",
   "result_evidence_unbound", "repair_target_unresolved",
 ])
-
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   try {
@@ -133,13 +130,14 @@ function projectNode(value: unknown): Omit<SafeNode, "lesson" | "reportedOutput"
   const hints = safeReasonHints(node)
   return { taskKind, status: node.status as SubagentTaskStatus, ...(hints ? { negativeReasonHints: hints } : {}) }
 }
-function candidate(value: unknown): Candidate | null {
+function candidate(value: unknown, crossSession: boolean): Candidate | null {
   const item = record(value)
   if (!item || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
-    || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n) return null
+    || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n
+    || (crossSession && (!(item.terminalAt instanceof Date) || !Number.isFinite(item.terminalAt.getTime())))) return null
   const hasOrdinals = Object.hasOwn(item, "sourceNodeOrdinals"), hasLessons = Object.hasOwn(item, "nodeLessons")
   const hasOutputs = Object.hasOwn(item, "reportedOutputs")
-  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence",
+  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(crossSession ? ["terminalAt"] : []),
     ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : [])].sort().join(",")
   if (!exact(item, keys)) return null
   const graph = record(item.taskGraph)
@@ -161,7 +159,7 @@ function candidate(value: unknown): Candidate | null {
       || compare(JSON.stringify(left.projection), JSON.stringify(right.projection)))
   return {
     sourceTurnId: item.sourceTurnId, sourceRootTaskId: item.sourceRootTaskId,
-    terminalSequence: item.terminalSequence, ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
+    terminalSequence: item.terminalSequence, ...(crossSession ? { terminalAt: item.terminalAt as Date } : {}), ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }
@@ -193,18 +191,21 @@ function withinContentLimit(turns: readonly SelectedTurn[], withLessons = false,
   const serialized = JSON.stringify({ id: "root-task-history", content: content(emittedTurns(turns, withLessons, withReportedOutputs)) })
   return typeof serialized === "string" && Buffer.byteLength(serialized, "utf8") <= MAX_CONTENT_BYTES
 }
-function projectCandidates(values: readonly Candidate[]): ContextSeedBlock | undefined {
+function projectCandidates(values: readonly Candidate[], crossSession: boolean): ContextSeedBlock | undefined {
   const byIdentity = new Map<string, Candidate>(), conflicts = new Set<string>()
   for (const value of values) {
     if (conflicts.has(value.identity)) continue
     const previous = byIdentity.get(value.identity)
     if (!previous) byIdentity.set(value.identity, value)
-    else if (previous.terminalSequence !== value.terminalSequence || JSON.stringify(previous.safeNodes) !== JSON.stringify(value.safeNodes)) {
+    else if (previous.terminalSequence !== value.terminalSequence || previous.terminalAt?.getTime() !== value.terminalAt?.getTime()
+      || JSON.stringify(previous.safeNodes) !== JSON.stringify(value.safeNodes)) {
       byIdentity.delete(value.identity); conflicts.add(value.identity)
     }
   }
-  const ordered = [...byIdentity.values()].sort((left, right) => left.terminalSequence > right.terminalSequence ? -1
-    : left.terminalSequence < right.terminalSequence ? 1 : compare(left.identity, right.identity))
+  const ordered = [...byIdentity.values()].sort((left, right) => crossSession
+    ? right.terminalAt!.getTime() - left.terminalAt!.getTime() || compare(right.sourceTurnId, left.sourceTurnId)
+    : left.terminalSequence > right.terminalSequence ? -1
+      : left.terminalSequence < right.terminalSequence ? 1 : compare(left.identity, right.identity))
   const turns: SelectedTurn[] = []
   let nodeCount = 0
   for (const value of ordered) {
@@ -237,13 +238,13 @@ function projectCandidates(values: readonly Candidate[]): ContextSeedBlock | und
   }
   return { id: "root-task-history", content: content(emittedTurns(turns, true, true)) }
 }
-
 /** Projects bounded typed historical outcomes; private source identity is used only for ordering and deduplication. */
 export function projectRootTaskHistory(
   outcomes: readonly ValidatedRootTaskHistoryOutcome[],
+  crossSession = false,
 ): ContextSeedBlock | undefined {
   if (!Array.isArray(outcomes) || outcomes.length === 0 || outcomes.length > MAX_CANDIDATES || !dense(outcomes)) return undefined
-  const candidates = outcomes.map(candidate)
+  const candidates = outcomes.map(value => candidate(value, crossSession))
   if (candidates.some(value => value === null)) return undefined
-  return projectCandidates(candidates as Candidate[])
+  return projectCandidates(candidates as Candidate[], crossSession)
 }
