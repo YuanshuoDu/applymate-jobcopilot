@@ -12,7 +12,10 @@ import { createPgDirectSelectedJobHistoryStore } from "./context/selected-job-hi
 import { createPgDirectRootTaskHistoryStore } from "./context/root-task-history-direct-store.js"
 import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
-import { projectRootTaskGoalCriteria, type RootTaskGoalObjective } from "./context/root-task-goal-criteria-context.js"
+import {
+  projectRootTaskGoalCriteria, rootTaskVerificationRequirementsObservation,
+  ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, type RootTaskGoalObjective,
+} from "./context/root-task-goal-criteria-context.js"
 import {
   appendCanonicalSelectedJobHistory, appendCanonicalSelectedJobHistoryOutcomes,
   type DirectSelectedJobHistoryReader, type SelectedJobHistoryReader,
@@ -115,7 +118,11 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       }
       const rootTaskGoalCriteria = input.planningEnabled && !input.selectedJobMode && input.rootTaskObjective
         ? projectRootTaskGoalCriteria(input.turnInput, input.rootTaskObjective) : undefined
-      snapshot = { ...snapshot, rootTaskGoalCriteria }
+      const verificationRequirements = input.planningEnabled && !input.selectedJobMode
+        ? rootTaskVerificationRequirementsObservation(input.turnInput) : undefined
+      const toolObservations = snapshot.toolObservations.filter(observation => observation.id !== ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID)
+      if (verificationRequirements) toolObservations.push(verificationRequirements)
+      snapshot = { ...snapshot, rootTaskGoalCriteria, toolObservations }
       return base.build({ ...request, snapshot, taskId: input.rootTaskId })
     },
   }

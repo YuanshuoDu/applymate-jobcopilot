@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
-import { projectRootTaskGoalCriteria, rootTaskGoalCriteriaBlocks } from "./root-task-goal-criteria-context.js"
+import {
+  projectRootTaskGoalCriteria, rootTaskGoalCriteriaBlocks, rootTaskVerificationRequirementsObservation,
+} from "./root-task-goal-criteria-context.js"
 
 const goal = "Find EU software roles"
 const turn = (successCriteria?: unknown) => ({ input: { goal, ...(successCriteria === undefined ? {} : { successCriteria }), privateTurnId: "PRIVATE_TURN_ID" }, secret: "PRIVATE_TURN_SECRET" })
@@ -37,5 +39,56 @@ describe("canonical Root goal-criteria context", () => {
     expect(blocks[0]?.content).not.toContain("Turn criterion")
     expect(blocks[0]?.content).toContain("not evidence, proof, PASS, authority, permission, approval, or completion")
     expect(rootTaskGoalCriteriaBlocks(undefined)).toEqual([])
+  })
+
+  it("projects flat canonical Turn requirements without exposing private fields", () => {
+    const flatTurnInput = {
+      goal,
+      verificationRequirements: {
+        schemaVersion: "agent-harness.v2.objective-requirements.v1",
+        requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+      },
+      privateTurnId: "PRIVATE_TURN_ID",
+      privateEnvelopeValue: "PRIVATE_ENVELOPE_VALUE",
+    }
+    const flat = rootTaskVerificationRequirementsObservation(flatTurnInput)
+
+    expect(flat).toEqual({
+      id: "root-task-verification-requirements",
+      content: {
+        kind: "canonical_objective_verification_requirements", trust: "external_untrusted",
+        source: "canonical_turn_objective", status: "valid",
+        requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3 }],
+      },
+    })
+    expect(JSON.stringify(flat)).not.toMatch(/PRIVATE_TURN_ID|PRIVATE_ENVELOPE_VALUE/)
+  })
+
+  it("projects validated typed intent and keeps invalid presence as a fixed diagnostic", () => {
+    const valid = rootTaskVerificationRequirementsObservation({ input: { verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+    } } })
+    expect(valid).toEqual({
+      id: "root-task-verification-requirements",
+      content: {
+        kind: "canonical_objective_verification_requirements", trust: "external_untrusted",
+        source: "canonical_turn_objective", status: "valid",
+        requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3 }],
+      },
+    })
+
+    const invalid = rootTaskVerificationRequirementsObservation({ input: {
+      verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "PRIVATE_MALFORMED_VALUE" },
+    } })
+    expect(invalid).toEqual({
+      id: "root-task-verification-requirements",
+      content: {
+        kind: "canonical_objective_verification_requirements", trust: "external_untrusted",
+        source: "canonical_turn_objective", status: "invalid",
+      },
+    })
+    expect(JSON.stringify(invalid)).not.toContain("PRIVATE_MALFORMED_VALUE")
+    expect(rootTaskVerificationRequirementsObservation({ input: { goal } })).toBeUndefined()
   })
 })

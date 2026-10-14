@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
 import { Value } from "@sinclair/typebox/value"
 import { InputContentPartSchema } from "@jobcopilot/agent-protocol"
+import { TASK_GRAPH_VERIFICATION_LIMITS } from "../planning/task-graph-verification.js"
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
 
 export type RootTaskObjectiveResolution = Readonly<{
@@ -17,10 +18,22 @@ export type RootTaskVerifierObjective = Readonly<{
 /** The opt-in is only for native-verifier derivation before its Root row exists; history stays strict. */
 export type RootTaskObjectiveOptions = Readonly<{ allowNativeFreshRootFallback?: true }>
 
+export type RootTaskVerificationRequirement = Readonly<{
+  id: string
+  kind: "candidate_count_gte" | "finding_count_gte"
+  minimum: number
+}>
+export type RootTaskVerificationRequirementsResolution =
+  | Readonly<{ status: "absent" }>
+  | Readonly<{ status: "valid"; requirements: readonly RootTaskVerificationRequirement[] }>
+  | Readonly<{ status: "invalid" }>
+
 type Row = Record<string, unknown>
 const MAX_GOAL_BYTES = 4 * 1024
 const MAX_CRITERIA = 32
 const MAX_CRITERION_BYTES = 2_000
+const OBJECTIVE_REQUIREMENTS_SCHEMA_VERSION = "agent-harness.v2.objective-requirements.v1"
+const OBJECTIVE_REQUIREMENT_ID = /^[a-z][a-z0-9._-]{0,63}$/
 
 function record(value: unknown): Row | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
@@ -70,6 +83,110 @@ function mergeCriteria(turnCriteria: readonly string[], rootCriteria: readonly s
   const merged = [...new Set([...turnCriteria, ...rootCriteria])]
   if (merged.length > MAX_CRITERIA) return []
   return merged.length ? merged : goal ? [goal] : []
+}
+
+type OwnField = Readonly<{ status: "absent" }> | Readonly<{ status: "present"; value: unknown }> | Readonly<{ status: "invalid" }>
+
+function ownDataField(value: unknown, key: string): OwnField {
+  if (!value || typeof value !== "object") return { status: "absent" }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor) return { status: "absent" }
+    return "value" in descriptor && descriptor.enumerable
+      ? { status: "present", value: descriptor.value }
+      : { status: "invalid" }
+  } catch { return { status: "invalid" } }
+}
+
+function exactRequirementRecord(value: unknown, keys: readonly string[]): Row | null {
+  if (!value || typeof value !== "object") return null
+  try {
+    if (Array.isArray(value)) return null
+    const prototype = Object.getPrototypeOf(value)
+    const ownKeys = Reflect.ownKeys(value)
+    if ((prototype !== Object.prototype && prototype !== null) || ownKeys.length !== keys.length
+      || ownKeys.some(key => typeof key !== "string" || !keys.includes(key))) return null
+    const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<string, PropertyDescriptor>
+    const result: Row = Object.create(null) as Row
+    for (const key of keys) {
+      const descriptor = descriptors[key]
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return null
+      result[key] = descriptor.value
+    }
+    return result
+  } catch { return null }
+}
+
+function denseRequirementList(value: unknown): unknown[] | null {
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return null
+    const keys = Reflect.ownKeys(value)
+    const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<string, PropertyDescriptor>
+    const length = descriptors.length?.value
+    if (!Number.isSafeInteger(length) || Number(length) < 1 || Number(length) > TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria
+      || keys.length !== Number(length) + 1 || keys.some(key => typeof key !== "string"
+        || (key !== "length" && (!/^\d+$/.test(key) || Number(key) >= Number(length))))) return null
+    const result: unknown[] = []
+    for (let index = 0; index < Number(length); index++) {
+      const descriptor = descriptors[String(index)]
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return null
+      result.push(descriptor.value)
+    }
+    return result
+  } catch { return null }
+}
+
+function parseObjectiveRequirements(value: unknown): readonly RootTaskVerificationRequirement[] | null {
+  const block = exactRequirementRecord(value, ["schemaVersion", "requirements"])
+  if (!block || block.schemaVersion !== OBJECTIVE_REQUIREMENTS_SCHEMA_VERSION) return null
+  const rows = denseRequirementList(block.requirements)
+  if (!rows) return null
+  const ids = new Set<string>()
+  const result: RootTaskVerificationRequirement[] = []
+  for (const row of rows) {
+    const entry = exactRequirementRecord(row, ["id", "check"])
+    if (!entry || typeof entry.id !== "string" || entry.id.length > TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength
+      || !OBJECTIVE_REQUIREMENT_ID.test(entry.id) || ids.has(entry.id)) return null
+    const check = exactRequirementRecord(entry.check, ["kind", "minimum"])
+    if (!check || (check.kind !== "candidate_count_gte" && check.kind !== "finding_count_gte")
+      || !Number.isSafeInteger(check.minimum) || Number(check.minimum) < 1
+      || Number(check.minimum) > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return null
+    ids.add(entry.id)
+    result.push({ id: entry.id, kind: check.kind, minimum: Number(check.minimum) })
+  }
+  return Object.freeze(result)
+}
+
+function requirementsEqual(left: readonly RootTaskVerificationRequirement[], right: readonly RootTaskVerificationRequirement[]): boolean {
+  return left.length === right.length && left.every((requirement, index) => {
+    const other = right[index]
+    return requirement.id === other?.id && requirement.kind === other.kind && requirement.minimum === other.minimum
+  })
+}
+
+/** Resolves only the optional persisted Turn objective block; invalid intent stays distinct from absence. */
+export function resolveRootTaskVerificationRequirements(turnInput: unknown): RootTaskVerificationRequirementsResolution {
+  const envelope = record(turnInput)
+  if (!envelope) {
+    if (turnInput !== null && typeof turnInput === "object") return { status: "invalid" }
+    const direct = ownDataField(turnInput, "verificationRequirements")
+    return direct.status === "absent" ? { status: "absent" } : { status: "invalid" }
+  }
+  const envelopeField = ownDataField(envelope, "verificationRequirements")
+  const nestedInputField = ownDataField(envelope, "input")
+  if (envelopeField.status === "invalid" || nestedInputField.status === "invalid") return { status: "invalid" }
+  const nested = nestedInputField.status === "present" ? record(nestedInputField.value) : null
+  if (nestedInputField.status === "present" && nested === null && nestedInputField.value
+    && typeof nestedInputField.value === "object") return { status: "invalid" }
+  const nestedField = ownDataField(nested, "verificationRequirements")
+  if (nestedField.status === "invalid") return { status: "invalid" }
+  const fields = [envelopeField, nestedField].filter((field): field is Extract<OwnField, { status: "present" }> => field.status === "present")
+  if (!fields.length) return { status: "absent" }
+  const parsed = fields.map(field => parseObjectiveRequirements(field.value))
+  if (parsed.some(requirements => requirements === null)) return { status: "invalid" }
+  const requirements = parsed[0]
+  if (!requirements || parsed.slice(1).some(copy => !copy || !requirementsEqual(requirements, copy))) return { status: "invalid" }
+  return { status: "valid", requirements }
 }
 
 /** Resolves the frozen Turn objective against its persisted root task without changing verifier policy. */
