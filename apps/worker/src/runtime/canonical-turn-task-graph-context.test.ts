@@ -307,7 +307,7 @@ describe("TaskGraph turn observation", () => {
       const ids = criteria.map(criterion => criterion.id)
       return {
         key: `typed-${index}`, taskId: `task-${index}`, templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"],
-        dependsOn: [], status: "failed", readiness: "terminal", resultSummary: null, failureReason: null,
+        dependsOn: [], status: "failed", readiness: "terminal", resultSummary: null, failureReason: includeCategory ? "task_graph_verification_unverified" : null,
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria } as TaskGraphVerificationContract,
         verificationCriterionIds: ids,
         verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",

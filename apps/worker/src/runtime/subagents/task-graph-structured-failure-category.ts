@@ -130,7 +130,8 @@ export function projectTaskGraphStructuredFailureCategory(
 
   const role = view.templateId
   if (view.status !== "failed" || (role !== "scout" && role !== "analyst")
-    || source.status !== view.status || source.templateId !== role) return undefined
+    || source.status !== view.status || source.templateId !== role
+    || source.failureReason !== "task_graph_verification_unverified") return undefined
   const category = source.structuredOutputFailureCategory
   if (typeof category !== "string" || !CATEGORIES.has(category as TaskGraphStructuredOutputFailureCategory)) return undefined
 

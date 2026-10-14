@@ -51,7 +51,7 @@ function parsedProjection(role = "scout") {
 }
 
 function projectedRaw(category = "result_shape_invalid", role = "scout") {
-  return { status: "failed", templateId: role, structuredOutputFailureCategory: category }
+  return { status: "failed", templateId: role, failureReason: "task_graph_verification_unverified", structuredOutputFailureCategory: category }
 }
 
 describe("classifyTaskGraphStructuredOutputFailure", () => {
@@ -133,6 +133,8 @@ describe("projectTaskGraphStructuredFailureCategory", () => {
     const raw = projectedRaw(), parsed = parsedProjection()
     const report = parsed.verificationReport
     const badCases = [
+      [{ ...raw, failureReason: null }, parsed],
+      [{ ...raw, failureReason: "task_graph_verification_failed" }, parsed],
       [projectedRaw("unknown"), parsed],
       [{ ...raw, status: "completed" }, parsed],
       [{ ...raw, templateId: "writer" }, parsed],
