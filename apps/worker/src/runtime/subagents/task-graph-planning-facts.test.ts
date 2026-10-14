@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { currentTaskGraph } from "./task-graph-pg-state.js"
 import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import { buildTaskGraphPlanningFacts } from "./task-graph-planning-facts.js"
+import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
 
 const artifactRef = {
@@ -131,13 +133,39 @@ describe("TaskGraph planning facts producer", () => {
     expect(malformed?.counts.discoveredJobs).toEqual({ knownCount: null, coverage: "unavailable" })
   })
 
+  it("omits only the optional aggregate when the current graph uses a reducer-unsafe task ID", () => {
+    const taskId = "t".repeat(81)
+    const snapshot = parseTaskGraphSnapshot({
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [{ key: "node", templateId: "scout", goal: "Research jobs", successCriteria: ["List jobs"],
+        dependsOn: [], depth: 1, taskId }],
+    })
+    const state = taskGraphState(snapshot, 1, new Map([[taskId, { status: "completed" as const, failureReason: null }]]), [])
+    const loaded: LoadedGraph = {
+      rootTaskId: "root-task",
+      item: { id: "task-graph:root-task", revision: 1, content: snapshot, createdAt: new Date(0) },
+      snapshot, state, tasks: new Map([[taskId, row(taskId, "scout", "research", "completed")]]),
+    }
+
+    expect(currentTaskGraph(loaded).nodes[0]?.taskId).toBe(taskId)
+    expect(buildTaskGraphPlanningFacts(loaded)).toBeNull()
+  })
+
   it("propagates graph and reducer invariant errors", () => {
     const inconsistent = loadedGraph(6, [], [], 5)
     const duplicateNodes = loadedGraph(7, ["duplicate", "duplicate"], [
       row("duplicate", "scout", "research", "completed", scoutResult(["job-1"])),
     ])
+    const invalidRole = loadedGraph(8, ["valid-id"], [
+      row("valid-id", "r".repeat(65), "research", "completed"),
+    ])
+    const unsafeIdAndInvalidRole = loadedGraph(9, ["t".repeat(81)], [
+      row("t".repeat(81), "r".repeat(65), "research", "completed"),
+    ])
 
     expect(() => buildTaskGraphPlanningFacts(inconsistent)).toThrow("task_graph_final_summary_graph_invalid")
     expect(() => buildTaskGraphPlanningFacts(duplicateNodes)).toThrow("task_graph_final_summary_task_identity_conflict")
+    expect(() => buildTaskGraphPlanningFacts(invalidRole)).toThrow("task_graph_final_summary_node_invalid")
+    expect(() => buildTaskGraphPlanningFacts(unsafeIdAndInvalidRole)).toThrow("task_graph_final_summary_node_invalid")
   })
 })
