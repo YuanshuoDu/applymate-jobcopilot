@@ -38,17 +38,17 @@ function runtime(appendNativeCoordination: NonNullable<TaskGraphCommandPort["app
 }
 
 describe("native pending-task replacement executor", () => {
-  it("blocks both followup forms before legacy enqueue or native append when requirements are valid", async () => {
-    for (const route of ["legacy", "native", "replace"] as const) {
+  it("blocks followup and replace_unstarted before persistence when requirements are valid", async () => {
+    for (const route of ["legacy", "native", "replace", "legacy-replace"] as const) {
       type NativeInput = Parameters<NonNullable<TaskGraphCommandPort["appendNativeCoordination"]>>[0]
       const append = vi.fn(async (_input: NativeInput) => receipt)
       const runtimeState = runtime(append)
       const options = {
         ...runtimeState.options,
         verificationRequirements: validRequirements,
-        ...(route === "legacy" ? { nativeCoordination: undefined } : {}),
+        ...(route === "legacy" || route === "legacy-replace" ? { nativeCoordination: undefined } : {}),
       } as CoordinationExecutorOptions
-      const input: FollowupInput = route === "replace"
+      const input: FollowupInput = route === "replace" || route === "legacy-replace"
         ? { taskId: "queued-source", idempotencyKey: "replace-key", goal: "Continue", mode: "replace_unstarted", expectedRevision: 4 }
         : { taskId: "source", idempotencyKey: `followup-${route}`, goal: "Continue" }
 
