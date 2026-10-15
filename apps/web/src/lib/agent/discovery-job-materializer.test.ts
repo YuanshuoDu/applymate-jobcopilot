@@ -111,8 +111,8 @@ describe('discovery job URL identity', () => {
   it('requires credential-free HTTP(S), removes tracking keys and fragments, and sorts remaining query values', () => {
     expect(normalizeDiscoveryJobUrl('https://jobs.example/Case?z=2&utm_source=x&a=1&campaignId=3#section'))
       .toBe('https://jobs.example/Case?a=1&z=2')
-    expect(normalizeDiscoveryJobUrl('https://jobs.example/role?utm_medium=mail&TRK=feed&Ref=listing&Source=search&CampaignId=3&reference=drop&sourceType=drop&trkId=drop&keep=1&utm=keep'))
-      .toBe('https://jobs.example/role?keep=1&utm=keep')
+    expect(normalizeDiscoveryJobUrl('https://jobs.example/role?utm_medium=mail&TRK=feed&Ref=listing&Source=search&CampaignId=3&reference=keep&sourceType=keep&trkId=keep&sourceId=keep&refId=keep&UTM_term=mail&campaignTracking=mail&keep=1&utm=keep'))
+      .toBe('https://jobs.example/role?keep=1&refId=keep&reference=keep&sourceId=keep&sourceType=keep&trkId=keep&utm=keep')
     expect(normalizeDiscoveryJobUrl('https://jobs.example/role?b=2&a=2&a=1'))
       .toBe('https://jobs.example/role?a=1&a=2&b=2')
     expect(normalizeDiscoveryJobUrl('https://jobs.example/case?a=1&z=2')).not.toBe('https://jobs.example/Case?a=1&z=2')

@@ -55,7 +55,7 @@ export function normalizeDiscoveryJobUrl(value: unknown, source?: unknown): stri
 }
 
 function isLegacyTrackingKey(key: string): boolean {
-  return /^(utm_|trk|ref|source|campaign)/i.test(key)
+  return /^(?:utm_|campaign)/i.test(key) || /^(?:trk|ref|source)$/i.test(key)
 }
 
 export function deterministicDiscoveryJobId(userId: string, normalizedUrl: string): string {
