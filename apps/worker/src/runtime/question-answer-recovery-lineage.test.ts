@@ -152,6 +152,14 @@ describe("durable question answer lineage", () => {
     const conflicting = { id: "agent-question:question-item:question", content: "changed" }
     await expect(recoverAnsweredQuestionLineage(client(), input({ existingHistory: [conflicting] })))
       .rejects.toThrow("question_recovery_history_collision")
+    const reversedAnswer = { id: "agent-question:question-item:answer", content: {
+      role: "user", type: "answer", questionId: "wait-1", text: "different",
+    } }
+    const reversedQuestion = { id: "agent-question:question-item:question", content: {
+      role: "assistant", type: "question", question: "Where should I focus?", options: [{ label: "Dublin", value: "dublin" }],
+    } }
+    await expect(recoverAnsweredQuestionLineage(client(), input({ existingHistory: [reversedAnswer, reversedQuestion] })))
+      .rejects.toThrow("question_recovery_history_collision")
   })
 
   it("fails closed when root-call and Step lineage is absent, foreign, or ambiguous", async () => {
