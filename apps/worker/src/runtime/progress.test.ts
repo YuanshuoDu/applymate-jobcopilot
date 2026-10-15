@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto"
+
 import { describe, expect, it } from "vitest"
 
 import { createProgressDetector, NoProgressError } from "./progress.js"
@@ -5,6 +7,9 @@ import { stableJson } from "./turns/turn-engine-replay.js"
 
 const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
 const calls = [{ id: "call-1", name: "jobs.search", arguments: { location: "Dublin" } }]
+function publicDigest(value: unknown): string {
+  return `sha256:${createHash("sha256").update(stableJson(value), "utf8").digest("hex")}`
+}
 function checkpoint(inputThroughSequence: bigint, consumedInputIds: readonly string[] = [], taskGraphRevision?: number) {
   return { inputThroughSequence, consumedInputIds, ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }) }
 }
@@ -18,15 +23,15 @@ describe("no-progress detector", () => {
     try { detector.observe({ snapshot, toolCalls: calls }) } catch (error: unknown) { expect(error).toMatchObject({ code: "no_progress", reasonCode: "repeated_signature" }) }
   })
 
-  it("preserves deterministic public fingerprints and the repeated-signature error shape", () => {
+  it("exposes deterministic digest fingerprints and the repeated-signature error shape", () => {
     const checkpointOnlyId = "checkpoint-only-private-675"
     const detector = createProgressDetector(2)
     const input = { snapshot, toolCalls: calls }
     const metadata = checkpoint(4n, [checkpointOnlyId], 1)
     const observation = detector.observe(input, metadata)
     const otherObservation = createProgressDetector(2).observe(input, metadata)
-    const signature = stableJson(calls.map(call => ({ name: call.name, arguments: call.arguments })))
-    const stateFingerprint = stableJson({ businessRefs: [], toolObservations: [] })
+    const signature = publicDigest(calls.map(call => ({ name: call.name, arguments: call.arguments })))
+    const stateFingerprint = publicDigest({ businessRefs: [], toolObservations: [] })
 
     expect(observation).toEqual({ signature, stateFingerprint })
     expect(otherObservation).toEqual(observation)
@@ -42,6 +47,36 @@ describe("no-progress detector", () => {
     const error = caught as NoProgressError
     expect(error.observation).toEqual(observation)
     expect(error.message).toBe(`Turn made no progress: repeated ${signature}`)
+  })
+
+  it("keeps private tool arguments and observation values out of public fingerprints and errors", () => {
+    const markers = ["private-argument-675", "private-observation-input-675", "private-observation-output-675"]
+    const input = {
+      snapshot: {
+        ...snapshot,
+        toolObservations: [{ id: "private-observation", content: {
+          toolName: "jobs.search", input: { query: markers[1] }, status: "failed", output: { detail: markers[2] }, errorCode: null,
+        } }],
+      },
+      toolCalls: [{ id: "private-call", name: "jobs.search", arguments: { query: markers[0] } }],
+    }
+    const detector = createProgressDetector(2)
+    const observation = detector.observe(input)
+    let caught: unknown
+    try {
+      detector.observe(input)
+    } catch (error: unknown) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(NoProgressError)
+    const error = caught as NoProgressError
+    expect(observation.signature).toMatch(/^sha256:[a-f0-9]{64}$/)
+    expect(observation.stateFingerprint).toMatch(/^sha256:[a-f0-9]{64}$/)
+    expect(error.observation).toEqual(observation)
+    expect(JSON.stringify({ observation, message: error.message })).not.toContain(markers[0])
+    expect(JSON.stringify({ observation, message: error.message })).not.toContain(markers[1])
+    expect(JSON.stringify({ observation, message: error.message })).not.toContain(markers[2])
   })
 
   it("starts one new window for a forward owned input checkpoint, then stops unchanged repetition", () => {

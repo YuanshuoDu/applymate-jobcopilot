@@ -1,6 +1,12 @@
+import { createHash } from "node:crypto"
+
 import type { StepContext, StepContextSnapshot } from "./context/step-context-builder.js"
 import { stableJson } from "./turns/turn-engine-replay.js"
 import type { TurnEngineToolCall } from "./turns/turn-engine-types.js"
+
+function publicDigest(value: string): string {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`
+}
 
 export type ProgressObservation = {
   readonly signature: string
@@ -90,8 +96,8 @@ export function createProgressDetector(repeatLimit = 2): ProgressDetector {
         effectiveCheckpoint = advanced.checkpoint
         if (advanced.advanced) observations = new Map<string, number>()
       }
-      const signature = stableJson(input.toolCalls.map((call) => ({ name: call.name, arguments: call.arguments })))
-      const stateFingerprint = stableJson({
+      const signatureIdentity = stableJson(input.toolCalls.map((call) => ({ name: call.name, arguments: call.arguments })))
+      const stateIdentity = stableJson({
         businessRefs: input.snapshot.businessRefs.map((reference) => reference.id).sort(),
         toolObservations: [...new Set(input.snapshot.toolObservations.flatMap((observation) => {
           if (!observation.content || typeof observation.content !== "object" || Array.isArray(observation.content)) return []
@@ -99,7 +105,10 @@ export function createProgressDetector(repeatLimit = 2): ProgressDetector {
           return [stableJson({ toolName: content.toolName, input: content.input, status: content.status, output: content.output, errorCode: content.errorCode })]
         }))].sort(),
       })
-      const pair = stableJson([signature, stateFingerprint])
+      const signature = publicDigest(signatureIdentity)
+      const stateFingerprint = publicDigest(stateIdentity)
+      // Keep exact comparison material in memory while publishing only deterministic digests.
+      const pair = stableJson([signatureIdentity, stateIdentity])
       const nextObservationCount = (observations.get(pair) ?? 0) + 1
       observations.set(pair, nextObservationCount)
       if (nextObservationCount >= repeatLimit) throw new NoProgressError({ signature, stateFingerprint })
