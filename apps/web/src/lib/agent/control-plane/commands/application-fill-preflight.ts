@@ -44,11 +44,13 @@ export async function lockApplicationFillTask(
     `)
     const candidate = candidates[0]
     const retryCheckpoint = candidate?.checkpoint
-    if (candidate?.status === "cancelled" && retryCheckpoint && STOPPED_RETRY_CHECKPOINTS.includes(retryCheckpoint)) {
+    const stoppedRetry = candidate?.status === "cancelled" && typeof retryCheckpoint === "string" && STOPPED_RETRY_CHECKPOINTS.includes(retryCheckpoint)
+    const failedRetry = candidate?.status === "failed" && typeof retryCheckpoint === "string" && RETRY_CHECKPOINTS.includes(retryCheckpoint)
+    if (candidate && (stoppedRetry || failedRetry)) {
       if (retryCheckpoint === "cancelled_by_user" && options.explicitUserRetry !== true) {
         throw new AgentCommandError("retry_target_invalid", "Only an explicit user retry may restart a user-cancelled application fill", 409)
       }
-      await lockCancelledApplicationFillRetry(tx, candidate, identity, retryCheckpoint)
+      await lockTerminalApplicationFillRetry(tx, candidate, identity)
       prelockedCandidate = candidate
     }
   }
@@ -107,7 +109,7 @@ function unavailable(): AgentCommandError {
   return new AgentCommandError("retry_target_invalid", "Application fill materials are unavailable for this task", 409)
 }
 
-/** Require a terminal, lease-free filler before a user retries a stopped fill. */
+/** Require the exact old Turn and filler to be terminal and lease-free before retry. */
 export async function assertApplicationFillRetryReady(
   tx: CommandTransaction,
   task: { fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; status: string; checkpoint: string | null },
@@ -126,28 +128,22 @@ export async function assertApplicationFillRetryReady(
   if (task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) {
     throw new AgentCommandError("retry_target_invalid", "The application fill Turn is not bound to this user and session", 409)
   }
-  if (stopped || cancelledByUser) {
-    await lockCancelledApplicationFillRetry(tx, task, identity, task.checkpoint ?? "")
+  if (retryableFailure || stopped || cancelledByUser) {
+    await lockTerminalApplicationFillRetry(tx, task, identity)
     return
-  }
-  const previous = await tx.agentTurn.findFirst({
-    where: { id: task.fillTurnId, sessionId: identity.sessionId, userId: identity.userId }, select: { id: true, status: true },
-  })
-  if (!previous || !TERMINAL_TURNS.includes(previous.status)) {
-    throw new AgentCommandError("retry_target_invalid", "The prior application fill Turn is not terminal", 409)
   }
 }
 
-async function lockCancelledApplicationFillRetry(
+async function lockTerminalApplicationFillRetry(
   tx: CommandTransaction,
   task: { fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; status: string; checkpoint: string | null },
   identity: Pick<CommandIdentity, "userId" | "sessionId">,
-  checkpoint: string,
 ): Promise<void> {
-  if (task.status !== "cancelled" || task.checkpoint !== checkpoint || !STOPPED_RETRY_CHECKPOINTS.includes(checkpoint) || !task.fillTurnId
+  const retryableFailure = task.status === "failed" && RETRY_CHECKPOINTS.includes(task.checkpoint ?? "")
+  const stopped = task.status === "cancelled" && STOPPED_RETRY_CHECKPOINTS.includes(task.checkpoint ?? "")
+  if ((!retryableFailure && !stopped) || !task.fillTurnId
     || task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) {
-    const kind = checkpoint === "turn_stopped_before_submit" ? "stopped" : "user-cancelled"
-    throw new AgentCommandError("retry_target_invalid", `The application fill Turn is not bound to this ${kind} task`, 409)
+    throw new AgentCommandError("retry_target_invalid", "The prior application fill Turn is not bound to this retryable task", 409)
   }
   const turns = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwnerId: string | null; leaseExpiresAt: Date | null }>>(Prisma.sql`
     SELECT "id", "status", "leaseOwnerId", "leaseExpiresAt" FROM "agent_turns"

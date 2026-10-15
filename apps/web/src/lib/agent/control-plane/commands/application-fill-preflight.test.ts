@@ -45,6 +45,7 @@ function cancelledTaskLockFixture(
 
 const stoppedTask = { fillTurnId: "turn-1", fillTurnSessionId: "session-1", fillTurnUserId: "user-1", status: "cancelled", checkpoint: "turn_stopped_before_submit" }
 const userCancelledTask = { ...stoppedTask, checkpoint: "cancelled_by_user" }
+const failedTask = { ...stoppedTask, status: "failed", checkpoint: "fill_prestart_failed" }
 const retryIdentity = { userId: "user-1", sessionId: "session-1" }
 const explicitUserRetry = { explicitUserRetry: true }
 const terminalLeaseFreeFiller = { id: "filler-1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }
@@ -106,6 +107,66 @@ describe("application fill persisted-material preflight", () => {
     expect(sql).toContain('session."userId" =')
     expect(sql).toContain('turn."userId" =')
     expect(sql).toContain("FOR UPDATE OF task")
+  })
+
+  it.each(["fill_prestart_failed", "taskgraph_fill_failed"])("allows a %s retry only after its exact old filler is terminal and lease-free", async checkpoint => {
+    const test = retryFixture([terminalLeaseFreeFiller])
+
+    await expect(assertApplicationFillRetryReady(test.tx, { ...failedTask, checkpoint }, retryIdentity)).resolves.toBeUndefined()
+
+    expect(test.findTurn).not.toHaveBeenCalled()
+    const turnSql = ((test.query.mock.calls[0]?.[0] as Query).strings ?? []).join(" ")
+    expect(turnSql).toContain('"id" =')
+    expect(turnSql).toContain('"sessionId" =')
+    expect(turnSql).toContain('"userId" =')
+    expect(turnSql).toContain('"leaseOwnerId"')
+    expect(turnSql).toContain('"leaseExpiresAt"')
+    expect(turnSql).toContain("FOR UPDATE")
+    const fillerSql = ((test.query.mock.calls[1]?.[0] as Query).strings ?? []).join(" ")
+    expect(fillerSql).toContain('task."turnId" =')
+    expect(fillerSql).toContain("task.\"role\" = 'application_filler' OR task.\"taskType\" = 'application_fill_for_review'")
+    expect(fillerSql).toContain("FOR UPDATE OF task")
+  })
+
+  it.each([
+    ["nonterminal Turn", { id: "turn-1", status: "in_progress" }],
+    ["terminal Turn with an owner lease", { id: "turn-1", status: "interrupted", leaseOwnerId: "worker-1" }],
+    ["terminal Turn with an expiry lease", { id: "turn-1", status: "interrupted", leaseExpiresAt: new Date() }],
+  ] as const)("rejects a failed retry with a %s", async (_reason, turn) => {
+    const test = retryFixture([terminalLeaseFreeFiller], turn)
+
+    await expect(assertApplicationFillRetryReady(test.tx, failedTask, retryIdentity))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(test.query).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["running with a live lease", [{ id: "filler-1", status: "running", leaseOwner: "worker-1", leaseExpiresAt: new Date() }]],
+    ["terminal while still leased", [{ id: "filler-1", status: "failed", leaseOwner: "worker-1", leaseExpiresAt: null }]],
+    ["missing the exact filler", []],
+    ["using a different role", [{ ...terminalLeaseFreeFiller, role: "analyst" }]],
+    ["using a different task type", [{ ...terminalLeaseFreeFiller, taskType: "application_submit" }]],
+    ["ambiguous duplicate fillers", [terminalLeaseFreeFiller, { ...terminalLeaseFreeFiller, id: "filler-2" }]],
+  ] as const)("rejects a failed retry when its exact filler is %s", async (_reason, fillers) => {
+    const test = retryFixture([...fillers])
+
+    await expect(assertApplicationFillRetryReady(test.tx, failedTask, retryIdentity))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(test.query).toHaveBeenCalledTimes(2)
+  })
+
+  it("locks a failed retry Turn and filler before locking the application task", async () => {
+    const candidate = { id: "task-1", ...failedTask, confirmedAnswers: null }
+    const test = cancelledTaskLockFixture(candidate, candidate, [terminalLeaseFreeFiller])
+
+    await expect(lockApplicationFillTask(test.tx, "task-1", retryIdentity, true))
+      .resolves.toMatchObject({ task: candidate, stoppedRetryReady: false })
+
+    const queries = test.query.mock.calls.map(([input]) => ((input as Query).strings ?? []).join(" "))
+    expect(queries[1]).toContain('FROM "agent_turns"')
+    expect(queries[2]).toContain('FROM "sub_agent_tasks"')
+    expect(queries[3]).toContain("FOR UPDATE")
+    expect(queries[1]).not.toContain("FOR UPDATE OF task")
   })
 
   it.each(["fill_prestart_failed", "taskgraph_fill_failed", "fill_outcome_uncertain", null])(

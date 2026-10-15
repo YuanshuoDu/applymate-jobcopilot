@@ -298,6 +298,16 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     await expect(prisma!.agentTurn.findUnique({ where: { id: first.turnId }, select: { status: true } })).resolves.toEqual({ status: "in_progress" })
 
     await prisma!.$executeRaw`UPDATE "agent_turns" SET "status" = 'failed' WHERE "id" = ${first.turnId}`
+    await expect(startApplicationFillForReview(prisma!, {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `retry-filler-active-${randomUUID()}`, retry: true,
+    })).rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    await expect(prisma!.agentTurn.count({ where: { sessionId: value.sessionId } })).resolves.toBe(1)
+    await expect(prisma!.$queryRaw<Array<{ status: string; leaseOwner: string | null }>>`
+      SELECT "status", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = ${lease.id}
+    `).resolves.toEqual([{ status: "running", leaseOwner: lease.leaseOwner }])
+
+    await prisma!.$executeRaw`UPDATE "sub_agent_tasks" SET "status" = 'failed', "leaseOwner" = NULL,
+      "leaseExpiresAt" = NULL, "completedAt" = CURRENT_TIMESTAMP WHERE "id" = ${lease.id}`
     const retried = await startApplicationFillForReview(prisma!, {
       sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `retry-terminal-${randomUUID()}`, retry: true,
     })

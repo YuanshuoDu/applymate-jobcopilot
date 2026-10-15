@@ -623,4 +623,18 @@ describe("PATCH /api/agent/application-tasks with TaskGraph fills", () => {
     expect(mocks.queueApplicationFill.mock.calls[0]?.[0]).not.toHaveProperty("sessionId")
     expect(mocks.updateMany).not.toHaveBeenCalled()
   })
+
+  it("does not send a persisted TaskGraph fill through legacy answer handling when routing is disabled", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(false)
+    mocks.findFirst.mockResolvedValueOnce(task({ fillTurnId: "turn_bound" }))
+    const { PATCH } = await import("./route")
+
+    const response = await PATCH(patchRequest("answer_and_resume", { Location: "Dublin" }) as never)
+
+    expect(response.status).toBe(409)
+    expect(mocks.taskUpdate).not.toHaveBeenCalled()
+    expect(mocks.updateMany).not.toHaveBeenCalled()
+    expect(mocks.eventCreate).not.toHaveBeenCalled()
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
+  })
 })

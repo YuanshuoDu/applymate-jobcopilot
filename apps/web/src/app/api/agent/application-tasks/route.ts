@@ -151,6 +151,7 @@ export async function PATCH(req: NextRequest) {
     include: { job: { select: { id: true, url: true } } },
   })
   if (!task) return err("This task is not waiting for new form information", 409)
+  if (!taskGraph && task.fillTurnId !== null) return err("This bound TaskGraph fill cannot resume while TaskGraph routing is disabled", 409)
   const waitId = typeof body?.waitId === "string" ? body.waitId : ""
   if (taskGraph && (!waitId || questionWaitId(task.question) !== waitId)) return err("This form-answer wait has changed; refresh before answering", 409)
   const answers = action === "answer_and_resume" ? sanitizeConfirmedAnswers(task.question, body?.answers) : null
