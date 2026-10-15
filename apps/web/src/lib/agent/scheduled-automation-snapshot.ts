@@ -1,3 +1,5 @@
+import { JobsSearchInputSchema } from "./discovery-tool-types"
+
 export interface ScheduledAutomationSnapshotInput {
   readonly targetRoles?: unknown
   readonly targetLocations?: unknown
@@ -19,6 +21,7 @@ export interface ScheduledAutomationSnapshot {
 
 export type ScheduledAutomationSnapshotField =
   | "input"
+  | "schemaVersion"
   | "targetRoles"
   | "targetLocations"
   | "minScore"
@@ -37,17 +40,51 @@ export class ScheduledAutomationSnapshotValidationError extends TypeError {
   }
 }
 
-const MAX_SEARCH_TARGET_ITEMS = 8
-const MAX_SEARCH_TARGET_ITEM_LENGTH = 160
+const SNAPSHOT_SCHEMA_VERSION = "agent-harness.v2.scheduled-automation-snapshot.v1"
+const SNAPSHOT_KEYS = new Set([
+  "schemaVersion", "targetRoles", "targetLocations", "minScore", "dailyCap", "requireApproval", "autoApply",
+])
 
-function readStringArray(value: unknown, field: "targetRoles" | "targetLocations", minItems: number): string[] {
+type SearchTargetField = "targetRoles" | "targetLocations"
+type SearchTargetBounds = { minItems: number; maxItems: number; minLength: number; maxLength: number }
+
+function schemaRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function safeSchemaBound(value: unknown, fallback?: number): number | null {
+  if (value === undefined && fallback !== undefined) return fallback
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+function readSearchTargetBounds(field: SearchTargetField): SearchTargetBounds {
+  const property = schemaRecord(schemaRecord(JobsSearchInputSchema.properties)?.[field])
+  const items = schemaRecord(property?.items)
+  const minItems = safeSchemaBound(property?.minItems, 0)
+  const maxItems = safeSchemaBound(property?.maxItems)
+  const minLength = safeSchemaBound(items?.minLength, 0)
+  const maxLength = safeSchemaBound(items?.maxLength)
+  if (property?.type !== "array" || items?.type !== "string" || minItems === null || maxItems === null ||
+      minLength === null || maxLength === null || minItems > maxItems || minLength > maxLength) {
+    throw new TypeError("Invalid JobsSearchInputSchema bounds for " + field + ".")
+  }
+  return { minItems, maxItems, minLength, maxLength }
+}
+
+const SEARCH_TARGET_BOUNDS: Record<SearchTargetField, SearchTargetBounds> = {
+  targetRoles: readSearchTargetBounds("targetRoles"),
+  targetLocations: readSearchTargetBounds("targetLocations"),
+}
+
+function parseSearchTargetList(value: unknown, field: SearchTargetField, normalizeBeforeValidation: boolean): string[] {
+  const bounds = SEARCH_TARGET_BOUNDS[field]
   if (!Array.isArray(value)) {
     throw new ScheduledAutomationSnapshotValidationError(field, "an array of strings")
   }
-  if (value.length < minItems || value.length > MAX_SEARCH_TARGET_ITEMS) {
+  if (value.length < bounds.minItems || value.length > bounds.maxItems) {
     throw new ScheduledAutomationSnapshotValidationError(
       field,
-      "an array with " + minItems + " through " + MAX_SEARCH_TARGET_ITEMS + " entries",
+      "an array with " + bounds.minItems + " through " + bounds.maxItems + " entries",
     )
   }
 
@@ -57,19 +94,28 @@ function readStringArray(value: unknown, field: "targetRoles" | "targetLocations
     if (typeof entry !== "string") {
       throw new ScheduledAutomationSnapshotValidationError(field, "an array of strings")
     }
-    const trimmedEntry = entry.trim()
-    if (!trimmedEntry) {
+    const validatedEntry = normalizeBeforeValidation ? entry.trim() : entry
+    if (!validatedEntry.trim() || validatedEntry.length < bounds.minLength) {
       throw new ScheduledAutomationSnapshotValidationError(field, "an array of non-empty strings")
     }
-    if (trimmedEntry.length > MAX_SEARCH_TARGET_ITEM_LENGTH) {
+    if (validatedEntry.length > bounds.maxLength) {
       throw new ScheduledAutomationSnapshotValidationError(
         field,
-        "an array of non-empty strings up to " + MAX_SEARCH_TARGET_ITEM_LENGTH + " characters",
+        "an array of non-empty strings up to " + bounds.maxLength + " characters",
       )
     }
-    copy.push(trimmedEntry)
+    copy.push(entry.trim())
   }
   return copy
+}
+
+export function isValidDiscoverySearchTargetList(value: unknown, field: SearchTargetField): value is string[] {
+  try {
+    parseSearchTargetList(value, field, false)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function readBoundedInteger(value: unknown, field: "minScore" | "dailyCap", min: number, max: number): number {
@@ -86,6 +132,33 @@ function readBoolean(value: unknown, field: "requireApproval" | "autoApply"): bo
   return value
 }
 
+function snapshotFromFields(fields: Record<string, unknown>, normalizeBeforeValidation: boolean): ScheduledAutomationSnapshot {
+  return {
+    schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+    targetRoles: parseSearchTargetList(fields.targetRoles, "targetRoles", normalizeBeforeValidation),
+    targetLocations: parseSearchTargetList(fields.targetLocations, "targetLocations", normalizeBeforeValidation),
+    minScore: readBoundedInteger(fields.minScore, "minScore", 0, 100),
+    dailyCap: readBoundedInteger(fields.dailyCap, "dailyCap", 1, 50),
+    requireApproval: readBoolean(fields.requireApproval, "requireApproval"),
+    autoApply: readBoolean(fields.autoApply, "autoApply"),
+  }
+}
+
+export function parseScheduledAutomationSnapshot(value: unknown): ScheduledAutomationSnapshot {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new ScheduledAutomationSnapshotValidationError("input", "a complete snapshot object")
+  }
+
+  const fields = value as Record<string, unknown>
+  if (Object.keys(fields).length !== SNAPSHOT_KEYS.size || Object.keys(fields).some(key => !SNAPSHOT_KEYS.has(key))) {
+    throw new ScheduledAutomationSnapshotValidationError("input", "the complete snapshot envelope")
+  }
+  if (fields.schemaVersion !== SNAPSHOT_SCHEMA_VERSION) {
+    throw new ScheduledAutomationSnapshotValidationError("schemaVersion", SNAPSHOT_SCHEMA_VERSION)
+  }
+  return snapshotFromFields(fields, false)
+}
+
 export function buildScheduledAutomationSnapshot(
   input: ScheduledAutomationSnapshotInput,
 ): ScheduledAutomationSnapshot {
@@ -95,13 +168,5 @@ export function buildScheduledAutomationSnapshot(
   }
 
   const fields = value as Record<string, unknown>
-  return {
-    schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
-    targetRoles: readStringArray(fields.targetRoles, "targetRoles", 1),
-    targetLocations: readStringArray(fields.targetLocations, "targetLocations", 0),
-    minScore: readBoundedInteger(fields.minScore, "minScore", 0, 100),
-    dailyCap: readBoundedInteger(fields.dailyCap, "dailyCap", 1, 50),
-    requireApproval: readBoolean(fields.requireApproval, "requireApproval"),
-    autoApply: readBoolean(fields.autoApply, "autoApply"),
-  }
+  return snapshotFromFields(fields, true)
 }

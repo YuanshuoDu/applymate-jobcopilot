@@ -5,6 +5,11 @@ import { executeDiscover } from '@/lib/agent/discovery-tool-executors'
 import type { DiscoveryJobMaterializerFence } from '@/lib/agent/discovery-job-materializer'
 import { createToolUsage, DiscoveryToolError, type DiscoveryToolContext, type ToolUsageState } from '@/lib/agent/discovery-tool-support'
 import type { JobsSearchInput } from '@/lib/agent/discovery-tool-types'
+import {
+  isValidDiscoverySearchTargetList,
+  parseScheduledAutomationSnapshot,
+  ScheduledAutomationSnapshotValidationError,
+} from '@/lib/agent/scheduled-automation-snapshot'
 
 type DiscoveryRequest = {
   userId: string
@@ -38,10 +43,6 @@ function text(value: unknown, max = 256): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= max
 }
 
-function stringList(value: unknown, min: number, max: number): value is string[] {
-  return Array.isArray(value) && value.length >= min && value.length <= max && value.every(item => text(item, 160))
-}
-
 function exactKeys(value: Record<string, unknown>, allowed: Set<string>): boolean {
   return Object.keys(value).every(key => allowed.has(key))
 }
@@ -49,7 +50,10 @@ function exactKeys(value: Record<string, unknown>, allowed: Set<string>): boolea
 function parseRequest(value: unknown): DiscoveryRequest | null {
   const row = record(value)
   if (!row || !exactKeys(row, requestKeys) || row.role !== 'scout') return null
-  if (!stringList(row.targetRoles, 1, 8) || !stringList(row.targetLocations, 0, 8)) return null
+  const targetRoles = row.targetRoles
+  const targetLocations = row.targetLocations
+  if (!isValidDiscoverySearchTargetList(targetRoles, 'targetRoles') ||
+      !isValidDiscoverySearchTargetList(targetLocations, 'targetLocations')) return null
   if (row.source !== undefined && !text(row.source, 80)) return null
   if (row.pageSize !== undefined && (!Number.isSafeInteger(row.pageSize) || Number(row.pageSize) < 1 || Number(row.pageSize) > 50)) return null
   if (row.cursor !== undefined && !text(row.cursor, 512)) return null
@@ -67,8 +71,8 @@ function parseRequest(value: unknown): DiscoveryRequest | null {
     leaseOwner: row.leaseOwner as string,
     attemptCount: Number(row.attemptCount),
     role: 'scout',
-    targetRoles: row.targetRoles,
-    targetLocations: row.targetLocations,
+    targetRoles,
+    targetLocations,
     ...(row.source !== undefined ? { source: row.source as string } : {}),
     ...(row.pageSize !== undefined ? { pageSize: Number(row.pageSize) } : {}),
     ...(row.cursor !== undefined ? { cursor: row.cursor as string } : {}),
@@ -85,13 +89,25 @@ function toSearchInput(input: DiscoveryRequest): JobsSearchInput {
   }
 }
 
-async function hasActiveScoutScope(input: DiscoveryRequest): Promise<DiscoveryJobMaterializerFence | null> {
+type ScopedTurn = { id: string; sessionId: string; userId: string; rootTaskId: string | null; source: string; input: unknown }
+type ActiveScoutScope = { executionFence: DiscoveryJobMaterializerFence; turn: ScopedTurn }
+
+function toEffectiveSearchInput(input: DiscoveryRequest, turn: ScopedTurn): JobsSearchInput {
+  if (turn.source !== 'automation') return toSearchInput(input)
+  const persistedInput = record(turn.input)
+  const snapshot = parseScheduledAutomationSnapshot(persistedInput?.scheduledAutomationSnapshot)
+  return toSearchInput({ ...input, targetRoles: snapshot.targetRoles, targetLocations: snapshot.targetLocations })
+}
+
+async function hasActiveScoutScope(input: DiscoveryRequest): Promise<ActiveScoutScope | null> {
   const { userId, sessionId, turnId, stepId, taskId, rootTaskId } = input
   const [session, turn] = await Promise.all([
     db.agentSession.findFirst({ where: { id: sessionId, userId, status: 'running' }, select: { id: true } }),
-    db.agentTurn.findFirst({ where: { id: turnId, sessionId, userId, status: 'in_progress' }, select: { id: true, rootTaskId: true } }),
+    db.agentTurn.findFirst({ where: { id: turnId, sessionId, userId, status: 'in_progress' }, select: {
+      id: true, sessionId: true, userId: true, rootTaskId: true, source: true, input: true,
+    } }),
   ])
-  if (!session || !turn || turn.rootTaskId !== rootTaskId) return null
+  if (!session || !turn || turn.id !== turnId || turn.sessionId !== sessionId || turn.userId !== userId || turn.rootTaskId !== rootTaskId) return null
   const [step, root, child] = await Promise.all([
     db.agentStep.findFirst({ where: { id: stepId, sessionId, turnId, taskId, status: 'streaming' }, select: { id: true, attempt: true } }),
     db.subAgentTask.findFirst({ where: {
@@ -109,8 +125,14 @@ async function hasActiveScoutScope(input: DiscoveryRequest): Promise<DiscoveryJo
   if (!step || step.attempt !== input.attemptCount || !root || !child || child.leaseOwner !== input.leaseOwner ||
       child.attemptCount !== input.attemptCount || !Array.isArray(allowedActions) || !allowedActions.includes('jobs.discover')) return null
   return {
-    userId, sessionId, turnId, stepId, taskId, rootTaskId,
-    leaseOwner: input.leaseOwner, attemptCount: input.attemptCount,
+    executionFence: {
+      userId, sessionId, turnId, stepId, taskId, rootTaskId,
+      leaseOwner: input.leaseOwner, attemptCount: input.attemptCount,
+    },
+    turn: {
+      id: turn.id, sessionId: turn.sessionId, userId: turn.userId, rootTaskId: turn.rootTaskId,
+      source: turn.source, input: turn.input,
+    },
   }
 }
 
@@ -126,6 +148,9 @@ function usageFor(context: DiscoveryToolContext, startedAt: number, usage: ToolU
 }
 
 function errorDetails(error: unknown): { code: string; message: string; status: number } {
+  if (error instanceof ScheduledAutomationSnapshotValidationError) {
+    return { code: 'invalid_scheduled_automation_snapshot', message: 'Scheduled automation snapshot is invalid', status: 409 }
+  }
   if (error instanceof DiscoveryToolError) {
     const status = error.code === 'invalid_cursor' ? 400 : error.code === 'cancelled' ? 409 : error.code === 'agent_scope_mismatch' ? 404 : 502
     return { code: error.code, message: error.message.slice(0, 300), status }
@@ -149,10 +174,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     },
     signal: request.signal,
   }
-  const executionFence = await hasActiveScoutScope(input)
-  if (!executionFence) return NextResponse.json({ error: { code: 'agent_scope_mismatch' } }, { status: 404 })
+  const activeScope = await hasActiveScoutScope(input)
+  if (!activeScope) return NextResponse.json({ error: { code: 'agent_scope_mismatch' } }, { status: 404 })
   try {
-    const output = await executeDiscover(toSearchInput(input), context, { executionFence }, usage)
+    const output = await executeDiscover(toEffectiveSearchInput(input, activeScope.turn), context, {
+      executionFence: activeScope.executionFence,
+    }, usage)
     return NextResponse.json({ ...output, usage: usageFor(context, startedAt, usage) })
   } catch (error) {
     const details = errorDetails(error)
