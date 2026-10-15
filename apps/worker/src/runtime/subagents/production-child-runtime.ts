@@ -19,7 +19,6 @@ import { loadSelectedJobArtifactContext, resolveCoverLetterBase } from "./select
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
-import { executeApplicationFillForReview } from "./application-fill-for-review.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -209,6 +208,7 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
       if (!fillerRole || !fillerTaskType) return {
         status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal",
       }
+      const { executeApplicationFillForReview } = await import("./application-fill-for-review.js")
       return executeApplicationFillForReview({ pool: options.pool, lease })
     }
     if (!genericExecutor) {
