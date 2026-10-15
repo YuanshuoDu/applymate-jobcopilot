@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { buildScheduledAutomationSnapshot, type ScheduledAutomationSnapshotInput } from "./scheduled-automation-snapshot"
 
 export interface AutomationSessionRow {
   id: string
@@ -56,18 +57,23 @@ function isUniqueViolation(error: unknown) {
 /** Returns the active run Turn or atomically creates the next automation Turn. */
 export async function ensureAutomationTurn(
   db: unknown,
-  input: { sessionId: string; userId: string; name: string },
+  input: { sessionId: string; userId: string; name: string; scheduledAutomationSnapshot?: ScheduledAutomationSnapshotInput },
 ) {
   const store = db as AutomationTurnDb
   const where = { sessionId: input.sessionId, userId: input.userId, source: "automation", status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } }
   const existing = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true } })
   if (existing) return { turnId: existing.id, created: false }
 
+  const turnInput: Record<string, unknown> = { goal: `Run automation: ${input.name}` }
+  if (input.scheduledAutomationSnapshot !== undefined) {
+    turnInput.scheduledAutomationSnapshot = buildScheduledAutomationSnapshot(input.scheduledAutomationSnapshot)
+  }
+
   try {
     const created = await store.agentTurn.create({
       data: {
         id: randomUUID(), sessionId: input.sessionId, userId: input.userId, source: "automation", status: "queued",
-        input: { goal: `Run automation: ${input.name}` }, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {},
+        input: turnInput, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {},
       },
       select: { id: true },
     })
