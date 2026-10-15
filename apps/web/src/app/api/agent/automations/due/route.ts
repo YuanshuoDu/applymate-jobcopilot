@@ -30,6 +30,7 @@ type AutomationForRun = {
 }
 
 const ACTIVE_AUTOMATION_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"]
+const INVALID_AUTOMATION_CONFIG_RETRY_DELAY_MS = 5 * 60 * 1000
 
 function authorized(req: NextRequest) {
   const secret = process.env.AGENT_AUTOMATION_CRON_SECRET ?? process.env.CRON_SECRET
@@ -230,8 +231,12 @@ async function runDueAutomations(req: NextRequest) {
   const failedAutomations: { automationId: string; code: string }[] = []
   for (const automation of automations) {
     if (!await hasEffectiveEntitlement(automation.userId, 'auto_apply')) continue
-    const result = await startAutomation(automation, now).catch((error: unknown) => {
+    const result = await startAutomation(automation, now).catch(async (error: unknown) => {
       if (!(error instanceof ScheduledAutomationSnapshotValidationError)) throw error
+      await db.agentAutomation.updateMany({
+        where: runnableAutomationWhere(automation, now),
+        data: { nextRunAt: new Date(now.getTime() + INVALID_AUTOMATION_CONFIG_RETRY_DELAY_MS) },
+      })
       failedAutomations.push({ automationId: automation.id, code: error.code })
       return null
     })
@@ -241,10 +246,5 @@ async function runDueAutomations(req: NextRequest) {
   return ok({ checkedAt: now.toISOString(), started, failedAutomations })
 }
 
-export async function GET(req: NextRequest) {
-  return runDueAutomations(req)
-}
-
-export async function POST(req: NextRequest) {
-  return runDueAutomations(req)
-}
+export async function GET(req: NextRequest) { return runDueAutomations(req) }
+export async function POST(req: NextRequest) { return runDueAutomations(req) }

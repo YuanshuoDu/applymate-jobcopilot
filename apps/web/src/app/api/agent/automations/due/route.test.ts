@@ -300,7 +300,7 @@ describe("agent automation due scheduler API", () => {
     }))
   })
 
-  it.each([null, "session_1"] as const)("fails closed on malformed persisted config before scheduler/session side effects (%s)", async (sessionId) => {
+  it.each([null, "session_1"] as const)("defers malformed persisted config before session/Turn side effects (%s)", async (sessionId) => {
     mocks.automationFindMany.mockResolvedValueOnce([{
       id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
       timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: "SWE", targetLocations: ["Berlin"],
@@ -318,7 +318,17 @@ describe("agent automation due scheduler API", () => {
 
     expect(mocks.turnCreate).not.toHaveBeenCalled()
     expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
-    expect(mocks.automationUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.automationUpdateMany).toHaveBeenCalledTimes(1)
+    expect(mocks.automationUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "automation_1",
+        userId: "user_1",
+        enabled: true,
+        nextRunAt: { lte: expect.any(Date) },
+        user: { accountStatus: "active" },
+      },
+      data: { nextRunAt: expect.any(Date) },
+    })
     expect(mocks.automationUpdate).not.toHaveBeenCalled()
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
     expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
@@ -353,7 +363,7 @@ describe("agent automation due scheduler API", () => {
       started: [{ automationId: "automation_good", sessionId: "session_1", taskId: "task_1" }],
       failedAutomations: [{ automationId: "automation_bad", code: "INVALID_SCHEDULED_AUTOMATION_SNAPSHOT" }],
     })
-    expect(mocks.automationUpdateMany.mock.calls.map(([args]) => args.where.id)).toEqual(["automation_good", "automation_good"])
+    expect(mocks.automationUpdateMany.mock.calls.map(([args]) => args.where.id)).toEqual(["automation_bad", "automation_good", "automation_good"])
     expect(mocks.sessionCreate).toHaveBeenCalledTimes(1)
     expect(mocks.sessionCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ userId: "user_2" }) })
     expect(mocks.turnFindFirst).toHaveBeenCalledTimes(1)
@@ -391,5 +401,123 @@ describe("agent automation due scheduler API", () => {
     expect(mocks.turnFindFirst).toHaveBeenCalledTimes(1)
     expect(mocks.turnCreate).not.toHaveBeenCalled()
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_active", executionId: "execution_1" })
+  })
+
+  it("backs off the first 20 malformed rows so the next poll can select a later valid automation", async () => {
+    type SchedulerAutomationRow = {
+      id: string
+      userId: string
+      name: string
+      enabled: boolean
+      cron: string | null
+      timezone: string
+      triggerType: string
+      targetRoles: string[] | string
+      targetLocations: string[]
+      minScore: number
+      dailyCap: number
+      requireApproval: boolean
+      autoApply: boolean
+      sessionId: string | null
+      nextRunAt: Date | null
+      lastRunAt: Date | null
+    }
+    type FindDueArgs = { where: { nextRunAt: { lte: Date } }; take: number }
+    type UpdateDueArgs = {
+      where: {
+        id: string
+        userId: string
+        enabled: true
+        nextRunAt: { lte: Date }
+        user: { accountStatus: "active" }
+      }
+      data: { nextRunAt: Date | null; lastRunAt?: Date }
+    }
+
+    const dueAt = Date.now() - 60_000
+    const badRows: SchedulerAutomationRow[] = Array.from({ length: 20 }, (_, index) => ({
+      id: `automation_bad_${index}`,
+      userId: `user_bad_${index}`,
+      name: `Malformed automation ${index}`,
+      enabled: true,
+      cron: null,
+      timezone: "UTC",
+      triggerType: "manual",
+      targetRoles: "SWE",
+      targetLocations: ["Berlin"],
+      minScore: 85,
+      dailyCap: 8,
+      requireApproval: true,
+      autoApply: true,
+      sessionId: null,
+      nextRunAt: new Date(dueAt + index),
+      lastRunAt: null,
+    }))
+    const validRow: SchedulerAutomationRow = {
+      id: "automation_valid_21",
+      userId: "user_valid_21",
+      name: "Valid automation after malformed rows",
+      enabled: true,
+      cron: null,
+      timezone: "UTC",
+      triggerType: "manual",
+      targetRoles: ["SWE"],
+      targetLocations: ["Berlin"],
+      minScore: 85,
+      dailyCap: 8,
+      requireApproval: true,
+      autoApply: true,
+      sessionId: "session_valid_21",
+      nextRunAt: new Date(dueAt + 20),
+      lastRunAt: null,
+    }
+    const rows = [...badRows, validRow]
+
+    mocks.automationFindMany.mockImplementation(async ({ where, take }: FindDueArgs) => rows
+      .filter(row => row.enabled && row.nextRunAt !== null && row.nextRunAt.getTime() <= where.nextRunAt.lte.getTime())
+      .sort((left, right) => (left.nextRunAt?.getTime() ?? Infinity) - (right.nextRunAt?.getTime() ?? Infinity))
+      .slice(0, take))
+    mocks.automationUpdateMany.mockImplementation(async ({ where, data }: UpdateDueArgs) => {
+      const row = rows.find(candidate => candidate.id === where.id && candidate.userId === where.userId)
+      if (!row || !row.enabled || row.nextRunAt === null || row.nextRunAt.getTime() > where.nextRunAt.lte.getTime()) {
+        return { count: 0 }
+      }
+      row.nextRunAt = data.nextRunAt
+      row.lastRunAt = data.lastRunAt ?? row.lastRunAt
+      return { count: 1 }
+    })
+    mocks.sessionFindFirst.mockResolvedValueOnce({ id: validRow.sessionId, status: "paused" })
+
+    const { POST } = await import("./route")
+    const firstResponse = await POST(postRequest() as never)
+    const firstBody = await firstResponse.json() as { checkedAt: string; started: unknown[]; failedAutomations: { automationId: string }[] }
+
+    expect(firstBody.started).toEqual([])
+    expect(firstBody.failedAutomations).toHaveLength(20)
+    expect(mocks.automationFindMany).toHaveBeenCalledTimes(1)
+    expect(mocks.automationUpdateMany).toHaveBeenCalledTimes(20)
+    expect(mocks.automationUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        id: badRows[0].id,
+        userId: badRows[0].userId,
+        enabled: true,
+        nextRunAt: { lte: expect.any(Date) },
+        user: { accountStatus: "active" },
+      }),
+      data: { nextRunAt: expect.any(Date) },
+    }))
+    const firstCheckedAt = new Date(firstBody.checkedAt).getTime()
+    expect(badRows.every(row => row.nextRunAt !== null && row.nextRunAt.getTime() > firstCheckedAt + 4 * 60_000)).toBe(true)
+
+    const secondResponse = await POST(postRequest() as never)
+    const secondBody = await secondResponse.json()
+
+    expect(secondBody).toMatchObject({
+      started: [{ automationId: validRow.id, sessionId: validRow.sessionId }],
+      failedAutomations: [],
+    })
+    expect(mocks.automationFindMany).toHaveBeenCalledTimes(2)
+    expect(mocks.automationFindMany).toHaveBeenNthCalledWith(2, expect.objectContaining({ take: 20 }))
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledTimes(1)
   })
 })
