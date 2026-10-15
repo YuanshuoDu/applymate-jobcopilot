@@ -4,12 +4,19 @@ import { createRequire } from "node:module"
 import { fileURLToPath } from "node:url"
 
 import { PrismaClient } from "@prisma/client"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
-import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview } from "../../../../../../worker/src/db/application-task-completion.js"
+import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "../../../../../../worker/src/db/application-task-completion.js"
+import { executeApplicationFillForReview } from "../../../../../../worker/src/runtime/subagents/application-fill-for-review.js"
 import type { SubagentLease } from "../../../../../../worker/src/runtime/subagents/types.js"
 import { AgentCommandService } from "./agent-command-service"
 import { startApplicationFillForReview } from "./application-fill-command"
+
+const browserContextSpy = vi.hoisted(() => vi.fn())
+vi.mock("../../../../../../worker/src/cloak/pool.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../../../../../../worker/src/cloak/pool.js")>()
+  return { ...original, withCloakContext: browserContextSpy }
+})
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 
@@ -46,6 +53,46 @@ let prisma: PrismaClient | undefined
 let workerPool: WorkerPgPool | undefined
 let workerSchemaPool: Parameters<typeof completeApplicationFillForReview>[0] | undefined
 let schemaCreated = false
+
+type FillScenario = { userId: string; sessionId: string; taskId: string; jobId: string; resumeId: string }
+
+async function seedFillScenario(): Promise<FillScenario> {
+  const value = {
+    userId: `recovery-user-${randomUUID()}`, sessionId: `recovery-session-${randomUUID()}`,
+    taskId: `recovery-task-${randomUUID()}`, jobId: `recovery-job-${randomUUID()}`, resumeId: `recovery-resume-${randomUUID()}`,
+  }
+  await prisma!.$executeRaw`INSERT INTO "User" ("id", "email", "name", "accountStatus", "personaFields")
+    VALUES (${value.userId}, ${`${value.userId}@example.test`}, 'Candidate', 'active', '[]'::jsonb)`
+  await prisma!.$executeRaw`INSERT INTO "agent_sessions" ("id", "userId", "status") VALUES (${value.sessionId}, ${value.userId}, 'running')`
+  await prisma!.$executeRaw`INSERT INTO "Job" ("id", "userId", "url", "role", "company", "keywords", "description")
+    VALUES (${value.jobId}, ${value.userId}, 'https://boards.greenhouse.io/example/jobs/1', 'Engineer', 'Example', 'TypeScript', 'Engineer role')`
+  await prisma!.$executeRaw`INSERT INTO "Resume" ("id", "userId", "targetJobId", "content")
+    VALUES (${value.resumeId}, ${value.userId}, ${value.jobId}, '{"summary":"Candidate"}'::jsonb)`
+  await prisma!.$executeRaw`INSERT INTO "application_tasks" ("id", "userId", "jobId", "sessionId", "resumeId", "status", "checkpoint")
+    VALUES (${value.taskId}, ${value.userId}, ${value.jobId}, ${value.sessionId}, ${value.resumeId}, 'waiting_for_user', 'materials_ready')`
+  return value
+}
+
+async function startLeasedFill(
+  value: FillScenario,
+  turnId: string,
+  checkpoint: "taskgraph_fill_queued" | "browser_active",
+): Promise<SubagentLease> {
+  const childId = `recovery-child-${randomUUID()}`
+  const ownerId = `recovery-worker-${randomUUID()}`
+  const leaseExpiresAt = new Date(Date.now() + 120_000)
+  await prisma!.$executeRaw`UPDATE "agent_turns" SET "status" = 'in_progress' WHERE "id" = ${turnId}`
+  await prisma!.$executeRaw`UPDATE "application_tasks" SET "status" = 'filling', "checkpoint" = ${checkpoint} WHERE "id" = ${value.taskId}`
+  await prisma!.$executeRaw`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "role", "taskType", "status", "attemptCount", "leaseOwner", "leaseExpiresAt")
+    VALUES (${childId}, ${value.sessionId}, ${turnId}, 'application_filler', 'application_fill_for_review', 'running', 1, ${ownerId}, ${leaseExpiresAt})`
+  return {
+    id: childId, userId: value.userId, sessionId: value.sessionId, turnId, rootTaskId: childId, parentTaskId: null,
+    path: `/${childId}`, depth: 0, role: "application_filler", taskType: "application_fill_for_review", status: "running",
+    goal: "Fill for review", constraints: [], successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {},
+    result: null, failureReason: null, attemptCount: 1, maxAttempts: 1, leaseOwner: ownerId, leaseExpiresAt,
+    interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId, signal: new AbortController().signal,
+  }
+}
 
 describePg("application fill command PostgreSQL binding and idempotency", () => {
   beforeAll(async () => {
@@ -210,5 +257,117 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     await expect(prisma!.applicationTask.findUnique({ where: { id: taskId }, select: { status: true, checkpoint: true } }))
       .resolves.toEqual({ status: "cancelled", checkpoint: "turn_stopped_before_submit" })
     await expect(prisma!.applicationTaskEvent.count({ where: { taskId } })).resolves.toBe(0)
+  })
+
+  it("creates a retry Turn only after the previous failed fill Turn is terminal", async () => {
+    const value = await seedFillScenario()
+    const first = await startApplicationFillForReview(prisma!, {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `retry-first-${randomUUID()}`,
+    })
+    const lease = await startLeasedFill(value, first.turnId, "taskgraph_fill_queued")
+
+    await expect(failApplicationFillBeforeBrowser(workerSchemaPool!, { lease })).resolves.toEqual({ status: "failed" })
+    await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { fillTurnId: true, status: true, checkpoint: true } }))
+      .resolves.toEqual({ fillTurnId: first.turnId, status: "failed", checkpoint: "fill_prestart_failed" })
+    await expect(startApplicationFillForReview(prisma!, {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `retry-too-early-${randomUUID()}`, retry: true,
+    })).rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    await expect(prisma!.agentTurn.count({ where: { sessionId: value.sessionId } })).resolves.toBe(1)
+    await expect(prisma!.agentTurn.findUnique({ where: { id: first.turnId }, select: { status: true } })).resolves.toEqual({ status: "in_progress" })
+
+    await prisma!.$executeRaw`UPDATE "agent_turns" SET "status" = 'failed' WHERE "id" = ${first.turnId}`
+    const retried = await startApplicationFillForReview(prisma!, {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `retry-terminal-${randomUUID()}`, retry: true,
+    })
+
+    expect(retried.disposition).toBe("started")
+    expect(retried.turnId).not.toBe(first.turnId)
+    await expect(prisma!.agentTurn.count({ where: { sessionId: value.sessionId } })).resolves.toBe(2)
+    await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { fillTurnId: true, status: true, checkpoint: true } }))
+      .resolves.toEqual({ fillTurnId: retried.turnId, status: "filling", checkpoint: "taskgraph_fill_queued" })
+  })
+
+  it("reuses the durable Turn after a command restart and does not reopen a browser-active fill", async () => {
+    browserContextSpy.mockClear()
+    const value = await seedFillScenario()
+    const clientMessageId = `recovery-replay-${randomUUID()}`
+    const first = await startApplicationFillForReview(prisma!, {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId,
+    })
+    const lease = await startLeasedFill(value, first.turnId, "browser_active")
+    const scopedUrl = new URL(databaseUrl!)
+    scopedUrl.searchParams.set("schema", schema)
+    const restartedPrisma = new PrismaClient({ datasources: { db: { url: scopedUrl.toString() } } })
+    let replay: Awaited<ReturnType<typeof startApplicationFillForReview>>
+    try {
+      replay = await startApplicationFillForReview(restartedPrisma, {
+        sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId,
+      })
+    } finally {
+      await restartedPrisma.$disconnect()
+    }
+
+    expect(replay!).toMatchObject({ turnId: first.turnId, disposition: "duplicate" })
+    await expect(executeApplicationFillForReview({ pool: workerSchemaPool!, lease }))
+      .resolves.toMatchObject({ status: "waiting_for_user", failureReason: "fill_outcome_uncertain" })
+    expect(browserContextSpy).not.toHaveBeenCalled()
+    const waitEventCount = await prisma!.applicationTaskEvent.count({ where: { taskId: value.taskId, type: "fill_outcome_uncertain" } })
+    await expect(executeApplicationFillForReview({ pool: workerSchemaPool!, lease }))
+      .resolves.toMatchObject({ status: "waiting_for_user", failureReason: "fill_outcome_uncertain" })
+    expect(browserContextSpy).not.toHaveBeenCalled()
+
+    await expect(prisma!.agentTurn.count({ where: { sessionId: value.sessionId } })).resolves.toBe(1)
+    await expect(prisma!.agentInput.count({ where: { sessionId: value.sessionId } })).resolves.toBe(1)
+    await expect(prisma!.agentOutbox.count({ where: { aggregateId: value.sessionId, topic: "agent.turn.dispatch" } })).resolves.toBe(1)
+    await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { fillTurnId: true, status: true, checkpoint: true } }))
+      .resolves.toEqual({ fillTurnId: first.turnId, status: "waiting_for_user", checkpoint: "fill_outcome_uncertain" })
+    await expect(prisma!.applicationTaskEvent.count({ where: { taskId: value.taskId, type: "fill_outcome_uncertain" } }))
+      .resolves.toBe(waitEventCount)
+  })
+
+  it("persists a form-answer wait and resumes safely with the confirmed answer on a successor Turn", async () => {
+    const value = await seedFillScenario()
+    const first = await startApplicationFillForReview(prisma!, {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `answer-wait-${randomUUID()}`,
+    })
+    const lease = await startLeasedFill(value, first.turnId, "browser_active")
+
+    await expect(persistApplicationFillWait(workerSchemaPool!, {
+      lease, checkpoint: "form_answer_required", detail: "required_field", needs: { missing: ["Work authorization"], sensitive: [] },
+    })).resolves.toEqual({ status: "waiting" })
+    await prisma!.$executeRaw`UPDATE "sub_agent_tasks" SET "status" = 'waiting_for_user', "leaseOwner" = NULL, "leaseExpiresAt" = NULL
+      WHERE "id" = ${lease.id}`
+    await prisma!.$executeRaw`UPDATE "application_tasks" SET "confirmedAnswers" = '{"work_authorization":"Ireland"}'::jsonb WHERE "id" = ${value.taskId}`
+    const waitEvents = await prisma!.$queryRaw<Array<{ createdAt: Date }>>`SELECT "createdAt" FROM "application_task_events"
+      WHERE "taskId" = ${value.taskId} AND "type" = 'form_answer_required' AND "actor" = 'worker'`
+    expect(waitEvents).toHaveLength(1)
+    const answeredAt = new Date(waitEvents[0]!.createdAt.getTime() + 10)
+    await prisma!.$executeRaw`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
+      VALUES (${`answer-event-${randomUUID()}`}, ${value.taskId}, 'user_answers_confirmed', 'user', 'Candidate confirmed the required answer.', '{"answeredFieldCount":1}'::jsonb, ${answeredAt})`
+
+    await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { status: true, checkpoint: true, confirmedAnswers: true } }))
+      .resolves.toEqual({ status: "waiting_for_user", checkpoint: "form_answer_required", confirmedAnswers: { work_authorization: "Ireland" } })
+    await expect(prisma!.agentTurn.findUnique({ where: { id: first.turnId }, select: { status: true } })).resolves.toEqual({ status: "waiting_for_user" })
+    await expect(prisma!.agentSession.findUnique({ where: { id: value.sessionId }, select: { status: true } })).resolves.toEqual({ status: "waiting_for_user" })
+
+    const resumeCommand = {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId,
+      clientMessageId: `resume-request-${randomUUID()}`, resumeAfterUserInput: true,
+    }
+    const resumed = await startApplicationFillForReview(prisma!, resumeCommand)
+    const replay = await startApplicationFillForReview(prisma!, resumeCommand)
+
+    expect(resumed.disposition).toBe("started")
+    expect(resumed.turnId).not.toBe(first.turnId)
+    expect(replay).toMatchObject({ turnId: resumed.turnId, disposition: "duplicate" })
+    await expect(prisma!.agentTurn.count({ where: { sessionId: value.sessionId } })).resolves.toBe(2)
+    await expect(prisma!.agentTurn.findUnique({ where: { id: first.turnId }, select: { status: true, revision: true } }))
+      .resolves.toEqual({ status: "interrupted", revision: 2 })
+    await expect(prisma!.agentSession.findUnique({ where: { id: value.sessionId }, select: { status: true } })).resolves.toEqual({ status: "running" })
+    await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { fillTurnId: true, status: true, checkpoint: true, confirmedAnswers: true } }))
+      .resolves.toEqual({ fillTurnId: resumed.turnId, status: "filling", checkpoint: "taskgraph_fill_queued", confirmedAnswers: { work_authorization: "Ireland" } })
+    await expect(prisma!.$queryRaw<Array<{ status: string }>>`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = ${lease.id}`)
+      .resolves.toEqual([{ status: "interrupted" }])
+    await expect(prisma!.agentOutbox.count({ where: { aggregateId: value.sessionId, topic: "agent.turn.dispatch" } })).resolves.toBe(2)
   })
 })

@@ -2,7 +2,9 @@ CREATE TABLE "agent_sessions" (
   "id" TEXT PRIMARY KEY,
   "userId" TEXT NOT NULL,
   "status" TEXT NOT NULL,
-  "eventSequence" BIGINT NOT NULL DEFAULT 0
+  "eventSequence" BIGINT NOT NULL DEFAULT 0,
+  "completedAt" TIMESTAMP(3),
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE "agent_turns" (
@@ -20,29 +22,50 @@ CREATE TABLE "agent_turns" (
   "outputTokens" INTEGER NOT NULL DEFAULT 0,
   "estimatedCostUsd" DECIMAL(12, 8) NOT NULL DEFAULT 0,
   "leaseVersion" INTEGER NOT NULL DEFAULT 0,
+  "leaseOwnerId" TEXT,
+  "leaseExpiresAt" TIMESTAMP(3),
   "completedAt" TIMESTAMP(3),
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "agent_turns_id_session_user_key" UNIQUE ("id", "sessionId", "userId")
 );
 
+CREATE TABLE "User" (
+  "id" TEXT PRIMARY KEY,
+  "email" TEXT NOT NULL,
+  "name" TEXT,
+  "accountStatus" TEXT NOT NULL DEFAULT 'active',
+  "phone" TEXT,
+  "location" TEXT,
+  "linkedin" TEXT,
+  "personaFields" JSONB
+);
+
 CREATE TABLE "Job" (
   "id" TEXT PRIMARY KEY,
-  "userId" TEXT NOT NULL
+  "userId" TEXT NOT NULL,
+  "url" TEXT,
+  "role" TEXT,
+  "company" TEXT,
+  "keywords" TEXT,
+  "description" TEXT,
+  "coverLetter" TEXT
 );
 
 CREATE TABLE "Resume" (
   "id" TEXT PRIMARY KEY,
   "userId" TEXT NOT NULL,
   "targetJobId" TEXT,
-  "isDefault" BOOLEAN NOT NULL DEFAULT FALSE
+  "isDefault" BOOLEAN NOT NULL DEFAULT FALSE,
+  "content" JSONB
 );
 
 CREATE TABLE "CoverLetter" (
   "id" TEXT PRIMARY KEY,
   "userId" TEXT NOT NULL,
   "jobId" TEXT NOT NULL,
-  "resumeId" TEXT
+  "resumeId" TEXT,
+  "content" TEXT
 );
 
 CREATE TABLE "application_tasks" (
@@ -57,6 +80,7 @@ CREATE TABLE "application_tasks" (
   "fillTurnUserId" TEXT,
   "status" TEXT NOT NULL DEFAULT 'discovered',
   "checkpoint" TEXT,
+  "question" JSONB,
   "confirmedAnswers" JSONB,
   "error" TEXT,
   "startedAt" TIMESTAMP(3),
@@ -126,6 +150,18 @@ CREATE TABLE "application_task_events" (
   "taskId" TEXT NOT NULL,
   "type" TEXT NOT NULL,
   "actor" TEXT NOT NULL,
+  "body" TEXT NOT NULL,
+  "data" JSONB,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE "agent_transcript_events" (
+  "id" TEXT PRIMARY KEY,
+  "sessionId" TEXT NOT NULL,
+  "taskId" TEXT,
+  "type" TEXT NOT NULL,
+  "speaker" TEXT NOT NULL,
+  "title" TEXT NOT NULL,
   "body" TEXT NOT NULL,
   "data" JSONB,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
