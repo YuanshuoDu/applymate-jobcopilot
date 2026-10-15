@@ -5,7 +5,13 @@ import { db } from "@/lib/db"
 import { applicationTaskSummary } from "@/lib/agent/application-task-view"
 import { sanitizeConfirmedAnswers } from "@/lib/agent/application-task-input"
 import { applicationFillTaskGraphEnabled, queueApplicationFill } from "@/lib/auto-apply"
-import { TaskInterruptError, TaskInterruptService } from "@/lib/agent/control-plane/commands/task-interrupt-service"
+import {
+  cancelPendingSubmitApprovals,
+  hasBoundFillTurn,
+  interruptBoundFiller,
+  isStoppedFill,
+  lockStoppedFillReplay,
+} from "./cancellation-helpers"
 
 type ResumeTask = {
   id: string; sessionId: string | null; fillTurnId: string | null
@@ -28,11 +34,9 @@ function questionWaitId(value: unknown): string | null {
   return typeof waitId === "string" && waitId.trim() ? waitId : null
 }
 
-function hasBoundFillTurn(task: ResumeTask, userId: string): boolean {
-  return Boolean(task.sessionId && task.fillTurnId && task.fillTurnSessionId === task.sessionId && task.fillTurnUserId === userId)
-}
-
-async function queueTaskGraphResume(task: ResumeTask, userId: string, duplicateOnly = false): Promise<Response> {
+async function queueTaskGraphResume(
+  task: ResumeTask, userId: string, duplicateOnly = false,
+): Promise<Response> {
   try {
     const queued = await queueApplicationFill({
       userId, jobId: task.job.id, applyUrl: task.job.url, applicationTaskId: task.id,
@@ -67,30 +71,6 @@ export async function GET(req: NextRequest) {
   return ok({ tasks, summary: applicationTaskSummary(tasks) })
 }
 
-async function interruptBoundFiller(task: { id: string; sessionId: string; fillTurnId: string }, userId: string): Promise<Response | null> {
-  const fillers = await db.subAgentTask.findMany({
-    where: { sessionId: task.sessionId, turnId: task.fillTurnId, role: "application_filler", taskType: "application_fill_for_review" },
-    select: { id: true, status: true },
-  })
-  if (fillers.length > 1) return err("Multiple application fillers are bound to this Turn", 409)
-  const filler = fillers[0]
-  if (!filler) return null
-  if (["completed", "failed", "interrupted", "cancelled", "closed"].includes(filler.status)) return null
-  if (!["queued", "running", "retrying", "waiting", "waiting_for_user"].includes(filler.status)) {
-    return err("The application filler is in an unrecognized state and cannot be cancelled safely", 409)
-  }
-  try {
-    await new TaskInterruptService(db).interrupt({
-      sessionId: task.sessionId, taskId: filler.id, userId,
-      clientMessageId: `application-task-cancel:${task.id}:${task.fillTurnId}`,
-    })
-    return null
-  } catch (error) {
-    if (error instanceof TaskInterruptError) return err(error.message, error.status)
-    return err("Could not persist an interrupt for the active application filler", 500)
-  }
-}
-
 export async function DELETE(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
@@ -104,7 +84,17 @@ export async function DELETE(req: NextRequest) {
     },
   })
   if (!task) return err("Application task not found", 404)
-  if (["submitted", "skipped", "cancelled"].includes(task.status) || ["submission_request_started", "submission_uncertain"].includes(task.checkpoint ?? "")) {
+  if (task.status === "cancelled") {
+    if (!isStoppedFill(task, auth.userId)) return err("This application task cannot be cancelled", 409)
+    const replayed = await db.$transaction(async tx => {
+      if (!await lockStoppedFillReplay(tx, task, auth.userId)) return false
+      await cancelPendingSubmitApprovals(tx, id, task.sessionId!, auth.userId)
+      return true
+    })
+    if (!replayed) return err("This application task changed and cannot be cancelled", 409)
+    return ok({ cancelled: true })
+  }
+  if (["submitted", "skipped"].includes(task.status) || ["submission_request_started", "submission_uncertain"].includes(task.checkpoint ?? "")) {
     return err("This application task cannot be cancelled", 409)
   }
   const taskGraphCancel = typeof task.fillTurnId === "string" && ["filling", "waiting_for_user"].includes(task.status)
@@ -129,19 +119,13 @@ export async function DELETE(req: NextRequest) {
       },
       data: { status: "cancelled", checkpoint: "cancelled_by_user", completedAt: new Date() },
     })
-    if (updated.count !== 1) return false
-    await tx.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } })
+    if (updated.count !== 1) {
+      if (!taskGraphCancel || !await lockStoppedFillReplay(tx, task, auth.userId)) return false
+    } else {
+      await tx.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } })
+    }
     if (task.sessionId) {
-      await tx.agentApproval.updateMany({
-        where: {
-          sessionId: task.sessionId,
-          userId: auth.userId,
-          type: "submit_application",
-          status: "pending",
-          payload: { path: ["applicationTaskId"], equals: id },
-        },
-        data: { status: "cancelled", decidedAt: new Date() },
-      })
+      await cancelPendingSubmitApprovals(tx, id, task.sessionId, auth.userId)
     }
     return true
   })
