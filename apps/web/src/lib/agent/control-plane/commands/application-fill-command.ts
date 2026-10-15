@@ -50,7 +50,10 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
         }
       }
 
-      const { task, stoppedRetryReady } = await lockApplicationFillTask(tx, command.applicationTaskId, identity, Boolean(command.retry))
+      const fillTaskLock = command.retry
+        ? await lockApplicationFillTask(tx, command.applicationTaskId, identity, true, { explicitUserRetry: true })
+        : await lockApplicationFillTask(tx, command.applicationTaskId, identity, false)
+      const { task, stoppedRetryReady } = fillTaskLock
       if (!task) throw new AgentCommandError("agent_session_not_found", "Application task not found", 404)
       if (command.resumeAfterUserInput) {
         if (task.fillTurnId && task.fillTurnSessionId === identity.sessionId && task.fillTurnUserId === identity.userId) {
@@ -86,7 +89,7 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
       }
 
       if (command.retry) {
-        if (!stoppedRetryReady) await assertApplicationFillRetryReady(tx, task, identity)
+        if (!stoppedRetryReady) await assertApplicationFillRetryReady(tx, task, identity, { explicitUserRetry: true })
       } else if (task.status !== "waiting_for_user" || !START_CHECKPOINTS.includes(task.checkpoint ?? "")) {
         throw new AgentCommandError("retry_target_invalid", "Application task is not ready for a fill-for-review pass", 409)
       }

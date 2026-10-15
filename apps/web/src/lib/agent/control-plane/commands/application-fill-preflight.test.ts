@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
-import { assertApplicationFillPreflight, assertApplicationFillRetryReady } from "./application-fill-preflight"
+import { assertApplicationFillPreflight, assertApplicationFillRetryReady, lockApplicationFillTask } from "./application-fill-preflight"
 
 type Query = { strings?: readonly string[]; values?: readonly unknown[] }
 type Row = Record<string, unknown>
+type Filler = { id: string; status: string; leaseOwner: string | null; leaseExpiresAt: Date | null; role?: string; taskType?: string }
 
 function fixture(materialRows: Array<{ jobId: string; resumeId: string | null; coverLetterId: string | null }>, coverRows: Array<{ id: string }> = []) {
   const query = vi.fn(async (input: unknown) => {
@@ -14,19 +15,39 @@ function fixture(materialRows: Array<{ jobId: string; resumeId: string | null; c
   return { query, tx: { $queryRaw: query } as never }
 }
 
-function stoppedRetryFixture(fillers: Array<{ id: string; status: string; leaseOwner: string | null; leaseExpiresAt: Date | null }>, turn: Row | null = { id: "turn-1", status: "interrupted" }) {
+function retryFixture(fillers: Filler[], turn: Row | null = { id: "turn-1", status: "interrupted" }) {
   const query = vi.fn(async (input: unknown) => {
     const sql = ((input as Query).strings ?? []).join(" ")
-    if (sql.includes('FROM "agent_turns"')) return turn ? [turn] : []
-    if (sql.includes('FROM "sub_agent_tasks"')) return fillers
+    if (sql.includes('FROM "agent_turns"')) return turn ? [{ leaseOwnerId: null, leaseExpiresAt: null, ...turn }] : []
+    if (sql.includes('FROM "sub_agent_tasks"')) return fillers.map((filler) => ({ role: "application_filler", taskType: "application_fill_for_review", ...filler }))
     throw new Error(`unexpected retry query: ${sql}`)
   })
   const findTurn = vi.fn(async () => turn)
   return { query, findTurn, tx: { $queryRaw: query, agentTurn: { findFirst: findTurn } } as never }
 }
 
+function cancelledTaskLockFixture(
+  candidate: Row,
+  lockedTask: Row,
+  fillers: Filler[],
+  turn: Row | null = { id: "turn-1", status: "interrupted" },
+) {
+  const query = vi.fn(async (input: unknown) => {
+    const sql = ((input as Query).strings ?? []).join(" ")
+    if (sql.includes('FROM "application_tasks"') && sql.includes("FOR UPDATE")) return [lockedTask]
+    if (sql.includes('FROM "application_tasks"')) return [candidate]
+    if (sql.includes('FROM "agent_turns"')) return turn ? [{ leaseOwnerId: null, leaseExpiresAt: null, ...turn }] : []
+    if (sql.includes('FROM "sub_agent_tasks"')) return fillers.map((filler) => ({ role: "application_filler", taskType: "application_fill_for_review", ...filler }))
+    throw new Error(`unexpected retry query: ${sql}`)
+  })
+  return { query, tx: { $queryRaw: query } as never }
+}
+
 const stoppedTask = { fillTurnId: "turn-1", fillTurnSessionId: "session-1", fillTurnUserId: "user-1", status: "cancelled", checkpoint: "turn_stopped_before_submit" }
+const userCancelledTask = { ...stoppedTask, checkpoint: "cancelled_by_user" }
 const retryIdentity = { userId: "user-1", sessionId: "session-1" }
+const explicitUserRetry = { explicitUserRetry: true }
+const terminalLeaseFreeFiller = { id: "filler-1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }
 
 describe("application fill persisted-material preflight", () => {
   it("uses only the owned task's job, resume, and optional cover-letter references", async () => {
@@ -65,7 +86,7 @@ describe("application fill persisted-material preflight", () => {
   })
 
   it("allows a stopped retry only after its exact filler is terminal and lease-free", async () => {
-    const test = stoppedRetryFixture([{ id: "filler-1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }])
+    const test = retryFixture([terminalLeaseFreeFiller])
 
     await expect(assertApplicationFillRetryReady(test.tx, stoppedTask, retryIdentity)).resolves.toBeUndefined()
 
@@ -74,6 +95,8 @@ describe("application fill persisted-material preflight", () => {
     expect(turnSql).toContain('FROM "agent_turns"')
     expect(turnSql).toContain('"sessionId" =')
     expect(turnSql).toContain('"userId" =')
+    expect(turnSql).toContain('"leaseOwnerId"')
+    expect(turnSql).toContain('"leaseExpiresAt"')
     expect(turnSql).toContain("FOR UPDATE")
     const sql = ((test.query.mock.calls[1]?.[0] as Query).strings ?? []).join(" ")
     expect(sql).toContain('task."sessionId" =')
@@ -88,7 +111,7 @@ describe("application fill persisted-material preflight", () => {
   it.each(["fill_prestart_failed", "taskgraph_fill_failed", "fill_outcome_uncertain", null])(
     "does not treat cancelled state with checkpoint %s as a stopped retry",
     async (checkpoint) => {
-      const test = stoppedRetryFixture([{ id: "filler-1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }])
+      const test = retryFixture([terminalLeaseFreeFiller])
 
       await expect(assertApplicationFillRetryReady(test.tx, { ...stoppedTask, checkpoint }, retryIdentity))
         .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
@@ -107,22 +130,123 @@ describe("application fill persisted-material preflight", () => {
       { id: "filler-2", status: "interrupted", leaseOwner: null, leaseExpiresAt: null },
     ]],
   ] as const)("rejects a stopped retry when its filler is %s", async (_reason, fillers) => {
-    const test = stoppedRetryFixture([...fillers])
+    const test = retryFixture([...fillers])
 
     await expect(assertApplicationFillRetryReady(test.tx, stoppedTask, retryIdentity))
       .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
   })
 
   it("rejects stopped retries whose application or Turn binding crosses the user/session", async () => {
-    const test = stoppedRetryFixture([{ id: "filler-1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }])
+    const test = retryFixture([terminalLeaseFreeFiller])
 
     await expect(assertApplicationFillRetryReady(test.tx, { ...stoppedTask, fillTurnUserId: "other-user" }, retryIdentity))
       .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
     expect(test.findTurn).not.toHaveBeenCalled()
 
-    const foreignTurn = stoppedRetryFixture([], null)
+    const foreignTurn = retryFixture([], null)
     await expect(assertApplicationFillRetryReady(foreignTurn.tx, stoppedTask, retryIdentity))
       .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
     expect(foreignTurn.query).toHaveBeenCalledOnce()
+  })
+
+  it("requires exactly one exact filler for an explicit user-cancelled retry", async () => {
+    const test = retryFixture([terminalLeaseFreeFiller])
+
+    await expect(assertApplicationFillRetryReady(test.tx, userCancelledTask, retryIdentity, explicitUserRetry)).resolves.toBeUndefined()
+
+    expect(test.findTurn).not.toHaveBeenCalled()
+    const turnSql = ((test.query.mock.calls[0]?.[0] as Query).strings ?? []).join(" ")
+    expect(turnSql).toContain('"id" =')
+    expect(turnSql).toContain('"sessionId" =')
+    expect(turnSql).toContain('"userId" =')
+    expect(turnSql).toContain('"leaseOwnerId"')
+    expect(turnSql).toContain('"leaseExpiresAt"')
+    expect(turnSql).toContain("FOR UPDATE")
+    const fillerSql = ((test.query.mock.calls[1]?.[0] as Query).strings ?? []).join(" ")
+    expect(fillerSql).toContain('task."sessionId" =')
+    expect(fillerSql).toContain('task."turnId" =')
+    expect(fillerSql).toContain("task.\"role\" = 'application_filler'")
+    expect(fillerSql).toContain("task.\"taskType\" = 'application_fill_for_review'")
+    expect(fillerSql).toContain("task.\"role\" = 'application_filler' OR task.\"taskType\" = 'application_fill_for_review'")
+    expect(fillerSql).toContain("FOR UPDATE OF task")
+  })
+
+  it("rejects cancelled_by_user when cancellation happened before a filler existed", async () => {
+    const test = retryFixture([])
+
+    await expect(assertApplicationFillRetryReady(test.tx, userCancelledTask, retryIdentity, explicitUserRetry))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(test.query).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([undefined, false])("fails closed for cancelled_by_user without explicit user retry (option=%s)", async (explicitUserRetryFlag) => {
+    const test = retryFixture([terminalLeaseFreeFiller])
+    const options = explicitUserRetryFlag === undefined ? {} : { explicitUserRetry: explicitUserRetryFlag }
+
+    await expect(assertApplicationFillRetryReady(test.tx, userCancelledTask, retryIdentity, options))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(test.query).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["missing Turn", null],
+    ["nonterminal Turn", { id: "turn-1", status: "in_progress" }],
+    ["terminal Turn with an owner lease", { id: "turn-1", status: "interrupted", leaseOwnerId: "worker-1" }],
+    ["terminal Turn with an expiry lease", { id: "turn-1", status: "interrupted", leaseExpiresAt: new Date() }],
+  ] as const)("rejects cancelled_by_user when its %s is not terminal and lease-free", async (_reason, turn) => {
+    const test = retryFixture([terminalLeaseFreeFiller], turn)
+
+    await expect(assertApplicationFillRetryReady(test.tx, userCancelledTask, retryIdentity, explicitUserRetry))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(test.query).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["running with a live lease", [{ id: "filler-1", status: "running", leaseOwner: "worker-1", leaseExpiresAt: new Date() }]],
+    ["running without a reported owner", [{ id: "filler-1", status: "running", leaseOwner: null, leaseExpiresAt: null }]],
+    ["terminal with an owner lease", [{ id: "filler-1", status: "interrupted", leaseOwner: "worker-1", leaseExpiresAt: null }]],
+    ["terminal with an expiry lease", [{ id: "filler-1", status: "interrupted", leaseOwner: null, leaseExpiresAt: new Date() }]],
+    ["wrong role", [{ id: "filler-1", role: "analyst", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }]],
+    ["wrong task type", [{ id: "filler-1", taskType: "application_submit", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }]],
+    ["ambiguous duplicate fillers", [terminalLeaseFreeFiller, { ...terminalLeaseFreeFiller, id: "filler-2" }]],
+  ] as const)("rejects cancelled_by_user when the exact filler is %s", async (_reason, fillers) => {
+    const test = retryFixture([...fillers])
+
+    await expect(assertApplicationFillRetryReady(test.tx, userCancelledTask, retryIdentity, explicitUserRetry))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+  })
+
+  it("locks a user-cancelled retry against the exact bound Turn and rejects stale task bindings", async () => {
+    const candidate = { id: "task-1", ...userCancelledTask, confirmedAnswers: null }
+    const test = cancelledTaskLockFixture(candidate, candidate, [terminalLeaseFreeFiller])
+
+    await expect(lockApplicationFillTask(test.tx, "task-1", retryIdentity, true, explicitUserRetry))
+      .resolves.toMatchObject({ task: candidate, stoppedRetryReady: false })
+
+    const queries = test.query.mock.calls.map(([input]) => ((input as Query).strings ?? []).join(" "))
+    expect(queries[0]).toContain('"id" =')
+    expect(queries[0]).toContain('"userId" =')
+    expect(queries[0]).toContain('"sessionId" =')
+    expect(queries.map((sql) => sql.includes("FOR UPDATE"))).toEqual([false, true, true, true])
+
+    const stale = cancelledTaskLockFixture(candidate, { ...candidate, fillTurnId: "turn-2" }, [terminalLeaseFreeFiller])
+    await expect(lockApplicationFillTask(stale.tx, "task-1", retryIdentity, true, explicitUserRetry))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+  })
+
+  it("does not pre-lock or accept an automatic retry of cancelled_by_user", async () => {
+    const candidate = { id: "task-1", ...userCancelledTask, confirmedAnswers: null }
+    const test = cancelledTaskLockFixture(candidate, candidate, [terminalLeaseFreeFiller])
+
+    await expect(lockApplicationFillTask(test.tx, "task-1", retryIdentity, true))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(test.query).toHaveBeenCalledOnce()
+  })
+
+  it("requires exactly one filler for a Turn-stopped retry", async () => {
+    const test = retryFixture([])
+
+    await expect(assertApplicationFillRetryReady(test.tx, stoppedTask, retryIdentity))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
   })
 })

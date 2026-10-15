@@ -301,7 +301,7 @@ describe("pauseForFormInput", () => {
     const { pool, query } = testPool();
     query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
 
-    await pauseForFormInput(pool, "task_1", "Missing required field", { missing: ["Email"], sensitive: [] });
+    await pauseForFormInput(pool, "task_1", "Missing required field", { missing: [{ key: null, label: "Email" }], sensitive: [] });
 
     const transition = String(query.mock.calls[0]?.[0]);
     expect(transition).toContain('"checkpoint" IS DISTINCT FROM \'submission_request_started\'');

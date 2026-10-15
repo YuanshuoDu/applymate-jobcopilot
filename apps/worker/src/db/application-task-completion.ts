@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg"
 import { createApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared"
 import type { FormReviewNeeds } from "../harness/form-review.js"
+import { isFormAnswerKeyV2 } from "../form-answer-key.js"
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js"
 import { protocolScope, type ApprovalScopeInput, type IssueApprovalReceiptInput } from "../runtime/approval/types.js"
 import type { SubagentLease } from "../runtime/subagents/types.js"
@@ -196,7 +197,11 @@ function waitMessage(detail: WaitDetail): string {
 }
 
 function safeNeeds(needs?: FormReviewNeeds): FormReviewNeeds {
-  const clean = (values: string[] | undefined) => (values ?? []).slice(0, 10).map(value => redactSensitiveText(value).slice(0, 200)); return { missing: clean(needs?.missing), sensitive: clean(needs?.sensitive) }
+  const clean = (fields: FormReviewNeeds["missing"] | undefined) => (fields ?? []).slice(0, 10).map(({ key, label }) => ({
+    key: key && isFormAnswerKeyV2(key) ? key : null,
+    label: redactSensitiveText(label).slice(0, 200),
+  }))
+  return { missing: clean(needs?.missing), sensitive: clean(needs?.sensitive) }
 }
 
 /** Persists an application-specific wait without using the legacy unfenced pause path. */

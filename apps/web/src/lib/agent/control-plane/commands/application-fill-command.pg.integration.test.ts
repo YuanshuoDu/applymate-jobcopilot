@@ -7,6 +7,7 @@ import { PrismaClient } from "@prisma/client"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "../../../../../../worker/src/db/application-task-completion.js"
+import { formAnswerKeyForSelector } from "../../../../../../worker/src/form-answer-key.js"
 import { executeApplicationFillForReview } from "../../../../../../worker/src/runtime/subagents/application-fill-for-review.js"
 import type { SubagentLease } from "../../../../../../worker/src/runtime/subagents/types.js"
 import { AgentCommandService } from "./agent-command-service"
@@ -352,13 +353,19 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `answer-wait-${randomUUID()}`,
     })
     const lease = await startLeasedFill(value, first.turnId, "browser_active")
+    const answerKey = formAnswerKeyForSelector("work-authorization", "work_authorization")!
 
     await expect(persistApplicationFillWait(workerSchemaPool!, {
-      lease, checkpoint: "form_answer_required", detail: "required_field", needs: { missing: ["Work authorization"], sensitive: [] },
+      lease, checkpoint: "form_answer_required", detail: "required_field", needs: {
+        missing: [{ key: answerKey, label: "Work authorization" }, { key: null, label: "Work authorization" }], sensitive: [],
+      },
     })).resolves.toEqual({ status: "waiting" })
+    const waitQuestion = await prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { question: true } })
+    expect(waitQuestion?.question).toMatchObject({ missing: [{ key: answerKey, label: "Work authorization" }, { key: null, label: "Work authorization" }] })
     await prisma!.$executeRaw`UPDATE "sub_agent_tasks" SET "status" = 'waiting_for_user', "leaseOwner" = NULL, "leaseExpiresAt" = NULL
       WHERE "id" = ${lease.id}`
-    await prisma!.$executeRaw`UPDATE "application_tasks" SET "confirmedAnswers" = '{"work_authorization":"Ireland"}'::jsonb WHERE "id" = ${value.taskId}`
+    const confirmedAnswers = JSON.stringify({ [answerKey]: "Ireland" })
+    await prisma!.$executeRaw`UPDATE "application_tasks" SET "confirmedAnswers" = ${confirmedAnswers}::jsonb WHERE "id" = ${value.taskId}`
     const waitEvents = await prisma!.$queryRaw<Array<{ createdAt: Date }>>`SELECT "createdAt" FROM "application_task_events"
       WHERE "taskId" = ${value.taskId} AND "type" = 'form_answer_required' AND "actor" = 'worker'`
     expect(waitEvents).toHaveLength(1)
@@ -367,7 +374,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       VALUES (${`answer-event-${randomUUID()}`}, ${value.taskId}, 'user_answers_confirmed', 'user', 'Candidate confirmed the required answer.', '{"answeredFieldCount":1}'::jsonb, ${answeredAt})`
 
     await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { status: true, checkpoint: true, confirmedAnswers: true } }))
-      .resolves.toEqual({ status: "waiting_for_user", checkpoint: "form_answer_required", confirmedAnswers: { work_authorization: "Ireland" } })
+      .resolves.toEqual({ status: "waiting_for_user", checkpoint: "form_answer_required", confirmedAnswers: { [answerKey]: "Ireland" } })
     await expect(prisma!.agentTurn.findUnique({ where: { id: first.turnId }, select: { status: true } })).resolves.toEqual({ status: "waiting_for_user" })
     await expect(prisma!.agentSession.findUnique({ where: { id: value.sessionId }, select: { status: true } })).resolves.toEqual({ status: "waiting_for_user" })
 
@@ -386,7 +393,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       .resolves.toEqual({ status: "interrupted", revision: 2 })
     await expect(prisma!.agentSession.findUnique({ where: { id: value.sessionId }, select: { status: true } })).resolves.toEqual({ status: "running" })
     await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { fillTurnId: true, status: true, checkpoint: true, confirmedAnswers: true } }))
-      .resolves.toEqual({ fillTurnId: resumed.turnId, status: "filling", checkpoint: "taskgraph_fill_queued", confirmedAnswers: { work_authorization: "Ireland" } })
+      .resolves.toEqual({ fillTurnId: resumed.turnId, status: "filling", checkpoint: "taskgraph_fill_queued", confirmedAnswers: { [answerKey]: "Ireland" } })
     await expect(prisma!.$queryRaw<Array<{ status: string }>>`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = ${lease.id}`)
       .resolves.toEqual([{ status: "interrupted" }])
     await expect(prisma!.agentOutbox.count({ where: { aggregateId: value.sessionId, topic: "agent.turn.dispatch" } })).resolves.toBe(2)

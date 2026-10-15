@@ -28,7 +28,7 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
     $queryRaw: vi.fn(async (query: unknown) => {
       const sql = ((query as { strings?: readonly string[] }).strings ?? []).join(" ")
       if (sql.includes('FROM "agent_sessions"')) return [{ id: "session_1" }]
-      if (sql.includes('FROM "agent_turns"')) return turns.filter(turn => turn.id === "turn_previous" && turn.sessionId === "session_1" && turn.userId === "user_1").map(turn => ({ id: turn.id, status: turn.status }))
+      if (sql.includes('FROM "agent_turns"')) return turns.filter(turn => turn.id === "turn_previous" && turn.sessionId === "session_1" && turn.userId === "user_1").map(turn => ({ id: turn.id, status: turn.status, leaseOwnerId: turn.leaseOwnerId, leaseExpiresAt: turn.leaseExpiresAt }))
       if (sql.includes('FROM "application_tasks" AS app')) {
         if (task.resumeId === null || materialSeed.jobOwned === false || materialSeed.resumeAssociated === false) return []
         return [{ jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId }]
@@ -39,7 +39,7 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
         applicationEventRead += 1
         return applicationEventRead === 1 ? resume?.waitEvents ?? [] : resume?.answerEvents ?? []
       }
-      if (sql.includes('FROM "sub_agent_tasks"')) return fillers
+      if (sql.includes('FROM "sub_agent_tasks"')) return fillers.map(filler => ({ role: "application_filler", taskType: "application_fill_for_review", ...filler }))
       if (sql.includes('UPDATE "agent_sessions"')) return [{ eventSequence: ++eventSequence }]
       return []
     }),
@@ -223,6 +223,37 @@ describe("startApplicationFillForReview", () => {
     expect(previewLock).toBeLessThan(priorTurnLock)
     expect(priorTurnLock).toBeLessThan(fillerLock)
     expect(fillerLock).toBeLessThan(taskLock)
+  })
+
+  it.each(["turn_stopped_before_submit", "cancelled_by_user"])("rejects a %s retry when no filler exists", async checkpoint => {
+    const fake = harness({
+      status: "cancelled", checkpoint, fillTurnId: "turn_previous",
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+    }, false, { fillers: [], turnStatus: "interrupted" })
+
+    await expect(startApplicationFillForReview(fake.db, command("fill_retry_without_filler", true)))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(fake.state.task).toMatchObject({ status: "cancelled", checkpoint, fillTurnId: "turn_previous" })
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it.each([
+    ["nonterminal Turn", { fillers: [], turnStatus: "in_progress" }],
+    ["running filler", { fillers: [{ id: "subagent_fill_1", status: "running", leaseOwner: "worker_1", leaseExpiresAt: new Date(), interruptRequestedAt: null }] }],
+    ["terminal filler with a stale lease", { fillers: [{ id: "subagent_fill_1", status: "interrupted", leaseOwner: null, leaseExpiresAt: new Date(), interruptRequestedAt: new Date() }] }],
+    ["terminal but leased Turn", { fillers: [{ id: "subagent_fill_1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: new Date() }], rootLeaseOwnerId: "turn_worker_1" }],
+  ] as Array<[string, ResumeSeed]>)('keeps a user-cancelled retry closed while its %s is not safe', async (_reason, retrySeed) => {
+    const fake = harness({
+      status: "cancelled", checkpoint: "cancelled_by_user", fillTurnId: "turn_previous",
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+    }, false, { turnStatus: "interrupted", ...retrySeed })
+
+    await expect(startApplicationFillForReview(fake.db, command("fill_user_cancel_retry_unsafe", true)))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(fake.state.task).toMatchObject({ status: "cancelled", checkpoint: "cancelled_by_user", fillTurnId: "turn_previous" })
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.outbox).toHaveLength(0)
   })
 
   it.each([

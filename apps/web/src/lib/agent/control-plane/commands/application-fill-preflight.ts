@@ -13,6 +13,9 @@ type PersistedApplicationMaterial = {
 const RETRY_CHECKPOINTS = ["fill_prestart_failed", "taskgraph_fill_failed"]
 const TERMINAL_TURNS = ["completed", "failed", "interrupted", "cancelled"]
 const TERMINAL_FILLERS = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
+const STOPPED_RETRY_CHECKPOINTS = ["turn_stopped_before_submit", "cancelled_by_user"]
+
+type ApplicationFillRetryOptions = { explicitUserRetry?: boolean }
 
 type ApplicationFillTask = {
   id: string
@@ -30,8 +33,9 @@ export async function lockApplicationFillTask(
   applicationTaskId: string,
   identity: Pick<CommandIdentity, "userId" | "sessionId">,
   retry: boolean,
+  options: ApplicationFillRetryOptions = {},
 ): Promise<{ task: ApplicationFillTask | undefined; stoppedRetryReady: boolean }> {
-  let stoppedCandidate: ApplicationFillTask | undefined
+  let prelockedCandidate: ApplicationFillTask | undefined
   if (retry) {
     const candidates = await tx.$queryRaw<ApplicationFillTask[]>(Prisma.sql`
       SELECT "id", "status", "checkpoint", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "confirmedAnswers"
@@ -39,9 +43,13 @@ export async function lockApplicationFillTask(
       WHERE "id" = ${applicationTaskId} AND "userId" = ${identity.userId} AND "sessionId" = ${identity.sessionId}
     `)
     const candidate = candidates[0]
-    if (candidate?.status === "cancelled" && candidate.checkpoint === "turn_stopped_before_submit") {
-      await lockStoppedApplicationFillRetry(tx, candidate, identity)
-      stoppedCandidate = candidate
+    const retryCheckpoint = candidate?.checkpoint
+    if (candidate?.status === "cancelled" && retryCheckpoint && STOPPED_RETRY_CHECKPOINTS.includes(retryCheckpoint)) {
+      if (retryCheckpoint === "cancelled_by_user" && options.explicitUserRetry !== true) {
+        throw new AgentCommandError("retry_target_invalid", "Only an explicit user retry may restart a user-cancelled application fill", 409)
+      }
+      await lockCancelledApplicationFillRetry(tx, candidate, identity, retryCheckpoint)
+      prelockedCandidate = candidate
     }
   }
 
@@ -52,11 +60,14 @@ export async function lockApplicationFillTask(
     FOR UPDATE
   `)
   const task = rows[0]
-  if (stoppedCandidate && task && !sameStoppedRetryBinding(task, stoppedCandidate)) throw unavailable()
-  return { task, stoppedRetryReady: Boolean(stoppedCandidate && task) }
+  if (prelockedCandidate && task && !samePrelockedRetryBinding(task, prelockedCandidate)) throw unavailable()
+  return {
+    task,
+    stoppedRetryReady: Boolean(prelockedCandidate && task && prelockedCandidate.checkpoint === "turn_stopped_before_submit"),
+  }
 }
 
-function sameStoppedRetryBinding(task: ApplicationFillTask, candidate: ApplicationFillTask): boolean {
+function samePrelockedRetryBinding(task: ApplicationFillTask, candidate: ApplicationFillTask): boolean {
   return task.status === candidate.status && task.checkpoint === candidate.checkpoint
     && task.fillTurnId === candidate.fillTurnId && task.fillTurnSessionId === candidate.fillTurnSessionId
     && task.fillTurnUserId === candidate.fillTurnUserId
@@ -101,17 +112,22 @@ export async function assertApplicationFillRetryReady(
   tx: CommandTransaction,
   task: { fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; status: string; checkpoint: string | null },
   identity: Pick<CommandIdentity, "userId" | "sessionId">,
+  options: ApplicationFillRetryOptions = {},
 ): Promise<void> {
   const retryableFailure = task.status === "failed" && RETRY_CHECKPOINTS.includes(task.checkpoint ?? "")
   const stopped = task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit"
-  if (!task.fillTurnId || (!retryableFailure && !stopped)) {
+  const cancelledByUser = task.status === "cancelled" && task.checkpoint === "cancelled_by_user"
+  if (!task.fillTurnId || (!retryableFailure && !stopped && !cancelledByUser)) {
     throw new AgentCommandError("retry_target_invalid", "Application fill is not in a safely retryable terminal state", 409)
+  }
+  if (cancelledByUser && options.explicitUserRetry !== true) {
+    throw new AgentCommandError("retry_target_invalid", "Only an explicit user retry may restart a user-cancelled application fill", 409)
   }
   if (task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) {
     throw new AgentCommandError("retry_target_invalid", "The application fill Turn is not bound to this user and session", 409)
   }
-  if (stopped) {
-    await lockStoppedApplicationFillRetry(tx, task, identity)
+  if (stopped || cancelledByUser) {
+    await lockCancelledApplicationFillRetry(tx, task, identity, task.checkpoint ?? "")
     return
   }
   const previous = await tx.agentTurn.findFirst({
@@ -122,34 +138,38 @@ export async function assertApplicationFillRetryReady(
   }
 }
 
-async function lockStoppedApplicationFillRetry(
+async function lockCancelledApplicationFillRetry(
   tx: CommandTransaction,
   task: { fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; status: string; checkpoint: string | null },
   identity: Pick<CommandIdentity, "userId" | "sessionId">,
+  checkpoint: string,
 ): Promise<void> {
-  if (task.status !== "cancelled" || task.checkpoint !== "turn_stopped_before_submit" || !task.fillTurnId
+  if (task.status !== "cancelled" || task.checkpoint !== checkpoint || !STOPPED_RETRY_CHECKPOINTS.includes(checkpoint) || !task.fillTurnId
     || task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) {
-    throw new AgentCommandError("retry_target_invalid", "The application fill Turn is not bound to this stopped task", 409)
+    const kind = checkpoint === "turn_stopped_before_submit" ? "stopped" : "user-cancelled"
+    throw new AgentCommandError("retry_target_invalid", `The application fill Turn is not bound to this ${kind} task`, 409)
   }
-  const turns = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
-    SELECT "id", "status" FROM "agent_turns"
+  const turns = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwnerId: string | null; leaseExpiresAt: Date | null }>>(Prisma.sql`
+    SELECT "id", "status", "leaseOwnerId", "leaseExpiresAt" FROM "agent_turns"
     WHERE "id" = ${task.fillTurnId} AND "sessionId" = ${identity.sessionId} AND "userId" = ${identity.userId}
     FOR UPDATE
   `)
-  if (!turns[0] || !TERMINAL_TURNS.includes(turns[0].status)) {
-    throw new AgentCommandError("retry_target_invalid", "The prior application fill Turn is not terminal", 409)
+  if (!turns[0] || !TERMINAL_TURNS.includes(turns[0].status) || turns[0].leaseOwnerId !== null || turns[0].leaseExpiresAt !== null) {
+    throw new AgentCommandError("retry_target_invalid", "The prior application fill Turn must be terminal and lease-free", 409)
   }
-  const fillers = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwner: string | null; leaseExpiresAt: Date | null }>>(Prisma.sql`
-    SELECT task."id", task."status", task."leaseOwner", task."leaseExpiresAt"
+  const fillers = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwner: string | null; leaseExpiresAt: Date | null; role: string; taskType: string }>>(Prisma.sql`
+    SELECT task."id", task."status", task."leaseOwner", task."leaseExpiresAt", task."role", task."taskType"
     FROM "sub_agent_tasks" AS task
     JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = ${identity.userId}
     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" AND turn."userId" = ${identity.userId}
     WHERE task."sessionId" = ${identity.sessionId} AND task."turnId" = ${task.fillTurnId}
-      AND task."role" = 'application_filler' AND task."taskType" = 'application_fill_for_review'
+      AND (task."role" = 'application_filler' OR task."taskType" = 'application_fill_for_review')
     FOR UPDATE OF task
   `)
-  if (fillers.length !== 1 || !TERMINAL_FILLERS.has(fillers[0]!.status)
-    || fillers[0]!.leaseOwner !== null || fillers[0]!.leaseExpiresAt !== null) {
-    throw new AgentCommandError("retry_target_invalid", "The stopped application filler must be terminal with no live lease", 409)
+  if (fillers.length !== 1 || fillers.some((filler) => (
+    filler.role !== "application_filler" || filler.taskType !== "application_fill_for_review"
+    || !TERMINAL_FILLERS.has(filler.status) || filler.leaseOwner !== null || filler.leaseExpiresAt !== null
+  ))) {
+    throw new AgentCommandError("retry_target_invalid", "The application filler must be terminal with no live lease", 409)
   }
 }

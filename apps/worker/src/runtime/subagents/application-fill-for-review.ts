@@ -201,7 +201,7 @@ function isAllowedDestination(raw: string, flow: FlowType, approved: string): bo
 }
 function waitDetail(reason: NonNullable<Awaited<ReturnType<typeof detectBrowserWait>>>["reason"]): WaitDetail { return reason === "captcha" ? "captcha_required" : reason === "login_required" ? "authentication_required" : reason === "mfa_required" ? "mfa_required" : reason === "stale_review" ? "stale_review" : "unknown_sensitive_field" }
 function waitDetailFromResult(result: HarnessResult): WaitDetail { return result.classification === "cancelled" ? "cancelled" : result.classification === "browser_crash" ? "fill_outcome_uncertain" : result.classification === "untrusted_input" ? "unknown_sensitive_field" : "review_required" }
-function safeNeeds(needs: FormReviewNeeds): FormReviewNeeds { return { missing: needs.missing.length ? ["Required application field"] : [], sensitive: needs.sensitive.length ? ["Sensitive answer requiring confirmation"] : [] } }
+function safeNeeds(needs: FormReviewNeeds): FormReviewNeeds { const safe = (fields: FormReviewNeeds["missing"]) => fields.map(({ key, label }) => ({ key, label: label.slice(0, 200) })); return { missing: safe(needs.missing), sensitive: safe(needs.sensitive) } }
 async function claimBrowserStart(pool: Pool, lease: SubagentLease): Promise<"claimed" | "already_started" | "stale" | "conflict"> {
   const client = await pool.connect()
   let open = false

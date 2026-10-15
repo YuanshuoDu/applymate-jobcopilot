@@ -276,7 +276,10 @@ describe("ApplicationTask fill completion", () => {
 
     await expect(persistApplicationFillWait(test.pool, {
       lease: test.lease, checkpoint: "form_answer_required", detail: "required_field",
-      needs: { missing: ["Work authorisation"], sensitive: ["Salary"] }, now: new Date("2026-10-15T12:00:00.000Z"),
+      needs: {
+        missing: [{ key: "form-answer-v2-" + "a".repeat(64), label: "Work authorisation contact candidate@example.test" }],
+        sensitive: [{ key: "form-answer-v2-" + "b".repeat(64), label: "Salary" }],
+      }, now: new Date("2026-10-15T12:00:00.000Z"),
     })).resolves.toEqual({ status: "waiting" })
 
     const event = test.calls.find(call => call.sql.includes('INSERT INTO "application_task_events"'))
@@ -285,8 +288,9 @@ describe("ApplicationTask fill completion", () => {
     const question = JSON.parse(String(appUpdate?.values?.[5])) as { waitId?: unknown; missing?: unknown; sensitive?: unknown }
     expect(event?.values?.[2]).toBe("form_answer_required")
     expect(String(event?.values?.[3])).toContain("missing required application information")
-    expect(question).toMatchObject({ missing: ["Work authorisation"], sensitive: ["Salary"] })
+    expect(question).toMatchObject({ missing: [{ key: "form-answer-v2-" + "a".repeat(64), label: "Work authorisation contact [REDACTED_EMAIL]" }], sensitive: [{ key: "form-answer-v2-" + "b".repeat(64), label: "Salary" }] })
     expect(question.waitId).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(JSON.stringify(question)).not.toContain("candidate@example.test")
     expect(turnWait?.values).toEqual(["turn-a", "session-a", 4, expect.any(Date)])
     expect(test.calls.some(call => call.sql.includes('FROM "agent_turns"') && call.values?.[0] === "turn-a")).toBe(true)
     expect(test.calls.some(call => call.sql.includes("BEGIN"))).toBe(true)

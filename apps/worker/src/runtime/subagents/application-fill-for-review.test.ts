@@ -145,9 +145,37 @@ describe("executeApplicationFillForReview", () => {
     expect(JSON.stringify(fill)).not.toContain("attacker.test")
     expect(JSON.stringify(fill)).not.toContain("client-job")
     expect(fillCustomQuestions).toHaveBeenCalledWith(browserPage, expect.objectContaining({ email: "db@example.test" }), [], { salary: "€80,000" })
+    expect(vi.mocked(executeBrowserFill).mock.calls[0]?.[0]).not.toHaveProperty("confirmedAnswers")
+    expect(JSON.stringify(vi.mocked(executeBrowserFill).mock.calls[0]?.[0])).not.toContain("€80,000")
     expect(queries.mock.calls.find(([sql]) => sql.includes('SELECT app."userId"'))?.[1]).toEqual(["user-1", "session-1", "turn-1"])
     expect(completeApplicationFillForReview).toHaveBeenCalledWith(pool, { lease: expect.objectContaining({ turnId: "turn-1" }) })
     expect(executeBrowserFill).toHaveBeenCalledTimes(1)
+  })
+
+  it("persists an uncertain wait when post-fill form inspection fails", async () => {
+    const { pool } = poolFor(context())
+    vi.mocked(inspectFormReviewNeeds).mockRejectedValue(new Error("DOM inspection failed"))
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "fill_outcome_uncertain" })
+    expect(persistApplicationFillWait).toHaveBeenCalledWith(pool, expect.objectContaining({ checkpoint: "fill_outcome_uncertain", detail: "fill_outcome_uncertain" }))
+    expect(completeApplicationFillForReview).not.toHaveBeenCalled()
+  })
+
+  it("preserves bounded wait labels and opaque keys without sending confirmed answers to the browser agent", async () => {
+    const { pool } = poolFor(context({ confirmedAnswers: { ["form-answer-v2-" + "a".repeat(64)]: "Private candidate answer" } }))
+    const needs = {
+      missing: [{ key: "form-answer-v2-" + "b".repeat(64), label: "Work authorization" }],
+      sensitive: [{ key: "form-answer-v2-" + "c".repeat(64), label: "Salary expectation" }],
+    }
+    vi.mocked(inspectFormReviewNeeds).mockResolvedValue(needs)
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "waiting_for_user", failureReason: "unknown_sensitive_field" })
+    expect(persistApplicationFillWait).toHaveBeenCalledWith(pool, expect.objectContaining({ needs }))
+    expect(JSON.stringify(vi.mocked(executeBrowserFill).mock.calls[0]?.[0])).not.toContain("Private candidate answer")
   })
 
   it("recovers browser_active as a durable uncertain wait without relaunching", async () => {
