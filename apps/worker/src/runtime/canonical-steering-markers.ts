@@ -7,6 +7,7 @@ import {
 
 type Row = Record<string, unknown>
 export type PriorHistoryEntry = { readonly id: string; readonly content: unknown; readonly sequence: bigint | null }
+type PriorInputDisposition = "not_consumed" | "cancelled" | "rejected"
 export type CanonicalSteeringMarkerScope = {
   readonly userId: string
   readonly sessionId: string
@@ -38,6 +39,56 @@ export function textContent(value: unknown): string | null {
   return parts.length > 0 ? parts.join("\n").trim() : null
 }
 
+function ownValue(row: Row, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(row, key)
+  return descriptor && descriptor.enumerable && "value" in descriptor ? descriptor.value : undefined
+}
+
+function ownString(row: Row, key: string): string | null {
+  const value = ownValue(row, key)
+  return typeof value === "string" ? value : null
+}
+
+function ownConsumedStepId(row: Row): string | null {
+  const value = ownValue(row, "consumedByStepId")
+  return typeof value === "string" && value.length > 0 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) ? value : null
+}
+
+function ownNull(row: Row, key: string): boolean { return ownValue(row, key) === null }
+
+function ownDate(row: Row, key: string): Date | null {
+  const value = ownValue(row, key)
+  return value instanceof Date && Number.isFinite(value.getTime()) ? value : null
+}
+
+function priorInputDisposition(row: Row): { readonly valid: boolean; readonly value?: PriorInputDisposition } {
+  const delivery = ownString(row, "delivery")
+  const status = ownString(row, "status")
+  if ((delivery !== "steer" && delivery !== "follow_up") || !status) return { valid: false }
+  if (status === "accepted" || status === "queued") {
+    if (delivery === "follow_up") return { valid: false }
+    if (!["consumedByStepId", "consumedAt", "cancelledAt"].every(key => ownNull(row, key))) return { valid: false }
+    return { valid: true, value: "not_consumed" }
+  }
+  if (status === "consumed") {
+    if (!ownConsumedStepId(row) || !ownDate(row, "consumedAt") || !ownNull(row, "cancelledAt")) return { valid: false }
+    return { valid: true }
+  }
+  if (status === "cancelled") {
+    const consumedByStepId = ownConsumedStepId(row)
+    const consumedAt = ownDate(row, "consumedAt")
+    const unconsumed = ownNull(row, "consumedByStepId") && ownNull(row, "consumedAt")
+    if (delivery !== "follow_up" || !ownDate(row, "cancelledAt") || !(unconsumed || consumedByStepId && consumedAt)) return { valid: false }
+    return { valid: true, value: "cancelled" }
+  }
+  if (status === "rejected") {
+    if (!["consumedByStepId", "consumedAt", "cancelledAt"].every(key => ownNull(row, key))) return { valid: false }
+    return { valid: true, value: "rejected" }
+  }
+  return { valid: false }
+}
+
 export function priorConversation(rows: readonly Row[], currentTurnId: string, throughSequence: bigint | null): PriorHistoryEntry[] {
   return rows.flatMap(row => {
     const id = typeof row.id === "string" ? row.id : null
@@ -50,7 +101,12 @@ export function priorConversation(rows: readonly Row[], currentTurnId: string, t
     } catch { return [] }
     if (throughSequence !== null && sequence !== null && sequence <= throughSequence) return []
     const role = row.historyRole === "assistant" ? "assistant" : "user"
-    return id && turnId !== currentTurnId && text ? [{ id: `history:${role}:${id}`, content: { role, text }, sequence }] : []
+    if (!id || turnId === currentTurnId || !text) return []
+    if (role === "assistant") return [{ id: `history:${role}:${id}`, content: { role, text }, sequence }]
+    const disposition = priorInputDisposition(row)
+    if (!disposition.valid) return []
+    const content = disposition.value ? { role, text, priorInputDisposition: disposition.value } : { role, text }
+    return [{ id: `history:${role}:${id}`, content, sequence }]
   })
 }
 
