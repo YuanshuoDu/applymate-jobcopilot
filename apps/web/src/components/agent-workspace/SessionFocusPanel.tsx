@@ -18,12 +18,20 @@ function formWaitId(question: unknown): string | null { const waitId = question 
 export function formAnswerDraftKey(taskId: string, waitId: string, field: string) { return `${taskId}:${waitId}:${field}` }
 
 export function RetryCancelledApplicationFillButton({ sessionId, taskId }: { sessionId: string; taskId: string }) {
-  return <button type="button" onClick={() => retryCancelledApplicationFill(sessionId, taskId)} style={resumeButtonStyle}>Retry form fill</button>
+  async function onRetry(event: React.MouseEvent<HTMLButtonElement>) {
+    const alert = event.currentTarget.nextElementSibling as HTMLDivElement | null
+    if (alert) alert.textContent = ''
+    try { await retryCancelledApplicationFill(sessionId, taskId) } catch (error) {
+      if (alert) { const status = error instanceof Error ? /^server_rejected:(\d+)$/.exec(error.message)?.[1] : null; alert.textContent = status ? `Retry rejected by the server (HTTP ${status}). Refresh and try again.` : 'Could not retry the form fill. Check your connection and try again.' }
+    }
+  }
+  return <><button type="button" onClick={onRetry} style={resumeButtonStyle}>Retry form fill</button><div role="alert" aria-live="assertive" /></>
 }
 
 async function retryCancelledApplicationFill(sessionId: string, taskId: string) {
   const response = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/actions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'retry_application_fill', applicationTaskId: taskId, requestId: crypto.randomUUID() }) })
-  if (response.ok) window.dispatchEvent(new Event('applymate:sessions-changed'))
+  if (!response.ok) throw new Error(`server_rejected:${response.status}`)
+  window.dispatchEvent(new Event('applymate:sessions-changed'))
 }
 
 export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
@@ -77,7 +85,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
       window.dispatchEvent(new Event('applymate:sessions-changed'))
     }
   }
-
   async function answerQuestion(questionId: string, answer: string) {
     const response = await fetch('/api/agent/answer', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -210,18 +217,11 @@ function EmptyText({ children }: { children: React.ReactNode }) {
 }
 
 const sectionTitleStyle: React.CSSProperties = {
-  fontSize: 10,
-  color: 'var(--text-muted)',
-  textTransform: 'uppercase',
-  letterSpacing: 0,
-  fontWeight: 700,
-  marginBottom: 6,
+  fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0,
+  fontWeight: 700, marginBottom: 6,
 }
 const rowStyle: React.CSSProperties = {
-  display: 'flex',
-  alignItems: 'flex-start',
-  gap: 8,
-  padding: '9px 10px',
+  display: 'flex', alignItems: 'flex-start', gap: 8, padding: '9px 10px',
   borderTop: '1px solid var(--border)',
 }
 const rowTitleStyle: React.CSSProperties = {

@@ -50,22 +50,44 @@ describe('SessionFocusPanel application fill retry', () => {
     expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).not.toContain('Retry form fill')
   })
 
-  it('posts one explicit retry with a fresh request ID only when its button is clicked', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: false })
+  it('posts one explicit retry and refreshes only after success', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 202 })
     const randomUUID = vi.fn().mockReturnValue('retry_request_12345678')
+    const dispatchEvent = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('crypto', { randomUUID })
-    const button = RetryCancelledApplicationFillButton({ sessionId: 'session_1', taskId: 'application_1' })
-
-    await button.props.onClick({} as React.MouseEvent<HTMLButtonElement>)
+    vi.stubGlobal('window', { dispatchEvent })
+    const element = RetryCancelledApplicationFillButton({ sessionId: 'session_1', taskId: 'application_1' }) as React.ReactElement<{ children: React.ReactNode }>
+    const [button, alert] = React.Children.toArray(element.props.children) as React.ReactElement[]
+    await (button!.props as { onClick: (event: React.MouseEvent<HTMLButtonElement>) => Promise<void> }).onClick({ currentTarget: { nextElementSibling: { textContent: '' } } } as unknown as React.MouseEvent<HTMLButtonElement>)
 
     expect(randomUUID).toHaveBeenCalledOnce()
     expect(fetchMock).toHaveBeenCalledOnce()
     expect(fetchMock).toHaveBeenCalledWith('/api/agent/sessions/session_1/actions', expect.objectContaining({
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'retry_application_fill', applicationTaskId: 'application_1', requestId: 'retry_request_12345678' }),
     }))
+    expect((alert!.props as { role?: string; 'aria-live'?: string })).toMatchObject({ role: 'alert', 'aria-live': 'assertive' })
+    expect(dispatchEvent).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['server rejection', async () => ({ ok: false, status: 409 }), 'Retry rejected by the server (HTTP 409). Refresh and try again.'],
+    ['network failure', async () => { throw new Error('offline') }, 'Could not retry the form fill. Check your connection and try again.'],
+  ])('announces %s in the alert region without dispatching success', async (_reason, respond, expectedMessage) => {
+    const fetchMock = vi.fn().mockImplementation(respond)
+    const dispatchEvent = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('crypto', { randomUUID: vi.fn().mockReturnValue('retry_request_12345678') })
+    vi.stubGlobal('window', { dispatchEvent })
+    const element = RetryCancelledApplicationFillButton({ sessionId: 'session_1', taskId: 'application_1' }) as React.ReactElement<{ children: React.ReactNode }>
+    const [button, alert] = React.Children.toArray(element.props.children) as React.ReactElement[]
+    const feedback = { textContent: '' }
+    await (button!.props as { onClick: (event: React.MouseEvent<HTMLButtonElement>) => Promise<void> }).onClick({ currentTarget: { nextElementSibling: feedback } } as unknown as React.MouseEvent<HTMLButtonElement>)
+
+    expect((alert!.props as { role?: string; 'aria-live'?: string })).toMatchObject({ role: 'alert', 'aria-live': 'assertive' })
+    expect(feedback.textContent).toBe(expectedMessage)
+    expect(dispatchEvent).not.toHaveBeenCalled()
   })
 
   it('does not dispatch a retry just by rendering the user-cancelled task', () => {
