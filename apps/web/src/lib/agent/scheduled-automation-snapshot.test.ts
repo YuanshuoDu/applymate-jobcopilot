@@ -30,6 +30,27 @@ describe("buildScheduledAutomationSnapshot", () => {
     })
   })
 
+  it("trims non-empty role and location entries while preserving their order", () => {
+    expect(buildScheduledAutomationSnapshot({
+      ...validInput(),
+      targetRoles: ["  Engineer ", "Data Scientist  "],
+      targetLocations: [" Dublin", "Amsterdam  "],
+    })).toMatchObject({
+      targetRoles: ["Engineer", "Data Scientist"],
+      targetLocations: ["Dublin", "Amsterdam"],
+    })
+  })
+
+  it.each([
+    ["targetRoles", [""]],
+    ["targetRoles", [" \t "]],
+    ["targetLocations", [""]],
+    ["targetLocations", [" \t "]],
+  ] as const)("rejects blank-only %s entries", (field, value) => {
+    expect(() => buildScheduledAutomationSnapshot({ ...validInput(), [field]: value }))
+      .toThrow(ScheduledAutomationSnapshotValidationError)
+  })
+
   it("accepts the inclusive numeric bounds and empty lists", () => {
     expect(buildScheduledAutomationSnapshot({
       targetRoles: [],

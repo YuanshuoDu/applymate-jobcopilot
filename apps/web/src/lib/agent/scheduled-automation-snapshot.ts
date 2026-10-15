@@ -48,7 +48,11 @@ function readStringArray(value: unknown, field: "targetRoles" | "targetLocations
     if (typeof entry !== "string") {
       throw new ScheduledAutomationSnapshotValidationError(field, "an array of strings")
     }
-    copy.push(entry)
+    const trimmedEntry = entry.trim()
+    if (!trimmedEntry) {
+      throw new ScheduledAutomationSnapshotValidationError(field, "an array of non-empty strings")
+    }
+    copy.push(trimmedEntry)
   }
   return copy
 }
