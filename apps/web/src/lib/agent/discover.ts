@@ -553,7 +553,8 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
   const adzunaKey = keys.adzunaAppKey
   const cleanJobDataKey = keys.cleanJobDataApiKey
   const fantasticJobsKey = keys.fantasticJobsApiKey
-  const fantasticShadowActive = fantasticShadowEnabled && Boolean(fantasticJobsKey) && (!source || source.toLowerCase() === 'fantasticjobs')
+  const fantasticJobsSelected = source?.toLowerCase() === 'fantasticjobs'
+  const fantasticShadowActive = fantasticShadowEnabled && Boolean(fantasticJobsKey) && (!source || fantasticJobsSelected)
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
@@ -759,10 +760,10 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
         : { items: [] as DiscoveredJob[], decisions: [] }
       if (fantasticShadowActive) recordScoutDecisions(shadow.decisions, keys, userId, role, loc)
 
-      const allResults = visible.items
+      const allResults = fantasticJobsSelected ? shadow.items : visible.items
       const shadowResults = shadow.items
 
-      if (fantasticShadowActive) {
+      if (fantasticShadowActive && !fantasticJobsSelected) {
         const evidence = compareShadowJobs(allResults, shadowResults)
         void recordDiscoveryOptimization({
           userId, eventType: 'shadow_comparison', provider: 'fantasticjobs', credentialScope: 'platform',

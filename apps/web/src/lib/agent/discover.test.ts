@@ -255,6 +255,12 @@ describe('discoverJobs platform controls', () => {
       rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '',
       fantasticJobsApiKey: 'fantastic-key',
     })
+    mocks.fetchFantasticJobs.mockResolvedValue([{
+      title: 'Platform Engineer', company: 'Acme', location: 'Berlin, Germany',
+      url: 'https://jobs.example.com/fj-1', description: 'Build APIs', salary: null,
+      logo: null, source: 'fantasticjobs', externalId: 'fj-1', postedAt: null,
+      jobType: null, experienceLevel: null, workArrangement: null,
+    }])
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
 
@@ -263,7 +269,9 @@ describe('discoverJobs platform controls', () => {
       existingUrls: new Set(), maxResults: 5,
     })
 
-    expect(jobs).toEqual([])
+    expect(jobs).toEqual([expect.objectContaining({
+      title: 'Platform Engineer', company: 'Acme', source: 'fantasticjobs', url: 'https://jobs.example.com/fj-1',
+    })])
     expect(mocks.fetchFantasticJobs).toHaveBeenCalledOnce()
     expect(mocks.reserveProviderQuota.mock.calls.map(([call]) => (call as { provider: string }).provider)).toEqual(['fantasticjobs'])
     expect(fetchMock).not.toHaveBeenCalled()
