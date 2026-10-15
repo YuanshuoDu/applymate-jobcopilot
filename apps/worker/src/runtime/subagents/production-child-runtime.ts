@@ -206,9 +206,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
   }
 }
 
-export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean {
-  return value === "1"
-}
+export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean { return value === "1" }
 
 function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReader"] | undefined {
   // Keep lightweight construction fixtures usable; a real pg.Pool exposes
@@ -228,26 +226,18 @@ function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   let genericExecutor: SubagentExecutor | undefined
   return async ({ lease }) => {
-    const fillerRole = lease.role === "application_filler"
-    const fillerTaskType = lease.taskType === "application_fill_for_review"
-    if (fillerRole || fillerTaskType) {
-      if (!fillerRole || !fillerTaskType) return {
-        status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal",
-      }
-      const { executeApplicationFillForReview } = await import("./application-fill-for-review.js")
-      return executeApplicationFillForReview({ pool: options.pool, lease })
+    if (lease.role === "application_filler" || lease.taskType === "application_fill_for_review") {
+      if (lease.role !== "application_filler" || lease.taskType !== "application_fill_for_review") return { status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal" }
+      return (await import("./application-fill-for-review.js")).executeApplicationFillForReview({ pool: options.pool, lease })
     }
     if (!genericExecutor) {
       const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
-      const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
-      const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
-      const mailboxReader = options.mailboxReader ?? defaultMailboxReader(options.pool)
-      const resumeLoader = options.resumeLoader ?? defaultResumeLoader(options.pool)
       genericExecutor = createChildExecutor({
-        store: bindStore(engineStore), treeBudget, authorizeUsage,
+        store: bindStore(engineStore), treeBudget: options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool),
+        authorizeUsage: options.authorizeUsage ?? createWorkerUsageAuthorizer(),
         modelRuntimeFactory: options.modelRuntimeFactory,
         toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner, options.jobDiscoveryClient)),
-        mailboxReader, resumeLoader,
+        mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? defaultResumeLoader(options.pool),
       })
     }
     return genericExecutor({ lease })
@@ -255,6 +245,5 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
 }
 
 export function createOptionalProductionChildExecutor(options: ProductionChildRuntimeOptions & { readonly enabled?: boolean }): SubagentExecutor | undefined {
-  const enabled = options.enabled ?? childExecutionEnabled()
-  return enabled ? createProductionChildExecutor(options) : undefined
+  return (options.enabled ?? childExecutionEnabled()) ? createProductionChildExecutor(options) : undefined
 }

@@ -52,6 +52,7 @@ CREATE TABLE "application_tasks" (
   "fillTurnUserId" TEXT,
   "status" TEXT NOT NULL DEFAULT 'discovered',
   "checkpoint" TEXT,
+  "confirmedAnswers" JSONB,
   "error" TEXT,
   "startedAt" TIMESTAMP(3),
   "completedAt" TIMESTAMP(3),
@@ -65,6 +66,64 @@ CREATE TABLE "application_tasks" (
   CONSTRAINT "application_tasks_fill_turn_scope_key" UNIQUE ("fillTurnId", "fillTurnSessionId", "fillTurnUserId"),
   CONSTRAINT "application_tasks_fill_turn_fkey" FOREIGN KEY ("fillTurnId", "fillTurnSessionId", "fillTurnUserId")
     REFERENCES "agent_turns" ("id", "sessionId", "userId") ON DELETE SET NULL
+);
+
+CREATE TABLE "sub_agent_tasks" (
+  "id" TEXT PRIMARY KEY,
+  "sessionId" TEXT NOT NULL,
+  "turnId" TEXT,
+  "role" TEXT NOT NULL,
+  "taskType" TEXT NOT NULL,
+  "status" TEXT NOT NULL,
+  "attemptCount" INTEGER NOT NULL DEFAULT 0,
+  "leaseOwner" TEXT,
+  "leaseExpiresAt" TIMESTAMP(3),
+  "interruptRequestedAt" TIMESTAMP(3),
+  "nextAttemptAt" TIMESTAMP(3),
+  "completedAt" TIMESTAMP(3),
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE "agent_executions" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "sessionId" TEXT NOT NULL,
+  "status" TEXT NOT NULL,
+  "checkpoint" TEXT,
+  "cancelledAt" TIMESTAMP(3),
+  "completedAt" TIMESTAMP(3),
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE "agent_approvals" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "sessionId" TEXT NOT NULL,
+  "turnId" TEXT,
+  "taskId" TEXT,
+  "type" TEXT NOT NULL,
+  "status" TEXT NOT NULL,
+  "payload" JSONB NOT NULL,
+  "scopeHash" TEXT,
+  "revision" INTEGER NOT NULL DEFAULT 0,
+  "decidedAt" TIMESTAMP(3)
+);
+
+CREATE TABLE "AgentRunQuestion" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "runId" TEXT NOT NULL,
+  "answer" TEXT
+);
+
+CREATE TABLE "application_task_events" (
+  "id" TEXT PRIMARY KEY,
+  "taskId" TEXT NOT NULL,
+  "type" TEXT NOT NULL,
+  "actor" TEXT NOT NULL,
+  "body" TEXT NOT NULL,
+  "data" JSONB,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE "agent_inputs" (
