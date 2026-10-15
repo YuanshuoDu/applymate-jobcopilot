@@ -257,6 +257,27 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     await expect(prisma!.applicationTask.findUnique({ where: { id: taskId }, select: { status: true, checkpoint: true } }))
       .resolves.toEqual({ status: "cancelled", checkpoint: "turn_stopped_before_submit" })
     await expect(prisma!.applicationTaskEvent.count({ where: { taskId } })).resolves.toBe(0)
+
+    await expect(startApplicationFillForReview(prisma!, {
+      sessionId, userId, applicationTaskId: taskId, clientMessageId: `stop-retry-active-${randomUUID()}`, retry: true,
+    })).rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    await expect(prisma!.agentTurn.count({ where: { sessionId } })).resolves.toBe(1)
+    await expect(prisma!.applicationTask.findUnique({ where: { id: taskId }, select: { status: true, checkpoint: true, fillTurnId: true } }))
+      .resolves.toEqual({ status: "cancelled", checkpoint: "turn_stopped_before_submit", fillTurnId: started.turnId })
+
+    await prisma!.$executeRaw`UPDATE "sub_agent_tasks" SET "status" = 'interrupted', "leaseOwner" = NULL,
+      "leaseExpiresAt" = NULL, "completedAt" = CURRENT_TIMESTAMP WHERE "id" = ${childId}`
+    const retried = await startApplicationFillForReview(prisma!, {
+      sessionId, userId, applicationTaskId: taskId, clientMessageId: `stop-retry-fenced-${randomUUID()}`, retry: true,
+    })
+
+    expect(retried.disposition).toBe("started")
+    expect(retried.turnId).not.toBe(started.turnId)
+    await expect(prisma!.agentTurn.findUnique({ where: { id: started.turnId }, select: { status: true } }))
+      .resolves.toEqual({ status: "interrupted" })
+    await expect(prisma!.agentTurn.count({ where: { sessionId } })).resolves.toBe(2)
+    await expect(prisma!.applicationTask.findUnique({ where: { id: taskId }, select: { fillTurnId: true, fillTurnSessionId: true, fillTurnUserId: true, status: true, checkpoint: true } }))
+      .resolves.toEqual({ fillTurnId: retried.turnId, fillTurnSessionId: sessionId, fillTurnUserId: userId, status: "filling", checkpoint: "taskgraph_fill_queued" })
   })
 
   it("creates a retry Turn only after the previous failed fill Turn is terminal", async () => {

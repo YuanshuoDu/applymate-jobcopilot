@@ -8,13 +8,14 @@ import { startApplicationFillForReview } from "./application-fill-command"
 
 type Row = Record<string, unknown>
 type Task = { id: string; userId: string; sessionId: string; jobId: string; resumeId: string | null; coverLetterId: string | null; status: string; checkpoint: string | null; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; confirmedAnswers?: unknown }
-type ResumeSeed = { waitEvents?: Row[]; answerEvents?: Row[]; fillers?: Row[]; rootLeaseOwnerId?: string | null; rootLeaseExpiresAt?: Date | null; sessionStatus?: string }
+type ResumeSeed = { waitEvents?: Row[]; answerEvents?: Row[]; fillers?: Row[]; rootLeaseOwnerId?: string | null; rootLeaseExpiresAt?: Date | null; sessionStatus?: string; turnStatus?: string; turnSessionId?: string; turnUserId?: string; activeTurn?: boolean }
 type MaterialSeed = { jobOwned?: boolean; resumeAssociated?: boolean; coverLetterAssociated?: boolean }
 
 function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSeed, materialSeed: MaterialSeed = {}) {
   let task: Task = { id: "application_1", userId: "user_1", sessionId: "session_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null, status: "waiting_for_user", checkpoint: "materials_ready", fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, confirmedAnswers: null, ...seed }
   let sessionStatus = resume?.sessionStatus ?? (resume ? "waiting_for_user" : "running")
-  let turns: Row[] = seed.fillTurnId ? [{ id: seed.fillTurnId, sessionId: "session_1", userId: "user_1", status: resume ? "waiting_for_user" : "completed", revision: 0, input: {}, leaseOwnerId: resume?.rootLeaseOwnerId ?? null, leaseExpiresAt: resume?.rootLeaseExpiresAt ?? null }] : []
+  let turns: Row[] = seed.fillTurnId ? [{ id: seed.fillTurnId, sessionId: resume?.turnSessionId ?? "session_1", userId: resume?.turnUserId ?? "user_1", status: resume?.turnStatus ?? (resume ? "waiting_for_user" : "completed"), revision: 0, input: {}, leaseOwnerId: resume?.rootLeaseOwnerId ?? null, leaseExpiresAt: resume?.rootLeaseExpiresAt ?? null }] : []
+  if (resume?.activeTurn) turns.push({ id: "turn_active", sessionId: "session_1", userId: "user_1", status: "in_progress", revision: 0, input: {} })
   const fillers = resume?.fillers ?? []
   let inputs: Row[] = []
   let items: Row[] = []
@@ -27,6 +28,7 @@ function harness(seed: Partial<Task> = {}, failOutbox = false, resume?: ResumeSe
     $queryRaw: vi.fn(async (query: unknown) => {
       const sql = ((query as { strings?: readonly string[] }).strings ?? []).join(" ")
       if (sql.includes('FROM "agent_sessions"')) return [{ id: "session_1" }]
+      if (sql.includes('FROM "agent_turns"')) return turns.filter(turn => turn.id === "turn_previous" && turn.sessionId === "session_1" && turn.userId === "user_1").map(turn => ({ id: turn.id, status: turn.status }))
       if (sql.includes('FROM "application_tasks" AS app')) {
         if (task.resumeId === null || materialSeed.jobOwned === false || materialSeed.resumeAssociated === false) return []
         return [{ jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId }]
@@ -182,6 +184,79 @@ describe("startApplicationFillForReview", () => {
     expect(result.turnId).not.toBe("turn_previous")
     expect(fake.state.task).toMatchObject({ fillTurnId: result.turnId, status: "filling", checkpoint: "taskgraph_fill_queued" })
     expect(fake.state.turns).toHaveLength(2)
+  })
+
+  it("waits for a Stop-cancelled filler to become terminal and lease-free before an explicit retry", async () => {
+    const retrySeed = { fillers: [{ id: "subagent_fill_1", status: "running", leaseOwner: "worker_1", leaseExpiresAt: new Date("2026-10-15T10:05:00.000Z"), interruptRequestedAt: new Date() } as Row], turnStatus: "interrupted" }
+    const stopped = harness(
+      { status: "cancelled", checkpoint: "turn_stopped_before_submit", fillTurnId: "turn_previous", fillTurnSessionId: "session_1", fillTurnUserId: "user_1" },
+      false,
+      retrySeed,
+    )
+
+    await expect(startApplicationFillForReview(stopped.db, command("fill_retry_while_running", true)))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(stopped.state.task).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit", fillTurnId: "turn_previous" })
+    expect(stopped.state.turns).toHaveLength(1)
+    expect(stopped.state.outbox).toHaveLength(0)
+
+    retrySeed.fillers[0].status = "interrupted"
+    retrySeed.fillers[0].leaseOwner = null
+    retrySeed.fillers[0].leaseExpiresAt = null
+    const retried = await startApplicationFillForReview(stopped.db, command("fill_retry_after_worker_ack", true))
+
+    expect(retried.disposition).toBe("started")
+    expect(retried.turnId).not.toBe("turn_previous")
+    expect(stopped.state.task).toMatchObject({ fillTurnId: retried.turnId, fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "filling", checkpoint: "taskgraph_fill_queued" })
+    expect(stopped.state.turns).toHaveLength(2)
+    expect(JSON.stringify(stopped.state.items)).toContain("Never submit it.")
+    const queries = stopped.tx.$queryRaw.mock.calls.map(([query]) => ((query as { strings?: readonly string[] }).strings ?? []).join(" "))
+    const previewLock = queries.findIndex(sql => sql.includes('FROM "application_tasks"') && !sql.includes("FOR UPDATE"))
+    const sessionLock = queries.findIndex(sql => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const priorTurnLock = queries.findIndex(sql => sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE"))
+    const fillerLock = queries.findIndex(sql => sql.includes('FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE OF task"))
+    const taskLock = queries.findIndex(sql => sql.includes('FROM "application_tasks"') && sql.includes("FOR UPDATE"))
+    expect([sessionLock, previewLock, priorTurnLock, fillerLock, taskLock]).toEqual([
+      expect.any(Number), expect.any(Number), expect.any(Number), expect.any(Number), expect.any(Number),
+    ])
+    expect(sessionLock).toBeLessThan(previewLock)
+    expect(previewLock).toBeLessThan(priorTurnLock)
+    expect(priorTurnLock).toBeLessThan(fillerLock)
+    expect(fillerLock).toBeLessThan(taskLock)
+  })
+
+  it.each([
+    ["application binding", { fillTurnUserId: "other_user" }, { turnStatus: "interrupted" }],
+    ["application session binding", { fillTurnSessionId: "other_session" }, { turnStatus: "interrupted" }],
+    ["Turn owner", {}, { turnStatus: "interrupted", turnUserId: "other_user" }],
+    ["Turn session", {}, { turnStatus: "interrupted", turnSessionId: "other_session" }],
+  ] as const)("rejects a Stop retry with a mismatched %s", async (_scope, taskScope, turnScope) => {
+    const fake = harness({
+      status: "cancelled", checkpoint: "turn_stopped_before_submit", fillTurnId: "turn_previous",
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1", ...taskScope,
+    }, false, { fillers: [{ id: "subagent_fill_1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }], ...turnScope })
+
+    await expect(startApplicationFillForReview(fake.db, command("fill_retry_wrong_scope", true)))
+      .rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    expect(fake.state.task.fillTurnId).toBe("turn_previous")
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("rejects a safe stopped retry while another Turn is active in the same session", async () => {
+    const fake = harness({
+      status: "cancelled", checkpoint: "turn_stopped_before_submit", fillTurnId: "turn_previous",
+      fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+    }, false, {
+      fillers: [{ id: "subagent_fill_1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }],
+      turnStatus: "interrupted", activeTurn: true,
+    })
+
+    await expect(startApplicationFillForReview(fake.db, command("fill_retry_with_active_turn", true)))
+      .rejects.toMatchObject({ code: "retry_active_conflict", status: 409 })
+    expect(fake.state.task.fillTurnId).toBe("turn_previous")
+    expect(fake.state.turns).toHaveLength(2)
+    expect(fake.state.outbox).toHaveLength(0)
   })
 
   it("does not auto-retry an ambiguous or non-terminal previous attempt", async () => {

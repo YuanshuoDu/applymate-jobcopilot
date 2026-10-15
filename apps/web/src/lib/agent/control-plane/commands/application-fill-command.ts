@@ -2,12 +2,10 @@ import { Prisma, type PrismaClient } from "@prisma/client"
 
 import { interruptActiveTurn } from "./execution-cancellation"
 import { AgentCommandError, invalidCommand, isUniqueViolation } from "./errors"
-import { assertApplicationFillPreflight } from "./application-fill-preflight"
+import { assertApplicationFillPreflight, assertApplicationFillRetryReady, lockApplicationFillTask } from "./application-fill-preflight"
 import { acceptInputFacts, createRootTurn, findActiveTurn, findExistingCommand, lockOpenSession, type CommandTransaction } from "./transaction"
 import type { CommandIdentity, CommandResult, InterruptCommand } from "./types"
 
-const TERMINAL_TURNS = ["completed", "failed", "interrupted", "cancelled"]
-const RETRY_CHECKPOINTS = ["fill_prestart_failed", "taskgraph_fill_failed"]
 const START_CHECKPOINTS = ["materials_ready"]
 const CONTENT = [{ type: "text" as const, text: "Fill the server-bound application form for user review. Never submit it." }]
 
@@ -52,13 +50,7 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
         }
       }
 
-      const rows = await tx.$queryRaw<Array<{ id: string; status: string; checkpoint: string | null; fillTurnId: string | null; fillTurnSessionId: string | null; fillTurnUserId: string | null; confirmedAnswers?: unknown }>>(Prisma.sql`
-        SELECT "id", "status", "checkpoint", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "confirmedAnswers"
-        FROM "application_tasks"
-        WHERE "id" = ${command.applicationTaskId} AND "userId" = ${identity.userId} AND "sessionId" = ${identity.sessionId}
-        FOR UPDATE
-      `)
-      const task = rows[0]
+      const { task, stoppedRetryReady } = await lockApplicationFillTask(tx, command.applicationTaskId, identity, Boolean(command.retry))
       if (!task) throw new AgentCommandError("agent_session_not_found", "Application task not found", 404)
       if (command.resumeAfterUserInput) {
         if (task.fillTurnId && task.fillTurnSessionId === identity.sessionId && task.fillTurnUserId === identity.userId) {
@@ -93,8 +85,9 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
         return existingFillResult(tx, task.fillTurnId, identity)
       }
 
-      if (command.retry) await assertRetryReady(tx, task, identity)
-      else if (task.status !== "waiting_for_user" || !START_CHECKPOINTS.includes(task.checkpoint ?? "")) {
+      if (command.retry) {
+        if (!stoppedRetryReady) await assertApplicationFillRetryReady(tx, task, identity)
+      } else if (task.status !== "waiting_for_user" || !START_CHECKPOINTS.includes(task.checkpoint ?? "")) {
         throw new AgentCommandError("retry_target_invalid", "Application task is not ready for a fill-for-review pass", 409)
       }
       const active = await findActiveTurn(tx, identity.sessionId, identity.userId)
@@ -225,20 +218,4 @@ async function existingResumedTurnResult(
 function hasConfirmedAnswers(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   return Object.entries(value).some(([key, answer]) => key.trim().length > 0 && typeof answer === "string" && answer.trim().length > 0)
-}
-
-async function assertRetryReady(
-  tx: CommandTransaction,
-  task: { fillTurnId: string | null; status: string; checkpoint: string | null },
-  identity: CommandIdentity,
-): Promise<void> {
-  if (!task.fillTurnId || task.status !== "failed" || !RETRY_CHECKPOINTS.includes(task.checkpoint ?? "")) {
-    throw new AgentCommandError("retry_target_invalid", "Application fill is not in a safely retryable terminal state", 409)
-  }
-  const previous = await tx.agentTurn.findFirst({
-    where: { id: task.fillTurnId, sessionId: identity.sessionId, userId: identity.userId }, select: { id: true, status: true },
-  })
-  if (!previous || !TERMINAL_TURNS.includes(previous.status)) {
-    throw new AgentCommandError("retry_target_invalid", "The prior application fill Turn is not terminal", 409)
-  }
 }
