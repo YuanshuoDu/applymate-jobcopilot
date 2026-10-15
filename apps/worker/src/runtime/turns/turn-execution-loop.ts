@@ -3,7 +3,7 @@ import { signalWasInterrupted } from "../interrupt/registry.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { BudgetExceededError, createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
-import { NoProgressError, createProgressDetector } from "../progress.js"
+import { NoProgressError, createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
@@ -126,7 +126,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           const questionCallId = nativeQuestionCallId(output, options.identity)
           if (questionCallId && (!executionOptions.store.stageQuestionUsage || !executionOptions.store.cancelPausedQuestion)) throw new TurnEngineError("invalid_output", "Native question store is unavailable")
           questionIntentCallId = questionCallId
-          progress.observe({ snapshot, toolCalls: output.toolCalls })
+          progress.observe({ snapshot, toolCalls: output.toolCalls }, progressCheckpointFromStepContext(context))
           budget.reserveToolCalls(output.toolCalls.length)
           if (output.text) await publishCommentary(writer, options, step, output.text, now)
           let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof steeringMarkerState }

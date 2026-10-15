@@ -86,7 +86,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   const contextBuilder: TurnExecutionOptions["contextBuilder"] = {
     build: async ({ identity, stepId, snapshot }): Promise<StepContext> => ({
       schemaVersion: "agent-harness.v2", sessionId: identity.sessionId, turnId: identity.turnId, stepId,
-      inputThroughSequence: BigInt(snapshot.toolObservations.length + 1), consumedInputIds: [],
+      inputThroughSequence: 0n, consumedInputIds: [],
       blocks: snapshot.toolObservations.map(observation => ({
         id: `observation:${observation.id}`, layer: "tool_observation", role: "data", trust: "external_untrusted",
         source: "tool_or_subagent", content: observation.content as { readonly job: string },
@@ -103,6 +103,19 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     ...(completionGate ? { completionGate } : {}),
   }
   return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
+}
+
+function repeatedSearchModel(root: Fixture): ModelAdapter {
+  let callCount = 0
+  return {
+    ...root.options.model,
+    async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+      root.requests.push(request)
+      callCount += 1
+      yield { type: "tool_call_completed", callId: `repeat-search-${callCount}`, name: "jobs.search", arguments: { location: "Dublin" } }
+      yield { type: "completed", finishReason: "tool_calls" }
+    },
+  }
 }
 
 function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = "ask-1") {
@@ -1096,6 +1109,110 @@ describe("owner-agnostic turn execution loop", () => {
     ]))
     expect(JSON.stringify(secondRequest?.messages).split(lateSteerText)).toHaveLength(2)
     expect(JSON.stringify(secondRequest?.messages).match(/"type":"tool_result"/g)).toHaveLength(1)
+  })
+
+  it("dispatches one repeated signature after a fresh owned steer, then stops unchanged repeats", async () => {
+    const root = fixture(identity("turn", "root-1")), inputStore = new LateSteerInputClaimStore()
+    const turnStore = root.options.store, baseBuilder = new StepContextBuilder(inputStore)
+    const executeTool = root.options.executeTool
+    let builds = 0, dispatches = 0
+    root.options = {
+      ...root.options,
+      store: { ...turnStore, startStep: async input => {
+        inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+        return turnStore.startStep(input)
+      } },
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build({
+          scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+          stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+          steeringMarkerState: request.steeringMarkerState,
+        })
+        if (++builds === 2) inputStore.acceptSteer()
+        return context
+      } },
+      model: repeatedSearchModel(root),
+      executeTool: async request => { dispatches += 1; return executeTool(request) },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const steeredMessages = root.requests[2]?.messages.flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : [])).join("\n") ?? ""
+    const diagnostic = root.events.find(event => event.type === "turn.no_progress")?.payload
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 4, toolCallCount: 3 })
+    expect(root.requests).toHaveLength(4)
+    expect(dispatches).toBe(3)
+    expect(steeredMessages).toContain(lateSteerText)
+    expect(JSON.stringify(diagnostic)).not.toContain(lateSteerText)
+    expect(JSON.stringify(diagnostic)).not.toContain("steer-539")
+  })
+
+  it("keeps private repeated tool data out of no-progress events and the final blocker", async () => {
+    const markers = ["private-tool-argument-675", "private-observation-input-675", "private-observation-output-675"]
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "private-observation", content: {
+      toolName: "jobs.search", input: { query: markers[1] }, status: "completed", output: { detail: markers[2] }, errorCode: null,
+    } }])
+    let modelCalls = 0, dispatches = 0
+    const executeTool = root.options.executeTool
+    root.options = {
+      ...root.options,
+      model: {
+        ...root.options.model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          modelCalls += 1
+          yield { type: "tool_call_completed", callId: `private-repeat-${modelCalls}`, name: "jobs.search", arguments: { query: markers[0] } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        },
+      },
+      executeTool: async request => { dispatches += 1; return executeTool(request) },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const diagnostics = root.events.filter(event => event.type === "turn.no_progress" || event.type === "turn.failed")
+    const noProgress = root.events.find(event => event.type === "turn.no_progress")?.payload
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress" })
+    expect(dispatches).toBe(2)
+    expect(noProgress).toMatchObject({
+      reasonCode: "repeated_signature",
+      signature: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      stateFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    })
+    expect(JSON.stringify(diagnostics)).not.toContain(markers[0])
+    expect(JSON.stringify(diagnostics)).not.toContain(markers[1])
+    expect(JSON.stringify(diagnostics)).not.toContain(markers[2])
+    expect(JSON.stringify(root.finalResponses)).not.toContain(markers[0])
+    expect(JSON.stringify(root.finalResponses)).not.toContain(markers[1])
+    expect(JSON.stringify(root.finalResponses)).not.toContain(markers[2])
+  })
+
+  it("opens one repeated-signature window for a trusted TaskGraph revision change", async () => {
+    const root = fixture(identity("turn", "root-1")), baseBuilder = root.options.contextBuilder
+    const executeTool = root.options.executeTool
+    let refreshes = 0, dispatches = 0
+    const revisionsSeen: Array<number | undefined> = []
+    root.options = {
+      ...root.options,
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, {
+        revision: refreshes++ < 2 ? 0 : 1, nodes: [],
+      }),
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build(request)
+        const taskGraphRevision = request.snapshot.taskGraphRevision
+        revisionsSeen.push(taskGraphRevision)
+        return { ...context, ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }) }
+      } },
+      model: repeatedSearchModel(root),
+      executeTool: async request => { dispatches += 1; return executeTool(request) },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 4, toolCallCount: 3 })
+    expect(revisionsSeen).toEqual([0, 0, 1, 1])
+    expect(root.requests).toHaveLength(4)
+    expect(dispatches).toBe(3)
   })
 
   it("binds each refreshed graph revision to the same-step fresh-steering request and agenda", async () => {
