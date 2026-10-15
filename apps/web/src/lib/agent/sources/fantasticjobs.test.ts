@@ -32,9 +32,36 @@ describe('fetchFantasticJobs', () => {
   })
 
   it('fails open when the key or response is unavailable', async () => {
-    await expect(fetchFantasticJobs({ apiKey: ' ' })).resolves.toEqual([])
+    const onProviderFailure = vi.fn()
+    await expect(fetchFantasticJobs({ apiKey: ' ', onProviderFailure })).resolves.toEqual([])
+    expect(onProviderFailure).not.toHaveBeenCalled()
     mocks.pinnedFetch.mockResolvedValue(new Response(null, { status: 401 }))
-    await expect(fetchFantasticJobs({ apiKey: 'secret' })).resolves.toEqual([])
+    await expect(fetchFantasticJobs({ apiKey: 'secret', onProviderFailure })).resolves.toEqual([])
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['malformed response shape', new Response(JSON.stringify({ data: {} }), { status: 200 })],
+    ['malformed JSON', new Response('{', { status: 200 })],
+  ])('reports %s while preserving the empty fallback', async (_name, response) => {
+    mocks.pinnedFetch.mockResolvedValue(response)
+    const onProviderFailure = vi.fn()
+
+    await expect(fetchFantasticJobs({ apiKey: 'secret', onProviderFailure })).resolves.toEqual([])
+
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports network failures but not a successful empty result', async () => {
+    const onProviderFailure = vi.fn()
+    mocks.pinnedFetch.mockRejectedValueOnce(new Error('network unavailable'))
+    await expect(fetchFantasticJobs({ apiKey: 'secret', onProviderFailure })).resolves.toEqual([])
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
+
+    onProviderFailure.mockClear()
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    await expect(fetchFantasticJobs({ apiKey: 'secret', onProviderFailure })).resolves.toEqual([])
+    expect(onProviderFailure).not.toHaveBeenCalled()
   })
 
   it('drops non-http application destinations before they can enter discovery', async () => {
@@ -46,5 +73,31 @@ describe('fetchFantasticJobs', () => {
     const jobs = await fetchFantasticJobs({ apiKey: 'secret' })
 
     expect(jobs.map(job => job.externalId)).toEqual(['safe'])
+  })
+
+  it('reports malformed rows once and preserves valid partial results', async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify([
+      { id: 'safe', title: 'Engineer', organization: { name: 'Acme' }, url: 'https://jobs.example/safe' },
+      { id: 'missing-title', organization: { name: 'Acme' }, url: 'https://jobs.example/missing-title' },
+      { id: 'unsafe', title: 'Engineer', organization: { name: 'Acme' }, url: 'javascript:alert(1)' },
+    ]), { status: 200 }))
+    const onProviderFailure = vi.fn()
+
+    const jobs = await fetchFantasticJobs({ apiKey: 'secret', onProviderFailure })
+
+    expect(jobs.map(job => job.externalId)).toEqual(['safe'])
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports all-invalid rows once and preserves the empty fallback', async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify([
+      { id: 'missing-title', organization: { name: 'Acme' }, url: 'https://jobs.example/missing-title' },
+      { id: 'unsafe', title: 'Engineer', organization: { name: 'Acme' }, url: 'javascript:alert(1)' },
+    ]), { status: 200 }))
+    const onProviderFailure = vi.fn()
+
+    await expect(fetchFantasticJobs({ apiKey: 'secret', onProviderFailure })).resolves.toEqual([])
+
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
   })
 })

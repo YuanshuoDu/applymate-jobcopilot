@@ -64,7 +64,7 @@ export class ToolResultSanitizationError extends Error {
 
 function sanitizeSource(value: unknown, toolName: CanonicalToolSourceName): RepositoryJsonValue {
   if (toolName === "agent.wait" || toolName === "wait_subagents") return redactDurableWaitOutput(value)
-  if (toolName === "jobs.search" || toolName === "jobs.get") return redactJobReadOutput(toolName, value)
+  if (toolName === "jobs.search" || toolName === "jobs.get" || toolName === "jobs.discover") return redactJobReadOutput(toolName, value)
   return redactSensitiveValue(value)
 }
 

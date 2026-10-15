@@ -19,6 +19,8 @@ import { loadSelectedJobArtifactContext, resolveCoverLetterBase } from "./select
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
+import { createJobDiscoveryClient, type JobDiscoveryClient } from "../tools/job-discovery-client.js"
+import type { JobDiscoveryExecutionFence } from "../tools/job-discover-tool.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -29,6 +31,7 @@ export type ProductionChildRuntimeOptions = {
   readonly toolRuntimeFactory?: ChildExecutorOptions["toolRuntimeFactory"]
   readonly mailboxReader?: ChildExecutorOptions["mailboxReader"]
   readonly resumeLoader?: ChildExecutorOptions["resumeLoader"]
+  readonly jobDiscoveryClient?: JobDiscoveryClient
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -37,6 +40,15 @@ const SUBAGENT_READ_RULE = {
   id: "canonical-subagent-read",
   roles: ["subagent"], risks: ["read"], requiredCapabilities: ["read"],
   outcome: "allow", reasonCode: "server_subagent_read_gate", reason: "The server enabled scoped child read tools",
+} satisfies PolicyRule
+const SUBAGENT_INTERNAL_WRITE_DENY = {
+  id: "canonical-subagent-internal-write-deny", roles: ["subagent"], risks: ["internal_write"], outcome: "deny",
+  reasonCode: "server_subagent_internal_write_denied", reason: "Subagents may use only the exact server-enabled discovery write",
+} satisfies PolicyRule
+const SCOUT_DISCOVERY_WRITE_RULE = {
+  id: "canonical-scout-job-discovery-write", roles: ["subagent"], tools: ["jobs.discover"], toolVersions: ["1"],
+  risks: ["internal_write"], domains: ["jobs"], requiredCapabilities: ["read"], outcome: "allow",
+  reasonCode: "server_scout_job_discovery_write", reason: "The server enabled bounded provider discovery for a generic Scout",
 } satisfies PolicyRule
 
 function selectedJobId(task: SubagentTaskRecord): string | undefined {
@@ -62,15 +74,19 @@ function selectedJobPolicyRule(role: string, selectedJob: boolean): PolicyRule |
   return undefined
 }
 
-function policy(value: unknown, task: SubagentTaskRecord, selectedJob: boolean): PolicyEngine {
-  const snapshot = record(value)
+export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role" | "toolPolicySnapshot">, selectedJob: boolean): PolicyEngine {
+  const snapshot = record(task.toolPolicySnapshot)
   const hasMatrixField = Object.prototype.hasOwnProperty.call(snapshot, "version") || Object.prototype.hasOwnProperty.call(snapshot, "rules")
   const configured = typeof snapshot.version === "string" && Array.isArray(snapshot.rules)
     ? snapshot as unknown as PolicySnapshot
     : undefined
   if (hasMatrixField && !configured) return new PolicyEngine()
+  const configuredRules = configured?.rules ?? []
+  const explicitDiscoveryDenies = configuredRules.filter(rule => rule.outcome === "deny" && rule.roles.includes("subagent") && rule.tools?.includes("jobs.discover"))
+  const remainingConfiguredRules = configuredRules.filter(rule => !explicitDiscoveryDenies.includes(rule))
+  const discoveryRule = task.role === "scout" && !selectedJob ? [SCOUT_DISCOVERY_WRITE_RULE] : []
   const taskRule = selectedJobPolicyRule(task.role, selectedJob)
-  const rules: PolicyRule[] = [...(configured?.rules ?? []), SUBAGENT_READ_RULE, ...(taskRule ? [taskRule] : [])]
+  const rules: PolicyRule[] = [...explicitDiscoveryDenies, ...discoveryRule, SUBAGENT_INTERNAL_WRITE_DENY, ...remainingConfiguredRules, SUBAGENT_READ_RULE, ...(taskRule ? [taskRule] : [])]
   return new PolicyEngine({ snapshot: { version: configured?.version ?? "policy.v1", rules } })
 }
 
@@ -90,7 +106,7 @@ function withoutIdentity<T extends { identity: ExecutionOwnerFence }>(input: T):
   return rest
 }
 
-async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence): Promise<ChildToolRuntime> {
+async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence, discoveryClient?: JobDiscoveryClient): Promise<ChildToolRuntime> {
   const executionOwner: ExecutionOwner = { kind: "task", lease }
   const selectedJobRole = task.role === "scout" || task.role === "analyst" || task.role === "writer" || task.role === "reviewer"
   const selectedJob = selectedJobRole ? selectedJobId(task) : undefined
@@ -108,11 +124,21 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     selectedJobPreparation,
     ...(coverLetterBase ? { coverLetterBase } : {}),
   } : undefined
-  const toolPolicy = policy(task.toolPolicySnapshot, task, Boolean(selectedJobPreparation))
+  const toolPolicy = createProductionChildPolicy(task, Boolean(selectedJob || selectedJobPreparation))
+  const actions = Array.isArray(task.allowedActions) ? task.allowedActions : []
+  const canDiscover = task.role === "scout" && lease.role === "scout" && task.taskType === "job_discovery" && !selectedJob
+    && !selectedJobPreparation && actions.includes("jobs.discover") && task.id === lease.id && task.userId === lease.userId
+    && task.sessionId === lease.sessionId && task.turnId === lease.turnId && task.rootTaskId === lease.rootTaskId && lease.turnId !== null
+    && typeof lease.leaseOwner === "string" && lease.leaseOwner.trim() === lease.ownerId && Number.isSafeInteger(lease.attemptCount) && lease.attemptCount >= 1
+  const discoveryFence: JobDiscoveryExecutionFence | undefined = canDiscover ? {
+    userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId as string, taskId: lease.id, rootTaskId: lease.rootTaskId,
+    role: "scout", leaseOwner: lease.leaseOwner as string, attemptCount: lease.attemptCount,
+  } : undefined
   const runtime = createWorkerToolRuntime(pool, {
     sink: durableLifecycleSink(store, owner),
     resolveOwner: () => executionOwner,
-  }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined)
+  }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
+  discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined)
   return {
     definitions: runtime.registry.list(), router: runtime.router,
     ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
@@ -208,7 +234,7 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
   return createChildExecutor({
     store: bindStore(engineStore), treeBudget, authorizeUsage,
     modelRuntimeFactory: options.modelRuntimeFactory,
-    toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease, owner }) => defaultTools(options.pool, engineStore, task, lease, owner)),
+    toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease, owner }) => defaultTools(options.pool, engineStore, task, lease, owner, options.jobDiscoveryClient)),
     mailboxReader, resumeLoader,
   })
 }

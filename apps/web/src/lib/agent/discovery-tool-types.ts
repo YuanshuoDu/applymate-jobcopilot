@@ -5,7 +5,7 @@ const id = { type: 'string', minLength: 1, maxLength: 256 }
 const cursor = { type: 'string', minLength: 1, maxLength: 512 }
 const usageSchema: JsonSchema = {
   type: 'object', additionalProperties: false,
-  properties: { ledgerKey: id, toolName: id, toolVersion: id, toolCallId: id, sessionId: id, turnId: id, stepId: id, requests: { type: 'integer', minimum: 0 }, jobsProcessed: { type: 'integer', minimum: 0 }, jobsSucceeded: { type: 'integer', minimum: 0 }, jobsFailed: { type: 'integer', minimum: 0 }, aiCalls: { type: 'integer', minimum: 0 }, providers: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 80 } }, estimatedCostUsd: { type: 'number', minimum: 0 }, durationMs: { type: 'integer', minimum: 0 } },
+  properties: { ledgerKey: id, toolName: id, toolVersion: id, toolCallId: id, sessionId: id, turnId: id, stepId: id, requests: { type: 'integer', minimum: 0 }, jobsProcessed: { type: 'integer', minimum: 0 }, jobsSucceeded: { type: 'integer', minimum: 0 }, jobsFailed: { type: 'integer', minimum: 0 }, providerFailures: { type: 'integer', minimum: 0 }, aiCalls: { type: 'integer', minimum: 0 }, providers: { type: 'array', maxItems: 32, items: { type: 'string', minLength: 1, maxLength: 80 } }, estimatedCostUsd: { type: 'number', minimum: 0 }, durationMs: { type: 'integer', minimum: 0 } },
   required: ['ledgerKey', 'toolName', 'toolVersion', 'toolCallId', 'sessionId', 'turnId', 'stepId', 'requests', 'jobsProcessed', 'jobsSucceeded', 'jobsFailed', 'aiCalls', 'providers', 'estimatedCostUsd', 'durationMs'],
 }
 const evidenceSchema: JsonSchema = {
@@ -41,7 +41,7 @@ export const JobsCompareOutputSchema: JsonSchema = { $id: 'agent.jobs.compare.ou
 
 export interface JobsSearchInput { targetRoles: string[]; targetLocations: string[]; source?: string; pageSize?: number; cursor?: string }
 export interface JobEvidence { evidenceId: string; jobId: string; kind: 'source' | 'enrichment' | 'analysis' | 'comparison'; source: string; url: string; summary: string }
-export interface ToolUsage { ledgerKey: string; toolName: string; toolVersion: string; toolCallId: string; sessionId: string; turnId: string; stepId: string; requests: number; jobsProcessed: number; jobsSucceeded: number; jobsFailed: number; aiCalls: number; providers: string[]; estimatedCostUsd: number; durationMs: number }
+export interface ToolUsage { ledgerKey: string; toolName: string; toolVersion: string; toolCallId: string; sessionId: string; turnId: string; stepId: string; requests: number; jobsProcessed: number; jobsSucceeded: number; jobsFailed: number; providerFailures?: number; aiCalls: number; providers: string[]; estimatedCostUsd: number; durationMs: number }
 export interface NormalizedJob { id: string; title: string; company: string; location: string; url: string; description: string; fullDescription: string; salary: string | null; logo: string | null; source: string; evidenceRefs: string[] }
 export interface JobsSearchOutput { jobs: NormalizedJob[]; evidence: JobEvidence[]; nextCursor: string | null; usage: ToolUsage }
 export interface JobsEnrichInput { jobs: Array<{ jobId: string; html?: string }> }

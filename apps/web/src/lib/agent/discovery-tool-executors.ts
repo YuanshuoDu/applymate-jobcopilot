@@ -5,7 +5,8 @@ import { discoverJobs, type DiscoveredJob } from './discover'
 import { enrichJob } from './enrich'
 import { runAnalyze } from './stages/analyze'
 import type { AnalyzeOutput, PipelineCtx, StageResult } from './types'
-import { DiscoveryToolError, decodeSearchCursor, encodeSearchCursor, queryFingerprint, stableJobId, type DiscoveryToolContext, type ScorePipelineContext, type ToolUsageState } from './discovery-tool-support'
+import { materializeDiscoveredJobs, normalizeDiscoveryJobUrl, type DiscoveryJobMaterializerFence } from './discovery-job-materializer'
+import { DiscoveryToolError, decodeProviderDiscoveryCursor, decodeSearchCursor, encodeProviderDiscoveryCursor, encodeSearchCursor, providerDiscoveryOutput, queryFingerprint, selectProviderDiscoveryPage, stableJobId, type DiscoveryToolContext, type ScorePipelineContext, type ToolUsageState } from './discovery-tool-support'
 import type { JobsCompareInput, JobsCompareOutput, JobsEnrichInput, JobsEnrichOutput, JobsScoreInput, JobsScoreOutput, JobsSearchInput, JobsSearchOutput, JobEvidence } from './discovery-tool-types'
 
 export type DiscoveryToolDb = {
@@ -17,6 +18,8 @@ export type DiscoveryToolDb = {
 export type DiscoveryToolDependencies = {
   db?: DiscoveryToolDb
   discover?: typeof discoverJobs
+  materialize?: typeof materializeDiscoveredJobs
+  executionFence?: DiscoveryJobMaterializerFence
   enrich?: typeof enrichJob
   analyze?: typeof runAnalyze
 }
@@ -58,6 +61,93 @@ export async function executeSearch(input: JobsSearchInput, context: DiscoveryTo
   const jobs = page.map(job => normalizedJob(job, evidence))
   const nextCursor = offset + page.length < filtered.length ? encodeSearchCursor(context.scope.userId, fingerprint, offset + page.length) : null
   return { jobs, evidence, nextCursor }
+}
+
+const PROVIDER_CANDIDATE_WINDOW = 100
+
+export async function executeDiscover(input: JobsSearchInput, context: DiscoveryToolContext, deps: DiscoveryToolDependencies, usage: ToolUsageState): Promise<Omit<JobsSearchOutput, 'usage'>> {
+  assertNotCancelled(context)
+  if (!deps.executionFence || deps.executionFence.userId !== context.scope.userId) {
+    throw new DiscoveryToolError('agent_scope_mismatch', 'The discovery execution attempt could not be verified')
+  }
+  const pageSize = Math.min(50, Math.max(1, input.pageSize ?? 10))
+  const baseInput = { targetRoles: input.targetRoles, targetLocations: input.targetLocations, source: input.source, pageSize }
+  const fingerprint = queryFingerprint(baseInput)
+  const offset = decodeProviderDiscoveryCursor(context.scope, fingerprint, pageSize, input.cursor)
+  const discover = deps.discover ?? discoverJobs
+  const providerCalls = new Set<string>()
+  const discovered = await discover({
+    userId: context.scope.userId,
+    targetRoles: input.targetRoles,
+    targetLocations: input.targetLocations,
+    source: input.source,
+    // Persisted Jobs must not change the provider candidate window or cursor offsets.
+    existingUrls: new Set<string>(),
+    maxResults: PROVIDER_CANDIDATE_WINDOW,
+    onProviderCall: event => {
+      providerCalls.add(event.provider)
+      usage.requests += 1
+      usage.providers.add(event.provider)
+      if (event.status === 'error') usage.providerFailures = (usage.providerFailures ?? 0) + 1
+    },
+  })
+  for (const provider of providerCalls) usage.providers.add(provider)
+
+  const seen = new Set<string>()
+  const candidates = discovered.flatMap(job => {
+    if (!isMaterializableDiscoveryJob(job) || (input.source && job.source.toLowerCase() !== input.source.toLowerCase())) return []
+    const url = normalizeDiscoveryJobUrl(job.url, job.source)
+    if (!url || url.length > 4_096 || seen.has(url)) return []
+    const candidate = boundedCandidate({ ...job, url })
+    if (!candidate.title || !candidate.company || !candidate.source) return []
+    seen.add(url)
+    return [candidate]
+  })
+  const page = selectProviderDiscoveryPage(candidates.slice(offset, offset + pageSize), job => providerDiscoveryOutput(job, 'x'.repeat(256)))
+  for (const job of page) usage.providers.add(job.source)
+  usage.jobsProcessed = page.length
+  usage.jobsSucceeded = 0
+  usage.jobsFailed = 0
+  assertNotCancelled(context)
+
+  let canonicalIds: string[]
+  try {
+    canonicalIds = await (deps.materialize ?? materializeDiscoveredJobs)(context.scope.userId, page, context.signal, deps.executionFence)
+  } catch (error) {
+    if (!(error instanceof DiscoveryToolError && error.code === 'cancelled')) usage.jobsFailed = page.length
+    throw error
+  }
+  if (canonicalIds.length !== page.length) {
+    usage.jobsFailed = page.length
+    throw new DiscoveryToolError('materialization_failed', 'Not every discovered job was saved')
+  }
+  usage.jobsSucceeded = page.length
+  const projected = page.map((job, index) => providerDiscoveryOutput(job, canonicalIds[index]!))
+  const jobs = projected.map(item => item.job)
+  const evidence = projected.map(item => item.evidence)
+  const nextOffset = offset + page.length
+  const nextCursor = nextOffset < candidates.length
+    ? encodeProviderDiscoveryCursor(context.scope, fingerprint, pageSize, nextOffset)
+    : null
+  return { jobs, evidence, nextCursor }
+}
+
+function assertNotCancelled(context: DiscoveryToolContext): void { if (context.signal?.aborted) throw new DiscoveryToolError('cancelled', 'Discovery was cancelled') }
+
+function isMaterializableDiscoveryJob(value: unknown): value is DiscoveredJob {
+  const job = value as Partial<DiscoveredJob> | null
+  return !!job && typeof job === 'object' && typeof job.title === 'string' && typeof job.company === 'string'
+    && typeof job.location === 'string' && typeof job.url === 'string' && typeof job.description === 'string'
+    && typeof job.source === 'string' && (job.salary == null || typeof job.salary === 'string') && (job.logo == null || typeof job.logo === 'string')
+}
+
+function boundedCandidate(job: DiscoveredJob): DiscoveredJob {
+  return {
+    title: job.title.trim().slice(0, 500), company: job.company.trim().slice(0, 500),
+    location: job.location.trim().slice(0, 500), url: job.url.slice(0, 4_096),
+    description: job.description.slice(0, 100_000), salary: job.salary?.slice(0, 500) ?? null,
+    logo: job.logo?.slice(0, 4_096) ?? null, source: job.source.trim().slice(0, 80),
+  }
 }
 
 function normalizedJob(job: DiscoveredJob, evidence: JobEvidence[]): JobsSearchOutput['jobs'][number] {

@@ -26,6 +26,13 @@ interface LedgerEntry {
   readonly promise: Promise<ToolExecutionResult>
 }
 
+interface ToolExecution {
+  readonly signal: AbortSignal
+  abortCode(): "timeout" | "cancelled"
+  run(): Promise<unknown>
+  dispose(): void
+}
+
 export class ToolRouter {
   private readonly ledger = new Map<string, LedgerEntry>()
 
@@ -55,6 +62,7 @@ export class ToolRouter {
       return { ...request, status: "cancelled", errorCode: "cancelled" }
     }
     await this.lifecycle.started(call, request.input)
+    let execution: ToolExecution | undefined
     try {
       if (!context.scope.userId.trim() || containsModelUserId(request.input)) {
         throw new ToolRouterError("runtime_scope_error", "Tenant userId must be supplied by runtime scope")
@@ -84,17 +92,17 @@ export class ToolRouter {
       const effectiveInput = policyDecision.safeInput === undefined ? request.input : policyDecision.safeInput
       if (containsModelUserId(effectiveInput)) throw new ToolRouterError("policy_rewrite_expands_permissions", "A policy rewrite attempted to override tenant scope")
       this.registry.validators.validate(definition.inputSchema, effectiveInput, `${request.toolName} rewritten input`)
-      const execution = this.createExecution(context, request, definition, effectiveInput)
+      execution = this.createExecution(context, request, definition, effectiveInput)
       const output = await execution.run()
       this.registry.validators.validate(definition.outputSchema, output, `${request.toolName} output`)
-      const safeOutput = await this.lifecycle.completed(call, output)
+      const safeOutput = await this.lifecycle.completed(call, output, execution.signal)
       return { ...request, status: "completed", output: safeOutput, errorCode: null }
     } catch (error: unknown) {
       if (isSessionPauseRequestedError(error)) {
         await this.lifecycle.failed(call, "failed", error.code, { message: "Session work is fenced by a durable pause request" })
         throw error
       }
-      const code = this.errorCode(error)
+      const code = execution?.signal.aborted ? execution.abortCode() : this.errorCode(error)
       const phase = code === "cancelled" || code === "timeout" ? "cancelled" : "failed"
       const structuredOutput = error instanceof ToolExecutionError ? error.safeOutput : undefined
       const failureDetail = structuredOutput === undefined
@@ -107,10 +115,12 @@ export class ToolRouter {
         ...(structuredOutput === undefined ? {} : { output: safeOutput }),
         errorCode: code,
       }
+    } finally {
+      execution?.dispose()
     }
   }
 
-  private createExecution(context: ToolRouterContext, request: ToolCallRequest, definition: RuntimeToolDefinition, input: unknown): { run(): Promise<unknown> } {
+  private createExecution(context: ToolRouterContext, request: ToolCallRequest, definition: RuntimeToolDefinition, input: unknown): ToolExecution {
     const controller = new AbortController()
     let timedOut = false
     const parent = context.signal
@@ -137,17 +147,24 @@ export class ToolRouter {
       },
     }
     return {
+      signal: controller.signal,
+      abortCode() {
+        return timedOut ? "timeout" : "cancelled"
+      },
       async run() {
         try {
           if (controller.signal.aborted) throw new ToolRouterError(timedOut ? "timeout" : "cancelled", "Tool execution was interrupted")
-          return await definition.execute(executionContext, input)
+          const output = await definition.execute(executionContext, input)
+          if (controller.signal.aborted) throw new ToolRouterError(timedOut ? "timeout" : "cancelled", "Tool execution was interrupted")
+          return output
         } catch (error: unknown) {
           if (controller.signal.aborted) throw new ToolRouterError(timedOut ? "timeout" : "cancelled", "Tool execution was interrupted")
           throw error
-        } finally {
-          clearTimeout(timer)
-          parent?.removeEventListener("abort", onAbort)
         }
+      },
+      dispose() {
+        clearTimeout(timer)
+        parent?.removeEventListener("abort", onAbort)
       },
     }
   }

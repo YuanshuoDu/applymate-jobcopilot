@@ -14,6 +14,14 @@ function tool(name: string, risk: RuntimeToolDefinition["risk"], domain: Runtime
   }
 }
 
+function discoverTool(overrides: Partial<RuntimeToolDefinition> = {}): RuntimeToolDefinition {
+  return {
+    ...tool("jobs.discover", "internal_write", "jobs"),
+    version: "1", capabilities: ["read", "write"], requiredCapabilities: ["read"], idempotency: "requires_key",
+    ...overrides,
+  }
+}
+
 describe("subagent role policy", () => {
   it("gives Auditor a read-only evidence policy", () => {
     expect(getSubagentRolePolicy("auditor")).toMatchObject({ allowedRisks: ["read"], externalWritesEnabled: false })
@@ -41,6 +49,29 @@ describe("subagent role policy", () => {
   it("fails closed for an unknown role and missing tools", () => {
     expect(visibleSubagentTools("future-role", [tool("jobs.search", "read", "jobs")])).toEqual([])
     expect(preflightSubagentTool("executor", null)).toMatchObject({ allowed: false, execute: false })
+  })
+
+  it("allows only the exact jobs.discover internal-write tuple to generic Scout", () => {
+    const discover = discoverTool()
+    expect(visibleToolPolicy("scout", discover)).toEqual({ visible: true, reason: "role_allowed" })
+    expect(preflightSubagentTool("scout", discover)).toMatchObject({ allowed: true, execute: false, reasonCode: "role_allowed" })
+
+    for (const role of ["analyst", "writer", "reviewer", "auditor", "executor"] as const) {
+      expect(visibleToolPolicy(role, discover).visible).toBe(false)
+      expect(visibleSubagentTools(role, [discover])).toEqual([])
+    }
+    for (const invalid of [
+      { ...discover, version: "2" },
+      { ...discover, risk: "read" as const },
+      { ...discover, domain: "persona" as const },
+      { ...discover, capabilities: ["read"] as const },
+      { ...discover, capabilities: ["read", "external_write"] as const },
+      { ...discover, requiredCapabilities: ["read", "write"] },
+      { ...discover, name: "jobs.lookup" },
+    ]) {
+      expect(visibleToolPolicy("scout", invalid).visible).toBe(false)
+    }
+    expect(visibleToolPolicy("scout", discoverTool({ name: "jobs.search" })).visible).toBe(false)
   })
 
   it("hides every canonical and legacy coordination tool from children", () => {
