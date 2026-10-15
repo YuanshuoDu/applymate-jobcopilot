@@ -1,4 +1,4 @@
-import { CoordinationError, type CoordinationTaskView } from "./coordination-types.js"
+import { assertRootChildCreationUsesCoveragePlan, CoordinationError, type CoordinationTaskView } from "./coordination-types.js"
 import { assertFollowupReplay, followupContext, followupOutput, followupProvenance } from "./coordination-followup.js"
 import { appendNativeCoordination, nativeCoordinationKey, nativeCoordinationOutput, plannerEnabledRoot } from "./task-graph-coordination-bridge.js"
 import { activity, currentFollowupParent, followupSource, managerError, waitResult, type CoordinationExecutorOptions } from "./coordination-executor-support.js"
@@ -16,6 +16,7 @@ function replacementRoot(context: ToolExecutionContext, options: CoordinationExe
 }
 
 export async function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
+  assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   if ("mode" in input) {
     if (!replacementRoot(context, options) || !options.nativeCoordination?.commandPort?.appendNativeCoordination) {
       throw new CoordinationError("coordination_native_replacement_unavailable", "Pending native task replacement is unavailable")

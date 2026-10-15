@@ -1,7 +1,8 @@
 import type { AgentTreeManager } from "../subagents/manager.js"
 import type { SubagentTaskRecord } from "../subagents/types.js"
 import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
-import { ToolExecutionError } from "./types.js"
+import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
+import { ToolExecutionError, type ToolExecutionContext } from "./types.js"
 
 export type CoordinationTaskView = Pick<SubagentTaskRecord,
   "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId" | "path" | "depth" |
@@ -149,6 +150,8 @@ export type CoordinationRuntimeOptions = {
   readonly store: CoordinationStore
   readonly wait?: DurableWaitPort
   readonly nativeCoordination?: NativeCoordinationRuntimeOptions
+  /** Server-resolved canonical objective requirements; never supplied by a model tool call. */
+  readonly verificationRequirements?: RootTaskVerificationRequirementsResolution
 }
 
 export class CoordinationError extends ToolExecutionError {
@@ -156,4 +159,19 @@ export class CoordinationError extends ToolExecutionError {
     super(code, message)
     this.name = "CoordinationError"
   }
+}
+
+export function assertRootChildCreationUsesCoveragePlan(
+  context: ToolExecutionContext,
+  requirements: RootTaskVerificationRequirementsResolution | undefined,
+): void {
+  if (requirements?.status !== "valid" || context.actorRole === "subagent") return
+  const currentTaskId = context.taskId
+  const currentRootTaskId = context.rootTaskId
+  const isRoot = (typeof currentTaskId === "string" && currentTaskId.trim() !== "" && currentTaskId === currentRootTaskId)
+    || (context.actorRole === "orchestrator" && (!currentTaskId || !currentRootTaskId))
+  if (isRoot) throw new CoordinationError(
+    "coordination_objective_requirements_require_plan",
+    "Root child work with valid objective requirements must use a coverage-checked agent.plan proposal",
+  )
 }

@@ -118,7 +118,7 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       }
       const rootTaskGoalCriteria = input.planningEnabled && !input.selectedJobMode && input.rootTaskObjective
         ? projectRootTaskGoalCriteria(input.turnInput, input.rootTaskObjective) : undefined
-      const verificationRequirements = input.planningEnabled && !input.selectedJobMode
+      const verificationRequirements = input.planningEnabled || input.selectedJobMode
         ? rootTaskVerificationRequirementsObservation(input.turnInput) : undefined
       const toolObservations = snapshot.toolObservations.filter(observation => observation.id !== ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID)
       if (verificationRequirements) toolObservations.push(verificationRequirements)

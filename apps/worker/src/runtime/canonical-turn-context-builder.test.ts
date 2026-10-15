@@ -296,7 +296,30 @@ describe("canonical Turn context builder", () => {
     const absent = await buildFor({ input: { goal } })("absent-plan")
     expect(absent.blocks.some(block => block.id === observationId)).toBe(false)
     const selectedJob = await buildFor(turnInput, true, true)("selected-job-plan")
-    expect(selectedJob.blocks.some(block => block.id === observationId)).toBe(false)
+    const selectedJobPlanningDisabled = await buildFor(turnInput, false, true)("selected-job-plan-disabled")
+    for (const selectedContext of [selectedJob, selectedJobPlanningDisabled]) expect(selectedContext.blocks.find(block => block.id === observationId)).toMatchObject({
+      layer: "tool_observation", role: "data", trust: "external_untrusted",
+      content: {
+        kind: "canonical_objective_verification_requirements", trust: "external_untrusted",
+        source: "canonical_turn_objective", status: "valid",
+        requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3 }],
+      },
+    })
+    const invalidSelectedJob = await buildFor({ input: {
+      goal, verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "PRIVATE_MALFORMED_VALUE" },
+    } }, true, true)("selected-job-invalid-plan")
+    const invalidSelectedJobPlanningDisabled = await buildFor({ input: {
+      goal, verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "PRIVATE_MALFORMED_VALUE" },
+    } }, false, true)("selected-job-invalid-plan-disabled")
+    for (const invalidSelectedContext of [invalidSelectedJob, invalidSelectedJobPlanningDisabled]) expect(invalidSelectedContext.blocks.find(block => block.id === observationId)).toMatchObject({
+      layer: "tool_observation", role: "data", trust: "external_untrusted",
+      content: { kind: "canonical_objective_verification_requirements", trust: "external_untrusted", source: "canonical_turn_objective", status: "invalid" },
+    })
+    for (const invalidSelectedContext of [invalidSelectedJob, invalidSelectedJobPlanningDisabled]) {
+      expect(JSON.stringify(invalidSelectedContext.blocks.find(block => block.id === observationId))).not.toContain("PRIVATE_MALFORMED_VALUE")
+    }
+    const absentSelectedJob = await buildFor({ input: { goal } }, false, true)("selected-job-absent-plan")
+    expect(absentSelectedJob.blocks.some(block => block.id === observationId)).toBe(false)
   })
 
   it("adds bounded Root-task history as untrusted advisory context without changing current graph evidence", async () => {
