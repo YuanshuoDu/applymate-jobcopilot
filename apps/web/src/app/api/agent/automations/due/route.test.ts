@@ -124,6 +124,19 @@ describe("agent automation due scheduler API", () => {
         sessionId: "session_1",
         type: "automation_started",
         body: "Started scheduled automation: Weekday Berlin SWE Scout",
+        data: {
+          automationId: "automation_1",
+          automation: {
+            name: "Weekday Berlin SWE Scout",
+            triggerType: "weekdays",
+            targetRoles: ["SWE"],
+            targetLocations: ["Berlin"],
+            minScore: 85,
+            dailyCap: 8,
+            requireApproval: true,
+            autoApply: true,
+          },
+        },
       }),
     })
     expect(mocks.automationUpdateMany).toHaveBeenCalledWith({
@@ -137,6 +150,22 @@ describe("agent automation due scheduler API", () => {
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_1", executionId: "execution_1" })
+    expect(mocks.turnCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        input: {
+          goal: "Run automation: Weekday Berlin SWE Scout",
+          scheduledAutomationSnapshot: {
+            schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+            targetRoles: ["SWE"],
+            targetLocations: ["Berlin"],
+            minScore: 85,
+            dailyCap: 8,
+            requireApproval: true,
+            autoApply: true,
+          },
+        },
+      }),
+    }))
   }, 15_000)
 
   it("skips session creation when another scheduler already claimed the automation", async () => {
@@ -269,5 +298,98 @@ describe("agent automation due scheduler API", () => {
     expect(mocks.turnFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
       where: expect.objectContaining({ userId: "user_1", sessionId: "session_1", source: "automation" }),
     }))
+  })
+
+  it.each([null, "session_1"] as const)("fails closed on malformed persisted config before scheduler/session side effects (%s)", async (sessionId) => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: "SWE", targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId,
+    }])
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      started: [],
+      failedAutomations: [{ automationId: "automation_1", code: "INVALID_SCHEDULED_AUTOMATION_SNAPSHOT" }],
+    })
+
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.automationUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.automationUpdate).not.toHaveBeenCalled()
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(sessionId ? 1 : 0)
+    if (sessionId) {
+      expect(mocks.turnFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+        where: expect.objectContaining({ sessionId, userId: "user_1", source: "automation" }),
+      }))
+    }
+  })
+
+  it("continues dispatching valid automations after reporting a malformed row", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([
+      {
+        id: "automation_bad", userId: "user_bad", name: "Malformed automation", cron: null,
+        timezone: "UTC", triggerType: "manual", targetRoles: "SWE", targetLocations: [],
+        minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: null,
+      },
+      {
+        id: "automation_good", userId: "user_2", name: "Valid automation", cron: null,
+        timezone: "UTC", triggerType: "manual", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+        minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: null,
+      },
+    ])
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      started: [{ automationId: "automation_good", sessionId: "session_1", taskId: "task_1" }],
+      failedAutomations: [{ automationId: "automation_bad", code: "INVALID_SCHEDULED_AUTOMATION_SNAPSHOT" }],
+    })
+    expect(mocks.automationUpdateMany.mock.calls.map(([args]) => args.where.id)).toEqual(["automation_good", "automation_good"])
+    expect(mocks.sessionCreate).toHaveBeenCalledTimes(1)
+    expect(mocks.sessionCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ userId: "user_2" }) })
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(1)
+    expect(mocks.turnCreate).toHaveBeenCalledTimes(1)
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledTimes(1)
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_2", sessionId: "session_1", turnId: "turn_1", executionId: "execution_1" })
+  })
+
+  it("reuses an active automation Turn without validating edited persisted config", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: "edited-invalid-value", targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1" })
+    mocks.turnFindFirst.mockResolvedValue({ id: "turn_active" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
+    })
+    expect(mocks.turnFindFirst).toHaveBeenNthCalledWith(1, {
+      where: {
+        sessionId: "session_1",
+        userId: "user_1",
+        source: "automation",
+        status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] },
+      },
+      orderBy: { createdAt: "desc" },
+      select: { id: true },
+    })
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(1)
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_active", executionId: "execution_1" })
   })
 })
