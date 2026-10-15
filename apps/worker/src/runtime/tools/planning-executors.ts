@@ -3,6 +3,8 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
+import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
+import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import type {
   TaskGraphCommandPort,
   TaskGraphScheduleReceipt,
@@ -98,11 +100,13 @@ export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly
 export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+  verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>
 
 export type PlanningRegistrationOptions = ReconciliationFenceOptions & Readonly<{
   commandPort?: TaskGraphCommandPort
   templates?: Readonly<Record<string, TaskGraphTaskTemplate>>
+  verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>
 export type TaskGraphToolRegistry = Readonly<{ register?(definition: RuntimeToolDefinition): void }>
 const MAX_PROPOSAL_BYTES = TASK_GRAPH_LIMITS.maxProposalBytes
@@ -174,6 +178,13 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
           ...(repairOf ? { repairOf: { ...repairOf, graphRootTaskId: scope.rootTaskId, criterionIds: [...repairOf.criterionIds] } } : {}),
         }
       }),
+    }
+    const coverage = evaluateTaskGraphObjectiveCoverage(options.verificationRequirements ?? { status: "absent" }, proposal, options.templates)
+    if (coverage.status === "incomplete") {
+      const code = "task_graph_objective_coverage_incomplete"
+      throw new ToolExecutionError(code, "TaskGraph plan does not cover the canonical objective requirements", {
+        code, requirements: coverage.requirements,
+      })
     }
     try {
       if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {

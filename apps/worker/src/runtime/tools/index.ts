@@ -17,6 +17,7 @@ import { createGmailTools } from "./gmail-tools.js"
 import type { GmailToolOptions } from "./gmail-types.js"
 import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
 import type { RuntimeToolDefinition } from "./types.js"
+import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import { createAskUserTool } from "./ask-user.js"
 
 export * from "./lifecycle.js"
@@ -49,6 +50,7 @@ export type WorkerCoordinationOptions = {
   readonly store?: CoordinationStore
   readonly wait?: DurableWaitPort
   readonly nativeCoordination?: NativeCoordinationRuntimeOptions
+  readonly verificationRequirements?: RootTaskVerificationRequirementsResolution
   readonly askUserEnabled?: boolean
 }
 
@@ -77,6 +79,7 @@ export function createWorkerToolRuntime(
       store: coordination.store ?? new PgCoordinationStore(pool),
       wait: coordination.wait,
       nativeCoordination: coordination.nativeCoordination,
+      verificationRequirements: coordination.verificationRequirements,
     }
     definitions.push(...createCoordinationTools(options))
     if (coordination.askUserEnabled) definitions.push(createAskUserTool() as RuntimeToolDefinition)

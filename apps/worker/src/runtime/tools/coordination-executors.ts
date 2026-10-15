@@ -1,4 +1,4 @@
-import { CoordinationError, type CoordinationTaskView } from "./coordination-types.js"
+import { assertRootChildCreationUsesCoveragePlan, CoordinationError, type CoordinationTaskView } from "./coordination-types.js"
 import { executeFollowup as runFollowup } from "./coordination-pending-replacement.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import type { ToolExecutionContext } from "./types.js"
@@ -40,6 +40,7 @@ function managerKey(value: string | undefined): string {
   return value
 }
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
+  assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null
   if (!policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
   const expectedSchema = expectedOutputSchema(context.delegateOutputSchemaMarker, input.role)

@@ -34,11 +34,16 @@ import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import type { TaskGraphCommandPort, TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
+import { resolveRootTaskVerificationRequirements, type RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 
 const baseTask: CoordinationTaskView = {
   id: "root-1", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-1", parentTaskId: null,
   path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "root goal",
   attemptCount: 1, maxAttempts: 1, leaseOwner: "worker-1", leaseExpiresAt: null, interruptRequestedAt: null,
+}
+
+const validRequirements: RootTaskVerificationRequirementsResolution = {
+  status: "valid", requirements: [{ id: "minimum-candidates", kind: "candidate_count_gte", minimum: 2 }],
 }
 
 function makeTask(overrides: Partial<CoordinationTaskView> = {}): CoordinationTaskView {
@@ -144,6 +149,117 @@ function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionCo
 }
 
 describe("coordination executors", () => {
+  it("requires a coverage-checked plan before either root spawn alias reaches legacy or native persistence", async () => {
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    for (const toolName of ["spawn_subagent", "agent.spawn"]) {
+      for (const native of [false, true]) {
+        const runtime = makeRuntime()
+        const appendNativeCoordination = vi.fn()
+        const options: CoordinationRuntimeOptions = {
+          ...runtime.options,
+          verificationRequirements: validRequirements,
+          ...(native ? { nativeCoordination: {
+            enabled: true, commandPort: { appendNativeCoordination } as unknown as TaskGraphCommandPort,
+            turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+          } } : {}),
+        }
+        const tool = createCoordinationTools(options).find(candidate => candidate.name === toolName)
+        if (!tool) throw new Error(`${toolName} definition missing`)
+        const getSpawnReplay = vi.spyOn(runtime.store, "getSpawnReplay")
+        const recordSpawn = vi.spyOn(runtime.store, "recordSpawn")
+
+        await expect(tool.execute(rootContext, { role: "scout", taskType: "inspect", goal: "Inspect" }))
+          .rejects.toMatchObject({ code: "coordination_objective_requirements_require_plan" })
+        expect(runtime.manager.spawn).not.toHaveBeenCalled()
+        expect(getSpawnReplay).not.toHaveBeenCalled()
+        expect(recordSpawn).not.toHaveBeenCalled()
+        expect(runtime.store.activities).toHaveLength(0)
+        expect(appendNativeCoordination).not.toHaveBeenCalled()
+      }
+    }
+  })
+
+  it("keeps root spawn behavior unchanged when requirements are absent or invalid", async () => {
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    for (const requirements of [
+      { status: "absent" },
+      { status: "invalid" },
+    ] satisfies readonly RootTaskVerificationRequirementsResolution[]) {
+      const runtime = makeRuntime()
+      const result = await executeSpawn(rootContext, {
+        idempotencyKey: `prose-only-${requirements.status}`, role: "scout", taskType: "inspect", goal: "Inspect",
+      }, { ...runtime.options, verificationRequirements: requirements })
+
+      expect(result).toMatchObject({ taskId: "child-1", parentTaskId: "root-1", replay: false })
+      expect(runtime.manager.spawn).toHaveBeenCalledOnce()
+    }
+  })
+
+  it("preserves native and legacy follow-up routes for invalid canonical requirements", async () => {
+    const invalidRequirements = resolveRootTaskVerificationRequirements({ input: {
+      verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "must-not-be-used" },
+    } })
+    expect(invalidRequirements).toEqual({ status: "invalid" })
+
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const source = makeTask({
+      id: "terminal-source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/terminal-source", depth: 1,
+      role: "scout", taskType: "research", status: "failed",
+    })
+    const legacy = makeRuntime()
+    legacy.store.tasks.set(source.id, source)
+    const legacyResult = await executeFollowup(rootContext, {
+      idempotencyKey: "invalid-legacy-followup", taskId: source.id, goal: "Continue the investigation",
+    }, { ...legacy.options, verificationRequirements: invalidRequirements })
+    expect(legacyResult).toMatchObject({ sourceTaskId: source.id, parentTaskId: "root-1", replay: false })
+    expect(legacy.manager.spawn).toHaveBeenCalledOnce()
+
+    const nativeReceipt: TaskGraphNativeCommandReceipt = {
+      status: "accepted", replay: false, operationId: "invalid-followup-operation", requestFingerprint: "e".repeat(64),
+      graphRevision: 2, nodeKey: "followup-node", dispatchDisposition: "pending",
+      child: { taskId: "native-followup-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/native-followup-child",
+        depth: 1, role: "scout", taskType: "research", status: "queued" },
+    }
+    const nativeRequests: TaskGraphNativeCommandInput[] = []
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 0, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      appendNativeCoordination: vi.fn(async input => { nativeRequests.push(input); return nativeReceipt }),
+    }
+    const native = makeRuntime()
+    const nativeOptions = {
+      ...native.options,
+      verificationRequirements: invalidRequirements,
+      nativeCoordination: {
+        enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
+        parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+      },
+    }
+    const nativeResult = await executeFollowup(rootContext, {
+      idempotencyKey: "invalid-native-followup", taskId: source.id, goal: "Continue natively",
+    }, nativeOptions)
+    const replacementResult = await executeFollowup(rootContext, {
+      idempotencyKey: "invalid-native-replacement", taskId: "queued-source", goal: "Replace the unstarted task",
+      mode: "replace_unstarted", expectedRevision: 1,
+    }, nativeOptions)
+    expect(nativeResult).toMatchObject({ taskId: "native-followup-child", sourceTaskId: source.id, replay: false })
+    expect(replacementResult).toMatchObject({ taskId: "native-followup-child", sourceTaskId: "queued-source", replay: false })
+    expect(nativeRequests.map(request => request.request.kind)).toEqual(["followup", "followup"])
+    expect(nativeRequests[1]?.request).toMatchObject({ mode: "replace_unstarted", expectedRevision: 1 })
+    expect(commandPort.appendNativeCoordination).toHaveBeenCalledTimes(2)
+    expect(native.manager.spawn).not.toHaveBeenCalled()
+
+    const legacyReplacement = makeRuntime()
+    const legacyReplacementLookup = vi.spyOn(legacyReplacement.store, "getTask")
+    await expect(executeFollowup(rootContext, {
+      idempotencyKey: "invalid-legacy-replacement", taskId: "queued-source", goal: "Replace the unstarted task",
+      mode: "replace_unstarted", expectedRevision: 1,
+    }, { ...legacyReplacement.options, verificationRequirements: invalidRequirements }))
+      .rejects.toMatchObject({ code: "coordination_native_replacement_unavailable" })
+    expect(legacyReplacement.manager.spawn).not.toHaveBeenCalled()
+    expect(legacyReplacementLookup).not.toHaveBeenCalled()
+  })
+
   it("spawns through the manager, records durable dispatch, and replays by key", async () => {
     const runtime = makeRuntime()
     const input: SpawnSubagentInput = { idempotencyKey: "spawn-1", role: "scout", taskType: "inspect", goal: "Inspect the job" }

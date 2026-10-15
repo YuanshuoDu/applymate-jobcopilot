@@ -4,6 +4,7 @@ import type { ToolExecutionContext } from "./types.js"
 import { createTaskGraphPlanningTool } from "./planning-executors.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphCommandPort, TaskGraphScheduleReceipt, TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
+import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
 
 const proposal = {
   expectedRevision: 0,
@@ -34,7 +35,7 @@ function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionCo
 
 function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
   scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
-}) {
+}, verificationRequirements: ReturnType<typeof resolveRootTaskVerificationRequirements> = { status: "absent" }) {
   let received: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0] | undefined
   let operation: Parameters<NonNullable<TaskGraphCommandPort["appendAndScheduleWithReconciliation"]>>[1] | undefined
   const appendAndSchedule = vi.fn(async (input: Parameters<TaskGraphCommandPort["appendAndSchedule"]>[0]) => { received = input; return receipt })
@@ -47,6 +48,7 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
   const tool = createTaskGraphPlanningTool({
     commandPort,
     templates,
+    verificationRequirements,
     turnLeaseOwner: "server-worker",
     turnLeaseVersion: 9,
     parentLeaseOwner: "server-worker",
@@ -56,6 +58,38 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
 }
 
 describe("agent.plan tool executor", () => {
+  it("gates scheduling on server-resolved coverage and ignores model-provided requirements", async () => {
+    const resolution = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+    } } })
+    const { tool, commandPort } = setup(undefined, resolution)
+    const hostile = { ...proposal, verificationRequirements: { status: "absent" }, context: { verificationRequirements: [] } }
+    await expect(tool.execute(context(), hostile)).rejects.toMatchObject({
+      code: "task_graph_objective_coverage_incomplete",
+      safeOutput: { code: "task_graph_objective_coverage_incomplete", requirements: [
+        { id: "candidate-total", kind: "candidate_count_gte", role: "scout", minimum: 2 },
+      ] },
+    })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(commandPort.reconcileSteering).not.toHaveBeenCalled()
+
+    const stronger = { ...proposal, nodes: [{ ...proposal.nodes[0], verification: {
+      ...proposal.nodes[0].verification, criteria: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 3 } }],
+    } }] }
+    await expect(tool.execute(context(), stronger)).resolves.toEqual(receipt)
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+  })
+
+  it("keeps invalid optional requirements distinct while allowing prose-only planning", async () => {
+    const invalid = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: { malformed: true } } })
+    expect(invalid).toEqual({ status: "invalid" })
+    const { tool, commandPort } = setup(undefined, invalid)
+    await expect(tool.execute(context(), proposal)).resolves.toEqual(receipt)
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+  })
+
   it("rejects malformed model proposals before the scheduler port runs", () => {
     const { tool, commandPort } = setup()
     const registry = new ToolRegistry([tool])

@@ -16,6 +16,7 @@ import {
   projectRootTaskGoalCriteria, rootTaskVerificationRequirementsObservation,
   ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, type RootTaskGoalObjective,
 } from "./context/root-task-goal-criteria-context.js"
+import { resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
 import {
   appendCanonicalSelectedJobHistory, appendCanonicalSelectedJobHistoryOutcomes,
   type DirectSelectedJobHistoryReader, type SelectedJobHistoryReader,
@@ -118,8 +119,12 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       }
       const rootTaskGoalCriteria = input.planningEnabled && !input.selectedJobMode && input.rootTaskObjective
         ? projectRootTaskGoalCriteria(input.turnInput, input.rootTaskObjective) : undefined
-      const verificationRequirements = input.planningEnabled && !input.selectedJobMode
+      let verificationRequirements = input.planningEnabled || input.selectedJobMode
         ? rootTaskVerificationRequirementsObservation(input.turnInput) : undefined
+      if (!input.planningEnabled && !input.selectedJobMode
+        && resolveRootTaskVerificationRequirements(input.turnInput).status === "invalid") {
+        verificationRequirements = rootTaskVerificationRequirementsObservation(input.turnInput)
+      }
       const toolObservations = snapshot.toolObservations.filter(observation => observation.id !== ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID)
       if (verificationRequirements) toolObservations.push(verificationRequirements)
       snapshot = { ...snapshot, rootTaskGoalCriteria, toolObservations }

@@ -5,6 +5,11 @@ import type { CoordinationExecutorOptions } from "./coordination-executor-suppor
 import type { FollowupInput } from "./coordination-tools.js"
 import type { ToolExecutionContext } from "./types.js"
 import type { TaskGraphCommandPort, TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
+import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
+
+const validRequirements: RootTaskVerificationRequirementsResolution = {
+  status: "valid", requirements: [{ id: "minimum-candidates", kind: "candidate_count_gte", minimum: 2 }],
+}
 
 const context: ToolExecutionContext = {
   scope: { userId: "user" }, sessionId: "session", turnId: "turn", stepId: "step", toolCallId: "tool-call",
@@ -33,6 +38,30 @@ function runtime(appendNativeCoordination: NonNullable<TaskGraphCommandPort["app
 }
 
 describe("native pending-task replacement executor", () => {
+  it("blocks followup and replace_unstarted before persistence when requirements are valid", async () => {
+    for (const route of ["legacy", "native", "replace", "legacy-replace"] as const) {
+      type NativeInput = Parameters<NonNullable<TaskGraphCommandPort["appendNativeCoordination"]>>[0]
+      const append = vi.fn(async (_input: NativeInput) => receipt)
+      const runtimeState = runtime(append)
+      const options = {
+        ...runtimeState.options,
+        verificationRequirements: validRequirements,
+        ...(route === "legacy" || route === "legacy-replace" ? { nativeCoordination: undefined } : {}),
+      } as CoordinationExecutorOptions
+      const input: FollowupInput = route === "replace" || route === "legacy-replace"
+        ? { taskId: "queued-source", idempotencyKey: "replace-key", goal: "Continue", mode: "replace_unstarted", expectedRevision: 4 }
+        : { taskId: "source", idempotencyKey: `followup-${route}`, goal: "Continue" }
+
+      await expect(executeFollowup(context, input, options))
+        .rejects.toMatchObject({ code: "coordination_objective_requirements_require_plan" })
+      expect(append).not.toHaveBeenCalled()
+      expect(runtimeState.getTask).not.toHaveBeenCalled()
+      expect(runtimeState.getSpawnReplay).not.toHaveBeenCalled()
+      expect(runtimeState.spawn).not.toHaveBeenCalled()
+      expect(runtimeState.appendActivity).not.toHaveBeenCalled()
+    }
+  })
+
   it("forwards the exact replacement command and returns the durable receipt without legacy lookups", async () => {
     type NativeInput = Parameters<NonNullable<TaskGraphCommandPort["appendNativeCoordination"]>>[0]
     const append = vi.fn(async (_input: NativeInput) => receipt)
