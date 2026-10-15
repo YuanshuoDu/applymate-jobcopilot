@@ -64,7 +64,17 @@ describe("tool result reference runtime contract", () => {
       },
     }
     const prepared = prepareToolResultJson(raw, source)
-    expect(prepared.value).toEqual({ ...raw, jobs: [{ ...raw.jobs[0], description: "Reference [REDACTED_PHONE]" }] })
+    expect(prepared.value).toEqual({
+      ...raw,
+      jobs: [{ ...raw.jobs[0], description: "Reference [REDACTED_PHONE]" }],
+      usage: {
+        toolName: "jobs.discover", toolVersion: "1", requests: 1, jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0,
+        providerFailures: 0, aiCalls: 0, providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1,
+      },
+    })
+    for (const key of ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"]) {
+      expect(prepared.value).not.toHaveProperty(`usage.${key}`)
+    }
     const row = {
       id: "tool-result-discover", userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", taskId: "root-1", toolCallId: "call-1",
       sanitizedJson: prepared.value, sha256: prepared.sha256, byteCount: prepared.bytes, createdAt: new Date(0), updatedAt: new Date(0),
