@@ -10,6 +10,10 @@ const baseBody = {
   objective: "  Find senior backend roles in Dublin  ",
   content: [{ type: "text", text: "\nReference context stays byte-for-byte.\n" }],
 }
+const validRequirements = {
+  schemaVersion: "agent-harness.v2.objective-requirements.v1",
+  requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+}
 
 function request(key = "start_1") {
   return new Request("http://localhost/api/agent/sessions/session_1/start-objective", {
@@ -42,6 +46,21 @@ describe("parseObjectiveStartBody", () => {
     const text = "reference ".repeat(2_000)
     const parsed = parseObjectiveStartBody({ ...baseBody, content: [{ type: "text", text }] }, request(), sessionId)
     expect(parsed).toMatchObject({ content: [{ type: "text", text }] })
+  })
+
+  it("keeps requirements tri-state: absent is omitted, valid is parsed, and invalid is a null sentinel", () => {
+    const absent = parseObjectiveStartBody(baseBody, request(), sessionId)
+    expect(Object.hasOwn(absent as object, "verificationRequirements")).toBe(false)
+
+    const valid = parseObjectiveStartBody({ ...baseBody, verificationRequirements: validRequirements }, request(), sessionId)
+    expect(valid).toMatchObject({ verificationRequirements: validRequirements })
+
+    const malformed = { ...validRequirements, requirements: [{
+      id: "candidate-count", check: { kind: "evidence_count_gte", minimum: 3 },
+    }] }
+    const invalid = parseObjectiveStartBody({ ...baseBody, verificationRequirements: malformed }, request(), sessionId)
+    expect(invalid).toMatchObject({ objective: "Find senior backend roles in Dublin", verificationRequirements: null })
+    expect(invalid).not.toMatchObject({ verificationRequirements: malformed })
   })
 
   it("rejects authority fields and malformed or over-bound context without trimming text", () => {

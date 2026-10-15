@@ -25,6 +25,10 @@ vi.mock("@/lib/agent/control-plane/commands", () => ({
 
 const params = { params: Promise.resolve({ id: "session_1" }) }
 const context = [{ type: "text", text: "\nReference context stays exact.\n" }]
+const validRequirements = {
+  schemaVersion: "agent-harness.v2.objective-requirements.v1",
+  requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+}
 
 function body(overrides: Record<string, unknown> = {}) {
   return { schemaVersion, clientMessageId: "start_1", objective: "  Find Dublin roles  ", content: context, ...overrides }
@@ -33,6 +37,12 @@ function body(overrides: Record<string, unknown> = {}) {
 function request(value: unknown, key = "start_1") {
   return new Request("http://localhost/api/agent/sessions/session_1/start-objective", {
     method: "POST", headers: { "content-type": "application/json", "idempotency-key": key }, body: JSON.stringify(value),
+  })
+}
+
+function rawRequest(raw: string) {
+  return new Request("http://localhost/api/agent/sessions/session_1/start-objective", {
+    method: "POST", headers: { "content-type": "application/json", "idempotency-key": "start_1" }, body: raw,
   })
 }
 
@@ -57,6 +67,33 @@ describe("start-objective command API", () => {
       sessionId: "session_1", userId: "user_1", clientMessageId: "start_1", source: "user",
       objective: "Find Dublin roles", content: context,
     })
+  })
+
+  it("forwards valid requirements and reduces present-invalid values to the null sentinel", async () => {
+    const { POST } = await import("./route")
+    const valid = await POST(request(body({ verificationRequirements: validRequirements })) as never, params)
+    expect(valid.status).toBe(202)
+    expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({
+      source: "user", verificationRequirements: validRequirements,
+    }))
+
+    mocks.start.mockClear()
+    const malformed = {
+      ...validRequirements,
+      requirements: [{ id: "candidate-count", check: { kind: "evidence_count_gte", minimum: 3 } }],
+    }
+    const invalid = await POST(request(body({ verificationRequirements: malformed })) as never, params)
+    expect(invalid.status).toBe(202)
+    expect(mocks.start).toHaveBeenCalledWith(expect.objectContaining({ source: "user", verificationRequirements: null }))
+    expect(mocks.start.mock.calls[0]?.[0]).not.toHaveProperty("verificationRequirements.requirements")
+  })
+
+  it("does not admit malformed request bytes to the command or model context", async () => {
+    const { POST } = await import("./route")
+    const response = await POST(rawRequest('{"clientMessageId":"start_1","verificationRequirements":"raw malformed bytes"') as never, params)
+
+    expect(response.status).toBe(422)
+    expect(mocks.start).not.toHaveBeenCalled()
   })
 
   it("rejects mismatched idempotency and all client authority fields before service dispatch", async () => {

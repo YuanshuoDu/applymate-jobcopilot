@@ -61,4 +61,29 @@ describe("Agent command transaction helpers", () => {
     const input = agentTurn.create.mock.calls[0]?.[0]?.data.input
     expect(input).toEqual(expect.objectContaining({ goal: "Discovery goal", intent }))
   })
+
+  it("persists valid, invalid-sentinel, and absent objective requirements distinctly", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_requirements" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_requirements", source: "user" as const }
+    const requirements = {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }],
+    } as const
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Find roles" }], "Find roles", undefined, undefined, requirements)
+    const validInput = agentTurn.create.mock.calls[0]?.[0]?.data.input
+    expect(validInput).toHaveProperty("verificationRequirements", requirements)
+    const roundTrippedRequirements: unknown = JSON.parse(JSON.stringify(validInput.verificationRequirements))
+    expect(roundTrippedRequirements).toEqual(requirements)
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Find roles" }], "Find roles", undefined, undefined, null)
+    const invalidInput = agentTurn.create.mock.calls[1]?.[0]?.data.input
+    expect(invalidInput).toHaveProperty("verificationRequirements", null)
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Find roles" }], "Find roles")
+    const absentInput = agentTurn.create.mock.calls[2]?.[0]?.data.input
+    expect(absentInput).not.toHaveProperty("verificationRequirements")
+  })
 })

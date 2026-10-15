@@ -11,7 +11,12 @@ import {
   findExistingCommand,
   type CommandTransaction,
 } from "./transaction"
-import type { ObjectiveStartCommand, ObjectiveStartResult } from "./types"
+import {
+  parseObjectiveVerificationRequirements,
+  type ObjectiveStartCommand,
+  type ObjectiveStartResult,
+  type ObjectiveVerificationRequirements,
+} from "./types"
 
 const MAX_OBJECTIVE_BYTES = 2_000
 const MAX_CONTENT_PARTS = 32
@@ -66,7 +71,9 @@ async function startOnce(command: ObjectiveStartCommand, db: PrismaClient): Prom
     const active = await findActiveTurn(tx, command.sessionId, command.userId)
     if (active) throw retryActiveConflict(active.id)
 
-    const turn = await createRootTurn(tx, command, command.content, command.objective)
+    const turn = await createRootTurn(
+      tx, command, command.content, command.objective, undefined, undefined, command.verificationRequirements,
+    )
     const facts = await acceptInputFacts(tx, command, command.content, turn, "follow_up", "started", true)
     return { ...facts, disposition: "started" }
   })
@@ -77,7 +84,29 @@ export class ObjectiveStartCommandService {
 
   async start(command: ObjectiveStartCommand): Promise<ObjectiveStartResult> {
     if (command.source !== "user") throw invalidCommand("Only a user can start an objective")
-    const normalized = { ...command, objective: normalizeObjective(command.objective) }
+    let hasRequirements = false
+    let requirements: ObjectiveVerificationRequirements | null | undefined
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(command, "verificationRequirements")
+      hasRequirements = descriptor !== undefined
+      requirements = descriptor
+        ? "value" in descriptor && descriptor.enumerable
+          ? parseObjectiveVerificationRequirements(descriptor.value)
+          : null
+        : undefined
+    } catch {
+      hasRequirements = true
+      requirements = null
+    }
+    const normalized: ObjectiveStartCommand = {
+      sessionId: command.sessionId,
+      userId: command.userId,
+      clientMessageId: command.clientMessageId,
+      source: command.source,
+      objective: normalizeObjective(command.objective),
+      content: command.content,
+      ...(hasRequirements ? { verificationRequirements: requirements ?? null } : {}),
+    }
     if (!hasBoundedContent(command.content)) throw invalidCommand("Objective context is invalid or exceeds the command limits")
     try {
       return await startOnce(normalized, this.db)
