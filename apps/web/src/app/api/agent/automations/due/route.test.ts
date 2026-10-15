@@ -405,14 +405,36 @@ describe("agent automation due scheduler API", () => {
   })
 
   it("rechecks a stale active Turn and enqueues a new Turn with the scheduled snapshot", async () => {
+    const events: string[] = []
+    let activeTurnId: string | null = "turn_stale"
     mocks.automationFindMany.mockResolvedValueOnce([{
       id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
       timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
       minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
     }])
     mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1" })
-    mocks.turnFindFirst.mockResolvedValueOnce({ id: "turn_stale" }).mockResolvedValueOnce(null)
-    mocks.turnCreate.mockResolvedValueOnce({ id: "turn_fresh" })
+    mocks.turnFindFirst.mockImplementation(async () => {
+      if (events.includes("schedule-claim")) {
+        events.push("post-claim-turn-recheck")
+        expect(activeTurnId).toBeNull()
+        return null
+      }
+      events.push("initial-turn-lookup")
+      return activeTurnId ? { id: activeTurnId } : null
+    })
+    mocks.automationUpdateMany.mockImplementationOnce(async () => {
+      events.push("schedule-claim")
+      activeTurnId = null
+      return { count: 1 }
+    })
+    mocks.turnCreate.mockImplementationOnce(async () => {
+      events.push("fresh-turn-create")
+      return { id: "turn_fresh" }
+    })
+    mocks.enqueueAgentRun.mockImplementationOnce(async () => {
+      events.push("fresh-turn-enqueue")
+      return "task_1"
+    })
     const { POST } = await import("./route")
 
     const res = await POST(postRequest() as never)
@@ -422,6 +444,9 @@ describe("agent automation due scheduler API", () => {
       started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
     })
     expect(mocks.turnFindFirst).toHaveBeenCalledTimes(2)
+    expect(events).toEqual([
+      "initial-turn-lookup", "schedule-claim", "post-claim-turn-recheck", "fresh-turn-create", "fresh-turn-enqueue",
+    ])
     expect(mocks.turnCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
         input: {
