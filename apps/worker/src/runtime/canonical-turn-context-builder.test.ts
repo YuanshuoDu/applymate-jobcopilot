@@ -295,6 +295,18 @@ describe("canonical Turn context builder", () => {
     expect(JSON.stringify(invalid.blocks)).not.toContain("PRIVATE_MALFORMED_VALUE")
     const absent = await buildFor({ input: { goal } })("absent-plan")
     expect(absent.blocks.some(block => block.id === observationId)).toBe(false)
+    const validPlanningDisabled = await buildFor(turnInput, false, false)("valid-no-plan")
+    expect(validPlanningDisabled.blocks.some(block => block.id === observationId)).toBe(false)
+    const invalidPlanningDisabled = await buildFor({ input: {
+      goal, verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "PRIVATE_MALFORMED_VALUE" },
+    } }, false, false)("invalid-no-plan")
+    expect(invalidPlanningDisabled.blocks.find(block => block.id === observationId)).toMatchObject({
+      layer: "tool_observation", role: "data", trust: "external_untrusted",
+      content: { kind: "canonical_objective_verification_requirements", trust: "external_untrusted", source: "canonical_turn_objective", status: "invalid" },
+    })
+    expect(JSON.stringify(invalidPlanningDisabled.blocks.find(block => block.id === observationId))).not.toContain("PRIVATE_MALFORMED_VALUE")
+    const absentPlanningDisabled = await buildFor({ input: { goal } }, false, false)("absent-no-plan")
+    expect(absentPlanningDisabled.blocks.some(block => block.id === observationId)).toBe(false)
     const selectedJob = await buildFor(turnInput, true, true)("selected-job-plan")
     const selectedJobPlanningDisabled = await buildFor(turnInput, false, true)("selected-job-plan-disabled")
     for (const selectedContext of [selectedJob, selectedJobPlanningDisabled]) expect(selectedContext.blocks.find(block => block.id === observationId)).toMatchObject({
