@@ -17,7 +17,7 @@ interface DetailResponse {
 function formWaitId(question: unknown): string | null { const waitId = question && typeof question === 'object' && !Array.isArray(question) ? (question as Record<string, unknown>).waitId : null; return typeof waitId === 'string' && waitId.trim() ? waitId : null }
 export function formAnswerDraftKey(taskId: string, waitId: string, field: string) { return `${taskId}:${waitId}:${field}` }
 
-export function RetryCancelledApplicationFillButton({ sessionId, taskId }: { sessionId: string; taskId: string }) {
+export function RetryApplicationFillButton({ sessionId, taskId }: { sessionId: string; taskId: string }) {
   async function onRetry(event: React.MouseEvent<HTMLButtonElement>) {
     const alert = event.currentTarget.nextElementSibling as HTMLDivElement | null
     if (alert) alert.textContent = ''
@@ -124,6 +124,8 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
         {applicationTasks.slice(0, 5).map(task => {
           const fields = task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required' ? formQuestionFields(task.question) : []
           const waitId = formWaitId(task.question)
+          const retryableFill = (task.status === 'cancelled' && ['cancelled_by_user', 'turn_stopped_before_submit'].includes(task.checkpoint ?? ''))
+            || (task.status === 'failed' && ['fill_prestart_failed', 'taskgraph_fill_failed'].includes(task.checkpoint ?? ''))
           return (
           <div key={task.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
@@ -136,7 +138,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
                 : <div key={`unmapped:${task.id}:${waitId ?? ''}:${field.label}`} style={rowMetaStyle}>{field.label}</div>)}
               {fields.some(field => field.key !== null) && waitId && <button onClick={() => { void answerAndResume(task.id, waitId, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
             </div>
-            {task.status === 'cancelled' && ['cancelled_by_user', 'turn_stopped_before_submit'].includes(task.checkpoint ?? '') && <RetryCancelledApplicationFillButton sessionId={sessionId} taskId={task.id} />}
+            {retryableFill && <RetryApplicationFillButton sessionId={sessionId} taskId={task.id} />}
             {!['submitted', 'skipped', 'cancelled'].includes(task.status) && (
               <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancel')}</button>
             )}

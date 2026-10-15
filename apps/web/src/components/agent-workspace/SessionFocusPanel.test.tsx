@@ -1,7 +1,7 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { formAnswerDraftKey, RetryCancelledApplicationFillButton, SessionFocusPanel } from './SessionFocusPanel'
+import { formAnswerDraftKey, RetryApplicationFillButton, SessionFocusPanel } from './SessionFocusPanel'
 import type { AgentSessionDetail } from './session-view-model'
 
 const mocks = vi.hoisted(() => ({ useApi: vi.fn(), formQuestionFields: vi.fn() }))
@@ -38,15 +38,24 @@ describe('SessionFocusPanel application fill retry', () => {
   })
   afterEach(() => vi.unstubAllGlobals())
 
-  it('shows the retry button for user-cancelled and safely stopped fill tasks only', () => {
-    installSession([task()])
+  it.each([
+    ['cancelled', 'cancelled_by_user'],
+    ['cancelled', 'turn_stopped_before_submit'],
+    ['failed', 'fill_prestart_failed'],
+    ['failed', 'taskgraph_fill_failed'],
+  ])('shows the retry button for %s / %s', (status, checkpoint) => {
+    installSession([task(status, checkpoint)])
     expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).toContain('Retry form fill')
+  })
 
-    installSession([task('cancelled', 'turn_stopped_before_submit')])
-    expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).toContain('Retry form fill')
-    installSession([task('cancelled', 'worker_failed')])
-    expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).not.toContain('Retry form fill')
-    installSession([task('failed', 'cancelled_by_user')])
+  it.each([
+    ['cancelled', 'worker_failed'],
+    ['failed', 'cancelled_by_user'],
+    ['failed', 'fill_outcome_uncertain'],
+    ['waiting_for_user', 'fill_outcome_uncertain'],
+    ['filling', 'taskgraph_fill_queued'],
+  ])('hides the retry button for unsupported %s / %s states', (status, checkpoint) => {
+    installSession([task(status, checkpoint)])
     expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).not.toContain('Retry form fill')
   })
 
@@ -57,7 +66,7 @@ describe('SessionFocusPanel application fill retry', () => {
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('crypto', { randomUUID })
     vi.stubGlobal('window', { dispatchEvent })
-    const element = RetryCancelledApplicationFillButton({ sessionId: 'session_1', taskId: 'application_1' }) as React.ReactElement<{ children: React.ReactNode }>
+    const element = RetryApplicationFillButton({ sessionId: 'session_1', taskId: 'application_1' }) as React.ReactElement<{ children: React.ReactNode }>
     const [button, alert] = React.Children.toArray(element.props.children) as React.ReactElement[]
     await (button!.props as { onClick: (event: React.MouseEvent<HTMLButtonElement>) => Promise<void> }).onClick({ currentTarget: { nextElementSibling: { textContent: '' } } } as unknown as React.MouseEvent<HTMLButtonElement>)
 
@@ -80,7 +89,7 @@ describe('SessionFocusPanel application fill retry', () => {
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('crypto', { randomUUID: vi.fn().mockReturnValue('retry_request_12345678') })
     vi.stubGlobal('window', { dispatchEvent })
-    const element = RetryCancelledApplicationFillButton({ sessionId: 'session_1', taskId: 'application_1' }) as React.ReactElement<{ children: React.ReactNode }>
+    const element = RetryApplicationFillButton({ sessionId: 'session_1', taskId: 'application_1' }) as React.ReactElement<{ children: React.ReactNode }>
     const [button, alert] = React.Children.toArray(element.props.children) as React.ReactElement[]
     const feedback = { textContent: '' }
     await (button!.props as { onClick: (event: React.MouseEvent<HTMLButtonElement>) => Promise<void> }).onClick({ currentTarget: { nextElementSibling: feedback } } as unknown as React.MouseEvent<HTMLButtonElement>)
@@ -90,12 +99,17 @@ describe('SessionFocusPanel application fill retry', () => {
     expect(dispatchEvent).not.toHaveBeenCalled()
   })
 
-  it('does not dispatch a retry just by rendering the user-cancelled task', () => {
+  it.each([
+    ['cancelled', 'cancelled_by_user'],
+    ['cancelled', 'turn_stopped_before_submit'],
+    ['failed', 'fill_prestart_failed'],
+    ['failed', 'taskgraph_fill_failed'],
+  ])('does not dispatch retry while rendering %s / %s', (status, checkpoint) => {
     const fetchMock = vi.fn()
     const randomUUID = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('crypto', { randomUUID })
-    installSession([task()])
+    installSession([task(status, checkpoint)])
 
     expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).toContain('Retry form fill')
     expect(fetchMock).not.toHaveBeenCalled()
