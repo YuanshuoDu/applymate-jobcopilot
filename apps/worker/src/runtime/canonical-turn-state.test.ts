@@ -11,6 +11,7 @@ import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { StepContextBuilder } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
+import { collectContextSnapshot } from "./context/context-snapshot-collector.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -207,6 +208,49 @@ describe("loadCanonicalTurnState", () => {
     const orderedToolItemsQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes("'tool_call', 'tool_result'"))?.[0]
     expect(orderedToolItemsQuery).toContain('ORDER BY "createdAt" ASC, "id" ASC')
     expect(value.snapshot).not.toHaveProperty("planningClarificationHistoryPair")
+  })
+
+  it("resumes a current Turn from the canonical snapshot's lexical answer-first Q/A order", async () => {
+    const question = { id: "agent-question:question-item:question", content: {
+      role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }],
+    } }
+    const answer = { id: "agent-question:question-item:answer", content: {
+      role: "user", type: "answer", questionId: "question-1", text: "yes",
+    } }
+    const collected = await collectContextSnapshot({
+      scope: { userId: "user-1" }, sessionId: "session-1", throughSequence: 7n,
+      source: { goal: "Find jobs", userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [],
+        artifacts: [], facts: [], failedAttempts: [], references: [], tokenUsage: [],
+        context: { system: [], profile: [], steerHistory: [question, answer], toolObservations: [] } },
+      references: { verify: async reference => ({ ...reference, verified: true as const }) },
+    })
+    expect(collected.content.context.steerHistory.map(entry => entry.id)).toEqual([answer.id, question.id])
+    const questionItem = { id: "question-item", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+      stepId: null, status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: "question-call-1",
+        question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
+    const questionEvents = [
+      { id: "started", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
+        type: "item.started", actor: "orchestrator", sequence: "10", correlationId: "question-item", causationId: "question-1",
+        payload: { itemId: "question-item", waitKind: "question", toolCallId: "question-call-1" } },
+      { id: "answered", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
+        type: "question.answered", actor: "user", sequence: "11", correlationId: "question-1", causationId: "question-item",
+        payload: { waitKind: "question", waitId: "question-1", itemId: "question-item", turnId: "turn-1", toolCallId: "question-call-1", status: "answered" } },
+    ]
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ id: "step-1", taskId: "root-1", ordinal: 0, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      items: [{ id: "tool-call-item", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1", type: "tool_call", status: "completed", revision: 1,
+        content: { toolCallId: "question-call-1", toolName: "jobs.search", input: { query: "engineer" }, status: "completed" } }],
+      questionItems: [questionItem], questionEvents,
+      snapshots: [{ id: "snapshot-1", throughSequence: "7", version: 1, content: collected.content }],
+    })
+
+    const resumed = await loadCanonicalTurnState(fake, lease)
+    expect(resumed.resume).toMatchObject({ nextOrdinal: 1, stepCount: 1 })
+    expect(resumed.snapshot.steerHistory).toEqual([
+      question,
+      answer,
+    ])
   })
 
   it("restores a complete earlier root answer after compaction as untrusted model history without replacing the current goal", async () => {

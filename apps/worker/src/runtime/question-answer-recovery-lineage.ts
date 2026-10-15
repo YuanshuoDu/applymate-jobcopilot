@@ -114,10 +114,8 @@ function appendIfNew(entries: readonly ContextHistoryEntry[], existing: readonly
   }
   const questionIndex = existing.findIndex(entry => entry.id === entries[0].id)
   const answerIndex = existing.findIndex(entry => entry.id === entries[1].id)
-  if (questionIndex >= 0 && answerIndex >= 0 && questionIndex > answerIndex) {
-    throw new Error("question_recovery_history_order_invalid")
-  }
   if (known.has(entries[1].id) && !known.has(entries[0].id)) throw new Error("question_recovery_history_pair_incomplete")
+  if (questionIndex >= 0 && answerIndex >= 0 && questionIndex > answerIndex) return [...entries]
   return entries.filter(entry => !known.has(entry.id))
 }
 

@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { recoverAnsweredQuestionContext, recoverAnsweredQuestionHistory } from "./question-answer-recovery.js"
 import { readTurnQuestionPlanningHistory } from "./turns/turn-question-planning-history.js"
 import { questionId, questionItemId } from "./turns/turn-question-store-guards.js"
+import { collectContextSnapshot } from "./context/context-snapshot-collector.js"
+import { mergeCanonicalTurnQuestionContext } from "./canonical-turn-question-context.js"
 
 vi.mock("./turns/turn-question-planning-history.js", () => ({ readTurnQuestionPlanningHistory: vi.fn() }))
 
@@ -83,11 +85,46 @@ describe("recoverAnsweredQuestionHistory", () => {
     expect(entries).toEqual([])
   })
 
-  it("rejects an existing stable-ID pair when the answer precedes the question", async () => {
-    await expect(recoverAnsweredQuestionHistory(client(), input({ existingHistory: [
-      { id: "agent-question:question-item:answer", content: { role: "user", type: "answer", questionId: "wait-1", text: "yes" } },
-      { id: "agent-question:question-item:question", content: { role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }] } },
-    ] }))).rejects.toThrow("question_recovery_history_order_invalid")
+  it("normalizes the real canonical answer-first snapshot and keeps planning attached to its exact pair", async () => {
+    const question = { id: "agent-question:question-item:question", content: {
+      role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }],
+    } }
+    const answer = { id: "agent-question:question-item:answer", content: {
+      role: "user", type: "answer", questionId: "wait-1", text: "yes",
+    } }
+    const unrelatedQuestion = { id: "agent-question:foreign-item:question", content: {
+      role: "assistant", type: "question", question: "Other?", options: [{ label: "No", value: "no" }],
+    } }
+    const unrelatedAnswer = { id: "agent-question:foreign-item:answer", content: {
+      role: "user", type: "answer", questionId: "foreign-wait", text: "no",
+    } }
+    const collected = await collectContextSnapshot({
+      scope: { userId: "user-1" }, sessionId: "session-1", throughSequence: 7n,
+      source: { goal: "Continue", userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [],
+        artifacts: [], facts: [], failedAttempts: [], references: [], tokenUsage: [],
+        context: { system: [], profile: [], steerHistory: [question, answer, unrelatedQuestion, unrelatedAnswer], toolObservations: [] } },
+      references: { verify: async reference => ({ ...reference, verified: true as const }) },
+    })
+    const snapshotHistory = collected.content.context.steerHistory
+    expect(snapshotHistory.map(entry => entry.id)).toEqual([
+      unrelatedAnswer.id, unrelatedQuestion.id, answer.id, question.id,
+    ])
+
+    const summary = { observedPlanRevision: 1, graphRevisionAtAsk: 2, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "5" }
+    vi.mocked(readTurnQuestionPlanningHistory).mockResolvedValueOnce([summary])
+    const recovered = await recoverAnsweredQuestionContext(client(), input({ existingHistory: snapshotHistory }))
+    expect(recovered.history).toEqual([question, answer])
+    expect(recovered.planningClarifications).toEqual([summary])
+    expect(recovered.planningClarificationHistoryPair).toEqual({ questionEntryId: question.id, answerEntryId: answer.id })
+
+    const merged = mergeCanonicalTurnQuestionContext({
+      snapshot: { system: [], profile: [], steerHistory: snapshotHistory, businessRefs: [], toolObservations: [] },
+      priorHistory: [], recovered,
+    })
+    expect(merged.steerHistory).toEqual([unrelatedAnswer, unrelatedQuestion, question, answer])
+    expect(merged.steerHistory[2]?.id).toBe(merged.planningClarificationHistoryPair?.questionEntryId)
+    expect(merged.steerHistory[3]?.id).toBe(merged.planningClarificationHistoryPair?.answerEntryId)
+    expect(merged.planningClarificationHistoryPair).toEqual({ questionEntryId: question.id, answerEntryId: answer.id })
   })
 
   it("rejects repeated existing question or answer stable IDs even when the entries match", async () => {
