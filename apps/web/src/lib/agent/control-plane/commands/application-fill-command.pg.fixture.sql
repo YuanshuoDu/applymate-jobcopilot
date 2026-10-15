@@ -20,6 +20,7 @@ CREATE TABLE "agent_turns" (
   "outputTokens" INTEGER NOT NULL DEFAULT 0,
   "estimatedCostUsd" DECIMAL(12, 8) NOT NULL DEFAULT 0,
   "leaseVersion" INTEGER NOT NULL DEFAULT 0,
+  "completedAt" TIMESTAMP(3),
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "agent_turns_id_session_user_key" UNIQUE ("id", "sessionId", "userId")

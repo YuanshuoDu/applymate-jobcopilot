@@ -102,6 +102,10 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
   })
 
   it("rejects a Turn id whose stored session/user composite does not match the task", async () => {
+    const original = await prisma!.$queryRaw<Array<{ fillTurnId: string; fillTurnSessionId: string; fillTurnUserId: string }>>`
+      SELECT "fillTurnId", "fillTurnSessionId", "fillTurnUserId" FROM "application_tasks" WHERE "id" = ${ids.task}
+    `
+    expect(original[0]).toMatchObject({ fillTurnId: expect.any(String), fillTurnSessionId: ids.session, fillTurnUserId: ids.user })
     const otherTurnId = `foreign-turn-${randomUUID()}`
     await prisma!.$executeRaw`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot")
       VALUES (${otherTurnId}, ${ids.session}, 'different-user', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`
@@ -112,7 +116,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     const rows = await prisma!.$queryRaw<Array<{ fillTurnId: string; fillTurnSessionId: string; fillTurnUserId: string }>>`
       SELECT "fillTurnId", "fillTurnSessionId", "fillTurnUserId" FROM "application_tasks" WHERE "id" = ${ids.task}
     `
-    expect(rows[0]).toEqual({ fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null })
+    expect(rows[0]).toEqual(original[0])
   })
 
   it.each(["job ownership", "resume ownership/association", "cover-letter ownership/application association"])(
