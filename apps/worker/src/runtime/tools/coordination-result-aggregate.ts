@@ -2,10 +2,9 @@ import { reduceScoutAnalystOutcomes, type ScoutAnalystAggregate, type RoleExecut
 import { validateRoleResult, type StructuredRoleResult } from "../subagents/role-results.js"
 import { MIGRATED_ROLES, type MigratedRole } from "../subagents/scout-analyst-contracts.js"
 import type { CoordinationTaskView } from "./coordination-types.js"
-import { sanitizeLifecyclePreview } from "./redaction.js"
+import { waitResult } from "./coordination-executor-support.js"
 
 const MAX_AGGREGATE_BYTES = 2 * 1024
-const MAX_WAIT_RESULT_BYTES = 2 * 1024
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 
 export type WaitAggregate = {
@@ -83,7 +82,7 @@ type CompletedStructuredResultProjection = "none" | "readable" | "oversized" | "
 function completedStructuredResultProjection(task: CoordinationTaskView): CompletedStructuredResultProjection {
   try {
     if (!task.result || typeof task.result !== "object" || Array.isArray(task.result) || !Object.prototype.hasOwnProperty.call(task.result, "structuredResult")) return "none"
-    const preview = sanitizeLifecyclePreview(task.result, MAX_WAIT_RESULT_BYTES)
+    const preview = waitResult(task.result)
     return preview && typeof preview === "object" && !Array.isArray(preview) && preview.$truncated === true ? "oversized" : "readable"
   }
   catch { return "invalid" }
