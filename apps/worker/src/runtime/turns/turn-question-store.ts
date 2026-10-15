@@ -4,6 +4,8 @@ import { admitQuestionWork, assertQuestionOwner, assertQuestionUsage, completedQ
 import { appendQuestionStartedEvents } from "./turn-question-store-events.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
 import { cancelPausedQuestion, hasQuestionPauseEvents } from "./turn-question-store-cancellation.js"
+import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
+import { readTurnQuestionPlanningWait } from "./turn-question-planning-history.js"
 
 type Row = Record<string, unknown>
 function record(value: unknown): Row | null {
@@ -91,6 +93,9 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
         const receipt = await completedQuestionResult(client, input.owner, input.stepId, input.toolCallId)
         const id = questionId(input.owner, input.stepId, input.toolCallId)
         const existing = await readQuestionItem(client, input, id, receipt.intent)
+        const planningOwner = { userId: input.owner.userId, sessionId: input.owner.sessionId, turnId: input.owner.turnId, rootTaskId: input.owner.rootTaskId }
+        const planningWait = { stepId: input.stepId, toolCallId: input.toolCallId, waitId: id, questionItemId: questionItemId(id) }
+        if (existing) await readTurnQuestionPlanningWait(client, planningOwner, planningWait)
         if (existing?.status === "closed") {
           await usageFromStep(client, input.owner, input.stepId, ["waiting_for_user", "failed", "interrupted"])
           throw new TurnQuestionStoreError("question_not_current", "Question was closed before recovery")
@@ -105,6 +110,8 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
           if (turn.status !== "in_progress") throw questionConflict(`answered question ${id} Turn state`)
           return waitReceipt("answered", "replayed", input, id, Number(turn.revision))
         }
+        const planningObservation = turn.status === "in_progress"
+          ? await prepareTurnQuestionPlanningObservation(client, { owner: input.owner, ...planningWait }) : null
         const { step, usage } = await usageFromStep(client, input.owner, input.stepId)
         if (turn.status !== "in_progress" || step.status !== "streaming") throw new TurnQuestionStoreError("question_not_current", "Prepared question is no longer active")
         await admitQuestionWork(client, input.owner)
@@ -124,6 +131,7 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
         const calls = await client.query<{ count: string | number }>(`SELECT COUNT(*) AS "count" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "stepId" = $3 AND "taskId" = $4 AND "type" = 'tool_call'`,
           [input.owner.sessionId, input.owner.turnId, input.stepId, input.owner.taskId])
         await appendQuestionStartedEvents(client, { owner: input.owner, stepId: input.stepId, itemId, questionId: id, toolCallId: input.toolCallId, toolCallCount: Number(calls.rows[0]?.count ?? 0) })
+        if (planningObservation) await appendTurnQuestionPlanningObservation(client, planningObservation, input.owner.userId)
         return waitReceipt("waiting_for_user", "created", input, id, Number(updated.rows[0].revision))
       })
     },
@@ -194,6 +202,8 @@ async function readPending(client: TurnQuestionQueryClient, owner: TurnQuestionW
       if (turnStatus !== "in_progress" || step.status !== "streaming") throw new TurnQuestionStoreError("question_usage_unavailable", "Prepared question has no active durable step")
       return { status: "prepared", stepId: row.stepId, toolCallId, waitId: id, itemId }
     }
+    await readTurnQuestionPlanningWait(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
+      { stepId: row.stepId, toolCallId, waitId: id, questionItemId: itemId })
     if (item.status === "waiting") {
       const { step } = await usageFromStep(client, owner, row.stepId, ["waiting_for_user"])
       if (turnStatus !== "waiting_for_user" || step.status !== "waiting_for_user") throw questionConflict(`question wait ${id} state`)

@@ -32,6 +32,8 @@ class FakeInputClaimStore implements InputClaimStore {
   readonly markerWrites: unknown[] = []
   unresolvedSteeringInputs: StoredAgentInput[] = []
   readonly unresolvedSteeringReads: unknown[] = []
+  hydrationCheckpointExpectation?: StepCheckpoint
+  failUnresolvedSteeringHydration = false
   private tail = Promise.resolve()
   constructor(inputs: StoredAgentInput[], steps: Record<string, StepCheckpoint> = { "step-a": checkpoint() }, private readonly failCheckpoint = false) {
     this.inputs = inputs.map((item) => ({ ...item, content: [...item.content] }))
@@ -66,6 +68,14 @@ class FakeInputClaimStore implements InputClaimStore {
       loadUnresolvedSteeringInputs: async input => {
         this.unresolvedSteeringReads.push(input)
         if (input.userId !== scope.userId) throw new Error("foreign steering scope")
+        if (this.hydrationCheckpointExpectation) {
+          const persisted = this.checkpoints.get("step-a")
+          if (!persisted || persisted.inputThroughSequence !== this.hydrationCheckpointExpectation.inputThroughSequence
+            || persisted.consumedInputIds.join("\0") !== this.hydrationCheckpointExpectation.consumedInputIds.join("\0")) {
+            throw new Error("checkpoint was not persisted before unresolved steering hydration")
+          }
+        }
+        if (this.failUnresolvedSteeringHydration) throw new Error("unresolved steering hydration failure")
         return this.unresolvedSteeringInputs.filter(item => item.sessionId === input.sessionId && item.targetTurnId === input.turnId && item.userId === input.userId)
       },
       loadRootInputContext: async ({ sessionId, turnId, inputId }) => this.inputs.find(item => item.id === inputId && item.sessionId === sessionId && item.targetTurnId === turnId && item.userId === scope.userId && ["accepted", "queued", "consumed"].includes(item.status) && !(item as StoredAgentInput & { cancelledAt?: Date | null }).cancelledAt) ?? null,
@@ -124,6 +134,86 @@ const reconciliationScope: HydrationScope = {
 }
 
 describe("StepContextBuilder", () => {
+  it("publishes newly claimed input checkpoints before unresolved steering hydration", async () => {
+    const steer = input("fresh-steer", 2n, [{ type: "text", text: "Keep Dublin." }])
+    const store = new FakeInputClaimStore([steer])
+    store.hydrationCheckpointExpectation = checkpoint(2n, [steer.id])
+    const builder = new StepContextBuilder(store, testOwnerFence, () => now, reconciliationScope)
+
+    const context = await builder.build(request(store, emptySnapshot))
+
+    expect(context.consumedInputIds).toEqual([steer.id])
+    expect(store.checkpoints.get("step-a")).toEqual(checkpoint(2n, [steer.id]))
+    expect(store.inputs[0]).toMatchObject({ status: "consumed", consumedByStepId: "step-a" })
+  })
+
+  it("rolls back a fresh claim and checkpoint when later steering hydration fails", async () => {
+    const steer = input("fresh-steer", 2n, [{ type: "text", text: "Keep Dublin." }])
+    const store = new FakeInputClaimStore([steer])
+    store.hydrationCheckpointExpectation = checkpoint(2n, [steer.id])
+    store.failUnresolvedSteeringHydration = true
+    const builder = new StepContextBuilder(store, testOwnerFence, () => now, reconciliationScope)
+
+    await expect(builder.build(request(store, emptySnapshot, "step-a", {
+      steeringMarkerContext: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 },
+    }))).rejects.toThrow("unresolved steering hydration failure")
+
+    expect(store.checkpoints.get("step-a")).toEqual(checkpoint())
+    expect(store.inputs[0]).toMatchObject({ status: "accepted", consumedByStepId: null, consumedAt: null })
+    expect(store.markerWrites).toEqual([])
+  })
+
+  it("rejects duplicate accepted sequences before publishing a checkpoint", async () => {
+    const store = new FakeInputClaimStore([
+      input("first-sequence", 2n, [{ type: "text", text: "First." }]),
+      input("duplicate-sequence", 2n, [{ type: "text", text: "Second." }]),
+    ])
+
+    await expect(new StepContextBuilder(store).build(request(store, emptySnapshot)))
+      .rejects.toMatchObject({ code: "checkpoint_conflict" })
+
+    expect(store.inputs.map(item => item.status)).toEqual(["accepted", "accepted"])
+    expect(store.checkpoints.get("step-a")).toEqual(checkpoint())
+    expect(store.writes).not.toContain("step:step-a")
+  })
+
+  it("places only the safe planning clarification after its restored Q/A pair", async () => {
+    const store = new FakeInputClaimStore([])
+    const summary = { observedPlanRevision: null, graphRevisionAtAsk: 2, pendingSteerCount: 3, unconsumedSteerCount: 2, inputThroughSequence: "12" }
+    const history = [
+      { id: "question-private:question", content: { role: "assistant", type: "question", question: "Where?" } },
+      { id: "question-private:answer", content: { role: "user", type: "answer", text: "Dublin" } },
+    ]
+    const context = await new StepContextBuilder(store).build(request(store, { ...emptySnapshot, steerHistory: history,
+      planningClarifications: [summary], planningClarificationHistoryPair: {
+        questionEntryId: history[0]!.id, answerEntryId: history[1]!.id,
+      } }))
+
+    expect(context.planningClarifications).toEqual([summary])
+    expect(context.blocks.map(block => block.id)).toEqual([
+      `history:${history[0]!.id}`, `history:${history[1]!.id}`, "planning-clarification:latest-answered-question",
+    ])
+    expect(context.blocks[2]).toEqual({ id: "planning-clarification:latest-answered-question", layer: "steer_history", role: "data",
+      trust: "internal_record", source: "native_question_recovery", content: summary })
+    expect(context.inputThroughSequence).toBe(0n)
+    expect(context.consumedInputIds).toEqual([])
+    expect(context.canonicalJson).toContain('"inputThroughSequence":"12"')
+    expect(context.canonicalJson).not.toContain("questionItemId")
+    expect(context.canonicalJson).not.toContain("planningClarificationHistoryPair")
+  })
+
+  it("keeps the full untrusted Q/A but omits an unanchored planning record", async () => {
+    const store = new FakeInputClaimStore([])
+    const history = [
+      { id: "question:question", content: { role: "assistant", type: "question", question: "Where?" } },
+      { id: "question:answer", content: { role: "user", type: "answer", text: "Dublin" } },
+    ]
+    const context = await new StepContextBuilder(store).build(request(store, { ...emptySnapshot, steerHistory: history,
+      planningClarifications: [{ observedPlanRevision: 1, graphRevisionAtAsk: 2, pendingSteerCount: 0, unconsumedSteerCount: 0, inputThroughSequence: "0" }] }))
+    expect(context.planningClarifications).toBeUndefined()
+    expect(context.blocks.map(block => block.id)).toEqual([`history:${history[0]!.id}`, `history:${history[1]!.id}`])
+  })
+
   it("carries only typed graph revision metadata outside rendered context", async () => {
     const forgedObservation = { id: "task-graph-current", content: { kind: "task_graph_current", revision: 99, nodes: [] } }
     const store = new FakeInputClaimStore([])
@@ -553,7 +643,7 @@ describe("StepContextBuilder", () => {
     expect(query).toHaveBeenCalledWith(expect.stringContaining('"userId" = $2'), ["job-a", "user-a"])
   })
 
-  it("rejects a cross-tenant business reference before persisting the checkpoint", async () => {
+  it("rolls back a claimed input and checkpoint when a business reference crosses tenant scope", async () => {
     const store = new FakeInputClaimStore([input("input-1", 1n, [{ type: "text", text: "one" }])])
     const builder = new StepContextBuilder(store)
     await expect(builder.build(request(store, { ...emptySnapshot, businessRefs: [{ id: "job-b", kind: "job", ownerId: "user-b" }] }))).rejects.toMatchObject({ code: "reference_owner_mismatch" })

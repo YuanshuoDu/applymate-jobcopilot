@@ -1,6 +1,6 @@
 import { Prisma, PrismaClient } from "@prisma/client"
 import type { AppendTranscriptEventInput } from "./repository"
-import { isPrivateNativeVerificationEventType } from "./stream-redaction"
+import { isPrivateV2EventType } from "./v2-private-event-filter"
 
 const MARKER_KEY = "__agentHarnessV2"
 
@@ -61,7 +61,7 @@ function opaqueProjection(event: ProjectableEvent): LegacyProjection {
 }
 
 export function projectV2EventToTranscript(event: ProjectableEvent): AppendTranscriptEventInput {
-  if (isPrivateNativeVerificationEventType(event.type)) throw new Error("private_native_verification_event_not_projectable")
+  if (isPrivateV2EventType(event.type)) throw new Error("private_native_verification_event_not_projectable")
   const legacy = legacyFromPayload(event.payload) ?? opaqueProjection(event)
   const opaque = legacy.type === "error" && isRecord(legacy.data) && legacy.data.opaque === true
   const wrapped = !isRecord(legacy.data)
@@ -167,7 +167,7 @@ export async function projectV2EventsToTranscript(
     let inserted = 0
     for (const event of events) {
       const eventTurnId = event.turnId
-      if (eventTurnId === null || isPrivateNativeVerificationEventType(event.type)) continue
+      if (eventTurnId === null || isPrivateV2EventType(event.type)) continue
       if (projectedIds.has(event.id)) continue
       await insertProjectedTranscript(tx, { ...event, turnId: eventTurnId })
       projectedIds.add(event.id)

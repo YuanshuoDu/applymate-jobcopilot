@@ -658,6 +658,12 @@ describe("createCanonicalTurnRuntime", () => {
       turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1, rootInputId: originalInput.id,
     })
     const rootQuestionId = "question-wait-1"
+    const latestStepQuestionText = "Which country should I prioritize for this step?"
+    const latestStepAnswerText = "Germany, for this step."
+    const laterAnsweredOlderQuestionText = "Which city should I prioritize?"
+    const laterAnsweredOlderAnswerText = "Berlin, please."
+    const planningSummary = { observedPlanRevision: 0, graphRevisionAtAsk: 1, pendingSteerCount: 1,
+      unconsumedSteerCount: 1, inputThroughSequence: "3" }
     const questionStore = {
       ...store(events),
       stageQuestionUsage: vi.fn(async () => undefined),
@@ -689,9 +695,18 @@ describe("createCanonicalTurnRuntime", () => {
       snapshot: {
         ...state().snapshot, goal: { id: "canonical-goal", content: "Find software engineering roles." },
         steerHistory: [
+          { id: "agent-question:question-item-2:question", content: { role: "assistant", type: "question", question: latestStepQuestionText, options: [{ label: "Germany", value: "de" }] } },
+          { id: "agent-question:question-item-2:answer", content: { role: "user", type: "answer", questionId: "wait-2", text: latestStepAnswerText } },
           { id: "agent-question:question-item-1:question", content: { role: "assistant", type: "question", question: questionText, options: [{ label: "Germany", value: "de" }] } },
           { id: "agent-question:question-item-1:answer", content: { role: "user", type: "answer", questionId: rootQuestionId, text: answerText } },
+          { id: "agent-question:question-item-3:question", content: { role: "assistant", type: "question", question: laterAnsweredOlderQuestionText, options: [{ label: "Berlin", value: "berlin" }] } },
+          { id: "agent-question:question-item-3:answer", content: { role: "user", type: "answer", questionId: "wait-3", text: laterAnsweredOlderAnswerText } },
         ],
+        planningClarifications: [planningSummary],
+        planningClarificationHistoryPair: {
+          questionEntryId: "agent-question:question-item-2:question",
+          answerEntryId: "agent-question:question-item-2:answer",
+        },
       },
     })
     const proposal = {
@@ -741,6 +756,10 @@ describe("createCanonicalTurnRuntime", () => {
       expect(reference).toMatchObject({ trust: "external_untrusted", content: { inputId: originalInput.id, text: originalText } })
       expect(context.blocks.some(block => block.layer === "steer_history" && JSON.stringify(block.content).includes(questionText))).toBe(true)
       expect(context.blocks.some(block => block.layer === "steer_history" && JSON.stringify(block.content).includes(answerText))).toBe(true)
+      expect(context.blocks.some(block => block.layer === "steer_history" && JSON.stringify(block.content).includes(latestStepQuestionText))).toBe(true)
+      expect(context.blocks).toContainEqual({ id: "planning-clarification:latest-answered-question", layer: "steer_history", role: "data",
+        trust: "internal_record", source: "native_question_recovery", content: planningSummary })
+      expect(context.planningClarifications).toEqual([planningSummary])
     }
     expect(contexts[0]?.blocks.filter(block => block.layer === "pending_input" && JSON.stringify(block.content).includes("resumed-steer-input"))).toHaveLength(2)
     expect(contexts[0]?.blocks.some(block => block.layer === "pending_input" && JSON.stringify(block.content).includes(steerParts[0]!))).toBe(true)
@@ -754,6 +773,31 @@ describe("createCanonicalTurnRuntime", () => {
       expect(messages).toContain(originalText)
       expect(messages).toContain(questionText)
       expect(messages).toContain(answerText)
+      expect(messages).toContain(latestStepQuestionText)
+      expect(messages).toContain(latestStepAnswerText)
+      expect(messages).toContain(laterAnsweredOlderQuestionText)
+      expect(messages).toContain(laterAnsweredOlderAnswerText)
+    }
+    const firstRequestText = requests[0]!.messages.map(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n"))
+    const selectedQuestionIndex = firstRequestText.findIndex(text => text.includes(latestStepQuestionText))
+    const selectedAnswerIndex = firstRequestText.findIndex(text => text.includes(latestStepAnswerText))
+    const summaryIndex = firstRequestText.findIndex(text => text.includes('"graphRevisionAtAsk":1'))
+    const laterAnsweredQuestionIndex = firstRequestText.findIndex(text => text.includes(laterAnsweredOlderQuestionText))
+    expect(selectedAnswerIndex).toBe(selectedQuestionIndex + 1)
+    expect(summaryIndex).toBe(selectedAnswerIndex + 1)
+    expect(laterAnsweredQuestionIndex).toBeGreaterThan(summaryIndex)
+    for (const request of requests) {
+      const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+        .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+      expect(system).toContain("immediately following an answered question and answer")
+      expect(system).toContain("refreshed current TaskGraph")
+      expect(system).not.toContain(questionText)
+      expect(system).not.toContain(answerText)
+      expect(system).not.toContain("question-item-1")
+      expect(system).not.toContain("question-item-2")
+      expect(system).not.toContain("resumed-steer-input")
+      expect(system).not.toContain("inputThroughSequence")
+      expect(system).not.toContain(originalText)
     }
     expect(requestMessages[0]).toContain(steerParts[0])
     expect(requestMessages[0]).toContain(steerParts[1])

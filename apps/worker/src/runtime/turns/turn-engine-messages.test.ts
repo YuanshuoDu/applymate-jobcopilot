@@ -90,6 +90,39 @@ describe("TurnEngine model message mapping", () => {
     expect(text).toContain("do not take an uncertain plan action")
   })
 
+  it("guides from the latest internal planning record without copying it or Q/A into system instructions", () => {
+    const summary = { observedPlanRevision: 3, graphRevisionAtAsk: 4, pendingSteerCount: 2, unconsumedSteerCount: 1, inputThroughSequence: "12" }
+    const question = { id: "history:q", layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const,
+      source: "steer_history", content: { role: "assistant", type: "question", question: "PRIVATE_QUESTION" } }
+    const answer = { id: "history:a", layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const,
+      source: "steer_history", content: { role: "user", type: "answer", text: "PRIVATE_ANSWER" } }
+    const record = { id: "planning-clarification:latest-answered-question", layer: "steer_history" as const, role: "data" as const,
+      trust: "internal_record" as const, source: "native_question_recovery", content: summary }
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.reconcile", version: "1" }, { name: "agent.ask_user", version: "1" }]
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({
+      context: { ...context(), blocks: [...context().blocks, question, answer, record], planningClarifications: [summary], taskGraphRevision: 5 },
+      model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
+      signal: new AbortController().signal,
+    })
+    const system = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const user = request.messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(system).toContain("immediately following an answered question and answer")
+    expect(system).toContain("refreshed current TaskGraph")
+    expect(system).toContain("agent.reconcile")
+    expect(system).toContain("agent.ask_user")
+    expect(system).not.toContain("PRIVATE_QUESTION")
+    expect(system).not.toContain("PRIVATE_ANSWER")
+    expect(system).not.toContain("inputThroughSequence")
+    expect(user).toContain("PRIVATE_QUESTION")
+    expect(user).toContain("PRIVATE_ANSWER")
+    expect(user).toContain('"graphRevisionAtAsk":4')
+    expect(request.tools).toEqual(tools)
+  })
+
   it("preserves instruction/data separation and marks untrusted data", () => {
     const messages = contextToModelMessages(context())
     expect(messages).toHaveLength(2)
