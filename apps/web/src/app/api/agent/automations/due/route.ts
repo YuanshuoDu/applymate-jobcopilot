@@ -90,15 +90,13 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
   }
 
   const snapshot = scheduledAutomationSnapshot(automation)
-  let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>> | null = null
   const activeTurn = automation.sessionId
     ? await db.agentTurn.findFirst({
       where: { sessionId: automation.sessionId, userId: automation.userId, source: "automation", status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } },
       orderBy: { createdAt: "desc" }, select: { id: true },
     })
     : null
-  if (activeTurn) canonicalTurn = { turnId: activeTurn.id, created: false }
-  else buildScheduledAutomationSnapshot(snapshot)
+  if (!activeTurn) buildScheduledAutomationSnapshot(snapshot)
 
   const claimed = await db.agentAutomation.updateMany({
     where: runnableAutomationWhere(automation, now),
@@ -128,21 +126,20 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     }
   }
 
-  if (!canonicalTurn) {
-    try {
-      canonicalTurn = await ensureAutomationTurn(db, {
-        sessionId: session.id,
-        userId: automation.userId,
-        name: automation.name,
-        scheduledAutomationSnapshot: snapshot,
-      })
-    } catch (error: unknown) {
-      if (error instanceof AutomationTurnOccupiedError) {
-        await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
-        return null
-      }
-      throw error
+  let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>> | null = null
+  try {
+    canonicalTurn = await ensureAutomationTurn(db, {
+      sessionId: session.id,
+      userId: automation.userId,
+      name: automation.name,
+      scheduledAutomationSnapshot: snapshot,
+    })
+  } catch (error: unknown) {
+    if (error instanceof AutomationTurnOccupiedError) {
+      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
+      return null
     }
+    throw error
   }
   if (!canonicalTurn) throw new Error("Could not resolve the automation Turn")
 

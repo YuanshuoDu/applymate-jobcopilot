@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   hasEffectiveEntitlement: vi.fn(),
   turnFindFirst: vi.fn(),
   turnCreate: vi.fn(),
+  turnUpdate: vi.fn(),
 }))
 
 vi.mock("@/lib/agent-run-queue-client", () => ({ enqueueAgentRun: mocks.enqueueAgentRun }))
@@ -38,7 +39,7 @@ vi.mock("@/lib/db", () => ({
     agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate, updateMany: mocks.sessionUpdateMany },
     agentExecution: { findFirst: mocks.executionFindFirst, update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
-    agentTurn: { findFirst: mocks.turnFindFirst, create: mocks.turnCreate },
+    agentTurn: { findFirst: mocks.turnFindFirst, create: mocks.turnCreate, update: mocks.turnUpdate },
   },
 }))
 
@@ -398,9 +399,70 @@ describe("agent automation due scheduler API", () => {
       orderBy: { createdAt: "desc" },
       select: { id: true },
     })
-    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(1)
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(2)
     expect(mocks.turnCreate).not.toHaveBeenCalled()
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_active", executionId: "execution_1" })
+  })
+
+  it("rechecks a stale active Turn and enqueues a new Turn with the scheduled snapshot", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1" })
+    mocks.turnFindFirst.mockResolvedValueOnce({ id: "turn_stale" }).mockResolvedValueOnce(null)
+    mocks.turnCreate.mockResolvedValueOnce({ id: "turn_fresh" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
+    })
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(2)
+    expect(mocks.turnCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        input: {
+          goal: "Run automation: Weekday Berlin SWE Scout",
+          scheduledAutomationSnapshot: {
+            schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+            targetRoles: ["SWE"],
+            targetLocations: ["Berlin"],
+            minScore: 85,
+            dailyCap: 8,
+            requireApproval: true,
+            autoApply: true,
+          },
+        },
+      }),
+    }))
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_fresh", executionId: "execution_1" })
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn_stale" }))
+  })
+
+  it("reuses a different active Turn found by the post-claim lookup without writing its input", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1" })
+    mocks.turnFindFirst.mockResolvedValueOnce({ id: "turn_stale" }).mockResolvedValueOnce({ id: "turn_winner" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
+    })
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(2)
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.turnUpdate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_winner", executionId: "execution_1" })
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn_stale" }))
   })
 
   it.each([
