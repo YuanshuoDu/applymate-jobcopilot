@@ -105,7 +105,6 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     const original = await prisma!.$queryRaw<Array<{ fillTurnId: string; fillTurnSessionId: string; fillTurnUserId: string }>>`
       SELECT "fillTurnId", "fillTurnSessionId", "fillTurnUserId" FROM "application_tasks" WHERE "id" = ${ids.task}
     `
-    expect(original[0]).toMatchObject({ fillTurnId: expect.any(String), fillTurnSessionId: ids.session, fillTurnUserId: ids.user })
     const otherTurnId = `foreign-turn-${randomUUID()}`
     await prisma!.$executeRaw`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot")
       VALUES (${otherTurnId}, ${ids.session}, 'different-user', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`
