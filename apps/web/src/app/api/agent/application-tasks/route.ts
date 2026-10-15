@@ -107,7 +107,7 @@ export async function DELETE(req: NextRequest) {
   if (["submitted", "skipped", "cancelled"].includes(task.status) || ["submission_request_started", "submission_uncertain"].includes(task.checkpoint ?? "")) {
     return err("This application task cannot be cancelled", 409)
   }
-  const taskGraphCancel = applicationFillTaskGraphEnabled() && task.fillTurnId !== null && ["filling", "waiting_for_user"].includes(task.status)
+  const taskGraphCancel = typeof task.fillTurnId === "string" && ["filling", "waiting_for_user"].includes(task.status)
   if (taskGraphCancel) {
     if (!task.sessionId || task.fillTurnSessionId !== task.sessionId || task.fillTurnUserId !== auth.userId) {
       return err("The active application fill has no scoped TaskGraph Turn", 409)
