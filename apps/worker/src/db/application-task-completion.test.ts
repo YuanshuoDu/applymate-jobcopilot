@@ -312,6 +312,7 @@ describe("ApplicationTask fill completion", () => {
 
     const update = test.calls.find(call => call.sql.startsWith('UPDATE "application_tasks"'))
     expect(update?.values?.[3]).toBe("fill_outcome_uncertain")
+    expect(update?.values?.[4]).toBe("The browser stopped after starting the fill. This fill does not submit the application. Stop this Turn before requesting another fill attempt.")
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_artifact"') || call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
   })
 

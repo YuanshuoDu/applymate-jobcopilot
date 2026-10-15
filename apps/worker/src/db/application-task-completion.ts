@@ -188,7 +188,7 @@ function waitMessage(detail: WaitDetail): string {
     captcha_required: "A site challenge requires your action before the fill can continue.", authentication_required: "Sign in to the application site before the fill can continue.",
     mfa_required: "Complete the verification step before the fill can continue.", unknown_sensitive_field: "Review and confirm the sensitive application fields before the fill can continue.",
     required_field: "Provide the missing required application information before the fill can continue.", stale_review: "The application changed during review. Review the current form before continuing.",
-    review_required: "Review the filled application before continuing.", fill_outcome_uncertain: "The browser stopped after starting the fill. Check the application site before requesting another attempt.",
+    review_required: "Review the filled application before continuing.", fill_outcome_uncertain: "The browser stopped after starting the fill. This fill does not submit the application. Stop this Turn before requesting another fill attempt.",
     unattended_apply_unavailable: "Unattended form fill is unavailable. Review the application manually.", cancelled: "The application fill was cancelled.",
     browser_fill_failed: "The application form could not be filled. Review it manually before continuing.",
   }
