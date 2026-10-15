@@ -48,7 +48,7 @@ describe("DELETE /api/agent/application-tasks", () => {
     Object.values(mocks).forEach(mock => mock.mockReset())
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(false)
-    mocks.findFirst.mockResolvedValue({ id: "task_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled" })
+    mocks.findFirst.mockResolvedValue({ id: "task_1", sessionId: "session_1", fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null, status: "waiting_for_authorization", checkpoint: "form_filled" })
     mocks.fillerFindMany.mockResolvedValue([])
     mocks.updateMany.mockResolvedValue({ count: 1 })
     mocks.approvalUpdateMany.mockResolvedValue({ count: 1 })
@@ -161,6 +161,32 @@ describe("DELETE /api/agent/application-tasks", () => {
     expect(mocks.taskInterrupt).toHaveBeenCalledTimes(2)
     expect(mocks.taskInterrupt.mock.invocationCallOrder[0]).toBeLessThan(mocks.transaction.mock.invocationCallOrder[0]!)
     expect(mocks.transaction.mock.invocationCallOrder[0]).toBeLessThan(mocks.taskInterrupt.mock.invocationCallOrder[1]!)
+  })
+
+  it("conflicts if answer-resume rebinds the task after the old filler interrupt", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.findFirst.mockResolvedValueOnce({
+      id: "task_1", sessionId: "session_1", status: "waiting_for_user", checkpoint: "form_answer_required",
+      fillTurnId: "turn_old", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+    })
+    mocks.fillerFindMany.mockResolvedValueOnce([{ id: "filler_old", status: "waiting_for_user" }])
+    mocks.taskInterrupt.mockResolvedValueOnce({ disposition: "accepted" })
+    mocks.updateMany.mockResolvedValueOnce({ count: 0 })
+    const { DELETE } = await import("./route")
+    const request = new Request("http://localhost/api/agent/application-tasks?id=task_1", { method: "DELETE" })
+
+    const response = await DELETE(request as never)
+
+    expect(response.status).toBe(409)
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        id: "task_1", userId: "user_1", sessionId: "session_1",
+        fillTurnId: "turn_old", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+      }),
+    }))
+    expect(mocks.taskInterrupt).toHaveBeenCalledOnce()
+    expect(mocks.eventCreate).not.toHaveBeenCalled()
+    expect(mocks.approvalUpdateMany).not.toHaveBeenCalled()
   })
 
   it("allows cancellation before filler admission and interrupts a filler found after commit", async () => {

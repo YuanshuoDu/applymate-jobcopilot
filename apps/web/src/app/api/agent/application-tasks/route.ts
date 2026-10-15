@@ -120,6 +120,10 @@ export async function DELETE(req: NextRequest) {
       where: {
         id,
         userId: auth.userId,
+        sessionId: task.sessionId,
+        fillTurnId: task.fillTurnId,
+        fillTurnSessionId: task.fillTurnSessionId,
+        fillTurnUserId: task.fillTurnUserId,
         status: { notIn: ["submitted", "skipped", "cancelled"] },
         OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
       },
