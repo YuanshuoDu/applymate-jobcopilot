@@ -178,7 +178,11 @@ describe("startApplicationFillForReview", () => {
   })
 
   it("only creates a new Turn after an explicit retry of a safe terminal failure", async () => {
-    const fake = harness({ status: "failed", checkpoint: "fill_prestart_failed", fillTurnId: "turn_previous", fillTurnSessionId: "session_1", fillTurnUserId: "user_1" })
+    const fake = harness(
+      { status: "failed", checkpoint: "fill_prestart_failed", fillTurnId: "turn_previous", fillTurnSessionId: "session_1", fillTurnUserId: "user_1" },
+      false,
+      { turnStatus: "failed", fillers: [{ id: "subagent_fill_1", status: "failed", leaseOwner: null, leaseExpiresAt: null }] },
+    )
     const result = await startApplicationFillForReview(fake.db, command("fill_retry_1", true))
     expect(result.disposition).toBe("started")
     expect(result.turnId).not.toBe("turn_previous")
