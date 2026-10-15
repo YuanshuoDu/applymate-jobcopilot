@@ -36,6 +36,9 @@ export async function POST(request: NextRequest, context: RouteContext) {
       source: "user",
       objective: command.objective,
       content: command.content,
+      ...(Object.hasOwn(command, "verificationRequirements")
+        ? { verificationRequirements: command.verificationRequirements }
+        : {}),
     })
     return ok(result, 202)
   } catch (error: unknown) {

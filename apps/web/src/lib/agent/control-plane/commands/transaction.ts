@@ -5,7 +5,7 @@ import type { InputContentPart, TurnSource } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { activeTurnChanged, sessionNotFound } from "./errors"
-import type { CommandDisposition, CommandIdentity, InterruptDisposition, SelectedJobPreparationScope, ServerAgentTurnIntent } from "./types"
+import type { CommandDisposition, CommandIdentity, InterruptDisposition, ObjectiveVerificationRequirements, SelectedJobPreparationScope, ServerAgentTurnIntent } from "./types"
 
 export { fallbackDisposition, findExistingCommand } from "./existing-command"
 export type { ExistingCommand } from "./existing-command"
@@ -92,6 +92,7 @@ export async function createRootTurn(
   explicitGoal?: string,
   selectedJobPreparation?: SelectedJobPreparationScope,
   intent?: ServerAgentTurnIntent,
+  verificationRequirements?: ObjectiveVerificationRequirements | null,
 ): Promise<ActiveTurn> {
   const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
   const turn = await tx.agentTurn.create({
@@ -107,6 +108,7 @@ export async function createRootTurn(
         clientMessageId: command.clientMessageId,
         ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
         ...(intent ? { intent } : {}),
+        ...(verificationRequirements !== undefined ? { verificationRequirements } : {}),
       }),
       modelProfileSnapshot: json({}),
       toolPolicySnapshot: json({}),

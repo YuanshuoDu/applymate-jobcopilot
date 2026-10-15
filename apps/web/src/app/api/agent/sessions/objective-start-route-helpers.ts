@@ -2,11 +2,13 @@ import { AgentInputCommandSchema, assertValid, schemaVersion, type InputContentP
 import { NextResponse } from "next/server"
 
 import { MAX_ATTACHMENT_REFS, MAX_CONTENT_PARTS, MAX_TEXT_PART_LENGTH } from "./command-route-helpers"
+import { parseObjectiveVerificationRequirements, type ObjectiveVerificationRequirements } from "@/lib/agent/control-plane/commands/types"
 
 export type ParsedObjectiveStartCommand = {
   clientMessageId: string
   objective: string
   content: InputContentPart[]
+  verificationRequirements?: ObjectiveVerificationRequirements | null
 }
 
 type RecordBody = Record<string, unknown>
@@ -16,7 +18,16 @@ function isRecord(value: unknown): value is RecordBody {
 }
 
 function exactKeys(value: RecordBody, allowed: readonly string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key))
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    return Reflect.ownKeys(value).every((key) => {
+      if (typeof key !== "string" || !allowed.includes(key)) return false
+      const descriptor = descriptors[key]
+      return Boolean(descriptor && "value" in descriptor && descriptor.enumerable)
+    })
+  } catch {
+    return false
+  }
 }
 
 function trimmedString(value: unknown, maxLength = 256): string | null {
@@ -68,7 +79,7 @@ export function parseObjectiveStartBody(
   request: Request,
   sessionId: string,
 ): ParsedObjectiveStartCommand | NextResponse {
-  if (!isRecord(body) || !exactKeys(body, ["schemaVersion", "clientMessageId", "objective", "content"])) {
+  if (!isRecord(body) || !exactKeys(body, ["schemaVersion", "clientMessageId", "objective", "content", "verificationRequirements"])) {
     return invalid("Unsupported or forbidden objective start field")
   }
   const clientMessageId = trimmedString(body.clientMessageId)
@@ -80,5 +91,11 @@ export function parseObjectiveStartBody(
       !protocolValid(clientMessageId, sessionId, content)) {
     return invalid("Invalid objective start command payload")
   }
-  return { clientMessageId, objective, content }
+  const hasRequirements = Object.hasOwn(body, "verificationRequirements")
+  return {
+    clientMessageId,
+    objective,
+    content,
+    ...(hasRequirements ? { verificationRequirements: parseObjectiveVerificationRequirements(body.verificationRequirements) } : {}),
+  }
 }
