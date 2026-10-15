@@ -106,6 +106,40 @@ describe("durable jobs.discover result reducer", () => {
     expect(assembly.complete).toBe(true)
   })
 
+  it("releases completed chunk buffers while retaining compact replay validation", () => {
+    const text = JSON.stringify({ payload: "x".repeat(9_000) })
+    const { bytes, reference } = fixture(text)
+    const assembly = createDurableDiscoveryAssembly(reference)
+    let final: ReturnType<typeof reduceDurableDiscoveryChunk> | undefined
+
+    for (let offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
+      const end = Math.min(offset + CHUNK_BYTES, bytes.length)
+      const chunkText = bytes.subarray(offset, end).toString("utf8")
+      final = reduceDurableDiscoveryChunk(
+        assembly, chunk(reference, chunkText, end === bytes.length ? null : String(end)), request(REF, offset),
+      )
+    }
+
+    expect(final).toMatchObject({ kind: "complete", releasedBytes: bytes.length })
+    expect(assembly.bytesStored).toBe(0)
+    expect(assembly.chunks.size).toBe(0)
+    expect(assembly.completedChunks.size).toBe(3)
+    for (let offset = 0; offset < bytes.length; offset += CHUNK_BYTES) {
+      const end = Math.min(offset + CHUNK_BYTES, bytes.length)
+      expect(reduceDurableDiscoveryChunk(
+        assembly,
+        chunk(reference, bytes.subarray(offset, end).toString("utf8"), end === bytes.length ? null : String(end)),
+        request(REF, offset),
+      ).kind).toBe("duplicate")
+    }
+
+    const conflicting = `!${bytes.subarray(0, CHUNK_BYTES).toString("utf8").slice(1)}`
+    expect(reduceDurableDiscoveryChunk(
+      assembly, chunk(reference, conflicting, String(CHUNK_BYTES)), request(REF),
+    )).toMatchObject({ kind: "invalid", releasedBytes: 0 })
+    expect(assembly.invalid).toBe(true)
+  })
+
   it("accepts exactly 1 MiB across 256 chunks and rejects a reference above the bound", () => {
     const prefix = '{"payload":"'
     const payloadLength = MAX_BYTES - Buffer.byteLength(prefix, "utf8") - 2

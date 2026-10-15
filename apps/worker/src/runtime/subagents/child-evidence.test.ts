@@ -374,7 +374,7 @@ describe("child evidence binding", () => {
   })
 
   it("binds live durable discovery evidence only after the complete chunk chain is verified", () => {
-    const { observations, bytes } = durableDiscoveryObservations()
+    const { observations } = durableDiscoveryObservations()
     const index = createObservedEvidenceIndex()
     recordLiveDiscovery(index, observations, 0)
     expect(entry(index, "job", DISCOVERED_JOB_ID)).toBeUndefined()
@@ -387,7 +387,9 @@ describe("child evidence binding", () => {
     expect(entry(index, "job", DISCOVERED_JOB_ID)).toEqual({
       id: `read:job:${DISCOVERED_JOB_ID}`, kind: "job", ref: DISCOVERED_JOB_ID, source: "greenhouse",
     })
-    expect(index.durableDiscoveryBytes).toBe(bytes.byteLength)
+    expect(index.durableDiscoveryBytes).toBe(0)
+    expect(index.durableDiscoveries.get(DURABLE_DISCOVERY_REF)?.bytesStored).toBe(0)
+    expect(index.durableDiscoveries.get(DURABLE_DISCOVERY_REF)?.chunks.size).toBe(0)
   })
 
   it("keeps verified live discovery evidence after a valid empty EOF read", () => {
@@ -424,14 +426,57 @@ describe("child evidence binding", () => {
   it("derives live chunk offsets from UTF-8 byte lengths", () => {
     const output = providerDiscoveryOutput(1)
     output.jobs[0]!.description = `Dublin 🚀 ${"x".repeat(30_000)}`
-    const { observations, bytes } = durableDiscoveryObservations(output)
+    const { observations } = durableDiscoveryObservations(output)
     const index = createObservedEvidenceIndex()
     recordLiveDiscovery(index, observations)
 
     expect(entry(index, "job", output.jobs[0]!.id)).toEqual({
       id: `read:job:${output.jobs[0]!.id}`, kind: "job", ref: output.jobs[0]!.id, source: "greenhouse",
     })
-    expect(index.durableDiscoveryBytes).toBe(bytes.byteLength)
+    expect(index.durableDiscoveryBytes).toBe(0)
+  })
+
+  it("accepts one valid durable discovery result above 256 KiB and up to 1 MiB", () => {
+    const output = providerDiscoveryOutput(12)
+    for (const job of output.jobs) job.description = "x".repeat(80_000)
+    const { observations, bytes } = durableDiscoveryObservations(output)
+    const index = createObservedEvidenceIndex()
+
+    expect(bytes.byteLength).toBeGreaterThan(256 * 1024)
+    expect(bytes.byteLength).toBeLessThanOrEqual(1024 * 1024)
+    recordLiveDiscovery(index, observations)
+
+    for (const job of output.jobs) expect(entry(index, "job", job.id)).toBeDefined()
+    expect(index.durableDiscoveryBytes).toBe(0)
+  })
+
+  it("releases completed chunks across several sequential full discovery pages", () => {
+    const index = createObservedEvidenceIndex()
+    const references: string[] = []
+    let totalPageBytes = 0
+
+    for (let page = 0; page < 18; page += 1) {
+      const output = providerDiscoveryOutput(1, page)
+      output.jobs[0]!.description = "x".repeat(60_000)
+      output.jobs[0]!.fullDescription = "y".repeat(1_000)
+      const reference = `tool-result-12345678-1234-4234-9234-${(page + 1).toString(16).padStart(12, "0")}`
+      const { observations, bytes } = durableDiscoveryObservations(output, reference)
+      references.push(reference)
+      totalPageBytes += bytes.byteLength
+
+      expect(bytes.byteLength).toBeGreaterThan(60_000)
+      recordLiveDiscovery(index, observations)
+
+      expect(entry(index, "job", output.jobs[0]!.id)).toBeDefined()
+      expect(index.durableDiscoveryBytes).toBe(0)
+      expect(index.durableDiscoveries.get(reference)?.bytesStored).toBe(0)
+      expect(index.durableDiscoveries.get(reference)?.chunks.size).toBe(0)
+    }
+
+    expect(totalPageBytes).toBeGreaterThan(1024 * 1024)
+    expect(references).toHaveLength(18)
+    expect(index.durableDiscoveries.size).toBe(18)
+    expect(index.entries.size).toBe(18)
   })
 
   it("accepts identical live chunk replay and revokes evidence after a conflicting duplicate", () => {
@@ -494,21 +539,23 @@ describe("child evidence binding", () => {
   })
 
   it("bounds cumulative live chunk memory across pending discovery references", () => {
-    const firstOutput = providerDiscoveryOutput(1)
-    firstOutput.jobs[0]!.description = "x".repeat(90_000)
-    firstOutput.jobs[0]!.fullDescription = "x".repeat(90_000)
-    const secondOutput = providerDiscoveryOutput(1, 1)
-    secondOutput.jobs[0]!.description = "x".repeat(90_000)
-    secondOutput.jobs[0]!.fullDescription = "x".repeat(90_000)
+    const firstOutput = providerDiscoveryOutput(7)
+    for (const job of firstOutput.jobs) job.description = "x".repeat(90_000)
+    const secondOutput = providerDiscoveryOutput(7, 7)
+    for (const job of secondOutput.jobs) job.description = "x".repeat(90_000)
     const first = durableDiscoveryObservations(firstOutput)
     const second = durableDiscoveryObservations(secondOutput, "tool-result-87654321-4321-4321-8321-cba987654321")
     const index = createObservedEvidenceIndex()
-    recordLiveDiscovery(index, first.observations)
-    expect(index.durableDiscoveryBytes).toBe(first.bytes.byteLength)
+    recordLiveDiscovery(index, first.observations, first.observations.length - 2)
+    const firstLastRead = first.observations[first.observations.length - 1]!.content as Record<string, unknown>
+    const firstLastOutput = firstLastRead.output as Record<string, unknown>
+    const firstPendingBytes = first.bytes.byteLength - Buffer.byteLength(firstLastOutput.chunk as string, "utf8")
+    expect(index.durableDiscoveryBytes).toBe(firstPendingBytes)
+    expect(entry(index, "job", firstOutput.jobs[0]!.id)).toBeUndefined()
 
     recordLiveDiscovery(index, second.observations)
-    expect(index.durableDiscoveryBytes).toBe(first.bytes.byteLength)
-    expect(index.durableDiscoveryBytes).toBeLessThanOrEqual(256 * 1024)
+    expect(index.durableDiscoveryBytes).toBe(firstPendingBytes)
+    expect(index.durableDiscoveryBytes).toBeLessThanOrEqual(1024 * 1024)
     expect(entry(index, "job", secondOutput.jobs[0]!.id)).toBeUndefined()
   })
 

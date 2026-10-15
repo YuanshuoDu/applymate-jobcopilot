@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer"
 
 import { parseArtifactReference, ROLE_RESULT_SCHEMA, validateRoleResult, type RoleEvidence, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
 import { artifactReferenceKey, artifactResultKey, MAX_EVIDENCE_BYTES, parseAndBindStructuredResultOutcome } from "./child-structured-result-outcome.js"
-import { createDurableDiscoveryAssembly, invalidateDurableDiscoveryAssembly, isPlainJson, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly, type DurableDiscoveryReference } from "./child-durable-discovery.js"
+import { createDurableDiscoveryAssembly, invalidateDurableDiscoveryAssembly, isPlainJson, MAX_DURABLE_DISCOVERY_BYTES, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly, type DurableDiscoveryReference } from "./child-durable-discovery.js"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
 
@@ -11,7 +11,7 @@ const MAX_EVIDENCE_ENTRIES = 50
 const MAX_DISCOVERY_EVIDENCE_BYTES = 32 * 1024
 const MAX_EVIDENCE_FIELD_LENGTH = 256
 const MAX_RESTORED_OBSERVATIONS = 256
-const MAX_LIVE_DISCOVERY_BYTES = 256 * 1024
+const MAX_LIVE_DISCOVERY_BYTES = MAX_DURABLE_DISCOVERY_BYTES
 const RESTORED_TOOL_KEYS = ["toolCallId", "toolName", "input", "status", "output", "errorCode"] as const
 const RESTORED_READ_TOOLS = new Set(["jobs.search", "jobs.get", "jobs.discover", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read", "cover_letter.draft", "artifact.version.read", "artifact.review"])
 type ObservedEvidenceKind = "job" | "persona" | "resume"

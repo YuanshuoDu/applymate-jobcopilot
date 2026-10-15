@@ -1,16 +1,18 @@
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 
-const MAX_DURABLE_DISCOVERY_BYTES = 1024 * 1024
+export const MAX_DURABLE_DISCOVERY_BYTES = 1024 * 1024
 const MAX_DURABLE_CHUNK_BYTES = 4096
 const MAX_DURABLE_CHUNKS = Math.ceil(MAX_DURABLE_DISCOVERY_BYTES / MAX_DURABLE_CHUNK_BYTES)
 const DURABLE_RESULT_REF = /^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const SHA256 = /^[0-9a-f]{64}$/
 
 export type DurableDiscoveryReference = { readonly ref: string; readonly byteCount: number; readonly sha256: string }
+type DurableDiscoveryChunkDigest = { readonly byteCount: number; readonly sha256: string }
 export type DurableDiscoveryAssembly = {
   readonly reference: DurableDiscoveryReference
   readonly chunks: Map<number, Buffer>
+  readonly completedChunks: Map<number, DurableDiscoveryChunkDigest>
   nextOffset: number
   bytesStored: number
   invalid: boolean
@@ -19,7 +21,7 @@ export type DurableDiscoveryAssembly = {
 export type DurableDiscoveryReduction =
   | { readonly kind: "pending"; readonly addedBytes: number; readonly releasedBytes: 0 }
   | { readonly kind: "duplicate"; readonly addedBytes: 0; readonly releasedBytes: 0 }
-  | { readonly kind: "complete"; readonly value: unknown; readonly addedBytes: number; readonly releasedBytes: 0 }
+  | { readonly kind: "complete"; readonly value: unknown; readonly addedBytes: number; readonly releasedBytes: number }
   | { readonly kind: "invalid"; readonly addedBytes: number; readonly releasedBytes: number }
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
@@ -52,13 +54,14 @@ export function parseDurableDiscoveryReference(output: unknown): DurableDiscover
 }
 
 export function createDurableDiscoveryAssembly(reference: DurableDiscoveryReference): DurableDiscoveryAssembly {
-  return { reference, chunks: new Map(), nextOffset: 0, bytesStored: 0, invalid: false, complete: false }
+  return { reference, chunks: new Map(), completedChunks: new Map(), nextOffset: 0, bytesStored: 0, invalid: false, complete: false }
 }
 
 export function invalidateDurableDiscoveryAssembly(assembly: DurableDiscoveryAssembly): number {
   const releasedBytes = assembly.bytesStored
   assembly.bytesStored = 0
   assembly.chunks.clear()
+  assembly.completedChunks.clear()
   assembly.invalid = true
   assembly.complete = false
   return releasedBytes
@@ -106,6 +109,10 @@ export function reduceDurableDiscoveryChunk(
   }
   const previous = assembly.chunks.get(start)
   if (previous) return previous.equals(bytes) ? { kind: "duplicate", addedBytes: 0, releasedBytes: 0 } : reject()
+  const completed = assembly.completedChunks.get(start)
+  if (completed) return completed.byteCount === bytes.length && completed.sha256 === createHash("sha256").update(bytes).digest("hex")
+    ? { kind: "duplicate", addedBytes: 0, releasedBytes: 0 } : reject()
+  if (assembly.complete) return reject()
   if (start !== assembly.nextOffset || assembly.chunks.size >= MAX_DURABLE_CHUNKS
     || !Number.isSafeInteger(maxBufferedBytes) || assembly.bytesStored + bytes.length > maxBufferedBytes) return reject()
   assembly.chunks.set(start, bytes)
@@ -116,6 +123,12 @@ export function reduceDurableDiscoveryChunk(
   if (complete.length !== reference.byteCount || createHash("sha256").update(complete).digest("hex") !== reference.sha256) return reject(bytes.length)
   const parsed = parseCompleteBytes(complete)
   if (parsed === undefined) return reject(bytes.length)
+  for (const [offset, part] of assembly.chunks) {
+    assembly.completedChunks.set(offset, { byteCount: part.length, sha256: createHash("sha256").update(part).digest("hex") })
+  }
+  const releasedBytes = assembly.bytesStored
+  assembly.chunks.clear()
+  assembly.bytesStored = 0
   assembly.complete = true
-  return { kind: "complete", value: parsed, addedBytes: bytes.length, releasedBytes: 0 }
+  return { kind: "complete", value: parsed, addedBytes: bytes.length, releasedBytes }
 }
