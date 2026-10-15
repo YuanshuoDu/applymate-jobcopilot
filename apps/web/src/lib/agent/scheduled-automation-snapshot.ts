@@ -37,9 +37,18 @@ export class ScheduledAutomationSnapshotValidationError extends TypeError {
   }
 }
 
-function readStringArray(value: unknown, field: "targetRoles" | "targetLocations"): string[] {
+const MAX_SEARCH_TARGET_ITEMS = 8
+const MAX_SEARCH_TARGET_ITEM_LENGTH = 160
+
+function readStringArray(value: unknown, field: "targetRoles" | "targetLocations", minItems: number): string[] {
   if (!Array.isArray(value)) {
     throw new ScheduledAutomationSnapshotValidationError(field, "an array of strings")
+  }
+  if (value.length < minItems || value.length > MAX_SEARCH_TARGET_ITEMS) {
+    throw new ScheduledAutomationSnapshotValidationError(
+      field,
+      "an array with " + minItems + " through " + MAX_SEARCH_TARGET_ITEMS + " entries",
+    )
   }
 
   const copy: string[] = []
@@ -51,6 +60,12 @@ function readStringArray(value: unknown, field: "targetRoles" | "targetLocations
     const trimmedEntry = entry.trim()
     if (!trimmedEntry) {
       throw new ScheduledAutomationSnapshotValidationError(field, "an array of non-empty strings")
+    }
+    if (trimmedEntry.length > MAX_SEARCH_TARGET_ITEM_LENGTH) {
+      throw new ScheduledAutomationSnapshotValidationError(
+        field,
+        "an array of non-empty strings up to " + MAX_SEARCH_TARGET_ITEM_LENGTH + " characters",
+      )
     }
     copy.push(trimmedEntry)
   }
@@ -82,8 +97,8 @@ export function buildScheduledAutomationSnapshot(
   const fields = value as Record<string, unknown>
   return {
     schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
-    targetRoles: readStringArray(fields.targetRoles, "targetRoles"),
-    targetLocations: readStringArray(fields.targetLocations, "targetLocations"),
+    targetRoles: readStringArray(fields.targetRoles, "targetRoles", 1),
+    targetLocations: readStringArray(fields.targetLocations, "targetLocations", 0),
     minScore: readBoundedInteger(fields.minScore, "minScore", 0, 100),
     dailyCap: readBoundedInteger(fields.dailyCap, "dailyCap", 1, 50),
     requireApproval: readBoolean(fields.requireApproval, "requireApproval"),

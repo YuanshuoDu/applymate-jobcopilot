@@ -51,20 +51,52 @@ describe("buildScheduledAutomationSnapshot", () => {
       .toThrow(ScheduledAutomationSnapshotValidationError)
   })
 
-  it("accepts the inclusive numeric bounds and empty lists", () => {
+  it("accepts the inclusive numeric bounds and empty locations", () => {
     expect(buildScheduledAutomationSnapshot({
-      targetRoles: [],
+      targetRoles: ["Engineer"],
       targetLocations: [],
       minScore: 0,
       dailyCap: 1,
       requireApproval: true,
       autoApply: false,
-    })).toMatchObject({ targetRoles: [], targetLocations: [], minScore: 0, dailyCap: 1 })
+    })).toMatchObject({ targetRoles: ["Engineer"], targetLocations: [], minScore: 0, dailyCap: 1 })
     expect(buildScheduledAutomationSnapshot({
       ...validInput(),
       minScore: 100,
       dailyCap: 50,
     })).toMatchObject({ minScore: 100, dailyCap: 50 })
+  })
+
+  it("requires at least one role while allowing empty locations", () => {
+    expect(() => buildScheduledAutomationSnapshot({ ...validInput(), targetRoles: [] }))
+      .toThrow(ScheduledAutomationSnapshotValidationError)
+    expect(buildScheduledAutomationSnapshot({ ...validInput(), targetLocations: [] }))
+      .toMatchObject({ targetRoles: ["Engineer", "Data Scientist"], targetLocations: [] })
+  })
+
+  it("accepts eight roles and locations with trimmed 160-character entries", () => {
+    const maxLengthEntry = "x".repeat(160)
+    const paddedEntry = " " + maxLengthEntry + " "
+    const snapshot = buildScheduledAutomationSnapshot({
+      ...validInput(),
+      targetRoles: Array(8).fill(paddedEntry),
+      targetLocations: Array(8).fill(maxLengthEntry),
+    })
+
+    expect(snapshot.targetRoles).toEqual(Array(8).fill(maxLengthEntry))
+    expect(snapshot.targetLocations).toEqual(Array(8).fill(maxLengthEntry))
+  })
+
+  it.each(["targetRoles", "targetLocations"] as const)("rejects more than eight %s entries", field => {
+    expect(() => buildScheduledAutomationSnapshot({ ...validInput(), [field]: Array(9).fill("value") }))
+      .toThrow(ScheduledAutomationSnapshotValidationError)
+  })
+
+  it.each(["targetRoles", "targetLocations"] as const)("rejects %s entries longer than 160 characters", field => {
+    expect(() => buildScheduledAutomationSnapshot({
+      ...validInput(),
+      [field]: ["x".repeat(161)],
+    })).toThrow(ScheduledAutomationSnapshotValidationError)
   })
 
   it("rejects a non-object input with a typed, clear error", () => {
