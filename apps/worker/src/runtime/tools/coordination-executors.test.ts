@@ -693,6 +693,23 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toHaveLength(0)
   })
 
+  it("checks objective coverage before looking up a legacy follow-up source", async () => {
+    const runtime = makeRuntime()
+    const lookup = vi.spyOn(runtime.store, "getTask")
+
+    let thrown: unknown
+    try { executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" }), {
+      taskId: "missing", idempotencyKey: "followup-without-plan", goal: "Continue",
+    }, {
+      ...runtime.options,
+      verificationRequirements: { status: "valid", requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2 }] },
+    }) } catch (error: unknown) { thrown = error }
+
+    expect(thrown).toMatchObject({ code: "coordination_objective_requirements_require_plan" })
+    expect(lookup).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
   it("rejects foreign sources and a missing, terminal, or cross-turn runtime parent", async () => {
     const runtime = makeRuntime()
     const source = makeTask({ id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source", depth: 1, status: "completed" })

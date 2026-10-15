@@ -127,6 +127,7 @@ export async function executeSendMessage(context: ToolExecutionContext, input: S
   return { messageId: result.message.id, taskId: target.id, status: result.duplicate ? "duplicate" as const : "queued" as const }
 }
 export function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
+  assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   if (!("mode" in input) && !plannerEnabledRoot(context, options.nativeCoordination?.enabled === true)) {
     return followupSource(context, input.taskId, options).then(source => {
       if (source.role === APPLICATION_FILLER_ROLE) throw new CoordinationError("coordination_invalid_input", "Application filler follow-up is only allowed through TaskGraph")
