@@ -10,8 +10,9 @@ const mocks = vi.hoisted(() => ({ findMany: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { job: { findMany: mocks.findMany } } }))
 
 type FixtureJobDelegate = {
-  findMany(args: { where: { userId: string; url?: string } }): Promise<Array<{ id: string; url: string; source: string }>>
+  findMany(args: { where: { userId: string; url?: string } }): Promise<Array<{ id: string; url: string; source: string; description: string | null }>>
   create(args: { data: Record<string, unknown> }): Promise<{ id: string }>
+  updateMany(args: { where: { id: string; userId: string; description: string | null }; data: { description: string } }): Promise<{ count: number }>
 }
 type FixtureTransaction = {
   job: FixtureJobDelegate
@@ -37,17 +38,23 @@ function usage(): ToolUsageState {
 }
 
 function materializerFixture() {
-  const rows = new Map<string, { id: string; userId: string; url: string; source: string }>()
+  const rows = new Map<string, { id: string; userId: string; url: string; source: string; description: string | null }>()
   const db = {
     job: {
       findMany: vi.fn(async ({ where }: { where: { userId: string; url?: string } }) => [...rows.values()]
         .filter(row => row.userId === where.userId && (where.url === undefined || row.url === where.url))
-        .map(({ id, url, source }) => ({ id, url, source }))),
+        .map(({ id, url, source, description }) => ({ id, url, source, description }))),
       create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
         const id = String(data.id)
         if (rows.has(id)) throw { code: 'P2002' }
-        rows.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source) })
+        rows.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source), description: typeof data.description === 'string' ? data.description : null })
         return { id }
+      }),
+      updateMany: vi.fn(async ({ where, data }: { where: { id: string; userId: string; description: string | null }; data: { description: string } }) => {
+        const row = rows.get(where.id)
+        if (!row || row.userId !== where.userId || row.description !== where.description) return { count: 0 }
+        rows.set(where.id, { ...row, description: data.description })
+        return { count: 1 }
       }),
     },
     async $transaction<T>(callback: (transaction: FixtureTransaction) => Promise<T>): Promise<T> {
@@ -55,12 +62,18 @@ function materializerFixture() {
       const result = await callback({ job: {
         findMany: async ({ where }: { where: { userId: string; url?: string } }) => [...staged.values()]
           .filter(row => row.userId === where.userId && (where.url === undefined || row.url === where.url))
-          .map(({ id, url, source }) => ({ id, url, source })),
+          .map(({ id, url, source, description }) => ({ id, url, source, description })),
         create: async ({ data }: { data: Record<string, unknown> }) => {
           const id = String(data.id)
           if (staged.has(id)) throw { code: 'P2002' }
-          staged.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source) })
+          staged.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source), description: typeof data.description === 'string' ? data.description : null })
           return { id }
+        },
+        updateMany: async ({ where, data }: { where: { id: string; userId: string; description: string | null }; data: { description: string } }) => {
+          const row = staged.get(where.id)
+          if (!row || row.userId !== where.userId || row.description !== where.description) return { count: 0 }
+          staged.set(where.id, { ...row, description: data.description })
+          return { count: 1 }
         },
       },
         $executeRaw: async () => 1,
