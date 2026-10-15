@@ -403,7 +403,10 @@ describe("agent automation due scheduler API", () => {
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_active", executionId: "execution_1" })
   })
 
-  it("backs off the first 20 malformed rows so the next poll can select a later valid automation", async () => {
+  it.each([
+    ["malformed", true, 20],
+    ["non-entitled malformed", false, 0],
+  ] as const)("backs off the first 20 %s rows so the next poll can select a later valid automation", async (_scenario, badRowsEntitled, expectedFailures) => {
     type SchedulerAutomationRow = {
       id: string
       userId: string
@@ -472,6 +475,7 @@ describe("agent automation due scheduler API", () => {
       lastRunAt: null,
     }
     const rows = [...badRows, validRow]
+    mocks.hasEffectiveEntitlement.mockImplementation(async (userId: string) => badRowsEntitled || userId === validRow.userId)
 
     mocks.automationFindMany.mockImplementation(async ({ where, take }: FindDueArgs) => rows
       .filter(row => row.enabled && row.nextRunAt !== null && row.nextRunAt.getTime() <= where.nextRunAt.lte.getTime())
@@ -493,7 +497,7 @@ describe("agent automation due scheduler API", () => {
     const firstBody = await firstResponse.json() as { checkedAt: string; started: unknown[]; failedAutomations: { automationId: string }[] }
 
     expect(firstBody.started).toEqual([])
-    expect(firstBody.failedAutomations).toHaveLength(20)
+    expect(firstBody.failedAutomations).toHaveLength(expectedFailures)
     expect(mocks.automationFindMany).toHaveBeenCalledTimes(1)
     expect(mocks.automationUpdateMany).toHaveBeenCalledTimes(20)
     expect(mocks.automationUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -508,6 +512,7 @@ describe("agent automation due scheduler API", () => {
     }))
     const firstCheckedAt = new Date(firstBody.checkedAt).getTime()
     expect(badRows.every(row => row.nextRunAt !== null && row.nextRunAt.getTime() > firstCheckedAt + 4 * 60_000)).toBe(true)
+    expect(badRows.every(row => row.enabled && row.lastRunAt === null)).toBe(true)
 
     const secondResponse = await POST(postRequest() as never)
     const secondBody = await secondResponse.json()
@@ -519,5 +524,18 @@ describe("agent automation due scheduler API", () => {
     expect(mocks.automationFindMany).toHaveBeenCalledTimes(2)
     expect(mocks.automationFindMany).toHaveBeenNthCalledWith(2, expect.objectContaining({ take: 20 }))
     expect(mocks.enqueueAgentRun).toHaveBeenCalledTimes(1)
+
+    if (!badRowsEntitled) {
+      // Simulate the retry time becoming due, then restore entitlement.
+      for (const row of badRows) row.nextRunAt = new Date(Date.now() - 60_000)
+      mocks.hasEffectiveEntitlement.mockResolvedValue(true)
+
+      const retryResponse = await POST(postRequest() as never)
+      const retryBody = await retryResponse.json()
+
+      expect(retryBody.failedAutomations).toHaveLength(20)
+      expect(mocks.automationFindMany).toHaveBeenCalledTimes(3)
+      expect(mocks.turnCreate).toHaveBeenCalledTimes(1)
+    }
   })
 })

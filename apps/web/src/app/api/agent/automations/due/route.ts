@@ -30,7 +30,7 @@ type AutomationForRun = {
 }
 
 const ACTIVE_AUTOMATION_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"]
-const INVALID_AUTOMATION_CONFIG_RETRY_DELAY_MS = 5 * 60 * 1000
+const DUE_AUTOMATION_RETRY_DELAY_MS = 5 * 60 * 1000
 
 function authorized(req: NextRequest) {
   const secret = process.env.AGENT_AUTOMATION_CRON_SECRET ?? process.env.CRON_SECRET
@@ -51,7 +51,6 @@ function automationPayload(automation: AutomationForRun) {
     autoApply: automation.autoApply,
   }
 }
-
 const scheduledAutomationSnapshot = (automation: AutomationForRun) => ({
   targetRoles: automation.targetRoles,
   targetLocations: automation.targetLocations,
@@ -60,7 +59,6 @@ const scheduledAutomationSnapshot = (automation: AutomationForRun) => ({
   requireApproval: automation.requireApproval,
   autoApply: automation.autoApply,
 })
-
 function runnableAutomationWhere(automation: Pick<AutomationForRun, "id" | "userId">, now: Date): Prisma.AgentAutomationWhereInput {
   return {
     id: automation.id,
@@ -70,7 +68,6 @@ function runnableAutomationWhere(automation: Pick<AutomationForRun, "id" | "user
     user: { accountStatus: "active" },
   }
 }
-
 async function startAutomation(automation: AutomationForRun, now: Date) {
   requireLegacyPolicy({
     userId: automation.userId, sessionId: automation.sessionId ?? `automation-scheduler:${automation.id}`,
@@ -229,14 +226,17 @@ async function runDueAutomations(req: NextRequest) {
 
   const started = []
   const failedAutomations: { automationId: string; code: string }[] = []
+  const deferDueAutomation = (automation: AutomationForRun) => db.agentAutomation.updateMany({
+    where: runnableAutomationWhere(automation, now), data: { nextRunAt: new Date(now.getTime() + DUE_AUTOMATION_RETRY_DELAY_MS) },
+  })
   for (const automation of automations) {
-    if (!await hasEffectiveEntitlement(automation.userId, 'auto_apply')) continue
+    if (!await hasEffectiveEntitlement(automation.userId, 'auto_apply')) {
+      await deferDueAutomation(automation)
+      continue
+    }
     const result = await startAutomation(automation, now).catch(async (error: unknown) => {
       if (!(error instanceof ScheduledAutomationSnapshotValidationError)) throw error
-      await db.agentAutomation.updateMany({
-        where: runnableAutomationWhere(automation, now),
-        data: { nextRunAt: new Date(now.getTime() + INVALID_AUTOMATION_CONFIG_RETRY_DELAY_MS) },
-      })
+      await deferDueAutomation(automation)
       failedAutomations.push({ automationId: automation.id, code: error.code })
       return null
     })
