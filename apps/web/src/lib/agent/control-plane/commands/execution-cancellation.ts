@@ -14,6 +14,7 @@ import {
 import type { InterruptCommand, InterruptResult } from "./types"
 
 export type CancelExecutionCommand = { executionId: string; userId: string; sessionId?: string | null }
+type InterruptOptions = { executionOwner?: { id: string }; taskGraphFillCancellation?: "cancel" | "preserve" }
 
 const CANCELLABLE_EXECUTION_STATUSES = ["queued", "running", "waiting_for_user", "paused"] as const
 
@@ -57,7 +58,7 @@ async function interruptActiveSubagentTree(
   `)
 }
 
-async function cancelAuthorizedApplicationsBeforeSubmit(tx: CommandTransaction, scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date }): Promise<number> {
+async function cancelAuthorizedApplicationsBeforeSubmit(tx: CommandTransaction, scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date }, cancelBoundTaskGraphFill = true): Promise<number> {
   return tx.$executeRaw(Prisma.sql`
     WITH stop AS (SELECT ${scope.requestedAt}::timestamptz AS "requestedAt")
     UPDATE "application_tasks" AS application
@@ -87,6 +88,7 @@ async function cancelAuthorizedApplicationsBeforeSubmit(tx: CommandTransaction, 
           AND application."fillTurnId" = ${scope.turnId}
           AND application."fillTurnSessionId" = ${scope.sessionId}
           AND application."fillTurnUserId" = ${scope.userId}
+          AND ${cancelBoundTaskGraphFill}
         )
       )
       AND EXISTS (
@@ -117,7 +119,7 @@ async function cancelActiveTurnFollowUps(tx: CommandTransaction, scope: { userId
   return cancelled.count
 }
 
-export async function interruptActiveTurn(tx: CommandTransaction, command: InterruptCommand, active: ActiveTurn, executionOwner?: { id: string }): Promise<InterruptResult> {
+export async function interruptActiveTurn(tx: CommandTransaction, command: InterruptCommand, active: ActiveTurn, options: InterruptOptions = {}): Promise<InterruptResult> {
   const requestedAt = new Date()
   const interrupted = await tx.agentTurn.updateMany({ where: { id: active.id, sessionId: command.sessionId, userId: command.userId, status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] }, revision: active.revision }, data: { status: "interrupted", revision: { increment: 1 }, completedAt: requestedAt } })
   if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
@@ -125,7 +127,7 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
   // Fence the execution before touching ApplicationTask rows.
   const executionFence = await tx.agentExecution.updateMany({
     where: {
-      ...(executionOwner ? { id: executionOwner.id } : {}),
+      ...(options.executionOwner ? { id: options.executionOwner.id } : {}),
       userId: command.userId,
       sessionId: command.sessionId,
       status: { in: [...CANCELLABLE_EXECUTION_STATUSES] },
@@ -137,12 +139,12 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
       completedAt: requestedAt,
     },
   })
-  if (executionOwner && executionFence.count !== 1) {
+  if (options.executionOwner && executionFence.count !== 1) {
     const current = await tx.agentExecution.findFirst({
-      where: { id: executionOwner.id, userId: command.userId, sessionId: command.sessionId },
+      where: { id: options.executionOwner.id, userId: command.userId, sessionId: command.sessionId },
       select: { status: true },
     })
-    if (current?.status !== "cancelled") throw executionChanged(executionOwner.id)
+    if (current?.status !== "cancelled") throw executionChanged(options.executionOwner.id)
   }
 
   await interruptActiveSubagentTree(tx, {
@@ -152,12 +154,7 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
     requestedAt,
   })
 
-  await cancelAuthorizedApplicationsBeforeSubmit(tx, {
-    userId: command.userId,
-    sessionId: command.sessionId,
-    turnId: active.id,
-    requestedAt,
-  })
+  await cancelAuthorizedApplicationsBeforeSubmit(tx, { userId: command.userId, sessionId: command.sessionId, turnId: active.id, requestedAt }, options.taskGraphFillCancellation !== "preserve")
 
   await cancelActiveTurnFollowUps(tx, {
     userId: command.userId,
@@ -215,7 +212,7 @@ export async function cancelExecutionInTransaction(
 
   const willInterruptActiveTurn = Boolean(interruptCommand && !existing && active)
   if (willInterruptActiveTurn && interruptCommand && active) {
-    await interruptActiveTurn(tx, interruptCommand, active, { id: execution.id })
+    await interruptActiveTurn(tx, interruptCommand, active, { executionOwner: { id: execution.id } })
   } else if (lockedExecution.status !== "cancelled") {
     const updated = await tx.agentExecution.updateMany({
       where: {

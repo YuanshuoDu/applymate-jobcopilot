@@ -80,7 +80,7 @@ export async function startApplicationFillForReview(db: PrismaClient, command: F
               expectedTurnId: resume.active.id,
               expectedRevision: resume.active.revision,
             }
-            await interruptActiveTurn(tx, interrupt, resume.active)
+            await interruptActiveTurn(tx, interrupt, resume.active, { taskGraphFillCancellation: "preserve" })
             return await createFillTurn(tx, resumeIdentity, task, command.applicationTaskId, true)
           }
         }

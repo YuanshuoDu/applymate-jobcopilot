@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { CommandTransaction } from "./transaction"
-import { cancelExecutionInTransaction } from "./execution-cancellation"
+import { cancelExecutionInTransaction, interruptActiveTurn } from "./execution-cancellation"
 
 type State = {
   execution: { id: string; sessionId: string; userId: string; status: string; attemptCount: number } | null
@@ -117,8 +117,9 @@ function makeTransaction(options: {
             && approval.sessionId === sessionId && approval.turnId === turnId
             && approval.type === "submit_application" && ["approved", "consumed"].includes(approval.status)
             && approval.payload.applicationTaskId === task.id)
-          const inFlightFill = (task.status === "filling" && ["taskgraph_fill_queued", "browser_active"].includes(task.checkpoint ?? ""))
-            || (task.status === "waiting_for_user" && ["form_answer_required", "fill_outcome_uncertain"].includes(task.checkpoint ?? ""))
+          const cancelBoundTaskGraphFill = values.includes(true)
+          const inFlightFill = cancelBoundTaskGraphFill && ((task.status === "filling" && ["taskgraph_fill_queued", "browser_active"].includes(task.checkpoint ?? ""))
+            || (task.status === "waiting_for_user" && ["form_answer_required", "fill_outcome_uncertain"].includes(task.checkpoint ?? "")))
           const beforeSubmit = (task.status === "filling" && !["submission_request_started", "submission_uncertain"].includes(task.checkpoint ?? ""))
             || (task.status === "waiting_for_authorization" && ["form_filled", "queue_retry"].includes(task.checkpoint ?? ""))
             || (task.status === "waiting_for_user" && task.checkpoint === "user_takeover")
@@ -512,6 +513,38 @@ describe("execution cancellation transaction", () => {
     expect(sql).toContain("'taskgraph_fill_queued', 'browser_active'")
     expect(sql).toContain("'form_answer_required', 'fill_outcome_uncertain'")
     expect(rawUpdate(fake.tx, "sub_agent_tasks").order).toBeLessThan(rawUpdate(fake.tx, "application_tasks").order)
+  })
+
+  it("preserves a bound answer wait for resume while cancelling legacy approved work", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "answer_wait", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "waiting_for_user", checkpoint: "form_answer_required", completedAt: null },
+      { id: "completed_review", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+    ]
+    const childTasks: State["tasks"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", status: "waiting_for_user", interruptRequestedAt: null, nextAttemptAt: null, completedAt: null, leaseOwner: null, leaseExpiresAt: null },
+    ]
+    const approvals: State["approvals"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "completed_review" } },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "manual", activeSource: "manual", applicationTasks, approvals, childTasks })
+
+    await expect(interruptActiveTurn(fake.tx, {
+      sessionId: "session_1",
+      userId: "user_1",
+      clientMessageId: "answer_resume_interrupt",
+      source: "user",
+      expectedTurnId: "turn_1",
+      expectedRevision: 0,
+    }, fake.state.active!, { taskGraphFillCancellation: "preserve" })).resolves.toMatchObject({ disposition: "interrupted" })
+
+    expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+    expect(childTasks[0]).toMatchObject({ status: "interrupted", interruptRequestedAt: expect.any(Date) })
+    expect(applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "form_answer_required", fillTurnId: "turn_1", completedAt: null })
+    expect(applicationTasks[1]).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) })
+    const applicationUpdates = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([query]) => ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes('UPDATE "application_tasks"'))
+    expect(applicationUpdates).toHaveLength(1)
+    expect((applicationUpdates[0]?.[0] as { values?: readonly unknown[] }).values).toContain(false)
   })
 
   it("cancels a linked pre-start user handoff while preserving uncertain submissions", async () => {

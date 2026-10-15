@@ -204,7 +204,12 @@ describe("startApplicationFillForReview", () => {
     expect(fake.state.turns).toHaveLength(2)
     expect(fake.state.inputs.find(input => input.targetTurnId === result.turnId)?.clientMessageId).toMatch(/^application-fill-resume:application_1:/)
     expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
-    expect(executionMocks.interruptActiveTurn).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ expectedTurnId: "turn_previous", expectedRevision: 0 }), expect.objectContaining({ id: "turn_previous" }))
+    expect(executionMocks.interruptActiveTurn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ expectedTurnId: "turn_previous", expectedRevision: 0 }),
+      expect.objectContaining({ id: "turn_previous" }),
+      { taskGraphFillCancellation: "preserve" },
+    )
   })
 
   it("rejects invalid persisted materials before interrupting a resumable fill Turn", async () => {
