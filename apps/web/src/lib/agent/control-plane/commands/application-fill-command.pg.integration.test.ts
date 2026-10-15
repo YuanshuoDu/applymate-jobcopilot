@@ -16,10 +16,12 @@ const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
-  if (process.env.CI !== "true" && !required) return null
-  if (!value || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true") {
+  if (!value) {
     if (required) throw new Error("Application fill PostgreSQL tests need AGENT_RUNTIME_PG_TEST_URL and AGENT_RUNTIME_PG_TEST_DISPOSABLE=true")
     return null
+  }
+  if (process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true") {
+    throw new Error("Application fill PostgreSQL tests require AGENT_RUNTIME_PG_TEST_DISPOSABLE=true")
   }
   const url = new URL(value)
   if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1" || url.port !== "5432"
@@ -104,12 +106,13 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     await prisma!.$executeRaw`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot")
       VALUES (${otherTurnId}, ${ids.session}, 'different-user', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb)`
 
-    await expect(prisma!.$executeRaw`UPDATE "application_tasks" SET "fillTurnId" = ${otherTurnId} WHERE "id" = ${ids.task}`).rejects.toThrow()
+    await expect(prisma!.$executeRaw`UPDATE "application_tasks"
+      SET "fillTurnId" = ${otherTurnId}, "fillTurnSessionId" = ${ids.session}, "fillTurnUserId" = ${ids.user}
+      WHERE "id" = ${ids.task}`).rejects.toThrow()
     const rows = await prisma!.$queryRaw<Array<{ fillTurnId: string; fillTurnSessionId: string; fillTurnUserId: string }>>`
       SELECT "fillTurnId", "fillTurnSessionId", "fillTurnUserId" FROM "application_tasks" WHERE "id" = ${ids.task}
     `
-    expect(rows[0]).toMatchObject({ fillTurnSessionId: ids.session, fillTurnUserId: ids.user })
-    expect(rows[0]?.fillTurnId).not.toBe(otherTurnId)
+    expect(rows[0]).toEqual({ fillTurnId: null, fillTurnSessionId: null, fillTurnUserId: null })
   })
 
   it.each(["job ownership", "resume ownership/association", "cover-letter ownership/application association"])(
@@ -194,10 +197,13 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     const controller = new AbortController()
     controller.abort()
     lease.signal = controller.signal
-    await expect(acknowledgeApplicationFillCancellation(workerSchemaPool!, { lease })).resolves.toEqual({ status: "cancelled" })
-
     await prisma!.$executeRaw`UPDATE "sub_agent_tasks" SET "leaseOwner" = ${`${ownerId}-replacement`} WHERE "id" = ${childId}`
     await expect(acknowledgeApplicationFillCancellation(workerSchemaPool!, { lease })).resolves.toEqual({ status: "stale" })
+    const staleAcknowledgementChild = await prisma!.$queryRaw<Array<{ status: string; leaseOwner: string | null; interruptRequestedAt: Date | null }>>`
+      SELECT "status", "leaseOwner", "interruptRequestedAt" FROM "sub_agent_tasks" WHERE "id" = ${childId}
+    `
+    expect(staleAcknowledgementChild[0]).toMatchObject({ status: "running", leaseOwner: `${ownerId}-replacement` })
+    expect(staleAcknowledgementChild[0]?.interruptRequestedAt).toBeInstanceOf(Date)
     await expect(prisma!.applicationTask.findUnique({ where: { id: taskId }, select: { status: true, checkpoint: true } }))
       .resolves.toEqual({ status: "cancelled", checkpoint: "turn_stopped_before_submit" })
     await expect(prisma!.applicationTaskEvent.count({ where: { taskId } })).resolves.toBe(0)

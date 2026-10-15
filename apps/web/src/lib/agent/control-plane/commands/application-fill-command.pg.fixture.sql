@@ -16,6 +16,10 @@ CREATE TABLE "agent_turns" (
   "toolPolicySnapshot" JSONB NOT NULL,
   "budgetSnapshot" JSONB NOT NULL,
   "revision" INTEGER NOT NULL DEFAULT 0,
+  "inputTokens" INTEGER NOT NULL DEFAULT 0,
+  "outputTokens" INTEGER NOT NULL DEFAULT 0,
+  "estimatedCostUsd" DECIMAL(12, 8) NOT NULL DEFAULT 0,
+  "leaseVersion" INTEGER NOT NULL DEFAULT 0,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "agent_turns_id_session_user_key" UNIQUE ("id", "sessionId", "userId")
