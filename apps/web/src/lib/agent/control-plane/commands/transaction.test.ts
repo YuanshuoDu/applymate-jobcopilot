@@ -75,6 +75,8 @@ describe("Agent command transaction helpers", () => {
     await createRootTurn(tx, command, [{ type: "text", text: "Find roles" }], "Find roles", undefined, undefined, requirements)
     const validInput = agentTurn.create.mock.calls[0]?.[0]?.data.input
     expect(validInput).toHaveProperty("verificationRequirements", requirements)
+    const roundTrippedRequirements: unknown = JSON.parse(JSON.stringify(validInput.verificationRequirements))
+    expect(roundTrippedRequirements).toEqual(requirements)
 
     await createRootTurn(tx, command, [{ type: "text", text: "Find roles" }], "Find roles", undefined, undefined, null)
     const invalidInput = agentTurn.create.mock.calls[1]?.[0]?.data.input
