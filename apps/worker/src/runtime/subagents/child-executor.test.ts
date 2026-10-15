@@ -4,6 +4,20 @@ import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import { Buffer } from "node:buffer"
 
+const turnExecutionLoop = vi.hoisted(() => ({ resultOverride: undefined as unknown }))
+vi.mock("../turns/turn-execution-loop.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../turns/turn-execution-loop.js")>()
+  return {
+    ...actual,
+    runTurnExecutionLoop: async (options: Parameters<typeof actual.runTurnExecutionLoop>[0]) => {
+      if (turnExecutionLoop.resultOverride !== undefined) {
+        return turnExecutionLoop.resultOverride as Awaited<ReturnType<typeof actual.runTurnExecutionLoop>>
+      }
+      return actual.runTurnExecutionLoop(options)
+    },
+  }
+})
+
 import { createChildExecutor, type ChildToolRuntime } from "./child-executor.js"
 import { RootAbortController } from "../interrupt/registry.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
@@ -910,6 +924,29 @@ describe("child executor composition", () => {
     expect(result).toMatchObject({ status: "failed", result: { status: "failed", structuredOutputFailureCategory: "result_shape_invalid" }, failureReason: "invalid_structured_result" })
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
+  })
+
+  it("retains only the fixed missing-output category for completed Scout results without string final text", async () => {
+    const rejectedOutput = "RAW_REJECTED_NON_STRING_OUTPUT_SENTINEL"
+    turnExecutionLoop.resultOverride = {
+      status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "child-final-item",
+      finalText: { privateOutput: rejectedOutput },
+    }
+    try {
+      const result = await finalTextExecutor(textOnlyModel("unreachable"))({ lease: structuredLease("scout") })
+
+      expect(result).toEqual({
+        status: "failed",
+        result: {
+          status: "failed", stepCount: 2, toolCallCount: 1, finalItemId: "child-final-item",
+          structuredOutputFailureCategory: "missing_final_output",
+        },
+        failureReason: "invalid_structured_result",
+      })
+      expect(JSON.stringify(result)).not.toContain(rejectedOutput)
+    } finally {
+      turnExecutionLoop.resultOverride = undefined
+    }
   })
 
   it("keeps a valid-looking final text as generic output without a structured marker", async () => {
