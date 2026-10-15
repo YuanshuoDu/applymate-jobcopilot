@@ -13,6 +13,10 @@ import { FocusTaskTree, focusQuestionOptions } from './session-focus-parts'
 interface DetailResponse {
   session: AgentSessionDetail
 }
+
+function formWaitId(question: unknown): string | null { const waitId = question && typeof question === 'object' && !Array.isArray(question) ? (question as Record<string, unknown>).waitId : null; return typeof waitId === 'string' && waitId.trim() ? waitId : null }
+export function formAnswerDraftKey(taskId: string, waitId: string, field: string) { return `${taskId}:${waitId}:${field}` }
+
 export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
   const { t } = useI18n()
   if (!sessionId) {
@@ -56,13 +60,9 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
       window.dispatchEvent(new Event('applymate:sessions-changed'))
     }
   }
-
-  async function answerAndResume(id: string, fields: string[]) {
-    const submittedAnswers = Object.fromEntries(fields.map(field => [field, answers[`${id}:${field}`] ?? '']).filter(([, value]) => value.trim()))
-    const response = await fetch('/api/agent/application-tasks', {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, action: 'answer_and_resume', answers: submittedAnswers }),
-    })
+  async function answerAndResume(id: string, waitId: string, fields: string[]) {
+    const submittedAnswers = Object.fromEntries(fields.map(field => [field, answers[formAnswerDraftKey(id, waitId, field)] ?? '']).filter(([, value]) => value.trim()))
+    const response = await fetch('/api/agent/application-tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, waitId, action: 'answer_and_resume', answers: submittedAnswers }) })
     if (response.ok) {
       await refetch()
       window.dispatchEvent(new Event('applymate:sessions-changed'))
@@ -109,16 +109,18 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
         {!loading && applicationTasks.length === 0 && <EmptyText>{t('agent.noApplicationTasks')}</EmptyText>}
         {applicationTasks.slice(0, 5).map(task => {
           const fields = task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required' ? formQuestionFields(task.question) : []
+          const waitId = formWaitId(task.question)
           return (
           <div key={task.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
               <div style={rowTitleStyle}>{task.job.company} · {task.job.role}</div>
               <div style={rowMetaStyle}>{task.status}{task.checkpoint ? ` · ${task.checkpoint}` : ''}</div>
               {task.error && <div style={{ ...rowMetaStyle, color: '#d97706' }}>{task.error}</div>}
+              {fields.length > 0 && !waitId && <div style={{ ...rowMetaStyle, color: '#d97706' }}>This saved form wait is missing its wait ID and cannot be safely resumed.</div>}
               {fields.map(field => (
-                <input key={field} value={answers[`${task.id}:${field}`] ?? ''} onChange={event => setAnswers(current => ({ ...current, [`${task.id}:${field}`]: event.target.value }))} placeholder={field} style={answerInputStyle} />
+                <input key={formAnswerDraftKey(task.id, waitId ?? '', field)} value={answers[formAnswerDraftKey(task.id, waitId ?? '', field)] ?? ''} onChange={event => setAnswers(current => ({ ...current, [formAnswerDraftKey(task.id, waitId ?? '', field)]: event.target.value }))} placeholder={field} style={answerInputStyle} />
               ))}
-              {fields.length > 0 && <button onClick={() => { void answerAndResume(task.id, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
+              {fields.length > 0 && waitId && <button onClick={() => { void answerAndResume(task.id, waitId, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
             </div>
             {!['submitted', 'skipped', 'cancelled'].includes(task.status) && (
               <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancel')}</button>

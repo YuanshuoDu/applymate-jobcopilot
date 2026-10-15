@@ -1,73 +1,11 @@
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
-import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
-import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
-import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
+import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
+import { applicationFillTaskGraphEnabled, asRecord, assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, AutoApplyError, validateAutoApplyUrl } from "./auto-apply-guards";
 
-export class AutoApplyError extends Error {}
-
-async function assertActiveAccount(userId: string): Promise<void> {
-  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
-  if (user?.accountStatus !== 'active') throw new AutoApplyError('Account is not active.')
-}
-
-async function assertUnattendedApplyEnabled(userId: string): Promise<void> {
-  try {
-    if (!await isFeatureAllowed(userId, 'auto_apply')) throw new AutoApplyError('This feature is not included in your current plan.')
-    const aiAccess = await resolveAiAccess(userId)
-    if (aiAccess === 'disabled') throw new AutoApplyError('This feature is not included in your current plan.')
-    if (aiAccess === 'exhausted') throw new AutoApplyError('Monthly AI credits exhausted.')
-    if (!await isRuntimeFeatureEnabled('unattended_apply', userId)) {
-      throw new AutoApplyError('Unattended applications are temporarily unavailable.')
-    }
-  } catch (error) {
-    if (error instanceof AutoApplyError) throw error
-    throw new AutoApplyError('Unattended applications are temporarily unavailable.')
-  }
-}
-
-export function validateAutoApplyUrl(rawUrl: string | null | undefined): string {
-  const url = rawUrl?.trim();
-  if (!url) throw new AutoApplyError("This job has no application URL.");
-
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new AutoApplyError("The application URL is invalid.");
-  }
-
-  if (parsed.protocol !== "https:") {
-    throw new AutoApplyError("Automatic applications require an HTTPS destination.");
-  }
-
-  if (!isSupportedAutomatedApplyUrl(parsed.toString())) {
-    throw new AutoApplyError("Automatic application requires a direct supported ATS link, not a job-board or unknown destination.");
-  }
-
-  return parsed.toString();
-}
-
-async function assertJobPreflight(input: { userId: string; jobId: string }) {
-  const job = await db.job.findFirst({
-    where: { id: input.jobId, userId: input.userId },
-    select: { company: true, description: true, source: true, url: true },
-  })
-  if (!job) throw new AutoApplyError("The job could not be found for application preflight.")
-  try {
-    requireLegacyPolicy({
-      userId: input.userId, sessionId: `application-preflight:${input.jobId}`, turnId: `preflight:${input.jobId}`,
-      stepId: "application.preflight", toolCallId: `preflight:${input.jobId}`, toolName: "application.preflight",
-      domain: "application", risk: "read", capabilities: ["read"], input: { jobId: input.jobId, unknownSensitiveFacts: false },
-    })
-  } catch (error) {
-    throw new AutoApplyError(error instanceof Error ? error.message : "Application preflight was denied by policy.")
-  }
-  const preflight = assessApplicationPreflight(job)
-  if (!preflight.canAutomate) throw new AutoApplyError(preflight.issues.map(issue => issue.message).join(" "))
-}
+export { AutoApplyError, applicationFillTaskGraphEnabled, validateAutoApplyUrl } from "./auto-apply-guards";
 
 /** Dispatches the safe first browser pass: fill fields, then stop for review. */
 export async function queueApplicationFill(input: {
@@ -76,7 +14,10 @@ export async function queueApplicationFill(input: {
   applyUrl: string | null | undefined;
   applicationTaskId: string;
   resumeAfterUserInput?: boolean;
-}): Promise<{ taskId: string }> {
+  sessionId?: string;
+  retry?: boolean;
+  retryId?: string;
+}): Promise<{ taskId: string; turnId?: string; disposition?: string }> {
   await assertActiveAccount(input.userId)
   await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
@@ -90,6 +31,28 @@ export async function queueApplicationFill(input: {
     })
   } catch (error) {
     throw new AutoApplyError(error instanceof Error ? error.message : "Application fill was denied by policy.")
+  }
+  if (applicationFillTaskGraphEnabled()) {
+    if (input.retry && (!input.retryId || !/^[A-Za-z0-9_-]{8,128}$/.test(input.retryId))) {
+      throw new AutoApplyError("A valid retry request ID is required for an explicit application fill retry.")
+    }
+    const task = await db.applicationTask.findFirst({
+      where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId },
+      select: { sessionId: true, fillTurnId: true },
+    })
+    if (!task?.sessionId || (input.sessionId && input.sessionId !== task.sessionId)) {
+      throw new AutoApplyError("The application is missing its scoped Agent session.")
+    }
+    const clientMessageId = input.retry
+      ? `application-fill-retry:${input.applicationTaskId}:${input.retryId}`
+      : input.resumeAfterUserInput
+        ? `application-fill-resume:${input.applicationTaskId}`
+        : `application-fill:${input.applicationTaskId}`
+    const result = await new AgentCommandService(db).startApplicationFillForReview({
+      sessionId: task.sessionId, userId: input.userId, clientMessageId,
+      applicationTaskId: input.applicationTaskId, retry: input.retry, resumeAfterUserInput: input.resumeAfterUserInput,
+    })
+    return { taskId: result.turnId, turnId: result.turnId, disposition: result.disposition }
   }
   const claimed = await db.applicationTask.updateMany({
     where: {
@@ -283,8 +246,4 @@ export async function queueAutonomousApplication(input: {
     }).catch(() => undefined);
     throw error;
   }
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }

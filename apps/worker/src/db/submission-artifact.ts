@@ -1,7 +1,7 @@
-import type { Pool } from "pg"
+import type { Pool, PoolClient } from "pg"
 
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
-import { createAgentArtifactRepository, type AgentArtifactRow } from "./agent-artifact-repo.js"
+import { createAgentArtifactRepository, insertAgentArtifactBaseWithClient, type AgentArtifactRow } from "./agent-artifact-repo.js"
 
 export type SubmissionArtifactInput = {
   readonly applicationTaskId: string
@@ -65,4 +65,19 @@ export async function ensureSubmissionArtifact(pool: Pool, input: SubmissionArti
     if (existing && sameArtifact(existing, input, hash)) return existing
     throw new SubmissionArtifactError("conflict", "A different immutable submission artifact already exists for this task.")
   }
+}
+
+/** Idempotently creates the submission manifest on a caller-owned transaction. */
+export async function ensureSubmissionArtifactWithClient(client: Pick<PoolClient, "query">, input: SubmissionArtifactInput): Promise<AgentArtifactRow> {
+  assertInput(input)
+  const content = { schemaVersion: "agent-harness.application-submission.v1", applicationTaskId: input.applicationTaskId,
+    jobId: input.jobId, resumeId: input.resumeId, coverLetterId: input.coverLetterId, answersHash: input.answersHash }
+  const hash = hashArtifactContent(content)
+  const row = await insertAgentArtifactBaseWithClient(client, {
+    id: `application:${input.applicationTaskId}`, userId: input.userId, jobId: input.jobId, artifactType: "application", content, hash,
+    constraintHash: hashArtifactContent({ applicationTaskId: input.applicationTaskId, jobId: input.jobId }),
+    provenanceRefs: [`application-task:${input.applicationTaskId}`], evidenceRefs: [`application-task:${input.applicationTaskId}`],
+  })
+  if (!sameArtifact(row, input, hash)) throw new SubmissionArtifactError("conflict", "A different immutable submission artifact already exists for this task.")
+  return row
 }

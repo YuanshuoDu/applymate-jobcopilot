@@ -298,6 +298,9 @@ model ApplicationTask {
   userId           String
   jobId            String
   sessionId        String?
+  fillTurnId       String?   @unique
+  fillTurnSessionId String?
+  fillTurnUserId   String?
   status           String    @default("discovered")
   checkpoint       String?
   question         Json?
@@ -317,9 +320,11 @@ model ApplicationTask {
   user    User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
   job     Job                    @relation(fields: [jobId], references: [id], onDelete: Cascade)
   session AgentSession?          @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  fillTurn AgentTurn?            @relation("ApplicationFillTurn", fields: [fillTurnId, fillTurnSessionId, fillTurnUserId], references: [id, sessionId, userId], onDelete: SetNull)
   events  ApplicationTaskEvent[]
 
   @@unique([userId, jobId])
+  @@unique([fillTurnId, fillTurnSessionId, fillTurnUserId])
   @@index([userId, status, updatedAt(sort: Desc)])
   @@index([sessionId, status])
   @@map("application_tasks")
@@ -1996,6 +2001,7 @@ model AgentTurn {
   inputs          AgentInput[]          @relation("AgentTurnInputs")
   items           AgentItem[]
   events          AgentEvent[]
+  applicationFillTask ApplicationTask? @relation("ApplicationFillTurn")
   approvals       AgentApproval[]
   subAgentTasks   SubAgentTask[]
   mailboxMessages AgentMailboxMessage[]

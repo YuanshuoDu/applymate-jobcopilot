@@ -57,37 +57,37 @@ async function interruptActiveSubagentTree(
   `)
 }
 
-async function cancelAuthorizedApplicationsBeforeSubmit(
-  tx: CommandTransaction,
-  scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date },
-): Promise<number> {
+async function cancelAuthorizedApplicationsBeforeSubmit(tx: CommandTransaction, scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date }): Promise<number> {
   return tx.$executeRaw(Prisma.sql`
     WITH stop AS (SELECT ${scope.requestedAt}::timestamptz AS "requestedAt")
     UPDATE "application_tasks" AS application
-    SET "status" = 'cancelled',
-        "checkpoint" = 'turn_stopped_before_submit',
-        "completedAt" = stop."requestedAt",
-        "updatedAt" = stop."requestedAt"
+    SET "status" = 'cancelled', "checkpoint" = 'turn_stopped_before_submit',
+        "completedAt" = stop."requestedAt", "updatedAt" = stop."requestedAt"
     FROM stop
     WHERE application."userId" = ${scope.userId}
       AND application."sessionId" = ${scope.sessionId}
       AND (
-        (application."status" = 'filling'
-          AND application."checkpoint" IS DISTINCT FROM 'submission_request_started'
-          AND application."checkpoint" IS DISTINCT FROM 'submission_uncertain')
-        OR (application."status" = 'waiting_for_authorization'
-          AND application."checkpoint" IN ('form_filled', 'queue_retry'))
-        OR (application."status" = 'waiting_for_user'
-          AND application."checkpoint" = 'user_takeover')
-      )
-      AND EXISTS (
-        SELECT 1 FROM "agent_approvals" AS approval
-        WHERE approval."userId" = ${scope.userId}
-          AND approval."sessionId" = ${scope.sessionId}
-          AND approval."turnId" = ${scope.turnId}
-          AND approval."type" = 'submit_application'
-          AND approval."status" IN ('approved', 'consumed')
-          AND approval."payload"->>'applicationTaskId' = application."id"
+        (
+          (application."status" = 'filling' AND application."checkpoint" IS DISTINCT FROM 'submission_request_started' AND application."checkpoint" IS DISTINCT FROM 'submission_uncertain')
+          OR (application."status" = 'waiting_for_authorization' AND application."checkpoint" IN ('form_filled', 'queue_retry'))
+          OR (application."status" = 'waiting_for_user' AND application."checkpoint" = 'user_takeover')
+        )
+        AND EXISTS (
+          SELECT 1 FROM "agent_approvals" AS approval
+          WHERE approval."userId" = ${scope.userId} AND approval."sessionId" = ${scope.sessionId}
+            AND approval."turnId" = ${scope.turnId} AND approval."type" = 'submit_application'
+            AND approval."status" IN ('approved', 'consumed')
+            AND approval."payload"->>'applicationTaskId' = application."id"
+        )
+        OR (
+          (
+            (application."status" = 'filling' AND application."checkpoint" IN ('taskgraph_fill_queued', 'browser_active'))
+            OR (application."status" = 'waiting_for_user' AND application."checkpoint" IN ('form_answer_required', 'fill_outcome_uncertain'))
+          )
+          AND application."fillTurnId" = ${scope.turnId}
+          AND application."fillTurnSessionId" = ${scope.sessionId}
+          AND application."fillTurnUserId" = ${scope.userId}
+        )
       )
       AND EXISTS (
         SELECT 1 FROM "agent_sessions" AS session
@@ -145,6 +145,13 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
     if (current?.status !== "cancelled") throw executionChanged(executionOwner.id)
   }
 
+  await interruptActiveSubagentTree(tx, {
+    userId: command.userId,
+    sessionId: command.sessionId,
+    turnId: active.id,
+    requestedAt,
+  })
+
   await cancelAuthorizedApplicationsBeforeSubmit(tx, {
     userId: command.userId,
     sessionId: command.sessionId,
@@ -159,12 +166,6 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
     requestedAt,
   })
 
-  await interruptActiveSubagentTree(tx, {
-    userId: command.userId,
-    sessionId: command.sessionId,
-    turnId: active.id,
-    requestedAt,
-  })
   await enqueueTaskGraphStopIntent(tx, { sessionId: command.sessionId, turnId: active.id })
 
   await cancelPendingWaitsInTransaction(tx, {

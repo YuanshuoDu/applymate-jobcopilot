@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
 import { taskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
 import { hasOverlappingTaskGraphRepair } from "./task-graph-repair-conflicts.js"
-import { getSubagentRolePolicy } from "./role-policy.js"
+import { APPLICATION_FILLER_TEMPLATE_ID, isApplicationFillerTemplate, isHarnessSubagentRole } from "./role-policy.js"
 import { createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord } from "./types.js"
@@ -24,9 +24,10 @@ export type CreatedGraphTasks = Readonly<{
   readyTaskIds: readonly string[]
 }>
 
-function safeTemplate(template: TaskGraphTaskTemplate): void {
-  if (!getSubagentRolePolicy(template.role) || !Array.isArray(template.allowedActions)
-    || template.allowedActions.some(action => typeof action !== "string" || !action.trim() || EXTERNAL_ACTION.test(action))) {
+function safeTemplate(templateId: string, template: TaskGraphTaskTemplate): void {
+  const applicationFiller = isApplicationFillerTemplate(templateId, template.role, template.taskType)
+  if ((!applicationFiller && (!isHarnessSubagentRole(template.role) || templateId === APPLICATION_FILLER_TEMPLATE_ID)) || !Array.isArray(template.allowedActions)
+    || applicationFiller && template.allowedActions.length !== 0 || template.allowedActions.some(action => typeof action !== "string" || !action.trim() || EXTERNAL_ACTION.test(action))) {
     throw new Error("task_graph_template_policy_rejected")
   }
 }
@@ -42,7 +43,7 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   const policy = policyFromTask(parentTask)
   safeProposalSize(input.proposal)
   if (input.proposal.nodes.length > policy.maxFanOut) throw new Error("task_graph_proposal_fan_out_limit")
-  for (const template of Object.values(input.templates)) safeTemplate(template)
+  for (const [id, template] of Object.entries(input.templates)) safeTemplate(id, template)
   const options = {
     registeredTemplateIds: new Set(Object.keys(input.templates)),
     // Lifetime DAG size is independent from the active-child fan-out limit.
@@ -122,7 +123,7 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
       goal: node.goal, constraints: template.constraints ?? [], successCriteria: node.successCriteria,
       allowedActions: template.allowedActions, context,
       expectedOutputSchema: template.expectedOutputSchema ?? {}, policy: childPolicy,
-    }, true)
+    }, true, { preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType) })
     if (status === "waiting") {
       const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'waiting', "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $5 AND "status" = 'queued'`,

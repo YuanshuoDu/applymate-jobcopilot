@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { describe, expect, it } from "vitest"
 
-import { getSubagentRolePolicy, isHarnessSubagentRole, preflightSubagentTool, visibleSubagentTools, visibleToolPolicy } from "./role-policy.js"
+import { APPLICATION_FILLER_ROLE, APPLICATION_FILLER_TASK_TYPE, APPLICATION_FILLER_TEMPLATE_ID, getSubagentRolePolicy, isApplicationFillerTemplate, isHarnessSubagentRole, preflightSubagentTool, visibleSubagentTools, visibleToolPolicy } from "./role-policy.js"
 import type { RuntimeToolDefinition } from "../tools/types.js"
 
 function tool(name: string, risk: RuntimeToolDefinition["risk"], domain: RuntimeToolDefinition["domain"]): RuntimeToolDefinition {
@@ -41,6 +41,17 @@ describe("subagent role policy", () => {
   it("fails closed for an unknown role and missing tools", () => {
     expect(visibleSubagentTools("future-role", [tool("jobs.search", "read", "jobs")])).toEqual([])
     expect(preflightSubagentTool("executor", null)).toMatchObject({ allowed: false, execute: false })
+  })
+
+  it("registers Application Filler as a server-owned role with no model-visible tools", () => {
+    expect(getSubagentRolePolicy(APPLICATION_FILLER_ROLE)).toMatchObject({
+      role: APPLICATION_FILLER_ROLE, actorRole: "subagent", capabilities: [], allowedRisks: [], allowedDomains: [],
+      canManageChildren: false, externalWritesEnabled: false,
+    })
+    expect(isHarnessSubagentRole(APPLICATION_FILLER_ROLE)).toBe(false)
+    expect(isApplicationFillerTemplate(APPLICATION_FILLER_TEMPLATE_ID, APPLICATION_FILLER_ROLE, APPLICATION_FILLER_TASK_TYPE)).toBe(true)
+    expect(isApplicationFillerTemplate("caller_template", APPLICATION_FILLER_ROLE, APPLICATION_FILLER_TASK_TYPE)).toBe(false)
+    expect(visibleSubagentTools(APPLICATION_FILLER_ROLE, [tool("application.get_state", "read", "application")])).toEqual([])
   })
 
   it("hides every canonical and legacy coordination tool from children", () => {

@@ -56,6 +56,35 @@ function ownedTurnScopeRow(sql: string, values?: unknown[]) {
 }
 
 describe("createGraphTasks", () => {
+  it("preserves the filler template's empty actions while generic roles keep parent action inheritance", async () => {
+    const create = async (templateId: string, role: string, taskType: string) => {
+      let insertedActions: unknown
+      const query = vi.fn(async (sql: string, values?: unknown[]) => {
+        const admission = ownedTurnScopeRow(sql, values)
+        if (admission) return admission
+        if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
+        if (sql.startsWith('SELECT "rootTaskId", "turnId"')) return { rows: [{ rootTaskId: "root-1", turnId: "turn-1" }], rowCount: 1 }
+        if (sql.startsWith('SELECT root."id", root."turnId"')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
+        if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) { insertedActions = JSON.parse(String(values?.[12])) as unknown; return { rows: [{ id: "child-1" }], rowCount: 1 } }
+        if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [{ ...taskRow(), role, taskType, allowedActions: insertedActions }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      })
+      const input: TaskGraphScheduleInput = {
+        scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+        proposal: { expectedRevision: 0, nodes: [role === "analyst"
+          ? plannedNode({ key: "work", templateId, goal: "Do bounded work", successCriteria: ["done"], dependsOn: [] })
+          : { key: "work", templateId, goal: "Do bounded work", successCriteria: ["done"], dependsOn: [] }] },
+        templates: { [templateId]: { role, taskType, allowedActions: [] } },
+      }
+      await createGraphTasks({ query } as unknown as Pick<pg.PoolClient, "query">, input,
+        { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
+      return insertedActions
+    }
+
+    await expect(create("application_filler", "application_filler", "application_fill_for_review")).resolves.toEqual([])
+    await expect(create("analyst", "analyst", "research")).resolves.toEqual(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
+  })
+
   it("persists scoped completed direct prerequisite evidence before dispatching a ready child", async () => {
     const scoutResult = {
       schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
@@ -408,6 +437,25 @@ describe("createGraphTasks", () => {
       budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } },
     }, createInitialTaskGraphState(), new Map()))
       .rejects.toThrow("task_graph_snapshot_template_unsupported")
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["wrong task type", "application_filler", "application_filler", "application_fill", []],
+    ["caller-controlled action", "application_filler", "application_filler", "application_fill_for_review", ["application.fill"]],
+    ["caller template id", "caller_template", "application_filler", "application_fill_for_review", []],
+    ["reserved id with another role", "application_filler", "analyst", "application_fill_for_review", []],
+  ] as const)("rejects Application Filler template admission with %s before database access", async (_reason, templateId, role, taskType, allowedActions) => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 0 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 0, nodes: [{ key: "fill", templateId, goal: "Prepare the application for review", successCriteria: ["Form is ready for user review"], dependsOn: [] }] },
+      templates: { [templateId]: { role, taskType, allowedActions } },
+    }
+
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
+      .rejects.toThrow("task_graph_template_policy_rejected")
     expect(query).not.toHaveBeenCalled()
   })
 

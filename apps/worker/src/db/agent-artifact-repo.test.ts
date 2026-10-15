@@ -1,7 +1,34 @@
 import { describe, expect, it, vi } from "vitest"
-import { createAgentArtifactRepository } from "./agent-artifact-repo.js"
+import { createAgentArtifactRepository, insertAgentArtifactBaseWithClient } from "./agent-artifact-repo.js"
 
 describe("agent artifact repository", () => {
+  it("uses the caller transaction and resolves an idempotent base insert without a unique error", async () => {
+    const input = { id: "artifact-a", userId: "user-a", jobId: "job-a", artifactType: "application", content: { answerHash: "hash-a" }, hash: "hash-a",
+      constraintHash: "constraints-a", provenanceRefs: ["application-task:task-a"], evidenceRefs: ["application-task:task-a"] }
+    const row = { ...input, lifecycle: "base", baseId: input.id, baseHash: input.hash, previousHash: null, version: 1, createdAt: new Date(), updatedAt: new Date() }
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      return sql.startsWith("INSERT") ? { rows: [], rowCount: 0 } : { rows: [row], rowCount: 1 }
+    }) }
+
+    await expect(insertAgentArtifactBaseWithClient(client as never, input)).resolves.toMatchObject(row)
+    expect(calls[0]?.sql).toContain("ON CONFLICT DO NOTHING RETURNING")
+    expect(calls[1]?.sql).toContain('WHERE "id" = $1 AND "userId" = $2')
+    expect(calls[1]?.values).toEqual([input.id, input.userId])
+  })
+
+  it("rejects an idempotent caller-client insert when the same identity has different content", async () => {
+    const input = { id: "artifact-a", userId: "user-a", jobId: "job-a", artifactType: "application", content: {}, hash: "expected",
+      constraintHash: "constraints-a", provenanceRefs: ["source-a"], evidenceRefs: ["source-a"] }
+    const existing = { ...input, hash: "different", lifecycle: "base", baseId: input.id, baseHash: "different", previousHash: null,
+      version: 1, createdAt: new Date(), updatedAt: new Date() }
+    const client = { query: vi.fn(async (sql: string) => sql.startsWith("INSERT") ? { rows: [], rowCount: 0 } : { rows: [existing], rowCount: 1 }) }
+
+    await expect(insertAgentArtifactBaseWithClient(client as never, input)).rejects.toMatchObject({ code: "receipt_conflict" })
+    expect(client.query).toHaveBeenCalledTimes(2)
+  })
+
   it("keeps find tenant-scoped and parameterized", async () => {
     const query = vi.fn().mockResolvedValue({ rows: [], rowCount: 0 })
     const repository = createAgentArtifactRepository({ query } as never)

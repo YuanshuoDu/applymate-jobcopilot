@@ -19,6 +19,7 @@ import { loadSelectedJobArtifactContext, resolveCoverLetterBase } from "./select
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
+import { executeApplicationFillForReview } from "./application-fill-for-review.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -200,17 +201,31 @@ function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"
 
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
-  const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
-  const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
-  const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
-  const mailboxReader = options.mailboxReader ?? defaultMailboxReader(options.pool)
-  const resumeLoader = options.resumeLoader ?? defaultResumeLoader(options.pool)
-  return createChildExecutor({
-    store: bindStore(engineStore), treeBudget, authorizeUsage,
-    modelRuntimeFactory: options.modelRuntimeFactory,
-    toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease, owner }) => defaultTools(options.pool, engineStore, task, lease, owner)),
-    mailboxReader, resumeLoader,
-  })
+  let genericExecutor: SubagentExecutor | undefined
+  return async ({ lease }) => {
+    const fillerRole = lease.role === "application_filler"
+    const fillerTaskType = lease.taskType === "application_fill_for_review"
+    if (fillerRole || fillerTaskType) {
+      if (!fillerRole || !fillerTaskType) return {
+        status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal",
+      }
+      return executeApplicationFillForReview({ pool: options.pool, lease })
+    }
+    if (!genericExecutor) {
+      const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
+      const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
+      const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
+      const mailboxReader = options.mailboxReader ?? defaultMailboxReader(options.pool)
+      const resumeLoader = options.resumeLoader ?? defaultResumeLoader(options.pool)
+      genericExecutor = createChildExecutor({
+        store: bindStore(engineStore), treeBudget, authorizeUsage,
+        modelRuntimeFactory: options.modelRuntimeFactory,
+        toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner)),
+        mailboxReader, resumeLoader,
+      })
+    }
+    return genericExecutor({ lease })
+  }
 }
 
 export function createOptionalProductionChildExecutor(options: ProductionChildRuntimeOptions & { readonly enabled?: boolean }): SubagentExecutor | undefined {

@@ -2,7 +2,7 @@ import { assertRootChildCreationUsesCoveragePlan, CoordinationError, type Coordi
 import { executeFollowup as runFollowup } from "./coordination-pending-replacement.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import type { ToolExecutionContext } from "./types.js"
-import { getSubagentRolePolicy } from "../subagents/role-policy.js"
+import { APPLICATION_FILLER_ROLE, getSubagentRolePolicy, isHarnessSubagentRole } from "../subagents/role-policy.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { appendNativeCoordination, nativeCoordinationKey, nativeCoordinationOutput, plannerEnabledRoot } from "./task-graph-coordination-bridge.js"
 import { buildScoutAnalystAggregate } from "./coordination-result-aggregate.js"
@@ -10,6 +10,7 @@ import {
   activity,
   assertSpawnReplay,
   currentTurnTask,
+  followupSource,
   managerError,
   resolveSpawnLineage,
   spawnOutput,
@@ -42,7 +43,7 @@ function managerKey(value: string | undefined): string {
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
   assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null
-  if (!policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
+  if (!isHarnessSubagentRole(input.role) || !policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
   const expectedSchema = expectedOutputSchema(context.delegateOutputSchemaMarker, input.role)
   const lineage = await resolveSpawnLineage(context, input.parentTaskId, options)
   const parentTaskId = lineage.parentTaskId
@@ -126,6 +127,12 @@ export async function executeSendMessage(context: ToolExecutionContext, input: S
   return { messageId: result.message.id, taskId: target.id, status: result.duplicate ? "duplicate" as const : "queued" as const }
 }
 export function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
+  if (!("mode" in input) && !plannerEnabledRoot(context, options.nativeCoordination?.enabled === true)) {
+    return followupSource(context, input.taskId, options).then(source => {
+      if (source.role === APPLICATION_FILLER_ROLE) throw new CoordinationError("coordination_invalid_input", "Application filler follow-up is only allowed through TaskGraph")
+      return runFollowup(context, input, options)
+    })
+  }
   return runFollowup(context, input, options)
 }
 export async function executeWaitSubagents(context: ToolExecutionContext, input: WaitSubagentsInput, options: CoordinationExecutorOptions) {

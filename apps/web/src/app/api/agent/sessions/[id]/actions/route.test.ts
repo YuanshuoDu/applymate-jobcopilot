@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { POST } from "./route"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
@@ -26,8 +27,10 @@ const mocks = vi.hoisted(() => ({
   jobFindFirst: vi.fn(),
   jobUpdate: vi.fn(),
   applicationTaskUpdateMany: vi.fn(),
+  applicationTaskFindFirst: vi.fn(),
   applicationTaskEventCreate: vi.fn(),
   queueApplicationFill: vi.fn(),
+  applicationFillTaskGraphEnabled: vi.fn(),
   queueAutonomousApplication: vi.fn(),
   tailorResumeForAgent: vi.fn(),
   loadUserAiConfig: vi.fn(),
@@ -57,7 +60,7 @@ vi.mock("@/lib/db", () => ({
     agentTranscriptEvent: { create: mocks.transcriptCreate },
     resume: { findFirst: mocks.resumeFindFirst },
     job: { findFirst: mocks.jobFindFirst, update: mocks.jobUpdate },
-    applicationTask: { updateMany: mocks.applicationTaskUpdateMany },
+    applicationTask: { findFirst: mocks.applicationTaskFindFirst, updateMany: mocks.applicationTaskUpdateMany },
     applicationTaskEvent: { create: mocks.applicationTaskEventCreate },
   },
 }))
@@ -66,6 +69,7 @@ vi.mock("@/lib/model-router", () => ({ loadUserAiConfig: mocks.loadUserAiConfig 
 vi.mock("@/lib/entitlements", () => ({ isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }))
 vi.mock("@/lib/agent/resume-tailoring", () => ({ tailorResumeForAgent: mocks.tailorResumeForAgent }))
 vi.mock("@/lib/auto-apply", () => ({
+  applicationFillTaskGraphEnabled: mocks.applicationFillTaskGraphEnabled,
   queueApplicationFill: mocks.queueApplicationFill,
   queueAutonomousApplication: mocks.queueAutonomousApplication,
 }))
@@ -123,12 +127,15 @@ function canonicalResolution(decision: "approved" | "rejected", disposition: "re
 }
 
 const ctx = { params: Promise.resolve({ id: "session_1" }) }
+
+async function callPost(request: unknown, context: unknown) {
+  return POST(request as never, context as never)
+}
 let turnStatus = "waiting_for_approval"
 let applicationTaskStatus = "waiting_for_authorization"
 
 describe("agent session actions API", () => {
   beforeEach(() => {
-    vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.sessionFindFirst.mockReset()
     mocks.sessionUpdate.mockReset()
@@ -154,8 +161,10 @@ describe("agent session actions API", () => {
     mocks.jobFindFirst.mockReset()
     mocks.jobUpdate.mockReset()
     mocks.applicationTaskUpdateMany.mockReset()
+    mocks.applicationTaskFindFirst.mockReset().mockResolvedValue(null)
     mocks.applicationTaskEventCreate.mockReset()
     mocks.queueApplicationFill.mockReset()
+    mocks.applicationFillTaskGraphEnabled.mockReset().mockReturnValue(false)
     mocks.queueAutonomousApplication.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
@@ -216,6 +225,41 @@ describe("agent session actions API", () => {
     })
   })
 
+  it("returns the bound Turn for a replayed approval response after the approval is consumed", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.approvalFindFirst.mockReset()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(approvalRecord({ type: "review_application", payload: { applicationTaskId: "task_1", jobId: "job_1" } }))
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ fillTurnId: "turn_fill_1" })
+
+    const post = callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+    const res = await post
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ turnId: "turn_fill_1", taskId: "turn_fill_1", duplicate: true })
+    expect(mocks.resolveLegacyApproval).not.toHaveBeenCalled()
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
+  })
+
+  it("allows only an authenticated, scoped explicit fill retry with a stable request ID", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ id: "task_1", jobId: "job_1" })
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.lever.co/acme/123" })
+    mocks.queueApplicationFill.mockResolvedValueOnce({ taskId: "turn_fill_2", turnId: "turn_fill_2", disposition: "started" })
+
+    const res = await callPost(postRequest({
+      type: "retry_application_fill", applicationTaskId: "task_1", requestId: "retry_req_12345678",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ turnId: "turn_fill_2", retried: true })
+    expect(mocks.queueApplicationFill).toHaveBeenCalledWith(expect.objectContaining({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "task_1", sessionId: "session_1", retry: true, retryId: "retry_req_12345678",
+    }))
+  })
+
   it("creates an automation from a transcript draft action", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
       id: "automation_approval",
@@ -238,9 +282,8 @@ describe("agent session actions API", () => {
       durationMs: null,
       createdAt: new Date("2026-06-18T10:05:00Z"),
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "create_automation",
       approvalId: "automation_approval",
       receiptNonce: "nonce_1",
@@ -340,9 +383,8 @@ describe("agent session actions API", () => {
       durationMs: null,
       createdAt: new Date("2026-06-18T10:06:00Z"),
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "create_automation",
       approvalId: "automation_approval",
       receiptNonce: "nonce_1",
@@ -391,9 +433,8 @@ describe("agent session actions API", () => {
   })
 
   it("records an approval response and updates the approval when approvalId is provided", async () => {
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision: "approved",
@@ -450,9 +491,8 @@ describe("agent session actions API", () => {
     ["rejected", "rejected"],
   ] as const)("returns a 202 canonical %s disposition without legacy side effects", async (decision, expectedDisposition) => {
     mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution(decision))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision,
@@ -482,9 +522,8 @@ describe("agent session actions API", () => {
       applicationTaskStatus = "cancelled"
       throw new Error("This application is no longer ready for the approved submission step.")
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision: "approved",
@@ -506,9 +545,8 @@ describe("agent session actions API", () => {
 
   it("returns a duplicate canonical disposition without replaying the action", async () => {
     mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved", "duplicate"))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
     }) as never, ctx)
 
@@ -522,9 +560,8 @@ describe("agent session actions API", () => {
 
   it("fails closed when another approval wait is active in the same Turn", async () => {
     mocks.resolveLegacyApproval.mockRejectedValueOnce(Object.assign(new Error("Another approval wait is already active for this Turn"), { code: "approval_wait_active" }))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
     }) as never, ctx)
 
@@ -562,9 +599,8 @@ describe("agent session actions API", () => {
       turnStatus = "interrupted"
       return { disposition: "legacy_only", decision: "approved" }
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest(action) as never, ctx)
+    const res = await callPost(postRequest(action) as never, ctx)
 
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toEqual({ error: "Approval turn is no longer active" })
@@ -586,9 +622,8 @@ describe("agent session actions API", () => {
       await options?.beforeResolve?.()
       return canonicalResolution("approved")
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "bad_nonce",
     }) as never, ctx)
 
@@ -603,9 +638,8 @@ describe("agent session actions API", () => {
 
   it("rejects stale approval responses without writing transcript events", async () => {
     mocks.resolveLegacyApproval.mockRejectedValueOnce(new Error("Approval is no longer pending"))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision: "approved",
@@ -624,9 +658,8 @@ describe("agent session actions API", () => {
       payload: { applicationTaskId: "task_1", jobId: "job_1" },
     }))
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "rejected", body: "Declined review",
     }) as never, ctx)
 
@@ -652,9 +685,8 @@ describe("agent session actions API", () => {
       payload: { applicationTaskId: "task_1", jobId: "job_1" },
     }))
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({ type: "approval_response", approvalId: "approval_1", decision }) as never, ctx)
+    const res = await callPost(postRequest({ type: "approval_response", approvalId: "approval_1", decision }) as never, ctx)
 
     expect(res.status).toBe(200)
     const update = mocks.applicationTaskUpdateMany.mock.calls[0]?.[0]
@@ -670,9 +702,8 @@ describe("agent session actions API", () => {
     mocks.transcriptCreate
       .mockResolvedValueOnce({ id: 'event_tailored', sessionId: 'session_1', taskId: null, type: 'resume_tailored', speaker: 'Writer', title: 'Tailored resume ready', body: 'Ready', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:01:00Z') })
       .mockResolvedValueOnce({ id: 'event_review', sessionId: 'session_1', taskId: null, type: 'approval_request', speaker: 'Reviewer', title: 'Final resume review', body: 'Review it', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:02:00Z') })
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ events: [{ type: 'resume_tailored' }, { type: 'approval_request' }] })
@@ -685,9 +716,8 @@ describe("agent session actions API", () => {
     mocks.resolveAiAccess.mockResolvedValueOnce('disabled')
     mocks.tailorResumeForAgent.mockClear()
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } }))
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(403)
     expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
@@ -697,9 +727,8 @@ describe("agent session actions API", () => {
     mocks.isFeatureAllowed.mockResolvedValueOnce(false)
     mocks.tailorResumeForAgent.mockClear()
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } }))
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(403)
     expect(mocks.resolveAiAccess).not.toHaveBeenCalled()
@@ -711,9 +740,8 @@ describe("agent session actions API", () => {
     mocks.resolveAiAccess.mockResolvedValueOnce('exhausted')
     mocks.tailorResumeForAgent.mockClear()
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } }))
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(429)
     expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
@@ -725,9 +753,8 @@ describe("agent session actions API", () => {
     mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', url: 'https://jobs.example/apply', status: 'saved' })
     mocks.jobUpdate.mockResolvedValue({})
     mocks.transcriptCreate.mockResolvedValueOnce({ id: 'event_ready', sessionId: 'session_1', taskId: null, type: 'resume_finalized', speaker: 'Reviewer', title: 'Application pack ready', body: 'Ready', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:03:00Z') })
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_reviewer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_reviewer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ event: { type: 'resume_finalized', title: 'Application pack ready' } })
@@ -738,9 +765,8 @@ describe("agent session actions API", () => {
   })
 
   it("rejects unsupported action types", async () => {
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({ type: "unknown" }) as never, ctx)
+    const res = await callPost(postRequest({ type: "unknown" }) as never, ctx)
 
     expect(res.status).toBe(400)
     await expect(res.json()).resolves.toEqual({ error: "Unsupported action type" })
@@ -748,9 +774,8 @@ describe("agent session actions API", () => {
 
   it("returns 404 when the session is not owned by the user", async () => {
     mocks.sessionFindFirst.mockResolvedValueOnce(null)
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({ type: "approval_response", decision: "rejected" }) as never, ctx)
+    const res = await callPost(postRequest({ type: "approval_response", decision: "rejected" }) as never, ctx)
 
     expect(res.status).toBe(404)
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()

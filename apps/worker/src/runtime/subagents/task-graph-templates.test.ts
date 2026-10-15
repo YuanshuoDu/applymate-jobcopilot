@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn, taskGraphRuntimeOptions, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { describe, expect, it, vi } from "vitest"
+import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn, taskGraphRuntimeOptions, taskGraphTemplatesForApplicationFill, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphCommandPort } from "./task-graph-command-port.js"
 
@@ -73,11 +73,67 @@ describe("TaskGraph server-owned templates", () => {
   })
 
   it("returns selected-job mode only when the server-side preparation loader finds a selection", async () => {
-    const base = { pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true }
+    const base = {
+      pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true,
+      applicationFillPreparationLoader: async () => undefined,
+    }
     const selected = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => ({ jobId: "job-1" }) })
     const generic = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => undefined })
 
     expect(selected).toMatchObject({ enabled: true, selectedJobMode: true, selectedJobPreparation: { jobId: "job-1" } })
     expect(generic).toMatchObject({ enabled: true, selectedJobMode: false, selectedJobPreparation: undefined })
+  })
+
+  it("adds only the fixed identity-free Application Filler template after exact preparation", () => {
+    const base = { scout: TASK_GRAPH_TEMPLATES.scout }
+    const templates = taskGraphTemplatesForApplicationFill(base, { available: true })
+
+    expect(Object.keys(templates ?? {})).toEqual(["scout", "application_filler"])
+    expect(templates?.scout).toBe(base.scout)
+    expect(templates?.application_filler).toMatchObject({
+      role: "application_filler", taskType: "application_fill_for_review", allowedActions: [],
+    })
+    expect(templates?.application_filler).not.toHaveProperty("context")
+    expect(templates?.application_filler).not.toHaveProperty("expectedOutputSchema")
+    expect(templates?.application_filler?.allowedActions).toEqual([])
+    expect(JSON.stringify(templates?.application_filler)).not.toMatch(/applicationTaskId|taskId|userId|sessionId|turnId/)
+  })
+
+  it("keeps generic templates unchanged and strips the reserved filler key without exact preparation", () => {
+    const base = { scout: TASK_GRAPH_TEMPLATES.scout }
+    expect(taskGraphTemplatesForApplicationFill(base, undefined)).toBe(base)
+    const callerControlled = {
+      ...base,
+      application_filler: { role: "writer", taskType: "cover_letter_draft", allowedActions: ["cover_letter.draft"] },
+    }
+    const templates = taskGraphTemplatesForApplicationFill(callerControlled, undefined)
+    expect(Object.keys(templates ?? {})).toEqual(["scout"])
+  })
+
+  it("uses the lease-fenced fill preparation loader and keeps generic templates when no fill is bound", async () => {
+    const baseTemplates = { scout: TASK_GRAPH_TEMPLATES.scout }
+    const base = {
+      pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true,
+      taskGraphTemplates: baseTemplates,
+      selectedJobPreparationLoader: async () => undefined,
+    }
+    const loader = vi.fn(async () => ({ available: true as const }))
+    const available = await taskGraphRuntimeForTurn({ ...base, applicationFillPreparationLoader: loader })
+    const absent = await taskGraphRuntimeForTurn({ ...base, applicationFillPreparationLoader: async () => undefined })
+
+    expect(loader).toHaveBeenCalledWith(base.pool, base.lease, expect.any(Date))
+    expect(available.templates?.application_filler).toMatchObject({ role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] })
+    expect(absent.templates).toBe(baseTemplates)
+  })
+
+  it("propagates invalid bound-fill or loader failures before runtime root creation", async () => {
+    const base = {
+      pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true,
+      taskGraphTemplates: { scout: TASK_GRAPH_TEMPLATES.scout },
+      selectedJobPreparationLoader: async () => undefined,
+      applicationFillPreparationLoader: async () => { throw new Error("application_fill_material_unavailable") },
+    }
+
+    await expect(taskGraphRuntimeForTurn(base)).rejects.toThrow("application_fill_material_unavailable")
   })
 })
