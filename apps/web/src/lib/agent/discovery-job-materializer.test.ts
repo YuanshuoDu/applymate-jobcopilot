@@ -8,7 +8,7 @@ import {
 } from './discovery-job-materializer'
 import type { DiscoveredJob } from './discover'
 
-type StoredJob = { id: string; userId: string; url: string | null; source: string | null }
+type StoredJob = { id: string; userId: string; url: string | null; source: string | null; description?: string | null; status?: string; notes?: string | null; score?: number | null; finalResumeId?: string | null }
 const fence = {
   userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', stepId: 'step-1',
   taskId: 'scout-1', rootTaskId: 'root-1', leaseOwner: 'worker-1', attemptCount: 4,
@@ -25,9 +25,10 @@ function fixture(initial: StoredJob[] = [], options: {
     childAttemptCount: number; childLive: boolean; childActions: unknown; stepAttempt: number; stepStatus: string
   }>
 } = {}) {
-  const rows = new Map(initial.map(row => [row.id, row]))
+  const rows = new Map(initial.map(row => [row.id, { ...row, description: row.description ?? null }]))
   const createData: Record<string, unknown>[] = []
   const whereQueries: Array<{ userId: string; url?: string }> = []
+  const updateQueries: Array<{ where: { id: string; userId: string; description: string | null }; data: { description: string } }> = []
   const queryLog: string[] = []
   const scope = {
     sessionStatus: 'running', turnStatus: 'in_progress', turnRootTaskId: fence.rootTaskId,
@@ -44,18 +45,25 @@ function fixture(initial: StoredJob[] = [], options: {
       whereQueries.push(where)
       return [...view.values()]
         .filter(row => row.userId === where.userId && (where.url === undefined || row.url === where.url))
-        .map(({ id, url, source }) => ({ id, url, source }))
+        .map(({ id, url, source, description }) => ({ id, url, source, description: description ?? null }))
+    }),
+    updateMany: vi.fn(async ({ where, data }: { where: { id: string; userId: string; description: string | null }; data: { description: string } }) => {
+      updateQueries.push({ where, data })
+      const row = view.get(where.id)
+      if (!row || row.userId !== where.userId || (row.description ?? null) !== where.description) return { count: 0 }
+      view.set(where.id, { ...row, description: data.description })
+      return { count: 1 }
     }),
     create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
       createData.push(data)
       const id = String(data.id)
       if (options.raceOnCreate && transactional && !raced) {
         raced = true
-        rows.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source) })
+        rows.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source), description: String(data.description ?? '') || null })
         throw { code: 'P2002' }
       }
       if (view.has(id)) throw { code: 'P2002' }
-      view.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source) })
+      view.set(id, { id, userId: String(data.userId), url: String(data.url), source: String(data.source), description: String(data.description ?? '') || null })
       options.afterCreate?.()
       return { id }
     }),
@@ -104,7 +112,7 @@ function fixture(initial: StoredJob[] = [], options: {
       return result
     },
   } as unknown as DiscoveryJobMaterializerDatabase
-  return { database, rows, createData, whereQueries, queryLog, scope }
+  return { database, rows, createData, whereQueries, updateQueries, queryLog, scope }
 }
 
 describe('discovery job URL identity', () => {
@@ -157,6 +165,28 @@ describe('discovery job URL identity', () => {
     expect(db.rows.size).toBe(1)
     expect(db.createData[0]).toMatchObject({ userId: 'user-1', url: normalizedUrl, status: 'saved', workflowState: 'draft' })
     expect(db.whereQueries).toContainEqual({ userId: 'user-1', url: normalizedUrl })
+  })
+
+  it('fills an incomplete canonical description on a same-owner match and preserves saved user fields', async () => {
+    const url = normalizeDiscoveryJobUrl(candidate().url, 'greenhouse')!
+    const db = fixture([{
+      id: 'legacy', userId: 'user-1', url, source: 'greenhouse', description: null,
+      status: 'applied', notes: 'Keep these notes', score: 87, finalResumeId: 'resume-1',
+    }])
+
+    await expect(materializeDiscoveredJobs('user-1', [candidate()], undefined, fence, { db: db.database }))
+      .resolves.toEqual(['legacy'])
+
+    const canonicalRead = await db.database.job.findMany({
+      where: { userId: 'user-1', url }, select: { id: true, url: true, source: true, description: true },
+    })
+    expect(canonicalRead[0]).toMatchObject({ id: 'legacy', description: 'Full description' })
+    expect(db.rows.get('legacy')).toMatchObject({
+      description: 'Full description', status: 'applied', notes: 'Keep these notes', score: 87, finalResumeId: 'resume-1',
+    })
+    expect(db.updateQueries).toEqual([{
+      where: { id: 'legacy', userId: 'user-1', description: null }, data: { description: 'Full description' },
+    }])
   })
 
   it('fails closed on a foreign ID collision and rolls back when cancellation arrives before commit', async () => {

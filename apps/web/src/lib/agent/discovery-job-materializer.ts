@@ -8,10 +8,11 @@ import type { DiscoveredJob } from './discover'
 
 export type DiscoveryJobMaterializerFence = Readonly<{ userId: string; sessionId: string; turnId: string; stepId: string; taskId: string; rootTaskId: string; leaseOwner: string; attemptCount: number }>
 
-type JobIdentity = Pick<Job, 'id' | 'url' | 'source'>
+type JobIdentity = Pick<Job, 'id' | 'url' | 'source' | 'description'>
 type JobIdentityDelegate = {
-  findMany(args: { where: { userId: string; url?: string }; select: { id: true; url: true; source: true } }): Promise<JobIdentity[]>
+  findMany(args: { where: { userId: string; url?: string }; select: { id: true; url: true; source: true; description: true } }): Promise<JobIdentity[]>
   create(args: { data: Record<string, unknown> }): Promise<{ id: string }>
+  updateMany(args: { where: { id: string; userId: string; description: string | null }; data: { description: string } }): Promise<{ count: number }>
 }
 type MaterializerTransaction = {
   job: JobIdentityDelegate
@@ -74,25 +75,25 @@ export async function materializeDiscoveredJobs(
     return { ...candidate, url }
   })
   const database = deps.db ?? defaultDb
-
   for (let attempt = 0; attempt <= jobs.length; attempt += 1) {
     try {
       return await database.$transaction(async transaction => {
         assertNotCancelled(signal)
         await lockAndValidateAttempt(transaction, fence)
         const ownerRows = await transaction.job.findMany({
-          where: { userId }, select: { id: true, url: true, source: true },
+          where: { userId }, select: { id: true, url: true, source: true, description: true },
         })
         const ids: string[] = []
         for (const candidate of jobs) {
           const existing = matchingOwnerRows(ownerRows, candidate.url, candidate.source)[0]
           if (existing) {
+            if (candidate.description.trim() && !existing.description?.trim()) await transaction.job.updateMany({ where: { id: existing.id, userId, description: existing.description ?? null }, data: { description: candidate.description } })
             ids.push(existing.id)
             continue
           }
           try {
             const created = await transaction.job.create({ data: jobData(userId, candidate) })
-            ownerRows.push({ id: created.id, url: candidate.url, source: candidate.source })
+            ownerRows.push({ id: created.id, url: candidate.url, source: candidate.source, description: candidate.description || null })
             ids.push(created.id)
           } catch (error) {
             if (isUniqueConstraintConflict(error)) throw new IdentityRace(candidate.url)
@@ -107,7 +108,7 @@ export async function materializeDiscoveredJobs(
     } catch (error) {
       if (!(error instanceof IdentityRace)) throw error
       const racedRows = await database.job.findMany({
-        where: { userId, url: error.url }, select: { id: true, url: true, source: true },
+        where: { userId, url: error.url }, select: { id: true, url: true, source: true, description: true },
       })
       if (!matchingOwnerRows(racedRows, error.url, jobs.find(job => job.url === error.url)?.source ?? '')[0]) {
         throw new DiscoveryToolError('job_id_conflict', 'A discovered job ID conflicts with another saved row')
