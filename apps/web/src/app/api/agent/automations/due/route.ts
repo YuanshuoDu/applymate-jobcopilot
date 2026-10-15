@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
+import { buildScheduledAutomationSnapshot, ScheduledAutomationSnapshotValidationError } from "@/lib/agent/scheduled-automation-snapshot"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
 import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
@@ -28,6 +29,9 @@ type AutomationForRun = {
   sessionId: string | null
 }
 
+const ACTIVE_AUTOMATION_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"]
+const DUE_AUTOMATION_RETRY_DELAY_MS = 5 * 60 * 1000
+
 function authorized(req: NextRequest) {
   const secret = process.env.AGENT_AUTOMATION_CRON_SECRET ?? process.env.CRON_SECRET
   if (!secret) return process.env.NODE_ENV !== "production"
@@ -47,7 +51,14 @@ function automationPayload(automation: AutomationForRun) {
     autoApply: automation.autoApply,
   }
 }
-
+const scheduledAutomationSnapshot = (automation: AutomationForRun) => ({
+  targetRoles: automation.targetRoles,
+  targetLocations: automation.targetLocations,
+  minScore: automation.minScore,
+  dailyCap: automation.dailyCap,
+  requireApproval: automation.requireApproval,
+  autoApply: automation.autoApply,
+})
 function runnableAutomationWhere(automation: Pick<AutomationForRun, "id" | "userId">, now: Date): Prisma.AgentAutomationWhereInput {
   return {
     id: automation.id,
@@ -57,7 +68,6 @@ function runnableAutomationWhere(automation: Pick<AutomationForRun, "id" | "user
     user: { accountStatus: "active" },
   }
 }
-
 async function startAutomation(automation: AutomationForRun, now: Date) {
   requireLegacyPolicy({
     userId: automation.userId, sessionId: automation.sessionId ?? `automation-scheduler:${automation.id}`,
@@ -78,6 +88,15 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
       return null
     }
   }
+
+  const snapshot = scheduledAutomationSnapshot(automation)
+  const activeTurn = automation.sessionId
+    ? await db.agentTurn.findFirst({
+      where: { sessionId: automation.sessionId, userId: automation.userId, source: "automation", status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } },
+      orderBy: { createdAt: "desc" }, select: { id: true },
+    })
+    : null
+  if (!activeTurn) buildScheduledAutomationSnapshot(snapshot)
 
   const claimed = await db.agentAutomation.updateMany({
     where: runnableAutomationWhere(automation, now),
@@ -107,12 +126,13 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     }
   }
 
-  let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>>
+  let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>> | null = null
   try {
     canonicalTurn = await ensureAutomationTurn(db, {
       sessionId: session.id,
       userId: automation.userId,
       name: automation.name,
+      scheduledAutomationSnapshot: snapshot,
     })
   } catch (error: unknown) {
     if (error instanceof AutomationTurnOccupiedError) {
@@ -121,6 +141,7 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     }
     throw error
   }
+  if (!canonicalTurn) throw new Error("Could not resolve the automation Turn")
 
   const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
     'AGENT_PROTOCOL_V2_DUAL_WRITE',
@@ -201,19 +222,26 @@ async function runDueAutomations(req: NextRequest) {
   }) as AutomationForRun[]
 
   const started = []
+  const failedAutomations: { automationId: string; code: string }[] = []
+  const deferDueAutomation = (automation: AutomationForRun) => db.agentAutomation.updateMany({
+    where: runnableAutomationWhere(automation, now), data: { nextRunAt: new Date(now.getTime() + DUE_AUTOMATION_RETRY_DELAY_MS) },
+  })
   for (const automation of automations) {
-    if (!await hasEffectiveEntitlement(automation.userId, 'auto_apply')) continue
-    const result = await startAutomation(automation, now)
+    if (!await hasEffectiveEntitlement(automation.userId, 'auto_apply')) {
+      await deferDueAutomation(automation)
+      continue
+    }
+    const result = await startAutomation(automation, now).catch(async (error: unknown) => {
+      if (!(error instanceof ScheduledAutomationSnapshotValidationError)) throw error
+      await deferDueAutomation(automation)
+      failedAutomations.push({ automationId: automation.id, code: error.code })
+      return null
+    })
     if (result) started.push(result)
   }
 
-  return ok({ checkedAt: now.toISOString(), started })
+  return ok({ checkedAt: now.toISOString(), started, failedAutomations })
 }
 
-export async function GET(req: NextRequest) {
-  return runDueAutomations(req)
-}
-
-export async function POST(req: NextRequest) {
-  return runDueAutomations(req)
-}
+export async function GET(req: NextRequest) { return runDueAutomations(req) }
+export async function POST(req: NextRequest) { return runDueAutomations(req) }

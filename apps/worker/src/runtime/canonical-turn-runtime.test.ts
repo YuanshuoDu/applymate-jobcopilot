@@ -35,6 +35,8 @@ import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createWorkerToolRuntime, InMemoryToolLifecycleSink, type CoordinationStore, type CoordinationTaskView, type DurableWaitPort } from "./tools/index.js"
+import type { RuntimeToolDefinition, ToolExecutionContext } from "./tools/types.js"
+import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/root-task-goal-criteria-context.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
 import { runTurnJob } from "./turns/turn-queue.js"
@@ -45,7 +47,6 @@ import { nativeCoordinationReceipts } from "./canonical-turn-native-graph-contex
 import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
 import type { NativeVerificationEnsureResult, NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
@@ -60,6 +61,7 @@ import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
 import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
 import { projectTaskGraphResultPage } from "./subagents/task-graph-result-page.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -479,9 +481,14 @@ async function taskGraphRootSurface(
   forgedToolName = "agent.spawn",
   recoveredToolName = "agent.interrupt",
   interactiveDiscovery = false,
+  turnInput?: unknown,
+  taskGraphPlanningEnabled = true,
+  emitToolCall = true,
 ) {
   const requests: HarnessModelRequest[] = []
   const events: RuntimeEvent[] = []
+  const contexts: StepContext[] = []
+  const registeredTools: RuntimeToolDefinition[] = []
   let allowedActions: readonly string[] = []
   const roots = {
     ensure: vi.fn(async (input: { allowedActions: readonly string[] }) => {
@@ -499,11 +506,13 @@ async function taskGraphRootSurface(
   }))
   const taskGraphCommandPort = {
     appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    appendAndScheduleWithReconciliation: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
     readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
   }
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
     workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
-      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      ...(taskGraphPlanningEnabled ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1" } : {}),
+      ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     }),
     taskGraphCommandPort: taskGraphCommandPort as never,
     taskGraphTemplates: interactiveDiscovery ? {
@@ -515,20 +524,25 @@ async function taskGraphRootSurface(
     selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
     stateLoader: async () => ({
       ...state(), toolPolicySnapshot: { capabilities: ["read"] },
+      ...(turnInput === undefined ? {} : { turnInput }),
       ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
       ...(recoverHiddenMutation ? {
         pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
         resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
       } : {}),
     }),
-    rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+    rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => ({ build: async request => {
+      const built = await contextBuilder().build(request)
+      contexts.push(built)
+      return built
+    } }),
     ...(interactiveDiscovery ? { interactiveDiscoveryShortlistLoader: async () => undefined } : {}),
     toolRuntimeFactory: () => ({
       registry: {
         list: () => definitions,
         resolve: (name: string) => ({ idempotency: name === "agent.interrupt" ? "idempotent" as const : name === "agent.spawn" ? "requires_key" as const : "read_only" as const }),
         validateArguments: () => true as const,
-        register: (definition: { name: string; version: string }) => { definitions.push(definition) },
+        register: (definition: RuntimeToolDefinition) => { definitions.push(definition); registeredTools.push(definition) },
       },
       router: { execute: route },
     }) as never,
@@ -536,7 +550,7 @@ async function taskGraphRootSurface(
       ...model(() => []),
       async *stream(request: HarnessModelRequest) {
         requests.push(request)
-        if (requests.length === 1 && !recoverHiddenMutation) {
+        if (requests.length === 1 && !recoverHiddenMutation && emitToolCall) {
           yield { type: "tool_call_completed", callId: "forged-call", name: forgedToolName, arguments: { jobId: "job-other" } }
           yield { type: "completed", finishReason: "tool_calls" }
         } else {
@@ -552,7 +566,71 @@ async function taskGraphRootSurface(
     if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
     return [tool.name]
   }) ?? []
-  return { toolNames, allowedActions, route, events, roots, requests }
+  return { toolNames, allowedActions, route, events, roots, requests, registeredTools, taskGraphCommandPort, contexts }
+}
+
+async function routeCanonicalRootMutation(toolName: "agent.spawn" | "spawn_subagent" | "agent.followup", planningEnabled: boolean) {
+  const events: RuntimeEvent[] = []
+  const requests: HarnessModelRequest[] = []
+  let allowedActions: readonly string[] = []
+  const roots = {
+    ensure: vi.fn(async (input: { allowedActions: readonly string[] }) => {
+      allowedActions = [...input.allowedActions]
+      return { id: "root-1", attemptCount: 1 } as never
+    }),
+    checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined),
+  }
+  const manager = { spawn: vi.fn(async () => { throw new Error("spawn_should_be_blocked") }), close: vi.fn(async () => true) }
+  const commandPort = {
+    appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    appendAndScheduleWithReconciliation: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    appendNativeCoordination: vi.fn(async () => { throw new Error("native_append_should_be_blocked") }),
+    readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+  }
+  const turnInput = { input: { goal: "Find jobs", verificationRequirements: {
+    schemaVersion: "agent-harness.v2.objective-requirements.v1",
+    requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+  } } }
+  const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
+  const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+    workerId: "worker-1",
+    productionFlags: resolveProductionAgentFlags({
+      ...(planningEnabled ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1" } : {}),
+      ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    }),
+    stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities: ["read"] }, turnInput }),
+    selectedJobPreparationLoader: async () => undefined,
+    taskGraphCommandPort: commandPort as never,
+    taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    rootTaskStore: roots as never,
+    manager: manager as never,
+    turnEngineStoreFactory: () => store(events),
+    contextBuilderFactory: () => contextBuilder(),
+    nativeVerificationFactory: () => nativeVerificationRuntime(),
+    modelRuntimeFactory: () => ({ adapter: {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        requests.push(request)
+        if (requests.length === 1) {
+          const args = toolName === "agent.followup"
+            ? { taskId: "terminal-task", goal: "Follow up on the result" }
+            : { idempotencyKey: "spawn-key", role: "scout", taskType: "job_discovery", goal: "Find matching roles" }
+          yield { type: "tool_call_completed", callId: "routed-mutation", name: toolName, arguments: args }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }, registry: {} as never, candidates: [] }),
+    authorizeUsage,
+  })
+  await runtime.execute({ lease, signal: new AbortController().signal })
+  const rootToolNames = requests[0]?.tools.flatMap(tool => {
+    if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
+    return [tool.name]
+  }) ?? []
+  return { events, allowedActions, rootToolNames, manager, commandPort, authorizeUsage }
 }
 
 describe("createCanonicalTurnRuntime", () => {
@@ -2334,6 +2412,92 @@ describe("createCanonicalTurnRuntime", () => {
     const recoveredRead = await taskGraphRootSurface(true, true, "agent.spawn", "jobs.get")
     expect(recoveredRead.route).not.toHaveBeenCalled()
     expect(JSON.stringify(recoveredRead.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
+  })
+
+  it("gates root child mutations from canonical verification requirements with either planning flag", async () => {
+    const childMutations = ["agent.spawn", "spawn_subagent", "agent.followup"]
+    const validTurnInput = { input: { goal: "Find jobs", verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+    } } }
+    const undercoveredProposal = {
+      expectedRevision: 0,
+      nodes: [{ key: "research", templateId: "scout", goal: "Find matching roles", successCriteria: ["Return relevant roles"], dependsOn: [],
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+          criteria: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 1 } }] } }],
+    }
+    const planContext: ToolExecutionContext = {
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", toolCallId: "plan-call",
+      taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator", remainingTurnSteps: 2,
+      signal: new AbortController().signal, capabilities: ["coordination", "canManageChildren"], reportProgress: async () => undefined,
+    }
+
+    for (const planningEnabled of [true, false]) {
+      const surface = await taskGraphRootSurface(false, false, "", "agent.interrupt", false, validTurnInput, planningEnabled, false)
+      expect(surface.toolNames).not.toEqual(expect.arrayContaining(childMutations))
+      expect(surface.allowedActions).not.toEqual(expect.arrayContaining(childMutations))
+      const plan = surface.registeredTools.find(tool => tool.name === "agent.plan")
+      if (planningEnabled) {
+        expect(plan).toBeDefined()
+        await expect(plan!.execute(planContext, {
+          ...undercoveredProposal,
+          verificationRequirements: { status: "absent" },
+          context: { verificationRequirements: [] },
+        })).rejects.toMatchObject({
+          code: "task_graph_objective_coverage_incomplete",
+          safeOutput: { code: "task_graph_objective_coverage_incomplete", requirements: [
+            { id: "candidate-total", kind: "candidate_count_gte", role: "scout", minimum: 2 },
+          ] },
+        })
+        expect(surface.taskGraphCommandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+        expect(surface.taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+      } else {
+        expect(plan).toBeUndefined()
+      }
+    }
+  })
+
+  it("preserves the prose-only root surface for absent or invalid requirements", async () => {
+    const childMutations = ["agent.spawn", "spawn_subagent", "agent.followup"]
+    const absentAndInvalid = [
+      { name: "absent", turnInput: undefined },
+      { name: "invalid", turnInput: { input: { goal: "Find jobs", verificationRequirements: {
+        schemaVersion: "unsupported", privateMalformedValue: "PRIVATE_MALFORMED_VALUE",
+      } } } },
+    ] as const
+
+    for (const { name, turnInput } of absentAndInvalid) {
+      for (const planningEnabled of [true, false]) {
+        const surface = await taskGraphRootSurface(false, false, "", "agent.interrupt", false, turnInput, planningEnabled, false)
+        expect(surface.toolNames).toEqual(expect.arrayContaining(childMutations))
+        expect(surface.allowedActions).toEqual(expect.arrayContaining(childMutations))
+        if (name === "invalid" && planningEnabled) {
+          const diagnostic = surface.contexts[0]?.blocks.find(block => block.id.includes(ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID))
+          expect(diagnostic).toMatchObject({ trust: "external_untrusted", content: {
+            kind: "canonical_objective_verification_requirements", source: "canonical_turn_objective", status: "invalid",
+          } })
+          expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE_MALFORMED_VALUE")
+        }
+      }
+    }
+  })
+
+  it("rejects directly routed root mutations before legacy or native enqueue", async () => {
+    const childMutations = ["agent.spawn", "spawn_subagent", "agent.followup"]
+    for (const planningEnabled of [true, false]) {
+      for (const toolName of childMutations as Array<"agent.spawn" | "spawn_subagent" | "agent.followup">) {
+        const routed = await routeCanonicalRootMutation(toolName, planningEnabled)
+        expect(routed.rootToolNames).not.toEqual(expect.arrayContaining(childMutations))
+        expect(routed.allowedActions).not.toEqual(expect.arrayContaining(childMutations))
+        expect(routed.authorizeUsage).toHaveBeenCalled()
+        const failure = routed.events.find(event => event.type === "tool_call.failed")
+        expect(failure?.payload).toMatchObject({ toolName, errorCode: "coordination_objective_requirements_require_plan" })
+        expect(routed.manager.spawn).not.toHaveBeenCalled()
+        expect(routed.commandPort.appendNativeCoordination).not.toHaveBeenCalled()
+        expect(routed.commandPort.appendAndSchedule).not.toHaveBeenCalled()
+        expect(routed.commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+      }
+    }
   })
 
   it("activates discovery restrictions only for the trusted intent and persists a failed root marker without a validated shortlist", async () => {
