@@ -45,6 +45,7 @@ type Input = Readonly<{
   /** Explicit adapter for callers that still supply compaction-captured records. Production uses the direct source reader. */
   selectedJobHistoryReader?: SelectedJobHistoryReader
   rootTaskHistoryDirectReader?: DirectRootTaskHistoryReader
+  crossSessionRootTaskHistoryEnabled?: boolean
   currentRootBudgetReader?: (owner: ExecutionOwnerFence) => Promise<CurrentRootBudgetObservation>
 }>
 
@@ -98,7 +99,9 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       }
       if (rootTaskHistoryReader) snapshot = await appendCanonicalRootTaskHistory({
         snapshot, reader: rootTaskHistoryReader,
-        request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date() },
+        request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date(),
+          ...(input.crossSessionRootTaskHistoryEnabled === true && input.planningEnabled && !input.selectedJobMode
+            ? { crossSessionRootTaskHistoryEnabled: true } : {}) },
       })
       if (input.planningEnabled) {
         const owner = executionOwnerFence({ kind: "turn", taskId: input.rootTaskId, lease: input.lease })

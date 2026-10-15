@@ -844,6 +844,7 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const planningFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1",
     })
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
@@ -879,6 +880,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(readCurrent).toHaveBeenCalledTimes(3)
     expect(rootTaskHistory.load).toHaveBeenCalledWith(expect.objectContaining({
       lease, rootTaskId: "root-1", rootAttemptCount: 1, stepId: expect.any(String), now: expect.any(Date),
+      crossSessionRootTaskHistoryEnabled: true,
     }))
     expect(modelSnapshots[0]?.toolObservations).toContainEqual({
       id: "task-graph-current",

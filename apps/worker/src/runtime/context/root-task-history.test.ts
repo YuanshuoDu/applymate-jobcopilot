@@ -303,6 +303,21 @@ describe("root task history projection", () => {
     expect(JSON.stringify(projected)).not.toContain("unknown-private-template")
   })
 
+  it("orders cross-session outcomes by DB time and breaks equal-time ties by descending Turn ID", () => {
+    const terminalAt = new Date("2026-10-07T11:00:00.000Z")
+    const highTurnId = { ...outcome("z-source", 1n, [node({ status: "running" })]), terminalAt }
+    const lowTurnId = { ...outcome("a-source", 90n, [node({ status: "queued" })]), terminalAt }
+    const olderTime = { ...outcome("older-time", 100n, [node({ status: "interrupted" })]),
+      terminalAt: new Date(terminalAt.getTime() - 1) }
+    const projected = projectRootTaskHistory([lowTurnId, highTurnId], true)
+    const turns = (projected?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }).turns
+
+    expect(turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "queued"])
+    const byTime = projectRootTaskHistory([olderTime, highTurnId], true)?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }
+    expect(byTime.turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "interrupted"])
+    expect(projectRootTaskHistory([outcome("missing-terminal-time", 2n)], true)).toBeUndefined()
+  })
+
   it("strips large untrusted node strings before applying the byte bound", () => {
     const large = node({ goal: "g".repeat(1000), resultSummary: "r".repeat(4000), failureReason: "f".repeat(2000) })
     const projected = projectRootTaskHistory([outcome("large", 4n, [large])])
