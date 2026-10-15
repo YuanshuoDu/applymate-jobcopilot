@@ -50,9 +50,17 @@ export interface DiscoverParams {
   userId?:          string
   targetRoles:     string[]
   targetLocations: string[]  // empty → global search
+  source?:          string
   existingUrls:    Set<string>
   maxResults:      number    // total cap across all queries
   onProviderCall?:  (event: DiscoverProviderEvent) => void | Promise<void>
+}
+
+async function notifyProviderCall(
+  callback: DiscoverParams['onProviderCall'],
+  event: DiscoverProviderEvent,
+): Promise<void> {
+  try { await callback?.(event) } catch { /* Telemetry must not affect discovery. */ }
 }
 
 // EU country code detector — mirrors unified route's EU_COUNTRY_MAP for consistency
@@ -130,8 +138,64 @@ type ScoutFetchContext = {
 
 type ScoutProviderExecution = () => Promise<DiscoveredJob[]>
 
+const failedProviderResults = new WeakSet<DiscoveredJob[]>()
+
+function providerFailure(items: DiscoveredJob[] = []): DiscoveredJob[] {
+  failedProviderResults.add(items)
+  return items
+}
+
+function isValidProviderJob(value: unknown): value is DiscoveredJob {
+  if (!value || typeof value !== 'object') return false
+  const job = value as Partial<DiscoveredJob>
+  return typeof job.title === 'string' && job.title.trim().length > 0
+    && typeof job.company === 'string' && job.company.trim().length > 0
+    && typeof job.location === 'string' && typeof job.url === 'string' && job.url.length > 0
+    && typeof job.description === 'string'
+    && (job.salary === null || typeof job.salary === 'string')
+    && (job.logo === null || typeof job.logo === 'string')
+    && typeof job.source === 'string' && job.source.trim().length > 0
+}
+
+function validatedProviderJobs(items: DiscoveredJob[]): DiscoveredJob[] {
+  const valid = items.filter(isValidProviderJob)
+  return valid.length === items.length && !failedProviderResults.has(items) ? items : providerFailure(valid)
+}
+
+function mapProviderItems<T extends object>(items: readonly unknown[], map: (item: T) => DiscoveredJob): DiscoveredJob[] {
+  let malformed = false
+  const jobs: DiscoveredJob[] = []
+  for (const item of items) {
+    try {
+      const job = map(item as T)
+      if (!isValidProviderJob(job)) malformed = true
+      jobs.push(job)
+    } catch {
+      // The original whole-array map was inside one catch, so any thrown row
+      // mapping discarded the complete provider response.
+      return providerFailure()
+    }
+  }
+  return malformed ? providerFailure(jobs) : jobs
+}
+
 function providerCallKey(call: ProviderCall): string {
   return `${call.id}|${Object.entries(call.params).sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}`).join('&')}`
+}
+
+const PROVIDER_JOB_SOURCES: Record<string, string> = {
+  'rapidapi-active-jobs': 'ats',
+  'rapidapi-linkedin': 'linkedin',
+  adzuna: 'adzuna',
+  'rapidapi-jsearch': 'jsearch',
+  'rapidapi-jobs-api14': 'indeed',
+  irishjobs: 'irishjobs',
+  cleanjobdata: 'cleanjobdata',
+}
+
+function providerMatchesSource(call: ProviderCall): boolean {
+  const source = call.params.source
+  return !source || PROVIDER_JOB_SOURCES[call.id] === source.toLowerCase()
 }
 
 function providerCredentialSource(provider: string, access: DiscoveryApiAccess): ScoutCredentialSource {
@@ -196,11 +260,12 @@ async function fetchAts(q: string, location: string, key: string, context: Scout
       signal: AbortSignal.timeout(5_000),
       cache: 'no-store',
     }, { provider: 'rapidapi-active-jobs', operation: 'list', credentialSource: context.rapidapiCredentialSource, userId: context.userId })
-    if (!r.ok) return []
-    const json = await r.json()
-    if (!Array.isArray(json)) return []
-    await reportJobApiJobs(r, json.length)
-    return json.map((j: {
+    if (!r.ok) return providerFailure()
+    const json: unknown = await r.json()
+    if (!Array.isArray(json)) return providerFailure()
+    const items: unknown[] = json
+    await reportJobApiJobs(r, items.length)
+    return mapProviderItems(items, (j: {
       title: string; organization: string; apply_url?: string; url: string
       locations_derived?: string[]; remote_derived?: boolean
       description_text?: string; organization_logo?: string | null
@@ -220,7 +285,7 @@ async function fetchAts(q: string, location: string, key: string, context: Scout
         source:      'ats',
       }
     })
-  } catch { return [] }
+  } catch { return providerFailure() }
 }
 
 async function fetchLinkedIn(q: string, location: string, key: string, context: ScoutFetchContext): Promise<DiscoveredJob[]> {
@@ -235,11 +300,12 @@ async function fetchLinkedIn(q: string, location: string, key: string, context: 
       signal: AbortSignal.timeout(5_000),
       cache: 'no-store',
     }, { provider: 'rapidapi-linkedin', operation: 'list', credentialSource: context.rapidapiCredentialSource, userId: context.userId })
-    if (!r.ok) return []
-    const json = await r.json()
-    if (!Array.isArray(json)) return []
-    await reportJobApiJobs(r, json.length)
-    return json.map((j: {
+    if (!r.ok) return providerFailure()
+    const json: unknown = await r.json()
+    if (!Array.isArray(json)) return providerFailure()
+    const items: unknown[] = json
+    await reportJobApiJobs(r, items.length)
+    return mapProviderItems(items, (j: {
       title: string; organization: string; external_apply_url?: string; url: string
       locations_derived?: string[]; remote_derived?: boolean
       description_text?: string; organization_logo?: string | null
@@ -254,7 +320,7 @@ async function fetchLinkedIn(q: string, location: string, key: string, context: 
       logo:        j.organization_logo ?? null,
       source:      'linkedin',
     }))
-  } catch { return [] }
+  } catch { return providerFailure() }
 }
 
 async function fetchAdzuna(
@@ -271,14 +337,16 @@ async function fetchAdzuna(
     const r = await trackedJobApiFetch(`https://api.adzuna.com/v1/api/jobs/${country}/search/1?${p}`, {
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
     }, { provider: 'adzuna', operation: 'list', credentialSource: context.adzunaCredentialSource, userId: context.userId })
-    if (!r.ok) return []
-    const json = await r.json() as { results?: Array<{
+    if (!r.ok) return providerFailure()
+    const json = await r.json() as { results?: unknown }
+    if (!json || !Array.isArray(json.results)) return providerFailure()
+    const items: unknown[] = json.results
+    await reportJobApiJobs(r, items.length)
+    return mapProviderItems(items, (j: {
       title: string; company?: { display_name: string }; location?: { display_name: string }
       redirect_url: string; description?: string
       salary_min?: number; salary_max?: number
-    }> }
-    await reportJobApiJobs(r, json.results?.length ?? 0)
-    return (json.results ?? []).map(j => ({
+    }) => ({
       title:       j.title,
       company:     j.company?.display_name ?? '',
       location:    j.location?.display_name ?? '',
@@ -288,7 +356,7 @@ async function fetchAdzuna(
       logo:        null,
       source:      'adzuna',
     }))
-  } catch { return [] }
+  } catch { return providerFailure() }
 }
 
 async function fetchJSearch(q: string, location: string, key: string, context: ScoutFetchContext): Promise<DiscoveredJob[]> {
@@ -302,14 +370,16 @@ async function fetchJSearch(q: string, location: string, key: string, context: S
       headers: { 'X-RapidAPI-Key': key, 'X-RapidAPI-Host': 'jsearch.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
     }, { provider: 'rapidapi-jsearch', operation: 'list', credentialSource: context.rapidapiCredentialSource, userId: context.userId })
-    if (!r.ok) return []
-    const json = await r.json() as { data?: { jobs?: Array<{
+    if (!r.ok) return providerFailure()
+    const json = await r.json() as { data?: { jobs?: unknown } }
+    if (!json?.data || !Array.isArray(json.data.jobs)) return providerFailure()
+    const items: unknown[] = json.data.jobs
+    await reportJobApiJobs(r, items.length)
+    return mapProviderItems(items, (j: {
       job_title: string; employer_name?: string; job_apply_link: string
       job_city?: string; job_country?: string; job_is_remote?: boolean
       job_description?: string; job_min_salary?: number; job_max_salary?: number
-    }> } }
-    await reportJobApiJobs(r, json.data?.jobs?.length ?? 0)
-    return (json.data?.jobs ?? []).map(j => {
+    }) => {
       const loc = j.job_is_remote ? 'Remote' : [j.job_city, j.job_country].filter(Boolean).join(', ')
       return {
         title:       j.job_title,
@@ -322,7 +392,7 @@ async function fetchJSearch(q: string, location: string, key: string, context: S
         source:      'jsearch',
       }
     })
-  } catch { return [] }
+  } catch { return providerFailure() }
 }
 
 // Indeed IE — mirrors unified route's Ireland strategy (countryCode=ie, verified working)
@@ -338,19 +408,20 @@ async function fetchIndeedIE(q: string, location: string, key: string, context: 
       headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'jobs-api14.p.rapidapi.com' },
       signal: AbortSignal.timeout(5_000), cache: 'no-store',
     }, { provider: 'rapidapi-jobs-api14', operation: 'list', credentialSource: context.rapidapiCredentialSource, userId: context.userId })
-    if (!r.ok) return []
+    if (!r.ok) return providerFailure()
     const json = await r.json() as {
-      data?: Array<{
+      data?: unknown
+      hasError?: boolean
+    }
+    if (json.hasError || !Array.isArray(json.data)) return providerFailure()
+    const items: unknown[] = json.data
+    await reportJobApiJobs(r, items.length)
+    return mapProviderItems(items, (j: {
         id: string; title: string
         company: { name: string; image?: string }
         location: { location?: string; country?: string }
         description?: string; applyUrl?: string
-    }>
-      hasError?: boolean
-    }
-    if (json.hasError || !Array.isArray(json.data)) return []
-    await reportJobApiJobs(r, json.data.length)
-    return json.data.map(j => ({
+    }) => ({
       title:       j.title,
       company:     j.company?.name ?? '',
       location:    j.location?.location ?? j.location?.country ?? 'Ireland',
@@ -359,8 +430,8 @@ async function fetchIndeedIE(q: string, location: string, key: string, context: 
       salary:      null,
       logo:        j.company?.image ?? null,
       source:      'indeed',
-    })).filter(j => j.url)
-  } catch { return [] }
+    }))
+  } catch { return providerFailure() }
 }
 
 // ── IrishJobs.ie RSS (free, no key needed) ────────────────────────────────────
@@ -383,16 +454,18 @@ async function fetchIrishJobsRss(q: string, location: string, userId?: string): 
     `https://www.irishjobs.ie/jobs/${keySlug}/in-${locSlug}?format=rss`,
     `https://www.irishjobs.ie/jobs/${keySlug}?format=rss`,
   ]
+  let providerFailed = false
   for (const url of urls) {
     try {
       const r = await trackedJobApiFetch(url, {
         headers: { 'User-Agent': 'ApplyMate/1.0', 'Accept': 'application/rss+xml, text/xml' },
         signal: AbortSignal.timeout(7_000), cache: 'no-store',
       }, { provider: 'irishjobs', operation: 'list', credentialSource: 'public', userId })
-      if (!r.ok) continue
+      if (!r.ok) { providerFailed = true; continue }
       const xml = await r.text()
+      if (!/<rss\b[\s\S]*<\/rss>/i.test(xml)) { providerFailed = true; continue }
       if (!xml.includes('<item')) continue
-      const jobs = [...xml.matchAll(/<item[^>]*>([\s\S]*?)<\/item>/gi)].map((m, i) => {
+      const parsedJobs = [...xml.matchAll(/<item[^>]*>([\s\S]*?)<\/item>/gi)].map(m => {
         const it    = m[1]
         const title = stripHtml(extractRssTag(it, 'title'))
         const link  = extractRssTag(it, 'link')
@@ -408,12 +481,14 @@ async function fetchIrishJobsRss(q: string, location: string, userId?: string): 
           logo:        null,
           source:      'irishjobs' as const,
         }
-      }).filter(j => j.title && j.url)
+      })
+      if (parsedJobs.some(job => !job.title || !job.url)) providerFailed = true
+      const jobs = parsedJobs.filter(job => job.title && job.url)
       await reportJobApiJobs(r, jobs.length)
-      return jobs
-    } catch { continue }
+      return providerFailed ? providerFailure(jobs) : jobs
+    } catch { providerFailed = true; continue }
   }
-  return []
+  return providerFailed ? providerFailure() : []
 }
 
 // ── Main discovery function ───────────────────────────────────────────────────
@@ -443,8 +518,9 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
       existingUrls: [...params.existingUrls].sort().join('\u001f'),
       maxResults: params.maxResults,
       fantasticShadow: fantasticShadowEnabled,
+      ...(params.source ? { source: params.source.toLowerCase() } : {}),
     },
-    providers: ['worker-discovery-v1'],
+    providers: ['worker-discovery-v2'],
     credentialScope: credentialCacheScope({
       userId: userId ?? 'anonymous',
       providerScopes: { worker: userId ? 'user' : 'public' },
@@ -470,14 +546,15 @@ export async function discoverJobs(params: DiscoverParams): Promise<DiscoveredJo
 }
 
 async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabled: boolean, keys: DiscoveryApiAccess): Promise<DiscoveredJob[]> {
-  const { userId, targetRoles, targetLocations, existingUrls, maxResults } = params
+  const { userId, targetRoles, targetLocations, source, existingUrls, maxResults } = params
 
   const apiKey    = keys.rapidapiKey
   const adzunaId  = keys.adzunaAppId
   const adzunaKey = keys.adzunaAppKey
   const cleanJobDataKey = keys.cleanJobDataApiKey
   const fantasticJobsKey = keys.fantasticJobsApiKey
-  const fantasticShadowActive = fantasticShadowEnabled && Boolean(fantasticJobsKey)
+  const fantasticJobsSelected = source?.toLowerCase() === 'fantasticjobs'
+  const fantasticShadowActive = fantasticShadowEnabled && Boolean(fantasticJobsKey) && (!source || fantasticJobsSelected)
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []
@@ -535,11 +612,15 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
       const executions = new Map<string, ScoutProviderExecution>()
       const addProvider = (
         id: string,
-        params: Record<string, string>,
+        providerParams: Record<string, string>,
         execute: ScoutProviderExecution,
         expectedJobs = 20,
       ) => {
-        const call: ProviderCall = { id, params, expectedJobs }
+        const call: ProviderCall = {
+          id,
+          params: { ...providerParams, ...(source ? { source } : {}) },
+          expectedJobs,
+        }
         if (calls.some(existing => existing.id === id)) return
         calls.push(call)
         executions.set(providerCallKey(call), execute)
@@ -608,29 +689,35 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
       // CleanJobData is a normalized supplementary feed, not an ATS. Keep it
       // additive and let the existing location filter/dedup pipeline arbitrate.
       if (cleanJobDataKey) {
-        addProvider('cleanjobdata', { role, country: country ?? '' }, () => fetchCleanJobData({
-          apiKey: cleanJobDataKey,
-          userId,
-          title: role,
-          countryCode: country ?? undefined,
-          maxPages: 1,
-          maxResults: Math.min(20, maxResults - results.length),
-        }))
+        addProvider('cleanjobdata', { role, country: country ?? '' }, async () => {
+          let providerFailed = false
+          const jobs = await fetchCleanJobData({
+            apiKey: cleanJobDataKey,
+            userId,
+            title: role,
+            countryCode: country ?? undefined,
+            maxPages: 1,
+            maxResults: Math.min(20, maxResults - results.length),
+            ...(params.onProviderCall ? { onProviderFailure: () => { providerFailed = true } } : {}),
+          })
+          return providerFailed ? providerFailure(jobs) : jobs
+        })
       }
 
       const execute = async (call: ProviderCall) => {
         const startedAt = Date.now()
         try {
-          const items = await (executions.get(providerCallKey(call))?.() ?? Promise.resolve([]))
-          await params.onProviderCall?.({ provider: call.id, role, location: loc, jobsReturned: items.length, status: 'success', latencyMs: Date.now() - startedAt })
+          const rawItems = await (executions.get(providerCallKey(call))?.() ?? Promise.resolve([]))
+          const items = validatedProviderJobs(rawItems)
+          await notifyProviderCall(params.onProviderCall, { provider: call.id, role, location: loc, jobsReturned: rawItems.length, status: failedProviderResults.has(items) ? 'error' : 'success', latencyMs: Date.now() - startedAt })
           return items
         } catch (error) {
-          await params.onProviderCall?.({ provider: call.id, role, location: loc, jobsReturned: 0, status: 'error', latencyMs: Date.now() - startedAt })
+          await notifyProviderCall(params.onProviderCall, { provider: call.id, role, location: loc, jobsReturned: 0, status: 'error', latencyMs: Date.now() - startedAt })
           throw error
         }
       }
       const visible = await executeProviderPlan({
-        calls,
+        calls: calls.filter(providerMatchesSource),
         availableProviders: available,
         states,
         targetResults: Math.max(1, maxResults - results.length),
@@ -646,17 +733,37 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
             availableProviders: available,
             states,
             targetResults: Number.MAX_SAFE_INTEGER,
-            execute: () => fetchFantasticJobs({ apiKey: fantasticJobsKey!, title: role, location: loc, userId }),
+            execute: async () => {
+              const startedAt = Date.now()
+              let providerFailed = false
+              try {
+                const jobs = await fetchFantasticJobs({
+                  apiKey: fantasticJobsKey!, title: role, location: loc, userId,
+                  ...(params.onProviderCall ? { onProviderFailure: () => { providerFailed = true } } : {}),
+                })
+                await notifyProviderCall(params.onProviderCall, {
+                  provider: 'fantasticjobs', role, location: loc, jobsReturned: jobs.length,
+                  status: providerFailed ? 'error' : 'success', latencyMs: Date.now() - startedAt,
+                })
+                return jobs
+              } catch (error) {
+                await notifyProviderCall(params.onProviderCall, {
+                  provider: 'fantasticjobs', role, location: loc, jobsReturned: 0,
+                  status: 'error', latencyMs: Date.now() - startedAt,
+                })
+                throw error
+              }
+            },
             count: items => items.length,
             reserve,
           })
         : { items: [] as DiscoveredJob[], decisions: [] }
       if (fantasticShadowActive) recordScoutDecisions(shadow.decisions, keys, userId, role, loc)
 
-      const allResults = visible.items
+      const allResults = fantasticJobsSelected ? shadow.items : visible.items
       const shadowResults = shadow.items
 
-      if (fantasticShadowActive) {
+      if (fantasticShadowActive && !fantasticJobsSelected) {
         const evidence = compareShadowJobs(allResults, shadowResults)
         void recordDiscoveryOptimization({
           userId, eventType: 'shadow_comparison', provider: 'fantasticjobs', credentialScope: 'platform',
@@ -670,7 +777,8 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
       // filters are advisory, so without this a fallback can leak other cities.
       const locL = loc.toLowerCase()
       const scored = allResults.flat()
-        .filter(j => j.url && j.title && j.company && (!loc || matchesTargetLocation(j.location, loc)))
+        .filter(j => j.url && j.title && j.company && (!source || j.source.toLowerCase() === source.toLowerCase()))
+        .filter(j => !loc || matchesTargetLocation(j.location, loc))
         .map(j => ({
           job:   j,
           score: (locL && j.location.toLowerCase().includes(locL)) ? 1 : 0,

@@ -8,6 +8,8 @@ import { InMemoryToolResultReferenceStore } from "./redaction.js"
 import { ToolRouter } from "./router.js"
 import { ToolExecutionError, type RuntimeToolDefinition } from "./types.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import type { ExecutionOwner } from "../execution-owner.js"
+import type { ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const context = { scope: { userId: "user-a" }, sessionId: "session-a", turnId: "turn-a", stepId: "step-a" }
 
@@ -60,6 +62,99 @@ describe("ToolRouter", () => {
     const pending = cancelled.router.execute({ ...context, signal: controller.signal }, { ...request, id: "call-cancel" })
     controller.abort()
     await expect(pending).resolves.toMatchObject({ status: "cancelled", errorCode: "cancelled" })
+  })
+
+  it("rejects a tool that resolves after its per-call timeout signal aborts", async () => {
+    let resolveTool!: (output: { result: string }) => void
+    let signalAbort!: () => void
+    const output = new Promise<{ result: string }>((resolve) => { resolveTool = resolve })
+    const aborted = new Promise<void>((resolve) => { signalAbort = resolve })
+    const timed = makeRouter(async (toolContext) => {
+      toolContext.signal.addEventListener("abort", signalAbort, { once: true })
+      return output
+    }, 5)
+    const pending = timed.router.execute(context, { ...request, id: "call-timeout-late" })
+
+    await aborted
+    resolveTool({ result: "late success" })
+
+    await expect(pending).resolves.toMatchObject({ status: "cancelled", errorCode: "timeout" })
+    expect(timed.sink.events.map((event) => event.phase)).toEqual(["started", "cancelled"])
+    expect(timed.sink.events.some((event) => event.eventType === "tool_call.completed")).toBe(false)
+  })
+
+  it("cancels completion when the root aborts during durable result persistence", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const owner = {} as unknown as ExecutionOwner
+    let signalPutStarted!: () => void
+    let releasePut!: () => void
+    const putStarted = new Promise<void>((resolve) => { signalPutStarted = resolve })
+    const putGate = new Promise<void>((resolve) => { releasePut = resolve })
+    const durableResults = {
+      put: vi.fn(async () => {
+        signalPutStarted()
+        await putGate
+        return { id: "tool-result-00000000-0000-4000-8000-000000000001", byteCount: 9_000, sha256: "a".repeat(64) }
+      }),
+    } as unknown as ToolResultReferenceRepository
+    const registry = new ToolRegistry([{
+      schemaVersion: "agent-harness.v2", name: "test.read", version: "1", description: "test",
+      capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
+      outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs: 5_000, requiredCapabilities: [],
+      execute: async () => ({ result: "x".repeat(9_000) }),
+    }])
+    const lifecycle = new ToolLifecycle({
+      sink, durableResults, resolveOwner: () => owner, maxEventBytes: 256,
+    })
+    const router = new ToolRouter(registry, lifecycle)
+    const controller = new AbortController()
+    const pending = router.execute({ ...context, signal: controller.signal }, request)
+
+    await putStarted
+    controller.abort()
+    releasePut()
+
+    await expect(pending).resolves.toMatchObject({ status: "cancelled", errorCode: "cancelled" })
+    expect(sink.events.map((event) => event.phase)).toEqual(["started", "cancelled"])
+    expect(sink.events.some((event) => event.eventType === "tool_call.completed")).toBe(false)
+  })
+
+  it("keeps the per-call timeout active during durable result persistence", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const owner = {} as unknown as ExecutionOwner
+    let signalAbort!: () => void
+    let signalPutStarted!: () => void
+    let releasePut!: () => void
+    const aborted = new Promise<void>((resolve) => { signalAbort = resolve })
+    const putStarted = new Promise<void>((resolve) => { signalPutStarted = resolve })
+    const putGate = new Promise<void>((resolve) => { releasePut = resolve })
+    const durableResults = {
+      put: vi.fn(async () => {
+        signalPutStarted()
+        await putGate
+        return { id: "tool-result-00000000-0000-4000-8000-000000000002", byteCount: 9_000, sha256: "b".repeat(64) }
+      }),
+    } as unknown as ToolResultReferenceRepository
+    const registry = new ToolRegistry([{
+      schemaVersion: "agent-harness.v2", name: "test.read", version: "1", description: "test",
+      capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
+      outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs: 20, requiredCapabilities: [],
+      execute: async (toolContext) => {
+        toolContext.signal.addEventListener("abort", signalAbort, { once: true })
+        return { result: "x".repeat(9_000) }
+      },
+    }])
+    const lifecycle = new ToolLifecycle({ sink, durableResults, resolveOwner: () => owner, maxEventBytes: 256 })
+    const router = new ToolRouter(registry, lifecycle)
+    const pending = router.execute(context, { ...request, id: "call-timeout-during-put" })
+
+    await putStarted
+    await aborted
+    releasePut()
+
+    await expect(pending).resolves.toMatchObject({ status: "cancelled", errorCode: "timeout" })
+    expect(sink.events.map((event) => event.phase)).toEqual(["started", "cancelled"])
+    expect(sink.events.some((event) => event.eventType === "tool_call.completed")).toBe(false)
   })
 
   it("does not emit a started event or invoke a tool after the root is stopped", async () => {

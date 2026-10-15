@@ -48,6 +48,23 @@ describe("canonical Root task history context", () => {
     expect(built.toolObservations).toEqual([{ id: "keep", content: { safe: true } }])
   })
 
+  it("passes the opt-in projection mode so equal-time outcomes use descending Turn ID order", async () => {
+    const terminalAt = new Date("2026-10-08T00:00:00Z")
+    const base = outcomes[0]!
+    const before = { ...base, sourceTurnId: "turn-a", terminalAt,
+      taskGraph: { revision: 1, nodes: [{ ...base.taskGraph.nodes[0]!, status: "queued" as const }] } }
+    const after = { ...base, sourceTurnId: "turn-z", terminalAt,
+      taskGraph: { revision: 1, nodes: [{ ...base.taskGraph.nodes[0]!, status: "running" as const }] } }
+    const reader: DirectRootTaskHistoryReader = { load: async () => [before, after] }
+    const built = await appendCanonicalRootTaskHistory({ snapshot, reader,
+      request: { ...request, crossSessionRootTaskHistoryEnabled: true } })
+    const history = built.toolObservations.find(item => item.id === "root-task-history")?.content as {
+      turns: Array<{ nodes: Array<{ status: string }> }>
+    }
+
+    expect(history.turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "queued"])
+  })
+
   it("propagates owner/database read failures instead of turning them into accepted history", async () => {
     const reader: DirectRootTaskHistoryReader = { load: async () => { throw new Error("root_task_history_scope_invalid") } }
     await expect(appendCanonicalRootTaskHistory({ snapshot, reader, request })).rejects.toThrow("root_task_history_scope_invalid")

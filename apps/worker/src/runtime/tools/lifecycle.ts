@@ -107,20 +107,19 @@ export class ToolLifecycle {
     await this.append({ phase: "progress", eventType: "tool_call.progress", item, payload: this.payload(call, "streaming", { progress: safeProgress }) })
   }
 
-  async completed(call: LifecycleCall, output: unknown): Promise<unknown> {
-    return this.result(call, "completed", null, output)
-  }
+  async completed(call: LifecycleCall, output: unknown, signal?: AbortSignal): Promise<unknown> { return this.result(call, "completed", null, output, signal) }
 
   async failed(call: LifecycleCall, phase: "failed" | "cancelled", errorCode: string, detail?: unknown): Promise<unknown> {
     return this.result(call, phase, errorCode, detail)
   }
 
-  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown): Promise<unknown> {
+  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal): Promise<unknown> {
     const timestamp = this.now()
     const pageCall = this.pageCalls.delete(call.id)
     const safeOutput = phase === "completed"
       ? await this.persistCompletedOutput(call, output ?? null, pageCall)
       : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
+    if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     const item: ToolResultItem = {
       schemaVersion,
       id: `tool-result-item:${call.id}`,
@@ -135,6 +134,7 @@ export class ToolLifecycle {
       output: safeOutput,
       errorCode,
     }
+    if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     await this.append({ phase, eventType: phase === "completed" ? "tool_call.completed" : "tool_call.failed", item, payload: this.payload(call, phase, { output: safeOutput, errorCode }) })
     this.inputs.delete(call.id)
     return safeOutput
@@ -170,7 +170,7 @@ export class ToolLifecycle {
       } catch {
         throw new ToolExecutionError("durable_wait_receipt_invalid", "Durable wait receipt is invalid")
       }
-    } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get") {
+    } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get" || call.toolName === "jobs.discover") {
       prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
     } else if (call.toolName === "tool_results.read") {
       let owner: ExecutionOwner | undefined
@@ -185,7 +185,8 @@ export class ToolLifecycle {
     if (prepared.sizeBytes > MAX_TOOL_RESULT_BYTES) {
       throw new ToolExecutionError("tool_result_too_large", "Tool result exceeds the 1 MiB limit")
     }
-    if (prepared.sizeBytes <= this.maxEventBytes) return prepared.safe
+    const inlineLimit = call.toolName === "jobs.discover" ? Math.min(this.maxEventBytes, 6 * 1024) : this.maxEventBytes
+    if (prepared.sizeBytes <= inlineLimit) return prepared.safe
     if (call.toolName === "agent.plan" || call.toolName === "agent.spawn" || call.toolName === "spawn_subagent" || nativeFollowup) {
       throw new ToolExecutionError("tool_result_too_large", "Agent receipt exceeds the lifecycle event limit")
     }

@@ -4,16 +4,29 @@ import { ANALYST_ROLE_CONTRACT, SCOUT_ROLE_CONTRACT, assertRoleActionAllowed, as
 
 describe("migrated role contracts", () => {
   it("keeps Scout and Analyst on explicit read-only allowlists", () => {
-    expect(SCOUT_ROLE_CONTRACT.allowedTools).toEqual(["jobs.search", "jobs.get"])
+    expect(SCOUT_ROLE_CONTRACT.allowedTools).toEqual(["jobs.search", "jobs.get", "jobs.discover"])
     expect(ANALYST_ROLE_CONTRACT.allowedTools).toEqual(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
     expect(SCOUT_ROLE_CONTRACT.forbiddenCapabilities).toEqual(["write", "external_write", "browser"])
-    expect(Object.values(ROLE_TOOL_CONTRACTS).every(tool => tool.risk === "read" && tool.capabilities.includes("read"))).toBe(true)
+    expect(Object.values(ROLE_TOOL_CONTRACTS).filter(tool => tool.name !== "jobs.discover").every(tool => tool.risk === "read" && tool.capabilities.includes("read"))).toBe(true)
+    expect(ROLE_TOOL_CONTRACTS["jobs.discover"]).toEqual({
+      name: "jobs.discover", risk: "internal_write", domain: "jobs", capabilities: ["read", "write"],
+    })
   })
 
   it("rejects capability-positive actions for both roles", () => {
     expect(() => assertRoleActionAllowed("analyst", { name: "application.submit", risk: "external_write", capabilities: ["external_write", "browser"] })).toThrow(/cannot use/)
     expect(() => assertRoleToolAllowed("scout", { ...ROLE_TOOL_CONTRACTS["persona.retrieve"] })).toThrow(/cannot use persona.retrieve/)
     expect(() => assertRoleActionAllowed("scout", { name: "browser.fill", risk: "internal_write", capabilities: ["browser", "write"] })).toThrow()
+  })
+
+  it("allows only Scout's exact jobs.discover internal-write tuple", () => {
+    const discover = { name: "jobs.discover", risk: "internal_write" as const, capabilities: ["read", "write"] as const }
+    expect(() => assertRoleActionAllowed("scout", discover)).not.toThrow()
+    expect(() => assertRoleToolAllowed("scout", ROLE_TOOL_CONTRACTS["jobs.discover"])).not.toThrow()
+    expect(() => assertRoleActionAllowed("analyst", discover)).toThrow(/cannot use jobs.discover/)
+    expect(() => assertRoleActionAllowed("scout", { ...discover, risk: "read" })).toThrow()
+    expect(() => assertRoleActionAllowed("scout", { ...discover, capabilities: ["read", "write", "browser"] })).toThrow()
+    expect(() => assertRoleActionAllowed("scout", { ...discover, name: "jobs.search" })).toThrow()
   })
 
   it("does not invoke a downstream executor after a denied action", async () => {

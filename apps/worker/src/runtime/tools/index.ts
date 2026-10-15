@@ -19,6 +19,7 @@ import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
 import type { RuntimeToolDefinition } from "./types.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import { createAskUserTool } from "./ask-user.js"
+import { createJobsDiscoverTool, type JobDiscoverToolOptions } from "./job-discover-tool.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -66,6 +67,7 @@ export function createWorkerToolRuntime(
   gmail?: WorkerGmailOptions,
   artifacts?: WorkerArtifactOptions,
   write?: WorkerWriteOptions,
+  jobDiscovery?: JobDiscoverToolOptions,
 ): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
   const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
@@ -87,6 +89,7 @@ export function createWorkerToolRuntime(
   if (gmail) definitions.push(...createGmailTools(gmail))
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   if (write) definitions.push(...createWriteTools({ pool, ...write }))
+  if (jobDiscovery) definitions.push(createJobsDiscoverTool(jobDiscovery) as RuntimeToolDefinition)
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
   return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }

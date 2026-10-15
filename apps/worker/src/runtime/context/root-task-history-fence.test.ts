@@ -1,7 +1,7 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
-import { readRootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { readRootTaskHistoryFence, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { rootTaskObjectiveDigest } from "./root-task-objective.js"
 
 type Row = Record<string, unknown>
@@ -18,7 +18,8 @@ function start(sequence = "20"): Row {
   return {
     sessionId: "session-1", turnId: "turn-current", taskId: "root-current", itemId: null, sequence,
     type: "turn.started", actor: "orchestrator", correlationId: "turn-current",
-    idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" }, startEventCount: 1,
+    idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" },
+    createdAt: new Date("2026-10-07T12:00:00.000Z"), startEventCount: 1,
   }
 }
 
@@ -41,8 +42,9 @@ function fixture(options: Options = {}) {
         id: "step-current", sessionId: "session-1", turnId: "turn-current", taskId: "root-current",
         attempt: options.stepAttempt ?? 1, status: "streaming",
       }] }
-      if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "input"')) return { rows: [{
+      if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "source", "input"')) return { rows: [{
         id: "turn-current", sessionId: "session-1", userId: "user-1", rootTaskId: "root-current", status: "in_progress",
+        source: "user",
         input: options.turnInput ?? { goal: " Plan a role " },
       }] }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [start()] }
@@ -113,5 +115,33 @@ describe("root task history current fence", () => {
 
     const nonrunning = fixture({ rootStatus: "completed" })
     await expect(readRootTaskHistoryFence(nonrunning.client, nonrunning.input)).rejects.toThrow("root_task_history_current_root_fenced")
+  })
+
+  it("derives the cross-session origin and DB cutoff from the persisted current Turn and start receipt", async () => {
+    const test = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "interactive_discovery_shortlist", version: 1 } } })
+
+    await expect(readRootTaskHistoryFence(test.client, { ...test.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toMatchObject({
+      currentStartSequence: 20n, currentStartCreatedAt: new Date("2026-10-07T12:00:00.000Z"),
+      currentOrigin: JSON.stringify(["user", "interactive_discovery_shortlist", 1]), objectiveDigest: expect.any(String),
+    })
+    expect(rootTaskHistoryOrigin("user", { goal: "x" })).toBe(JSON.stringify(["user", "none"]))
+    expect(rootTaskHistoryOrigin("user", { goal: "x", intent: { kind: "interactive_discovery_shortlist", version: 1, extra: true } })).toBeUndefined()
+    const supported = { kind: "interactive_discovery_shortlist", version: 1 }
+    expect(rootTaskHistoryOrigin("user", { intent: supported, input: { goal: "x", intent: supported } }))
+      .toBe(JSON.stringify(["user", "interactive_discovery_shortlist", 1]))
+    expect(rootTaskHistoryOrigin("user", { intent: { kind: "unknown", version: 1 }, input: { goal: "x" } })).toBeUndefined()
+    expect(rootTaskHistoryOrigin("user", { intent: supported, input: { goal: "x", intent: { kind: "unknown", version: 1 } } })).toBeUndefined()
+  })
+
+  it("fails closed on invalid origin, malformed start time, or invalid typed requirements only in opt-in mode", async () => {
+    const unknownIntent = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "unknown", version: 1 } } })
+    await expect(readRootTaskHistoryFence(unknownIntent.client, { ...unknownIntent.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()
+
+    const malformedTime = fixture({ startRows: [{ ...start(), createdAt: "not-a-date" }] })
+    await expect(readRootTaskHistoryFence(malformedTime.client, { ...malformedTime.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()
+
+    const invalidRequirements = fixture({ turnInput: { goal: " Plan a role ", verificationRequirements: { schemaVersion: "bad", requirements: [] } } })
+    await expect(readRootTaskHistoryFence(invalidRequirements.client, { ...invalidRequirements.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()
+    await expect(readRootTaskHistoryFence(invalidRequirements.client, invalidRequirements.input)).resolves.toMatchObject({ objectiveDigest: expect.any(String) })
   })
 })

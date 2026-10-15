@@ -47,8 +47,7 @@ import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.j
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalSelectedJobCompletion, createCanonicalTurnTerminalGuard, loadNativeVerificationRootContext, prepareNativeVerificationRootContext, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 import { configureNativeSemanticProgress } from "./canonical-turn-native-semantic-rejection.js"
 import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
-export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
-export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
+export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"; export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
   /** One server-owned activation contract for production route capabilities. */ readonly productionFlags?: ProductionAgentFlags
@@ -210,7 +209,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       pool, store: inputStore, baseBuilder: options.contextBuilderFactory?.({ pool, scope: state.scope }), scope: state.scope, lease,
       rootTaskId: root.id, rootAttemptCount: root.attemptCount, rootInputId: state.rootInputId,
       turnInput: state.turnInput, rootTaskObjective: { goal: root.goal, successCriteria: root.successCriteria },
-      planningEnabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,
+      planningEnabled: taskGraphPlanningEnabled, selectedJobMode, crossSessionRootTaskHistoryEnabled: productionFlags?.crossSessionRootTaskHistoryEnabled === true && taskGraphPlanningEnabled && !selectedJobMode,
+      selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,
     })
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const engine = new TurnEngine({

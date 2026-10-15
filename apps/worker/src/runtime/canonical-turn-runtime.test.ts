@@ -526,7 +526,7 @@ async function taskGraphRootSurface(
       analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
       writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: ["cover_letter.draft"] },
       reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
-    } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"] } },
     selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
     stateLoader: async () => ({
       ...state(), toolPolicySnapshot: { capabilities: ["read"] },
@@ -870,6 +870,7 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const planningFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1",
     })
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
@@ -905,6 +906,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(readCurrent).toHaveBeenCalledTimes(3)
     expect(rootTaskHistory.load).toHaveBeenCalledWith(expect.objectContaining({
       lease, rootTaskId: "root-1", rootAttemptCount: 1, stepId: expect.any(String), now: expect.any(Date),
+      crossSessionRootTaskHistoryEnabled: true,
     }))
     expect(modelSnapshots[0]?.toolObservations).toContainEqual({
       id: "task-graph-current",
@@ -2422,6 +2424,8 @@ describe("createCanonicalTurnRuntime", () => {
     expect(generic.toolNames).toEqual(expect.arrayContaining(genericReads))
     expect(generic.allowedActions).toEqual(expect.arrayContaining([...genericCoordination, ...retained]))
     expect(generic.allowedActions).toEqual(expect.arrayContaining(genericReads))
+    expect(generic.allowedActions).toEqual(expect.arrayContaining(["jobs.discover", "tool_results.read"]))
+    expect(generic.toolNames).not.toEqual(expect.arrayContaining(["jobs.discover", "tool_results.read"]))
     expect(generic.route).toHaveBeenCalledOnce()
 
     const forgedRead = await taskGraphRootSurface(true, false, "jobs.get")
@@ -2530,7 +2534,7 @@ describe("createCanonicalTurnRuntime", () => {
     const discoveryTemplateActions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
     expect(discovery.toolNames.slice().sort()).toEqual([...safeRootTools].sort())
     expect(discovery.toolNames).not.toEqual(expect.arrayContaining([...discoveryTemplateActions, "agent.spawn", "agent.send", "agent.interrupt", "agent.close", "writer", "reviewer"]))
-    expect(discovery.allowedActions.slice().sort()).toEqual([...safeRootTools, ...discoveryTemplateActions].sort())
+    expect(discovery.allowedActions.slice().sort()).toEqual([...safeRootTools, ...discoveryTemplateActions, "jobs.discover", "tool_results.read"].sort())
     expect(discovery.allowedActions).not.toEqual(expect.arrayContaining(["cover_letter.draft", "artifact.review"]))
     expect(JSON.stringify(discovery.requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan"))).toContain("analyst")
     expect(JSON.stringify(discovery.requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan"))).not.toContain("writer")

@@ -22,6 +22,7 @@ export interface CleanJobDataQuery {
   salaryMax?: number
   maxPages?: number
   maxResults?: number
+  onProviderFailure?: () => void
 }
 
 export interface CleanJobDataJob extends DiscoveredJob {
@@ -150,6 +151,12 @@ export async function fetchCleanJobData(query: CleanJobDataQuery): Promise<Clean
   const resultLimit = Math.min(Math.max(query.maxResults ?? PAGE_SIZE, 1), MAX_RESULTS)
   const results: CleanJobDataJob[] = []
   let cursor = ''
+  let failureReported = false
+  const reportFailure = () => {
+    if (failureReported) return
+    failureReported = true
+    query.onProviderFailure?.()
+  }
 
   for (let page = 0; page < pageLimit && results.length < resultLimit; page += 1) {
     const params = new URLSearchParams()
@@ -166,19 +173,23 @@ export async function fetchCleanJobData(query: CleanJobDataQuery): Promise<Clean
       }, {
         provider: 'cleanjobdata', operation: 'list', credentialSource: 'platform', userId: query.userId,
       })
-      if (!response.ok) return page === 0 ? [] : results
+      if (!response.ok) { reportFailure(); return page === 0 ? [] : results }
 
       const envelope = asRecord(await response.json())
       await reportJobApiJobs(response, Array.isArray(envelope.data) ? envelope.data.length : 0)
-      if (!Array.isArray(envelope.data)) return page === 0 ? [] : results
+      if (!Array.isArray(envelope.data)) { reportFailure(); return page === 0 ? [] : results }
       for (const value of envelope.data) {
         const job = mapJob(value)
-        if (job) results.push(job)
-        if (results.length >= resultLimit) break
+        if (!job) {
+          reportFailure()
+          continue
+        }
+        if (results.length < resultLimit) results.push(job)
       }
       cursor = asString(asRecord(envelope.pagination).next_page)
       if (!cursor) break
     } catch {
+      reportFailure()
       return page === 0 ? [] : results
     }
   }
