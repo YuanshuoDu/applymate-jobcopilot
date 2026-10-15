@@ -1185,7 +1185,7 @@ describe("apply-queue (unit — mocked)", () => {
   });
 
   it("fills without submission, then creates the durable final-review checkpoint", async () => {
-    mockPage.evaluate.mockResolvedValue({ missing: [], sensitive: [] });
+    mockPage.evaluate.mockResolvedValue({ missing: [], sensitive: [], selectors: [] });
     await import("./apply-queue.js");
     await mockProcessor({
       data: {
