@@ -553,7 +553,7 @@ async function discoverJobsUncached(params: DiscoverParams, fantasticShadowEnabl
   const adzunaKey = keys.adzunaAppKey
   const cleanJobDataKey = keys.cleanJobDataApiKey
   const fantasticJobsKey = keys.fantasticJobsApiKey
-  const fantasticShadowActive = fantasticShadowEnabled && Boolean(fantasticJobsKey)
+  const fantasticShadowActive = fantasticShadowEnabled && Boolean(fantasticJobsKey) && (!source || source.toLowerCase() === 'fantasticjobs')
 
   const seen    = new Set(existingUrls)
   const results: DiscoveredJob[] = []

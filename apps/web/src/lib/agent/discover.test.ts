@@ -230,6 +230,45 @@ describe('discoverJobs platform controls', () => {
     expect(mocks.reserveProviderQuota.mock.calls.map(([call]) => (call as { provider: string }).provider)).toEqual(['rapidapi-linkedin'])
   })
 
+  it('skips Fantastic Jobs shadow calls when another source is explicitly selected', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
+      rapidapiKey: 'rapidapi-key', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '',
+      fantasticJobsApiKey: 'fantastic-key',
+    })
+    const fetchMock = mockProviderResponses()
+
+    const jobs = await discoverJobs({
+      userId: 'user-1', targetRoles: ['Engineer'], targetLocations: ['Berlin'], source: 'linkedin',
+      existingUrls: new Set(), maxResults: 5,
+    })
+
+    expect(jobs.map(job => job.source)).toEqual(['linkedin'])
+    expect(mocks.fetchFantasticJobs).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([expect.stringContaining('linkedin-job-search-api')])
+    expect(mocks.reserveProviderQuota.mock.calls.map(([call]) => (call as { provider: string }).provider)).toEqual(['rapidapi-linkedin'])
+  })
+
+  it('allows Fantastic Jobs shadow calls when FantasticJobs itself is selected', async () => {
+    mocks.featureEnabled.mockResolvedValue(true)
+    mocks.getDiscoveryApiAccess.mockResolvedValue({
+      rapidapiKey: '', adzunaAppId: '', adzunaAppKey: '', cleanJobDataApiKey: '',
+      fantasticJobsApiKey: 'fantastic-key',
+    })
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const jobs = await discoverJobs({
+      userId: 'user-1', targetRoles: ['Engineer'], targetLocations: ['Berlin'], source: 'FantasticJobs',
+      existingUrls: new Set(), maxResults: 5,
+    })
+
+    expect(jobs).toEqual([])
+    expect(mocks.fetchFantasticJobs).toHaveBeenCalledOnce()
+    expect(mocks.reserveProviderQuota.mock.calls.map(([call]) => (call as { provider: string }).provider)).toEqual(['fantasticjobs'])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('separates cached candidate windows by requested source', async () => {
     mocks.featureEnabled.mockResolvedValue(true)
     const fetchMock = mockProviderResponses()

@@ -269,7 +269,16 @@ describe("ToolLifecycle", () => {
     expect(output).toMatchObject({
       jobs: [{ id: cuidJobId, description: "Contact [REDACTED_PHONE]", evidenceRefs: ["evidence-source-1"] }],
       evidence: [{ jobId: cuidJobId, source: "greenhouse" }],
+      usage: {
+        toolName: "jobs.discover", toolVersion: "1", requests: 1, jobsProcessed: 1,
+        jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0, aiCalls: 0,
+        providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1,
+      },
     })
+    for (const key of ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"]) {
+      expect(output).not.toHaveProperty(`usage.${key}`)
+      expect(sink.events[0]?.payload.output).not.toHaveProperty(`usage.${key}`)
+    }
     expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output })
     expect(sink.events[0]?.payload.output).toEqual(output)
   })

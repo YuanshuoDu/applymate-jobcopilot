@@ -4,6 +4,7 @@ import { createHash } from "node:crypto"
 
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
+import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
 
 function scoutResult(overrides: Record<string, unknown> = {}) {
   return {
@@ -170,7 +171,9 @@ describe("child evidence binding", () => {
       },
     }
     const index = createObservedEvidenceIndex()
-    recordReadToolOutput(index, "jobs.discover", output)
+    const safeOutput = redactJobReadOutput("jobs.discover", output)
+    expect(safeOutput).not.toBe("[REDACTED]")
+    recordReadToolOutput(index, "jobs.discover", safeOutput)
     expect(entry(index, "job", jobId)).toEqual({ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" })
     expect(parseAndBindStructuredResult(JSON.stringify(scoutResult({
       candidates: [{ jobId, source: "greenhouse", url: null, evidenceIds: ["model-job"] }],
@@ -181,7 +184,7 @@ describe("child evidence binding", () => {
     })
 
     const restoredIndex = createObservedEvidenceIndex()
-    hydrateObservedEvidence(restoredIndex, [restored("discover", "jobs.discover", output)])
+    hydrateObservedEvidence(restoredIndex, [restored("discover", "jobs.discover", safeOutput)])
     expect(entry(restoredIndex, "job", jobId)).toEqual({ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" })
   })
 
@@ -201,6 +204,25 @@ describe("child evidence binding", () => {
       candidates: [{ jobId: DISCOVERED_JOB_ID, evidenceIds: [`read:job:${DISCOVERED_JOB_ID}`] }],
       evidence: [{ id: `read:job:${DISCOVERED_JOB_ID}`, ref: DISCOVERED_JOB_ID, source: "greenhouse" }],
     })
+  })
+
+  it("rehydrates a safe projection from durable chunks after restart and rejects a source conflict", () => {
+    const rawOutput = durableDiscoveryObservations().output
+    const safeOutput = redactJobReadOutput("jobs.discover", rawOutput)
+    expect(safeOutput).not.toBe("[REDACTED]")
+    const { observations } = durableDiscoveryObservations(safeOutput)
+
+    const index = createObservedEvidenceIndex()
+    hydrateObservedEvidence(index, observations)
+    expect(entry(index, "job", DISCOVERED_JOB_ID)).toEqual({
+      id: `read:job:${DISCOVERED_JOB_ID}`, kind: "job", ref: DISCOVERED_JOB_ID, source: "greenhouse",
+    })
+
+    const conflictingIndex = createObservedEvidenceIndex()
+    recordReadToolOutput(conflictingIndex, "jobs.search", { jobs: [{ id: DISCOVERED_JOB_ID, source: "lever" }] })
+    expect(() => hydrateObservedEvidence(conflictingIndex, observations)).toThrow("child_resume_evidence_conflict")
+    expect(entry(conflictingIndex, "job", DISCOVERED_JOB_ID)).toBeUndefined()
+    expect(conflictingIndex.conflicts.has(`job\u0000${DISCOVERED_JOB_ID}`)).toBe(true)
   })
 
   it("restores a 64 KiB jobs.discover result after 50 ordinary observations within resume limits", () => {

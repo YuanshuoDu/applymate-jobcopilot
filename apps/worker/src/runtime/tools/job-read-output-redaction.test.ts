@@ -103,18 +103,30 @@ describe("job read output redaction", () => {
       }],
       nextCursor: null,
       usage: {
-        ledgerKey: "ledger-1", toolName: "jobs.discover", toolVersion: "1", toolCallId: "call-1",
-        sessionId: "session-1", turnId: "turn-1", stepId: "step-1", requests: 1,
+        toolName: "jobs.discover", toolVersion: "1", requests: 1,
         jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, aiCalls: 0, providers: ["greenhouse"],
         estimatedCostUsd: 0, durationMs: 10,
       },
     })
+    for (const key of ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"]) {
+      expect(safe).not.toHaveProperty(`usage.${key}`)
+    }
+    expect(safe).toMatchObject({ usage: { requests: 1, jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, aiCalls: 0, providers: ["greenhouse"], durationMs: 10 } })
+  })
+
+  it("accepts an already-redacted discover usage projection idempotently", () => {
+    const safe = redactJobReadOutput("jobs.discover", discoverOutput())
+    expect(safe).not.toBe("[REDACTED]")
+    expect(redactJobReadOutput("jobs.discover", safe)).toEqual(safe)
+    for (const key of ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"]) {
+      expect(safe).not.toHaveProperty(`usage.${key}`)
+    }
   })
 
   it("allows the optional providerFailures usage field", () => {
     const output = discoverOutput()
     Object.assign(output.usage, { providerFailures: 1 })
-    expect(redactJobReadOutput("jobs.discover", output)).not.toBe("[REDACTED]")
+    expect(redactJobReadOutput("jobs.discover", output)).toMatchObject({ usage: { providerFailures: 1 } })
   })
 
   it("fails closed for unknown or missing discover object fields", () => {
@@ -133,6 +145,23 @@ describe("job read output redaction", () => {
     const extraUsageField = discoverOutput()
     Object.assign(extraUsageField.usage, { unexpected: "private" })
     expect(redactJobReadOutput("jobs.discover", extraUsageField)).toBe("[REDACTED]")
+  })
+
+  it("fails closed when discover usage scope fields are partial or have the wrong type", () => {
+    const partial = discoverOutput()
+    Reflect.deleteProperty(partial.usage, "sessionId")
+    expect(redactJobReadOutput("jobs.discover", partial)).toBe("[REDACTED]")
+
+    const partialProjection = discoverOutput()
+    for (const key of ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"]) {
+      Reflect.deleteProperty(partialProjection.usage, key)
+    }
+    Object.assign(partialProjection.usage, { sessionId: "session-1" })
+    expect(redactJobReadOutput("jobs.discover", partialProjection)).toBe("[REDACTED]")
+
+    const wrongType = discoverOutput()
+    Reflect.set(wrongType.usage, "turnId", 3)
+    expect(redactJobReadOutput("jobs.discover", wrongType)).toBe("[REDACTED]")
   })
 
   it("fails closed when discover values exceed the declared shape bounds", () => {

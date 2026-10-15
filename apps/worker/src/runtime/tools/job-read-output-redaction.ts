@@ -14,7 +14,9 @@ type VerifiedTarget =
 const DISCOVER_OUTPUT_KEYS = ["jobs", "evidence", "nextCursor", "usage"]
 const DISCOVER_JOB_KEYS = ["id", "title", "company", "location", "url", "description", "fullDescription", "salary", "logo", "source", "evidenceRefs"]
 const DISCOVER_EVIDENCE_KEYS = ["evidenceId", "jobId", "kind", "source", "url", "summary"]
-const DISCOVER_USAGE_KEYS = ["ledgerKey", "toolName", "toolVersion", "toolCallId", "sessionId", "turnId", "stepId", "requests", "jobsProcessed", "jobsSucceeded", "jobsFailed", "aiCalls", "providers", "estimatedCostUsd", "durationMs"]
+const DISCOVER_USAGE_SCOPE_KEYS = ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"] as const
+const DISCOVER_USAGE_REQUIRED_KEYS = ["toolName", "toolVersion", "requests", "jobsProcessed", "jobsSucceeded", "jobsFailed", "aiCalls", "providers", "estimatedCostUsd", "durationMs"]
+const DISCOVER_INTERNAL_USAGE_KEYS = new Set<string>(DISCOVER_USAGE_SCOPE_KEYS)
 const DISCOVER_EVIDENCE_KINDS = new Set<unknown>(["source", "enrichment", "analysis", "comparison"])
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -93,14 +95,17 @@ function validDiscoverEvidence(value: unknown): value is Record<string, unknown>
 }
 
 function validDiscoverUsage(value: unknown): value is Record<string, unknown> {
-  if (!isPlainRecord(value) || !hasExactDataKeys(value, DISCOVER_USAGE_KEYS, ["providerFailures"])) return false
+  if (!isPlainRecord(value)) return false
+  const scopeKeyCount = DISCOVER_USAGE_SCOPE_KEYS.filter(key => Object.hasOwn(value, key)).length
+  if (scopeKeyCount !== 0 && scopeKeyCount !== DISCOVER_USAGE_SCOPE_KEYS.length) return false
+  if (!hasExactDataKeys(value, DISCOVER_USAGE_REQUIRED_KEYS, [...DISCOVER_USAGE_SCOPE_KEYS, "providerFailures"])) return false
   const integerFields = ["requests", "jobsProcessed", "jobsSucceeded", "jobsFailed", "aiCalls", "durationMs"]
   if (integerFields.some(key => !isNonNegativeInteger(ownDataValue(value, key)))) return false
   if (Object.hasOwn(value, "providerFailures")
     && !isNonNegativeInteger(ownDataValue(value, "providerFailures"))) return false
   const estimatedCostUsd = ownDataValue(value, "estimatedCostUsd")
-  return ["ledgerKey", "toolName", "toolVersion", "toolCallId", "sessionId", "turnId", "stepId"]
-    .every(key => isId(ownDataValue(value, key)))
+  return ["toolName", "toolVersion"].every(key => isId(ownDataValue(value, key)))
+    && (scopeKeyCount === 0 || DISCOVER_USAGE_SCOPE_KEYS.every(key => isId(ownDataValue(value, key))))
     && isBoundedArray(ownDataValue(value, "providers"), 32, item => isNonEmptyText(item, 80))
     && typeof estimatedCostUsd === "number" && Number.isFinite(estimatedCostUsd) && estimatedCostUsd >= 0
 }
@@ -219,7 +224,13 @@ export function redactJobReadOutput(toolName: string, output: unknown): Reposito
         if (!isJsonRecord(item)) return FAIL_CLOSED
         safeEvidence.push({ ...item, jobId: target.evidenceJobIds[index] })
       }
-      return { ...redacted, jobs: safeJobs, evidence: safeEvidence }
+      const usage = redacted.usage
+      if (!isJsonRecord(usage)) return FAIL_CLOSED
+      const safeUsage: Record<string, RepositoryJsonValue> = {}
+      for (const [key, value] of Object.entries(usage)) {
+        if (!DISCOVER_INTERNAL_USAGE_KEYS.has(key)) safeUsage[key] = value
+      }
+      return { ...redacted, jobs: safeJobs, evidence: safeEvidence, usage: safeUsage }
     }
 
     const job = redacted.job
