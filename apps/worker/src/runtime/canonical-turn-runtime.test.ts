@@ -2592,16 +2592,14 @@ describe("createCanonicalTurnRuntime", () => {
     expect(budgetObservationReads).toBe(6)
     expect(budgetClientReleases).toBe(6)
     expect(openedRootSteps).toHaveLength(6)
-    expect(requests.map(request => ({
-      sessionId: request.metadata.sessionId,
-      turnId: request.metadata.turnId,
-      taskId: request.metadata.taskId,
-      stepId: request.metadata.stepId,
-    }))).toEqual(openedRootSteps.map(stepId => ({
+    expect(requests.map(request => request.metadata)).toEqual(openedRootSteps.map(stepId => ({
       sessionId: lease.sessionId,
       turnId: lease.turnId,
-      taskId: "root-1",
       stepId,
+      taskId: "root-1",
+      userId: lease.userId,
+      featureId: "agent-harness.turn",
+      traceId: `${lease.turnId}:${stepId}`,
     })))
     expect(contexts.map(context => context.taskGraphRevision)).toEqual([7, 7, 7, 7, 8, 8])
     expect(contexts.map(context => context.inputThroughSequence)).toEqual([3n, 3n, 3n, 3n, 3n, 3n])
