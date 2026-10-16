@@ -34,6 +34,8 @@ export async function validateCurrentSubmit(
   const job = (await client.query<{ status: string; workflowState: string }>(`SELECT "status", "workflowState" FROM "Job"
     WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [intent.jobId, intent.userId])).rows[0]
   if (!job || job.status !== "saved" || job.workflowState !== "queued") return "application_job_state_mismatch"
+  const account = (await client.query<{ accountStatus: string }>(`SELECT "accountStatus" FROM "User" WHERE "id" = $1`, [intent.userId])).rows[0]
+  if (account?.accountStatus !== "active") return "application_account_inactive"
   const approval = await client.query<{ expired: boolean }>(`SELECT "expiresAt" <= CURRENT_TIMESTAMP AS expired FROM "agent_approvals" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
     AND "taskId" = $4 AND "userId" = $5 AND "jobId" = $6 AND "toolCallId" = $7
     AND "type" = 'submit_application' AND "status" = 'approved' AND "scopeHash" = $8

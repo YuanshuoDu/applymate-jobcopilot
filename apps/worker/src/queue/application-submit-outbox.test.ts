@@ -23,7 +23,7 @@ const makeOutbox = () => ({
   idempotencyKey: `application-submit:${digest}`, payload: intent,
   attemptCount: 0, publishedAt: null as Date | null, lastError: null as string | null,
 })
-type FixtureOptions = { turnId?: string; checkpoint?: string; taskStatus?: string; jobWorkflow?: string; failAckOnce?: boolean; jobState?: string; paused?: boolean; lock?: string | null; approvalExpired?: boolean; approvalProblem?: "missing" | "revoked" | "mismatched"; terminalOnRollback?: boolean; attemptsMade?: number; attempts?: number }
+type FixtureOptions = { turnId?: string; checkpoint?: string; taskStatus?: string; jobWorkflow?: string; failAckOnce?: boolean; jobState?: string; paused?: boolean; lock?: string | null; approvalExpired?: boolean; approvalProblem?: "missing" | "revoked" | "mismatched"; accountStatus?: string; terminalOnRollback?: boolean; attemptsMade?: number; attempts?: number }
 
 function makeFixture(options: FixtureOptions = {}) {
   const state = {
@@ -82,6 +82,7 @@ function makeFixture(options: FixtureOptions = {}) {
         return result(exact ? [{ ...state.task }] : [])
       }
       if (sql.includes('SELECT "status", "workflowState" FROM "Job"')) return result([{ ...state.job }])
+      if (sql.includes('SELECT "accountStatus" FROM "User"')) return result([{ accountStatus: options.accountStatus ?? "active" }])
       if (sql.includes('FROM "agent_approvals"')) return options.approvalProblem ? result([], 0) : result([{ expired: options.approvalExpired ?? false }], 1)
       if (sql.includes('FROM "application_task_events"')) return result([{ id: "queued-event" }])
       if (sql.startsWith("UPDATE application_tasks SET status = 'waiting_for_authorization'")) {
@@ -257,6 +258,23 @@ describe("application submit outbox publisher", () => {
     expect(fixture.state.outbox.lastError).toBe("terminal:approval_expired")
     expect(fixture.queue.add).not.toHaveBeenCalled()
     expect(fixture.client.query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO application_task_events"))).toBe(true)
+  })
+
+  it("terminalizes an inactive account's completed published delivery without retrying it", async () => {
+    const fixture = makeFixture({ accountStatus: "suspended", jobState: "completed" })
+    fixture.state.outbox.publishedAt = new Date("2026-10-16T12:00:00.000Z")
+    const job = fixture.makeJob(workerTaskId, payload)
+    fixture.jobs.set(workerTaskId, job)
+
+    await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
+
+    expect(fixture.state.outbox.lastError).toBe("terminal:application_account_inactive")
+    expect(fixture.queue.add).not.toHaveBeenCalled()
+    expect(job.retry).not.toHaveBeenCalled()
+
+    const lookups = fixture.queue.getJob.mock.calls.length
+    await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
+    expect(fixture.queue.getJob).toHaveBeenCalledTimes(lookups)
   })
 
   it.each(["missing", "revoked", "mismatched"] as const)("does not reset an exact task when approval is %s", async approvalProblem => {
