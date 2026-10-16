@@ -71,7 +71,7 @@ function poolFor(row: FillContextFixture | null, options: { interruptBeforeStart
       if (options.delaySessionLockMs) vi.setSystemTime(new Date(Date.now() + options.delaySessionLockMs))
       return { rows: [{ status: "running" }], rowCount: 1 }
     }
-    if (sql.includes("SELECT status FROM agent_turns")) return { rows: [{ status: "in_progress" }], rowCount: 1 }
+    if (sql.includes("SELECT status FROM agent_turns")) return { rows: [{ status: typeof row?.turnStatus === "string" ? row.turnStatus : "in_progress" }], rowCount: 1 }
     if (sql.includes('SELECT sub."id"')) {
       const expiry = values?.[8] instanceof Date ? values[8].getTime() : Number.POSITIVE_INFINITY
       const checkedAt = sql.includes("clock_timestamp()") ? Date.now() : transactionStartedAt
@@ -150,6 +150,17 @@ describe("executeApplicationFillForReview", () => {
     expect(queries.mock.calls.find(([sql]) => sql.includes('SELECT app."userId"'))?.[1]).toEqual(["user-1", "session-1", "turn-1"])
     expect(completeApplicationFillForReview).toHaveBeenCalledWith(pool, { lease: expect.objectContaining({ turnId: "turn-1" }) })
     expect(executeBrowserFill).toHaveBeenCalledTimes(1)
+  })
+
+  it("starts the exact bound fill after the root Turn has handed off to a dependency wait", async () => {
+    const { pool } = poolFor(context({ turnStatus: "waiting_for_dependency" }))
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease() })
+
+    expect(result).toMatchObject({ status: "completed", result: { status: "filled_for_user_review" } })
+    expect(withCloakContext).toHaveBeenCalledOnce()
+    expect(executeBrowserFill).toHaveBeenCalledWith(expect.objectContaining({ submit: false }), expect.anything())
+    expect(completeApplicationFillForReview).toHaveBeenCalledWith(pool, { lease: expect.objectContaining({ turnId: "turn-1" }) })
   })
 
   it("persists an uncertain wait when post-fill form inspection fails", async () => {
