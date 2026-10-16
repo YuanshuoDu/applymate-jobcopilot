@@ -34,6 +34,14 @@ function node(taskId: string, role: string, taskStatus: string, structuredResult
     : { kind, taskId, role, taskStatus, structuredResult } as TaskGraphFinalSummaryNode
 }
 
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child)
+    Object.freeze(value)
+  }
+  return value
+}
+
 async function mapPersistedRowsToSummaryNodes(taskId: string, role: "scout" | "analyst", structuredResult: unknown): Promise<TaskGraphFinalSummaryNode[]> {
   const identity = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
   const snapshot = {
@@ -72,7 +80,10 @@ describe("TaskGraph final-summary reducer", () => {
       node("reviewer-b", "reviewer", "completed", reviewerResult("passed", hash("c"))),
       node("reviewer-a", "reviewer", "completed", reviewerResult("passed")),
     ]
+    const inputSnapshot = structuredClone(nodes)
+    deepFreeze(nodes)
     const summary = reduceTaskGraphFinalSummary({ graphRevision: 7, nodes })
+    expect(nodes).toEqual(inputSnapshot)
     expect(summary.graphRevision).toBe(7)
     expect(summary.counts.discoveredJobs).toEqual({ knownCount: 6, coverage: "complete" })
     expect(summary.discoveredJobs.find(item => item.jobId === "job-4")?.taskIds).toEqual(["scout-a", "scout-b"])
