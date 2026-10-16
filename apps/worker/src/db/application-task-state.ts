@@ -25,8 +25,8 @@ export async function markSubmissionRequestStarted(client: PoolClient, scope: Ap
         AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id")
     INSERT INTO application_task_events (id, "taskId", type, actor, body, data, "createdAt")
     SELECT 'evt_' || $6, started."id", 'submission_execution_started', 'worker', 'Submit execution started',
-      jsonb_build_object('executionId', $6, 'workerTaskId', $7, 'applicationTaskId', $1, 'userId', $2, 'jobId', $3,
-        'sessionId', $4, 'fillTurnId', $5, 'approvalId', $8, 'constraintHash', $9), NOW() FROM started RETURNING "id"`,
+      jsonb_build_object('executionId', $6, 'workerTaskId', $7::text, 'applicationTaskId', $1, 'userId', $2, 'jobId', $3,
+        'sessionId', $4, 'fillTurnId', $5, 'approvalId', $8::text, 'constraintHash', $9::text), NOW() FROM started RETURNING "id"`,
     [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId, scope.fillTurnId,
       scope.executionId, scope.workerTaskId, scope.approvalId, scope.constraintHash],
   );
