@@ -129,14 +129,53 @@ CREATE TABLE "agent_approvals" (
   "userId" TEXT NOT NULL,
   "sessionId" TEXT NOT NULL,
   "turnId" TEXT,
+  "toolCallId" TEXT,
+  "jobId" TEXT,
   "taskId" TEXT,
   "type" TEXT NOT NULL,
-  "status" TEXT NOT NULL,
+  "status" TEXT NOT NULL DEFAULT 'pending',
+  "title" TEXT NOT NULL,
+  "body" TEXT NOT NULL,
+  "impact" JSONB,
   "payload" JSONB NOT NULL,
+  "resourceHash" TEXT,
+  "materialHash" TEXT,
+  "answersHash" TEXT,
   "scopeHash" TEXT,
+  "nonceHash" TEXT,
   "revision" INTEGER NOT NULL DEFAULT 0,
-  "decidedAt" TIMESTAMP(3)
+  "expiresAt" TIMESTAMP(3),
+  "decidedAt" TIMESTAMP(3),
+  "consumedAt" TIMESTAMP(3),
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TYPE "AgentArtifactLifecycle" AS ENUM ('base', 'draft');
+
+CREATE TABLE "agent_artifact" (
+  "id" TEXT PRIMARY KEY,
+  "userId" TEXT NOT NULL,
+  "jobId" TEXT NOT NULL,
+  "artifactType" TEXT NOT NULL,
+  "lifecycle" "AgentArtifactLifecycle" NOT NULL,
+  "baseId" TEXT,
+  "baseHash" TEXT,
+  "content" JSONB NOT NULL,
+  "hash" TEXT NOT NULL,
+  "constraintHash" TEXT NOT NULL,
+  "provenanceRefs" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  "evidenceRefs" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  "previousHash" TEXT,
+  "version" INTEGER NOT NULL DEFAULT 1,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
+  CONSTRAINT "agent_artifact_id_userId_jobId_key" UNIQUE ("id", "userId", "jobId")
+);
+
+CREATE INDEX "agent_artifact_userId_jobId_lifecycle_idx"
+  ON "agent_artifact"("userId", "jobId", "lifecycle");
+CREATE UNIQUE INDEX "agent_artifact_userId_jobId_lifecycle_artifactType_key"
+  ON "agent_artifact"("userId", "jobId", "lifecycle", "artifactType");
 
 CREATE TABLE "AgentRunQuestion" (
   "id" TEXT PRIMARY KEY,
