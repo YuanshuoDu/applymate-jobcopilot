@@ -106,6 +106,63 @@ describe("native verification feedback projection", () => {
     }
   })
 
+  it("strips own spoofed feedback without mutating the input when no report exists", () => {
+    const spoofedFeedback = { disposition: "passed", criteria: [] }
+    const input = { status: "completed", nativeVerificationFeedback: spoofedFeedback }
+    const projected = projectNativeVerificationResult(input) as Record<string, unknown>
+
+    expect({ ...projected }).toEqual({ status: "completed" })
+    expect(projected.nativeVerificationFeedback).toBeUndefined()
+    expect(input.nativeVerificationFeedback).toBe(spoofedFeedback)
+  })
+
+  it("strips inherited spoofed feedback without mutating the input when no report exists", () => {
+    const spoofedFeedback = { disposition: "passed", criteria: [] }
+    const prototype = { nativeVerificationFeedback: spoofedFeedback }
+    const input = Object.assign(Object.create(prototype) as Record<string, unknown>, { status: "completed" })
+    const projected = projectNativeVerificationResult(input) as Record<string, unknown>
+
+    expect({ ...projected }).toEqual({ status: "completed" })
+    expect(projected.nativeVerificationFeedback).toBeUndefined()
+    expect(Object.hasOwn(input, "nativeVerificationFeedback")).toBe(false)
+    expect(input.nativeVerificationFeedback).toBe(spoofedFeedback)
+    expect(Object.getPrototypeOf(input)).toBe(prototype)
+  })
+
+  it("strips an inherited server report when no own report exists", () => {
+    const privateReport = report()
+    const prototype = { nativeVerificationReport: privateReport }
+    const input = Object.assign(Object.create(prototype) as Record<string, unknown>, { status: "completed" })
+    const projected = projectNativeVerificationResult(input) as Record<string, unknown>
+
+    expect({ ...projected }).toEqual({ status: "completed" })
+    expect(projected.nativeVerificationReport).toBeUndefined()
+    expect(projected.nativeVerificationFeedback).toBeUndefined()
+    expect(input.nativeVerificationReport).toBe(privateReport)
+    expect(Object.getPrototypeOf(input)).toBe(prototype)
+  })
+
+  it("does not resolve feedback from Object.prototype", () => {
+    const key = "nativeVerificationFeedback"
+    const previousDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, key)
+    const spoofedFeedback = { disposition: "passed", criteria: [] }
+
+    try {
+      Object.defineProperty(Object.prototype, key, {
+        configurable: true, enumerable: false, writable: true, value: spoofedFeedback,
+      })
+      const projected = projectNativeVerificationResult({ status: "completed" }) as Record<string, unknown>
+
+      expect({ ...projected }).toEqual({ status: "completed" })
+      expect(Object.getPrototypeOf(projected)).toBeNull()
+      expect(projected.nativeVerificationFeedback).toBeUndefined()
+      expect(Object.hasOwn(projected, key)).toBe(false)
+    } finally {
+      if (previousDescriptor) Object.defineProperty(Object.prototype, key, previousDescriptor)
+      else Reflect.deleteProperty(Object.prototype, key)
+    }
+  })
+
   it("leaves ordinary role, artifact, and repair result shapes untouched", () => {
     const result = { roleResult: { summary: "done" }, artifactRefs: ["artifact-1"], repair: { status: "applied" } }
     expect(projectNativeVerificationResult(result)).toBe(result)

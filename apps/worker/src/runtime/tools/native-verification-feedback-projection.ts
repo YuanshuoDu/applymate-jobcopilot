@@ -118,17 +118,19 @@ function feedback(reportValue: unknown): NativeVerificationFeedback | null {
 export function projectNativeVerificationResult(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value
   let reportDescriptor: PropertyDescriptor | undefined
-  try { reportDescriptor = Object.getOwnPropertyDescriptor(value, REPORT_KEY) } catch { return null }
-  if (!reportDescriptor) return value
+  try {
+    reportDescriptor = Object.getOwnPropertyDescriptor(value, REPORT_KEY)
+    if (!reportDescriptor && !(REPORT_KEY in value) && !(FEEDBACK_KEY in value)) return value
+  } catch { return null }
 
-  const projected: Record<string, unknown> = {}
+  const projected = Object.create(null) as Record<string, unknown>
   try {
     for (const key of Reflect.ownKeys(value)) {
       if (typeof key !== "string" || key === REPORT_KEY || key === FEEDBACK_KEY) continue
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
       if (descriptor?.enumerable && "value" in descriptor) projected[key] = descriptor.value
     }
-    if (reportDescriptor.enumerable && "value" in reportDescriptor) {
+    if (reportDescriptor?.enumerable && "value" in reportDescriptor) {
       const safeFeedback = feedback(reportDescriptor.value)
       if (safeFeedback) projected[FEEDBACK_KEY] = safeFeedback
     }
