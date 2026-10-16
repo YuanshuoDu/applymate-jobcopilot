@@ -36,6 +36,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (action.type === "confirm_submission_not_received") return handleConfirmSubmissionNotReceivedAction(id, auth.userId, action)
 
   let approval: ScopedApproval | null = null
+  let canonicalSubmissionApproved = false
   if (action.approvalId) {
     approval = await db.agentApproval.findFirst({
       where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "pending" },
@@ -113,10 +114,49 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
           ? () => validateReceiptForApproval(approval!, action.receiptNonce!, auth.userId, id)
           : undefined,
       })
-      if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
-      if (approval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: approval.turnId })
-      if (action.decision === "approved" && approval.type !== "submit_application") {
-        await consumeReceiptForApproval(approval, action.receiptNonce!, auth.userId, id)
+      if (resolution?.disposition === "canonical_wait") {
+        const canonicalSubmissionDeclined = approval.type === "submit_application"
+          && (action.decision === "rejected" || action.decision === "cancelled")
+          && resolution.decision === "rejected"
+          && resolution.result.status === "rejected"
+          && resolution.result.disposition !== "duplicate"
+        if (canonicalSubmissionDeclined && approval.turnId && approval.jobId) {
+          const payload = applicationPayload(approval.payload)
+          if (payload?.jobId === approval.jobId) {
+            const cancelled = action.decision === "cancelled"
+            const updated = await db.applicationTask.updateMany({
+              where: {
+                id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, sessionId: id,
+                fillTurnId: approval.turnId, fillTurnSessionId: id, fillTurnUserId: auth.userId,
+                status: "waiting_for_authorization", checkpoint: "form_filled",
+              },
+              data: {
+                status: cancelled ? "cancelled" : "waiting_for_user",
+                checkpoint: cancelled ? "submission_cancelled" : "review_requested",
+                completedAt: cancelled ? new Date() : null,
+              },
+            })
+            if (updated.count === 1) {
+              await db.applicationTaskEvent.create({
+                data: {
+                  taskId: payload.applicationTaskId, type: "submission_" + action.decision, actor: "user",
+                  body: safeEventFields("submission_" + action.decision, action.body, {}).body,
+                },
+              })
+            }
+          }
+        }
+        canonicalSubmissionApproved = action.decision === "approved"
+          && resolution.decision === "approved"
+          && approval.type === "submit_application"
+          && resolution.result.disposition !== "duplicate"
+        if (!canonicalSubmissionApproved) return canonicalApprovalResponse(resolution)
+      }
+      if (!canonicalSubmissionApproved) {
+        if (approval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: approval.turnId })
+        if (action.decision === "approved" && approval.type !== "submit_application") {
+          await consumeReceiptForApproval(approval, action.receiptNonce!, auth.userId, id)
+        }
       }
     } catch (error) {
       return legacyApprovalErrorResponse(error, "Approval could not be resolved")

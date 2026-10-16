@@ -522,6 +522,102 @@ describe("agent session actions API", () => {
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
   })
 
+  it("queues an approved canonical submission after validating its scoped receipt", async () => {
+    const payload = { applicationTaskId: "task_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null }
+    const expiresAt = new Date("2026-06-18T10:15:00.000Z")
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: "submit_application", payload, expiresAt }))
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.example/apply" })
+    mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
+      await options?.beforeResolve?.()
+      return canonicalResolution("approved")
+    })
+    mocks.transcriptCreate.mockResolvedValueOnce({
+      id: "event_queued", sessionId: "session_1", taskId: null, type: "application_queued", speaker: "Executor",
+      title: "Submission queued", body: "Your approved application was queued for background execution.",
+      data: { taskId: "submit_task_1", jobId: "job_1" }, durationMs: null,
+      createdAt: new Date("2026-06-18T10:01:00.000Z"),
+    })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      event: { id: "event_queued", type: "application_queued", title: "Submission queued" },
+    })
+    expect(mocks.validateLegacyReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      approvalId: "approval_1", userId: "user_1", sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1",
+      jobId: "job_1", action: "submit_application", nonce: "nonce_1", resource: { jobId: "job_1" },
+      material: payload, answers: null, revision: 0, expiresAt,
+    }))
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledTimes(1)
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledWith({
+      userId: "user_1", jobId: "job_1", applyUrl: "https://jobs.example/apply", applicationTaskId: "task_1",
+      approvalId: "approval_1", receiptNonce: "nonce_1", sessionId: "session_1",
+    })
+    expect(mocks.transcriptCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ type: "application_queued", title: "Submission queued" }),
+    }))
+    expect(mocks.sessionUpdate).toHaveBeenCalledWith({ where: { id: "session_1" }, data: { status: "running", completedAt: null } })
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { decision: "rejected", status: "waiting_for_user", checkpoint: "review_requested", cancelled: false, eventType: "submission_rejected" },
+    { decision: "cancelled", status: "cancelled", checkpoint: "submission_cancelled", cancelled: true, eventType: "submission_cancelled" },
+  ] as const)("projects a canonical submission $decision onto its exact fill task", async ({ decision, status, checkpoint, cancelled, eventType }) => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("rejected"))
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 1 })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision,
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    await expect(res.json()).resolves.toEqual({ disposition: "rejected", duplicate: false })
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1",
+        fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+        status: "waiting_for_authorization", checkpoint: "form_filled",
+      },
+      data: {
+        status, checkpoint, completedAt: cancelled ? expect.any(Date) : null,
+      },
+    })
+    expect(mocks.applicationTaskEventCreate).toHaveBeenCalledTimes(1)
+    expect(mocks.applicationTaskEventCreate).toHaveBeenCalledWith({
+      data: {
+        taskId: "task_1", type: eventType, actor: "user",
+        body: decision === "cancelled" ? "Cancelled the requested action." : "Rejected the requested action.",
+      },
+    })
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("does not append a canonical submission decision event when the exact fill task no longer matches", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("rejected"))
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "rejected",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    expect(mocks.applicationTaskEventCreate).not.toHaveBeenCalled()
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+  })
+
   it("does not reopen a submission task when Stop cancels it during queue continuation", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
       type: "submit_application",
@@ -566,6 +662,24 @@ describe("agent session actions API", () => {
     expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
     expect(mocks.transaction).not.toHaveBeenCalled()
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("does not queue a duplicate canonical submission", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved", "duplicate"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    await expect(res.json()).resolves.toEqual({ disposition: "approved", duplicate: true })
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+    expect(mocks.jobFindFirst).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
@@ -628,6 +742,10 @@ describe("agent session actions API", () => {
   })
 
   it("stops before canonical delegation when the scoped receipt is invalid", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
     mocks.validateLegacyReceipt.mockRejectedValueOnce(new Error("Approval nonce does not match"))
     mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
       await options?.beforeResolve?.()
@@ -644,6 +762,7 @@ describe("agent session actions API", () => {
     expect(mocks.validateLegacyReceipt).toHaveBeenCalledTimes(1)
     expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
