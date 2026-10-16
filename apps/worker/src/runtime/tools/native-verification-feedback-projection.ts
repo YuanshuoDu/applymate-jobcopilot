@@ -130,7 +130,7 @@ export function projectNativeVerificationResult(value: unknown): unknown {
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
       if (descriptor?.enumerable && "value" in descriptor) projected[key] = descriptor.value
     }
-    if (reportDescriptor.enumerable && "value" in reportDescriptor) {
+    if (reportDescriptor?.enumerable && "value" in reportDescriptor) {
       const safeFeedback = feedback(reportDescriptor.value)
       if (safeFeedback) projected[FEEDBACK_KEY] = safeFeedback
     }

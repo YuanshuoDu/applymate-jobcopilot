@@ -109,8 +109,10 @@ describe("native verification feedback projection", () => {
   it("strips own spoofed feedback without mutating the input when no report exists", () => {
     const spoofedFeedback = { disposition: "passed", criteria: [] }
     const input = { status: "completed", nativeVerificationFeedback: spoofedFeedback }
+    const projected = projectNativeVerificationResult(input) as Record<string, unknown>
 
-    expect(projectNativeVerificationResult(input)).toEqual({ status: "completed" })
+    expect({ ...projected }).toEqual({ status: "completed" })
+    expect(projected.nativeVerificationFeedback).toBeUndefined()
     expect(input.nativeVerificationFeedback).toBe(spoofedFeedback)
   })
 
@@ -118,8 +120,10 @@ describe("native verification feedback projection", () => {
     const spoofedFeedback = { disposition: "passed", criteria: [] }
     const prototype = { nativeVerificationFeedback: spoofedFeedback }
     const input = Object.assign(Object.create(prototype) as Record<string, unknown>, { status: "completed" })
+    const projected = projectNativeVerificationResult(input) as Record<string, unknown>
 
-    expect(projectNativeVerificationResult(input)).toEqual({ status: "completed" })
+    expect({ ...projected }).toEqual({ status: "completed" })
+    expect(projected.nativeVerificationFeedback).toBeUndefined()
     expect(Object.hasOwn(input, "nativeVerificationFeedback")).toBe(false)
     expect(input.nativeVerificationFeedback).toBe(spoofedFeedback)
     expect(Object.getPrototypeOf(input)).toBe(prototype)
@@ -131,8 +135,9 @@ describe("native verification feedback projection", () => {
     const input = Object.assign(Object.create(prototype) as Record<string, unknown>, { status: "completed" })
     const projected = projectNativeVerificationResult(input) as Record<string, unknown>
 
-    expect(projected).toEqual({ status: "completed" })
+    expect({ ...projected }).toEqual({ status: "completed" })
     expect(projected.nativeVerificationReport).toBeUndefined()
+    expect(projected.nativeVerificationFeedback).toBeUndefined()
     expect(input.nativeVerificationReport).toBe(privateReport)
     expect(Object.getPrototypeOf(input)).toBe(prototype)
   })
@@ -148,7 +153,7 @@ describe("native verification feedback projection", () => {
       })
       const projected = projectNativeVerificationResult({ status: "completed" }) as Record<string, unknown>
 
-      expect(projected).toEqual({ status: "completed" })
+      expect({ ...projected }).toEqual({ status: "completed" })
       expect(Object.getPrototypeOf(projected)).toBeNull()
       expect(projected.nativeVerificationFeedback).toBeUndefined()
       expect(Object.hasOwn(projected, key)).toBe(false)
