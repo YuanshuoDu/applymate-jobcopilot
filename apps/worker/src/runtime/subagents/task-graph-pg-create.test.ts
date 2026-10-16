@@ -85,6 +85,38 @@ describe("createGraphTasks", () => {
     await expect(create("analyst", "analyst", "research")).resolves.toEqual(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
   })
 
+  it("rejects a second application filler across the existing Turn graph and new proposal before database access", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 0 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const fillerNode = (key: string) => ({
+      key, templateId: "application_filler", goal: "Prepare application for review",
+      successCriteria: ["Review checkpoint is ready"], dependsOn: [],
+    })
+    const inputFor = (nodes: TaskGraphNodeProposal[], expectedRevision: number): TaskGraphScheduleInput => ({
+      scope: {
+        userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+        stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1,
+      },
+      proposal: { expectedRevision, nodes },
+      templates: { application_filler: { role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] } },
+    })
+    const parent = { budgetSnapshot: { subagentPolicy: { maxConcurrency: 4, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }
+    const initial = createInitialTaskGraphState()
+
+    await expect(createGraphTasks(client, inputFor([fillerNode("fill-a"), fillerNode("fill-b")], 0), parent, initial, new Map()))
+      .rejects.toMatchObject({ code: "task_graph_application_filler_limit" })
+
+    const priorFill: TaskGraphState = {
+      revision: 1,
+      nodes: [{ ...fillerNode("fill-old"), depth: 1, status: "failed" }],
+      appliedEvents: [],
+    }
+    await expect(createGraphTasks(client, inputFor([fillerNode("fill-new")], 1), parent, priorFill, new Map([["fill-old", "task-old"]])))
+      .rejects.toMatchObject({ code: "task_graph_application_filler_limit" })
+
+    expect(query).not.toHaveBeenCalled()
+  })
+
   it("persists scoped completed direct prerequisite evidence before dispatching a ready child", async () => {
     const scoutResult = {
       schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",

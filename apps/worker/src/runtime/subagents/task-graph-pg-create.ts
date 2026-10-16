@@ -33,9 +33,7 @@ function safeTemplate(templateId: string, template: TaskGraphTaskTemplate): void
 }
 
 function safeProposalSize(proposal: TaskGraphProposal): void {
-  if (Buffer.byteLength(JSON.stringify(proposal), "utf8") > TASK_GRAPH_LIMITS.maxProposalBytes) {
-    throw new Error("task_graph_proposal_too_large")
-  }
+  if (Buffer.byteLength(JSON.stringify(proposal), "utf8") > TASK_GRAPH_LIMITS.maxProposalBytes) throw new Error("task_graph_proposal_too_large")
 }
 
 export async function createGraphTasks(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>): Promise<CreatedGraphTasks> {
@@ -44,6 +42,8 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   safeProposalSize(input.proposal)
   if (input.proposal.nodes.length > policy.maxFanOut) throw new Error("task_graph_proposal_fan_out_limit")
   for (const [id, template] of Object.entries(input.templates)) safeTemplate(id, template)
+  const applicationFillerCount = current.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length + input.proposal.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length
+  if (applicationFillerCount > 1) throw Object.assign(new Error("TaskGraph Turn may contain at most one application filler"), { code: "task_graph_application_filler_limit" })
   const options = {
     registeredTemplateIds: new Set(Object.keys(input.templates)),
     // Lifetime DAG size is independent from the active-child fan-out limit.
