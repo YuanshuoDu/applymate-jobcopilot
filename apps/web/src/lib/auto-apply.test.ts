@@ -61,13 +61,19 @@ describe("auto-apply authorization", () => {
     applyUrl: "https://jobs.lever.co/acme/123",
   };
 
-  const materialSnapshot = () => ({
+  type MaterialSnapshot = {
+    applicationTaskId: string;
+    jobId: string;
+    resumeId: string;
+    coverLetterId: string | null;
+  };
+  const materialSnapshot = (): MaterialSnapshot => ({
     applicationTaskId: "application_1",
     jobId: "job_1",
     resumeId: "resume_1",
     coverLetterId: null,
   });
-  const makeApproval = async (confirmedAnswers: unknown = null, material = materialSnapshot()) => ({
+  const makeApproval = async (confirmedAnswers: unknown = null, material: MaterialSnapshot = materialSnapshot()) => ({
     id: "approval_1",
     payload: material,
     sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
