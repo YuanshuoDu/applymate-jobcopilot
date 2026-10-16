@@ -10,6 +10,7 @@ import { acknowledgeApplicationFillCancellation, completeApplicationFillForRevie
 import { formAnswerKeyForSelector } from "../../../../../../worker/src/form-answer-key.js"
 import { executeApplicationFillForReview } from "../../../../../../worker/src/runtime/subagents/application-fill-for-review.js"
 import type { SubagentLease } from "../../../../../../worker/src/runtime/subagents/types.js"
+import { insertApplyResultWithClient, persistLegacyApplicationTaskOutcome } from "../../../../../../worker/src/db/legacy-application-task-outcome.js"
 import { AgentCommandService } from "./agent-command-service"
 import { startApplicationFillForReview } from "./application-fill-command"
 
@@ -45,7 +46,7 @@ const describePg = databaseUrl ? describe : describe.skip
 const schema = `application_fill_${randomUUID().replaceAll("-", "")}`
 const ids = { user: `fill-user-${randomUUID()}`, session: `fill-session-${randomUUID()}`, task: `fill-task-${randomUUID()}`, job: `fill-job-${randomUUID()}`, resume: `fill-resume-${randomUUID()}` }
 const fixture = readFileSync(fileURLToPath(new URL("./application-fill-command.pg.fixture.sql", import.meta.url)), "utf8")
-type WorkerPgClient = { query(sql: string, values?: unknown[]): Promise<unknown>; release(): void }
+type WorkerPgClient = { query(sql: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>; release(): void }
 type WorkerPgPool = { connect(): Promise<WorkerPgClient>; end(): Promise<void> }
 const workerRequire = createRequire(new URL("../../../../../../worker/package.json", import.meta.url))
 const WorkerPool = (workerRequire("pg") as { Pool: new (options: { connectionString: string; max: number }) => WorkerPgPool }).Pool
@@ -72,6 +73,22 @@ async function seedFillScenario(): Promise<FillScenario> {
   await prisma!.$executeRaw`INSERT INTO "application_tasks" ("id", "userId", "jobId", "sessionId", "resumeId", "status", "checkpoint")
     VALUES (${value.taskId}, ${value.userId}, ${value.jobId}, ${value.sessionId}, ${value.resumeId}, 'waiting_for_user', 'materials_ready')`
   return value
+}
+
+async function connectWorkerClient(): Promise<WorkerPgClient> {
+  const client = await workerPool!.connect()
+  await client.query(`SET search_path TO "${schema}"`)
+  return client
+}
+
+async function writeLegacyRaceOutcome(client: Parameters<typeof persistLegacyApplicationTaskOutcome>[0], value: FillScenario): Promise<void> {
+  await insertApplyResultWithClient(client, {
+    userId: value.userId, jobId: value.jobId, status: "failed", error: "legacy worker outcome", durationMs: 9,
+  })
+  await client.query('UPDATE "Job" SET status = $1, "workflowState" = $2 WHERE id = $3 AND "userId" = $4',
+    ["saved", "ready_to_apply", value.jobId, value.userId])
+  await client.query('UPDATE application_tasks SET status = $1, "checkpoint" = $2 WHERE id = $3 AND "userId" = $4 AND "jobId" = $5',
+    ["failed", "worker_failed", value.taskId, value.userId, value.jobId])
 }
 
 async function startLeasedFill(
@@ -104,17 +121,19 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     const scopedUrl = new URL(databaseUrl!)
     scopedUrl.searchParams.set("schema", schema)
     prisma = new PrismaClient({ datasources: { db: { url: scopedUrl.toString() } } })
-    workerPool = new WorkerPool({ connectionString: databaseUrl!, max: 2 })
+    workerPool = new WorkerPool({ connectionString: databaseUrl!, max: 4 })
     workerSchemaPool = {
-      connect: async () => {
-        const client = await workerPool!.connect()
-        await client.query(`SET search_path TO "${schema}"`)
-        return client
-      },
+      connect: connectWorkerClient,
     } as unknown as Parameters<typeof completeApplicationFillForReview>[0]
     for (const statement of fixture.split(";").map((part) => part.trim()).filter(Boolean)) {
       await prisma.$executeRawUnsafe(statement)
     }
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Job"
+      ADD COLUMN "status" TEXT, ADD COLUMN "workflowState" TEXT, ADD COLUMN "appliedAt" TIMESTAMP(3),
+      ADD COLUMN "analysisNote" TEXT, ADD COLUMN "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`)
+    await prisma.$executeRawUnsafe(`CREATE TABLE apply_results (
+      id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, job_id TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'unattended',
+      ats_type TEXT, flow_used TEXT, status TEXT NOT NULL, error TEXT, duration_ms INT, created_at TIMESTAMPTZ DEFAULT NOW())`)
     await prisma.$executeRaw`INSERT INTO "agent_sessions" ("id", "userId", "status") VALUES (${ids.session}, ${ids.user}, 'running')`
     await prisma.$executeRaw`INSERT INTO "Job" ("id", "userId") VALUES (${ids.job}, ${ids.user})`
     await prisma.$executeRaw`INSERT INTO "Resume" ("id", "userId", "targetJobId") VALUES (${ids.resume}, ${ids.user}, ${ids.job})`
@@ -147,6 +166,175 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       SELECT "fillTurnId", "fillTurnSessionId", "fillTurnUserId" FROM "application_tasks" WHERE "id" = ${ids.task}
     `
     expect(bound[0]).toEqual({ fillTurnId: results[0]!.turnId, fillTurnSessionId: ids.session, fillTurnUserId: ids.user })
+  })
+
+  it("serializes legacy fill outcomes against TaskGraph binding in either commit order", async () => {
+    const taskgraphFirst = await seedFillScenario()
+    await prisma!.$executeRaw`UPDATE "Job" SET status = 'saved', "workflowState" = 'queued' WHERE id = ${taskgraphFirst.jobId}`
+    const started = await startApplicationFillForReview(prisma!, {
+      sessionId: taskgraphFirst.sessionId, userId: taskgraphFirst.userId, applicationTaskId: taskgraphFirst.taskId,
+      clientMessageId: `race-taskgraph-first-${randomUUID()}`,
+    })
+    const boundClient = await connectWorkerClient()
+    try {
+      await boundClient.query("BEGIN")
+      await boundClient.query("SELECT set_config($1, $2, true)", ["app.user_id", taskgraphFirst.userId])
+      const result = await persistLegacyApplicationTaskOutcome(boundClient as unknown as Parameters<typeof persistLegacyApplicationTaskOutcome>[0], {
+        applicationTaskId: taskgraphFirst.taskId, userId: taskgraphFirst.userId, jobId: taskgraphFirst.jobId,
+      }, (client) => writeLegacyRaceOutcome(client, taskgraphFirst))
+      await boundClient.query("COMMIT")
+      expect(result).toEqual({ status: "taskgraph_bound" })
+    } finally {
+      boundClient.release()
+    }
+    await expect(prisma!.applicationTask.findUnique({ where: { id: taskgraphFirst.taskId }, select: { fillTurnId: true, status: true, checkpoint: true } }))
+      .resolves.toEqual({ fillTurnId: started.turnId, status: "filling", checkpoint: "taskgraph_fill_queued" })
+    await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${taskgraphFirst.jobId}`)
+      .resolves.toEqual([{ count: 0 }])
+    await expect(prisma!.$queryRaw<Array<{ status: string; workflowState: string }>>`SELECT status, "workflowState" FROM "Job" WHERE id = ${taskgraphFirst.jobId}`)
+      .resolves.toEqual([{ status: "saved", workflowState: "queued" }])
+
+    const workerFirst = await seedFillScenario()
+    await prisma!.$executeRaw`UPDATE "Job" SET status = 'saved', "workflowState" = 'queued' WHERE id = ${workerFirst.jobId}`
+    const workerClient = await connectWorkerClient()
+    const observer = await connectWorkerClient()
+    let releaseWriter!: () => void
+    let writerLocked!: () => void
+    let outcomePromise: Promise<unknown> | undefined
+    const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve })
+    const writerHasLock = new Promise<void>((resolve) => { writerLocked = resolve })
+    try {
+      await workerClient.query("BEGIN")
+      await workerClient.query("SELECT set_config($1, $2, true)", ["app.user_id", workerFirst.userId])
+      const outcome = (async () => {
+        const result = await persistLegacyApplicationTaskOutcome(workerClient as unknown as Parameters<typeof persistLegacyApplicationTaskOutcome>[0], {
+          applicationTaskId: workerFirst.taskId, userId: workerFirst.userId, jobId: workerFirst.jobId,
+        }, async (client) => {
+          writerLocked()
+          await writerGate
+          await writeLegacyRaceOutcome(client, workerFirst)
+          return "legacy-committed"
+        })
+        await workerClient.query("COMMIT")
+        return result
+      })()
+      outcomePromise = outcome
+      await writerHasLock
+
+      const bindingAttempt = startApplicationFillForReview(prisma!, {
+        sessionId: workerFirst.sessionId, userId: workerFirst.userId, applicationTaskId: workerFirst.taskId,
+        clientMessageId: `race-worker-first-${randomUUID()}`,
+      })
+      let blocked = false
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const state = await observer.query(`SELECT pid FROM pg_stat_activity
+          WHERE wait_event_type = 'Lock' AND query ILIKE '%agent_sessions%' AND query ILIKE '%FOR UPDATE%'`)
+        if (state.rows.length > 0) {
+          blocked = true
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(blocked).toBe(true)
+      releaseWriter()
+      await expect(outcome).resolves.toEqual({ status: "persisted", value: "legacy-committed" })
+      await expect(bindingAttempt).rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+    } finally {
+      releaseWriter()
+      await outcomePromise?.catch(() => undefined)
+      await workerClient.query("ROLLBACK").catch(() => undefined)
+      workerClient.release()
+      observer.release()
+    }
+    await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${workerFirst.jobId}`)
+      .resolves.toEqual([{ count: 1 }])
+    await expect(prisma!.applicationTask.findUnique({ where: { id: workerFirst.taskId }, select: { fillTurnId: true, status: true, checkpoint: true } }))
+      .resolves.toEqual({ fillTurnId: null, status: "failed", checkpoint: "worker_failed" })
+    await expect(prisma!.$queryRaw<Array<{ status: string; workflowState: string }>>`SELECT status, "workflowState" FROM "Job" WHERE id = ${workerFirst.jobId}`)
+      .resolves.toEqual([{ status: "saved", workflowState: "ready_to_apply" }])
+  })
+
+  it("suppresses a legacy fill outcome after cancellation and serializes cancellation against an in-flight outcome", async () => {
+    const cancelledFirst = await seedFillScenario()
+    await prisma!.$executeRaw`UPDATE "Job" SET status = 'saved', "workflowState" = 'queued' WHERE id = ${cancelledFirst.jobId}`
+    await prisma!.$executeRaw`UPDATE application_tasks SET status = 'filling', "checkpoint" = 'browser_active' WHERE id = ${cancelledFirst.taskId}`
+    await prisma!.$executeRaw`UPDATE application_tasks SET status = 'cancelled', "checkpoint" = 'cancelled_by_user' WHERE id = ${cancelledFirst.taskId}`
+    const staleWorker = await connectWorkerClient()
+    try {
+      await staleWorker.query("BEGIN")
+      await staleWorker.query("SELECT set_config($1, $2, true)", ["app.user_id", cancelledFirst.userId])
+      const outcome = await persistLegacyApplicationTaskOutcome(staleWorker as unknown as Parameters<typeof persistLegacyApplicationTaskOutcome>[0], {
+        applicationTaskId: cancelledFirst.taskId, userId: cancelledFirst.userId, jobId: cancelledFirst.jobId,
+      }, (client) => writeLegacyRaceOutcome(client, cancelledFirst))
+      await staleWorker.query("COMMIT")
+      expect(outcome).toEqual({ status: "task_inactive" })
+    } finally {
+      await staleWorker.query("ROLLBACK").catch(() => undefined)
+      staleWorker.release()
+    }
+    await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${cancelledFirst.jobId}`)
+      .resolves.toEqual([{ count: 0 }])
+    await expect(prisma!.$queryRaw<Array<{ status: string; workflowState: string }>>`SELECT status, "workflowState" FROM "Job" WHERE id = ${cancelledFirst.jobId}`)
+      .resolves.toEqual([{ status: "saved", workflowState: "queued" }])
+    await expect(prisma!.applicationTask.findUnique({ where: { id: cancelledFirst.taskId }, select: { status: true, checkpoint: true } }))
+      .resolves.toEqual({ status: "cancelled", checkpoint: "cancelled_by_user" })
+
+    const outcomeFirst = await seedFillScenario()
+    await prisma!.$executeRaw`UPDATE "Job" SET status = 'saved', "workflowState" = 'queued' WHERE id = ${outcomeFirst.jobId}`
+    await prisma!.$executeRaw`UPDATE application_tasks SET status = 'filling', "checkpoint" = 'browser_active' WHERE id = ${outcomeFirst.taskId}`
+    const worker = await connectWorkerClient()
+    const canceller = await connectWorkerClient()
+    let releaseWriter!: () => void
+    let writerLocked!: () => void
+    let outcomePromise: Promise<unknown> | undefined
+    const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve })
+    const writerHasLock = new Promise<void>((resolve) => { writerLocked = resolve })
+    try {
+      await worker.query("BEGIN")
+      await worker.query("SELECT set_config($1, $2, true)", ["app.user_id", outcomeFirst.userId])
+      const outcome = (async () => {
+        const result = await persistLegacyApplicationTaskOutcome(worker as unknown as Parameters<typeof persistLegacyApplicationTaskOutcome>[0], {
+          applicationTaskId: outcomeFirst.taskId, userId: outcomeFirst.userId, jobId: outcomeFirst.jobId,
+        }, async (client) => {
+          writerLocked()
+          await writerGate
+          await writeLegacyRaceOutcome(client, outcomeFirst)
+          return "legacy-committed"
+        })
+        await worker.query("COMMIT")
+        return result
+      })()
+      outcomePromise = outcome
+      await writerHasLock
+
+      const cancellation = canceller.query(`UPDATE application_tasks SET status = 'cancelled', "checkpoint" = 'cancelled_by_user', "completedAt" = NOW()
+        WHERE id = $1 AND "userId" = $2 AND "sessionId" = $3 AND "fillTurnId" IS NULL
+          AND "fillTurnSessionId" IS NULL AND "fillTurnUserId" IS NULL
+          AND status NOT IN ('submitted', 'skipped', 'cancelled')
+          AND ("checkpoint" IS NULL OR "checkpoint" NOT IN ('submission_request_started', 'submission_uncertain'))`,
+      [outcomeFirst.taskId, outcomeFirst.userId, outcomeFirst.sessionId])
+      let blocked = false
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const state = await canceller.query(`SELECT pid FROM pg_stat_activity
+          WHERE wait_event_type = 'Lock' AND query ILIKE '%UPDATE application_tasks%'`)
+        if (state.rows.length > 0) { blocked = true; break }
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(blocked).toBe(true)
+      releaseWriter()
+      await expect(outcome).resolves.toEqual({ status: "persisted", value: "legacy-committed" })
+      await expect(cancellation).resolves.toMatchObject({ rowCount: 1 })
+    } finally {
+      releaseWriter()
+      await outcomePromise?.catch(() => undefined)
+      await worker.query("ROLLBACK").catch(() => undefined)
+      worker.release()
+      canceller.release()
+    }
+    await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${outcomeFirst.jobId}`)
+      .resolves.toEqual([{ count: 1 }])
+    await expect(prisma!.applicationTask.findUnique({ where: { id: outcomeFirst.taskId }, select: { status: true, checkpoint: true } }))
+      .resolves.toEqual({ status: "cancelled", checkpoint: "cancelled_by_user" })
   })
 
   it("rejects a Turn id whose stored session/user composite does not match the task", async () => {

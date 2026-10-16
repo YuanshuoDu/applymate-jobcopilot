@@ -2,7 +2,7 @@ import type { Pool, PoolClient } from "pg";
 import type { FormReviewNeeds } from "../harness/form-review.js";
 import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
-import { ensureSubmissionArtifact } from "./submission-artifact.js";
+import { ensureSubmissionArtifact, ensureSubmissionArtifactWithClient } from "./submission-artifact.js";
 
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
@@ -86,9 +86,7 @@ export async function claimApplicationTask(
   return result.rowCount === 1;
 }
 
-export async function finishApplicationTask(
-  pool: Pool, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null, operation: "fill" | "submit",
-): Promise<void> {
+export async function finishApplicationTask(pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null, operation: "fill" | "submit"): Promise<void> {
   const transitioned = await pool.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
      SET status = $2, "checkpoint" = $3, error = $4,
@@ -129,7 +127,7 @@ export async function applicationTaskStillActive(pool: Pool, taskId: string, use
   return result.rowCount === 1
 }
 
-async function refreshSessionStatus(pool: Pool, sessionId: string): Promise<void> {
+async function refreshSessionStatus(pool: Pool | PoolClient, sessionId: string): Promise<void> {
   const result = await pool.query(`SELECT status FROM application_tasks WHERE "sessionId" = $1`, [sessionId]);
   const statuses = result.rows.map(row => String(row.status));
   const status = statuses.includes("filling")
@@ -145,10 +143,9 @@ async function refreshSessionStatus(pool: Pool, sessionId: string): Promise<void
 }
 
 /** Completes a non-submitting fill pass and creates the only authorization that unlocks submission. */
-export async function completeFillForReview(
-  pool: Pool, taskId: string, userId: string, jobId: string,
-): Promise<boolean> {
-  const transitioned = await pool.query<{ sessionId: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }>(
+export async function completeFillForReview(pool: Pool, taskId: string, userId: string, jobId: string, transactionClient?: PoolClient): Promise<boolean> {
+  const client = transactionClient ?? pool;
+  const transitioned = await client.query<{ sessionId: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }>(
     `UPDATE application_tasks
        SET status = 'waiting_for_authorization', "checkpoint" = 'form_filled', error = NULL, "updatedAt" = NOW()
      WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND "fillTurnId" IS NULL
@@ -164,22 +161,29 @@ export async function completeFillForReview(
   const title = "Final submission authorization";
   const body = "The form was filled without submission. Review the current job, material alignment, required answers, and any sensitive declarations before authorizing this external submission.";
   const payload = { applicationTaskId: taskId, jobId, resumeId: transitioned.rows[0]?.resumeId ?? null, coverLetterId: transitioned.rows[0]?.coverLetterId ?? null };
-  const turn = await pool.query<{ id: string; revision: number }>(
+  const turn = await client.query<{ id: string; revision: number }>(
     `SELECT "id", "revision" FROM agent_turns WHERE "sessionId" = $1 AND "userId" = $2 ORDER BY "createdAt" DESC LIMIT 1`,
     [sessionId, userId],
   );
   const turnRow = turn.rows[0];
   if (!turnRow) throw new Error("Filled application is missing its Agent turn");
   const answersHash = await hashAgentReceiptValue("answers", transitioned.rows[0]?.confirmedAnswers ?? null);
-  const artifact = await ensureSubmissionArtifact(pool, {
+  const artifactInput = {
     applicationTaskId: taskId,
     userId,
     jobId,
     resumeId: transitioned.rows[0]?.resumeId ?? null,
     coverLetterId: transitioned.rows[0]?.coverLetterId ?? null,
     answersHash,
-  });
-  const receipt = await createPgApprovalStore(pool, { userId }).issue({
+  };
+  const artifact = transactionClient
+    ? await ensureSubmissionArtifactWithClient(transactionClient, artifactInput)
+    : await ensureSubmissionArtifact(pool, artifactInput);
+  const approvalStore = createPgApprovalStore(pool, { userId });
+  const issueApproval = (input: Parameters<typeof approvalStore.issue>[0]) => transactionClient
+    ? approvalStore.issueInTransaction(transactionClient, input)
+    : approvalStore.issue(input);
+  const receipt = await issueApproval({
     approvalId,
     taskId,
     scope: {
@@ -193,27 +197,25 @@ export async function completeFillForReview(
     },
     title, body, impact: { externalSubmission: true, jobId }, payload,
   });
-  await pool.query(
+  await client.query(
     `INSERT INTO agent_transcript_events (id, "sessionId", "taskId", type, speaker, title, body, data, "createdAt")
      VALUES ($1, $2, NULL, 'approval_request', 'Executor', $3, $4,
              jsonb_build_object('approval', jsonb_build_object('id', $5, 'type', 'submit_application', 'title', $3, 'body', $4, 'impact', jsonb_build_object('externalSubmission', true, 'jobId', $6), 'payload', $7::jsonb, 'scopeHash', $8, 'status', 'pending')), NOW())`,
     [`evt_${randomId()}`, sessionId, title, body, approvalId, jobId, JSON.stringify(payload), receipt.approval.scopeHash],
   );
-  await pool.query(
+  await client.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
      VALUES ($1, $2, 'form_filled', 'worker', $3, NOW())`,
     [`evt_${randomId()}`, taskId, "Form filled without submission; final user authorization requested."],
   );
-  await pool.query(
+  await client.query(
     `UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1`,
     [sessionId],
   );
   return true;
 }
 
-export async function pauseForFormInput(
-  pool: Pool, taskId: string, detail: string, needs: FormReviewNeeds,
-): Promise<void> {
+export async function pauseForFormInput(pool: Pool | PoolClient, taskId: string, detail: string, needs: FormReviewNeeds): Promise<void> {
   const transitioned = await pool.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
        SET status = 'waiting_for_user', "checkpoint" = 'form_answer_required', error = $2,

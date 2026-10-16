@@ -36,8 +36,11 @@ const mockTurnState = vi.hoisted(() => ({ sessionStatus: "running", turnStatus: 
 const mockPoolQuery = vi.hoisted(() => vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }));
 const mockTurnClient = vi.hoisted(() => ({
   query: vi.fn(async (sql: string) => {
+    if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "agent-session-1" }], rowCount: 1 };
+    if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "agent-session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
+    if (sql.includes("INSERT INTO apply_results")) return { rows: [{ id: 1 }], rowCount: 1 };
     if (sql.includes('FROM "agent_sessions"')) return { rows: [{ status: mockTurnState.sessionStatus }], rowCount: 1 };
-    if (sql.includes('FROM "agent_turns"')) return { rows: [{ status: mockTurnState.turnStatus }], rowCount: 1 };
+    if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: "agent-turn-1", status: mockTurnState.turnStatus }], rowCount: 1 };
     if (sql.includes('FROM "agent_events"')) return { rows: [{ stopped: mockTurnState.interrupted }], rowCount: 1 };
     return { rows: [], rowCount: 1 };
   }),
@@ -1194,8 +1197,8 @@ describe("apply-queue (unit — mocked)", () => {
         applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
       },
     });
-    expect(mockCompleteFillForReview).toHaveBeenCalledWith(expect.anything(), "application-task-1", "user-1", "job-1");
-    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual", error: expect.stringContaining("ready for user review") }));
+    expect(mockCompleteFillForReview).toHaveBeenCalledWith(expect.anything(), "application-task-1", "user-1", "job-1", mockTurnClient);
+    expect(mockTurnClient.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO apply_results"), expect.arrayContaining(["user-1", "job-1", "manual"]));
   });
 
   it("marks suspended queued tasks failed without opening a browser", async () => {

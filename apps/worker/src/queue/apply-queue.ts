@@ -1,10 +1,19 @@
 import { Queue, Worker } from "bullmq";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import type { ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { detectCaptcha } from "../cloak/captcha.js";
 import { insertApplyResult, getPool } from "../db/apply-results.js";
+import {
+  persistLegacyApplicationTaskOutcome,
+  writeLegacyFillErrorOutcome,
+  writeLegacyFillReviewOutcome,
+  writeLegacyFillSuccessOutcome,
+  writeLegacyFillUnavailableOutcome,
+  type LegacyApplicationTaskOutcomeResult,
+  type LegacyApplicationTaskOutcomeScope,
+} from "../db/legacy-application-task-outcome.js";
 import {
   claimUnattendedSubmission,
   releaseUncertainSubmission,
@@ -33,12 +42,10 @@ import {
   CAPTCHA_USER_TAKEOVER_MESSAGE,
   CHALLENGE_DETECTION_FAILED_MESSAGE,
   claimApplicationTask,
-  completeFillForReview,
   finishApplicationTask,
   isUserActive,
   needsUserTakeover,
   type ApplicationSubmissionStartScope,
-  pauseForFormInput,
   USER_TAKEOVER_CHECKPOINT,
 } from "../db/application-task-state.js";
 import { formNeedsMessage, inspectFormReviewNeeds } from "../harness/form-review.js";
@@ -67,6 +74,29 @@ const SUBMISSION_START_OBSERVATION_TIMEOUT_MS = 8_000;
 const BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS = 1_000;
 
 export const QUEUE_NAME = "apply-tasks";
+
+async function withLegacyFillOutcome<T>(
+  scope: LegacyApplicationTaskOutcomeScope,
+  write: (client: PoolClient) => Promise<T>,
+  options: { readonly lockLatestTurn?: boolean } = {},
+): Promise<LegacyApplicationTaskOutcomeResult<T>> {
+  const client = await getPool().connect();
+  let transactionOpen = false;
+  try {
+    await client.query("BEGIN");
+    transactionOpen = true;
+    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId]);
+    const result = await persistLegacyApplicationTaskOutcome(client, scope, write, options);
+    await client.query("COMMIT");
+    transactionOpen = false;
+    return result;
+  } catch (error: unknown) {
+    if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 /** The queue used to enqueue apply tasks */
 export const applyQueue = new Queue<ApplyTaskPayload>(QUEUE_NAME, {
@@ -164,7 +194,15 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           }
         }
         if (startedSubmissionFound) return;
-        await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.", operation === "submit" ? "submit" : "fill");
+        if (operation === "fill" && applicationTaskId) {
+          const outcome = await withLegacyFillOutcome({ applicationTaskId, userId, jobId }, async (client) => {
+            await finishApplicationTask(client, applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.", "fill");
+            return true;
+          });
+          if (outcome.status !== "persisted") console.info(`[apply-worker] Suppressed legacy fill outcome (${outcome.status}) for task=${applicationTaskId}`);
+        } else if (operation === "submit") {
+          await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.", "submit");
+        }
         console.warn(`[apply-worker] Skipping suspended account for job=${jobId}`);
         return;
       }
@@ -864,23 +902,60 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         if (operation === "fill" && harnessResult.reviewReady) {
           const needs = await inspectFormReviewNeeds(page);
           const needMessage = formNeedsMessage(needs);
-          if (needMessage) {
-            await insertApplyResult({ userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow, error: needMessage, durationMs: Date.now() - startedAt });
-            resultWritten = true;
-            await pauseForFormInput(getPool(), applicationTaskId, needMessage, needs);
-            createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
-              .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+          const scope = { applicationTaskId, userId, jobId };
+          const outcome = await withLegacyFillOutcome(scope, (client) => writeLegacyFillReviewOutcome(getPool(), client, scope, {
+            result: {
+              userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow,
+              error: needMessage ?? harnessResult.error ?? "Form filled and ready for user review.", durationMs: Date.now() - startedAt,
+            }, needMessage, needs,
+          }), { lockLatestTurn: !needMessage });
+          if (outcome.status !== "persisted") {
+            console.info(`[apply-worker] Suppressed legacy fill outcome (${outcome.status}) for task=${applicationTaskId}`);
             return;
           }
-          await insertApplyResult({
-            userId, jobId, status: "manual", mode: "unattended", atsType: flow ?? "unknown", flowUsed: usedFlow,
-            error: harnessResult.error ?? "Form filled and ready for user review.", durationMs: Date.now() - startedAt,
-          });
           resultWritten = true;
-          const reviewReady = await completeFillForReview(getPool(), applicationTaskId, userId, jobId);
-          if (!reviewReady) return;
-          createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
-            .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+          if (outcome.value) {
+            createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
+              .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+          }
+          return;
+        }
+
+        if (operation === "fill") {
+          const durationMs = Date.now() - startedAt;
+          const isSubmitted = harnessResult.status === "submitted";
+          const isSubmissionBlocked = harnessResult.status === "submission_blocked";
+          const requiresUserTakeover = harnessResult.status === "manual" || needsUserTakeover(harnessResult.error);
+          const scope = { applicationTaskId, userId, jobId };
+          const outcome = await withLegacyFillOutcome(scope, (client) => writeLegacyFillSuccessOutcome(client, scope, {
+            result: {
+              userId, jobId, status: harnessResult.status, mode: "unattended", atsType: flow ?? "unknown",
+              flowUsed: usedFlow, error: harnessResult.error ?? null, durationMs,
+            },
+            isSubmitted, isSubmissionBlocked, requiresUserTakeover, turnStopped,
+            submissionRequestStarted, applicationTaskFinalized,
+          }));
+          if (outcome.status !== "persisted") {
+            console.info(`[apply-worker] Suppressed legacy fill outcome (${outcome.status}) for task=${applicationTaskId}`);
+            return;
+          }
+          resultWritten = true;
+          applicationTaskFinalized = outcome.value.taskFinalized;
+          if (isSubmitted) {
+            await purgeTemporaryGeneratedCoverLetters(userId, jobId).catch((error: Error) =>
+              console.warn('[apply-worker] Could not apply cover-letter retention policy:', error.message)
+            );
+          }
+          if (harnessResult.status === "submitted" || harnessResult.status === "manual" || harnessResult.status === "failed" || harnessResult.status === "submission_blocked") {
+            createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: harnessResult.status })
+              .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+          }
+          if (harnessResult.status !== "dry-run") {
+            notifyApplyResult({
+              userId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: harnessResult.status,
+              error: harnessResult.error ?? null, flowUsed: usedFlow, jobUrl: taskCtx.applyUrl,
+            }).catch((e: Error) => console.warn("[notify] email failed:", e.message));
+          }
           return;
         }
 
@@ -979,6 +1054,27 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       const safeMessage = submissionRequestStarted
         ? `${UNCONFIRMED_SUBMISSION_MESSAGE} Original error: ${message}`
         : message;
+      if (operation === "fill") {
+        if (!applicationTaskId || stoppedBeforeRequest) return;
+        const status = browserAttemptStarted ? "manual" : "failed";
+        const scope = { applicationTaskId, userId, jobId };
+        const outcome = await withLegacyFillOutcome(scope, (client) => writeLegacyFillErrorOutcome(client, scope, {
+          result: { userId, jobId, status, mode: "unattended", atsType: null, flowUsed: null, error: safeMessage, durationMs },
+          shouldInsertResult: !resultWritten && !resultWriteStarted, browserAttemptStarted, applicationTaskFinalized,
+        }));
+        if (outcome.status !== "persisted") {
+          console.info(`[apply-worker] Suppressed legacy fill outcome (${outcome.status}) for task=${applicationTaskId}`);
+          return;
+        }
+        resultWritten = resultWritten || outcome.value.insertedResult;
+        applicationTaskFinalized = applicationTaskFinalized || outcome.value.taskFinalized;
+        if (outcome.value.insertedResult) {
+          createApplyResultNotification({
+            userId, jobId, jobTitle: ctx?.jobTitle ?? null, jobCompany: ctx?.jobCompany ?? "Application", status,
+          }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+        }
+        return;
+      }
       if (submissionRequestStarted && applicationTaskId && !applicationTaskFinalized) {
         try {
           await finishApplicationTask(
@@ -1226,6 +1322,23 @@ async function handOffUnavailableUnattendedTask(params: {
   jobTitle: string | null;
   jobCompany: string;
 }): Promise<void> {
+  if (params.operation === "fill") {
+    const scope = {
+      applicationTaskId: params.applicationTaskId, userId: params.userId, jobId: params.jobId,
+    };
+    const outcome = await withLegacyFillOutcome(scope, (client) => writeLegacyFillUnavailableOutcome(client, scope, {
+        userId: params.userId, jobId: params.jobId, status: "manual", mode: "unattended", atsType: params.flow,
+        flowUsed: null, error: UNATTENDED_APPLY_UNAVAILABLE_MESSAGE, durationMs: Date.now() - params.startedAt,
+      }, UNATTENDED_APPLY_UNAVAILABLE_MESSAGE));
+    if (outcome.status === "persisted") {
+      createApplyResultNotification({
+        userId: params.userId, jobId: params.jobId, jobTitle: params.jobTitle, jobCompany: params.jobCompany, status: "manual",
+      }).catch((error: Error) => console.warn("[notify] in-app notification failed:", error.message));
+    } else {
+      console.info(`[apply-worker] Suppressed legacy fill outcome (${outcome.status}) for task=${params.applicationTaskId}`);
+    }
+    return;
+  }
   await insertApplyResult({
     userId: params.userId,
     jobId: params.jobId,
