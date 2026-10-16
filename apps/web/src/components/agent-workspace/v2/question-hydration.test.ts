@@ -96,4 +96,72 @@ describe('final item hydration pump', () => {
     await pump.current()
     expect(hydrate).toHaveBeenCalledTimes(1)
   })
+
+  it('retries a failed lookup after a delay without another event or reconnect', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const hydrate = vi.fn<(itemId: string) => Promise<void>>()
+        .mockRejectedValueOnce(new Error('temporary lookup failure'))
+        .mockResolvedValueOnce(undefined)
+      const pump = createFinalItemHydrationPump({ sessionId: 'session-1', hydrate })
+
+      pump.request(completedTurn('final-item'))
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(hydrate).toHaveBeenCalledTimes(1)
+      pump.request(completedTurn('final-item', { id: 'completion-duplicate', sequence: '3' }))
+      await Promise.resolve()
+      expect(hydrate).toHaveBeenCalledTimes(1)
+
+      await vi.advanceTimersByTimeAsync(249)
+      expect(hydrate).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      await Promise.resolve()
+      await Promise.resolve()
+      await pump.current()
+
+      expect(hydrate).toHaveBeenCalledTimes(2)
+      expect(hydrate.mock.calls.map(([itemId]) => itemId)).toEqual(['final-item', 'final-item'])
+      pump.request(completedTurn('final-item', { id: 'completion-duplicate', sequence: '3' }))
+      await Promise.resolve()
+      expect(hydrate).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops after abort and caps repeated lookup failures', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const controller = new AbortController()
+      const abortedHydrate = vi.fn<(itemId: string) => Promise<void>>().mockRejectedValue(new Error('temporary lookup failure'))
+      const abortedPump = createFinalItemHydrationPump({ sessionId: 'session-1', signal: controller.signal, hydrate: abortedHydrate })
+      abortedPump.request(completedTurn('aborted-item'))
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(abortedHydrate).toHaveBeenCalledTimes(1)
+
+      controller.abort()
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(abortedHydrate).toHaveBeenCalledTimes(1)
+
+      const failingHydrate = vi.fn<(itemId: string) => Promise<void>>().mockRejectedValue(new Error('persistent lookup failure'))
+      const failingPump = createFinalItemHydrationPump({ sessionId: 'session-1', hydrate: failingHydrate })
+      failingPump.request(completedTurn('exhausted-item'))
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.runAllTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(failingHydrate).toHaveBeenCalledTimes(3)
+
+      failingPump.request(completedTurn('exhausted-item', { id: 'completion-duplicate', sequence: '3' }))
+      await Promise.resolve()
+      await vi.runAllTimersAsync()
+      expect(failingHydrate).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

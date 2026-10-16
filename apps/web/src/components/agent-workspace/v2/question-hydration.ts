@@ -24,6 +24,8 @@ export interface FinalItemHydrationPump {
   current(): Promise<void> | null
 }
 
+const FINAL_ITEM_RETRY_DELAYS_MS = [250, 1_000] as const
+
 /** Queues strict live question stubs behind one targeted canonical snapshot request. */
 export function createQuestionHydrationPump(options: QuestionHydrationPumpOptions): QuestionHydrationPump {
   let current: Promise<void> | null = null
@@ -72,6 +74,42 @@ export function createFinalItemHydrationPump(options: FinalItemHydrationPumpOpti
   const pending = new Set<string>()
   const hydrating = new Set<string>()
   const hydrated = new Set<string>()
+  const exhausted = new Set<string>()
+  const attempts = new Map<string, number>()
+  const retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  const cancelRetries = (): void => {
+    for (const timer of retryTimers.values()) clearTimeout(timer)
+    retryTimers.clear()
+    pending.clear()
+    attempts.clear()
+  }
+  options.signal?.addEventListener('abort', cancelRetries, { once: true })
+
+  const retry = (itemId: string): void => {
+    if (options.signal?.aborted) {
+      attempts.delete(itemId)
+      return
+    }
+    const attempt = attempts.get(itemId) ?? 0
+    const delay = FINAL_ITEM_RETRY_DELAYS_MS[attempt - 1]
+    if (delay === undefined) {
+      attempts.delete(itemId)
+      exhausted.add(itemId)
+      return
+    }
+    const timer = setTimeout(() => {
+      retryTimers.delete(itemId)
+      if (options.signal?.aborted) {
+        attempts.delete(itemId)
+        exhausted.add(itemId)
+        return
+      }
+      pending.add(itemId)
+      pump()
+    }, delay)
+    retryTimers.set(itemId, timer)
+  }
 
   const pump = (): void => {
     if (scheduled || current || pending.size === 0 || options.signal?.aborted) return
@@ -82,21 +120,21 @@ export function createFinalItemHydrationPump(options: FinalItemHydrationPumpOpti
       const batch = [...pending]
       pending.clear()
       batch.forEach(itemId => hydrating.add(itemId))
-      let failed = false
       current = (async () => {
         await Promise.all(batch.map(async itemId => {
+          attempts.set(itemId, (attempts.get(itemId) ?? 0) + 1)
           try {
             await options.hydrate(itemId)
-            hydrated.add(itemId)
+            if (!options.signal?.aborted) hydrated.add(itemId)
           } catch {
-            failed = true
-            pending.add(itemId)
+            retry(itemId)
           } finally {
             hydrating.delete(itemId)
+            if (hydrated.has(itemId)) attempts.delete(itemId)
           }
         }))
         current = null
-        if (!failed) pump()
+        pump()
       })()
     })
   }
@@ -104,7 +142,8 @@ export function createFinalItemHydrationPump(options: FinalItemHydrationPumpOpti
   return {
     request(value: unknown): void {
       const itemId = finalItemIdFromCompletion(value, options.sessionId)
-      if (!itemId || hydrated.has(itemId) || hydrating.has(itemId)) return
+      if (!itemId || options.signal?.aborted || hydrated.has(itemId) || exhausted.has(itemId) ||
+        hydrating.has(itemId) || retryTimers.has(itemId)) return
       pending.add(itemId)
       pump()
     },
