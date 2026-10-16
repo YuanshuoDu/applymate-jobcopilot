@@ -16,6 +16,9 @@ const mockClaimUnattendedSubmission = vi.fn().mockResolvedValue("claimed");
 const mockReleaseUncertainSubmission = vi.fn().mockResolvedValue({ kind: "current", value: true });
 const mockUpdateJobForSubmission = vi.fn().mockResolvedValue({ kind: "current", value: true });
 const mockRecordSubmissionExecutionSettled = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const mockWorkerListeners = vi.hoisted(() => new Map<string, (job?: unknown) => Promise<void>>());
+const mockRedisExists = vi.hoisted(() => vi.fn().mockResolvedValue(0));
+const mockReconcileClaimedSubmissionUncertain = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const expectedSubmissionIdentity = {
   applicationTaskId: "application-task-1",
   userId: "user-1",
@@ -90,9 +93,11 @@ vi.mock("ioredis", () => ({
   })),
 }));
 
+vi.mock("../redis.js", () => ({ redisConnection: { exists: mockRedisExists } }));
+
 vi.mock("bullmq", () => {
   const mockWorker = {
-    on: vi.fn(),
+    on: vi.fn((event: string, listener: (job?: unknown) => Promise<void>) => mockWorkerListeners.set(event, listener)),
     close: vi.fn().mockResolvedValue(undefined),
     isRunning: vi.fn().mockReturnValue(true),
   };
@@ -103,6 +108,7 @@ vi.mock("bullmq", () => {
   const mockQueueCtor = vi.fn().mockReturnValue({
     add: vi.fn().mockResolvedValue({ id: "test-job-1" }),
     isPaused: vi.fn().mockResolvedValue(false),
+    toKey: vi.fn((key: string) => `apply-tasks:${key}`),
   });
   return {
     Worker: mockWorkerCtor,
@@ -157,6 +163,7 @@ vi.mock("./application-submit-fence.js", async importOriginal => ({
 
 vi.mock("../db/submission-guard.js", () => ({
   claimUnattendedSubmission: mockClaimUnattendedSubmission,
+  reconcileClaimedSubmissionUncertain: mockReconcileClaimedSubmissionUncertain,
   releaseUncertainSubmission: mockReleaseUncertainSubmission,
   updateJobForSubmission: mockUpdateJobForSubmission,
   UNCONFIRMED_SUBMISSION_MESSAGE: "The previous background attempt was interrupted after it started. ApplyMate did not retry it to avoid sending a duplicate application.",
@@ -278,9 +285,33 @@ function configureMockBrowserSubmitTool(): void {
   }));
 }
 
+function terminalSubmitJob(attemptsMade = 3, attempts = 3, overrides: Record<string, unknown> = {}) {
+  return {
+    id: "bull-submit-1",
+    data: {
+      applicationTaskId: expectedSubmissionIdentity.applicationTaskId,
+      userId: expectedSubmissionIdentity.userId,
+      jobId: expectedSubmissionIdentity.jobId,
+      sessionId: expectedSubmissionIdentity.sessionId,
+      fillTurnId: expectedSubmissionIdentity.fillTurnId,
+      receiptId: expectedSubmissionIdentity.approvalId,
+      constraintHash: expectedSubmissionIdentity.constraintHash,
+      operation: "submit",
+      applyUrl: "https://example.com/jobs/1/apply",
+      personaId: "persona-1",
+      resumePath: "/resume.pdf",
+      ...overrides,
+    },
+    attemptsMade,
+    opts: { attempts },
+  };
+}
+
 describe("apply-queue (unit — mocked)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRedisExists.mockResolvedValue(0);
+    mockReconcileClaimedSubmissionUncertain.mockResolvedValue(true);
     mockIsUserActive.mockResolvedValue(true);
     mockClaimApplicationTask.mockReset().mockResolvedValue(true);
     mockMarkSubmissionRequestStarted.mockReset().mockImplementation(async () =>
@@ -346,10 +377,58 @@ describe("apply-queue (unit — mocked)", () => {
   });
 
   it("creates a worker on the apply-tasks queue", async () => {
+    const { Worker } = await import("bullmq");
     const mod = await import("./apply-queue.js");
     expect(mod.QUEUE_NAME).toBe("apply-tasks");
     expect(mod.applyWorker).toBeDefined();
+    expect(vi.mocked(Worker)).toHaveBeenCalledWith(
+      "apply-tasks", expect.any(Function), expect.objectContaining({ autorun: false }),
+    );
   }, 30_000);
+
+  it("reconciles a completed exact submit delivery only after its Redis lock is absent", async () => {
+    await import("./apply-queue.js");
+    const completed = mockWorkerListeners.get("completed");
+    expect(completed).toBeDefined();
+    if (!completed) throw new Error("completed listener was not registered");
+
+    await completed(terminalSubmitJob());
+
+    expect(mockRedisExists).toHaveBeenCalledWith("apply-tasks:bull-submit-1:lock");
+    expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledWith(
+      expect.anything(),
+      { ...expectedSubmissionIdentity },
+      "bull-submit-1",
+    );
+  });
+
+  it("leaves retryable or live-locked failed deliveries unchanged", async () => {
+    await import("./apply-queue.js");
+    const failed = mockWorkerListeners.get("failed");
+    expect(failed).toBeDefined();
+    if (!failed) throw new Error("failed listener was not registered");
+
+    await failed(terminalSubmitJob(1, 3));
+    expect(mockRedisExists).not.toHaveBeenCalled();
+    expect(mockReconcileClaimedSubmissionUncertain).not.toHaveBeenCalled();
+
+    mockRedisExists.mockResolvedValue(1);
+    await failed(terminalSubmitJob());
+    expect(mockRedisExists).toHaveBeenCalledWith("apply-tasks:bull-submit-1:lock");
+    expect(mockReconcileClaimedSubmissionUncertain).not.toHaveBeenCalled();
+  });
+
+  it("ignores a malformed terminal submit identity", async () => {
+    await import("./apply-queue.js");
+    const completed = mockWorkerListeners.get("completed");
+    expect(completed).toBeDefined();
+    if (!completed) throw new Error("completed listener was not registered");
+
+    await completed(terminalSubmitJob(3, 3, { constraintHash: "wrong" }));
+
+    expect(mockRedisExists).not.toHaveBeenCalled();
+    expect(mockReconcileClaimedSubmissionUncertain).not.toHaveBeenCalled();
+  });
 
   it("can enqueue a task", async () => {
     const mod = await import("./apply-queue.js");
@@ -1057,15 +1136,11 @@ describe("apply-queue (unit — mocked)", () => {
     }
   });
 
-  it("recovers a durable started marker on redelivery without reopening the browser", async () => {
+  it("leaves an existing started marker untouched when the durable claim is unavailable", async () => {
     const task = { status: "filling", checkpoint: "submission_request_started" };
     mockClaimApplicationTask.mockResolvedValue(false);
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ status: task.status, checkpoint: task.checkpoint }] });
-    mockClaimUnattendedSubmission.mockResolvedValueOnce("uncertain");
-    mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _taskId: string, status: string, checkpoint: string) => {
-      task.status = status;
-      task.checkpoint = checkpoint;
-    });
+    mockClaimUnattendedSubmission.mockResolvedValue("unavailable");
 
     await import("./apply-queue.js");
     const payload = {
@@ -1075,31 +1150,105 @@ describe("apply-queue (unit — mocked)", () => {
     };
     await mockProcessor({ data: payload });
 
-    expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+    expect(task).toEqual({ status: "filling", checkpoint: "submission_request_started" });
     expect(mockWithCloakContext).not.toHaveBeenCalled();
     expect(mockProviderSubmitClick).not.toHaveBeenCalled();
     expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
-    expect(mockClaimUnattendedSubmission).toHaveBeenCalledWith(expect.anything(), expectedSubmissionIdentity);
-    expect(mockInsertApplyResult).toHaveBeenCalledOnce();
+    expect(mockClaimUnattendedSubmission).toHaveBeenCalledWith(expect.anything(), expectedSubmissionIdentity, "worker-task-test");
+    expect(mockFinishApplicationTask).not.toHaveBeenCalled();
+    expect(mockUpdateJobForSubmission).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).not.toHaveBeenCalled();
 
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ status: task.status, checkpoint: task.checkpoint }] });
     await mockProcessor({ data: payload });
 
-    expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+    expect(task).toEqual({ status: "filling", checkpoint: "submission_request_started" });
     expect(mockWithCloakContext).not.toHaveBeenCalled();
     expect(mockProviderSubmitClick).not.toHaveBeenCalled();
-    expect(mockInsertApplyResult).toHaveBeenCalledOnce();
+    expect(mockInsertApplyResult).not.toHaveBeenCalled();
   });
 
-  it("keeps a durable started marker uncertain when the account is suspended before redelivery", async () => {
-    const task = { status: "filling", checkpoint: "submission_request_started" };
-    mockIsUserActive.mockResolvedValue(false);
-    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ checkpoint: task.checkpoint }] });
-    mockClaimUnattendedSubmission.mockResolvedValueOnce("uncertain");
-    mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _taskId: string, status: string, checkpoint: string) => {
-      task.status = status;
-      task.checkpoint = checkpoint;
+  it("retries approval inspection errors without changing the queued task or Job", async () => {
+    const approvalError = new Error("approval_expired");
+    approvalMocks.inspectSubmission.mockRejectedValueOnce(approvalError);
+    await import("./apply-queue.js");
+
+    await expect(mockProcessor({
+      data: {
+        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+        receiptId: "approval-1", constraintHash: "c".repeat(64),
+      },
+    })).rejects.toBe(approvalError);
+
+    expect(mockClaimUnattendedSubmission).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).not.toHaveBeenCalled();
+    expect(mockUpdateJobForSubmission).not.toHaveBeenCalled();
+    expect(mockFinishApplicationTask).not.toHaveBeenCalled();
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+  });
+
+  it("does not regress a competing claimed task and submitting Job after a pre-claim error", async () => {
+    let rejectApproval!: (error: Error) => void;
+    approvalMocks.inspectSubmission.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectApproval = reject; }));
+    const current = {
+      task: { status: "filling", checkpoint: "submission_authorized" },
+      job: { status: "saved", workflowState: "queued" },
+    };
+    mockUpdateJobForSubmission.mockImplementation(async (_pool: unknown, _identity: unknown, update: { status: string; workflowState: string }) => {
+      current.job = { status: update.status, workflowState: update.workflowState };
+      return { kind: "current", value: true };
     });
+    mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _id: string, status: string, checkpoint: string) => {
+      current.task = { status, checkpoint };
+    });
+    await import("./apply-queue.js");
+
+    const processing = mockProcessor({
+      data: {
+        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+        receiptId: "approval-1", constraintHash: "c".repeat(64),
+      },
+    });
+    await vi.waitFor(() => expect(approvalMocks.inspectSubmission).toHaveBeenCalledOnce());
+    current.task = { status: "filling", checkpoint: "browser_active" };
+    current.job = { status: "saved", workflowState: "submitting" };
+    rejectApproval(new Error("approval_expired"));
+
+    await expect(processing).rejects.toThrow("approval_expired");
+
+    expect(current).toEqual({
+      task: { status: "filling", checkpoint: "browser_active" },
+      job: { status: "saved", workflowState: "submitting" },
+    });
+    expect(mockInsertApplyResult).not.toHaveBeenCalled();
+    expect(mockUpdateJobForSubmission).not.toHaveBeenCalled();
+    expect(mockFinishApplicationTask).not.toHaveBeenCalled();
+  });
+
+  it("rethrows submit-claim errors for BullMQ retry before browser setup", async () => {
+    const claimError = new Error("temporary claim database failure");
+    mockClaimUnattendedSubmission.mockRejectedValueOnce(claimError);
+    await import("./apply-queue.js");
+
+    await expect(mockProcessor({
+      data: {
+        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1", sessionId: "agent-session-1", fillTurnId: "agent-turn-1",
+        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+        receiptId: "approval-1", constraintHash: "c".repeat(64),
+      },
+    })).rejects.toBe(claimError);
+
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+    expect(mockFinishApplicationTask).not.toHaveBeenCalled();
+    expect(mockUpdateJobForSubmission).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).not.toHaveBeenCalled();
+  });
+
+  it("marks a suspended submit task failed without opening a browser", async () => {
+    mockIsUserActive.mockResolvedValue(false);
 
     await import("./apply-queue.js");
     await mockProcessor({
@@ -1110,17 +1259,14 @@ describe("apply-queue (unit — mocked)", () => {
       },
     });
 
-    expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+    expect(mockClaimUnattendedSubmission).not.toHaveBeenCalled();
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String), "submit",
-        expectedSubmissionIdentity,
-    );
-    expect(mockFinishApplicationTask).not.toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "failed", "account_suspended", expect.any(String), "submit", expectedSubmissionIdentity,
+      expect.anything(), "application-task-1", "failed", "account_suspended",
+      "Account suspended by an administrator.", "submit", expectedSubmissionIdentity,
     );
     expect(mockWithCloakContext).not.toHaveBeenCalled();
     expect(mockProviderSubmitClick).not.toHaveBeenCalled();
-    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual" }));
+    expect(mockInsertApplyResult).not.toHaveBeenCalled();
   });
 
   it("keeps the timed-out submit attempt active until context closure settles its route", async () => {
@@ -1268,7 +1414,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockTurnClient.query.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(commitCountBeforeFence + 1);
     expect(mockTurnClient.release).toHaveBeenCalledTimes(3);
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover", expect.stringContaining("Apply timeout"), "submit", expectedSubmissionIdentity,
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("Apply timeout"), "submit", expectedSubmissionIdentity,
     );
   });
 

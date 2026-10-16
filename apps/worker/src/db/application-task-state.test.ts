@@ -370,73 +370,64 @@ describe("pauseForFormInput", () => {
 });
 
 describe("claimApplicationTask", () => {
-  it("preserves browser-active recovery but refuses both sticky submission checkpoints", async () => {
-    let checkpoint = "browser_active";
-    const query = vi.fn().mockImplementation(async () => ({
-      rowCount: ["submission_request_started", "submission_uncertain"].includes(checkpoint) ? 0 : 1,
-      rows: [],
-    }));
-    const pool = { query } as unknown as Pool;
-
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "submit", submissionIdentity)).resolves.toBe(true);
-    checkpoint = "submission_request_started";
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "submit", submissionIdentity)).resolves.toBe(false);
-    checkpoint = "submission_uncertain";
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "submit", submissionIdentity)).resolves.toBe(false);
-
-    const claim = String(query.mock.calls[0]?.[0]);
-    expect(claim).toContain('status = \'filling\'');
-    expect(claim).toContain('"checkpoint" IS DISTINCT FROM \'submission_request_started\'');
-    expect(claim).toContain('"checkpoint" IS DISTINCT FROM \'submission_uncertain\'');
-    expect(claim).not.toContain('"checkpoint" IN (\'form_fill_queued\', \'submission_authorized\')');
-    expect(query).toHaveBeenCalledTimes(3);
-  });
-
-  it("allows one legacy fill owner and a later known-before-browser requeue", async () => {
+  it("claims only a queued legacy fill before browser setup", async () => {
     let checkpoint = "form_fill_queued";
-    const query = vi.fn().mockImplementation(async (_sql: string, values: unknown[]) => {
-      const operation = values[3];
-      const claimable = operation === "submit" || (operation === "fill" && checkpoint === "form_fill_queued");
+    const query = vi.fn().mockImplementation(async () => {
+      const claimable = checkpoint === "form_fill_queued";
       if (claimable) checkpoint = "browser_active";
       return { rowCount: claimable ? 1 : 0, rows: [] };
     });
     const pool = { query } as unknown as Pool;
 
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "fill")).resolves.toBe(true);
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "fill")).resolves.toBe(false);
+    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1")).resolves.toBe(true);
+    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1")).resolves.toBe(false);
+    checkpoint = "submission_authorized";
+    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1")).resolves.toBe(false);
+
+    const claim = String(query.mock.calls[0]?.[0]);
+    expect(claim).toContain('status = \'filling\'');
+    expect(claim).toContain('"fillTurnId" IS NULL');
+    expect(claim).toContain('"checkpoint" = \'form_fill_queued\'');
+    expect(claim).not.toContain('"checkpoint" = \'submission_authorized\'');
+    expect(query).toHaveBeenCalledTimes(3);
+  });
+
+  it("allows one legacy fill owner and a later known-before-browser requeue", async () => {
+    let checkpoint = "form_fill_queued";
+    const query = vi.fn().mockImplementation(async () => {
+      const claimable = checkpoint === "form_fill_queued";
+      if (claimable) checkpoint = "browser_active";
+      return { rowCount: claimable ? 1 : 0, rows: [] };
+    });
+    const pool = { query } as unknown as Pool;
+
+    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1")).resolves.toBe(true);
+    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1")).resolves.toBe(false);
     expect(String(query.mock.calls[0]?.[0])).toContain('"checkpoint" = \'form_fill_queued\'');
-    expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "user_1", "job_1", "fill", null, null]);
+    expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "user_1", "job_1"]);
 
     // The existing safe requeue path resets to form_fill_queued before delivery.
     checkpoint = "form_fill_queued";
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "fill")).resolves.toBe(true);
+    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1")).resolves.toBe(true);
     expect(query).toHaveBeenCalledTimes(3);
   });
 });
 
 describe("TaskGraph-bound legacy fill fencing", () => {
-  it("rejects fill claims and late failures while preserving explicit submit", async () => {
+  it("rejects fill claims and late fill failures for TaskGraph-bound tasks", async () => {
     const { pool, query } = testPool();
     query
       .mockResolvedValueOnce({ rowCount: 0, rows: [] })
-      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: null }] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] });
 
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "fill")).resolves.toBe(false);
+    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1")).resolves.toBe(false);
     await finishApplicationTask(pool, "task_1", "failed", "execution_failed", "Late fill callback", "fill");
-    await expect(claimApplicationTask(pool, "task_1", "user_1", "job_1", "submit", submissionIdentity)).resolves.toBe(true);
-    await finishApplicationTask(pool, "task_1", "submitted", "submission_verified", null, "submit", submissionIdentity);
 
     expect(String(query.mock.calls[0]?.[0])).toContain('"fillTurnId" IS NULL');
-    expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "user_1", "job_1", "fill", null, null]);
+    expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "user_1", "job_1"]);
     expect(String(query.mock.calls[1]?.[0])).toContain('"fillTurnId" IS NULL');
     expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "failed", "execution_failed", "Late fill callback", "fill", null, null]);
-    expect(query.mock.calls[2]?.[1]).toEqual(["task_1", "user_1", "job_1", "submit", "session_1", "turn_1"]);
-    expect(query.mock.calls[3]?.[1]).toEqual(["task_1", "submitted", "submission_verified", null, "submit", "session_1", "turn_1"]);
-    expect(query.mock.calls[4]?.[0]).toContain("INSERT INTO application_task_events");
-    expect(query).toHaveBeenCalledTimes(5);
+    expect(query).toHaveBeenCalledTimes(2);
   });
 });
 

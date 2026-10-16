@@ -10,6 +10,7 @@ import { startSubagentMailboxOutboxConsumer } from "./runtime/mailbox/outbox-con
 import { startAgentEventOutboxConsumer } from "./runtime/events/outbox-consumer.js";
 import { startTaskGraphStopOutboxConsumer } from "./runtime/subagents/task-graph-stop-outbox.js";
 import { startTaskInterruptOutboxConsumer } from "./runtime/subagents/task-interrupt-outbox.js";
+import { startApplicationSubmitOutboxPublisher } from "./queue/application-submit-outbox.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
@@ -105,9 +106,11 @@ async function main() {
   let agentEventOutboxConsumer: ReturnType<typeof startAgentEventOutboxConsumer> | undefined;
   let agentTaskGraphStopOutboxConsumer: ReturnType<typeof startTaskGraphStopOutboxConsumer> | undefined;
   let agentTaskInterruptOutboxConsumer: ReturnType<typeof startTaskInterruptOutboxConsumer> | undefined;
+  let applicationSubmitOutboxPublisher: ReturnType<typeof startApplicationSubmitOutboxPublisher> | undefined;
   let automationScheduler: ReturnType<typeof startAutomationScheduler> | undefined;
   let adminServer: ClosableHttpServer | undefined;
   const postBootstrapFence = createPostBootstrapStartupFence(() => [
+    () => applicationSubmitOutboxPublisher?.close(),
     () => scoutWorker.close(),
     () => applyWorker.close(),
     () => agentTaskInterruptOutboxConsumer?.close(),
@@ -169,6 +172,13 @@ async function main() {
     };
     const workerRuntimeState = await restoreWorkerRuntimeState(connection, workerControls);
     console.log(`[worker] Runtime control state: ${workerRuntimeState.status}`);
+    if (workerRuntimeState.status === "running") {
+      void applyWorker.run().catch((error: unknown) => {
+        console.error("[apply-worker] worker loop failed:", error);
+      });
+    }
+    applicationSubmitOutboxPublisher = startApplicationSubmitOutboxPublisher(pool, applyQueue);
+    console.log("[worker] Application submit outbox publisher started");
 
     console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
     console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);

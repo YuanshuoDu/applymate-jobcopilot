@@ -30,6 +30,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     workerHandler: undefined as undefined | ((job: { id: string; data: Record<string, unknown> }) => Promise<void>),
+    workerEvents: {} as Record<string, unknown>,
     fakePage,
     fakeContext,
     checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
@@ -60,6 +61,8 @@ const mocks = vi.hoisted(() => {
     claimUnattendedSubmission: vi.fn().mockResolvedValue("claimed"),
     releaseUncertainSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
     updateJobForSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
+    reconcileClaimedSubmissionUncertain: vi.fn().mockResolvedValue(true),
+    redisExists: vi.fn().mockResolvedValue(0),
     pauseForFormInput: vi.fn().mockResolvedValue(undefined),
     agentRun,
     AgentHarness: vi.fn().mockImplementation(() => ({ run: agentRun })),
@@ -88,16 +91,17 @@ const approvalMocks = vi.hoisted(() => ({
 const submitToolMocks = vi.hoisted(() => ({ create: vi.fn() }));
 
 vi.mock("bullmq", () => ({
-  Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), isPaused: vi.fn().mockResolvedValue(false) })),
+  Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), isPaused: vi.fn().mockResolvedValue(false), toKey: (suffix: string) => `bull:apply-tasks:${suffix}` })),
   Worker: vi.fn().mockImplementation((_name, handler) => {
     mocks.workerHandler = handler;
-    return { on: vi.fn(), close: vi.fn(), isRunning: vi.fn() };
+    return { on: vi.fn((event: string, callback: unknown) => { mocks.workerEvents[event] = callback; }), close: vi.fn(), isRunning: vi.fn() };
   }),
 }));
 
 vi.mock("ioredis", () => ({
   Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })),
 }));
+vi.mock("../redis.js", () => ({ redisConnection: { exists: mocks.redisExists } }));
 
 vi.mock("../rate-limit.js", () => ({ checkRateLimit: mocks.checkRateLimit }));
 vi.mock("../cloak/pool.js", () => ({ withCloakContext: mocks.withCloakContext }));
@@ -149,6 +153,7 @@ vi.mock("../db/application-task-state.js", () => ({
 }));
 vi.mock("../db/submission-guard.js", () => ({
   claimUnattendedSubmission: mocks.claimUnattendedSubmission,
+  reconcileClaimedSubmissionUncertain: mocks.reconcileClaimedSubmissionUncertain,
   releaseUncertainSubmission: mocks.releaseUncertainSubmission,
   updateJobForSubmission: mocks.updateJobForSubmission,
   UNCONFIRMED_SUBMISSION_MESSAGE: "The previous background attempt was interrupted after it started. ApplyMate did not retry it to avoid sending a duplicate application.",
@@ -223,6 +228,9 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.outcomeQuery.mockClear();
     mocks.outcomeClient.release.mockClear();
     mocks.workerHandler = undefined;
+    mocks.workerEvents = {};
+    mocks.redisExists.mockReset().mockResolvedValue(0);
+    mocks.reconcileClaimedSubmissionUncertain.mockReset().mockResolvedValue(true);
     mocks.fakePage.goto.mockResolvedValue(undefined);
     mocks.fakePage.context.mockClear();
     mocks.fakePage.close.mockReset().mockResolvedValue(undefined);
@@ -297,10 +305,69 @@ describe("apply-queue Phase 5 pipeline", () => {
         error: null,
       })
     );
-    expect(mocks.claimApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "user-1", "job-1", "submit", expect.objectContaining({ fillTurnId: "agent-turn-1" }),
+    expect(mocks.claimApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.claimUnattendedSubmission).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        applicationTaskId: "application-task-1", userId: "user-1", jobId: "job-1",
+        sessionId: "agent-session-1", fillTurnId: "agent-turn-1", approvalId: "approval-1",
+      }),
+      "worker-task-pipeline-1",
     );
     expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+  }, 15_000);
+
+  it("lets only one concurrent delivery reach browser setup before the submit-start marker", async () => {
+    let claimCount = 0;
+    mocks.claimUnattendedSubmission.mockImplementation(async () => ++claimCount === 1 ? "claimed" : "unavailable");
+    let browserSetupStarted!: () => void;
+    let allowBrowserSetup!: () => void;
+    const browserStarted = new Promise<void>(resolve => { browserSetupStarted = resolve; });
+    const browserGate = new Promise<void>(resolve => { allowBrowserSetup = resolve; });
+    mocks.withCloakContext.mockImplementationOnce(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
+      browserSetupStarted();
+      await browserGate;
+      await fn(mocks.fakePage);
+    });
+
+    const owner = runApplyJob();
+    await browserStarted;
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.claimUnattendedSubmission).toHaveBeenCalledTimes(2);
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+    expect(mocks.releaseUncertainSubmission).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+
+    allowBrowserSetup();
+    await expect(owner).resolves.toBeUndefined();
+    expect(mocks.updateJobForSubmission).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ applicationTaskId: "application-task-1" }),
+      expect.objectContaining({ status: "applied", workflowState: "submitted", applied: true }), "finish_apply_job_state",
+    );
+    expect(mocks.updateJobForSubmission.mock.calls.some(([, , state]) =>
+      (state as { workflowState?: string }).workflowState === "ready_to_apply")).toBe(false);
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+  }, 15_000);
+
+  it("keeps a claimed task terminal and uncertain when browser setup fails", async () => {
+    mocks.withCloakContext.mockRejectedValueOnce(new Error("Cloak context failed to start"));
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+    expect(mocks.releaseUncertainSubmission).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+      status: "manual", error: expect.stringContaining("did not retry"),
+    }));
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain",
+      expect.stringContaining("did not retry"), "submit", expect.objectContaining({ fillTurnId: "agent-turn-1" }),
+    );
   }, 15_000);
 
   it("rejects a stale legacy fill delivery for a TaskGraph-bound task before starting a browser", async () => {
@@ -310,7 +377,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     await expect(runApplyJob()).resolves.toBeUndefined();
 
     expect(mocks.claimApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "user-1", "job-1", "fill", undefined,
+      expect.anything(), "application-task-1", "user-1", "job-1",
     );
     expect(mocks.withCloakContext).not.toHaveBeenCalled();
     expect(mocks.fakePage.goto).not.toHaveBeenCalled();
@@ -464,19 +531,46 @@ describe("apply-queue Phase 5 pipeline", () => {
     );
   });
 
-  it("does not open a second browser when a previous attempt is uncertain", async () => {
-    mocks.claimUnattendedSubmission.mockResolvedValueOnce("uncertain");
+  it("does not mutate state or open a browser when the exact submit claim is unavailable", async () => {
+    mocks.claimUnattendedSubmission.mockResolvedValueOnce("unavailable");
 
     await expect(runApplyJob()).resolves.toBeUndefined();
 
-    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
-    expect(mocks.AgentHarness).not.toHaveBeenCalled();
-    expect(mocks.insertApplyResult).toHaveBeenCalledWith(
-      expect.objectContaining({
-        status: "manual",
-        error: expect.stringContaining("did not retry"),
-      }),
+    expect(mocks.claimUnattendedSubmission).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ applicationTaskId: "application-task-1" }), "worker-task-pipeline-1",
     );
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.AgentHarness).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+    expect(mocks.releaseUncertainSubmission).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a stranded claim only after terminal delivery and exact lock release", async () => {
+    mocks.claimUnattendedSubmission.mockResolvedValueOnce("unavailable");
+    await expect(runApplyJob()).resolves.toBeUndefined();
+    const completed = mocks.workerEvents.completed as (job: unknown) => Promise<void>;
+    const failed = mocks.workerEvents.failed as (job: unknown) => Promise<void>;
+    const terminalJob = { id: "worker-task-pipeline-1", data: payload, attemptsMade: 2, opts: { attempts: 2 } };
+
+    await failed({ ...terminalJob, attemptsMade: 1 });
+    expect(mocks.redisExists).not.toHaveBeenCalled();
+    await completed(terminalJob);
+
+    expect(mocks.redisExists).toHaveBeenCalledWith("bull:apply-tasks:worker-task-pipeline-1:lock");
+    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
+    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ applicationTaskId: "application-task-1", jobId: "job-1" }),
+      "worker-task-pipeline-1",
+    );
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+
+    mocks.redisExists.mockResolvedValueOnce(1);
+    await completed(terminalJob);
+    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
   });
 
   it("does not open a browser when a known ATS policy blocks unattended work", async () => {

@@ -87,6 +87,12 @@ jobs:
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify submit outbox retry and duplicate-delivery fencing
+        run: >-
+          pnpm --filter @jobcopilot/worker exec vitest run
+          src/queue/application-submit-outbox.test.ts
+          src/queue/application-submit-outbox-terminal-recovery.test.ts
+          src/queue/apply-queue-pipeline.test.ts
       - name: Verify application submit recovery commit orders on disposable PostgreSQL
         env:
           CI: "true"

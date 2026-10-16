@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool as PgPool, type PoolClient } from "pg"
+import { Pool as PgPool, type Pool, type PoolClient } from "pg"
 
 import { markSubmissionRequestStarted } from "../db/application-task-state.js"
+import { claimUnattendedSubmission, reconcileClaimedSubmissionUncertain } from "../db/submission-guard.js"
 import { recordSubmissionExecutionSettled, withExactAttemptFence, type ApplicationSubmitIdentity, type ExactAttemptFenceResult } from "./application-submit-fence.js"
 
 function disposableTestUrl(): string | null {
@@ -68,6 +69,16 @@ async function connectClient(applicationName: string): Promise<PoolClient> {
   }
 }
 
+function claimPool(applicationName: string): Pool {
+  return {
+    connect: async () => {
+      const client = await pool.connect()
+      await client.query("SELECT set_config('application_name', $1, false)", [applicationName])
+      return client
+    },
+  } as unknown as Pool
+}
+
 async function inTransaction<T>(applicationName: string, work: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await connectClient(applicationName)
   try {
@@ -103,6 +114,20 @@ async function seedScenario(label: string): Promise<Scenario> {
     `attempt-${suffix}`, identity.userId, identity.jobId, identity.approvalId, identity.constraintHash, "a".repeat(64),
   ])
   return identity
+}
+
+async function prepareSubmitClaim(identity: Scenario): Promise<void> {
+  await pool.query(`INSERT INTO "${schema}"."User" ("id", "accountStatus") VALUES ($1, 'active')`, [identity.userId])
+  await pool.query(`UPDATE "${schema}"."application_tasks" SET "status" = 'filling', "checkpoint" = 'submission_authorized', "workerTaskId" = $2 WHERE "id" = $1`, [
+    identity.applicationTaskId, identity.workerTaskId,
+  ])
+  await pool.query(`UPDATE "${schema}"."Job" SET "status" = 'saved', "workflowState" = 'queued' WHERE "id" = $1`, [identity.jobId])
+  await pool.query(`INSERT INTO "${schema}"."agent_approvals"
+    ("id", "userId", "sessionId", "turnId", "taskId", "jobId", "type", "toolCallId", "status", "scopeHash", "expiresAt", "payload")
+    VALUES ($1, $2, $3, $4, $5, $6, 'submit_application', 'application-submit:' || $5, 'approved', $7, NOW() + INTERVAL '1 hour', $8::jsonb)`, [
+    identity.approvalId, identity.userId, identity.sessionId, identity.fillTurnId, identity.applicationTaskId, identity.jobId,
+    identity.constraintHash, JSON.stringify({ applicationTaskId: identity.applicationTaskId, jobId: identity.jobId }),
+  ])
 }
 
 async function effectCount(identity: ApplicationSubmitIdentity): Promise<number> {
@@ -146,7 +171,10 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       await client.query(`CREATE SCHEMA "${schema}"`)
       schemaCreated = true
       await client.query(`SET search_path TO "${schema}"`)
-      await client.query(`CREATE TABLE "agent_sessions" ("id" text PRIMARY KEY, "userId" text NOT NULL)`)
+      await client.query(`CREATE TABLE "agent_sessions" (
+        "id" text PRIMARY KEY, "userId" text NOT NULL, "status" text NOT NULL DEFAULT 'running',
+        "completedAt" timestamptz, "updatedAt" timestamptz
+      )`)
       await client.query(`CREATE TABLE "agent_turns" ("id" text PRIMARY KEY, "sessionId" text NOT NULL, "userId" text NOT NULL)`)
       await client.query(`CREATE TABLE "sub_agent_tasks" (
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "role" text NOT NULL,
@@ -156,7 +184,7 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       await client.query(`CREATE TABLE "application_tasks" (
         "id" text PRIMARY KEY, "userId" text NOT NULL, "jobId" text NOT NULL, "sessionId" text NOT NULL,
         "fillTurnId" text, "fillTurnSessionId" text, "fillTurnUserId" text,
-        "status" text NOT NULL DEFAULT 'filling', "checkpoint" text NOT NULL DEFAULT 'submission_request_started', "workerTaskId" text,
+        "status" text NOT NULL DEFAULT 'filling', "checkpoint" text NOT NULL DEFAULT 'submission_request_started', "workerTaskId" text, "error" text,
         "updatedAt" TIMESTAMP(3) NOT NULL
       )`)
       await client.query(`CREATE TABLE "application_task_events" (
@@ -167,6 +195,16 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
         "id" text PRIMARY KEY, "userId" text NOT NULL, "status" text NOT NULL DEFAULT 'saved',
         "workflowState" text NOT NULL DEFAULT 'ready_to_apply', "appliedAt" timestamptz
       )`)
+      await client.query(`CREATE TABLE "User" ("id" text PRIMARY KEY, "accountStatus" text NOT NULL)`)
+      await client.query(`CREATE TABLE "agent_approvals" (
+        "id" text PRIMARY KEY, "userId" text NOT NULL, "sessionId" text NOT NULL, "turnId" text NOT NULL,
+        "taskId" text NOT NULL, "jobId" text NOT NULL, "type" text NOT NULL, "toolCallId" text NOT NULL,
+        "status" text NOT NULL, "scopeHash" text NOT NULL, "expiresAt" timestamptz NOT NULL, "payload" jsonb NOT NULL
+      )`)
+      await client.query(`CREATE FUNCTION "${schema}"."pause_submit_claim"() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(845, 84510); RETURN NEW; END $$`)
+      await client.query(`CREATE TRIGGER "pause_submit_claim" BEFORE UPDATE ON "application_tasks" FOR EACH ROW
+        WHEN (NEW."checkpoint" = 'browser_active') EXECUTE FUNCTION "${schema}"."pause_submit_claim"()`)
       await client.query(`CREATE TABLE "submit_effects" (
         "id" text PRIMARY KEY, "applicationTaskId" text NOT NULL, "fillTurnId" text NOT NULL, "result" text NOT NULL
       )`)
@@ -205,6 +243,95 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
     expect(await executionEvidenceSafe(identity)).toBe(false)
     await expect(recordSubmissionExecutionSettled(pool, identity)).resolves.toBe(true)
     expect(await executionEvidenceSafe(identity)).toBe(true)
+  }, 15_000)
+
+  it("atomically claims one exact submit delivery before browser setup and leaves its Job submitting", async () => {
+    const identity = await seedScenario("concurrent-submit-claim")
+    await prepareSubmitClaim(identity)
+
+    const blocker = await connectClient(`${appPrefix}_claim_blocker`)
+    const firstApp = `${appPrefix}_claim_first`
+    const secondApp = `${appPrefix}_claim_second`
+    let first: Promise<string> | undefined
+    let second: Promise<string> | undefined
+    try {
+      await blocker.query("SELECT pg_advisory_lock(845, 84510)")
+      first = claimUnattendedSubmission(claimPool(firstApp), identity, identity.workerTaskId)
+      await waitUntilLockBlocked(firstApp)
+      second = claimUnattendedSubmission(claimPool(secondApp), identity, identity.workerTaskId)
+      await waitUntilLockBlocked(secondApp)
+      await blocker.query("SELECT pg_advisory_unlock(845, 84510)")
+
+      await expect(first).resolves.toBe("claimed")
+      await expect(second).resolves.toBe("unavailable")
+      const durable = await pool.query<{ taskStatus: string; checkpoint: string; workerTaskId: string; status: string; workflowState: string }>(
+        `SELECT task."status" AS "taskStatus", task."checkpoint", task."workerTaskId", job."status", job."workflowState"
+           FROM "${schema}"."application_tasks" task JOIN "${schema}"."Job" job ON job."id" = task."jobId"
+          WHERE task."id" = $1`, [identity.applicationTaskId],
+      )
+      expect(durable.rows[0]).toEqual({
+        taskStatus: "filling", checkpoint: "browser_active", workerTaskId: identity.workerTaskId,
+        status: "saved", workflowState: "submitting",
+      })
+    } finally {
+      await blocker.query("SELECT pg_advisory_unlock(845, 84510)").catch(() => undefined)
+      blocker.release()
+      await Promise.allSettled([first, second].filter((claim): claim is Promise<string> => claim !== undefined))
+    }
+  }, 15_000)
+
+  it("surfaces a crashed pre-marker claim for review after terminal redelivery", async () => {
+    const identity = await seedScenario("crashed-pre-marker-claim")
+    await prepareSubmitClaim(identity)
+
+    await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("claimed")
+    const beforeRecovery = await pool.query<{ checkpoint: string; workflowState: string }>(
+      `SELECT task."checkpoint", job."workflowState" FROM "${schema}"."application_tasks" task
+       JOIN "${schema}"."Job" job ON job."id" = task."jobId" WHERE task."id" = $1`, [identity.applicationTaskId],
+    )
+    expect(beforeRecovery.rows[0]).toEqual({ checkpoint: "browser_active", workflowState: "submitting" })
+
+    await expect(reconcileClaimedSubmissionUncertain(pool, identity, identity.workerTaskId)).resolves.toBe(true)
+    const recovered = await pool.query<{ status: string; checkpoint: string; workflowState: string }>(
+      `SELECT task."status", task."checkpoint", job."workflowState" FROM "${schema}"."application_tasks" task
+       JOIN "${schema}"."Job" job ON job."id" = task."jobId" WHERE task."id" = $1`, [identity.applicationTaskId],
+    )
+    expect(recovered.rows[0]).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain", workflowState: "submitting" })
+    await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("unavailable")
+    expect(await pool.query(`SELECT 1 FROM "${schema}"."Job" WHERE "id" = $1 AND "workflowState" = 'ready_to_apply'`, [identity.jobId]))
+      .toMatchObject({ rowCount: 0 })
+  }, 15_000)
+
+  it("surfaces a crashed post-marker claim for review without changing the Job", async () => {
+    const identity = await seedScenario("crashed-post-marker-claim")
+    await prepareSubmitClaim(identity)
+
+    await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("claimed")
+    const marker = await inTransaction(`${appPrefix}_request_started`, client => withExactAttemptFence(client, identity, () =>
+      markSubmissionRequestStarted(client, {
+        ...identity, turnId: identity.fillTurnId, workerTaskId: identity.workerTaskId, executionId: identity.executionId,
+      })))
+    expect(marker).toEqual({ kind: "current", value: "started" })
+
+    const beforeRecovery = await pool.query<{ taskStatus: string; checkpoint: string; jobStatus: string; workflowState: string }>(
+      `SELECT task."status" AS "taskStatus", task."checkpoint", job."status" AS "jobStatus", job."workflowState"
+         FROM "${schema}"."application_tasks" task JOIN "${schema}"."Job" job ON job."id" = task."jobId"
+        WHERE task."id" = $1`, [identity.applicationTaskId],
+    )
+    expect(beforeRecovery.rows[0]).toEqual({
+      taskStatus: "filling", checkpoint: "submission_request_started", jobStatus: "saved", workflowState: "submitting",
+    })
+
+    await expect(reconcileClaimedSubmissionUncertain(pool, identity, identity.workerTaskId)).resolves.toBe(true)
+    const recovered = await pool.query<{ taskStatus: string; checkpoint: string; jobStatus: string; workflowState: string }>(
+      `SELECT task."status" AS "taskStatus", task."checkpoint", job."status" AS "jobStatus", job."workflowState"
+         FROM "${schema}"."application_tasks" task JOIN "${schema}"."Job" job ON job."id" = task."jobId"
+        WHERE task."id" = $1`, [identity.applicationTaskId],
+    )
+    expect(recovered.rows[0]).toEqual({
+      taskStatus: "waiting_for_user", checkpoint: "submission_uncertain", jobStatus: "saved", workflowState: "submitting",
+    })
+    await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("unavailable")
   }, 15_000)
 
   it("returns superseded without a submit side effect when recovery commits the successor binding first", async () => {

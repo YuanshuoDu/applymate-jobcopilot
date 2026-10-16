@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
 import { matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
@@ -7,6 +8,53 @@ import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 import { applicationFillTaskGraphEnabled, asRecord, assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, AutoApplyError, validateAutoApplyUrl } from "./auto-apply-guards";
 
 export { AutoApplyError, applicationFillTaskGraphEnabled, validateAutoApplyUrl } from "./auto-apply-guards";
+
+function createSubmitIntent(submitPayload: ApplyTaskSubmitPayload) {
+  const digest = createHash("sha256").update(JSON.stringify([
+    submitPayload.applicationTaskId, submitPayload.fillTurnId, submitPayload.receiptId,
+  ]) ?? "").digest("hex");
+  const workerTaskId = "apply-submit-" + digest;
+  return {
+    id: "application-submit-outbox-" + digest,
+    topic: "application.submit.dispatch",
+    aggregateId: submitPayload.sessionId,
+    idempotencyKey: "application-submit:" + digest,
+    payload: {
+      applicationTaskId: submitPayload.applicationTaskId, userId: submitPayload.userId,
+      jobId: submitPayload.jobId, sessionId: submitPayload.sessionId, fillTurnId: submitPayload.fillTurnId,
+      receiptId: submitPayload.receiptId, constraintHash: submitPayload.constraintHash, workerTaskId, submitPayload,
+    },
+  };
+}
+
+function matchesSubmitIntent(value: unknown, expected: ReturnType<typeof createSubmitIntent>): boolean {
+  const row = asRecord(value), payload = asRecord(row.payload), identity = expected.payload;
+  return row.id === expected.id && row.topic === expected.topic && row.aggregateId === expected.aggregateId &&
+    row.idempotencyKey === expected.idempotencyKey && payload.applicationTaskId === identity.applicationTaskId &&
+    payload.userId === identity.userId && payload.jobId === identity.jobId && payload.sessionId === identity.sessionId &&
+    payload.fillTurnId === identity.fillTurnId && payload.receiptId === identity.receiptId &&
+    payload.constraintHash === identity.constraintHash && payload.workerTaskId === identity.workerTaskId &&
+    matchesApplyTaskSubmitPayload(payload.submitPayload, identity);
+}
+
+function matchesSubmitEvent(value: unknown, expected: ReturnType<typeof createSubmitIntent>): boolean {
+  const event = asRecord(value), identity = expected.payload;
+  return event.applicationTaskId === identity.applicationTaskId && event.userId === identity.userId &&
+    event.jobId === identity.jobId && event.sessionId === identity.sessionId && event.fillTurnId === identity.fillTurnId &&
+    event.approvalId === identity.receiptId && event.receiptId === identity.receiptId &&
+    event.constraintHash === identity.constraintHash && event.workerTaskId === identity.workerTaskId;
+}
+
+async function resolveExistingSubmitIntent(tx: Prisma.TransactionClient, intent: ReturnType<typeof createSubmitIntent>): Promise<string> {
+  const [outbox, events] = await Promise.all([
+    tx.agentOutbox.findUnique({ where: { idempotencyKey: intent.idempotencyKey } }),
+    tx.applicationTaskEvent.findMany({ where: { taskId: intent.payload.applicationTaskId, type: "submission_queued" }, select: { data: true } }),
+  ]);
+  if (!matchesSubmitIntent(outbox, intent) || !events.some(event => matchesSubmitEvent(event.data, intent))) {
+    throw new AutoApplyError("The existing submit intent conflicts with the current approved attempt.");
+  }
+  return intent.payload.workerTaskId;
+}
 
 /** Dispatches the safe first browser pass: fill fields, then stop for review. */
 export async function queueApplicationFill(input: {
@@ -140,107 +188,55 @@ export async function queueAutonomousApplication(input: {
     sessionId: receiptSessionId, fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash,
   })) throw new AutoApplyError("The submit payload does not match the current approved application attempt.");
 
-  const claimed = await db.$transaction(async tx => {
-    const material = await tx.applicationTask.findFirst({
-      where: {
-        id: input.applicationTaskId,
-        userId: input.userId,
-        jobId: input.jobId,
-        sessionId: receiptSessionId,
-        fillTurnId,
-        status: "waiting_for_authorization",
-        checkpoint: "form_filled",
-        resumeId: { not: null },
-        question: { equals: Prisma.DbNull },
-      },
-      select: { resumeId: true, coverLetterId: true },
+  const intent = createSubmitIntent(submitPayload);
+  const taskId = await db.$transaction(async tx => {
+    const taskWhere = { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId, sessionId: receiptSessionId, fillTurnId };
+    const current = await tx.applicationTask.findFirst({
+      where: taskWhere,
+      select: { status: true, checkpoint: true, workerTaskId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true, question: true },
     });
-    if (!material?.resumeId) return false;
+    if (!current) return false;
+    if (current.resumeId !== material.resumeId || current.coverLetterId !== material.coverLetterId ||
+      JSON.stringify(current.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot.confirmedAnswers ?? null)) return false;
+    if (current.workerTaskId === intent.payload.workerTaskId) return resolveExistingSubmitIntent(tx, intent);
+    if (current.status !== "waiting_for_authorization" || current.checkpoint !== "form_filled" || !current.resumeId || current.question !== null) return false;
 
-    // A stale task must not submit a resume from another job. A candidate's
-    // current default resume is valid fallback material; any adapted resume
-    // must be explicitly linked to this job.
     const resume = await tx.resume.findFirst({
-      where: {
-        id: material.resumeId,
-        userId: input.userId,
-        OR: [{ targetJobId: input.jobId }, { isDefault: true }],
-      },
-      select: { id: true },
+      where: { id: current.resumeId, userId: input.userId, OR: [{ targetJobId: input.jobId }, { isDefault: true }] }, select: { id: true },
     });
     if (!resume) return false;
+    if (current.coverLetterId && !await tx.coverLetter.findFirst({
+      where: { id: current.coverLetterId, userId: input.userId, jobId: input.jobId, resumeId: current.resumeId }, select: { id: true },
+    })) return false;
 
-    // Cover letters are optional, but when a task has one it must be the
-    // current user's artifact for this exact job and selected resume.
-    if (material.coverLetterId) {
-      const coverLetter = await tx.coverLetter.findFirst({
-        where: {
-          id: material.coverLetterId,
-          userId: input.userId,
-          jobId: input.jobId,
-          resumeId: material.resumeId,
-        },
-        select: { id: true },
-      });
-      if (!coverLetter) return false;
-    }
-    const task = await tx.applicationTask.updateMany({
-      where: {
-        id: input.applicationTaskId,
-        userId: input.userId,
-        jobId: input.jobId,
-        sessionId: receiptSessionId,
-        fillTurnId,
-        status: "waiting_for_authorization",
-        checkpoint: "form_filled",
-        resumeId: { not: null },
-        question: { equals: Prisma.DbNull },
-      },
-      data: { status: "filling", checkpoint: "submission_authorized", question: Prisma.DbNull, startedAt: new Date() },
+    const claim = await tx.applicationTask.updateMany({
+      where: { ...taskWhere, workerTaskId: current.workerTaskId, status: "waiting_for_authorization", checkpoint: "form_filled",
+        resumeId: material.resumeId, coverLetterId: material.coverLetterId,
+        confirmedAnswers: { equals: taskSnapshot.confirmedAnswers === null ? Prisma.DbNull : taskSnapshot.confirmedAnswers as Prisma.InputJsonValue }, question: { equals: Prisma.DbNull } },
+      data: { status: "filling", checkpoint: "submission_authorized", question: Prisma.DbNull, workerTaskId: intent.payload.workerTaskId, startedAt: new Date() },
     });
-    if (task.count !== 1) return false;
+    if (claim.count !== 1) {
+      const raced = await tx.applicationTask.findFirst({ where: taskWhere, select: { workerTaskId: true } });
+      return raced?.workerTaskId === intent.payload.workerTaskId ? resolveExistingSubmitIntent(tx, intent) : false;
+    }
     const job = await tx.job.updateMany({
       where: { id: input.jobId, userId: input.userId, status: "saved", workflowState: "ready_to_apply" },
       data: { workflowState: "queued", analysisNote: "[Approved submission] Applying in the background after explicit user authorization." },
     });
-    return job.count === 1;
-  });
-  if (!claimed) {
-    throw new AutoApplyError("This application is no longer ready for the approved submission step.");
-  }
+    if (job.count !== 1) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
 
-  try {
-    const taskId = await enqueueApplyTask(submitPayload);
-    await db.activity.create({
-      data: { userId: input.userId, jobId: input.jobId, type: "agent_action",
-        text: "Agent queued this application after explicit per-job user authorization.", color: "#7C3AED" },
-    });
-    await db.applicationTask.update({ where: { id: input.applicationTaskId }, data: { workerTaskId: taskId } });
-    await db.applicationTaskEvent.create({
-      data: {
-        taskId: input.applicationTaskId, type: "submission_queued", actor: "user",
-        body: "User approved this job for background submission.",
-        data: { applicationTaskId: input.applicationTaskId, userId: input.userId, jobId: input.jobId,
-          sessionId: receiptSessionId, fillTurnId, approvalId: approval.id, constraintHash: approval.scopeHash, workerTaskId: taskId },
-      },
-    });
-    return { taskId };
-  } catch (error) {
-    await db.$transaction(async tx => {
-      const resetTask = await tx.applicationTask.updateMany({
-        where: {
-          id: input.applicationTaskId,
-          userId: input.userId,
-          jobId: input.jobId,
-          status: "filling",
-          checkpoint: "submission_authorized",
-        },
-        data: { status: "waiting_for_authorization", checkpoint: "queue_retry" },
-      })
-      if (resetTask.count === 1) {
-        await tx.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } })
-      }
-    }).catch(() => undefined);
-    throw error;
-  }
+    const identity = intent.payload;
+    await tx.applicationTaskEvent.create({ data: {
+      taskId: input.applicationTaskId, type: "submission_queued", actor: "user", body: "User approved this job for background submission.",
+      data: { applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+        sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, approvalId: identity.receiptId, receiptId: identity.receiptId,
+        constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId },
+    } });
+    await tx.agentOutbox.create({ data: { ...intent, payload: intent.payload as unknown as Prisma.InputJsonObject } });
+    await tx.activity.create({ data: { userId: input.userId, jobId: input.jobId, type: "agent_action",
+      text: "Agent queued this application after explicit per-job user authorization.", color: "#7C3AED" } });
+    return identity.workerTaskId;
+  });
+  if (!taskId) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
+  return { taskId };
 }

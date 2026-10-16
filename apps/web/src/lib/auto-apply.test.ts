@@ -1,9 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Prisma } from "@prisma/client";
 
 const mocks = vi.hoisted(() => ({
   approvalFindFirst: vi.fn(),
   transaction: vi.fn(),
+  transactionCommit: vi.fn(),
+  txTaskFindFirst: vi.fn(),
   txTaskUpdateMany: vi.fn(),
+  txTaskEventFindMany: vi.fn(),
+  txTaskEventCreate: vi.fn(),
+  outboxFindUnique: vi.fn(),
+  outboxCreate: vi.fn(),
+  txActivityCreate: vi.fn(),
   taskUpdate: vi.fn(),
   taskFindFirst: vi.fn(),
   taskEventCreate: vi.fn(),
@@ -57,11 +65,13 @@ describe("auto-apply authorization", () => {
     Object.values(mocks).forEach(mock => mock.mockReset());
     mocks.approvalFindFirst.mockResolvedValue({
       id: "approval_1",
-      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
+      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null },
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
       expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
     });
     mocks.taskFindFirst.mockResolvedValue({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.txTaskFindFirst.mockResolvedValue({ status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null, resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
+    mocks.txTaskEventFindMany.mockResolvedValue([]);
     mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
     mocks.coverLetterFindFirst.mockResolvedValue({ id: "cover_1" });
     mocks.jobFindFirst.mockResolvedValue({
@@ -70,12 +80,17 @@ describe("auto-apply authorization", () => {
     mocks.userFindUnique.mockResolvedValue({ accountStatus: "active" });
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
       if (typeof callback === "function") {
-        return callback({
-          applicationTask: { findFirst: mocks.taskFindFirst, updateMany: mocks.txTaskUpdateMany },
+        const result = await callback({
+          applicationTask: { findFirst: mocks.txTaskFindFirst, updateMany: mocks.txTaskUpdateMany },
           resume: { findFirst: mocks.resumeFindFirst },
           coverLetter: { findFirst: mocks.coverLetterFindFirst },
           job: { updateMany: mocks.jobUpdateMany },
+          applicationTaskEvent: { findMany: mocks.txTaskEventFindMany, create: mocks.txTaskEventCreate },
+          agentOutbox: { findUnique: mocks.outboxFindUnique, create: mocks.outboxCreate },
+          activity: { create: mocks.txActivityCreate },
         });
+        mocks.transactionCommit();
+        return result;
       }
       return Promise.all(callback);
     });
@@ -87,6 +102,10 @@ describe("auto-apply authorization", () => {
     mocks.activityCreate.mockResolvedValue({});
     mocks.taskUpdate.mockResolvedValue({});
     mocks.taskEventCreate.mockResolvedValue({});
+    mocks.txTaskEventCreate.mockResolvedValue({});
+    mocks.outboxFindUnique.mockResolvedValue(null);
+    mocks.outboxCreate.mockImplementation(async ({ data }: { data: unknown }) => data);
+    mocks.txActivityCreate.mockResolvedValue({});
     mocks.isFeatureAllowed.mockResolvedValue(true);
     mocks.resolveAiAccess.mockResolvedValue('allowed');
     mocks.startApplicationFillForReview.mockResolvedValue({ inputId: "input_1", turnId: "turn_fill_1", sequence: "1", disposition: "started" });
@@ -95,23 +114,61 @@ describe("auto-apply authorization", () => {
 
   it("queues only after matching explicit per-job authorization", async () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
-    await expect(queueAutonomousApplication(input)).resolves.toEqual({ taskId: "worker_1" });
-    expect(mocks.enqueueApplyTask).toHaveBeenCalledWith({
-      applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl, operation: "submit",
-      personaId: "server-side", resumePath: "", sessionId: "session_1", fillTurnId: "turn_1",
-      receiptId: "approval_1", constraintHash: "s".repeat(64),
-    });
+    const result = await queueAutonomousApplication(input);
+    expect(result.taskId).toMatch(/^apply-submit-[a-f0-9]{64}$/);
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
     expect(mocks.txTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ sessionId: "session_1", fillTurnId: "turn_1" }),
+      where: expect.objectContaining({ sessionId: "session_1", fillTurnId: "turn_1", workerTaskId: null,
+        resumeId: "resume_1", coverLetterId: null, confirmedAnswers: { equals: Prisma.DbNull } }),
+      data: expect.objectContaining({ workerTaskId: result.taskId }),
     }));
-    expect(mocks.taskEventCreate).toHaveBeenCalledWith(expect.objectContaining({
+    expect(mocks.txTaskEventCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
         taskId: "application_1", type: "submission_queued",
         data: expect.objectContaining({ applicationTaskId: "application_1", userId: "user_1", jobId: "job_1",
-          sessionId: "session_1", fillTurnId: "turn_1", approvalId: "approval_1", workerTaskId: "worker_1" }),
+          sessionId: "session_1", fillTurnId: "turn_1", approvalId: "approval_1", receiptId: "approval_1", workerTaskId: result.taskId }),
       }),
     }));
+    expect(mocks.outboxCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      topic: "application.submit.dispatch", aggregateId: "session_1", idempotencyKey: expect.stringMatching(/^application-submit:/),
+      payload: expect.objectContaining({ workerTaskId: result.taskId, receiptId: "approval_1", submitPayload: expect.objectContaining({ receiptId: "approval_1" }) }),
+    }) }));
     expect(mocks.transaction).toHaveBeenCalled();
+  }, 15_000);
+
+  it("resolves duplicate requests to the same committed submit intent and job ID", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    const first = await queueAutonomousApplication(input);
+    const outbox = mocks.outboxCreate.mock.calls[0]?.[0]?.data;
+    const event = mocks.txTaskEventCreate.mock.calls[0]?.[0]?.data?.data;
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "filling", checkpoint: "submission_authorized", workerTaskId: first.taskId,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.outboxFindUnique.mockResolvedValueOnce(outbox);
+    mocks.txTaskEventFindMany.mockResolvedValueOnce([{ data: event }]);
+
+    await expect(queueAutonomousApplication(input)).resolves.toEqual(first);
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.outboxCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["resume", { resumeId: "resume_2" }],
+    ["cover letter", { coverLetterId: "cover_2" }],
+    ["confirmed answers", { confirmedAnswers: { Location: "Cork" } }],
+  ] as const)("rejects when approved %s change before the submit transaction", async (_field, changed) => {
+    mocks.txTaskFindFirst.mockResolvedValueOnce({
+      status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null, ...changed,
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
   it("rejects a missing current fill Turn before enqueueing submission", async () => {
@@ -145,24 +202,28 @@ describe("auto-apply authorization", () => {
     expect(mocks.transaction).not.toHaveBeenCalled();
   });
 
-  it("does not reset task or job state when queue failure cleanup races with Worker progress", async () => {
-    mocks.enqueueApplyTask.mockRejectedValueOnce(new Error("queue response was lost"))
-    mocks.txTaskUpdateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 })
+  it("rolls back the claim when outbox persistence fails and never dispatches Redis work", async () => {
+    mocks.outboxCreate.mockRejectedValueOnce(new Error("outbox unavailable"));
     const { queueAutonomousApplication } = await import("./auto-apply");
 
-    await expect(queueAutonomousApplication(input)).rejects.toThrow("queue response was lost")
-
-    expect(mocks.txTaskUpdateMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      where: {
-        id: "application_1",
-        userId: "user_1",
-        jobId: "job_1",
-        status: "filling",
-        checkpoint: "submission_authorized",
-      },
-    }))
-    // The failed cleanup did not own the task row, so it must not reopen the Job for retry.
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("outbox unavailable");
+    expect(mocks.transactionCommit).not.toHaveBeenCalled();
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
     expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1)
+    expect(mocks.txTaskEventCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  })
+
+  it("rolls back the task claim when the canonical Job transition loses its race", async () => {
+    mocks.jobUpdateMany.mockResolvedValueOnce({ count: 0 });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.transactionCommit).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   })
 
   it("rejects autonomous submission when the current plan lacks auto-apply", async () => {
@@ -284,6 +345,7 @@ describe("auto-apply authorization", () => {
     mocks.taskFindFirst
       .mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: "cover_other", confirmedAnswers: null })
       .mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: "cover_other" });
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null, resumeId: "resume_1", coverLetterId: "cover_other", question: null });
     mocks.approvalFindFirst.mockResolvedValueOnce({
       id: "approval_1",
       payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: "cover_other" },

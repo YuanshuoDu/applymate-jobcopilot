@@ -8,7 +8,7 @@ import {
 export const UNCONFIRMED_SUBMISSION_MESSAGE =
   "The previous background attempt was interrupted after it started. ApplyMate did not retry it to avoid sending a duplicate application.";
 
-export type SubmissionClaim = "claimed" | "uncertain" | "unavailable" | "superseded";
+export type SubmissionClaim = "claimed" | "unavailable" | "superseded";
 export type ExactSubmissionWrite<T> =
   | { readonly kind: "current"; readonly value: T }
   | { readonly kind: "superseded" };
@@ -56,39 +56,75 @@ export async function withExactSubmissionClientWrite<T>(
   return fenced;
 }
 
-/**
- * Atomically moves a queued job into the browser-submission critical section.
- * A second delivery never opens the form again: a prior `submitting` state is
- * deliberately released for review instead of being retried.
- */
+/** Claims the exact approved task and queued Job before any browser is created. */
 export async function claimUnattendedSubmission(
   pool: Pool,
   identity: ApplicationSubmitIdentity,
+  workerTaskId: string,
 ): Promise<SubmissionClaim> {
-  const outcome = await withExactSubmissionWrite(pool, identity, "claim_unattended_submission", async (client) => {
-    const claimed = await client.query(
-      `UPDATE "Job"
-         SET "workflowState" = 'submitting', "updatedAt" = NOW()
-       WHERE id = $1
-         AND "userId" = $2
-         AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = "Job"."userId" AND u."accountStatus" = 'active')
-         AND status = 'saved'
-         AND "workflowState" = 'queued'
-       RETURNING id`,
+  if (!workerTaskId.trim()) return "unavailable";
+  const outcome = await withExactSubmissionWrite(pool, identity, "claim_unattended_submission", async client => {
+    const approval = await client.query(
+      `SELECT 1 FROM "agent_approvals"
+       WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5
+         AND "jobId" = $6 AND "type" = 'submit_application' AND "toolCallId" = 'application-submit:' || $5
+         AND "status" = 'approved' AND "scopeHash" = $7 AND "expiresAt" > NOW()
+         AND "payload"->>'applicationTaskId' = $5 AND "payload"->>'jobId' = $6 FOR UPDATE`,
+      [identity.approvalId, identity.userId, identity.sessionId, identity.fillTurnId, identity.applicationTaskId,
+        identity.jobId, identity.constraintHash],
+    );
+    if (approval.rowCount !== 1) return "unavailable" as const;
+    const task = await client.query(
+      `UPDATE "application_tasks" SET "checkpoint" = 'browser_active', "updatedAt" = NOW()
+       WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5
+         AND "workerTaskId" = $6 AND "status" = 'filling' AND "checkpoint" = 'submission_authorized'
+         AND EXISTS (SELECT 1 FROM "User" u WHERE u."id" = $2 AND u."accountStatus" = 'active')
+         AND EXISTS (SELECT 1 FROM "Job" j WHERE j."id" = $3 AND j."userId" = $2 AND j."status" = 'saved' AND j."workflowState" = 'queued')
+       RETURNING "id"`,
+      [identity.applicationTaskId, identity.userId, identity.jobId, identity.sessionId, identity.fillTurnId, workerTaskId],
+    );
+    if (task.rowCount !== 1) return "unavailable" as const;
+    const job = await client.query(
+      `UPDATE "Job" SET "workflowState" = 'submitting', "updatedAt" = NOW()
+       WHERE "id" = $1 AND "userId" = $2 AND "status" = 'saved' AND "workflowState" = 'queued' RETURNING "id"`,
       [identity.jobId, identity.userId],
     );
-    if (claimed.rowCount === 1) return "claimed" as const;
-
-    const current = await client.query(
-      `SELECT "workflowState" FROM "Job" WHERE id = $1 AND "userId" = $2`,
-      [identity.jobId, identity.userId],
-    );
-    const row = current.rows[0] as { workflowState?: unknown } | undefined;
-    if (row?.workflowState !== "submitting") return "unavailable" as const;
-    const released = await releaseUncertainSubmissionWithClient(client, identity);
-    return released ? "uncertain" as const : "unavailable" as const;
+    if (job.rowCount !== 1) throw new Error("Application Job changed during its exact submit claim.");
+    return "claimed" as const;
   });
   return outcome.kind === "current" ? outcome.value : "superseded";
+}
+
+/** Resolves a browser claim only after its terminal BullMQ event and lock check. */
+export async function reconcileClaimedSubmissionUncertain(
+  pool: Pool, identity: ApplicationSubmitIdentity, workerTaskId: string,
+): Promise<boolean> {
+  if (!workerTaskId.trim()) return false;
+  const outcome = await withExactSubmissionWrite(pool, identity, "terminal_submit_claim_recovery", async client => {
+    const task = await client.query<{ sessionId: string | null }>(
+      `UPDATE application_tasks SET status = 'waiting_for_user', "checkpoint" = 'submission_uncertain', error = $7, "updatedAt" = NOW()
+       WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6
+         AND status = 'filling' AND "checkpoint" IN ('browser_active', 'submission_request_started')
+         AND EXISTS (SELECT 1 FROM "Job" j WHERE j.id = $3 AND j."userId" = $2 AND j.status = 'saved' AND j."workflowState" = 'submitting')
+       RETURNING "sessionId"`,
+      [identity.applicationTaskId, identity.userId, identity.jobId, identity.sessionId, identity.fillTurnId, workerTaskId, UNCONFIRMED_SUBMISSION_MESSAGE],
+    );
+    if (task.rowCount !== 1) return false;
+    await client.query(`INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
+      VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, 'waiting_for_user', 'worker', $2, NOW())`,
+      [identity.applicationTaskId, UNCONFIRMED_SUBMISSION_MESSAGE]);
+    const sessionId = task.rows[0]?.sessionId;
+    if (sessionId) {
+      const tasks = await client.query<{ status: string }>(`SELECT status FROM application_tasks WHERE "sessionId" = $1`, [sessionId]);
+      const statuses = tasks.rows.map(row => String(row.status));
+      const status = statuses.includes("filling") ? "running"
+        : statuses.some(value => value === "waiting_for_user" || value === "waiting_for_authorization") ? "waiting_for_user" : "completed";
+      await client.query(`UPDATE agent_sessions SET status = $2, "completedAt" = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END, "updatedAt" = NOW()
+        WHERE id = $1 AND status NOT IN ('aborted', 'archived', 'completed', 'failed')`, [sessionId, status]);
+    }
+    return true;
+  });
+  return outcome.kind === "current" && outcome.value;
 }
 
 /** Returns a job to the review queue without ever re-opening its application form. */

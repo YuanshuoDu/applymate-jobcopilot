@@ -5,7 +5,6 @@ import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import { ensureSubmissionArtifact, ensureSubmissionArtifactWithClient } from "./submission-artifact.js";
 import type { ApplicationSubmitIdentity } from "../queue/application-submit-fence.js";
 import { withExactSubmissionClientWrite, withExactSubmissionWrite } from "./submission-guard.js";
-
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
 /** Stable checkpoint shared by CAPTCHA, login-wall, and MFA user handoffs. */
@@ -45,27 +44,17 @@ export async function isUserActive(pool: Pool, userId: string): Promise<boolean>
 
 /** Worker-side guard: a stale/revoked queue payload must never open a browser. */
 export async function claimApplicationTask(
-  pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit",
-  identity?: ApplicationSubmitIdentity,
+  pool: Pool, taskId: string, userId: string, jobId: string,
 ): Promise<boolean> {
-  if (operation === "submit" && !identity) throw new Error("Submit task claims require an exact application attempt identity.");
-  const claim = (client: Pick<PoolClient, "query">) => client.query(
-    `UPDATE application_tasks
-     SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
-     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND (($4 = 'submit') OR ($4 = 'fill' AND "fillTurnId" IS NULL AND "checkpoint" = 'form_fill_queued'))
-       AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
-       AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
-       AND ($4 = 'fill' OR ("sessionId" = $5 AND "fillTurnId" = $6))
-       AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = application_tasks."userId" AND u."accountStatus" = 'active')
-     RETURNING id`,
-    [taskId, userId, jobId, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
+  const result = await pool.query(
+    `UPDATE application_tasks SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
+     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND "fillTurnId" IS NULL
+       AND "checkpoint" = 'form_fill_queued'
+       AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = application_tasks."userId" AND u."accountStatus" = 'active') RETURNING id`,
+    [taskId, userId, jobId],
   );
-  if (operation === "fill") return (await claim(pool)).rowCount === 1;
-  const fenced = await withExactSubmissionWrite(pool, identity!, "claim_application_task", async client =>
-    (await claim(client)).rowCount === 1);
-  return fenced.kind === "current" && fenced.value;
+  return result.rowCount === 1;
 }
-
 export async function finishApplicationTask(
   pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
   operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,
