@@ -226,8 +226,7 @@ const rowStyle: React.CSSProperties = {
   borderTop: '1px solid var(--border)',
 }
 const rowTitleStyle: React.CSSProperties = {
-  fontSize: 11,
-  fontWeight: 650,
+  fontSize: 11, fontWeight: 650,
   color: 'var(--text)',
   overflow: 'hidden',
   textOverflow: 'ellipsis',
