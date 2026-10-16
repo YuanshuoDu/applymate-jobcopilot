@@ -88,8 +88,8 @@ export async function recordSubmissionExecutionSettled(pool: Pool, scope: Applic
         )
         INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
         SELECT $10, $1, 'submission_execution_settled', 'worker', 'Submit execution settled',
-          jsonb_build_object('executionId', $3, 'workerTaskId', $2, 'applicationTaskId', $1, 'userId', $4,
-            'jobId', $5, 'sessionId', $6, 'fillTurnId', $7, 'approvalId', $8, 'constraintHash', $9), NOW()
+          jsonb_build_object('executionId', $3::text, 'workerTaskId', $2::text, 'applicationTaskId', $1::text, 'userId', $4::text,
+            'jobId', $5::text, 'sessionId', $6::text, 'fillTurnId', $7::text, 'approvalId', $8::text, 'constraintHash', $9::text), NOW()
         WHERE (SELECT COUNT(*) FROM starts) = 1
           AND EXISTS (SELECT 1 FROM "application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_execution_started'
             AND "actor" = 'worker' AND "data"->>'workerTaskId' = $2 AND "data"->>'executionId' = $3

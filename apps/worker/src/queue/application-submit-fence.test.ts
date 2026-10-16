@@ -70,6 +70,15 @@ describe("application submit fence", () => {
       transactionCalls.push(sql)
       if (sql.includes("submission_execution_settled")) {
         expect(sql).toContain("(SELECT COUNT(*) FROM starts) = 1")
+        expect(sql).toContain("'executionId', $3::text")
+        expect(sql).toContain("'workerTaskId', $2::text")
+        expect(sql).toContain("'applicationTaskId', $1::text")
+        expect(sql).toContain("'userId', $4::text")
+        expect(sql).toContain("'jobId', $5::text")
+        expect(sql).toContain("'sessionId', $6::text")
+        expect(sql).toContain("'fillTurnId', $7::text")
+        expect(sql).toContain("'approvalId', $8::text")
+        expect(sql).toContain("'constraintHash', $9::text")
         expect(sql).toContain("data\"->>'executionId' = $3")
         expect(sql).toContain("NOT EXISTS")
         return { rows: [], rowCount: values?.[2] === "execution-a" ? 1 : 0 }
@@ -82,7 +91,16 @@ describe("application submit fence", () => {
 
     await expect(recordSubmissionExecutionSettled(pool, scope)).resolves.toBe(true)
     await expect(recordSubmissionExecutionSettled(pool, { ...scope, executionId: "execution-redelivery" })).resolves.toBe(false)
-    expect(query.mock.calls.filter(([sql]) => String(sql).includes("submission_execution_settled"))).toHaveLength(2)
+    const settledCalls = query.mock.calls.filter(([sql]) => String(sql).includes("submission_execution_settled"))
+    expect(settledCalls).toHaveLength(2)
+    expect(settledCalls[0]?.[1]?.slice(0, 9)).toEqual([
+      identity.applicationTaskId, "bull-a", "execution-a", identity.userId, identity.jobId,
+      identity.sessionId, identity.fillTurnId, identity.approvalId, identity.constraintHash,
+    ])
+    expect(settledCalls[1]?.[1]?.slice(0, 9)).toEqual([
+      identity.applicationTaskId, "bull-a", "execution-redelivery", identity.userId, identity.jobId,
+      identity.sessionId, identity.fillTurnId, identity.approvalId, identity.constraintHash,
+    ])
     expect(transactionCalls.filter(sql => sql === "COMMIT")).toHaveLength(2)
     expect(release).toHaveBeenCalledTimes(2)
   })

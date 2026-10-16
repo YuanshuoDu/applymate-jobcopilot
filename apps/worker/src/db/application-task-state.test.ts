@@ -455,7 +455,9 @@ describe("markSubmissionRequestStarted", () => {
     ]);
     expect(query.mock.calls.map(([sql]) => sql)).toEqual([expect.stringContaining("submission_request_started")]);
     expect(String(query.mock.calls[0]?.[0])).toContain('INSERT INTO application_task_events');
-    expect(String(query.mock.calls[0]?.[0])).toContain("'workerTaskId', $7");
+    expect(String(query.mock.calls[0]?.[0])).toContain("'workerTaskId', $7::text");
+    expect(String(query.mock.calls[0]?.[0])).toContain("'approvalId', $8::text");
+    expect(String(query.mock.calls[0]?.[0])).toContain("'constraintHash', $9::text");
     expect(release).not.toHaveBeenCalled();
   });
 
