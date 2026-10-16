@@ -107,6 +107,8 @@ describe("agent.plan tool executor", () => {
     const { tool } = setup({
       scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
       analyst: { role: "analyst", taskType: "analysis", allowedActions: ["persona.retrieve"] },
+      cover_letter_writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: ["cover_letter.draft"] },
+      cover_letter_reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
     })
     const registry = new ToolRegistry([tool])
     const { verification: _verification, ...withoutVerification } = proposal.nodes[0]
