@@ -92,20 +92,22 @@ export async function queueAutonomousApplication(input: {
   replayOnly?: boolean;
 }): Promise<{ taskId: string }> {
   await assertActiveAccount(input.userId)
-  if (!input.replayOnly) await assertUnattendedApplyEnabled(input.userId)
-  const applyUrl = input.replayOnly ? "" : validateAutoApplyUrl(input.applyUrl);
-  if (!input.replayOnly) await assertJobPreflight(input)
+  let applyUrl = input.replayOnly ? "" : validateAutoApplyUrl(input.applyUrl)
+  if (!input.replayOnly) {
+    await assertUnattendedApplyEnabled(input.userId)
+    await assertJobPreflight(input)
+  }
   const approval = await db.agentApproval.findFirst({
     where: {
       id: input.approvalId, userId: input.userId, type: "submit_application",
       status: input.replayOnly ? { in: ["approved", "consumed"] } : "approved",
     },
-    select: { id: true, payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true, nonceHash: true, resourceHash: true, materialHash: true, answersHash: true },
+    select: { id: true, status: true, payload: true, sessionId: true, taskId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true, nonceHash: true, resourceHash: true, materialHash: true, answersHash: true },
   });
   const payload = asRecord(approval?.payload);
   const taskSnapshot = await db.applicationTask.findFirst({
     where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId },
-    select: { sessionId: true, fillTurnId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
+    select: { sessionId: true, fillTurnId: true, workerTaskId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
   });
   const material = {
     applicationTaskId: input.applicationTaskId,
@@ -139,6 +141,23 @@ export async function queueAutonomousApplication(input: {
   const receiptSessionId = taskSnapshot.sessionId;
   const fillTurnId = taskSnapshot.fillTurnId;
 
+  const submitIdentity = { applicationTaskId: input.applicationTaskId, jobId: input.jobId, userId: input.userId,
+    personaId: "server-side", resumePath: "", operation: "submit" as const, sessionId: receiptSessionId,
+    fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash };
+  const stableWorkerTaskId = createSubmitIntent({ ...submitIdentity, applyUrl }).payload.workerTaskId;
+  let expectedJobUrl: string | undefined = input.replayOnly ? undefined : input.applyUrl ?? undefined;
+  if (input.replayOnly && taskSnapshot.workerTaskId !== stableWorkerTaskId && approval.status === "approved") {
+    if (approval.expiresAt <= new Date()) throw new AutoApplyError("The approval expired before its submit intent was committed.");
+    await assertUnattendedApplyEnabled(input.userId);
+    const job = await db.job.findFirst({ where: { id: input.jobId, userId: input.userId }, select: { url: true } });
+    if (!job?.url) throw new AutoApplyError("The job could not be found for application preflight.");
+    expectedJobUrl = job.url;
+    applyUrl = validateAutoApplyUrl(job.url);
+    await assertJobPreflight(input);
+  }
+  const submitPayload: ApplyTaskSubmitPayload = { ...submitIdentity, applyUrl };
+  const intent = createSubmitIntent(submitPayload);
+
   try {
     if (!input.replayOnly) requireLegacyPolicy({
       userId: input.userId, sessionId: receiptSessionId, turnId: approval.turnId,
@@ -150,17 +169,11 @@ export async function queueAutonomousApplication(input: {
     throw new AutoApplyError(error instanceof Error ? error.message : "Submission policy denied this application.");
   }
 
-  const submitPayload: ApplyTaskSubmitPayload = {
-    applicationTaskId: input.applicationTaskId, jobId: input.jobId, userId: input.userId, applyUrl,
-    personaId: "server-side", resumePath: "", operation: "submit", sessionId: receiptSessionId,
-    fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash,
-  };
   if (!matchesApplyTaskSubmitPayload(submitPayload, {
     applicationTaskId: input.applicationTaskId, userId: input.userId, jobId: input.jobId,
     sessionId: receiptSessionId, fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash,
   })) throw new AutoApplyError("The submit payload does not match the current approved application attempt.");
 
-  const intent = createSubmitIntent(submitPayload);
   const taskId = await db.$transaction(async tx => {
     const taskWhere = { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId, sessionId: receiptSessionId, fillTurnId };
     const current = await tx.applicationTask.findFirst({
@@ -174,7 +187,7 @@ export async function queueAutonomousApplication(input: {
       if (!isReplayableSubmitState(current.status, current.checkpoint)) return false;
       return resolveExistingSubmitIntent(tx, intent);
     }
-    if (input.replayOnly) return false;
+    if (input.replayOnly && approval.status !== "approved") return false;
     if (current.status !== "waiting_for_authorization" || current.checkpoint !== "form_filled" || !current.resumeId || current.question !== null) return false;
 
     const resume = await tx.resume.findFirst({
@@ -197,10 +210,24 @@ export async function queueAutonomousApplication(input: {
         ? resolveExistingSubmitIntent(tx, intent) : false;
     }
     const job = await tx.job.updateMany({
-      where: { id: input.jobId, userId: input.userId, status: "saved", workflowState: "ready_to_apply" },
+      where: { id: input.jobId, userId: input.userId, ...(expectedJobUrl ? { url: expectedJobUrl } : {}), status: "saved", workflowState: "ready_to_apply" },
       data: { workflowState: "queued", analysisNote: "[Approved submission] Applying in the background after explicit user authorization." },
     });
     if (job.count !== 1) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
+
+    const lockedApproval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT "id" FROM "agent_approvals"
+      WHERE "id" = ${approval.id} AND "userId" = ${input.userId} AND "sessionId" = ${receiptSessionId}
+        AND "taskId" IS NOT DISTINCT FROM ${approval.taskId} AND "turnId" = ${fillTurnId}
+        AND "jobId" = ${input.jobId} AND "toolCallId" = ${approval.toolCallId}
+        AND "type" = 'submit_application' AND "status" = 'approved' AND "scopeHash" = ${approval.scopeHash}
+        AND "nonceHash" = ${approval.nonceHash} AND "resourceHash" = ${approval.resourceHash}
+        AND "materialHash" = ${snapshotMaterialHash} AND "answersHash" = ${snapshotAnswersHash}
+        AND "revision" = ${approval.revision} AND "expiresAt" = ${approval.expiresAt} AND "expiresAt" > CURRENT_TIMESTAMP
+        AND "payload" = ${JSON.stringify(approval.payload)}::jsonb
+      FOR UPDATE
+    `);
+    if (lockedApproval.length !== 1) throw new AutoApplyError("The approved submission receipt changed before its intent was committed.");
 
     const identity = intent.payload;
     await tx.applicationTaskEvent.create({ data: {

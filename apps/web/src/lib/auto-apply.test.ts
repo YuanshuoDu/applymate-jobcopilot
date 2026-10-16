@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   transactionCommit: vi.fn(),
   txTaskFindFirst: vi.fn(),
   txTaskUpdateMany: vi.fn(),
+  approvalLock: vi.fn(),
   txTaskEventFindMany: vi.fn(),
   txTaskEventCreate: vi.fn(),
   outboxFindUnique: vi.fn(),
@@ -30,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   resolveAiAccess: vi.fn(),
   startApplicationFillForReview: vi.fn(),
 }));
+let transactionClient: unknown;
 
 vi.mock("@/lib/db", () => ({
   db: {
@@ -86,7 +88,7 @@ describe("auto-apply authorization", () => {
       nonceHash, expiresAt: expiresAt.toISOString(),
     });
     return {
-      id: "approval_1", status, nonceHash, resourceHash: "r".repeat(64), payload: material,
+      id: "approval_1", status, nonceHash, resourceHash: "r".repeat(64), payload: material, taskId: null,
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
       expiresAt, scopeHash, materialHash, answersHash,
     };
@@ -105,17 +107,20 @@ describe("auto-apply authorization", () => {
       company: "Acme", description: "Join the platform team with Acme. Build products.", source: "lever", url: input.applyUrl,
     });
     mocks.userFindUnique.mockResolvedValue({ accountStatus: "active" });
+    mocks.approvalLock.mockResolvedValue([{ id: "approval_1" }]);
+    transactionClient = {
+      applicationTask: { findFirst: mocks.txTaskFindFirst, updateMany: mocks.txTaskUpdateMany },
+      resume: { findFirst: mocks.resumeFindFirst },
+      coverLetter: { findFirst: mocks.coverLetterFindFirst },
+      job: { updateMany: mocks.jobUpdateMany },
+      applicationTaskEvent: { findMany: mocks.txTaskEventFindMany, create: mocks.txTaskEventCreate },
+      agentOutbox: { findUnique: mocks.outboxFindUnique, create: mocks.outboxCreate },
+      activity: { create: mocks.txActivityCreate },
+      $queryRaw: mocks.approvalLock,
+    };
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
       if (typeof callback === "function") {
-        const result = await callback({
-          applicationTask: { findFirst: mocks.txTaskFindFirst, updateMany: mocks.txTaskUpdateMany },
-          resume: { findFirst: mocks.resumeFindFirst },
-          coverLetter: { findFirst: mocks.coverLetterFindFirst },
-          job: { updateMany: mocks.jobUpdateMany },
-          applicationTaskEvent: { findMany: mocks.txTaskEventFindMany, create: mocks.txTaskEventCreate },
-          agentOutbox: { findUnique: mocks.outboxFindUnique, create: mocks.outboxCreate },
-          activity: { create: mocks.txActivityCreate },
-        });
+        const result = await callback(transactionClient);
         mocks.transactionCommit();
         return result;
       }
@@ -241,6 +246,8 @@ describe("auto-apply authorization", () => {
     const outbox = mocks.outboxCreate.mock.calls[0]?.[0]?.data;
     const event = mocks.txTaskEventCreate.mock.calls[0]?.[0]?.data?.data;
     mocks.approvalFindFirst.mockResolvedValueOnce({ ...approval, status: "consumed" });
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", workerTaskId: first.taskId,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.txTaskFindFirst.mockResolvedValueOnce({ status, checkpoint, workerTaskId: first.taskId,
       resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.outboxFindUnique.mockResolvedValueOnce(outbox);
@@ -252,6 +259,99 @@ describe("auto-apply authorization", () => {
     expect(mocks.txTaskEventCreate).toHaveBeenCalledTimes(1);
     expect(mocks.outboxCreate).toHaveBeenCalledTimes(1);
     expect(mocks.txActivityCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("recovers an approved replay once and resolves concurrent requests to its deterministic intent", async () => {
+    const approval = await makeApproval();
+    mocks.approvalFindFirst.mockResolvedValue(approval);
+    const current: Record<string, unknown> = { status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null };
+    let outbox: unknown = null;
+    const events: unknown[] = [];
+    let transactionQueue = Promise.resolve();
+    mocks.txTaskFindFirst.mockImplementation(async () => ({ ...current }));
+    mocks.txTaskUpdateMany.mockImplementation(async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+      if (where.status !== current.status || where.checkpoint !== current.checkpoint || where.workerTaskId !== current.workerTaskId) return { count: 0 };
+      Object.assign(current, data);
+      return { count: 1 };
+    });
+    mocks.outboxFindUnique.mockImplementation(async () => outbox);
+    mocks.outboxCreate.mockImplementation(async ({ data }: { data: unknown }) => { outbox = data; return data; });
+    mocks.txTaskEventFindMany.mockImplementation(async () => events);
+    mocks.txTaskEventCreate.mockImplementation(async ({ data }: { data: { data: unknown } }) => { events.push({ data: data.data }); return {}; });
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+      const previous = transactionQueue;
+      let release!: () => void;
+      transactionQueue = new Promise<void>(resolve => { release = resolve; });
+      await previous;
+      try { const result = await callback(transactionClient); mocks.transactionCommit(); return result; }
+      finally { release(); }
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    const results = await Promise.all([
+      queueAutonomousApplication({ ...input, replayOnly: true }),
+      queueAutonomousApplication({ ...input, replayOnly: true }),
+    ]);
+
+    expect(results[0]).toEqual(results[1]);
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.txTaskEventCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.outboxCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.approvalLock).toHaveBeenCalledTimes(1);
+    expect(mocks.outboxCreate.mock.calls[0]?.[0]?.data.payload.submitPayload.applyUrl).toBe(input.applyUrl);
+    expect(mocks.jobUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ url: input.applyUrl }) }));
+    expect(mocks.runtimeFeatureEnabled).toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a consumed approval when no submit intent exists", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(await makeApproval(null, materialSnapshot(), "consumed"));
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.approvalLock).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects an expired approved receipt before replay can create a missing intent", async () => {
+    const approval = await makeApproval();
+    approval.expiresAt = new Date(Date.now() - 60_000);
+    approval.scopeHash = await hashApprovalScope({
+      userId: input.userId, sessionId: approval.sessionId, turnId: approval.turnId, jobId: input.jobId,
+      toolCallId: approval.toolCallId, action: "submit_application", resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash, revision: approval.revision,
+      nonceHash: approval.nonceHash, expiresAt: approval.expiresAt.toISOString(),
+    });
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("approval expired");
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rolls back task and job claims when the transaction cannot lock the approved receipt", async () => {
+    mocks.approvalLock.mockResolvedValueOnce([]);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("receipt changed");
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.transactionCommit).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.txActivityCreate).not.toHaveBeenCalled();
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
@@ -267,6 +367,8 @@ describe("auto-apply authorization", () => {
     const outbox = mocks.outboxCreate.mock.calls[0]?.[0]?.data;
     const event = mocks.txTaskEventCreate.mock.calls[0]?.[0]?.data?.data;
     mocks.approvalFindFirst.mockResolvedValueOnce(consumedApproval);
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", workerTaskId: state.workerTaskId ?? first.taskId,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.txTaskFindFirst.mockResolvedValueOnce({ ...state, workerTaskId: state.workerTaskId ?? first.taskId,
       resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.outboxFindUnique.mockResolvedValueOnce(outbox);
@@ -373,12 +475,78 @@ describe("auto-apply authorization", () => {
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   })
 
-  it("rolls back the task claim when the canonical Job transition loses its race", async () => {
-    mocks.jobUpdateMany.mockResolvedValueOnce({ count: 0 });
+  it("restores task, Job, event, and outbox state when a post-outbox transaction write fails", async () => {
+    type ProducerState = { task: Record<string, unknown>; job: Record<string, unknown>; events: unknown[]; outbox: unknown[] };
+    const state: ProducerState = {
+      task: { id: "application_1", userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_1",
+        status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null, resumeId: "resume_1",
+        coverLetterId: null, confirmedAnswers: null, question: null },
+      job: { id: "job_1", userId: "user_1", url: input.applyUrl, status: "saved", workflowState: "ready_to_apply" },
+      events: [], outbox: [],
+    };
+    const taskBefore = structuredClone(state.task), jobBefore = structuredClone(state.job);
+    let taskWrites = 0, jobWrites = 0, eventWrites = 0, outboxWrites = 0, activityWrites = 0;
+    const tx = {
+      applicationTask: {
+        findFirst: async () => structuredClone(state.task),
+        updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+          if (where.status !== state.task.status || where.checkpoint !== state.task.checkpoint || where.workerTaskId !== state.task.workerTaskId) return { count: 0 };
+          taskWrites++; Object.assign(state.task, data); return { count: 1 };
+        },
+      },
+      resume: { findFirst: async () => ({ id: "resume_1" }) },
+      coverLetter: { findFirst: async () => ({ id: "cover_1" }) },
+      job: { updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        if (where.url !== state.job.url || where.workflowState !== state.job.workflowState) return { count: 0 };
+        jobWrites++; Object.assign(state.job, data); return { count: 1 };
+      } },
+      applicationTaskEvent: {
+        findMany: async () => state.events,
+        create: async ({ data }: { data: unknown }) => { eventWrites++; state.events.push(structuredClone(data)); return data; },
+      },
+      agentOutbox: {
+        findUnique: async () => null,
+        create: async ({ data }: { data: unknown }) => { outboxWrites++; state.outbox.push(structuredClone(data)); return data; },
+      },
+      activity: { create: async () => { activityWrites++; throw new Error("post-outbox write failed"); } },
+      $queryRaw: mocks.approvalLock,
+    };
+    mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+      const before: ProducerState = structuredClone(state);
+      try {
+        const result = await callback(tx);
+        mocks.transactionCommit();
+        return result;
+      } catch (error) {
+        state.task = before.task; state.job = before.job; state.events = before.events; state.outbox = before.outbox;
+        throw error;
+      }
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("post-outbox write failed");
+
+    expect(taskWrites).toBe(1);
+    expect(jobWrites).toBe(1);
+    expect(eventWrites).toBe(1);
+    expect(outboxWrites).toBe(1);
+    expect(activityWrites).toBe(1);
+    expect(state.task).toEqual(taskBefore);
+    expect(state.job).toEqual(jobBefore);
+    expect(state.events).toEqual([]);
+    expect(state.outbox).toEqual([]);
+    expect(mocks.transactionCommit).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rolls back the task claim when the canonical Job URL changes after the request snapshot", async () => {
+    const changedUrl = "https://jobs.lever.co/acme/changed";
+    mocks.jobUpdateMany.mockImplementationOnce(async ({ where }: { where: Record<string, unknown> }) => ({ count: where.url === changedUrl ? 1 : 0 }));
     const { queueAutonomousApplication } = await import("./auto-apply");
 
     await expect(queueAutonomousApplication(input)).rejects.toThrow("no longer ready");
     expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.jobUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ url: input.applyUrl }) }));
     expect(mocks.transactionCommit).not.toHaveBeenCalled();
     expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
     expect(mocks.outboxCreate).not.toHaveBeenCalled();
