@@ -26,9 +26,26 @@ vi.mock("bullmq", () => ({
 
 import {
   closeApplyQueueClient,
+  createSubmitIntent,
   enqueueApplyTask,
+  isReplayableSubmitState,
+  resolveExistingSubmitIntent,
   verifyAndCancelSubmissionJob,
 } from "./apply-queue-client";
+
+const submitPayload = {
+  applicationTaskId: "task-1",
+  jobId: "job-1",
+  userId: "user-1",
+  applyUrl: "https://jobs.example/apply",
+  personaId: "server-side",
+  resumePath: "",
+  operation: "submit" as const,
+  sessionId: "session-1",
+  fillTurnId: "turn-1",
+  receiptId: "approval-1",
+  constraintHash: "hash-1",
+};
 
 const workerTaskId = "submit-queue-job-1";
 const expected: ApplyQueueSubmissionIdentity = {
@@ -233,5 +250,108 @@ describe("apply queue submission recovery check", () => {
       expect.objectContaining({ sessionId: expected.sessionId, fillTurnId: expected.fillTurnId }),
       expect.any(Object),
     );
+  });
+
+  it("creates a stable submit intent from the exact application attempt identity", () => {
+    const intent = createSubmitIntent(submitPayload);
+    const repeated = createSubmitIntent({ ...submitPayload });
+
+    expect(intent).toEqual(repeated);
+    expect(intent.payload).toMatchObject({
+      applicationTaskId: submitPayload.applicationTaskId,
+      userId: submitPayload.userId,
+      jobId: submitPayload.jobId,
+      sessionId: submitPayload.sessionId,
+      fillTurnId: submitPayload.fillTurnId,
+      receiptId: submitPayload.receiptId,
+      constraintHash: submitPayload.constraintHash,
+      submitPayload,
+    });
+    expect(intent.payload.workerTaskId).toMatch(/^apply-submit-[a-f0-9]{64}$/);
+  });
+
+  it("resolves a persisted submit intent only when both outbox and event identities match", async () => {
+    const intent = createSubmitIntent(submitPayload);
+    const identity = intent.payload;
+    const queuedEvent = {
+      applicationTaskId: identity.applicationTaskId,
+      userId: identity.userId,
+      jobId: identity.jobId,
+      sessionId: identity.sessionId,
+      fillTurnId: identity.fillTurnId,
+      approvalId: identity.receiptId,
+      receiptId: identity.receiptId,
+      constraintHash: identity.constraintHash,
+      workerTaskId: identity.workerTaskId,
+    };
+    const findUnique = vi.fn().mockResolvedValue(intent);
+    const findMany = vi.fn().mockResolvedValue([{ data: queuedEvent }]);
+    const tx = {
+      agentOutbox: { findUnique },
+      applicationTaskEvent: { findMany },
+    } as unknown as Parameters<typeof resolveExistingSubmitIntent>[0];
+
+    await expect(resolveExistingSubmitIntent(tx, intent)).resolves.toBe(identity.workerTaskId);
+    expect(findUnique).toHaveBeenCalledWith({ where: { idempotencyKey: intent.idempotencyKey } });
+    expect(findMany).toHaveBeenCalledWith({
+      where: { taskId: submitPayload.applicationTaskId, type: "submission_queued" }, select: { data: true },
+    });
+    expect(findUnique).toHaveBeenCalledTimes(1);
+    expect(findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a changed outbox identity or submission event", async () => {
+    const intent = createSubmitIntent(submitPayload);
+    const identity = intent.payload;
+    const queuedEvent = {
+      applicationTaskId: identity.applicationTaskId,
+      userId: identity.userId,
+      jobId: identity.jobId,
+      sessionId: identity.sessionId,
+      fillTurnId: identity.fillTurnId,
+      approvalId: identity.receiptId,
+      receiptId: identity.receiptId,
+      constraintHash: identity.constraintHash,
+      workerTaskId: identity.workerTaskId,
+    };
+    const findUnique = vi.fn();
+    const findMany = vi.fn();
+    const tx = {
+      agentOutbox: { findUnique },
+      applicationTaskEvent: { findMany },
+    } as unknown as Parameters<typeof resolveExistingSubmitIntent>[0];
+
+    findUnique.mockResolvedValueOnce({
+      ...intent,
+      payload: { ...intent.payload, fillTurnId: "another-turn" },
+    });
+    findMany.mockResolvedValueOnce([{ data: queuedEvent }]);
+    await expect(resolveExistingSubmitIntent(tx, intent)).rejects.toThrow("conflicts with the current approved attempt");
+
+    findUnique.mockResolvedValueOnce(intent);
+    findMany.mockResolvedValueOnce([{ data: { ...queuedEvent, receiptId: "another-approval" } }]);
+    await expect(resolveExistingSubmitIntent(tx, intent)).rejects.toThrow("conflicts with the current approved attempt");
+  });
+
+  it.each([
+    ["filling", "submission_authorized"],
+    ["filling", "browser_active"],
+    ["filling", "submission_request_started"],
+    ["submitted", "submission_verified"],
+    ["failed", "execution_failed"],
+    ["failed", "submission_blocked"],
+    ["failed", "worker_failed"],
+  ])("allows replay for %s at %s", (status, checkpoint) => {
+    expect(isReplayableSubmitState(status, checkpoint)).toBe(true);
+  });
+
+  it.each([
+    ["waiting_for_user", "submission_uncertain"],
+    ["filling", "form_filled"],
+    ["submitted", "submission_request_started"],
+    ["failed", "unknown_failure"],
+    ["filling", null],
+  ])("rejects replay for %s at %s", (status, checkpoint) => {
+    expect(isReplayableSubmitState(status, checkpoint)).toBe(false);
   });
 });

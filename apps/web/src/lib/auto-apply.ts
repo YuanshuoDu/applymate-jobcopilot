@@ -1,60 +1,13 @@
-import { createHash } from "node:crypto";
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
+import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobcopilot/agent-protocol";
 import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
-import { enqueueApplyTask } from "@/lib/apply-queue-client";
+import { createSubmitIntent, enqueueApplyTask, isReplayableSubmitState, resolveExistingSubmitIntent } from "@/lib/apply-queue-client";
 import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
 import { applicationFillTaskGraphEnabled, asRecord, assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, AutoApplyError, validateAutoApplyUrl } from "./auto-apply-guards";
 
 export { AutoApplyError, applicationFillTaskGraphEnabled, validateAutoApplyUrl } from "./auto-apply-guards";
-
-function createSubmitIntent(submitPayload: ApplyTaskSubmitPayload) {
-  const digest = createHash("sha256").update(JSON.stringify([
-    submitPayload.applicationTaskId, submitPayload.fillTurnId, submitPayload.receiptId,
-  ]) ?? "").digest("hex");
-  const workerTaskId = "apply-submit-" + digest;
-  return {
-    id: "application-submit-outbox-" + digest,
-    topic: "application.submit.dispatch",
-    aggregateId: submitPayload.sessionId,
-    idempotencyKey: "application-submit:" + digest,
-    payload: {
-      applicationTaskId: submitPayload.applicationTaskId, userId: submitPayload.userId,
-      jobId: submitPayload.jobId, sessionId: submitPayload.sessionId, fillTurnId: submitPayload.fillTurnId,
-      receiptId: submitPayload.receiptId, constraintHash: submitPayload.constraintHash, workerTaskId, submitPayload,
-    },
-  };
-}
-
-function matchesSubmitIntent(value: unknown, expected: ReturnType<typeof createSubmitIntent>): boolean {
-  const row = asRecord(value), payload = asRecord(row.payload), identity = expected.payload;
-  return row.id === expected.id && row.topic === expected.topic && row.aggregateId === expected.aggregateId &&
-    row.idempotencyKey === expected.idempotencyKey && payload.applicationTaskId === identity.applicationTaskId &&
-    payload.userId === identity.userId && payload.jobId === identity.jobId && payload.sessionId === identity.sessionId &&
-    payload.fillTurnId === identity.fillTurnId && payload.receiptId === identity.receiptId &&
-    payload.constraintHash === identity.constraintHash && payload.workerTaskId === identity.workerTaskId &&
-    matchesApplyTaskSubmitPayload(payload.submitPayload, identity);
-}
-
-function matchesSubmitEvent(value: unknown, expected: ReturnType<typeof createSubmitIntent>): boolean {
-  const event = asRecord(value), identity = expected.payload;
-  return event.applicationTaskId === identity.applicationTaskId && event.userId === identity.userId &&
-    event.jobId === identity.jobId && event.sessionId === identity.sessionId && event.fillTurnId === identity.fillTurnId &&
-    event.approvalId === identity.receiptId && event.receiptId === identity.receiptId &&
-    event.constraintHash === identity.constraintHash && event.workerTaskId === identity.workerTaskId;
-}
-
-async function resolveExistingSubmitIntent(tx: Prisma.TransactionClient, intent: ReturnType<typeof createSubmitIntent>): Promise<string> {
-  const [outbox, events] = await Promise.all([
-    tx.agentOutbox.findUnique({ where: { idempotencyKey: intent.idempotencyKey } }),
-    tx.applicationTaskEvent.findMany({ where: { taskId: intent.payload.applicationTaskId, type: "submission_queued" }, select: { data: true } }),
-  ]);
-  if (!matchesSubmitIntent(outbox, intent) || !events.some(event => matchesSubmitEvent(event.data, intent))) {
-    throw new AutoApplyError("The existing submit intent conflicts with the current approved attempt.");
-  }
-  return intent.payload.workerTaskId;
-}
 
 /** Dispatches the safe first browser pass: fill fields, then stop for review. */
 export async function queueApplicationFill(input: {
@@ -135,14 +88,19 @@ export async function queueAutonomousApplication(input: {
   approvalId: string;
   receiptNonce?: string;
   sessionId?: string;
+  /** Read-only replay of an already persisted submit intent. */
+  replayOnly?: boolean;
 }): Promise<{ taskId: string }> {
   await assertActiveAccount(input.userId)
-  await assertUnattendedApplyEnabled(input.userId)
-  const applyUrl = validateAutoApplyUrl(input.applyUrl);
-  await assertJobPreflight(input)
+  if (!input.replayOnly) await assertUnattendedApplyEnabled(input.userId)
+  const applyUrl = input.replayOnly ? "" : validateAutoApplyUrl(input.applyUrl);
+  if (!input.replayOnly) await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({
-    where: { id: input.approvalId, userId: input.userId, status: "approved", type: "submit_application" },
-    select: { id: true, payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true, materialHash: true, answersHash: true },
+    where: {
+      id: input.approvalId, userId: input.userId, type: "submit_application",
+      status: input.replayOnly ? { in: ["approved", "consumed"] } : "approved",
+    },
+    select: { id: true, payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true, nonceHash: true, resourceHash: true, materialHash: true, answersHash: true },
   });
   const payload = asRecord(approval?.payload);
   const taskSnapshot = await db.applicationTask.findFirst({
@@ -157,6 +115,17 @@ export async function queueAutonomousApplication(input: {
   };
   const snapshotMaterialHash = await hashAgentReceiptValue("material", material);
   const snapshotAnswersHash = await hashAgentReceiptValue("answers", taskSnapshot?.confirmedAnswers ?? null);
+  let replayReceiptValid = !input.replayOnly;
+  if (input.replayOnly && approval && input.receiptNonce && approval.nonceHash && approval.resourceHash && approval.materialHash && approval.answersHash && approval.expiresAt && approval.sessionId && approval.turnId && approval.toolCallId && approval.jobId) {
+    const scope: ApprovalScope = {
+      userId: input.userId, sessionId: approval.sessionId, turnId: approval.turnId, jobId: approval.jobId,
+      toolCallId: approval.toolCallId, action: "submit_application", resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash, revision: approval.revision,
+      nonceHash: approval.nonceHash, expiresAt: approval.expiresAt.toISOString(),
+    };
+    replayReceiptValid = approval.nonceHash === await hashApprovalNonce(input.receiptNonce) &&
+      approval.scopeHash === await hashApprovalScope(scope);
+  }
   if (!approval || !taskSnapshot?.sessionId || !taskSnapshot.fillTurnId ||
     (input.sessionId && input.sessionId !== taskSnapshot.sessionId) || approval.sessionId !== taskSnapshot.sessionId ||
     approval.turnId !== taskSnapshot.fillTurnId || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
@@ -164,14 +133,14 @@ export async function queueAutonomousApplication(input: {
     ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
     approval.materialHash !== snapshotMaterialHash || approval.answersHash !== snapshotAnswersHash ||
     !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
-    !approval.scopeHash || !input.receiptNonce) {
+    !approval.scopeHash || !input.receiptNonce || !replayReceiptValid) {
     throw new AutoApplyError("A current, explicit approval is required before this application can be submitted.");
   }
   const receiptSessionId = taskSnapshot.sessionId;
   const fillTurnId = taskSnapshot.fillTurnId;
 
   try {
-    requireLegacyPolicy({
+    if (!input.replayOnly) requireLegacyPolicy({
       userId: input.userId, sessionId: receiptSessionId, turnId: approval.turnId,
       stepId: `submit:${input.applicationTaskId}`, toolCallId: approval.toolCallId, toolName: "application.submit",
       domain: "application", risk: "external_write", capabilities: ["read", "write", "external_write"],
@@ -201,7 +170,11 @@ export async function queueAutonomousApplication(input: {
     if (!current) return false;
     if (current.resumeId !== material.resumeId || current.coverLetterId !== material.coverLetterId ||
       JSON.stringify(current.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot.confirmedAnswers ?? null)) return false;
-    if (current.workerTaskId === intent.payload.workerTaskId) return resolveExistingSubmitIntent(tx, intent);
+    if (current.workerTaskId === intent.payload.workerTaskId) {
+      if (!isReplayableSubmitState(current.status, current.checkpoint)) return false;
+      return resolveExistingSubmitIntent(tx, intent);
+    }
+    if (input.replayOnly) return false;
     if (current.status !== "waiting_for_authorization" || current.checkpoint !== "form_filled" || !current.resumeId || current.question !== null) return false;
 
     const resume = await tx.resume.findFirst({
@@ -219,8 +192,9 @@ export async function queueAutonomousApplication(input: {
       data: { status: "filling", checkpoint: "submission_authorized", question: Prisma.DbNull, workerTaskId: intent.payload.workerTaskId, startedAt: new Date() },
     });
     if (claim.count !== 1) {
-      const raced = await tx.applicationTask.findFirst({ where: taskWhere, select: { workerTaskId: true } });
-      return raced?.workerTaskId === intent.payload.workerTaskId ? resolveExistingSubmitIntent(tx, intent) : false;
+      const raced = await tx.applicationTask.findFirst({ where: taskWhere, select: { workerTaskId: true, status: true, checkpoint: true } });
+      return raced?.workerTaskId === intent.payload.workerTaskId && isReplayableSubmitState(raced.status, raced.checkpoint)
+        ? resolveExistingSubmitIntent(tx, intent) : false;
     }
     const job = await tx.job.updateMany({
       where: { id: input.jobId, userId: input.userId, status: "saved", workflowState: "ready_to_apply" },

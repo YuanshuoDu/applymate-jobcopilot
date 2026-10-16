@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Prisma } from "@prisma/client";
+import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol";
 import { hashAgentReceiptValue } from "@jobcopilot/shared";
 
 const mocks = vi.hoisted(() => ({
@@ -44,7 +45,10 @@ vi.mock("@/lib/db", () => ({
   },
 }));
 
-vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
+vi.mock("@/lib/apply-queue-client", async importOriginal => ({
+  ...(await importOriginal<typeof import("@/lib/apply-queue-client")>()),
+  enqueueApplyTask: mocks.enqueueApplyTask,
+}));
 vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
 vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement, isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }));
 vi.mock("@/lib/agent/control-plane/commands/agent-command-service", () => ({
@@ -73,14 +77,20 @@ describe("auto-apply authorization", () => {
     resumeId: "resume_1",
     coverLetterId: null,
   });
-  const makeApproval = async (confirmedAnswers: unknown = null, material: MaterialSnapshot = materialSnapshot()) => ({
-    id: "approval_1",
-    payload: material,
-    sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
-    expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
-    materialHash: await hashAgentReceiptValue("material", material),
-    answersHash: await hashAgentReceiptValue("answers", confirmedAnswers ?? null),
-  });
+  const makeApproval = async (confirmedAnswers: unknown = null, material: MaterialSnapshot = materialSnapshot(), status = "approved") => {
+    const expiresAt = new Date(Date.now() + 60_000), nonceHash = await hashApprovalNonce(input.receiptNonce!);
+    const materialHash = await hashAgentReceiptValue("material", material), answersHash = await hashAgentReceiptValue("answers", confirmedAnswers ?? null);
+    const scopeHash = await hashApprovalScope({
+      userId: input.userId, sessionId: "session_1", turnId: "turn_1", jobId: "job_1", toolCallId: "call_1",
+      action: "submit_application", resourceHash: "r".repeat(64), materialHash, answersHash, revision: 0,
+      nonceHash, expiresAt: expiresAt.toISOString(),
+    });
+    return {
+      id: "approval_1", status, nonceHash, resourceHash: "r".repeat(64), payload: material,
+      sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
+      expiresAt, scopeHash, materialHash, answersHash,
+    };
+  };
 
   beforeEach(async () => {
     vi.resetModules();
@@ -217,6 +227,87 @@ describe("auto-apply authorization", () => {
     await expect(queueAutonomousApplication(input)).resolves.toEqual(first);
     expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
     expect(mocks.outboxCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["after the Worker claims it", "filling", "browser_active"],
+    ["after the Worker verifies submission", "submitted", "submission_verified"],
+  ] as const)("replays the committed intent %s without another dispatch", async (_stage, status, checkpoint) => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    const approval = await makeApproval();
+    mocks.approvalFindFirst.mockResolvedValue(approval);
+    const first = await queueAutonomousApplication(input);
+    const outbox = mocks.outboxCreate.mock.calls[0]?.[0]?.data;
+    const event = mocks.txTaskEventCreate.mock.calls[0]?.[0]?.data?.data;
+    mocks.approvalFindFirst.mockResolvedValueOnce({ ...approval, status: "consumed" });
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ status, checkpoint, workerTaskId: first.taskId,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.outboxFindUnique.mockResolvedValueOnce(outbox);
+    mocks.txTaskEventFindMany.mockResolvedValueOnce([{ data: event }]);
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).resolves.toEqual(first);
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1);
+    expect(mocks.txTaskEventCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.outboxCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.txActivityCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["uncertain outcome", { status: "waiting_for_user", checkpoint: "submission_uncertain", workerTaskId: null }],
+    ["another attempt", { status: "filling", checkpoint: "browser_active", workerTaskId: "apply-submit-other" }],
+  ] as const)("fails closed when the persisted attempt is in an %s state", async (_name, state) => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+    const approval = await makeApproval();
+    mocks.approvalFindFirst.mockResolvedValue(approval);
+    const first = await queueAutonomousApplication(input);
+    const consumedApproval = { ...approval, status: "consumed" };
+    const outbox = mocks.outboxCreate.mock.calls[0]?.[0]?.data;
+    const event = mocks.txTaskEventCreate.mock.calls[0]?.[0]?.data?.data;
+    mocks.approvalFindFirst.mockResolvedValueOnce(consumedApproval);
+    mocks.txTaskFindFirst.mockResolvedValueOnce({ ...state, workerTaskId: state.workerTaskId ?? first.taskId,
+      resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.outboxFindUnique.mockResolvedValueOnce(outbox);
+    mocks.txTaskEventFindMany.mockResolvedValueOnce([{ data: event }]);
+    mocks.txTaskUpdateMany.mockClear();
+    mocks.jobUpdateMany.mockClear();
+    mocks.txTaskEventCreate.mockClear();
+    mocks.outboxCreate.mockClear();
+    mocks.txActivityCreate.mockClear();
+    mocks.enqueueApplyTask.mockClear();
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("no longer ready");
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("scopes a committed-intent replay lookup to the authenticated user", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(null);
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication({ ...input, userId: "user_other", replayOnly: true })).rejects.toThrow("explicit approval");
+    expect(mocks.approvalFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "approval_1", userId: "user_other", status: { in: ["approved", "consumed"] } }),
+    }));
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects a replay with a stale fill Turn or receipt nonce before opening the transaction", async () => {
+    const approval = await makeApproval(null, materialSnapshot(), "consumed");
+    mocks.approvalFindFirst.mockResolvedValueOnce({ ...approval, turnId: "turn_old" });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication({ ...input, replayOnly: true })).rejects.toThrow("explicit approval");
+    expect(mocks.transaction).not.toHaveBeenCalled();
+
+    mocks.approvalFindFirst.mockResolvedValueOnce(approval);
+    await expect(queueAutonomousApplication({ ...input, receiptNonce: "wrong_nonce", replayOnly: true })).rejects.toThrow("explicit approval");
+    expect(mocks.transaction).not.toHaveBeenCalled();
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 

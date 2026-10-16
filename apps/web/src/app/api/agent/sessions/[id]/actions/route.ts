@@ -4,12 +4,11 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { applicationFillTaskGraphEnabled, queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-apply"
 import { resolveLegacyApproval } from "@/lib/agent/approval/legacy-receipt"
 import { updateAgentSession } from "@/lib/agent/session/repository"
-import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
 import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements"
 import {
-  applicationPayload, approvalPolicyInput, approvalTitle, canonicalApprovalResponse, legacyApprovalErrorResponse,
-  policyErrorResponse, readBody, safeEventFields, serializeEvent, type ScopedApproval,
+  approvalActionPolicyError, applicationPayload, approvalTitle, canonicalApprovalResponse, legacyApprovalErrorResponse,
+  readBody, replayConsumedSubmitApproval, safeEventFields, serializeEvent, type ScopedApproval,
 } from "@/lib/agent/session-actions/support"
 import {
   consumeReceiptForApproval, handleApprovedResumeTailoring, handleConfirmedTailoredResume,
@@ -46,6 +45,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       },
     })
     if (!approval) {
+      if (action.decision === "approved" && action.receiptNonce) {
+        const replay = await replayConsumedSubmitApproval({
+          sessionId: id, userId: auth.userId, approvalId: action.approvalId, receiptNonce: action.receiptNonce,
+        })
+        if (replay) return replay
+      }
       if (action.decision === "approved" && applicationFillTaskGraphEnabled()) {
         const prior = await db.agentApproval.findFirst({
           where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "approved", type: "review_application" },
@@ -75,27 +80,8 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       return err("Approval is no longer pending", 409)
     }
 
-    const policy = approvalPolicyInput(approval)
-    try {
-      requireLegacyPolicy({
-        userId: auth.userId,
-        sessionId: id,
-        turnId: approval.turnId ?? "legacy-approval:" + action.approvalId,
-        stepId: "approval:" + action.approvalId,
-        toolCallId: approval.toolCallId ?? "approval:" + action.approvalId,
-        toolName: policy.toolName,
-        domain: policy.domain,
-        risk: action.decision === "approved" ? policy.risk : "internal_write",
-        capabilities: policy.capabilities,
-        input: {
-          requiresReceipt: action.decision === "approved",
-          receiptValidated: Boolean(action.receiptNonce),
-          unknownSensitiveFacts: false,
-        },
-      })
-    } catch (error) {
-      return policyErrorResponse(error)
-    }
+    const policyError = approvalActionPolicyError(approval, action.decision, Boolean(action.receiptNonce), auth.userId, id)
+    if (policyError) return policyError
     if (action.decision === "approved" && !action.receiptNonce) return err("A scoped receipt is required to approve this action", 428)
     if (action.decision === "approved" && approval.type === "tailor_resume") {
       if (!(await isFeatureAllowed(auth.userId, "tailored_resume"))) return err("This feature is not included in your current plan", 403)

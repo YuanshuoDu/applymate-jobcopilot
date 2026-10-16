@@ -179,7 +179,6 @@ async function main() {
       });
     }
     applicationSubmitOutboxPublisher = applicationSubmitOutboxModule.startApplicationSubmitOutboxPublisher(pool, applyQueue);
-    console.log("[worker] Application submit outbox publisher started");
 
     console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
     console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);

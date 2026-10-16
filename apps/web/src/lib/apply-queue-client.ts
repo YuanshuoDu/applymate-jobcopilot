@@ -1,7 +1,66 @@
 import { Queue, type Job } from "bullmq";
 import { Redis } from "ioredis";
+import { createHash } from "node:crypto";
+import type { Prisma } from "@prisma/client";
+import { matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
+import { asRecord, AutoApplyError } from "./auto-apply-guards";
 
 type ApplyQueuePayload = EnqueueApplyInput;
+
+export function createSubmitIntent(submitPayload: ApplyTaskSubmitPayload) {
+  const digest = createHash("sha256").update(JSON.stringify([
+    submitPayload.applicationTaskId, submitPayload.fillTurnId, submitPayload.receiptId,
+  ]) ?? "").digest("hex");
+  const workerTaskId = "apply-submit-" + digest;
+  return {
+    id: "application-submit-outbox-" + digest,
+    topic: "application.submit.dispatch",
+    aggregateId: submitPayload.sessionId,
+    idempotencyKey: "application-submit:" + digest,
+    payload: {
+      applicationTaskId: submitPayload.applicationTaskId, userId: submitPayload.userId,
+      jobId: submitPayload.jobId, sessionId: submitPayload.sessionId, fillTurnId: submitPayload.fillTurnId,
+      receiptId: submitPayload.receiptId, constraintHash: submitPayload.constraintHash, workerTaskId, submitPayload,
+    },
+  };
+}
+
+type SubmitIntent = ReturnType<typeof createSubmitIntent>;
+
+function matchesSubmitIntent(value: unknown, expected: SubmitIntent): boolean {
+  const row = asRecord(value), payload = asRecord(row.payload), identity = expected.payload;
+  return row.id === expected.id && row.topic === expected.topic && row.aggregateId === expected.aggregateId &&
+    row.idempotencyKey === expected.idempotencyKey && payload.applicationTaskId === identity.applicationTaskId &&
+    payload.userId === identity.userId && payload.jobId === identity.jobId && payload.sessionId === identity.sessionId &&
+    payload.fillTurnId === identity.fillTurnId && payload.receiptId === identity.receiptId &&
+    payload.constraintHash === identity.constraintHash && payload.workerTaskId === identity.workerTaskId &&
+    matchesApplyTaskSubmitPayload(payload.submitPayload, identity);
+}
+
+function matchesSubmitEvent(value: unknown, expected: SubmitIntent): boolean {
+  const event = asRecord(value), identity = expected.payload;
+  return event.applicationTaskId === identity.applicationTaskId && event.userId === identity.userId &&
+    event.jobId === identity.jobId && event.sessionId === identity.sessionId && event.fillTurnId === identity.fillTurnId &&
+    event.approvalId === identity.receiptId && event.receiptId === identity.receiptId &&
+    event.constraintHash === identity.constraintHash && event.workerTaskId === identity.workerTaskId;
+}
+
+export async function resolveExistingSubmitIntent(tx: Prisma.TransactionClient, intent: SubmitIntent): Promise<string> {
+  const [outbox, events] = await Promise.all([
+    tx.agentOutbox.findUnique({ where: { idempotencyKey: intent.idempotencyKey } }),
+    tx.applicationTaskEvent.findMany({ where: { taskId: intent.payload.applicationTaskId, type: "submission_queued" }, select: { data: true } }),
+  ]);
+  if (!matchesSubmitIntent(outbox, intent) || !events.some(event => matchesSubmitEvent(event.data, intent))) {
+    throw new AutoApplyError("The existing submit intent conflicts with the current approved attempt.");
+  }
+  return intent.payload.workerTaskId;
+}
+
+export function isReplayableSubmitState(status: string, checkpoint: string | null): boolean {
+  return (status === "filling" && ["submission_authorized", "browser_active", "submission_request_started"].includes(checkpoint ?? "")) ||
+    (status === "submitted" && checkpoint === "submission_verified") ||
+    (status === "failed" && ["execution_failed", "submission_blocked", "worker_failed"].includes(checkpoint ?? ""));
+}
 
 let _queue: Queue<ApplyQueuePayload> | null = null;
 let _redis: Redis | null = null;

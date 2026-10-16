@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { hashApprovalNonce } from "@jobcopilot/agent-protocol"
 import { POST } from "./route"
 
 const mocks = vi.hoisted(() => ({
@@ -244,6 +245,7 @@ describe("agent session actions API", () => {
   it("returns the bound Turn for a replayed approval response after the approval is consumed", async () => {
     mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
     mocks.approvalFindFirst.mockReset()
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(approvalRecord({ type: "review_application", payload: { applicationTaskId: "task_1", jobId: "job_1" } }))
     mocks.applicationTaskFindFirst.mockResolvedValueOnce({ fillTurnId: "turn_fill_1" })
@@ -566,6 +568,53 @@ describe("agent session actions API", () => {
     }))
     expect(mocks.sessionUpdate).toHaveBeenCalledWith({ where: { id: "session_1" }, data: { status: "running", completedAt: null } })
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+  })
+
+  it("returns the persisted intent after its approval was consumed without replaying approval side effects", async () => {
+    const payload = { applicationTaskId: "task_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null }
+    const nonceHash = await hashApprovalNonce("nonce_1")
+    mocks.approvalFindFirst.mockReset()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(approvalRecord({ type: "submit_application", status: "consumed", payload, nonceHash }))
+    mocks.queueAutonomousApplication.mockResolvedValueOnce({ taskId: "apply-submit-original" })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({ queued: true, taskId: "apply-submit-original", duplicate: true })
+    expect(mocks.approvalFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: { id: "approval_1", sessionId: "session_1", userId: "user_1", status: { in: ["approved", "consumed"] }, type: "submit_application" },
+    }))
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledTimes(1)
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledWith({
+      userId: "user_1", jobId: "job_1", applyUrl: null, applicationTaskId: "task_1",
+      approvalId: "approval_1", receiptNonce: "nonce_1", sessionId: "session_1", replayOnly: true,
+    })
+    expect(mocks.resolveLegacyApproval).not.toHaveBeenCalled()
+    expect(mocks.validatePendingApprovalReceipt).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.approvalUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskEventCreate).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).not.toHaveBeenCalled()
+  })
+
+  it("does not replay a committed intent when the retry receipt nonce differs", async () => {
+    mocks.approvalFindFirst.mockReset()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(approvalRecord({ type: "submit_application", nonceHash: "0".repeat(64) }))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(409)
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+    expect(mocks.resolveLegacyApproval).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
   it.each(["transcript", "session"] as const)("reports queued success when the %s projection fails after queue resolution", async (failedProjection) => {
