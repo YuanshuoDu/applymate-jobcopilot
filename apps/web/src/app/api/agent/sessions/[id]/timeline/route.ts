@@ -54,6 +54,19 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
   if (!session) return sessionNotFound()
 
+  const targetItemId = new URL(request.url).searchParams.get("itemId")
+  if (targetItemId !== null) {
+    if (!safeItemId(targetItemId)) return ok({ items: [] })
+    const row = await db.agentItem.findFirst({
+      where: { id: targetItemId, sessionId },
+      select: {
+        id: true, sessionId: true, turnId: true, stepId: true, taskId: true, type: true, status: true,
+        phase: true, revision: true, content: true, startedAt: true, completedAt: true, createdAt: true, updatedAt: true,
+      },
+    })
+    return ok({ items: row ? [itemDto(row as ItemQueryRow)] : [] })
+  }
+
   const rows = await db.agentItem.findMany({
     where: { sessionId, ...afterCursor(page.cursor) },
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
@@ -78,6 +91,10 @@ export async function GET(request: NextRequest, context: RouteContext) {
       ...(approvalEvents.length > 0 ? { approvalEvents } : {}),
     } : {}),
   })
+}
+
+function safeItemId(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)
 }
 
 async function recentAgendas(sessionId: string) {

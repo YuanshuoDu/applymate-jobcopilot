@@ -12,6 +12,20 @@ export interface QuestionHydrationPump {
   current(): Promise<void> | null
 }
 
+export interface FinalItemHydrationPumpOptions {
+  sessionId: string
+  signal?: AbortSignal
+  hydrate: (itemId: string) => Promise<void>
+}
+
+export interface FinalItemHydrationPump {
+  request(value: unknown): void
+  pump(): void
+  current(): Promise<void> | null
+}
+
+const FINAL_ITEM_RETRY_DELAYS_MS = [250, 1_000] as const
+
 /** Queues strict live question stubs behind one targeted canonical snapshot request. */
 export function createQuestionHydrationPump(options: QuestionHydrationPumpOptions): QuestionHydrationPump {
   let current: Promise<void> | null = null
@@ -53,8 +67,101 @@ export function createQuestionHydrationPump(options: QuestionHydrationPumpOption
   }
 }
 
+/** Hydrates one canonical final item for each owned, same-session completion event. */
+export function createFinalItemHydrationPump(options: FinalItemHydrationPumpOptions): FinalItemHydrationPump {
+  let current: Promise<void> | null = null
+  let scheduled = false
+  const pending = new Set<string>()
+  const hydrating = new Set<string>()
+  const hydrated = new Set<string>()
+  const exhausted = new Set<string>()
+  const attempts = new Map<string, number>()
+  const retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  const cancelRetries = (): void => {
+    for (const timer of retryTimers.values()) clearTimeout(timer)
+    retryTimers.clear()
+    pending.clear()
+    attempts.clear()
+  }
+  options.signal?.addEventListener('abort', cancelRetries, { once: true })
+
+  const retry = (itemId: string): void => {
+    if (options.signal?.aborted) {
+      attempts.delete(itemId)
+      return
+    }
+    const attempt = attempts.get(itemId) ?? 0
+    const delay = FINAL_ITEM_RETRY_DELAYS_MS[attempt - 1]
+    if (delay === undefined) {
+      attempts.delete(itemId)
+      exhausted.add(itemId)
+      return
+    }
+    const timer = setTimeout(() => {
+      retryTimers.delete(itemId)
+      if (options.signal?.aborted) {
+        attempts.delete(itemId)
+        exhausted.add(itemId)
+        return
+      }
+      pending.add(itemId)
+      pump()
+    }, delay)
+    retryTimers.set(itemId, timer)
+  }
+
+  const pump = (): void => {
+    if (scheduled || current || pending.size === 0 || options.signal?.aborted) return
+    scheduled = true
+    queueMicrotask(() => {
+      scheduled = false
+      if (current || pending.size === 0 || options.signal?.aborted) return
+      const batch = [...pending]
+      pending.clear()
+      batch.forEach(itemId => hydrating.add(itemId))
+      current = (async () => {
+        await Promise.all(batch.map(async itemId => {
+          attempts.set(itemId, (attempts.get(itemId) ?? 0) + 1)
+          try {
+            await options.hydrate(itemId)
+            if (!options.signal?.aborted) hydrated.add(itemId)
+          } catch {
+            retry(itemId)
+          } finally {
+            hydrating.delete(itemId)
+            if (hydrated.has(itemId)) attempts.delete(itemId)
+          }
+        }))
+        current = null
+        pump()
+      })()
+    })
+  }
+
+  return {
+    request(value: unknown): void {
+      const itemId = finalItemIdFromCompletion(value, options.sessionId)
+      if (!itemId || options.signal?.aborted || hydrated.has(itemId) || exhausted.has(itemId) ||
+        hydrating.has(itemId) || retryTimers.has(itemId)) return
+      pending.add(itemId)
+      pump()
+    },
+    pump,
+    current: () => current,
+  }
+}
+
 export function filterQuestionHydrationValues(values: readonly unknown[], sessionId: string): unknown[] {
   return values.filter(value => belongsToSession(value, sessionId))
+}
+
+function finalItemIdFromCompletion(value: unknown, sessionId: string): string | null {
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.type !== 'turn.completed' || event.actor !== 'orchestrator' || event.sessionId !== sessionId ||
+    !safeId(event.id) || !safeId(event.turnId) || !safeId(event.itemId) || !isRecord(event.payload)) return null
+  const finalItemId = event.payload.finalItemId
+  return safeId(finalItemId) && finalItemId === event.itemId ? finalItemId : null
 }
 
 function questionStubKey(value: unknown, sessionId: string): string | null {

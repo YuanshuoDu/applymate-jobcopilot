@@ -44,6 +44,14 @@ function canonicalItemEvent(sequence: string, itemId: string, turnId: string, ty
   })
 }
 
+function turnCompletedEvent(sequence: string, eventId: string, itemId: string | null, overrides: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    schemaVersion: 'agent-harness.v2', id: eventId, sessionId: 'session-1', turnId: 'turn-final', itemId, taskId: null,
+    type: 'turn.completed', actor: 'orchestrator', sequence,
+    payload: { turnId: 'turn-final', taskId: 'root-task', finalItemId: itemId }, ...overrides,
+  })
+}
+
 function agendaEvent(overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: 'agent-harness.v2', id: 'agenda-7', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
@@ -146,6 +154,18 @@ describe('V2 timeline stream client', () => {
       '/api/agent/sessions/session-1/timeline?limit=1&cursor=next',
     ])
     expect(dispatch).toHaveBeenCalledWith({ type: 'hydrate', items: expect.any(Array) })
+  })
+
+  it('hydrates a single target item with one direct lookup and no timeline page scan', async () => {
+    const dispatch = vi.fn()
+    const target = { ...item('final-item', 2), status: 'completed', phase: 'final_answer', content: { text: 'Exact response.', summary: 'Advisory summary.' } }
+    const foreign = { ...target, id: 'final-item', sessionId: 'session-2' }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({ items: [foreign, target] })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher, targetItemId: 'final-item' })
+
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual(['/api/agent/sessions/session-1/timeline?itemId=final-item'])
+    expect(dispatch).toHaveBeenCalledWith({ type: 'hydrate', items: [target] })
   })
 
   it('hydrates the optional agenda through the canonical reducer so Brain state survives restore', async () => {
@@ -427,5 +447,43 @@ describe('V2 timeline stream client', () => {
     const withoutSource = (value: ReturnType<typeof selectTimelineItems>) => value.map(({ source, ...item }) => item)
     expect(withoutSource(selectTimelineItems(state))).toEqual(withoutSource(selectTimelineItems(replay)))
     expect(state.lastSequence).toBe('3')
+  })
+
+  it('hydrates one matching turn completion to the same safe final content as replay', async () => {
+    const controller = new AbortController()
+    let state: TimelineState = createTimelineState('session-1')
+    const finalItem = {
+      schemaVersion: 'agent-harness.v2', id: 'final-item', sessionId: 'session-1', turnId: 'turn-final', stepId: null, taskId: null,
+      type: 'agent_message', status: 'completed', phase: 'final_answer', revision: 2,
+      content: { text: 'The candidate response remains exact.', summary: 'Agent-reported advisory summary.' },
+      startedAt: '2026-09-02T00:00:00.000Z', completedAt: '2026-09-02T00:00:02.000Z',
+      createdAt: '2026-09-02T00:00:00.000Z', updatedAt: '2026-09-02T00:00:02.000Z',
+    }
+    const dispatch = (action: TimelineAction) => {
+      state = timelineReducer(state, action)
+      if (action.type === 'hydrate' && action.items.some(value => (value as { id?: string }).id === 'final-item')) controller.abort()
+    }
+    const events = [
+      turnCompletedEvent('1', 'mismatched-completion', 'other-item', { payload: { finalItemId: 'final-item' } }),
+      turnCompletedEvent('2', 'foreign-completion', 'foreign-item', { sessionId: 'session-2' }),
+      turnCompletedEvent('3', 'completion-1', 'final-item'),
+      turnCompletedEvent('4', 'completion-duplicate', 'final-item'),
+    ].map(data => `event: turn.completed\ndata: ${data}\n\n`).join('')
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+      .mockResolvedValueOnce(new Response(streamFrom(events), { headers: { 'Content-Type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [finalItem] })))
+
+    await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+
+    let replay = createTimelineState('session-1')
+    replay = timelineReducer(replay, { type: 'replay', items: [finalItem] })
+    expect(state.itemsById['final-item']?.content).toEqual(replay.itemsById['final-item']?.content)
+    expect(state.itemsById['final-item']?.content).toEqual({ text: 'The candidate response remains exact.', summary: 'Agent-reported advisory summary.' })
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/agent/sessions/session-1/timeline?limit=100',
+      '/api/agent/sessions/session-1/events',
+      '/api/agent/sessions/session-1/timeline?itemId=final-item',
+    ])
   })
 })

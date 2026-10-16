@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
+const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -10,7 +10,7 @@ vi.mock("@/lib/api-helpers", () => ({
 
 vi.mock("@/lib/db", () => ({ db: {
   agentSession: { findFirst: mocks.sessionFindFirst },
-  agentItem: { findMany: mocks.itemFindMany },
+  agentItem: { findFirst: mocks.itemFindFirst, findMany: mocks.itemFindMany },
   agentEvent: { findMany: mocks.agendaFindMany },
 } }))
 
@@ -93,10 +93,12 @@ describe("agent timeline query API", () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.sessionFindFirst.mockReset()
+    mocks.itemFindFirst.mockReset()
     mocks.itemFindMany.mockReset()
     mocks.agendaFindMany.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
+    mocks.itemFindFirst.mockResolvedValue(null)
     mocks.itemFindMany.mockResolvedValue([])
     mocks.agendaFindMany.mockResolvedValue([])
   })
@@ -126,10 +128,42 @@ describe("agent timeline query API", () => {
   it("returns 404 for a cross-tenant session before reading items", async () => {
     mocks.sessionFindFirst.mockResolvedValueOnce(null)
     const { GET } = await import("./route")
-    const response = await GET(request() as never, params)
+    const response = await GET(request("?itemId=final-item") as never, params)
     expect(response.status).toBe(404)
     await expect(response.json()).resolves.toMatchObject({ error: { code: "session_not_found" } })
+    expect(mocks.itemFindFirst).not.toHaveBeenCalled()
     expect(mocks.itemFindMany).not.toHaveBeenCalled()
+  })
+
+  it("hydrates one session-owned item through its display-safe DTO", async () => {
+    mocks.itemFindFirst.mockResolvedValueOnce({
+      ...item("final-item", 1), phase: "final_answer", taskId: null,
+      content: {
+        text: "The candidate response text remains exact.",
+        final: {
+          summary: "A concise candidate response summary.", finalResponse: "PRIVATE_FINAL_RESPONSE",
+          binding: { taskId: "PRIVATE_TASK_ID", contentHash: "PRIVATE_HASH" },
+        },
+      },
+    })
+    const { GET } = await import("./route")
+
+    const response = await GET(request("?itemId=final-item") as never, params)
+    const body = await response.json()
+    const serialized = JSON.stringify(body)
+
+    expect(response.status).toBe(200)
+    expect(body.items).toHaveLength(1)
+    expect(body.items[0].content).toEqual({ text: "The candidate response text remains exact.", summary: "A concise candidate response summary." })
+    expect(serialized).not.toContain("PRIVATE_FINAL_RESPONSE")
+    expect(serialized).not.toContain("PRIVATE_TASK_ID")
+    expect(serialized).not.toContain("PRIVATE_HASH")
+    expect(mocks.itemFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "final-item", sessionId: "session_1" },
+      select: expect.objectContaining({ id: true, sessionId: true, content: true }),
+    }))
+    expect(mocks.itemFindMany).not.toHaveBeenCalled()
+    expect(mocks.agendaFindMany).not.toHaveBeenCalled()
   })
 
   it("returns display-safe item DTOs and never reads execution or raw events", async () => {

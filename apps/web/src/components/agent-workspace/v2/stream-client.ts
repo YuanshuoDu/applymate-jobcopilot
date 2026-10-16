@@ -1,7 +1,7 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
-import { createQuestionHydrationPump, filterQuestionHydrationValues } from './question-hydration'
+import { createFinalItemHydrationPump, createQuestionHydrationPump, filterQuestionHydrationValues } from './question-hydration'
 import { hasAllTimelineTargetItems, sortTimelineTailEvents } from './timeline-hydration-order'
 
 interface TimelinePageResponse {
@@ -28,11 +28,26 @@ const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_PAGE_SIZE = 100
 type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'> & {
   targetItemIds?: readonly string[]
+  targetItemId?: string
 }
 
 /** Hydrates the canonical item projection before a live stream is attached. */
 export async function hydrateTimeline(options: TimelineHydrationOptions): Promise<void> {
   const fetcher = options.fetcher ?? fetch
+  if (options.targetItemId !== undefined) {
+    const targetItemId = options.targetItemId
+    if (!safeTargetItemId(targetItemId)) return
+    const query = new URLSearchParams({ itemId: targetItemId })
+    const response = await fetcher(`/api/agent/sessions/${encodeURIComponent(options.sessionId)}/timeline?${query}`, { signal: options.signal })
+    if (!response.ok) throw new Error(`Timeline item restore failed (${response.status})`)
+    const page = await response.json() as TimelinePageResponse
+    if (options.signal?.aborted) return
+    const item = Array.isArray(page.items)
+      ? page.items.find(value => matchesTargetItem(value, options.sessionId, targetItemId))
+      : undefined
+    if (item !== undefined) options.dispatch({ type: 'hydrate', items: [item] })
+    return
+  }
   const items: unknown[] = []
   let agenda: unknown = undefined
   let agendas: unknown[] | undefined
@@ -78,11 +93,17 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
     signal: options.signal,
     hydrate: targetItemIds => hydrateTimeline({ ...options, targetItemIds }),
   })
+  const finalItemHydration = createFinalItemHydrationPump({
+    sessionId: options.sessionId,
+    signal: options.signal,
+    hydrate: targetItemId => hydrateTimeline({ ...options, targetItemId }),
+  })
 
   await hydrateTimeline(options)
 
   while (!options.signal?.aborted) {
     questionHydration.pump()
+    finalItemHydration.pump()
     const path = `/api/agent/sessions/${encodeURIComponent(options.sessionId)}/events`
     const url = selectedV2 ? `${path}?afterSequence=${afterSequence.toString()}` : path
     let response: Response
@@ -136,12 +157,15 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
         } else {
           options.dispatch(event.kind ? { type: 'delta', delta: event } : { type: 'event', event })
           questionHydration.request(frame.data)
+          finalItemHydration.request(frame.data)
         }
       }, options.signal)
     } finally {
       ended = true
     }
-    while (questionHydration.current()) await questionHydration.current()
+    while (questionHydration.current() || finalItemHydration.current()) {
+      await Promise.all([questionHydration.current(), finalItemHydration.current()].filter((value): value is Promise<void> => value !== null))
+    }
     if (snapshotRequired && !options.signal?.aborted) await hydrateTimeline(options)
     if (ended && !options.signal?.aborted) {
       connected = false
@@ -204,6 +228,15 @@ async function readSseBody(body: ReadableStream<Uint8Array>, onFrame: (frame: Ss
 
 function isAbort(value: unknown): boolean {
   return value instanceof Error && value.name === 'AbortError'
+}
+
+function safeTargetItemId(value: string): boolean {
+  return value.length > 0 && value.trim() === value && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
+}
+
+function matchesTargetItem(value: unknown, sessionId: string, itemId: string): boolean {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value) &&
+    (value as { id?: unknown }).id === itemId && (value as { sessionId?: unknown }).sessionId === sessionId
 }
 
 async function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
