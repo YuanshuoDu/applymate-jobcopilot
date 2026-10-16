@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { assertApplicationFillPreflight, assertApplicationFillRetryReady, lockApplicationFillTask } from "./application-fill-preflight"
+import { assertApplicationFillPreflight, assertApplicationFillRetryReady, isApplicationFillRetryReadyProjection, lockApplicationFillTask } from "./application-fill-preflight"
 
 type Query = { strings?: readonly string[]; values?: readonly unknown[] }
 type Row = Record<string, unknown>
@@ -49,6 +49,28 @@ const failedTask = { ...stoppedTask, status: "failed", checkpoint: "fill_prestar
 const retryIdentity = { userId: "user-1", sessionId: "session-1" }
 const explicitUserRetry = { explicitUserRetry: true }
 const terminalLeaseFreeFiller = { id: "filler-1", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }
+
+describe("application fill retry readiness projection", () => {
+  const turn = { id: "turn-1", status: "interrupted", leaseOwnerId: null, leaseExpiresAt: null }
+  const filler = { role: "application_filler", taskType: "application_fill_for_review", status: "interrupted", leaseOwner: null, leaseExpiresAt: null }
+
+  it("returns ready only for the exact terminal, lease-free Turn and filler", () => {
+    expect(isApplicationFillRetryReadyProjection("turn-1", turn, [filler])).toBe(true)
+    expect(isApplicationFillRetryReadyProjection("turn-2", turn, [filler])).toBe(false)
+  })
+
+  it("keeps an active Turn unavailable", () => {
+    expect(isApplicationFillRetryReadyProjection("turn-1", { ...turn, status: "in_progress" }, [filler])).toBe(false)
+  })
+
+  it.each([
+    { ...filler, status: "running" },
+    { ...filler, leaseOwner: "worker-1" },
+    { ...filler, leaseExpiresAt: new Date() },
+  ])("keeps an active or leased filler unavailable", activeFiller => {
+    expect(isApplicationFillRetryReadyProjection("turn-1", turn, [activeFiller])).toBe(false)
+  })
+})
 
 describe("application fill persisted-material preflight", () => {
   it("uses only the owned task's job, resume, and optional cover-letter references", async () => {

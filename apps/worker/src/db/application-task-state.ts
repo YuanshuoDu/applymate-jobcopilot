@@ -71,30 +71,30 @@ export async function isUserActive(pool: Pool, userId: string): Promise<boolean>
 
 /** Worker-side guard: a stale/revoked queue payload must never open a browser. */
 export async function claimApplicationTask(
-  pool: Pool, taskId: string, userId: string, jobId: string,
+  pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit",
 ): Promise<boolean> {
   const result = await pool.query(
     `UPDATE application_tasks
      SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
-     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'
+     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND (($4 = 'submit') OR ($4 = 'fill' AND "fillTurnId" IS NULL AND "checkpoint" = 'form_fill_queued'))
        AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
        AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
        AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = application_tasks."userId" AND u."accountStatus" = 'active')
      RETURNING id`,
-    [taskId, userId, jobId],
+    [taskId, userId, jobId, operation],
   );
   return result.rowCount === 1;
 }
 
 export async function finishApplicationTask(
-  pool: Pool, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
+  pool: Pool, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null, operation: "fill" | "submit",
 ): Promise<void> {
   const transitioned = await pool.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
      SET status = $2, "checkpoint" = $3, error = $4,
            "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END,
            "updatedAt" = NOW()
-     WHERE id = $1 AND (
+     WHERE id = $1 AND (($5 = 'submit') OR ($5 = 'fill' AND "fillTurnId" IS NULL)) AND (
          status NOT IN ('cancelled', 'submitted')
          OR (status = 'cancelled' AND "checkpoint" = 'turn_stopped_before_submit'
            AND $2 = 'waiting_for_user' AND $3 = 'submission_uncertain')
@@ -104,7 +104,7 @@ export async function finishApplicationTask(
          AND NOT ($2 = 'submitted' OR ($2 = 'waiting_for_user' AND $3 = 'submission_uncertain')))
        AND (status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4)
      RETURNING "sessionId"`,
-    [taskId, status, checkpoint, error],
+    [taskId, status, checkpoint, error, operation],
   );
   if (transitioned.rowCount !== 1) return;
   await pool.query(
@@ -116,15 +116,15 @@ export async function finishApplicationTask(
   if (sessionId) await refreshSessionStatus(pool, sessionId);
 }
 
-export async function applicationTaskStillActive(pool: Pool, taskId: string, userId: string, jobId: string): Promise<boolean> {
+export async function applicationTaskStillActive(pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit"): Promise<boolean> {
   const result = await pool.query(
     `SELECT 1 FROM application_tasks t
        JOIN "User" u ON u.id = t."userId"
       WHERE t.id = $1 AND t."userId" = $2 AND t."jobId" = $3
-        AND t.status = 'filling' AND t."checkpoint" = 'browser_active'
+        AND t.status = 'filling' AND t."checkpoint" = 'browser_active' AND ($4 = 'submit' OR t."fillTurnId" IS NULL)
         AND u."accountStatus" = 'active'
       LIMIT 1`,
-    [taskId, userId, jobId],
+    [taskId, userId, jobId, operation],
   )
   return result.rowCount === 1
 }
@@ -151,7 +151,7 @@ export async function completeFillForReview(
   const transitioned = await pool.query<{ sessionId: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }>(
     `UPDATE application_tasks
        SET status = 'waiting_for_authorization', "checkpoint" = 'form_filled', error = NULL, "updatedAt" = NOW()
-     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'
+     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND "fillTurnId" IS NULL
        AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
        AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
         RETURNING "sessionId", "resumeId", "coverLetterId", "confirmedAnswers"`,
@@ -218,7 +218,7 @@ export async function pauseForFormInput(
     `UPDATE application_tasks
        SET status = 'waiting_for_user', "checkpoint" = 'form_answer_required', error = $2,
            question = jsonb_build_object('detail', $2, 'missing', $3::jsonb, 'sensitive', $4::jsonb), "updatedAt" = NOW()
-     WHERE id = $1
+     WHERE id = $1 AND "fillTurnId" IS NULL
        AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
        AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
      RETURNING "sessionId"`,

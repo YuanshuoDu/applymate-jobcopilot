@@ -164,7 +164,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           }
         }
         if (startedSubmissionFound) return;
-        await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.");
+        await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.", operation === "submit" ? "submit" : "fill");
         console.warn(`[apply-worker] Skipping suspended account for job=${jobId}`);
         return;
       }
@@ -175,7 +175,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       if (operation === "submit" && (!receiptId || !constraintHash)) {
         throw new Error("Canonical application submission requires both receiptId and constraintHash.");
       }
-      if (!await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
+      if (!await claimApplicationTask(getPool(), applicationTaskId, userId, jobId, operation === "submit" ? "submit" : "fill")) {
         if (operation === "submit" && receiptId && constraintHash) {
           try {
             const taskState = await getPool().query<{ status: string; checkpoint: string | null }>(
@@ -274,7 +274,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           await closeActivePage();
           return;
         }
-        if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) {
+        if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId, operation === "submit" ? "submit" : "fill")) {
           if (approvedTurnScope && await isApplicationSubmissionStopped(getPool(), approvedTurnScope)) {
             await interruptStoppedTurn();
             await persistStoppedSubmission({ applicationTaskId, userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, startedAt });
@@ -295,7 +295,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               error: UNCONFIRMED_SUBMISSION_MESSAGE, durationMs: Date.now() - startedAt,
             });
             resultWritten = true;
-            await finishApplicationTask(getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain", UNCONFIRMED_SUBMISSION_MESSAGE);
+            await finishApplicationTask(getPool(), applicationTaskId, "waiting_for_user", "submission_uncertain", UNCONFIRMED_SUBMISSION_MESSAGE, "submit");
             createApplyResultNotification({ userId, jobId, jobTitle: taskCtx.jobTitle, jobCompany: taskCtx.jobCompany, status: "manual" })
               .catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
             return;
@@ -352,7 +352,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               const requestIntent = intent;
               if (!await challengeAllowsAction()) return false;
               if (await applyQueue.isPaused()) return false;
-              if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) {
+              if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId, operation === "submit" ? "submit" : "fill")) {
                 if (approvedTurnScope) {
                   try {
                     if (await isApplicationSubmissionStopped(getPool(), approvedTurnScope)) await interruptStoppedTurn();
@@ -522,7 +522,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                             applicationTaskId,
                             "waiting_for_user",
                             "submission_uncertain",
-                            UNCONFIRMED_SUBMISSION_MESSAGE,
+                            UNCONFIRMED_SUBMISSION_MESSAGE, "submit",
                           );
                           applicationTaskFinalized = true;
                         } catch (stateError: unknown) {
@@ -585,7 +585,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                             applicationTaskId,
                             "waiting_for_user",
                             "submission_uncertain",
-                            UNCONFIRMED_SUBMISSION_MESSAGE,
+                            UNCONFIRMED_SUBMISSION_MESSAGE, "submit",
                           );
                           applicationTaskFinalized = true;
                         } catch (stateError: unknown) {
@@ -854,7 +854,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             applicationTaskId,
             "waiting_for_user",
             "submission_uncertain",
-            harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE,
+            harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE, "submit",
           );
           applicationTaskFinalized = true;
           await closeActivePage();
@@ -961,7 +961,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             applicationTaskId,
             isSubmitted ? "submitted" : submissionUncertain || requiresUserTakeover ? "waiting_for_user" : isSubmissionBlocked ? "waiting_for_authorization" : "failed",
             isSubmitted ? "submission_verified" : submissionUncertain ? "submission_uncertain" : turnStopped && !submissionRequestStarted ? "turn_stopped_before_submit" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? USER_TAKEOVER_CHECKPOINT : "execution_failed",
-            harnessResult.error ?? null,
+            harnessResult.error ?? null, operation === "submit" ? "submit" : "fill",
           );
           applicationTaskFinalized = true;
         }
@@ -986,7 +986,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             applicationTaskId,
             "waiting_for_user",
             "submission_uncertain",
-            safeMessage,
+            safeMessage, "submit",
           );
           applicationTaskFinalized = true;
         } catch (stateError: unknown) {
@@ -1050,7 +1050,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           applicationTaskId,
           browserAttemptStarted ? "waiting_for_user" : "failed",
           submissionRequestStarted ? "submission_uncertain" : browserAttemptStarted ? USER_TAKEOVER_CHECKPOINT : "worker_failed",
-          safeMessage,
+          safeMessage, operation === "submit" ? "submit" : "fill",
         ).catch((stateError: Error) => console.warn("[apply-worker] Could not persist task failure:", stateError.message));
         applicationTaskFinalized = true;
       }
@@ -1148,7 +1148,7 @@ async function reconcileStartedSubmission(input: {
     input.applicationTaskId,
     "waiting_for_user",
     "submission_uncertain",
-    UNCONFIRMED_SUBMISSION_MESSAGE,
+    UNCONFIRMED_SUBMISSION_MESSAGE, "submit",
   );
   if (submissionClaim === "uncertain" || submissionClaim === "claimed") {
     await insertApplyResult({
@@ -1195,7 +1195,7 @@ async function persistStoppedSubmission(input: {
     [input.jobId, input.userId],
   );
   if (task.rows[0] && task.rows[0].status !== "cancelled") {
-    await finishApplicationTask(getPool(), input.applicationTaskId, "failed", "turn_stopped_before_submit", TURN_STOPPED_MESSAGE);
+    await finishApplicationTask(getPool(), input.applicationTaskId, "failed", "turn_stopped_before_submit", TURN_STOPPED_MESSAGE, "submit");
   }
   createApplyResultNotification({ ...input, status: "failed" })
     .catch((error: Error) => console.warn("[notify] in-app notification failed:", error.message));
@@ -1245,7 +1245,7 @@ async function handOffUnavailableUnattendedTask(params: {
     params.applicationTaskId,
     params.operation === "submit" ? "waiting_for_authorization" : "waiting_for_user",
     params.operation === "submit" ? "form_filled" : "materials_ready",
-    UNATTENDED_APPLY_UNAVAILABLE_MESSAGE,
+    UNATTENDED_APPLY_UNAVAILABLE_MESSAGE, params.operation,
   );
   createApplyResultNotification({
     userId: params.userId,

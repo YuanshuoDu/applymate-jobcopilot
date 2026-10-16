@@ -10,13 +10,9 @@ import { projectTaskTree } from './agent-workspace-projection'
 import { SessionStatusCards } from './SessionStatusCards'
 import { FocusTaskTree, focusQuestionOptions } from './session-focus-parts'
 
-interface DetailResponse {
-  session: AgentSessionDetail
-}
-
+interface DetailResponse { session: AgentSessionDetail }
 function formWaitId(question: unknown): string | null { const waitId = question && typeof question === 'object' && !Array.isArray(question) ? (question as Record<string, unknown>).waitId : null; return typeof waitId === 'string' && waitId.trim() ? waitId : null }
 export function formAnswerDraftKey(taskId: string, waitId: string, field: string) { return `${taskId}:${waitId}:${field}` }
-
 export function RetryApplicationFillButton({ sessionId, taskId }: { sessionId: string; taskId: string }) {
   async function onRetry(event: React.MouseEvent<HTMLButtonElement>) {
     const alert = event.currentTarget.nextElementSibling as HTMLDivElement | null
@@ -27,13 +23,15 @@ export function RetryApplicationFillButton({ sessionId, taskId }: { sessionId: s
   }
   return <><button type="button" onClick={onRetry} style={resumeButtonStyle}>Retry form fill</button><div role="alert" aria-live="assertive" /></>
 }
-
 async function retryCancelledApplicationFill(sessionId: string, taskId: string) {
   const response = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/actions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'retry_application_fill', applicationTaskId: taskId, requestId: crypto.randomUUID() }) })
-  if (!response.ok) throw new Error(`server_rejected:${response.status}`)
-  window.dispatchEvent(new Event('applymate:sessions-changed'))
+  if (!response.ok) throw new Error(`server_rejected:${response.status}`); window.dispatchEvent(new Event('applymate:sessions-changed'))
 }
-
+export function startApplicationFillRetryPolling(enabled: boolean, refresh: () => void) { if (!enabled) return () => {}; const timer = setInterval(refresh, 10_000); return () => clearInterval(timer) }
+function isRetryableApplicationFill(task: { status: string; checkpoint: string | null }) { return (task.status === 'cancelled' && ['cancelled_by_user', 'turn_stopped_before_submit'].includes(task.checkpoint ?? '')) || (task.status === 'failed' && ['fill_prestart_failed', 'taskgraph_fill_failed'].includes(task.checkpoint ?? '')) }
+export function needsApplicationFillRetryPolling(tasks: Array<{ id: string; status: string; checkpoint: string | null }>, readiness: Array<{ id: string; cancelledFillRetryReady: boolean }> | undefined, loading: boolean) {
+  return !loading && tasks.some(task => isRetryableApplicationFill(task) && !readiness?.some(row => row.id === task.id && row.cancelledFillRetryReady))
+}
 export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
   const { t } = useI18n()
   if (!sessionId) {
@@ -43,26 +41,29 @@ export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
       </Section>
     )
   }
-  return <SessionFocusPanelInner sessionId={sessionId} />
+  return <SessionFocusPanelInner sessionId={sessionId} key={sessionId} />
 }
-
 function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
+  const { data: retryReadiness, loading: retryReadinessLoading, refetch: refetchRetryReadiness } = useApi<{ tasks: Array<{ id: string; cancelledFillRetryReady: boolean }> }>(`/api/agent/application-tasks?projection=cancelled-fill-retry&sessionId=${encodeURIComponent(sessionId)}`, { cache: false })
   const session = data?.session
   const tasks = session?.tasks ?? []
   const approvals = session?.approvals ?? []
   const applicationTasks = session?.applicationTasks ?? []
+  const hasCancelledByUserRetryCandidate = applicationTasks.some(task => task.status === 'cancelled' && task.checkpoint === 'cancelled_by_user')
+  const needsApplicationFillRetryReadiness = needsApplicationFillRetryPolling(applicationTasks, retryReadiness?.tasks, retryReadinessLoading)
   const execution = session?.execution
   const questions = session?.questions ?? []
   const taskTree = React.useMemo(() => projectTaskTree(tasks), [tasks])
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
   const [answers, setAnswers] = React.useState<Record<string, string>>({})
   React.useEffect(() => {
-    const refresh = () => { void refetch() }
+    const refresh = () => { void refetch(); if (hasCancelledByUserRetryCandidate) void refetchRetryReadiness() }
     window.addEventListener('applymate:sessions-changed', refresh)
-    return () => window.removeEventListener('applymate:sessions-changed', refresh)
-  }, [refetch])
+    const stopPolling = startApplicationFillRetryPolling(needsApplicationFillRetryReadiness, () => { void refetchRetryReadiness() })
+    return () => { window.removeEventListener('applymate:sessions-changed', refresh); stopPolling() }
+  }, [refetch, refetchRetryReadiness, hasCancelledByUserRetryCandidate, needsApplicationFillRetryReadiness])
   async function cancelApplicationTask(id: string) {
     const response = await fetch(`/api/agent/application-tasks?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (response.ok) {
@@ -95,7 +96,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
       window.dispatchEvent(new Event('applymate:sessions-changed'))
     }
   }
-
   return (
     <>
       <Section title="Session focus"><div style={{ padding: '9px 10px' }}><div style={{ fontSize: 12, fontWeight: 750, color: 'var(--text)' }}>{session?.goal ?? 'Goal unavailable'}</div>{session && <div style={rowMetaStyle}>Session {session.id} · {sessionStatusLabel(session.status)} · updated {new Date(session.updatedAt).toLocaleString('en-GB')}</div>}</div></Section>
@@ -124,8 +124,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
         {applicationTasks.slice(0, 5).map(task => {
           const fields = task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required' ? formQuestionFields(task.question) : []
           const waitId = formWaitId(task.question)
-          const retryableFill = (task.status === 'cancelled' && ['cancelled_by_user', 'turn_stopped_before_submit'].includes(task.checkpoint ?? ''))
-            || (task.status === 'failed' && ['fill_prestart_failed', 'taskgraph_fill_failed'].includes(task.checkpoint ?? ''))
+          const retryableFill = isRetryableApplicationFill(task)
           return (
           <div key={task.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
@@ -138,7 +137,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
                 : <div key={`unmapped:${task.id}:${waitId ?? ''}:${field.label}`} style={rowMetaStyle}>{field.label}</div>)}
               {fields.some(field => field.key !== null) && waitId && <button onClick={() => { void answerAndResume(task.id, waitId, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
             </div>
-            {retryableFill && <RetryApplicationFillButton sessionId={sessionId} taskId={task.id} />}
+            {retryableFill && !retryReadinessLoading && retryReadiness?.tasks.some(row => row.id === task.id && row.cancelledFillRetryReady) && <RetryApplicationFillButton sessionId={sessionId} taskId={task.id} />}
             {!['submitted', 'skipped', 'cancelled'].includes(task.status) && (
               <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancel')}</button>
             )}
@@ -175,7 +174,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
         })}
       </Section>
       <SessionStatusCards artifacts={session?.artifacts} budget={session?.budget} compaction={session?.compaction} uncertain={session?.uncertain} />
-
       <Section title={t('agent.sessionQuality')}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
           <QualityMetric label={t('agent.quality')} value={session?.qualityScore == null ? '--' : `${Math.round(session.qualityScore)}%`} />

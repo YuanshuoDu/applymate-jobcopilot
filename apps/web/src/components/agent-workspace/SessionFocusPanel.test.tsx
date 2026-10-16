@@ -1,7 +1,7 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { formAnswerDraftKey, RetryApplicationFillButton, SessionFocusPanel } from './SessionFocusPanel'
+import { formAnswerDraftKey, needsApplicationFillRetryPolling, RetryApplicationFillButton, SessionFocusPanel, startApplicationFillRetryPolling } from './SessionFocusPanel'
 import type { AgentSessionDetail } from './session-view-model'
 
 const mocks = vi.hoisted(() => ({ useApi: vi.fn(), formQuestionFields: vi.fn() }))
@@ -18,13 +18,16 @@ type ApplicationTask = {
   job: { company: string; role: string }
 }
 
-function installSession(applicationTasks: ApplicationTask[]) {
+function installSession(applicationTasks: ApplicationTask[], retryTasks?: Array<{ id: string; cancelledFillRetryReady: boolean }>, retryLoading = false) {
   const session = {
     id: 'session_1', goal: 'Fill application', status: 'completed', source: 'user', memorySummary: '',
     qualityScore: null, currentTaskId: null, createdAt: '2026-10-15T10:00:00.000Z', updatedAt: '2026-10-15T10:00:00.000Z', completedAt: null,
     tasks: [], approvals: [], applicationTasks, execution: null, questions: [],
   } as unknown as AgentSessionDetail
-  mocks.useApi.mockReturnValue({ data: { session }, loading: false, error: null, refetch: vi.fn() })
+  const readiness = retryTasks ?? applicationTasks.map(item => ({ id: item.id, cancelledFillRetryReady: true }))
+  mocks.useApi.mockImplementation((url: string) => url.includes('projection=cancelled-fill-retry')
+    ? { data: retryLoading ? null : { tasks: readiness }, loading: retryLoading, error: null, refetch: vi.fn() }
+    : { data: { session }, loading: false, error: null, refetch: vi.fn() })
 }
 
 function task(status = 'cancelled', checkpoint: string | null = 'cancelled_by_user'): ApplicationTask {
@@ -36,7 +39,44 @@ describe('SessionFocusPanel application fill retry', () => {
     mocks.useApi.mockReset()
     mocks.formQuestionFields.mockReset().mockReturnValue([])
   })
-  afterEach(() => vi.unstubAllGlobals())
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
+
+  it('polls while any retryable TaskGraph fill checkpoint is not ready', () => {
+    expect(needsApplicationFillRetryPolling([task()], [], false)).toBe(true)
+    expect(needsApplicationFillRetryPolling([task()], [{ id: 'application_1', cancelledFillRetryReady: true }], false)).toBe(false)
+    expect(needsApplicationFillRetryPolling([task()], undefined, true)).toBe(false)
+    expect(needsApplicationFillRetryPolling([task('cancelled', 'turn_stopped_before_submit')], [], false)).toBe(true)
+    expect(needsApplicationFillRetryPolling([task('failed', 'fill_prestart_failed')], [], false)).toBe(true)
+    expect(needsApplicationFillRetryPolling([task('failed', 'worker_failed')], [], false)).toBe(false)
+  })
+
+  it('cleans up the readiness poll and does not poll when disabled', () => {
+    vi.useFakeTimers()
+    const refresh = vi.fn()
+    const stop = startApplicationFillRetryPolling(true, refresh)
+    vi.advanceTimersByTime(20_000)
+    expect(refresh).toHaveBeenCalledTimes(2)
+    stop()
+    vi.advanceTimersByTime(20_000)
+    expect(refresh).toHaveBeenCalledTimes(2)
+    const stopDisabled = startApplicationFillRetryPolling(false, refresh)
+    vi.advanceTimersByTime(20_000)
+    expect(refresh).toHaveBeenCalledTimes(2)
+    stopDisabled()
+  })
+
+  it.each([
+    ['read is loading', [{ id: 'application_1', cancelledFillRetryReady: true }], true],
+    ['read is missing the task', [], false],
+    ['server says not ready', [{ id: 'application_1', cancelledFillRetryReady: false }], false],
+  ])('hides retry while readiness %s', (_state, retryTasks, retryLoading) => {
+    installSession([task()], retryTasks, retryLoading)
+
+    const html = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+
+    expect(html).not.toContain('Retry form fill')
+    expect(mocks.useApi).toHaveBeenCalledWith(expect.stringContaining('projection=cancelled-fill-retry'), { cache: false })
+  })
 
   it.each([
     ['cancelled', 'cancelled_by_user'],

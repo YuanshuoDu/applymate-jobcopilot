@@ -5,6 +5,7 @@ import { db } from "@/lib/db"
 import { applicationTaskSummary } from "@/lib/agent/application-task-view"
 import { sanitizeConfirmedAnswers } from "@/lib/agent/application-task-input"
 import { applicationFillTaskGraphEnabled, queueApplicationFill } from "@/lib/auto-apply"
+import { isApplicationFillRetryReadyProjection } from "@/lib/agent/control-plane/commands/application-fill-preflight"
 import {
   cancelPendingSubmitApprovals,
   hasBoundFillTurn,
@@ -14,18 +15,15 @@ import {
 } from "./cancellation-helpers"
 
 type ResumeTask = {
-  id: string; sessionId: string | null; fillTurnId: string | null
-  fillTurnSessionId: string | null; fillTurnUserId: string | null; status: string
-  checkpoint: string | null; question: Prisma.JsonValue | null; confirmedAnswers: Prisma.JsonValue | null; job: { id: string; url: string | null }
+  id: string; sessionId: string | null; fillTurnId: string | null; fillTurnSessionId: string | null
+  fillTurnUserId: string | null; status: string; checkpoint: string | null; question: Prisma.JsonValue | null; confirmedAnswers: Prisma.JsonValue | null; job: { id: string; url: string | null }
 }
 
-function confirmedAnswers(value: unknown): Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+function confirmedAnswers(value: unknown): Record<string, string> { if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
 }
 
-function answersMatchPersisted(answers: Record<string, string>, value: unknown): boolean {
-  const persisted = confirmedAnswers(value)
+function answersMatchPersisted(answers: Record<string, string>, value: unknown): boolean { const persisted = confirmedAnswers(value)
   return Object.entries(answers).every(([field, answer]) => persisted[field] === answer)
 }
 
@@ -34,14 +32,9 @@ function questionWaitId(value: unknown): string | null {
   return typeof waitId === "string" && waitId.trim() ? waitId : null
 }
 
-async function queueTaskGraphResume(
-  task: ResumeTask, userId: string, duplicateOnly = false,
-): Promise<Response> {
+async function queueTaskGraphResume(task: ResumeTask, userId: string, duplicateOnly = false): Promise<Response> {
   try {
-    const queued = await queueApplicationFill({
-      userId, jobId: task.job.id, applyUrl: task.job.url, applicationTaskId: task.id,
-      sessionId: task.sessionId!, resumeAfterUserInput: true,
-    })
+    const queued = await queueApplicationFill({ userId, jobId: task.job.id, applyUrl: task.job.url, applicationTaskId: task.id, sessionId: task.sessionId!, resumeAfterUserInput: true })
     if (duplicateOnly && queued.disposition !== "duplicate") return err("The application fill changed before the duplicate request was resolved", 409)
     return ok({ resumed: true, ...(duplicateOnly ? { duplicate: true } : {}), ...queued })
   } catch (error) {
@@ -59,15 +52,29 @@ async function returnTaskGraphResumeDuplicate(task: ResumeTask, userId: string, 
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
-  const tasks = await db.applicationTask.findMany({
-    where: { userId: auth.userId },
-    orderBy: { updatedAt: "desc" },
-    take: 100,
-    include: {
-      job: { select: { company: true, role: true, url: true, workflowState: true } },
-      events: { orderBy: { createdAt: "desc" }, take: 20 },
-    },
-  })
+  const params = new URL(req.url).searchParams
+  if (params.get("projection") === "cancelled-fill-retry") {
+    const sessionId = params.get("sessionId")
+    if (!sessionId) return err("Session id is required", 400)
+    const rows = await db.applicationTask.findMany({
+      where: { userId: auth.userId, sessionId, fillTurnSessionId: sessionId, fillTurnUserId: auth.userId, fillTurnId: { not: null }, OR: [
+        { status: "cancelled", checkpoint: { in: ["cancelled_by_user", "turn_stopped_before_submit"] } },
+        { status: "failed", checkpoint: { in: ["fill_prestart_failed", "taskgraph_fill_failed"] } },
+      ] },
+      select: { id: true, fillTurnId: true, fillTurn: { select: { id: true, status: true, leaseOwnerId: true, leaseExpiresAt: true,
+        subAgentTasks: { where: { OR: [{ role: "application_filler" }, { taskType: "application_fill_for_review" }] }, select: { role: true, taskType: true, status: true, leaseOwner: true, leaseExpiresAt: true } },
+      } } },
+    })
+    const tasks = rows.map(task => {
+      const turn = task.fillTurn, fillers = turn?.subAgentTasks ?? []
+      return { id: task.id, cancelledFillRetryReady: isApplicationFillRetryReadyProjection(task.fillTurnId, turn, fillers) }
+    })
+    const response = ok({ tasks })
+    response.headers.set("Cache-Control", "no-store, private")
+    return response
+  }
+  const tasks = await db.applicationTask.findMany({ where: { userId: auth.userId }, orderBy: { updatedAt: "desc" }, take: 100,
+    include: { job: { select: { company: true, role: true, url: true, workflowState: true } }, events: { orderBy: { createdAt: "desc" }, take: 20 } } })
   return ok({ tasks, summary: applicationTaskSummary(tasks) })
 }
 

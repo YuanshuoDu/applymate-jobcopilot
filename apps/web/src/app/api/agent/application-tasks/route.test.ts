@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
+  findMany: vi.fn(),
   findFirst: vi.fn(),
   updateMany: vi.fn(),
   queryRaw: vi.fn(),
@@ -24,7 +25,7 @@ vi.mock("@/lib/api-helpers", () => ({
 
 vi.mock("@/lib/db", () => ({
   db: {
-    applicationTask: { findFirst: mocks.findFirst, updateMany: mocks.updateMany, update: mocks.taskUpdate },
+    applicationTask: { findMany: mocks.findMany, findFirst: mocks.findFirst, updateMany: mocks.updateMany, update: mocks.taskUpdate },
     subAgentTask: { findMany: mocks.fillerFindMany },
     agentApproval: { updateMany: mocks.approvalUpdateMany },
     applicationTaskEvent: { create: mocks.eventCreate },
@@ -43,6 +44,60 @@ vi.mock("@/lib/agent/control-plane/commands/task-interrupt-service", () => ({
     interrupt = mocks.taskInterrupt
   },
 }))
+
+function retryReadinessTask(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "task_1", status: "cancelled", checkpoint: "turn_stopped_before_submit", fillTurnId: "turn_1",
+    fillTurn: { id: "turn_1", status: "cancelled", leaseOwnerId: null, leaseExpiresAt: null, subAgentTasks: [
+      { role: "application_filler", taskType: "application_fill_for_review", status: "completed", leaseOwner: null, leaseExpiresAt: null },
+    ] },
+    ...overrides,
+  }
+}
+
+describe("GET /api/agent/application-tasks retry readiness projection", () => {
+  beforeEach(() => {
+    Object.values(mocks).forEach(mock => mock.mockReset())
+    mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.findMany.mockResolvedValue([retryReadinessTask()])
+  })
+
+  async function getReadiness() {
+    const { GET } = await import("./route")
+    return GET(new Request("http://localhost/api/agent/application-tasks?projection=cancelled-fill-retry&sessionId=session_1") as never)
+  }
+
+  it("returns only the scoped projection and disables caching", async () => {
+    const response = await getReadiness()
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get("Cache-Control")).toBe("no-store, private")
+    await expect(response.json()).resolves.toEqual({ tasks: [{ id: "task_1", cancelledFillRetryReady: true }] })
+    expect(mocks.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
+      userId: "user_1", sessionId: "session_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", fillTurnId: { not: null },
+    }) }))
+  })
+
+  it("does not mark a retry ready while its bound Turn is active", async () => {
+    mocks.findMany.mockResolvedValueOnce([retryReadinessTask({ fillTurn: { ...retryReadinessTask().fillTurn, status: "running" } })])
+
+    await expect((await getReadiness()).json()).resolves.toEqual({ tasks: [{ id: "task_1", cancelledFillRetryReady: false }] })
+  })
+
+  it.each([
+    ["active", { status: "running", leaseOwner: null, leaseExpiresAt: null }],
+    ["leased", { status: "completed", leaseOwner: "worker_1", leaseExpiresAt: new Date("2026-10-16T12:00:00Z") }],
+    ["ambiguous", { status: "completed", leaseOwner: null, leaseExpiresAt: null }, true],
+  ])("does not mark an %s filler ready", async (_state, filler, duplicate = false) => {
+    const fillers = [
+      { role: "application_filler", taskType: "application_fill_for_review", ...filler },
+      ...(duplicate ? [{ role: "application_filler", taskType: "application_fill_for_review", ...filler }] : []),
+    ]
+    mocks.findMany.mockResolvedValueOnce([retryReadinessTask({ fillTurn: { ...retryReadinessTask().fillTurn, subAgentTasks: fillers } })])
+
+    await expect((await getReadiness()).json()).resolves.toEqual({ tasks: [{ id: "task_1", cancelledFillRetryReady: false }] })
+  })
+})
 
 describe("DELETE /api/agent/application-tasks", () => {
   beforeEach(() => {

@@ -15,6 +15,28 @@ const TERMINAL_TURNS = ["completed", "failed", "interrupted", "cancelled"]
 const TERMINAL_FILLERS = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 const STOPPED_RETRY_CHECKPOINTS = ["turn_stopped_before_submit", "cancelled_by_user"]
 
+type RetryTurn = { id: string; status: string; leaseOwnerId: string | null; leaseExpiresAt: Date | null }
+type RetryFiller = { status: string; leaseOwner: string | null; leaseExpiresAt: Date | null; role: string; taskType: string }
+
+export function isApplicationFillRetryTurnReady(expectedTurnId: string | null, turn: RetryTurn | null | undefined): boolean {
+  return Boolean(expectedTurnId && turn?.id === expectedTurnId && TERMINAL_TURNS.includes(turn.status)
+    && turn.leaseOwnerId === null && turn.leaseExpiresAt === null)
+}
+
+export function isApplicationFillRetryFillersReady(fillers: RetryFiller[]): boolean {
+  return fillers.length === 1 && fillers[0].role === "application_filler"
+    && fillers[0].taskType === "application_fill_for_review" && TERMINAL_FILLERS.has(fillers[0].status)
+    && fillers[0].leaseOwner === null && fillers[0].leaseExpiresAt === null
+}
+
+export function isApplicationFillRetryReadyProjection(
+  expectedTurnId: string | null,
+  turn: RetryTurn | null | undefined,
+  fillers: RetryFiller[],
+): boolean {
+  return isApplicationFillRetryTurnReady(expectedTurnId, turn) && isApplicationFillRetryFillersReady(fillers)
+}
+
 type ApplicationFillRetryOptions = { explicitUserRetry?: boolean }
 
 type ApplicationFillTask = {
@@ -145,15 +167,15 @@ async function lockTerminalApplicationFillRetry(
     || task.fillTurnSessionId !== identity.sessionId || task.fillTurnUserId !== identity.userId) {
     throw new AgentCommandError("retry_target_invalid", "The prior application fill Turn is not bound to this retryable task", 409)
   }
-  const turns = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwnerId: string | null; leaseExpiresAt: Date | null }>>(Prisma.sql`
+  const turns = await tx.$queryRaw<RetryTurn[]>(Prisma.sql`
     SELECT "id", "status", "leaseOwnerId", "leaseExpiresAt" FROM "agent_turns"
     WHERE "id" = ${task.fillTurnId} AND "sessionId" = ${identity.sessionId} AND "userId" = ${identity.userId}
     FOR UPDATE
   `)
-  if (!turns[0] || !TERMINAL_TURNS.includes(turns[0].status) || turns[0].leaseOwnerId !== null || turns[0].leaseExpiresAt !== null) {
+  if (!isApplicationFillRetryTurnReady(task.fillTurnId, turns[0])) {
     throw new AgentCommandError("retry_target_invalid", "The prior application fill Turn must be terminal and lease-free", 409)
   }
-  const fillers = await tx.$queryRaw<Array<{ id: string; status: string; leaseOwner: string | null; leaseExpiresAt: Date | null; role: string; taskType: string }>>(Prisma.sql`
+  const fillers = await tx.$queryRaw<RetryFiller[]>(Prisma.sql`
     SELECT task."id", task."status", task."leaseOwner", task."leaseExpiresAt", task."role", task."taskType"
     FROM "sub_agent_tasks" AS task
     JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = ${identity.userId}
@@ -162,10 +184,7 @@ async function lockTerminalApplicationFillRetry(
       AND (task."role" = 'application_filler' OR task."taskType" = 'application_fill_for_review')
     FOR UPDATE OF task
   `)
-  if (fillers.length !== 1 || fillers.some((filler) => (
-    filler.role !== "application_filler" || filler.taskType !== "application_fill_for_review"
-    || !TERMINAL_FILLERS.has(filler.status) || filler.leaseOwner !== null || filler.leaseExpiresAt !== null
-  ))) {
+  if (!isApplicationFillRetryFillersReady(fillers)) {
     throw new AgentCommandError("retry_target_invalid", "The application filler must be terminal with no live lease", 409)
   }
 }
