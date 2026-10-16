@@ -162,7 +162,6 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       return legacyApprovalErrorResponse(error, "Approval could not be resolved")
     }
   }
-
   if (action.decision === "approved" && approval?.type === "tailor_resume") {
     return handleApprovedResumeTailoring(id, auth.userId, action, approval)
   }
