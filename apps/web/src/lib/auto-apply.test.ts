@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   hasEffectiveEntitlement: vi.fn(),
   isFeatureAllowed: vi.fn(),
   resolveAiAccess: vi.fn(),
+  startApplicationFillForReview: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -37,6 +38,12 @@ vi.mock("@/lib/db", () => ({
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }));
 vi.mock("@/lib/runtime-feature-flags", () => ({ isRuntimeFeatureEnabled: mocks.runtimeFeatureEnabled }));
 vi.mock("@/lib/entitlements", () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement, isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }));
+vi.mock("@/lib/agent/control-plane/commands/agent-command-service", () => ({
+  AgentCommandService: class {
+    constructor(_db: unknown) {}
+    startApplicationFillForReview = mocks.startApplicationFillForReview
+  },
+}));
 
 describe("auto-apply authorization", () => {
   const input = {
@@ -81,6 +88,8 @@ describe("auto-apply authorization", () => {
     mocks.taskEventCreate.mockResolvedValue({});
     mocks.isFeatureAllowed.mockResolvedValue(true);
     mocks.resolveAiAccess.mockResolvedValue('allowed');
+    mocks.startApplicationFillForReview.mockResolvedValue({ inputId: "input_1", turnId: "turn_fill_1", sequence: "1", disposition: "started" });
+    vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "0");
   });
 
   it("queues only after matching explicit per-job authorization", async () => {
@@ -96,7 +105,7 @@ describe("auto-apply authorization", () => {
   it("does not reset task or job state when queue failure cleanup races with Worker progress", async () => {
     mocks.enqueueApplyTask.mockRejectedValueOnce(new Error("queue response was lost"))
     mocks.txTaskUpdateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 })
-    const { queueAutonomousApplication } = await import("./auto-apply")
+    const { queueAutonomousApplication } = await import("./auto-apply");
 
     await expect(queueAutonomousApplication(input)).rejects.toThrow("queue response was lost")
 
@@ -137,6 +146,42 @@ describe("auto-apply authorization", () => {
     })).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
     expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+  });
+
+  it("routes a user-input resume through the TaskGraph resume transaction", async () => {
+    vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "1");
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_waiting" });
+    const { queueApplicationFill } = await import("./auto-apply");
+
+    await expect(queueApplicationFill({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "application_1", applyUrl: input.applyUrl,
+      resumeAfterUserInput: true,
+    })).resolves.toMatchObject({ taskId: "turn_fill_1", turnId: "turn_fill_1", disposition: "started" });
+
+    expect(mocks.startApplicationFillForReview).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1",
+      clientMessageId: "application-fill-resume:application_1", resumeAfterUserInput: true,
+    }));
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps TaskGraph fill disabled by default and uses the existing ApplyQueue fallback", async () => {
+    mocks.taskUpdate.mockResolvedValueOnce({ count: 1 });
+    const { applicationFillTaskGraphEnabled, queueApplicationFill } = await import("./auto-apply");
+    expect(applicationFillTaskGraphEnabled(undefined)).toBe(false);
+    await expect(queueApplicationFill(input)).resolves.toEqual({ taskId: "worker_1" });
+    expect(mocks.enqueueApplyTask).toHaveBeenCalledWith(expect.objectContaining({ operation: "fill" }));
+    expect(mocks.startApplicationFillForReview).not.toHaveBeenCalled();
+  });
+
+  it("routes enabled fill-for-review to one deterministic canonical Turn without enqueuing ApplyQueue", async () => {
+    vi.stubEnv("ENABLE_APPLICATION_FILL_TASKGRAPH", "1");
+    const { queueApplicationFill } = await import("./auto-apply");
+    await expect(queueApplicationFill(input)).resolves.toEqual({ taskId: "turn_fill_1", turnId: "turn_fill_1", disposition: "started" });
+    expect(mocks.startApplicationFillForReview).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1", clientMessageId: "application-fill:application_1",
+    }));
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
   });
 
   it("does not queue unattended browser work when the platform control is disabled", async () => {

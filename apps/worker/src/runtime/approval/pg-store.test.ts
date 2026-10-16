@@ -109,6 +109,20 @@ describe("Worker PG approval store", () => {
     expect(calls.some(text => text.includes('INSERT INTO "agent_events"') || text.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
+  it("issues on a supplied client without opening or committing a nested transaction", async () => {
+    const row = await makeRow()
+    const { pool, client, calls } = fakePool(row)
+    const store = createPgApprovalStore(pool, { userId: scope.userId })
+
+    await expect(store.issueInTransaction(client as never, {
+      approvalId: row.id as string, scope, title: "Submit", body: "Review", payload: { jobId: scope.jobId }, nonce: "nonce_1",
+    })).resolves.toMatchObject({ approval: { id: row.id }, nonce: "nonce_1" })
+    expect(pool.connect).not.toHaveBeenCalled()
+    expect(calls).not.toContain("BEGIN")
+    expect(calls).not.toContain("COMMIT")
+    expect(calls.some(text => text.includes('UPDATE "agent_turns" SET "status" = \'waiting_for_approval\''))).toBe(true)
+  })
+
   it("rolls back issue when projectApprovalWait loses the open-session fence", async () => {
     const row = await makeRow()
     const { pool, client } = fakePool(row, "running", "automation", true)

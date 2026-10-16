@@ -227,7 +227,7 @@ describe("apply-queue CAPTCHA handling", () => {
     expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
     expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
       expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
-      "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+      "CAPTCHA detected. User takeover is required; no bypass was attempted.", "submit",
     );
   });
 
@@ -266,7 +266,7 @@ describe("apply-queue CAPTCHA handling", () => {
     }));
     expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
       expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
-      "Challenge detection failed. User takeover is required; no bypass was attempted.",
+      "Challenge detection failed. User takeover is required; no bypass was attempted.", "submit",
     );
   });
 
@@ -287,7 +287,7 @@ describe("apply-queue CAPTCHA handling", () => {
     }));
     expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
       expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
-      "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+      "CAPTCHA detected. User takeover is required; no bypass was attempted.", "submit",
     );
   });
 

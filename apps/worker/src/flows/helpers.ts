@@ -1,4 +1,5 @@
 import type { Page } from "playwright-core";
+import { formAnswerKeyForSelector, isAnswerableFormControl, isFormAnswerKeyV2 } from "../form-answer-key.js";
 import { readSubmissionRequestIntent, type SubmissionRequestIntent } from "./submission-intent.js";
 
 export type FlowLogEntry = { field?: string; selector?: string; action: string };
@@ -6,20 +7,13 @@ export type FlowLogEntry = { field?: string; selector?: string; action: string }
 export function getPersonaValue(persona: Record<string, string>, key: string): string {
   if (persona[key]) return persona[key];
   if (key === "firstName" && persona.fullName) return persona.fullName.trim().split(/\s+/)[0] ?? "";
-  if (key === "lastName" && persona.fullName) {
-    const parts = persona.fullName.trim().split(/\s+/);
-    return parts.length > 1 ? parts.slice(1).join(" ") : "";
-  }
+  if (key === "lastName" && persona.fullName) { const parts = persona.fullName.trim().split(/\s+/); return parts.length > 1 ? parts.slice(1).join(" ") : ""; }
   return "";
 }
 
-export function normalizeLabel(value: string): string {
-  return value.replace(/[-_[\]]/g, " ").toLowerCase().trim();
-}
+export function normalizeLabel(value: string): string { return value.replace(/[-_[\]]/g, " ").toLowerCase().trim(); }
 
-export function isSensitiveQuestion(value: string): boolean {
-  return /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i.test(value)
-}
+export function isSensitiveQuestion(value: string): boolean { return /salary|compensation|pay|visa|sponsor|work.?authori[sz]|citizen|nationality|legal|criminal|disability|gender|race|ethnic|signature|e-?sign/i.test(value) }
 
 export function confirmedAnswerForLabel(
   answers: Record<string, string> | undefined,
@@ -33,7 +27,10 @@ export function confirmedAnswerForLabel(
   });
   return match?.[1] ?? "";
 }
-
+export function confirmedAnswerForField(answers: Record<string, string> | undefined, id: string | null, name: string | null, label: string, ambiguous = false): string {
+  if (!answers || !Object.keys(answers).some(isFormAnswerKeyV2)) return answers ? confirmedAnswerForLabel(answers, label) : "";
+  const key = ambiguous ? null : formAnswerKeyForSelector(id, name); return key ? answers[key] ?? "" : "";
+}
 export function escapeSelectorValue(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/"/g, '\\"');
 }
@@ -99,38 +96,42 @@ export async function fillCustomQuestions(
   confirmedAnswers?: Record<string, string>,
 ): Promise<void> {
   try {
-    const handles = await page.$$("textarea:not([disabled]), input[type='text']:not([disabled])");
-    for (const handle of handles) {
+    const selectorFields = await Promise.all((await page.$$("textarea:not([disabled]), input:not([disabled]), select:not([disabled])")).map(async handle => {
+      const details = await handle.evaluate(field => {
+        const select = field instanceof HTMLSelectElement;
+        return {
+          tagName: field.tagName.toLowerCase(), type: field instanceof HTMLInputElement ? field.type : "",
+          multiple: select && field.multiple,
+          options: select ? Array.from(field.options, (option, index) => ({ index, value: option.value, label: option.label, disabled: option.disabled })) : [],
+        };
+      });
+      return { handle, idAttr: (await handle.getAttribute("id")) ?? "", nameAttr: (await handle.getAttribute("name")) ?? "", visible: await handle.isVisible().catch(() => false), ...details };
+    }));
+    const identityCounts = new Map<string, number>(); selectorFields.forEach(({ visible, idAttr, nameAttr }) => { const key = formAnswerKeyForSelector(idAttr || null, nameAttr || null); if (visible && key) identityCounts.set(key, (identityCounts.get(key) ?? 0) + 1); });
+    const hasV2Answers = Object.keys(confirmedAnswers ?? {}).some(isFormAnswerKeyV2);
+    for (const { handle, idAttr, nameAttr, visible, tagName, type, multiple, options } of selectorFields) {
       try {
-        if (!(await handle.isVisible().catch(() => false))) continue;
-        if (await handle.inputValue().catch(() => "")) continue;
-
-        const nameAttr = (await handle.getAttribute("name")) ?? "";
-        const idAttr = (await handle.getAttribute("id")) ?? "";
+        if (!visible || !isAnswerableFormControl(tagName, type, multiple) || await handle.inputValue().catch(() => "")) continue;
         const label = normalizeLabel(`${nameAttr} ${idAttr}`);
         if (!label) continue;
-        // These require an explicit user decision, even when an old Persona
-        // happens to contain a similarly named value.
-        const confirmed = confirmedAnswerForLabel(confirmedAnswers, label);
+        const identity = formAnswerKeyForSelector(idAttr || null, nameAttr || null);
+        const confirmed = confirmedAnswerForField(confirmedAnswers, idAttr || null, nameAttr || null, label, Boolean(identity && identityCounts.get(identity) !== 1));
         if (isSensitiveQuestion(label) && !confirmed) continue;
-
-        const matchKey = confirmed ? "candidate_confirmed" : Object.keys(persona).find((key) => {
+        const selector = idAttr ? `#${escapeSelectorValue(idAttr)}` : nameAttr ? `[name="${escapeSelectorValue(nameAttr)}"]` : null;
+        if (!selector) continue;
+        if (tagName === "select") {
+          if (!hasV2Answers || !confirmed) continue;
+          const matching = options.filter(option => !option.disabled && (option.value === confirmed || option.label.trim() === confirmed.trim()));
+          if (matching.length !== 1) continue;
+          await page.locator(selector).selectOption({ index: matching[0]!.index });
+          log.push({ field: "candidate_confirmed", selector, action: "fill-custom" });
+          continue;
+        }
+        const matchKey = confirmed ? "candidate_confirmed" : Object.keys(persona).find(key => {
           const normalizedKey = normalizeLabel(key);
-          return Boolean(
-            normalizedKey &&
-            persona[key] &&
-            (label.includes(normalizedKey) || normalizedKey.includes(label))
-          );
+          return Boolean(normalizedKey && persona[key] && (label.includes(normalizedKey) || normalizedKey.includes(label)));
         });
         if (!matchKey) continue;
-
-        const selector = idAttr
-          ? `#${escapeSelectorValue(idAttr)}`
-          : nameAttr
-            ? `[name="${escapeSelectorValue(nameAttr)}"]`
-            : null;
-        if (!selector) continue;
-
         await humanType(page, selector, confirmed || String(persona[matchKey]));
         log.push({ field: matchKey, selector, action: "fill-custom" });
       } catch {

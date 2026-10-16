@@ -9,7 +9,6 @@ import {
   type ApprovalScope,
   type ApprovalType,
 } from "@jobcopilot/agent-protocol"
-
 import {
   ApprovalStoreError,
   assertScopeInput,
@@ -121,7 +120,7 @@ async function projectApprovalWait(client: Client, input: IssueApprovalReceiptIn
     [input.scope.turnId, input.scope.sessionId, input.scope.userId],
   )
   const turn = turnResult.rows[0]
-  if (!turn || !["queued", "in_progress", "waiting_for_dependency"].includes(turn.status) || turn.revision !== input.scope.revision) {
+  if (!turn || !["queued", "in_progress", "waiting_for_dependency", "waiting_for_user"].includes(turn.status) || turn.revision !== input.scope.revision) {
     throw new ApprovalStoreError("approval_revision_mismatch", "Approval Turn revision is stale")
   }
   const itemId = `agent-wait:approval:${approvalId}`
@@ -149,47 +148,51 @@ async function withTransaction<T>(pool: pg.Pool, userId: string, work: (client: 
     client.release()
   }
 }
+async function issueOnClient(client: Client, userId: string, input: IssueApprovalReceiptInput): Promise<ApprovalReceiptResult> {
+  if (input.scope.userId !== userId) throw new ApprovalStoreError("approval_scope_mismatch", "Approval user scope does not match the Worker tenant")
+  assertScopeInput(input.scope)
+  const nonce = input.nonce ?? createApprovalNonce()
+  const nonceHash = await hashApprovalNonce(nonce)
+  const scopeHash = await hashApprovalScope(protocolScope(input.scope, nonceHash))
+  const id = input.approvalId ?? randomUUID()
+  const session = await client.query(`SELECT "id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION}`, [input.scope.sessionId, userId])
+  if (!session.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session is not owned by the Worker tenant")
+  const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [input.scope.turnId, input.scope.sessionId, userId])
+  if (!turn.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval turn is not owned by the session")
+  const job = await client.query(`SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [input.scope.jobId, userId])
+  if (!job.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval job is not owned by the Worker tenant")
+  const result = await client.query<ApprovalRow>(`INSERT INTO "agent_approvals" ("id", "sessionId", "taskId", "userId", "turnId", "toolCallId", "jobId", "type", "status", "title", "body", "impact", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17, $18, $19) RETURNING *`, [id, input.scope.sessionId, input.taskId ?? null, userId, input.scope.turnId, input.scope.toolCallId, input.scope.jobId, input.scope.action, input.title, input.body, JSON.stringify(input.impact ?? null), JSON.stringify(input.payload), input.scope.resourceHash, input.scope.materialHash, input.scope.answersHash, scopeHash, nonceHash, input.scope.revision, input.scope.expiresAt])
+  if (input.projectWait !== false) await projectApprovalWait(client, input, id, scopeHash)
+  await appendAudit(client, { sessionId: input.scope.sessionId, turnId: input.scope.turnId, taskId: input.taskId ?? null, type: "approval.requested", actor: "orchestrator", approvalId: id, payload: auditPayload(id, input.scope.action, scopeHash, input.scope.revision), key: `approval:${id}:requested` })
+  const row = result.rows[0]
+  if (!row) throw new ApprovalStoreError("approval_scope_mismatch", "Approval receipt was not persisted")
+  return { approval: mapApproval(row), nonce }
+}
 export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) {
   const ensureTenant = (userId: string) => { if (userId !== scope.userId) throw new ApprovalStoreError("approval_scope_mismatch", "Approval user scope does not match the Worker tenant") }
   return {
     async issue(input: IssueApprovalReceiptInput): Promise<ApprovalReceiptResult> {
-      ensureTenant(input.scope.userId)
-      assertScopeInput(input.scope)
-      const nonce = input.nonce ?? createApprovalNonce()
-      const nonceHash = await hashApprovalNonce(nonce)
-      const approvalScope = protocolScope(input.scope, nonceHash)
-      const scopeHash = await hashApprovalScope(approvalScope)
-      const id = input.approvalId ?? randomUUID()
       try {
-        const row = await withTransaction(pool, scope.userId, async (client) => {
-          const session = await client.query(`SELECT "id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION}`, [input.scope.sessionId, scope.userId])
-          if (!session.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session is not owned by the Worker tenant")
-          const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [input.scope.turnId, input.scope.sessionId, scope.userId])
-          if (!turn.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval turn is not owned by the session")
-          const job = await client.query(`SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2`, [input.scope.jobId, scope.userId])
-          if (!job.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval job is not owned by the Worker tenant")
-          const result = await client.query<ApprovalRow>(`INSERT INTO "agent_approvals" ("id", "sessionId", "taskId", "userId", "turnId", "toolCallId", "jobId", "type", "status", "title", "body", "impact", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17, $18, $19) RETURNING *`, [id, input.scope.sessionId, input.taskId ?? null, scope.userId, input.scope.turnId, input.scope.toolCallId, input.scope.jobId, input.scope.action, input.title, input.body, JSON.stringify(input.impact ?? null), JSON.stringify(input.payload), input.scope.resourceHash, input.scope.materialHash, input.scope.answersHash, scopeHash, nonceHash, input.scope.revision, input.scope.expiresAt])
-          if (input.projectWait !== false) await projectApprovalWait(client, input, id, scopeHash)
-          await appendAudit(client, { sessionId: input.scope.sessionId, turnId: input.scope.turnId, taskId: input.taskId ?? null, type: "approval.requested", actor: "orchestrator", approvalId: id, payload: auditPayload(id, input.scope.action, scopeHash, input.scope.revision), key: `approval:${id}:requested` })
-          return result.rows[0]
-        })
-        return { approval: mapApproval(row), nonce }
+        ensureTenant(input.scope.userId)
+        return await withTransaction(pool, scope.userId, client => issueOnClient(client, scope.userId, input))
       } catch (error: unknown) {
         if (isUniqueViolation(error)) throw new ApprovalStoreError("approval_reservation_conflict", "Approval nonce or id is already in use")
         throw error
       }
+    },
+    async issueInTransaction(client: Client, input: IssueApprovalReceiptInput): Promise<ApprovalReceiptResult> {
+      ensureTenant(input.scope.userId)
+      return issueOnClient(client, scope.userId, input)
     },
     async validate(id: string, expected: ApprovalScopeMatch, now = new Date()): Promise<AgentApproval> {
       ensureTenant(expected.userId)
       assertScopeInput(expected)
       return withTransaction(pool, scope.userId, async (client) => mapApproval(await load(client, id, scope.userId).then(async (row) => { await assertScope(client, row, expected, now); return row })))
     },
-
     async inspectSubmission(id: string, expected: SubmissionScopeExpectation, now = new Date()): Promise<AgentApproval> {
       ensureTenant(expected.userId)
       return withTransaction(pool, scope.userId, async (client) => mapApproval(await load(client, id, scope.userId).then(async (row) => { await assertSubmissionScope(client, row, expected, now); return row })))
     },
-
     async consumeSubmission(id: string, expected: SubmissionScopeExpectation, now = new Date()): Promise<AgentApproval> {
       ensureTenant(expected.userId)
       return withTransaction(pool, scope.userId, async (client) => {
@@ -202,7 +205,6 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
         return mapApproval({ ...row, status: "consumed", consumedAt: now })
       })
     },
-
     async resolve(input: { id: string; sessionId: string; decision: ApprovalDecision; now?: Date }): Promise<void> {
       ensureTenant(scope.userId)
       const now = input.now ?? new Date()
@@ -218,11 +220,9 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
         await appendAudit(client, { sessionId: row.sessionId, turnId: row.turnId, taskId: row.taskId, type: "approval.resolved", actor: "user", approvalId: row.id, payload: auditPayload(row.id, row.type, row.scopeHash ?? "legacy", row.revision), key: `approval:${row.id}:resolved:${input.decision}` })
       })
     },
-
     async consume(id: string, expected: ApprovalScopeMatch, now = new Date()): Promise<ApprovalConsumeResult> {
       return this.consumeAndReserve(id, expected, null, now)
     },
-
     async consumeAndReserve(id: string, expected: ApprovalScopeMatch, reservation: ApprovalReservationInput | null, now = new Date()): Promise<ApprovalConsumeResult> {
       ensureTenant(expected.userId)
       assertScopeInput(expected)

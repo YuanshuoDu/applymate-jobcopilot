@@ -272,6 +272,17 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toContain("spawn_subagent")
   })
 
+  it("rejects Application Filler through generic agent.spawn before dispatch", async () => {
+    const runtime = makeRuntime()
+    await expect(executeSpawn(context(), {
+      idempotencyKey: "generic-application-filler", role: "application_filler",
+      taskType: "application_fill_for_review", goal: "Prepare this application for review",
+    }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
   it("routes planner-root spawn aliases through the native command with stable replay identity", async () => {
     const runtime = makeRuntime()
     const calls: TaskGraphNativeCommandInput[] = []
@@ -664,6 +675,39 @@ describe("coordination executors", () => {
       .rejects.toMatchObject({ code: overrides.id === "root-1" ? "coordination_followup_root_forbidden" : overrides.status === "running" ? "coordination_followup_source_not_terminal" : "coordination_task_not_found" })
     expect(runtime.manager.spawn).not.toHaveBeenCalled()
     expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("rejects generic legacy follow-up from an Application Filler task", async () => {
+    const runtime = makeRuntime()
+    const source = makeTask({
+      id: "application-filler", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/fill", depth: 1,
+      role: "application_filler", taskType: "application_fill_for_review", status: "completed",
+    })
+    runtime.store.tasks.set(source.id, source)
+
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      taskId: source.id, idempotencyKey: "generic-filler-followup", goal: "Continue filling",
+    }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("checks objective coverage before looking up a legacy follow-up source", async () => {
+    const runtime = makeRuntime()
+    const lookup = vi.spyOn(runtime.store, "getTask")
+
+    let thrown: unknown
+    try { executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" }), {
+      taskId: "missing", idempotencyKey: "followup-without-plan", goal: "Continue",
+    }, {
+      ...runtime.options,
+      verificationRequirements: { status: "valid", requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2 }] },
+    }) } catch (error: unknown) { thrown = error }
+
+    expect(thrown).toMatchObject({ code: "coordination_objective_requirements_require_plan" })
+    expect(lookup).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
   })
 
   it("rejects foreign sources and a missing, terminal, or cross-turn runtime parent", async () => {

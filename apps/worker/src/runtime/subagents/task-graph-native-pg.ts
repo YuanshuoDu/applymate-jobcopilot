@@ -1,7 +1,7 @@
 import { materializeTaskGraphDependencyContext, isTaskGraphDependencyContextError } from "./task-graph-dependency-context.js"
 import { assertPlanningRootHasNoUnresolvedSteering, createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
-import { getSubagentRolePolicy } from "./role-policy.js"
+import { getSubagentRolePolicy, isHarnessSubagentRole } from "./role-policy.js"
 import { appendTaskGraphNativeNode, TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 import { enqueueGraphTask } from "./task-graph-pg-create.js"
@@ -58,7 +58,7 @@ export async function appendNativeGraphCommand(
   const role = source?.provenance.role ?? (operation.kind === "spawn" ? operation.role : "")
   const taskType = source?.provenance.taskType ?? (operation.kind === "spawn" ? operation.taskType : "")
   const rolePolicy = getSubagentRolePolicy(role)
-  if (!rolePolicy || rolePolicy.actorRole !== "subagent" || rolePolicy.canManageChildren || rolePolicy.externalWritesEnabled) {
+  if (!isHarnessSubagentRole(role) || !rolePolicy || rolePolicy.actorRole !== "subagent" || rolePolicy.canManageChildren || rolePolicy.externalWritesEnabled) {
     throw commandError("native_role_not_allowed")
   }
   const baseContext = source ? followupContext(command.request.context, source) : command.request.context

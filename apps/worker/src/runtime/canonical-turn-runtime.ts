@@ -22,7 +22,7 @@ import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-typ
 import { INTERACTIVE_DISCOVERY_INTENT, loadCanonicalTurnState, type CanonicalTurnState, type CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
 import { isSelectedJobRootTool } from "./canonical-turn-task-graph-context.js"
 import { createCanonicalTurnCoordination } from "./canonical-turn-coordination.js"
-import { loadSelectedJobPreparation, type SelectedJobPreparation } from "./selected-job-preparation.js"
+import { loadSelectedJobPreparation } from "./selected-job-preparation.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
 import { readSelectedJobSourceDigestWithClient } from "./subagents/selected-job-artifact-context.js"
@@ -54,7 +54,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly consumeWaitOutcomes?: boolean
   /** Server-derived production gate; user policy cannot enable coordination. */ readonly coordinationEnabled?: boolean; /** Explicit trusted adapter seam for the native question wait contract. */ readonly nativeQuestionWaitEnabled?: boolean
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date, options?: CanonicalTurnStateLoadOptions) => Promise<CanonicalTurnState>
-  /** Test seam for the server-owned Turn input selector; production uses the lease-fenced database loader. */ readonly selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
+  /** Server-owned prep-loader test seams; production uses lease-fenced database loaders. */ readonly selectedJobPreparationLoader?: typeof loadSelectedJobPreparation; readonly applicationFillPreparationLoader?: Parameters<typeof taskGraphRuntimeForTurn>[0]["applicationFillPreparationLoader"]
   /** Test seam for the persisted artifact-head read; production uses the artifact repository. */ readonly selectedJobArtifactHeadReader?: (scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>
   /** Test seam for reloading the server-selected source digest at Turn completion. */ readonly selectedJobSourceDigestLoader?: (userId: string, jobId: string) => Promise<string | null>
   /** Test seam for rebuilding the shortlist from persisted owner-scoped child results and observations. */
@@ -123,7 +123,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     let state = await (options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }))
     const { enabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobPreparation, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
-      selectedJobPreparationLoader: options.selectedJobPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
+      selectedJobPreparationLoader: options.selectedJobPreparationLoader, applicationFillPreparationLoader: options.applicationFillPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
     if (!taskGraphPlanningEnabled && !signal.aborted) {
       const selectedJobPreparation = await (options.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(pool, lease, now())

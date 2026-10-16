@@ -2,6 +2,12 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { PrismaClient } from "@prisma/client"
 
+const applicationFillMocks = vi.hoisted(() => ({ startApplicationFillForReview: vi.fn() }))
+
+vi.mock("./application-fill-command", () => ({
+  startApplicationFillForReview: applicationFillMocks.startApplicationFillForReview,
+}))
+
 import { AgentCommandService } from "./agent-command-service"
 import { ObjectiveStartCommandService } from "./objective-start"
 
@@ -298,6 +304,30 @@ function objectiveStartCommand(clientMessageId: string, source: "user" | "automa
 }
 
 describe("AgentCommandService", () => {
+  it("forwards application fill review commands and returns the delegated result", async () => {
+    const fake = makeDb()
+    const command = {
+      sessionId: "session_1",
+      userId: "user_1",
+      clientMessageId: "fill_review_client_1",
+      applicationTaskId: "application_task_1",
+      resumeAfterUserInput: true,
+    }
+    const delegatedResult = {
+      inputId: "input_fill_1",
+      turnId: "turn_fill_1",
+      disposition: "started" as const,
+      sequence: "12",
+    }
+    applicationFillMocks.startApplicationFillForReview.mockReset().mockResolvedValueOnce(delegatedResult)
+
+    await expect(new AgentCommandService(fake.db).startApplicationFillForReview(command)).resolves.toBe(delegatedResult)
+
+    expect(applicationFillMocks.startApplicationFillForReview).toHaveBeenCalledOnce()
+    expect(applicationFillMocks.startApplicationFillForReview.mock.calls[0]?.[0]).toBe(fake.db)
+    expect(applicationFillMocks.startApplicationFillForReview.mock.calls[0]?.[1]).toBe(command)
+  })
+
   it("starts a fresh root with a separate exact objective and preserved context", async () => {
     const fake = makeDb({ sessionStatus: "running" })
     const longContext = "x".repeat(20_000)

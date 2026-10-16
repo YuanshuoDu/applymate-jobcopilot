@@ -2,7 +2,19 @@ import type pg from "pg"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphCommandPort, TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "../selected-job-preparation.js"
+import { loadApplicationFillPreparation, type ApplicationFillPreparation } from "../application-fill-preparation.js"
 import type { TurnLease } from "../turns/lease.js"
+
+const APPLICATION_FILL_TEMPLATE_ID = "application_filler"
+const APPLICATION_FILL_TEMPLATE: TaskGraphTaskTemplate = Object.freeze({
+  role: "application_filler",
+  taskType: "application_fill_for_review",
+  allowedActions: Object.freeze([]),
+  constraints: Object.freeze([
+    "Fill only the application bound to the server-owned current Turn.",
+    "Do not submit or contact the employer; stop for user review.",
+  ]),
+})
 
 /** Registered task types are server-owned; a plan may select only these IDs. */
 export const TASK_GRAPH_TEMPLATES = Object.freeze({
@@ -75,19 +87,39 @@ export function taskGraphTemplatesForSelectedJob(
   })
 }
 
+/** App-fill capability is reserved and appears only after its exact DB binding is confirmed. */
+export function taskGraphTemplatesForApplicationFill(
+  templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined,
+  preparation: ApplicationFillPreparation | undefined,
+): Readonly<Record<string, TaskGraphTaskTemplate>> | undefined {
+  const base = templates && Object.prototype.hasOwnProperty.call(templates, APPLICATION_FILL_TEMPLATE_ID)
+    ? Object.freeze(Object.fromEntries(Object.entries(templates).filter(([key]) => key !== APPLICATION_FILL_TEMPLATE_ID)))
+    : templates
+  return preparation ? Object.freeze({ ...(base ?? {}), [APPLICATION_FILL_TEMPLATE_ID]: APPLICATION_FILL_TEMPLATE }) : base
+}
+
 export async function taskGraphRuntimeForTurn(input: {
   enabled: boolean
   pool: Pick<pg.Pool, "connect">
   lease: TurnLease
   now: () => Date
   selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
+  applicationFillPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<ApplicationFillPreparation | undefined>
   taskGraphTemplates?: Readonly<Record<string, TaskGraphTaskTemplate>>
 }): Promise<{ enabled: boolean; selectedJobMode: boolean; selectedJobPreparation: SelectedJobPreparation | undefined; templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined }> {
-  if (!input.enabled) return { enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, templates: input.taskGraphTemplates }
-  const preparation = await (input.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(input.pool, input.lease, input.now())
+  if (!input.enabled) return {
+    enabled: false, selectedJobMode: false, selectedJobPreparation: undefined,
+    templates: taskGraphTemplatesForApplicationFill(input.taskGraphTemplates, undefined),
+  }
+  const now = input.now()
+  const [preparation, applicationFill] = await Promise.all([
+    (input.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(input.pool, input.lease, now),
+    (input.applicationFillPreparationLoader ?? loadApplicationFillPreparation)(input.pool, input.lease, now),
+  ])
+  const templates = preparation ? taskGraphTemplatesForSelectedJob(preparation) : input.taskGraphTemplates
   return {
     enabled: true, selectedJobMode: Boolean(preparation), selectedJobPreparation: preparation,
-    templates: preparation ? taskGraphTemplatesForSelectedJob(preparation) : input.taskGraphTemplates,
+    templates: taskGraphTemplatesForApplicationFill(templates, applicationFill),
   }
 }
 

@@ -99,6 +99,22 @@ describe("parseTaskGraphSnapshot", () => {
     })
   })
 
+  it("marks Application Filler graph nodes specialized without a typed verification contract", () => {
+    const state: TaskGraphState = {
+      revision: 1,
+      nodes: [{ key: "fill", templateId: "application_filler", goal: "Prepare for review", successCriteria: ["Ready for review"], dependsOn: [], depth: 1, status: "queued" }],
+      appliedEvents: [],
+    }
+    const snapshot = taskGraphSnapshot(state, new Map([["fill", "task-fill"]]))
+
+    expect(snapshot.nodes[0]).toMatchObject({ templateId: "application_filler", verificationDisposition: "specialized" })
+    expect(snapshot.nodes[0]).not.toHaveProperty("verification")
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(snapshot))).toEqual(snapshot)
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{
+      ...storedNode("typed-fill"), templateId: "application_filler", verification: analystVerification, verificationDisposition: "typed",
+    }]))).toThrow("task_graph_snapshot_verification_invalid")
+  })
+
   it("preserves normalized typed contracts in canonical snapshots and identifies old nodes as legacy", () => {
     const typed = parseTaskGraphSnapshot(snapshotWithNodes([{
       ...storedNode("typed"), templateId: "analyst", verification: analystVerification, verificationDisposition: "typed",

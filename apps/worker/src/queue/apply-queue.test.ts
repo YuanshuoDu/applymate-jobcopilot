@@ -36,8 +36,11 @@ const mockTurnState = vi.hoisted(() => ({ sessionStatus: "running", turnStatus: 
 const mockPoolQuery = vi.hoisted(() => vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }));
 const mockTurnClient = vi.hoisted(() => ({
   query: vi.fn(async (sql: string) => {
+    if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "agent-session-1" }], rowCount: 1 };
+    if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "agent-session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
+    if (sql.includes("INSERT INTO apply_results")) return { rows: [{ id: 1 }], rowCount: 1 };
     if (sql.includes('FROM "agent_sessions"')) return { rows: [{ status: mockTurnState.sessionStatus }], rowCount: 1 };
-    if (sql.includes('FROM "agent_turns"')) return { rows: [{ status: mockTurnState.turnStatus }], rowCount: 1 };
+    if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: "agent-turn-1", status: mockTurnState.turnStatus }], rowCount: 1 };
     if (sql.includes('FROM "agent_events"')) return { rows: [{ stopped: mockTurnState.interrupted }], rowCount: 1 };
     return { rows: [], rowCount: 1 };
   }),
@@ -441,6 +444,7 @@ describe("apply-queue (unit — mocked)", () => {
       "failed",
       "worker_failed",
       "Canonical application submission requires both receiptId and constraintHash.",
+      "submit",
     );
   });
 
@@ -487,7 +491,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
     expect(mockProviderSubmitClick).not.toHaveBeenCalled();
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover", expect.any(String),
+      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover", expect.any(String), "submit",
     );
   });
 
@@ -520,7 +524,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(uncertaintyWasPersistedAtClose).toBe(true);
     expect(mockFinishApplicationTask).toHaveBeenCalledTimes(1);
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String), "submit",
     );
   });
 
@@ -633,7 +637,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockPageRouting.matcher?.(new URL("https://example.com/telemetry"))).toBe(true);
     expect(mockContext.route).toHaveBeenCalledOnce();
     expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "failed", error: "Agent turn was stopped before the application submission request started." }));
-    expect(mockFinishApplicationTask).toHaveBeenCalledWith(expect.anything(), "application-task-1", "failed", "turn_stopped_before_submit", expect.stringContaining("stopped before"));
+    expect(mockFinishApplicationTask).toHaveBeenCalledWith(expect.anything(), "application-task-1", "failed", "turn_stopped_before_submit", expect.stringContaining("stopped before"), "submit");
     expect(mockPage.close).toHaveBeenCalled();
   });
 
@@ -727,7 +731,7 @@ describe("apply-queue (unit — mocked)", () => {
       expect(confirmationReads[0]?.fallback).toHaveBeenCalledOnce();
       expect(mockPage.close).toHaveBeenCalled();
       expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String), "submit",
       );
     },
   );
@@ -897,7 +901,7 @@ describe("apply-queue (unit — mocked)", () => {
       ]);
       expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
       expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String), "submit",
       );
       expect(mockInsertApplyResult).toHaveBeenCalledTimes(1);
 
@@ -942,7 +946,7 @@ describe("apply-queue (unit — mocked)", () => {
       expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
       expect(mockProviderSubmitClick).not.toHaveBeenCalled();
       expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String), "submit",
       );
       expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual" }));
       expect(order).toEqual(["fence-release", "finish-uncertain"]);
@@ -1016,10 +1020,10 @@ describe("apply-queue (unit — mocked)", () => {
 
     expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String), "submit",
     );
     expect(mockFinishApplicationTask).not.toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "failed", "account_suspended", expect.any(String),
+      expect.anything(), "application-task-1", "failed", "account_suspended", expect.any(String), "submit",
     );
     expect(mockWithCloakContext).not.toHaveBeenCalled();
     expect(mockProviderSubmitClick).not.toHaveBeenCalled();
@@ -1074,7 +1078,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
     expect(duplicateRequestWasAborted).toBe(true);
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("started"),
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("started"), "submit",
     );
     expect(mockInsertApplyResult).toHaveBeenCalledTimes(1);
   });
@@ -1143,7 +1147,7 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockTurnClient.query.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(commitCountBeforeFence);
     expect(mockTurnClient.release).toHaveBeenCalledTimes(2);
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover", expect.stringContaining("Apply timeout"),
+      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover", expect.stringContaining("Apply timeout"), "submit",
     );
   });
 
@@ -1179,13 +1183,13 @@ describe("apply-queue (unit — mocked)", () => {
       error: expect.stringContaining("after it started"),
     }));
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("after it started"),
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("after it started"), "submit",
     );
     expect(uncertaintyWasPersistedAtClose).toBe(true);
   });
 
   it("fills without submission, then creates the durable final-review checkpoint", async () => {
-    mockPage.evaluate.mockResolvedValue({ missing: [], sensitive: [] });
+    mockPage.evaluate.mockResolvedValue({ missing: [], sensitive: [], selectors: [] });
     await import("./apply-queue.js");
     await mockProcessor({
       data: {
@@ -1193,8 +1197,8 @@ describe("apply-queue (unit — mocked)", () => {
         applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
       },
     });
-    expect(mockCompleteFillForReview).toHaveBeenCalledWith(expect.anything(), "application-task-1", "user-1", "job-1");
-    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual", error: expect.stringContaining("ready for user review") }));
+    expect(mockCompleteFillForReview).toHaveBeenCalledWith(expect.anything(), "application-task-1", "user-1", "job-1", mockTurnClient);
+    expect(mockTurnClient.query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO apply_results"), expect.arrayContaining(["user-1", "job-1", "manual"]));
   });
 
   it("marks suspended queued tasks failed without opening a browser", async () => {

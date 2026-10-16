@@ -23,7 +23,7 @@ import { StepContextBuilder, type ContextBlock, type ContextOwnerFence, type Ste
 import type { InputClaimStore, InputClaimTransaction, StoredAgentInput } from "./context/input-claim-store.js"
 import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
-import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
+import { createCanonicalTurnRuntime as createCanonicalTurnRuntimeImpl, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { createChildExecutor, type ChildPublicDefinition } from "./subagents/child-executor.js"
 import type { TreeBudgetReservationStore } from "./subagents/tree-budget-types.js"
 import type { SubagentLease } from "./subagents/types.js"
@@ -66,6 +66,12 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-ve
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
+}
+function createCanonicalTurnRuntime(pool: Parameters<typeof createCanonicalTurnRuntimeImpl>[0], options: CanonicalTurnRuntimeOptions) {
+  return createCanonicalTurnRuntimeImpl(pool, {
+    applicationFillPreparationLoader: async () => undefined,
+    ...options,
+  })
 }
 type TurnEngineStoreFactory = NonNullable<CanonicalTurnRuntimeOptions["turnEngineStoreFactory"]>
 const recoveredPlanHash = `sha256:${"a".repeat(64)}`
@@ -668,6 +674,26 @@ describe("createCanonicalTurnRuntime", () => {
     expect(sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
       result: expect.objectContaining({ status: "failed", errorCode: "selected_job_preparation_unavailable" }),
     }))
+  })
+
+  it("rejects a bound fill with invalid materials before creating the root task", async () => {
+    const roots = rootStore()
+    const modelRuntimeFactory = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: "worker-1",
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      stateLoader: async () => state(),
+      selectedJobPreparationLoader: async () => undefined,
+      applicationFillPreparationLoader: async () => { throw new Error("application_fill_material_unavailable") },
+      rootTaskStore: roots as never,
+      modelRuntimeFactory,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).rejects.toThrow("application_fill_material_unavailable")
+    expect(roots.ensure).not.toHaveBeenCalled()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
   })
 
   it("keeps ordinary Turns on the existing model path when no selected-job intent is present", async () => {

@@ -10,8 +10,27 @@ import { projectTaskTree } from './agent-workspace-projection'
 import { SessionStatusCards } from './SessionStatusCards'
 import { FocusTaskTree, focusQuestionOptions } from './session-focus-parts'
 
-interface DetailResponse {
-  session: AgentSessionDetail
+interface DetailResponse { session: AgentSessionDetail }
+function formWaitId(question: unknown): string | null { const waitId = question && typeof question === 'object' && !Array.isArray(question) ? (question as Record<string, unknown>).waitId : null; return typeof waitId === 'string' && waitId.trim() ? waitId : null }
+export function formAnswerDraftKey(taskId: string, waitId: string, field: string) { return `${taskId}:${waitId}:${field}` }
+export function RetryApplicationFillButton({ sessionId, taskId }: { sessionId: string; taskId: string }) {
+  async function onRetry(event: React.MouseEvent<HTMLButtonElement>) {
+    const alert = event.currentTarget.nextElementSibling as HTMLDivElement | null
+    if (alert) alert.textContent = ''
+    try { await retryCancelledApplicationFill(sessionId, taskId) } catch (error) {
+      if (alert) { const status = error instanceof Error ? /^server_rejected:(\d+)$/.exec(error.message)?.[1] : null; alert.textContent = status ? `Retry rejected by the server (HTTP ${status}). Refresh and try again.` : 'Could not retry the form fill. Check your connection and try again.' }
+    }
+  }
+  return <><button type="button" onClick={onRetry} style={resumeButtonStyle}>Retry form fill</button><div role="alert" aria-live="assertive" /></>
+}
+async function retryCancelledApplicationFill(sessionId: string, taskId: string) {
+  const response = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/actions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'retry_application_fill', applicationTaskId: taskId, requestId: crypto.randomUUID() }) })
+  if (!response.ok) throw new Error(`server_rejected:${response.status}`); window.dispatchEvent(new Event('applymate:sessions-changed'))
+}
+export function startApplicationFillRetryPolling(enabled: boolean, refresh: () => void) { if (!enabled) return () => {}; const timer = setInterval(refresh, 10_000); return () => clearInterval(timer) }
+function isRetryableApplicationFill(task: { status: string; checkpoint: string | null }) { return (task.status === 'cancelled' && ['cancelled_by_user', 'turn_stopped_before_submit'].includes(task.checkpoint ?? '')) || (task.status === 'failed' && ['fill_prestart_failed', 'taskgraph_fill_failed'].includes(task.checkpoint ?? '')) }
+export function needsApplicationFillRetryPolling(tasks: Array<{ id: string; status: string; checkpoint: string | null }>, readiness: Array<{ id: string; cancelledFillRetryReady: boolean }> | undefined, loading: boolean) {
+  return !loading && tasks.some(task => isRetryableApplicationFill(task) && !readiness?.some(row => row.id === task.id && row.cancelledFillRetryReady))
 }
 export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
   const { t } = useI18n()
@@ -22,9 +41,8 @@ export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
       </Section>
     )
   }
-  return <SessionFocusPanelInner sessionId={sessionId} />
+  return <SessionFocusPanelInner sessionId={sessionId} key={sessionId} />
 }
-
 function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
@@ -32,16 +50,21 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const tasks = session?.tasks ?? []
   const approvals = session?.approvals ?? []
   const applicationTasks = session?.applicationTasks ?? []
+  const hasApplicationFillRetryCandidate = applicationTasks.some(isRetryableApplicationFill)
+  const { data: retryReadiness, loading: retryReadinessLoading, refetch: refetchRetryReadiness } = useApi<{ tasks: Array<{ id: string; cancelledFillRetryReady: boolean }> }>(`/api/agent/application-tasks?projection=cancelled-fill-retry&sessionId=${encodeURIComponent(sessionId)}`, { cache: false, enabled: hasApplicationFillRetryCandidate })
+  const hasCancelledByUserRetryCandidate = applicationTasks.some(task => task.status === 'cancelled' && task.checkpoint === 'cancelled_by_user')
+  const needsApplicationFillRetryReadiness = needsApplicationFillRetryPolling(applicationTasks, retryReadiness?.tasks, retryReadinessLoading)
   const execution = session?.execution
   const questions = session?.questions ?? []
   const taskTree = React.useMemo(() => projectTaskTree(tasks), [tasks])
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
   const [answers, setAnswers] = React.useState<Record<string, string>>({})
   React.useEffect(() => {
-    const refresh = () => { void refetch() }
+    const refresh = () => { void refetch(); if (hasCancelledByUserRetryCandidate) void refetchRetryReadiness() }
     window.addEventListener('applymate:sessions-changed', refresh)
-    return () => window.removeEventListener('applymate:sessions-changed', refresh)
-  }, [refetch])
+    const stopPolling = startApplicationFillRetryPolling(needsApplicationFillRetryReadiness, () => { void refetchRetryReadiness() })
+    return () => { window.removeEventListener('applymate:sessions-changed', refresh); stopPolling() }
+  }, [refetch, refetchRetryReadiness, hasCancelledByUserRetryCandidate, needsApplicationFillRetryReadiness])
   async function cancelApplicationTask(id: string) {
     const response = await fetch(`/api/agent/application-tasks?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (response.ok) {
@@ -56,19 +79,14 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
       window.dispatchEvent(new Event('applymate:sessions-changed'))
     }
   }
-
-  async function answerAndResume(id: string, fields: string[]) {
-    const submittedAnswers = Object.fromEntries(fields.map(field => [field, answers[`${id}:${field}`] ?? '']).filter(([, value]) => value.trim()))
-    const response = await fetch('/api/agent/application-tasks', {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, action: 'answer_and_resume', answers: submittedAnswers }),
-    })
+  async function answerAndResume(id: string, waitId: string, fields: Array<{ key: string | null; label: string }>) {
+    const submittedAnswers = Object.fromEntries(fields.flatMap(({ key }) => key ? [[key, answers[formAnswerDraftKey(id, waitId, key)] ?? '']] : []).filter(([, value]) => value.trim()))
+    const response = await fetch('/api/agent/application-tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, waitId, action: 'answer_and_resume', answers: submittedAnswers }) })
     if (response.ok) {
       await refetch()
       window.dispatchEvent(new Event('applymate:sessions-changed'))
     }
   }
-
   async function answerQuestion(questionId: string, answer: string) {
     const response = await fetch('/api/agent/answer', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -79,7 +97,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
       window.dispatchEvent(new Event('applymate:sessions-changed'))
     }
   }
-
   return (
     <>
       <Section title="Session focus"><div style={{ padding: '9px 10px' }}><div style={{ fontSize: 12, fontWeight: 750, color: 'var(--text)' }}>{session?.goal ?? 'Goal unavailable'}</div>{session && <div style={rowMetaStyle}>Session {session.id} · {sessionStatusLabel(session.status)} · updated {new Date(session.updatedAt).toLocaleString('en-GB')}</div>}</div></Section>
@@ -91,7 +108,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
         {!loading && !error && taskTree.length === 0 && <EmptyText>{t('agent.noTaskRecords')}</EmptyText>}
         <FocusTaskTree nodes={taskTree} />
       </Section>
-
       <Section title={t('agent.approvals')}>
         {!loading && pendingApprovals.length === 0 && <EmptyText>{t('agent.noPendingApprovals')}</EmptyText>}
         {pendingApprovals.slice(0, 3).map(approval => (
@@ -104,22 +120,25 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
           </div>
         ))}
       </Section>
-
       <Section title={t('agent.applicationTasks')}>
         {!loading && applicationTasks.length === 0 && <EmptyText>{t('agent.noApplicationTasks')}</EmptyText>}
         {applicationTasks.slice(0, 5).map(task => {
           const fields = task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required' ? formQuestionFields(task.question) : []
+          const waitId = formWaitId(task.question)
+          const retryableFill = isRetryableApplicationFill(task)
           return (
           <div key={task.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
               <div style={rowTitleStyle}>{task.job.company} · {task.job.role}</div>
               <div style={rowMetaStyle}>{task.status}{task.checkpoint ? ` · ${task.checkpoint}` : ''}</div>
               {task.error && <div style={{ ...rowMetaStyle, color: '#d97706' }}>{task.error}</div>}
-              {fields.map(field => (
-                <input key={field} value={answers[`${task.id}:${field}`] ?? ''} onChange={event => setAnswers(current => ({ ...current, [`${task.id}:${field}`]: event.target.value }))} placeholder={field} style={answerInputStyle} />
-              ))}
-              {fields.length > 0 && <button onClick={() => { void answerAndResume(task.id, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
+              {fields.length > 0 && !waitId && <div style={{ ...rowMetaStyle, color: '#d97706' }}>This saved form wait is missing its wait ID and cannot be safely resumed.</div>}
+              {fields.map(field => field.key
+                ? <input key={formAnswerDraftKey(task.id, waitId ?? '', field.key)} name={field.key} value={answers[formAnswerDraftKey(task.id, waitId ?? '', field.key)] ?? ''} onChange={event => setAnswers(current => ({ ...current, [formAnswerDraftKey(task.id, waitId ?? '', field.key!)]: event.target.value }))} placeholder={field.label} style={answerInputStyle} />
+                : <div key={`unmapped:${task.id}:${waitId ?? ''}:${field.label}`} style={rowMetaStyle}>{field.label}</div>)}
+              {fields.some(field => field.key !== null) && waitId && <button onClick={() => { void answerAndResume(task.id, waitId, fields) }} style={resumeButtonStyle}>{t('agent.confirmAnswersResume')}</button>}
             </div>
+            {retryableFill && !retryReadinessLoading && retryReadiness?.tasks.some(row => row.id === task.id && row.cancelledFillRetryReady) && <RetryApplicationFillButton sessionId={sessionId} taskId={task.id} />}
             {!['submitted', 'skipped', 'cancelled'].includes(task.status) && (
               <button onClick={() => { void cancelApplicationTask(task.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancel')}</button>
             )}
@@ -127,7 +146,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
           )
         })}
       </Section>
-
       <Section title={t('agent.executionControl')}>
         {!loading && !execution && <EmptyText>{t('agent.noExecution')}</EmptyText>}
         {execution && <div style={rowStyle}>
@@ -139,7 +157,6 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
           {!['completed', 'failed', 'cancelled'].includes(execution.status) && <button onClick={() => { void cancelExecution(execution.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancelRun')}</button>}
         </div>}
       </Section>
-
       <Section title={t('agent.questionsWaiting')}>
         {!loading && questions.length === 0 && <EmptyText>{t('agent.noQuestions')}</EmptyText>}
         {questions.map(question => {
@@ -157,9 +174,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
           </div>
         })}
       </Section>
-
       <SessionStatusCards artifacts={session?.artifacts} budget={session?.budget} compaction={session?.compaction} uncertain={session?.uncertain} />
-
       <Section title={t('agent.sessionQuality')}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
           <QualityMetric label={t('agent.quality')} value={session?.qualityScore == null ? '--' : `${Math.round(session.qualityScore)}%`} />
@@ -203,31 +218,20 @@ function EmptyText({ children }: { children: React.ReactNode }) {
 }
 
 const sectionTitleStyle: React.CSSProperties = {
-  fontSize: 10,
-  color: 'var(--text-muted)',
-  textTransform: 'uppercase',
-  letterSpacing: 0,
-  fontWeight: 700,
-  marginBottom: 6,
+  fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0,
+  fontWeight: 700, marginBottom: 6,
 }
-
 const rowStyle: React.CSSProperties = {
-  display: 'flex',
-  alignItems: 'flex-start',
-  gap: 8,
-  padding: '9px 10px',
+  display: 'flex', alignItems: 'flex-start', gap: 8, padding: '9px 10px',
   borderTop: '1px solid var(--border)',
 }
-
 const rowTitleStyle: React.CSSProperties = {
-  fontSize: 11,
-  fontWeight: 650,
+  fontSize: 11, fontWeight: 650,
   color: 'var(--text)',
   overflow: 'hidden',
   textOverflow: 'ellipsis',
   whiteSpace: 'nowrap',
 }
-
 const rowMetaStyle: React.CSSProperties = {
   fontSize: 9,
   color: 'var(--text-muted)',
@@ -236,13 +240,11 @@ const rowMetaStyle: React.CSSProperties = {
   textOverflow: 'ellipsis',
   whiteSpace: 'nowrap',
 }
-
 const badgeStyle: React.CSSProperties = {
   fontSize: 9,
   fontWeight: 650,
   flexShrink: 0,
 }
-
 const answerInputStyle: React.CSSProperties = { display: 'block', width: '100%', boxSizing: 'border-box', marginTop: 6, padding: '5px 6px', fontSize: 10, border: '1px solid var(--border)', borderRadius: 5, background: 'var(--bg)' }
 const resumeButtonStyle: React.CSSProperties = { marginTop: 6, fontSize: 9, color: '#0f766e', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }
 const retryButtonStyle: React.CSSProperties = { marginLeft: 4, padding: 0, border: 0, color: 'var(--primary)', background: 'transparent', cursor: 'pointer', font: 'inherit', fontWeight: 700, textDecoration: 'underline' }

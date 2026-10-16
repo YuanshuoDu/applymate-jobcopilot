@@ -4,6 +4,7 @@ import { taskGraphVerificationRole, validateTaskGraphVerificationContract, valid
 import type { SubagentTaskStatus } from "./types.js"
 import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { parseRegisteredScoutEnvelope, taskGraphNodeKeysMatch, type RegisteredScoutEnvelope } from "./task-graph-command-port.js"
+import { APPLICATION_FILLER_TEMPLATE_ID } from "./role-policy.js"
 
 export const TASK_GRAPH_ITEM_TYPE = "task_graph"
 export const TASK_GRAPH_SNAPSHOT_VERSION = "agent-harness.v2.task-graph"
@@ -36,7 +37,7 @@ const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
 const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
 const NODE_KEYS_WITH_REPAIR = "dependsOn,depth,goal,key,repairOf,successCriteria,taskId,templateId,verification,verificationDisposition"
 const NATIVE_NODE_KEYS = "dependsOn,depth,goal,key,nativeDelegation,successCriteria,taskId,templateId,verificationDisposition"
-const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer"])
+const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID])
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",

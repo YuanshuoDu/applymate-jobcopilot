@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { CommandTransaction } from "./transaction"
-import { cancelExecutionInTransaction } from "./execution-cancellation"
+import { cancelExecutionInTransaction, interruptActiveTurn } from "./execution-cancellation"
 
 type State = {
   execution: { id: string; sessionId: string; userId: string; status: string; attemptCount: number } | null
@@ -23,6 +23,9 @@ type State = {
     id: string
     userId: string
     sessionId: string
+    fillTurnId?: string | null
+    fillTurnSessionId?: string | null
+    fillTurnUserId?: string | null
     status: string
     checkpoint: string | null
     completedAt: Date | null
@@ -43,6 +46,12 @@ type State = {
 
 function whereOf(args: unknown): Record<string, unknown> {
   return ((args as { where?: Record<string, unknown> }).where ?? {})
+}
+
+function rawUpdate(tx: CommandTransaction, table: string) {
+  const raw = tx.$executeRaw as unknown as ReturnType<typeof vi.fn>
+  const index = raw.mock.calls.findIndex(([query]) => ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes(`UPDATE "${table}"`))
+  return { query: raw.mock.calls[index]?.[0] as { strings?: readonly string[] } | undefined, order: raw.mock.invocationCallOrder[index] ?? 0 }
 }
 
 function makeTransaction(options: {
@@ -108,10 +117,16 @@ function makeTransaction(options: {
             && approval.sessionId === sessionId && approval.turnId === turnId
             && approval.type === "submit_application" && ["approved", "consumed"].includes(approval.status)
             && approval.payload.applicationTaskId === task.id)
+          const cancelBoundTaskGraphFill = values.includes(true)
+          const inFlightFill = cancelBoundTaskGraphFill && ((task.status === "filling" && ["taskgraph_fill_queued", "browser_active"].includes(task.checkpoint ?? ""))
+            || (task.status === "waiting_for_user" && ["form_answer_required", "fill_outcome_uncertain"].includes(task.checkpoint ?? "")))
           const beforeSubmit = (task.status === "filling" && !["submission_request_started", "submission_uncertain"].includes(task.checkpoint ?? ""))
             || (task.status === "waiting_for_authorization" && ["form_filled", "queue_retry"].includes(task.checkpoint ?? ""))
             || (task.status === "waiting_for_user" && task.checkpoint === "user_takeover")
-          if (task.userId !== userId || task.sessionId !== sessionId || !beforeSubmit || !authorized) continue
+          const bound = task.fillTurnId === turnId
+            && task.fillTurnSessionId === sessionId
+            && task.fillTurnUserId === userId
+          if (task.userId !== userId || task.sessionId !== sessionId || !((inFlightFill && bound) || (beforeSubmit && authorized))) continue
           task.status = "cancelled"
           task.checkpoint = "turn_stopped_before_submit"
           task.completedAt = requestedAt
@@ -395,7 +410,10 @@ describe("execution cancellation transaction", () => {
     const turnUpdateOrder = (fake.tx.agentTurn.updateMany as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
     const inputUpdate = fake.tx.agentInput.updateMany as unknown as ReturnType<typeof vi.fn>
     const inputUpdateOrder = inputUpdate.mock.invocationCallOrder[0]
-    const applicationUpdateOrder = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    const childUpdateOrder = rawUpdate(fake.tx, "sub_agent_tasks").order
+    const applicationUpdateOrder = rawUpdate(fake.tx, "application_tasks").order
+    expect(turnUpdateOrder).toBeLessThan(childUpdateOrder)
+    expect(childUpdateOrder).toBeLessThan(applicationUpdateOrder)
     expect(turnUpdateOrder).toBeLessThan(applicationUpdateOrder)
     expect(applicationUpdateOrder).toBeLessThan(inputUpdateOrder)
     expect(inputUpdate).toHaveBeenCalledWith({
@@ -430,11 +448,10 @@ describe("execution cancellation transaction", () => {
       expect.objectContaining({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) }),
     ])
     const turnUpdateOrder = (fake.tx.agentTurn.updateMany as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
-    const applicationUpdateOrder = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    const applicationUpdateOrder = rawUpdate(fake.tx, "application_tasks").order
     expect(turnUpdateOrder).toBeLessThan(applicationUpdateOrder)
 
-    const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { strings?: readonly string[] }
-    const sql = query.strings?.join(" ") ?? ""
+    const sql = rawUpdate(fake.tx, "application_tasks").query?.strings?.join(" ") ?? ""
     expect(sql).toContain('application."checkpoint" IS DISTINCT FROM \'submission_request_started\'')
     expect(sql).toContain('application."checkpoint" IS DISTINCT FROM \'submission_uncertain\'')
     expect(sql).toContain('application."status" = \'waiting_for_authorization\'')
@@ -461,6 +478,75 @@ describe("execution cancellation transaction", () => {
     expect(applicationTasks).toEqual(before)
   })
 
+  it("cancels only exact-turn in-flight fills and leaves submit-boundary or terminal work untouched", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "queued_fill", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "filling", checkpoint: "taskgraph_fill_queued", completedAt: null },
+      { id: "active_fill", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "answer_wait", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "waiting_for_user", checkpoint: "form_answer_required", completedAt: null },
+      { id: "uncertain_fill_wait", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "waiting_for_user", checkpoint: "fill_outcome_uncertain", completedAt: null },
+      { id: "wrong_fill_turn", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_2", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "wrong_fill_session", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_2", fillTurnUserId: "user_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "wrong_fill_user", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_2", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "submit_started", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "submission_request_started", completedAt: null },
+      { id: "submission_uncertain", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "submission_uncertain", completedAt: null },
+      { id: "submitted_terminal", userId: "user_1", sessionId: "session_1", status: "submitted", checkpoint: "submitted", completedAt: new Date("2026-09-16T12:00:00.000Z") },
+      { id: "failed_terminal", userId: "user_1", sessionId: "session_1", status: "failed", checkpoint: "failed", completedAt: new Date("2026-09-16T12:00:00.000Z") },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", applicationTasks })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(applicationTasks.slice(0, 4).every((task) => task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit")).toBe(true)
+    expect(applicationTasks.slice(4).map(({ status, checkpoint }) => ({ status, checkpoint }))).toEqual([
+      { status: "filling", checkpoint: "browser_active" },
+      { status: "filling", checkpoint: "browser_active" },
+      { status: "filling", checkpoint: "browser_active" },
+      { status: "filling", checkpoint: "submission_request_started" },
+      { status: "filling", checkpoint: "submission_uncertain" },
+      { status: "submitted", checkpoint: "submitted" },
+      { status: "failed", checkpoint: "failed" },
+    ])
+    const sql = rawUpdate(fake.tx, "application_tasks").query?.strings?.join(" ") ?? ""
+    expect(sql).toContain('application."fillTurnId" =')
+    expect(sql).toContain('application."fillTurnSessionId" =')
+    expect(sql).toContain('application."fillTurnUserId" =')
+    expect(sql).toContain("'taskgraph_fill_queued', 'browser_active'")
+    expect(sql).toContain("'form_answer_required', 'fill_outcome_uncertain'")
+    expect(rawUpdate(fake.tx, "sub_agent_tasks").order).toBeLessThan(rawUpdate(fake.tx, "application_tasks").order)
+  })
+
+  it("preserves a bound answer wait for resume while cancelling legacy approved work", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "answer_wait", userId: "user_1", sessionId: "session_1", fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1", status: "waiting_for_user", checkpoint: "form_answer_required", completedAt: null },
+      { id: "completed_review", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+    ]
+    const childTasks: State["tasks"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", status: "waiting_for_user", interruptRequestedAt: null, nextAttemptAt: null, completedAt: null, leaseOwner: null, leaseExpiresAt: null },
+    ]
+    const approvals: State["approvals"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "completed_review" } },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "manual", activeSource: "manual", applicationTasks, approvals, childTasks })
+
+    await expect(interruptActiveTurn(fake.tx, {
+      sessionId: "session_1",
+      userId: "user_1",
+      clientMessageId: "answer_resume_interrupt",
+      source: "user",
+      expectedTurnId: "turn_1",
+      expectedRevision: 0,
+    }, fake.state.active!, { taskGraphFillCancellation: "preserve" })).resolves.toMatchObject({ disposition: "interrupted" })
+
+    expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+    expect(childTasks[0]).toMatchObject({ status: "interrupted", interruptRequestedAt: expect.any(Date) })
+    expect(applicationTasks[0]).toMatchObject({ status: "waiting_for_user", checkpoint: "form_answer_required", fillTurnId: "turn_1", completedAt: null })
+    expect(applicationTasks[1]).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) })
+    const applicationUpdates = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([query]) => ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes('UPDATE "application_tasks"'))
+    expect(applicationUpdates).toHaveLength(1)
+    expect((applicationUpdates[0]?.[0] as { values?: readonly unknown[] }).values).toContain(false)
+  })
+
   it("cancels a linked pre-start user handoff while preserving uncertain submissions", async () => {
     const applicationTasks: State["applicationTasks"] = [
       { id: "application_filling", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
@@ -477,8 +563,7 @@ describe("execution cancellation transaction", () => {
 
     expect(applicationTasks.slice(0, 3).every((task) => task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit")).toBe(true)
     expect(applicationTasks[3]).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain", completedAt: null })
-    const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { strings?: readonly string[] }
-    const sql = query.strings?.join(" ") ?? ""
+    const sql = rawUpdate(fake.tx, "application_tasks").query?.strings?.join(" ") ?? ""
     expect(sql).toContain('application."status" = \'waiting_for_user\'')
     expect(sql).toContain('application."checkpoint" = \'user_takeover\'')
     expect(sql).toContain('approval."turnId" =')
@@ -525,12 +610,12 @@ describe("execution cancellation transaction", () => {
 
   it("scope-fences linked approvals and stays idempotent when Stop is retried", async () => {
     const applicationTasks: State["applicationTasks"] = [
-      { id: "application_valid", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
-      { id: "application_wrong_user", userId: "user_2", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
-      { id: "application_wrong_session", userId: "user_1", sessionId: "session_2", status: "filling", checkpoint: "browser_active", completedAt: null },
-      { id: "application_wrong_turn", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
-      { id: "application_wrong_type", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
-      { id: "application_pending", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_valid", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+      { id: "application_wrong_user", userId: "user_2", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+      { id: "application_wrong_session", userId: "user_1", sessionId: "session_2", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+      { id: "application_wrong_turn", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+      { id: "application_wrong_type", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+      { id: "application_pending", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
     ]
     const approvals: State["approvals"] = [
       { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "application_valid" } },
@@ -546,7 +631,7 @@ describe("execution cancellation transaction", () => {
     await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
 
     expect(applicationTasks[0]).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit" })
-    expect(applicationTasks.slice(1).every((task) => task.status === "filling" && task.checkpoint === "browser_active")).toBe(true)
+    expect(applicationTasks.slice(1).every((task) => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled")).toBe(true)
     const applicationUpdates = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls
       .filter(([query]) => ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes('UPDATE "application_tasks"'))
     expect(applicationUpdates).toHaveLength(1)

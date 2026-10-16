@@ -2,6 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
   const agentRun = vi.fn().mockResolvedValue({ status: "submitted", durationMs: 11 });
+  const outcomeQuery = vi.fn(async (sql: string) => {
+    if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "session-1" }], rowCount: 1 };
+    if (sql.includes('FROM agent_sessions')) return { rows: [{ id: "session-1" }], rowCount: 1 };
+    if (sql.includes('FROM agent_turns')) return { rows: [{ id: "turn-1" }], rowCount: 1 };
+    if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
+    if (sql.includes("INSERT INTO apply_results")) return { rows: [{ id: 1 }], rowCount: 1 };
+    return { rows: [], rowCount: 1 };
+  });
+  const outcomeClient = { query: outcomeQuery, release: vi.fn() };
 
   return {
     workerHandler: undefined as undefined | ((job: { data: Record<string, unknown> }) => Promise<void>),
@@ -10,6 +19,8 @@ const mocks = vi.hoisted(() => {
     withCloakContext: vi.fn(),
     insertApplyResult: vi.fn().mockResolvedValue(1),
     query: vi.fn().mockResolvedValue({ rowCount: 1 }),
+    outcomeQuery,
+    outcomeClient,
     loadTaskContext: vi.fn(),
     detectCaptcha: vi.fn().mockResolvedValue(false),
     detectFlow: vi.fn().mockReturnValue(null),
@@ -75,7 +86,7 @@ vi.mock("../cloak/captcha.js", () => ({
 }));
 vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mocks.insertApplyResult,
-  getPool: vi.fn(() => ({ query: mocks.query })),
+  getPool: vi.fn(() => ({ query: mocks.query, connect: vi.fn().mockResolvedValue(mocks.outcomeClient) })),
 }));
 vi.mock("../db/budget.js", () => ({
   checkBudget: mocks.checkBudget,
@@ -176,6 +187,10 @@ describe("apply-queue Phase 5 pipeline", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    mocks.claimApplicationTask.mockReset().mockResolvedValue(true);
+    mocks.finishApplicationTask.mockReset().mockResolvedValue(undefined);
+    mocks.outcomeQuery.mockClear();
+    mocks.outcomeClient.release.mockClear();
     mocks.workerHandler = undefined;
     mocks.fakePage.goto.mockResolvedValue(undefined);
     mocks.withCloakContext.mockImplementation(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
@@ -245,7 +260,77 @@ describe("apply-queue Phase 5 pipeline", () => {
         error: null,
       })
     );
+    expect(mocks.claimApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "user-1", "job-1", "submit",
+    );
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
   }, 15_000);
+
+  it("rejects a stale legacy fill delivery for a TaskGraph-bound task before starting a browser", async () => {
+    payload.operation = "fill";
+    mocks.claimApplicationTask.mockResolvedValueOnce(false);
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.claimApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "user-1", "job-1", "fill",
+    );
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.completeFillForReview).not.toHaveBeenCalled();
+    expect(mocks.pauseForFormInput).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
+  });
+
+  it("rejects a duplicate legacy fill while the owner returns the task to materials review", async () => {
+    payload.operation = "fill";
+    let status = "filling";
+    let checkpoint = "form_fill_queued";
+    mocks.claimApplicationTask.mockImplementation(async (_pool, _taskId, _userId, _jobId, operation) => {
+      const claimable = operation === "submit"
+        || (status === "filling" && checkpoint === "form_fill_queued");
+      if (claimable) checkpoint = "browser_active";
+      return claimable;
+    });
+    let releaseControl!: (enabled: boolean) => void;
+    let controlStarted!: () => void;
+    const ownerReachedControl = new Promise<void>(resolve => { controlStarted = resolve; });
+    const ownerControl = new Promise<boolean>(resolve => { releaseControl = resolve; });
+    mocks.runtimeFeatureEnabled.mockImplementationOnce(async () => {
+      controlStarted();
+      return ownerControl;
+    });
+    mocks.finishApplicationTask.mockImplementationOnce(async (_pool, _taskId, nextStatus, nextCheckpoint) => {
+      status = nextStatus;
+      checkpoint = nextCheckpoint;
+    });
+
+    const owner = runApplyJob();
+    await ownerReachedControl;
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.claimApplicationTask).toHaveBeenCalledTimes(2);
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+
+    releaseControl(false);
+    await expect(owner).resolves.toBeUndefined();
+
+    expect(status).toBe("waiting_for_user");
+    expect(checkpoint).toBe("materials_ready");
+    expect(mocks.finishApplicationTask).toHaveBeenCalledOnce();
+    expect(mocks.outcomeQuery.mock.calls.filter(([sql]) => sql.includes("INSERT INTO apply_results"))).toHaveLength(1);
+    expect(mocks.outcomeQuery.mock.calls.some(([sql]) => sql.includes('UPDATE "Job"'))).toBe(true);
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+  });
 
   it("pattern cache authorization block is terminal and does not fall back to AI", async () => {
     mocks.findFormPattern.mockResolvedValueOnce(formPattern);
@@ -284,6 +369,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "waiting_for_authorization",
       "submission_blocked",
       "browser_412",
+      "submit",
     );
   });
 
@@ -377,6 +463,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "waiting_for_authorization",
       "form_filled",
       expect.stringContaining("temporarily unavailable"),
+      "submit",
     );
     expect(mocks.query).toHaveBeenCalledWith(
       expect.stringContaining('UPDATE "Job"'),
@@ -401,6 +488,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "waiting_for_authorization",
       "form_filled",
       expect.stringContaining("temporarily unavailable"),
+      "submit",
     );
   });
 
@@ -417,6 +505,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "waiting_for_user",
       "materials_ready",
       expect.stringContaining("temporarily unavailable"),
+      "fill",
     );
   });
 
@@ -432,6 +521,11 @@ describe("apply-queue Phase 5 pipeline", () => {
 
     expect(capturedTask.current).not.toBeNull();
     expect(capturedTask.current?.beforeSubmit).toBeUndefined();
+    const commitIndex = mocks.outcomeQuery.mock.calls.findIndex(([sql]) => sql === "COMMIT");
+    const commitOrder = mocks.outcomeQuery.mock.invocationCallOrder[commitIndex];
+    expect(commitIndex).toBeGreaterThanOrEqual(0);
+    expect(mocks.createNotification.mock.invocationCallOrder[0]).toBeGreaterThan(commitOrder!);
+    expect(mocks.notifyApplyResult.mock.invocationCallOrder[0]).toBeGreaterThan(commitOrder!);
   });
 
   it("fails closed without opening a browser when the platform control store is unavailable", async () => {

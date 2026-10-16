@@ -3,9 +3,13 @@ import type { PolicyDomain, PolicyRole } from "@jobcopilot/agent-protocol"
 import type { RuntimeToolDefinition, ToolRisk } from "../tools/types.js"
 
 export type HarnessSubagentRole = "scout" | "analyst" | "writer" | "reviewer" | "auditor" | "executor"
+export const APPLICATION_FILLER_ROLE = "application_filler" as const
+export const APPLICATION_FILLER_TASK_TYPE = "application_fill_for_review" as const
+export const APPLICATION_FILLER_TEMPLATE_ID = APPLICATION_FILLER_ROLE
+type RegisteredSubagentRole = HarnessSubagentRole | typeof APPLICATION_FILLER_ROLE
 
 export type SubagentRolePolicy = {
-  readonly role: HarnessSubagentRole
+  readonly role: RegisteredSubagentRole
   readonly actorRole: PolicyRole
   readonly capabilities: readonly string[]
   readonly allowedRisks: readonly ToolRisk[]
@@ -50,21 +54,27 @@ const COORDINATION_TOOL_NAMES: ReadonlySet<string> = new Set([
   "close_subagent", "agent.close",
 ])
 
-const POLICIES: Readonly<Record<HarnessSubagentRole, SubagentRolePolicy>> = {
+const POLICIES: Readonly<Record<RegisteredSubagentRole, SubagentRolePolicy>> = {
   scout: { role: "scout", actorRole: "subagent", capabilities: ["read"], allowedRisks: ["read"], allowedDomains: ["jobs"], canManageChildren: false, externalWritesEnabled: false },
   analyst: { role: "analyst", actorRole: "subagent", capabilities: ["read"], allowedRisks: ["read"], allowedDomains: ["jobs", "persona", "resume"], canManageChildren: false, externalWritesEnabled: false },
   writer: { role: "writer", actorRole: "subagent", capabilities: ["read", "draft"], allowedRisks: ["read", "draft_write"], allowedDomains: ["resume"], canManageChildren: false, externalWritesEnabled: false },
   reviewer: { role: "reviewer", actorRole: "subagent", capabilities: ["read", "review"], allowedRisks: ["read"], allowedDomains: READ_DOMAINS, canManageChildren: false, externalWritesEnabled: false },
   auditor: { role: "auditor", actorRole: "subagent", capabilities: ["read", "auditEvidence"], allowedRisks: ["read"], allowedDomains: READ_DOMAINS, canManageChildren: false, externalWritesEnabled: false },
   executor: { role: "executor", actorRole: "subagent", capabilities: ["read", "preflight"], allowedRisks: ["read"], allowedDomains: ["application", "resume", "jobs", "persona", "unknown"], canManageChildren: false, externalWritesEnabled: false },
+  application_filler: { role: APPLICATION_FILLER_ROLE, actorRole: "subagent", capabilities: [], allowedRisks: [], allowedDomains: [], canManageChildren: false, externalWritesEnabled: false },
 }
 
 export function getSubagentRolePolicy(role: string): SubagentRolePolicy | null {
-  return isHarnessSubagentRole(role) ? POLICIES[role] : null
+  return Object.prototype.hasOwnProperty.call(POLICIES, role) ? POLICIES[role as RegisteredSubagentRole] : null
 }
 
 export function isHarnessSubagentRole(role: string): role is HarnessSubagentRole {
-  return Object.prototype.hasOwnProperty.call(POLICIES, role)
+  return role !== APPLICATION_FILLER_ROLE && Object.prototype.hasOwnProperty.call(POLICIES, role)
+}
+
+export function isApplicationFillerTemplate(templateId: string, role: string, taskType: string): boolean {
+  return templateId === APPLICATION_FILLER_TEMPLATE_ID
+    && role === APPLICATION_FILLER_ROLE && taskType === APPLICATION_FILLER_TASK_TYPE
 }
 
 export function visibleToolPolicy(
