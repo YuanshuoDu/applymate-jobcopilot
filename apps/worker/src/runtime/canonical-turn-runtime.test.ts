@@ -59,6 +59,12 @@ const lease = {
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
 }
 type TurnEngineStoreFactory = NonNullable<CanonicalTurnRuntimeOptions["turnEngineStoreFactory"]>
+const HISTORICAL_EXECUTION_CATEGORY_INTRO = "Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning."
+const HISTORICAL_EXECUTION_CATEGORY_GUIDANCE = [
+  "For execution-setup cues, inspect the existing execution prerequisites for the child.",
+  "For resume-state cues, inspect the current resume state and available evidence.",
+  "For structured-output cues, inspect the existing typed output contract and current available result evidence.",
+] as const
 const recoveredPlanHash = `sha256:${"a".repeat(64)}`
 const canonicalJobId = "00000000-0000-4000-8000-000000000001"
 type RuntimeEvent = { id?: string; type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }
@@ -2723,9 +2729,20 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).not.toMatch(/PRIVATE_HISTORY|private-history|private\.example|PRIVATE_RESULT_PROSE|PRIVATE_FINAL_TEXT|TASK_GRAPH_FINAL_SUMMARY_BINDING/)
       expect(text).not.toMatch(/selected_job_context_unavailable|child_resume_unavailable|invalid_structured_result|PRIVATE_HISTORICAL|PRIVATE_HISTORICAL_(SETUP|RESUME|OUTPUT)_(TEXT|ERROR)/)
       expect(text).toContain(index < 4 ? '"knownCount":4' : '"knownCount":5')
-      const currentFailureGuidance = requests[index]!.messages.filter(message => message.role === "system")
+      const request = requests[index]!
+      expect(request.metadata).toMatchObject({ sessionId: lease.sessionId, turnId: lease.turnId, taskId: "root-1", userId: lease.userId })
+      expect(request.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []))
+        .toEqual(expect.arrayContaining(["agent.list", "agent.plan"]))
+      const systemText = request.messages.filter(message => message.role === "system")
         .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
-      expect(currentFailureGuidance).not.toContain("Current child failure-category cues")
+      expect(systemText).not.toContain("Current child failure-category cues")
+      expect(systemText).toContain(HISTORICAL_EXECUTION_CATEGORY_INTRO)
+      for (const phrase of HISTORICAL_EXECUTION_CATEGORY_GUIDANCE) expect(systemText).toContain(phrase)
+      for (const value of ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid",
+        "historical-scout", "historical-scout-task", "historical-setup-task", "historical-resume-task", "historical-output-task",
+        "PRIVATE_HISTORICAL_GOAL", "PRIVATE_HISTORICAL_TEXT", "PRIVATE_SETUP_TEXT", "PRIVATE_RESUME_TEXT", "PRIVATE_OUTPUT_TEXT"]) {
+        expect(systemText).not.toContain(value)
+      }
     }
     const planningGuidance = requests.map(request => request.messages.filter(message => message.role === "system")
       .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
@@ -2734,11 +2751,13 @@ describe("createCanonicalTurnRuntime", () => {
     expect(planningGuidance.map(text => text?.match(/expectedRevision (\d+)/)?.[1])).toEqual(["7", "7", "7", "7", "8", "8"])
     expect(new Set(planningGuidance.map(text => text?.replace(/expectedRevision \d+/g, "expectedRevision CURRENT"))).size).toBe(1)
     for (const text of planningGuidance) {
+      if (typeof text !== "string") throw new Error("missing_planning_guidance")
       expect(text).toContain("owner-read graph observation for current node, criterion, and revision identities")
       expect(text).toContain("visible agent.list only for matching result pages")
       expect(text).toContain("complete current result pages")
       expect(text).toContain("preserve the valid plan")
       expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
+      expect(text.endsWith(`${HISTORICAL_EXECUTION_CATEGORY_INTRO} ${HISTORICAL_EXECUTION_CATEGORY_GUIDANCE.join(" ")}`)).toBe(true)
       expect(text).not.toMatch(/PRIVATE_HISTORY|historical-scout|candidate-count|nodeOrdinal|criterionOrdinal|reported count/i)
       expect(text).not.toContain("candidate_count_gte")
       expect(text).not.toContain('"minimum":1')

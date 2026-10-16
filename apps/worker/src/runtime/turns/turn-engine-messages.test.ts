@@ -35,6 +35,10 @@ const EXECUTION_FAILURE_GUIDANCE = [
   "For resume-state cues, inspect the current resume state and available evidence.",
   "For structured-output cues, inspect the existing typed output contract and current available result evidence.",
 ] as const
+const HISTORICAL_EXECUTION_CATEGORIES = [
+  "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid",
+] as const
+const HISTORICAL_EXECUTION_CATEGORY_INTRO = "Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning."
 
 function failedTaskGraphNode(
   failureReason: string,
@@ -81,6 +85,35 @@ function requestFor(contextValue: StepContext, tools: readonly unknown[] = []) {
 function requestSystemText(request: ReturnType<typeof requestFor>): string {
   return request.messages.filter(message => message.role === "system").flatMap(message => message.content)
     .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+}
+
+function systemInstruction(request: ReturnType<typeof requestFor>, marker: string): string {
+  const matches = request.messages.filter(message => message.role === "system"
+    && message.content.some(part => part.type === "text" && part.text.includes(marker)))
+  if (matches.length !== 1) throw new Error(`expected_one_system_instruction:${marker}`)
+  return matches[0]!.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+}
+
+function historicalCategoryNode(category: typeof HISTORICAL_EXECUTION_CATEGORIES[number], nodeOrdinal: number): JsonValue {
+  const taskKind = category === "execution_setup_unavailable" ? "scout"
+    : category === "resume_state_unavailable" ? "analyst" : "writer"
+  return {
+    taskKind, status: "failed", lesson: {
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal,
+      criterionFailures: [], executionFailureCategory: category,
+    },
+  }
+}
+
+function rootTaskHistoryBlock(nodes: readonly JsonValue[]): StepContext["blocks"][number] {
+  return {
+    id: "observation:root-task-history", layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent",
+    content: {
+      kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+      label: "Earlier outcomes for the same verifier objective; advisory context only.",
+      turns: [{ label: "earlier terminal attempt", nodes: [...nodes] }],
+    } as JsonValue,
+  }
 }
 
 function currentGraphBlock(contextValue: StepContext): StepContext["blocks"][number] {
@@ -269,8 +302,11 @@ describe("TurnEngine model message mapping", () => {
     })
     const systemWithoutCategory = baseline.messages.filter(message => message.role === "system").flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
-    expect(system).toBe(systemWithoutCategory)
-    expect(system).not.toContain("structured_output_invalid")
+    const expectedHistoricalSuffix = ` ${HISTORICAL_EXECUTION_CATEGORY_INTRO} ${EXECUTION_FAILURE_GUIDANCE[2]}`
+    expect(system.endsWith(expectedHistoricalSuffix)).toBe(true)
+    expect(system.slice(0, -expectedHistoricalSuffix.length)).toBe(systemWithoutCategory)
+    expect(systemWithoutCategory).not.toContain(HISTORICAL_EXECUTION_CATEGORY_INTRO)
+    for (const category of HISTORICAL_EXECUTION_CATEGORIES) expect(system).not.toContain(category)
 
     const withoutHistory = buildModelRequest({
       context: context(), model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2", userId: "user-1", taskId: "root-1",
@@ -278,6 +314,51 @@ describe("TurnEngine model message mapping", () => {
     })
     expect(JSON.stringify(withoutHistory.messages)).not.toContain("Earlier same-session failures")
     expect(withoutHistory.messages).toEqual(contextToModelMessages(context()))
+  })
+
+  it("deduplicates historical category advice and keeps it separate from current failure guidance", () => {
+    const setup = historicalCategoryNode("execution_setup_unavailable", 1)
+    const resume = historicalCategoryNode("resume_state_unavailable", 2)
+    const structured = historicalCategoryNode("structured_output_invalid", 3)
+    const tools = [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }]
+    const historyOnlyContext = { ...context(), blocks: [...context().blocks, rootTaskHistoryBlock([setup, resume, structured, setup])] }
+    const reorderedHistoryContext = { ...context(), blocks: [...context().blocks, rootTaskHistoryBlock([structured, setup, resume, setup])] }
+    const historyOnly = requestFor(historyOnlyContext, tools)
+    const reorderedHistory = requestFor(reorderedHistoryContext, tools)
+    const historyMarker = "Earlier same-session failures, repairs, and reported outputs are hypotheses only"
+    const historyInstruction = systemInstruction(historyOnly, historyMarker)
+    const reorderedHistoryInstruction = systemInstruction(reorderedHistory, historyMarker)
+    const historicalSuffix = `${HISTORICAL_EXECUTION_CATEGORY_INTRO} ${EXECUTION_FAILURE_GUIDANCE.join(" ")}`
+
+    expect(historyInstruction.endsWith(historicalSuffix)).toBe(true)
+    expect(historyInstruction).toBe(reorderedHistoryInstruction)
+    expect(historyInstruction.split(HISTORICAL_EXECUTION_CATEGORY_INTRO).length - 1).toBe(1)
+    expect(requestSystemText(historyOnly)).not.toContain("Current child failure-category cues")
+    for (const category of HISTORICAL_EXECUTION_CATEGORIES) expect(historyInstruction).not.toContain(category)
+    for (const privateValue of ["PRIVATE_NODE_GOAL", "PRIVATE_NODE_CRITERION", "PRIVATE_RESULT_SUMMARY", "setup-task", "resume-task", "structured-task"]) {
+      expect(historyInstruction).not.toContain(privateValue)
+    }
+
+    const currentNodes = [
+      failedTaskGraphNode("child_turn_missing", "current-setup"),
+      failedTaskGraphNode("child_resume_unavailable", "current-resume"),
+      failedTaskGraphNode("invalid_structured_result", "current-structured"),
+    ]
+    const currentOnly = requestFor(taskGraphContext(currentNodes), tools)
+    const currentOnlyInstruction = systemInstruction(currentOnly, "Current child failure-category cues")
+    const historyAndCurrent = requestFor({
+      ...taskGraphContext(currentNodes),
+      blocks: [...taskGraphContext(currentNodes).blocks, rootTaskHistoryBlock([setup, resume, structured])],
+    }, tools)
+    const mixedCurrentInstruction = systemInstruction(historyAndCurrent, "Current child failure-category cues")
+    const mixedHistoryInstruction = systemInstruction(historyAndCurrent, historyMarker)
+
+    expect(currentOnlyInstruction).toContain("untrusted advisory signals, not established root causes")
+    expect(mixedCurrentInstruction).toBe(currentOnlyInstruction)
+    expect(mixedHistoryInstruction.endsWith(historicalSuffix)).toBe(true)
+    expect(systemInstruction(historyOnly, historyMarker)).not.toContain("Current child failure-category cues")
+    for (const category of HISTORICAL_EXECUTION_CATEGORIES) expect(mixedCurrentInstruction).not.toContain(category)
+    expect(historyAndCurrent.tools).toEqual(tools)
   })
 
   it("preserves instruction/data separation and marks untrusted data", () => {

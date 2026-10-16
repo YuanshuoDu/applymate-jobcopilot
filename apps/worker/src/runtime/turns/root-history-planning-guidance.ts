@@ -1,6 +1,7 @@
 import type { ModelMessage } from "@jobcopilot/agent-model"
 import { parseRootTaskHistoryNodeLesson } from "../context/root-task-history-lesson-projection.js"
 import type { StepContext } from "../context/step-context-builder.js"
+import { lookupTaskGraphExecutionFailureAdvice } from "./task-graph-execution-failure-guidance.js"
 
 const HISTORY_BLOCK_ID = "observation:root-task-history"
 const HISTORY_LABEL = "Earlier outcomes for the same verifier objective; advisory context only."
@@ -11,6 +12,8 @@ const MAX_NODES = 8
 const MAX_ITEMS = 128
 const TASK_KINDS = new Set(["scout", "analyst", "writer", "reviewer", "other"])
 const STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+const EXECUTION_FAILURE_CATEGORY_ORDER = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"] as const
+const HISTORICAL_CATEGORY_INTERPRETATION = "Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning. "
 const REASONS = new Set([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
   "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",
@@ -18,6 +21,7 @@ const REASONS = new Set([
 ])
 
 type Row = Record<string, unknown>
+type SafeHistoryNode = Readonly<{ hasFact: boolean; executionFailureCategory?: string }>
 
 function exactRecord(value: unknown, keys: readonly string[]): Row | undefined {
   try {
@@ -50,7 +54,7 @@ function safeArray(value: unknown, maximum: number, minimum = 0): unknown[] | un
   } catch { return undefined }
 }
 
-function safeHistoryNode(value: unknown): boolean | undefined {
+function safeHistoryNode(value: unknown): SafeHistoryNode | undefined {
   const candidate = value && typeof value === "object" && !Array.isArray(value) ? value as Row : undefined
   if (!candidate) return undefined
   let keys: string[]
@@ -63,10 +67,12 @@ function safeHistoryNode(value: unknown): boolean | undefined {
     const hints = safeArray(node.negativeReasonHints, 8, 1)
     if (!hints || hints.some(hint => typeof hint !== "string" || !REASONS.has(hint))) return undefined
   }
-  let hasFact = false
+  let hasFact = false, historyCategory: string | undefined
   if (Object.hasOwn(node, "lesson")) {
-    if (!parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind, node.status)) return undefined
+    const lesson = parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind, node.status)
+    if (!lesson) return undefined
     hasFact = true
+    if (lesson.executionFailureCategory) historyCategory = lesson.executionFailureCategory
   }
   if (Object.hasOwn(node, "reportedOutput")) {
     if (node.taskKind !== "scout" && node.taskKind !== "analyst") return undefined
@@ -76,31 +82,33 @@ function safeHistoryNode(value: unknown): boolean | undefined {
       || !Number.isSafeInteger(output[countKey]) || Number(output[countKey]) < 0) return undefined
     hasFact = true
   }
-  return hasFact
+  return { hasFact, ...(historyCategory ? { executionFailureCategory: historyCategory } : {}) }
 }
 
-function safeHistoryObservation(value: unknown): boolean {
+function safeHistoryObservation(value: unknown): Readonly<{ categories: ReadonlySet<string> }> | undefined {
   const block = exactRecord(value, ["id", "layer", "role", "trust", "source", "content"])
   if (!block || block.id !== HISTORY_BLOCK_ID || block.layer !== "tool_observation" || block.role !== "data"
-    || block.trust !== "external_untrusted" || block.source !== "tool_or_subagent") return false
+    || block.trust !== "external_untrusted" || block.source !== "tool_or_subagent") return undefined
   const content = exactRecord(block.content, ["kind", "informationalOnly", "advisoryOnly", "notCurrentEvidence", "label", "turns"])
   if (!content || content.kind !== "root_task_history" || content.informationalOnly !== true || content.advisoryOnly !== true
-    || content.notCurrentEvidence !== true || content.label !== HISTORY_LABEL) return false
+    || content.notCurrentEvidence !== true || content.label !== HISTORY_LABEL) return undefined
   const turns = safeArray(content.turns, MAX_TURNS, 1)
-  if (!turns) return false
+  if (!turns) return undefined
   let nodeCount = 0, hasFact = false
+  const categories = new Set<string>()
   for (const value of turns) {
     const turn = exactRecord(value, ["label", "nodes"])
-    if (!turn || turn.label !== TURN_LABEL) return false
+    if (!turn || turn.label !== TURN_LABEL) return undefined
     const nodes = safeArray(turn.nodes, MAX_NODES, 1)
-    if (!nodes || (nodeCount += nodes.length) > MAX_NODES) return false
+    if (!nodes || (nodeCount += nodes.length) > MAX_NODES) return undefined
     for (const node of nodes) {
       const valid = safeHistoryNode(node)
-      if (valid === undefined) return false
-      hasFact ||= valid
+      if (!valid) return undefined
+      hasFact ||= valid.hasFact
+      if (valid.executionFailureCategory) categories.add(valid.executionFailureCategory)
     }
   }
-  return hasFact
+  return hasFact ? { categories } : undefined
 }
 
 function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
@@ -120,7 +128,9 @@ function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
 export function buildRootHistoryPlanningInstruction(context: StepContext, tools: readonly unknown[]): ModelMessage | null {
   try {
     const matches = context.blocks.filter(block => block.id === HISTORY_BLOCK_ID)
-    if (matches.length !== 1 || !safeHistoryObservation(matches[0])) return null
+    if (matches.length !== 1) return null
+    const history = safeHistoryObservation(matches[0])
+    if (!history) return null
     const names = visibleToolNames(tools)
     const revision = Number.isSafeInteger(context.taskGraphRevision) && Number(context.taskGraphRevision) >= 0
       ? Number(context.taskGraphRevision) : undefined
@@ -137,6 +147,13 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
         : "No current plan-replacement command is visible; do not claim a plan replacement. Preserve the valid plan unless another visible command permits an evidence-backed change. Current verification and completion gates remain authoritative.",
       names.has("agent.followup") ? "Use the visible agent.followup only under its existing current unstarted-leaf rules." : "",
     ].filter(Boolean).join(" ")
-    return { role: "system", content: [{ type: "text", text: guidance }] }
+    const categoryAdvice = EXECUTION_FAILURE_CATEGORY_ORDER.flatMap(category => {
+      if (!history.categories.has(category)) return []
+      const advice = lookupTaskGraphExecutionFailureAdvice(category)
+      return advice ? [advice] : []
+    })
+    const historicalGuidance = categoryAdvice.length
+      ? `${HISTORICAL_CATEGORY_INTERPRETATION}${categoryAdvice.join(" ")}` : ""
+    return { role: "system", content: [{ type: "text", text: historicalGuidance ? `${guidance} ${historicalGuidance}` : guidance }] }
   } catch { return null }
 }
