@@ -1,5 +1,5 @@
 import type pg from "pg"
-import type { TenantScope, RepositoryJsonValue } from "@jobcopilot/agent-protocol"
+import type { TenantScope, RepositoryJsonValue, TurnSource } from "@jobcopilot/agent-protocol"
 
 import { restoreCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-state.js"
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
@@ -19,6 +19,8 @@ import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK } from "./tur
 import { restoreTaskGraphDenialProgress, TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE } from "./turns/task-graph-denial-resume.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
+  readonly source?: TurnSource
+  readonly automationRunMode?: "scheduled" | "manual"
   readonly goal: string
   /** Original persisted Turn payload for canonical objective resolution only; never model context. */
   readonly turnInput?: unknown
@@ -45,6 +47,8 @@ export type CanonicalTurnState = {
 export type CanonicalTurnIntent = Readonly<{ kind: "interactive_discovery_shortlist"; version: 1 }>
 export const INTERACTIVE_DISCOVERY_INTENT: CanonicalTurnIntent = Object.freeze({ kind: "interactive_discovery_shortlist", version: 1 })
 type Row = Record<string, unknown>
+function turnSource(value: unknown): TurnSource | undefined { return value === "user" || value === "automation" || value === "system" ? value : undefined }
+function automationRunMode(value: unknown): "scheduled" | "manual" | undefined { return value === "scheduled" || value === "manual" ? value : undefined }
 function object(value: unknown): Row {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
 }
@@ -114,7 +118,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
     const scope = { userId: lease.userId } satisfies TenantScope
     const turnResult = await client.query<Row>(
-      `SELECT "id", "sessionId", "userId", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "createdAt",
+      `SELECT "id", "sessionId", "userId", "source", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "createdAt",
               "input", "rootTaskId", "contextSnapshotId", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot"
        FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
          AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > $6 AND "status" = 'in_progress'
@@ -183,13 +187,10 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
       }
     }
-    const goal = turnGoal(turn.input)
-    const rootTaskId = typeof turn.rootTaskId === "string" ? turn.rootTaskId : null
-    const steeringMarkers = restoreCanonicalSteeringMarkers(eventsResult.rows, { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId })
-    const restoredAgenda = cognitiveAgendaReceipt(eventsResult.rows, lease, turn.rootTaskId)
-    const restored = restoreToolCallState(itemsResult.rows, eventsResult.rows)
-    const seen = new Set(snapshot.toolObservations.map(item => item.id))
-    const restoredToolObservations = restored.observations.map(item => ({ id: item.id, content: json(item.content) }))
+    const goal = turnGoal(turn.input), source = turnSource(turn.source), runMode = automationRunMode(object(turn.input).automationRunMode)
+    const rootTaskId = typeof turn.rootTaskId === "string" ? turn.rootTaskId : null, steeringMarkers = restoreCanonicalSteeringMarkers(eventsResult.rows, { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId })
+    const restoredAgenda = cognitiveAgendaReceipt(eventsResult.rows, lease, turn.rootTaskId), restored = restoreToolCallState(itemsResult.rows, eventsResult.rows)
+    const seen = new Set(snapshot.toolObservations.map(item => item.id)), restoredToolObservations = restored.observations.map(item => ({ id: item.id, content: json(item.content) }))
     const restoredIds = new Set<string>()
     const restoredNew = restoredToolObservations.filter(item => {
       if (seen.has(item.id) || restoredIds.has(item.id)) return false
@@ -231,9 +232,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       taskGraphDenialProgress })
     if (resume?.finalEvidenceRecoveryUsed) snapshot = applyCompletionRecovery(snapshot, "resume", FINAL_EVIDENCE_RECOVERY_FEEDBACK)
     validateAgendaResumeFence(restoredAgenda, stepsResult.rows)
-    const intent = turnIntent(turn.input)
-    const result = {
-      scope, goal, turnInput: turn.input, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {},
+    const intent = turnIntent(turn.input), result = {
+      scope, goal, turnInput: turn.input, ...(source ? { source } : {}), ...(runMode ? { automationRunMode: runMode } : {}), modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {},
       ...(intent ? { intent } : {}),
       contextSnapshotPinned: turn.contextSnapshotId !== null && turn.contextSnapshotId !== undefined,
       steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(restored.pending.length ? { pendingToolCalls: restored.pending } : {}), ...(rootTaskId ? { rootTaskId } : {}),
