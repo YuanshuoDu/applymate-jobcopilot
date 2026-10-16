@@ -284,6 +284,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     await prisma!.$executeRaw`UPDATE application_tasks SET status = 'filling', "checkpoint" = 'browser_active' WHERE id = ${outcomeFirst.taskId}`
     const worker = await connectWorkerClient()
     const canceller = await connectWorkerClient()
+    const cancellationObserver = await connectWorkerClient()
     let releaseWriter!: () => void
     let writerLocked!: () => void
     let outcomePromise: Promise<unknown> | undefined
@@ -315,7 +316,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       [outcomeFirst.taskId, outcomeFirst.userId, outcomeFirst.sessionId])
       let blocked = false
       for (let attempt = 0; attempt < 200; attempt++) {
-        const state = await canceller.query(`SELECT pid FROM pg_stat_activity
+        const state = await cancellationObserver.query(`SELECT pid FROM pg_stat_activity
           WHERE wait_event_type = 'Lock' AND query ILIKE '%UPDATE application_tasks%'`)
         if (state.rows.length > 0) { blocked = true; break }
         await new Promise((resolve) => setTimeout(resolve, 10))
@@ -330,6 +331,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       await worker.query("ROLLBACK").catch(() => undefined)
       worker.release()
       canceller.release()
+      cancellationObserver.release()
     }
     await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${outcomeFirst.jobId}`)
       .resolves.toEqual([{ count: 1 }])
