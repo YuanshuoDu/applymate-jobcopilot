@@ -193,7 +193,8 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       )`)
       await client.query(`CREATE TABLE "Job" (
         "id" text PRIMARY KEY, "userId" text NOT NULL, "status" text NOT NULL DEFAULT 'saved',
-        "workflowState" text NOT NULL DEFAULT 'ready_to_apply', "appliedAt" timestamptz
+        "workflowState" text NOT NULL DEFAULT 'ready_to_apply', "appliedAt" timestamptz,
+        "updatedAt" timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`)
       await client.query(`CREATE TABLE "User" ("id" text PRIMARY KEY, "accountStatus" text NOT NULL)`)
       await client.query(`CREATE TABLE "agent_approvals" (
