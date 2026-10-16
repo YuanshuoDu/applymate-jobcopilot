@@ -667,6 +667,54 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       .resolves.toBe(waitEventCount)
   })
 
+  it("commits an exact-Turn form fill for review without queuing submission", async () => {
+    const value = await seedFillScenario()
+    await prisma!.$executeRaw`UPDATE "Job" SET status = 'saved', "workflowState" = 'ready_to_apply' WHERE id = ${value.jobId}`
+    const started = await startApplicationFillForReview(prisma!, {
+      sessionId: value.sessionId, userId: value.userId, applicationTaskId: value.taskId, clientMessageId: `review-complete-${randomUUID()}`,
+    })
+    expect(started.disposition).toBe("started")
+    const lease = await startLeasedFill(value, started.turnId, "browser_active")
+
+    await expect(completeApplicationFillForReview(workerSchemaPool!, { lease })).resolves.toEqual({ status: "completed" })
+
+    await expect(prisma!.applicationTask.findUnique({ where: { id: value.taskId }, select: { fillTurnId: true, status: true, checkpoint: true } }))
+      .resolves.toEqual({ fillTurnId: started.turnId, status: "waiting_for_authorization", checkpoint: "form_filled" })
+    await expect(prisma!.agentTurn.findUnique({ where: { id: started.turnId }, select: { status: true, revision: true } }))
+      .resolves.toEqual({ status: "waiting_for_approval", revision: 1 })
+    await expect(prisma!.agentSession.findUnique({ where: { id: value.sessionId }, select: { status: true } }))
+      .resolves.toEqual({ status: "waiting_for_user" })
+
+    const approvals = await prisma!.$queryRaw<Array<{ id: string; turnId: string; taskId: string; jobId: string; toolCallId: string; type: string; status: string }>>`
+      SELECT "id", "turnId", "taskId", "jobId", "toolCallId", "type", "status" FROM "agent_approvals"
+      WHERE "userId" = ${value.userId} AND "sessionId" = ${value.sessionId} AND "turnId" = ${started.turnId}
+        AND "type" = 'submit_application'
+    `
+    expect(approvals).toEqual([{
+      id: `application-fill:${value.taskId}:${started.turnId}`, turnId: started.turnId, taskId: lease.id,
+      jobId: value.jobId, toolCallId: `application-submit:${value.taskId}`,
+      type: "submit_application", status: "pending",
+    }])
+
+    const formFilledEvents = await prisma!.$queryRaw<Array<{ actor: string; data: unknown }>>`
+      SELECT "actor", "data" FROM "application_task_events" WHERE "taskId" = ${value.taskId} AND "type" = 'form_filled'
+    `
+    expect(formFilledEvents).toEqual([{ actor: "worker", data: { turnId: started.turnId } }])
+    await expect(prisma!.applicationTaskEvent.count({ where: { taskId: value.taskId, type: "submission_queued" } }))
+      .resolves.toBe(0)
+    const submissionOutbox = await prisma!.$queryRaw<Array<{ count: number }>>`
+      SELECT COUNT(*)::int AS count FROM "agent_outbox"
+      WHERE "aggregateId" IN (${value.sessionId}, ${value.taskId}, ${value.jobId}, ${started.turnId})
+        AND ("topic" ILIKE '%submit%' OR "topic" ILIKE '%submission%' OR "payload"->>'type' = 'submission_queued')
+    `
+    expect(submissionOutbox).toEqual([{ count: 0 }])
+    await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${value.jobId}`)
+      .resolves.toEqual([{ count: 0 }])
+    await expect(prisma!.$queryRaw<Array<{ status: string | null; workflowState: string | null }>>`
+      SELECT status, "workflowState" FROM "Job" WHERE id = ${value.jobId}
+    `).resolves.toEqual([{ status: "saved", workflowState: "ready_to_apply" }])
+  })
+
   it("persists a form-answer wait and resumes safely with the confirmed answer on a successor Turn", async () => {
     const value = await seedFillScenario()
     const first = await startApplicationFillForReview(prisma!, {
