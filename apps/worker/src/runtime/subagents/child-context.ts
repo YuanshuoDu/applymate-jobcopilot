@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { StepContext, StepContextSnapshot, ContextBlock, ContextSeedBlock } from "../context/step-context-builder.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
+import type { TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import type { SelectedJobArtifactContextBundle } from "./selected-job-artifact-context.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
 import { structuredRoleOutputGuidance } from "./role-results.js"
@@ -196,7 +197,7 @@ function assertOwner(task: SubagentTaskRecord, identity: ExecutionOwnerFence, sc
     throw new Error("child_context_owner_mismatch")
   }
 }
-export function createChildContextBuilder(task: SubagentTaskRecord, initial = childContextSnapshot(task), mailboxReader?: ChildMailboxReader, transientSources: SelectedJobArtifactContextBundle["transientSources"] = []): ChildContextBuilder {
+export function createChildContextBuilder(task: SubagentTaskRecord, initial = childContextSnapshot(task), mailboxReader?: ChildMailboxReader, transientSources: SelectedJobArtifactContextBundle["transientSources"] = [], writerReviewFeedback?: TaskGraphWriterReviewFeedbackFrame): ChildContextBuilder {
   // Keep the first normalized block for each id. A Map preserves first-read
   // order and prevents later reads from replacing an already visible payload.
   const mailboxBlocks = new Map<string, ContextBlock>()
@@ -241,6 +242,8 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
         ...request.snapshot.toolObservations.map(item => seed("tool_observation", "data", "external_untrusted", "tool-or-subagent", item)),
         ...cachedMailboxBlocks,
         ...(task.role === "writer" || task.role === "reviewer" ? [seed("profile", "data", "external_untrusted", "selected-job-source", { id: "selected-job-sources", content: boundedSelectedJobSources(transientSources) })] : []),
+        ...(task.role === "writer" && writerReviewFeedback
+          ? [seed("profile", "data", "external_untrusted", "writer-review-feedback", { id: "writer-review-feedback", content: writerReviewFeedback })] : []),
       ]
       const result = { schemaVersion: "agent-harness.v2" as const, sessionId: task.sessionId, turnId: task.turnId!, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks }
       return { ...result, canonicalJson: JSON.stringify({ ...result, inputThroughSequence: "0" }) }

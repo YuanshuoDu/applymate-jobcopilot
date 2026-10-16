@@ -146,6 +146,7 @@ export function materializeTaskGraphDependencyContext(
       evidenceDigest: dependency.verificationReport.evidenceDigest, resultDigest: dependency.verificationReport.resultDigest,
     } : undefined
     return { dependencyKey: safeDependencyKey(dependency.key), role: dependency.role, taskStatus: "completed", result: projected,
+      ...(dependency.role === "reviewer" ? { dependencyTaskId: safeDependencyKey(dependency.taskId) } : {}),
       ...(verification ? { verification } : {}), ...(dependency.repairLineage ? { repairLineage: dependency.repairLineage } : {}) }
   })
   const evidence = { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items }

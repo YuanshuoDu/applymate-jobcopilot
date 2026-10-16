@@ -6,6 +6,7 @@ import type { SubagentLease } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineToolExecutor } from "../turns/turn-engine-types.js"
 import type { ToolCallRequest, ToolExecutionResult } from "../tools/types.js"
+import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 
 const ref = {
   artifactId: "cover-letter:abc123", version: 1, contentHash: `sha256:${"1".repeat(64)}`, sourceDigest: `sha256:${"2".repeat(64)}`,
@@ -258,6 +259,56 @@ describe("private child artifact boundary", () => {
     const denied = await reviewer(executionInput(call("application.submit", "submit-call")))
     expect(denied).toMatchObject({ status: "failed", errorCode: "child_action_denied" })
     expect(executeRoutedTool).not.toHaveBeenCalled()
+  })
+
+  it("lets only a revision Writer read the exact reviewed version and binds the draft CAS to it", async () => {
+    const writerLease = lease("writer")
+    const selectedJobPreparation = { jobId: "job-1", sourceDigest: ref.sourceDigest, evidenceRefs: ["job:job-1"] }
+    const revision: ArtifactToolRevisionContext = {
+      dependencyTaskId: "reviewer-1", artifactRef: ref, currentSourceDigest: ref.sourceDigest,
+      reviewHash: "sha256:" + "c".repeat(64),
+    }
+    const observedEvidence = createObservedEvidenceIndex()
+    const privateCalls: ToolCallRequest[] = []
+    const executePrivateTool = vi.fn(async (_context, request): Promise<ToolExecutionResult> => {
+      privateCalls.push(request)
+      return {
+        ...request, status: "completed", errorCode: null,
+        output: request.toolName === "artifact.version.read" ? { artifactRef: ref, content: "Exact reviewed draft body" } : { artifactRef: ref },
+      }
+    })
+    const dispatcher = createChildPrivateArtifactDispatcher({
+      lease: writerLease,
+      definitions: [{ name: "artifact.version.read", version: "1" }, { name: "cover_letter.draft", version: "1" }],
+      executeRoutedTool: vi.fn() as unknown as TurnEngineToolExecutor,
+      executePrivateTool, selectedJobPreparation, taskFence: taskFence(writerLease), writerRevisionContext: revision,
+      observedEvidence, privateCallIds: new Set(),
+    })
+
+    await expect(dispatcher(executionInput(call("cover_letter.draft", "before-read", { content: "revision", constraints: {} }))))
+      .resolves.toMatchObject({ status: "failed", errorCode: "writer_revision_exact_read_required" })
+    await expect(dispatcher(executionInput(call("artifact.version.read", "wrong-ref", { artifactRef: { ...ref, version: 2 } }))))
+      .resolves.toMatchObject({ status: "failed", errorCode: "private_artifact_read_unavailable" })
+    expect(executePrivateTool).not.toHaveBeenCalled()
+
+    const read = await dispatcher(executionInput(call("artifact.version.read", "exact-read", { artifactRef: ref })))
+    expect(read).toMatchObject({ status: "completed", output: { artifactRef: ref, content: "Exact reviewed draft body" } })
+    recordReadToolOutput(observedEvidence, "artifact.version.read", read.output)
+
+    const draftInput = { content: "Revised letter", constraints: {}, expectedPreviousVersion: 99, expectedPreviousHash: "sha256:" + "f".repeat(64) }
+    await dispatcher(executionInput(call("cover_letter.draft", "revision-write", draftInput)))
+    expect(privateCalls[1]?.input).toEqual({
+      ...draftInput, expectedPreviousVersion: ref.version, expectedPreviousHash: ref.contentHash,
+    })
+
+    const defaultWriter = createChildPrivateArtifactDispatcher({
+      lease: writerLease, definitions: [{ name: "artifact.version.read", version: "1" }],
+      executeRoutedTool: vi.fn() as unknown as TurnEngineToolExecutor,
+      executePrivateTool, selectedJobPreparation, taskFence: taskFence(writerLease),
+      observedEvidence: createObservedEvidenceIndex(), privateCallIds: new Set(),
+    })
+    await expect(defaultWriter(executionInput(call("artifact.version.read", "default-read", { artifactRef: ref }))))
+      .resolves.toMatchObject({ status: "failed", errorCode: "private_artifact_read_unavailable" })
   })
 
   it("fails closed when private selected-job scope does not match the server-selected task", async () => {

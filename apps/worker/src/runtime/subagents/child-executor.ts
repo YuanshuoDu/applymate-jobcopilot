@@ -9,6 +9,9 @@ import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA, roleResultOutputSchema, type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
+import { TaskGraphWriterReviewFeedbackError } from "./task-graph-writer-review-feedback.js"
+import type { TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
+import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, recordReadToolOutput } from "./child-evidence.js"
 import { parseAndBindStructuredResultOutcome } from "./child-structured-result-outcome.js"
 import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, type PrivateArtifactToolContext } from "./child-private-artifact.js"
@@ -32,6 +35,7 @@ export type ChildToolRuntime = {
   readonly definitions: readonly ChildPublicDefinition[]
   readonly router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
   readonly selectedJobArtifactContext?: SelectedJobArtifactContextBundle
+  readonly writerReviewRevision?: Readonly<{ context: ArtifactToolRevisionContext; feedback: TaskGraphWriterReviewFeedbackFrame }>
   readonly serverContext?: unknown
   /** Private scoped tools bypass normal lifecycle persistence; only their ref receipt is persisted. */
   readonly executePrivateTool?: (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
@@ -103,12 +107,12 @@ async function defaultModel(task: SubagentTaskRecord): Promise<ModelAdapter> {
   return (await createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
 
-function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly ChildPublicDefinition[], selectedJob?: string): ChildPublicDefinition[] {
+function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly ChildPublicDefinition[], selectedJob?: string, writerRevision = false): ChildPublicDefinition[] {
   const policy = getSubagentRolePolicy(task.role)
   if (!policy) throw new Error("subagent_role_unknown")
   const allowedActions = new Set(Array.isArray(task.allowedActions) ? task.allowedActions.filter((action): action is string => typeof action === "string") : [])
   return definitions.filter(definition => {
-    if (!allowedActions.has(definition.name) || (selectedJob && !selectedJobToolAllowed(task.role, definition.name))) return false
+    if (!allowedActions.has(definition.name) || (selectedJob && !selectedJobToolAllowed(task.role, definition.name, writerRevision))) return false
     if (definition.name === "tool_results.read") {
       return definition.risk === "read"
         && definition.idempotency === "read_only"
@@ -155,10 +159,18 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       try { reviewerArtifactRef = writerArtifactReferenceFromTaskContext(lease.context, selectedJob!) }
       catch { return { status: "failed", failureReason: "writer_dependency_unavailable", retryDisposition: "terminal" } }
     }
-    const runtime = await options.toolRuntimeFactory({ task: lease, owner, lease })
+    let runtime: ChildToolRuntime
+    try { runtime = await options.toolRuntimeFactory({ task: lease, owner, lease }) }
+    catch (error: unknown) {
+      if (error instanceof TaskGraphWriterReviewFeedbackError) {
+        return { status: "failed", failureReason: error.code, retryDisposition: "terminal" }
+      }
+      throw error
+    }
     const selectedJobPreparation = runtime.selectedJobArtifactContext?.preparation
     if (selectedJob && !hasSelectedJobReadContext(runtime.selectedJobArtifactContext, selectedJob)) return { status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" }
-    const definitions = visibleDefinitions(lease, runtime.definitions, selectedJob)
+    if (runtime.writerReviewRevision && lease.role !== "writer") return { status: "failed", failureReason: "writer_review_revision_role_invalid", retryDisposition: "terminal" }
+    const definitions = visibleDefinitions(lease, runtime.definitions, selectedJob, Boolean(runtime.writerReviewRevision))
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
     let snapshot = childContextSnapshot(lease, runtime.serverContext), resume: TurnResumeState | undefined
@@ -201,7 +213,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       : undefined
     const dispatchTool = createChildPrivateArtifactDispatcher({
       lease, definitions, executeRoutedTool: routedTool, executePrivateTool: runtime.executePrivateTool,
-      selectedJobPreparation, taskFence, reviewerArtifactRef, observedEvidence, privateCallIds,
+      selectedJobPreparation, taskFence, reviewerArtifactRef, writerRevisionContext: runtime.writerReviewRevision?.context,
+      observedEvidence, privateCallIds,
     })
     const executeTool: typeof routedTool = async input => {
       if (selectedJobPreparation && isSelectedJobReadTool(input.call.toolName)) privateCallIds.add(input.call.id)
@@ -209,7 +222,11 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
       return toolResult
     }
-    const contextBuilder = createChildContextBuilder(lease, snapshot, options.mailboxReader, lease.role === "writer" || lease.role === "reviewer" ? runtime.selectedJobArtifactContext?.transientSources : undefined)
+    const contextBuilder = createChildContextBuilder(
+      lease, snapshot, options.mailboxReader,
+      lease.role === "writer" || lease.role === "reviewer" ? runtime.selectedJobArtifactContext?.transientSources : undefined,
+      lease.role === "writer" ? runtime.writerReviewRevision?.feedback : undefined,
+    )
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
       contextBuilder, store: safeStore, model, tools: definitions,

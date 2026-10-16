@@ -12,14 +12,14 @@ import { createJobDiscoveryClient, type JobDiscoveryRequest } from "../tools/job
 import { InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
+import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { buildInteractiveDiscoveryShortlist, requireCurrentOwnerJobs } from "../interactive-discovery-persistence.js"
 import { restoreToolCallState } from "../turns/persisted-tool-call-state.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
 
-const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown }))
+const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
   execute: vi.fn(async (_input: { pool: unknown; lease: unknown }) => ({
     status: "completed" as const, result: { status: "filled_for_user_review" },
@@ -31,7 +31,10 @@ vi.mock("../tools/artifact-tools.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../tools/artifact-tools.js")>()
   return {
     ...actual,
-    createArtifactToolStore: () => artifactStoreMock.current as import("../tools/artifact-tools.js").ArtifactToolStore,
+    createArtifactToolStore: (...args: unknown[]) => {
+      artifactStoreMock.sourceDigestReader = args[1]
+      return artifactStoreMock.current as import("../tools/artifact-tools.js").ArtifactToolStore
+    },
   }
 })
 
@@ -138,7 +141,7 @@ function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPr
     ...lease(), role, taskType: role === "writer" ? "cover_letter_draft" : "cover_letter_review",
     goal: role === "writer" ? "Draft a cover letter" : "Review the cover letter",
     allowedActions: role === "writer"
-      ? ["cover_letter.draft"]
+      ? ["artifact.version.read", "cover_letter.draft"]
       : ["artifact.version.read", "artifact.review"],
     context, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role },
     toolPolicySnapshot: {},
@@ -825,6 +828,7 @@ describe("production child runtime", () => {
     const writer = await writerExecutor({ lease: writerLease })
     expect(writer, JSON.stringify({ writer, writes: writerPersistence.writes })).toMatchObject({ status: "completed" })
     expect(emittedTool(writerRequests[0]!, "cover_letter.draft")).toBe(true)
+    expect(emittedTool(writerRequests[0]!, "artifact.version.read")).toBe(false)
     assertNoExternalTools(writerRequests[0]!)
     expect(stringsDeep(writerRequests[0]).join("\n")).toContain(selectedJobSourceCanary)
     const writerResult = completedResult(writer.result)
@@ -910,6 +914,149 @@ describe("production child runtime", () => {
         expect(stringsDeep(write.value).join("\n")).not.toContain(body)
       }
     }
+  })
+
+  it("hands private needs_revision feedback to one exact selected-job Writer revision", async () => {
+    const body = "First cover letter body for exact review."
+    const revisedBody = "Revised cover letter body with the requested opening."
+    const preparation = (await selectedJobSourceDigest()).preparation
+    const baseArtifactId = "cover-letter-base:" + hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)
+    const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: "job-1" })
+    const artifactRef = {
+      artifactId: "cover-letter:" + hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7),
+      version: 1, contentHash: hashArtifactContent(body), sourceDigest: preparation.sourceDigest,
+    }
+    const finding = {
+      id: "opening_clarity", code: "content_clarity", severity: "warning",
+      message: "Clarify the opening; do not include alice@example.com.",
+      artifactHash: artifactRef.contentHash,
+      evidence: [{ artifactHash: artifactRef.contentHash, path: "$.text", summary: "The opening does not identify the strongest experience." }],
+    }
+    const reviewHash = hashArtifactContent({
+      artifactRef, currentSourceDigest: preparation.sourceDigest, status: "needs_revision",
+      findings: [finding], evidenceRefs: preparation.evidenceRefs,
+    })
+    const artifacts = new InMemoryArtifactToolStore()
+    const draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const writerRequests: HarnessModelRequest[] = []
+    const writerModel: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        writerRequests.push(request)
+        if (writerRequests.length === 1) {
+          yield { type: "tool_call_completed", callId: "draft-call", name: "cover_letter.draft", arguments: {
+            baseArtifactId, baseHash, content: body, constraints: { maxWords: 160 },
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const writerPersistence = recordingStore()
+    const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: writerPersistence, model: writerModel })
+    const writerLease = { ...jobTask("writer"), id: "writer-task" }
+    const writer = await writerExecutor({ lease: writerLease })
+    expect(writer).toMatchObject({ status: "completed" })
+    expect(emittedTool(writerRequests[0]!, "artifact.version.read")).toBe(false)
+
+    const scope = taskScope()
+    const reviewerContext = materializeTaskGraphDependencyContext(
+      { selectedJobPreparation: { jobId: "job-1" } }, scope, ["writer"], [{
+        ...scope, key: "writer", taskId: writerLease.id, status: "completed", role: "writer",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }, result: writer.result,
+      }],
+    )
+    const reviewerRequests: HarnessModelRequest[] = []
+    const reviewerModel: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        reviewerRequests.push(request)
+        if (reviewerRequests.length === 1) {
+          yield { type: "tool_call_completed", callId: "read-call", name: "artifact.version.read", arguments: { artifactRef } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (reviewerRequests.length === 2) {
+          yield { type: "tool_call_completed", callId: "review-call", name: "artifact.review", arguments: {
+            artifactRef, decision: "needs_revision", findings: [finding],
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+          reviewStatus: "needs_revision", reviewHash,
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const reviewerPersistence = recordingStore()
+    const reviewSpy = vi.spyOn(artifacts, "saveReview")
+    const reviewerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: reviewerPersistence, model: reviewerModel })
+    const reviewerLease = { ...jobTask("reviewer", reviewerContext), id: "reviewer-task", leaseExpiresAt: new Date("2099-01-01T00:00:00Z") }
+    const reviewer = await reviewerExecutor({ lease: reviewerLease })
+    expect(reviewer).toMatchObject({ status: "completed" })
+    expect(reviewSpy.mock.calls[0]?.[0]).toMatchObject({ taskId: "reviewer-task", status: "needs_revision", reviewHash })
+    expect(JSON.stringify(reviewer.result)).not.toContain(finding.message)
+    expect(JSON.stringify(reviewerContext)).not.toContain(finding.message)
+
+    const revisionContext = materializeTaskGraphDependencyContext(
+      { selectedJobPreparation: { jobId: "job-1" } }, scope, ["reviewer"], [{
+        ...scope, key: "reviewer", taskId: reviewerLease.id, status: "completed", role: "reviewer",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }, result: reviewer.result,
+      }],
+    )
+    const revisionRef = { ...artifactRef, version: 2, contentHash: hashArtifactContent(revisedBody) }
+    const revisionRequests: HarnessModelRequest[] = []
+    const revisionModel: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        revisionRequests.push(request)
+        if (revisionRequests.length === 1) {
+          yield { type: "tool_call_completed", callId: "revision-read", name: "artifact.version.read", arguments: { artifactRef } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (revisionRequests.length === 2) {
+          yield { type: "tool_call_completed", callId: "revision-draft", name: "cover_letter.draft", arguments: {
+            baseArtifactId, baseHash, content: revisedBody, constraints: { maxWords: 160 },
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: revisionRef,
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const revisionPersistence = recordingStore()
+    const revisionExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: revisionPersistence, model: revisionModel })
+    const revisionLease = {
+      ...jobTask("writer", revisionContext), id: "writer-revision-task",
+      leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+    }
+    const revised = await revisionExecutor({ lease: revisionLease })
+
+    expect(revised).toMatchObject({ status: "completed", result: { structuredResult: { role: "writer", artifactRef: revisionRef } } })
+    expect(artifactStoreMock.sourceDigestReader).toBe(readSelectedJobSourceDigestWithClient)
+    expect(emittedTool(revisionRequests[0]!, "artifact.version.read")).toBe(true)
+    expect(emittedTool(revisionRequests[0]!, "cover_letter.draft")).toBe(true)
+    expect(emittedTool(revisionRequests[0]!, "artifact.review")).toBe(false)
+    expect(stringsDeep(revisionRequests[0]!).join("\n")).toContain("[REDACTED_EMAIL]")
+    expect(stringsDeep(revisionRequests[0]!).join("\n")).not.toContain("alice@example.com")
+    expect(stringsDeep(revisionRequests[1]!).join("\n")).toContain(body)
+    expect(stringsDeep(revisionRequests[1]!).join("\n")).toContain("[REDACTED_EMAIL]")
+    expect(draftSpy).toHaveBeenCalledTimes(2)
+    expect(draftSpy.mock.calls[1]?.[1]).toMatchObject({
+      expectedPreviousVersion: artifactRef.version, expectedPreviousHash: artifactRef.contentHash,
+    })
+    expect(JSON.stringify(writerPersistence.writes)).not.toContain(finding.message)
+    expect(JSON.stringify(reviewerPersistence.writes)).not.toContain(finding.message)
+    expect(JSON.stringify(revisionPersistence.writes)).not.toContain(finding.message)
+    expect(JSON.stringify(revisionPersistence.writes)).not.toContain("The opening does not identify the strongest experience.")
   })
 
   it("refuses a Reviewer read whose reference differs from the direct Writer dependency", async () => {

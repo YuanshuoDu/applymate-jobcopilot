@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { createAgentArtifactRepository, insertAgentArtifactBaseWithClient } from "./agent-artifact-repo.js"
+import { createAgentArtifactRepository, insertAgentArtifactBaseWithClient, type AgentArtifactSourceDigestReader } from "./agent-artifact-repo.js"
 
 describe("agent artifact repository", () => {
   it("uses the caller transaction and resolves an idempotent base insert without a unique error", async () => {
@@ -106,6 +106,76 @@ describe("agent artifact repository", () => {
     await expect(repository.findCurrentDraftHead(scope)).resolves.toBeNull()
   })
 
+  it("returns full needs-revision details only for the exact review, live Writer fence, and unchanged head", async () => {
+    const values: Array<{ sql: string; params?: readonly unknown[] }> = []
+    const expected = {
+      userId: "user-a", sessionId: "session-a", jobId: "job-a", artifactId: "draft-a", version: 2,
+      contentHash: "hash-a", sourceDigest: "source-a", currentSourceDigest: "source-a",
+      dependencyTaskId: "reviewer-task", reviewHash: "review-hash",
+      taskFence: { taskId: "writer-task", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a", leaseOwner: "worker-a", attemptCount: 1 },
+    }
+    const review = {
+      id: "review-row", artifactVersionId: "version-row", userId: expected.userId, sessionId: expected.sessionId,
+      jobId: expected.jobId, artifactId: expected.artifactId, version: expected.version, contentHash: expected.contentHash,
+      sourceDigest: expected.sourceDigest, currentSourceDigest: expected.currentSourceDigest, status: "needs_revision",
+      findings: [{ id: "grammar", code: "grammar", severity: "warning", message: "Revise wording", artifactHash: "hash-a", evidence: [] }],
+      evidenceRefs: ["resume:1"], taskId: expected.dependencyTaskId, toolCallId: "review-call", requestHash: "request-hash",
+      reviewHash: expected.reviewHash, createdAt: new Date(),
+    }
+    let reviewRows: Record<string, unknown>[] = [review]
+    let live = true
+    let currentSourceDigest = "source-a"
+    let head: Record<string, unknown> = { id: expected.artifactId, userId: expected.userId, jobId: expected.jobId, artifactType: "cover_letter", lifecycle: "draft", version: 2, hash: "hash-a", constraintHash: "constraints", provenanceRefs: [], evidenceRefs: [], createdAt: new Date(), updatedAt: new Date() }
+    const client = {
+      query: vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+        values.push({ sql, params })
+        if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+        if (sql === "SELECT selected_source_digest") return { rows: [{ digest: currentSourceDigest }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: expected.taskFence.taskId }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks" AS parent')) return { rows: [{ id: expected.taskFence.parentTaskId }], rowCount: 1 }
+        if (sql.includes('SELECT "leaseExpiresAt" > clock_timestamp() AS "live"')) return { rows: [{ live }], rowCount: 1 }
+        if (sql.includes('FROM "agent_artifact_review"')) return { rows: reviewRows, rowCount: reviewRows.length }
+        if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact"')) return { rows: [head], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const readCurrentSourceDigest: AgentArtifactSourceDigestReader = async (queryClient, userId, jobId) => {
+      expect(queryClient).toBe(client)
+      const result = await queryClient.query<{ digest: string }>("SELECT selected_source_digest", [userId, jobId])
+      return result.rows[0]?.digest ?? null
+    }
+    const repository = createAgentArtifactRepository({ connect: vi.fn(async () => client) } as never)
+    const exactInput = { ...expected, readCurrentSourceDigest }
+
+    await expect(repository.readRevisionReview(exactInput)).resolves.toMatchObject({ id: "review-row", findings: [{ message: "Revise wording" }] })
+    const read = values.find(call => call.sql.includes('FROM "agent_artifact_review"'))!
+    expect(read.sql).toContain('"currentSourceDigest"=$8 AND "status"=\'needs_revision\' AND "taskId"=$9 AND "reviewHash"=$10 LIMIT 2')
+    expect(read.params).toEqual([expected.userId, expected.sessionId, expected.jobId, expected.artifactId, expected.version,
+      expected.contentHash, expected.sourceDigest, expected.currentSourceDigest, expected.dependencyTaskId, expected.reviewHash])
+    expect(values.find(call => call.sql.startsWith("SELECT") && call.sql.includes('FROM "agent_artifact"'))?.sql).toContain("FOR UPDATE")
+    const readIndex = values.findIndex(call => call.sql.includes('FROM "agent_artifact_review"'))
+    const sourceIndex = values.findIndex(call => call.sql === "SELECT selected_source_digest")
+    expect(sourceIndex).toBeGreaterThanOrEqual(0)
+    expect(sourceIndex).toBeLessThan(readIndex)
+
+    currentSourceDigest = "source-drifted"
+    const receiptReadsBeforeDrift = values.filter(call => call.sql.includes('FROM "agent_artifact_review"')).length
+    await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
+    expect(values.filter(call => call.sql.includes('FROM "agent_artifact_review"'))).toHaveLength(receiptReadsBeforeDrift)
+    currentSourceDigest = "source-a"
+
+    live = false
+    await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
+    live = true
+    head = { ...head, version: 3 }
+    await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
+    head = { ...head, version: 2 }
+    reviewRows = []
+    await expect(repository.readRevisionReview(exactInput)).resolves.toBeNull()
+    await expect(repository.readRevisionReview({ ...exactInput, sourceDigest: "old-source" })).resolves.toBeNull()
+  })
+
   it("reads only receipt metadata for the selected-job completion gate", async () => {
     const scope = {
       userId: "user-a", sessionId: "session-a", jobId: "job-a", artifactId: "draft-a", version: 2,
@@ -187,20 +257,22 @@ describe("agent artifact repository", () => {
       taskId: "task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "task-a",
       parentTaskId: null, leaseOwner: "worker-a", attemptCount: 1,
     }
-    const write = (content: string, hash: string, toolCallId: string, expectedPreviousHash?: string) => repository.saveDraft({
+    const write = (content: string, hash: string, toolCallId: string, expectedPreviousHash?: string, expectedPreviousVersion?: number) => repository.saveDraft({
       id: "draft-a", userId: "user-a", jobId: "job-a", artifactType: "cover_letter", content, hash,
       constraintHash: "constraints", provenanceRefs: ["persona:fact-a"], evidenceRefs: ["job:job-a"],
       sessionId: "session-a", baseId: "base-a", baseHash: "base-hash", previousHash: null,
-      sourceDigest: "source-a", taskId: "task-a", toolCallId, requestHash: `request-${toolCallId}`, taskFence, expectedPreviousHash,
+      sourceDigest: "source-a", taskId: "task-a", toolCallId, requestHash: `request-${toolCallId}`, taskFence, expectedPreviousHash, expectedPreviousVersion,
     })
 
     const first = await write(body1, "hash-one", "call-one")
-    const second = await write(body2, "hash-two", "call-two", first.contentHash)
+    const second = await write(body2, "hash-one", "call-two", first.contentHash, first.version)
+    await expect(write(body1, "hash-one", "call-stale-version", first.contentHash, first.version)).rejects.toMatchObject({ code: "precondition_failed" })
+    await expect(write(body2, "hash-two", "call-stale-hash", "stale-hash", second.version)).rejects.toMatchObject({ code: "precondition_failed" })
     const parentWrites = calls.filter(call => call.sql.startsWith('INSERT INTO "agent_artifact"') || call.sql.startsWith('UPDATE "agent_artifact"'))
     const parentContent = parentWrites.map(call => JSON.parse(String(call.sql.startsWith("INSERT") ? call.values[6] : call.values[0])) as unknown)
     expect(parentContent).toEqual([
       { kind: "agent_artifact_version", artifactId: "draft-a", version: 1, contentHash: "hash-one" },
-      { kind: "agent_artifact_version", artifactId: "draft-a", version: 2, contentHash: "hash-two" },
+      { kind: "agent_artifact_version", artifactId: "draft-a", version: 2, contentHash: "hash-one" },
     ])
     expect(JSON.stringify(parentContent)).not.toContain(body1)
     expect(JSON.stringify(parentContent)).not.toContain(body2)

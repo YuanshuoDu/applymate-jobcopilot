@@ -54,10 +54,11 @@ describe("TaskGraph server-owned templates", () => {
     expect(templates.analyst.allowedActions).not.toContain("jobs.discover")
     expect(templates.cover_letter_writer).toMatchObject({
       role: "writer", taskType: "cover_letter_draft",
-      allowedActions: ["cover_letter.draft"],
+      allowedActions: ["artifact.version.read", "cover_letter.draft"],
       context: { selectedJobPreparation: { jobId: "job-1" } },
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" },
     })
+    expect((templates.cover_letter_writer.constraints ?? []).join(" ")).toContain("exact reviewed artifact version")
     expect(templates.cover_letter_reviewer).toMatchObject({
       role: "reviewer", taskType: "cover_letter_review",
       allowedActions: ["artifact.version.read", "artifact.review"],

@@ -163,6 +163,8 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("findings_from_scout_dependency")
     expect(tool.description).toContain("findings_cover_scout_candidates_gte is Analyst-only")
     expect(tool.description).toContain("Omitting it preserves normal top-N selection")
+    expect(tool.description).toContain("append exactly one cover_letter_writer directly after that Reviewer")
+    expect(tool.description).toContain("the Worker does not schedule it automatically")
   })
 
   it("binds omitted repair roots at the executor and accepts only the matching legacy value", async () => {

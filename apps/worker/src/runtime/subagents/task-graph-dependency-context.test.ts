@@ -75,6 +75,13 @@ function writerDependency(result: unknown = writerProjection()): Record<string, 
   return { dependencyKey: "writer-task", role: "writer", taskStatus: "completed", result }
 }
 
+function reviewerDependency(taskId = "reviewer-database-id"): ScopedDependencyResult {
+  return dependency({ key: "review", taskId, role: "reviewer", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }, result: envelope({
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef: writerArtifactRef,
+    reviewStatus: "needs_revision", reviewHash: `sha256:${"c".repeat(64)}`,
+  }) })
+}
+
 const scoutVerification = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "scout",
@@ -193,6 +200,21 @@ describe("TaskGraph dependency result context", () => {
     const context = materializeTaskGraphDependencyContext({}, scope, ["other-source", "source"], [dependency(), second]) as Record<string, unknown>
     const evidence = context.taskGraphDependencyResults as { items: Array<{ dependencyKey: string }> }
     expect(evidence.items.map(item => item.dependencyKey)).toEqual(["other-source", "source"])
+  })
+
+  it("projects the completed Reviewer task id without exposing private findings", () => {
+    const context = materializeTaskGraphDependencyContext({}, scope, ["review"], [reviewerDependency()]) as Record<string, unknown>
+    const items = (context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }).items
+
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ dependencyKey: "review", dependencyTaskId: "reviewer-database-id", role: "reviewer", taskStatus: "completed" })
+    expect(items[0]?.result).toMatchObject({ role: "reviewer", reviewStatus: "needs_revision", reviewHash: `sha256:${"c".repeat(64)}` })
+    expect(JSON.stringify(items[0])).not.toContain("findings")
+  })
+
+  it("rejects an unsafe Reviewer task id before it enters dependency context", () => {
+    expect(() => materializeTaskGraphDependencyContext({}, scope, ["review"], [reviewerDependency("private reviewer id")]))
+      .toThrow("task_graph_dependency_key_unsafe")
   })
 
   it.each([
