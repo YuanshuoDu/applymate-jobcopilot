@@ -169,6 +169,24 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("the Worker does not schedule it automatically")
   })
 
+  it("advertises Writer revision guidance only when both selected-job templates are registered", () => {
+    const scout = { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } as const
+    const writer = { role: "writer", taskType: "cover_letter_draft", allowedActions: ["cover_letter.draft"] } as const
+    const reviewer = { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] } as const
+    const registries = [
+      { templates: { scout }, expected: false },
+      { templates: { scout, cover_letter_writer: writer }, expected: false },
+      { templates: { scout, cover_letter_reviewer: reviewer }, expected: false },
+      { templates: { scout, cover_letter_writer: writer, cover_letter_reviewer: reviewer }, expected: true },
+    ] as const
+
+    for (const { templates, expected } of registries) {
+      const { tool } = setup(templates)
+      expect(tool.description.includes("completed Reviewer dependency reports needs_revision")).toBe(expected)
+      expect(tool.description.includes("append exactly one cover_letter_writer directly after that Reviewer")).toBe(expected)
+    }
+  })
+
   it("binds omitted repair roots at the executor and accepts only the matching legacy value", async () => {
     const templates = {
       scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
