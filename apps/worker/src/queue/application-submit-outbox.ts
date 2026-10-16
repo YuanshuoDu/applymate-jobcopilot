@@ -53,7 +53,7 @@ async function selectOutboxRows(pool: Pool, limit: number, published: boolean): 
   const cursors = published ? publishedCursorByPool : pendingCursorByPool
   const page = (after?: string) => transaction(pool, async client => (await client.query<OutboxRow>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload"
     FROM "agent_outbox" WHERE "topic" = $1 AND "publishedAt" IS ${published ? "NOT " : ""}NULL
-      AND ("lastError" IS NULL OR "lastError" NOT LIKE 'terminal:%') AND ($3 IS NULL OR "id" > $3)
+      AND ("lastError" IS NULL OR "lastError" NOT LIKE 'terminal:%') AND ($3::text IS NULL OR "id" > $3::text)
     ORDER BY "id" ASC LIMIT $2 ${published ? "" : "FOR UPDATE SKIP LOCKED"}`, [APPLICATION_SUBMIT_OUTBOX_TOPIC, limit, after ?? null])).rows)
   let cursor = cursors.get(pool), rows = await page(cursor)
   if (!rows.length && cursor !== undefined) { cursor = undefined; rows = await page() }

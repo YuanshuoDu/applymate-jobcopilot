@@ -125,6 +125,16 @@ function result<Row>(rows: unknown[], rowCount = rows.length) { return { rows: r
 describe("application submit outbox publisher", () => {
   beforeEach(() => mockReconcileClaimedSubmissionUncertain.mockReset().mockResolvedValue(true))
 
+  it("types the initial null outbox cursor as text", async () => {
+    const fixture = makeFixture()
+
+    await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(1)
+
+    const pageQuery = fixture.client.query.mock.calls.find(([statement, values]) =>
+      statement.includes('FROM "agent_outbox"') && statement.includes('WHERE "topic" = $1') && values?.[2] === null)
+    expect(pageQuery?.[0]).toContain("$3::text IS NULL OR \"id\" > $3::text")
+  })
+
   it("recovers Redis-accepted delivery after the database acknowledgement fails", async () => {
     const fixture = makeFixture({ failAckOnce: true })
     fixture.queue.add.mockImplementationOnce(async (_name, data, options) => {
