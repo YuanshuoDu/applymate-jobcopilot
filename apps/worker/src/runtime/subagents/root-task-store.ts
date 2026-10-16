@@ -165,6 +165,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         if (input.taskGraphVerification && (children.ok || descendants.rows.every(row => row.status === "waiting"))) {
           const graph = await checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId, input.nativeVerificationPassed === true)
           if (!graph.ok) return graph
+          return children.ok ? graph : children
         }
         return children
       }
