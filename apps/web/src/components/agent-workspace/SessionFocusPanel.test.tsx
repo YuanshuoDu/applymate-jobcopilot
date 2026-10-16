@@ -75,7 +75,15 @@ describe('SessionFocusPanel application fill retry', () => {
     const html = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
 
     expect(html).not.toContain('Retry form fill')
-    expect(mocks.useApi).toHaveBeenCalledWith(expect.stringContaining('projection=cancelled-fill-retry'), { cache: false })
+    expect(mocks.useApi).toHaveBeenCalledWith(expect.stringContaining('projection=cancelled-fill-retry'), { cache: false, enabled: true })
+  })
+
+  it('does not request retry readiness when the session has no retryable application fill', () => {
+    installSession([task('failed', 'worker_failed')])
+
+    renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+
+    expect(mocks.useApi).toHaveBeenCalledWith(expect.stringContaining('projection=cancelled-fill-retry'), { cache: false, enabled: false })
   })
 
   it.each([

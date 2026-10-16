@@ -46,11 +46,12 @@ export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
 function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
-  const { data: retryReadiness, loading: retryReadinessLoading, refetch: refetchRetryReadiness } = useApi<{ tasks: Array<{ id: string; cancelledFillRetryReady: boolean }> }>(`/api/agent/application-tasks?projection=cancelled-fill-retry&sessionId=${encodeURIComponent(sessionId)}`, { cache: false })
   const session = data?.session
   const tasks = session?.tasks ?? []
   const approvals = session?.approvals ?? []
   const applicationTasks = session?.applicationTasks ?? []
+  const hasApplicationFillRetryCandidate = applicationTasks.some(isRetryableApplicationFill)
+  const { data: retryReadiness, loading: retryReadinessLoading, refetch: refetchRetryReadiness } = useApi<{ tasks: Array<{ id: string; cancelledFillRetryReady: boolean }> }>(`/api/agent/application-tasks?projection=cancelled-fill-retry&sessionId=${encodeURIComponent(sessionId)}`, { cache: false, enabled: hasApplicationFillRetryCandidate })
   const hasCancelledByUserRetryCandidate = applicationTasks.some(task => task.status === 'cancelled' && task.checkpoint === 'cancelled_by_user')
   const needsApplicationFillRetryReadiness = needsApplicationFillRetryPolling(applicationTasks, retryReadiness?.tasks, retryReadinessLoading)
   const execution = session?.execution
