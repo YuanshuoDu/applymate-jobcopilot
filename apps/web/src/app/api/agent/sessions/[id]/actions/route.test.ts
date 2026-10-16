@@ -30,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   applicationTaskFindFirst: vi.fn(),
   applicationTaskEventCreate: vi.fn(),
   queueApplicationFill: vi.fn(),
+  confirmSubmissionNotReceived: vi.fn(),
   applicationFillTaskGraphEnabled: vi.fn(),
   queueAutonomousApplication: vi.fn(),
   tailorResumeForAgent: vi.fn(),
@@ -72,6 +73,15 @@ vi.mock("@/lib/auto-apply", () => ({
   applicationFillTaskGraphEnabled: mocks.applicationFillTaskGraphEnabled,
   queueApplicationFill: mocks.queueApplicationFill,
   queueAutonomousApplication: mocks.queueAutonomousApplication,
+}))
+vi.mock("@/lib/auto-apply-guards", () => ({
+  assertActiveAccount: vi.fn(),
+  assertUnattendedApplyEnabled: vi.fn(),
+  validateAutoApplyUrl: (url: string) => url,
+  assertJobPreflight: vi.fn(),
+}))
+vi.mock("@/lib/agent/control-plane/commands/application-submission-recovery-command", () => ({
+  confirmSubmissionNotReceived: mocks.confirmSubmissionNotReceived,
 }))
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }))
 vi.mock("@/lib/agent/approval/legacy-receipt", () => ({
@@ -164,6 +174,7 @@ describe("agent session actions API", () => {
     mocks.applicationTaskFindFirst.mockReset().mockResolvedValue(null)
     mocks.applicationTaskEventCreate.mockReset()
     mocks.queueApplicationFill.mockReset()
+    mocks.confirmSubmissionNotReceived.mockReset()
     mocks.applicationFillTaskGraphEnabled.mockReset().mockReturnValue(false)
     mocks.queueAutonomousApplication.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
@@ -770,6 +781,25 @@ describe("agent session actions API", () => {
 
     expect(res.status).toBe(400)
     await expect(res.json()).resolves.toEqual({ error: "Unsupported action type" })
+  })
+
+  it("routes an explicit uncertain-submission attestation to the safe recovery command", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ id: "application_1", jobId: "job_1" })
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.lever.co/acme/123" })
+    mocks.confirmSubmissionNotReceived.mockResolvedValueOnce({ inputId: "input_1", turnId: "turn_new", sequence: "10", disposition: "started" })
+
+    const res = await callPost(postRequest({
+      type: "confirm_submission_not_received", applicationTaskId: "application_1", requestId: "confirm_12345678", confirmedNotReceived: true,
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ turnId: "turn_new", disposition: "started", recovered: true })
+    expect(mocks.confirmSubmissionNotReceived).toHaveBeenCalledWith(expect.anything(), {
+      type: "confirm_submission_not_received", applicationTaskId: "application_1", requestId: "confirm_12345678",
+      confirmedNotReceived: true, sessionId: "session_1", userId: "user_1",
+    })
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
   })
 
   it("returns 404 when the session is not owned by the user", async () => {

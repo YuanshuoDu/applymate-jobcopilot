@@ -107,6 +107,20 @@ describe('SessionFocusPanel application fill retry', () => {
     expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).not.toContain('Retry form fill')
   })
 
+  it('shows submission recovery only for the uncertain waiting task', () => {
+    installSession([task('waiting_for_user', 'submission_uncertain')])
+    expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).toContain('Confirm and start fresh fill for review')
+  })
+
+  it.each([
+    ['waiting_for_user', 'form_answer_required'],
+    ['filling', 'submission_uncertain'],
+    ['failed', 'submission_uncertain'],
+  ])('hides submission recovery for other %s / %s states', (status, checkpoint) => {
+    installSession([task(status, checkpoint)])
+    expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).not.toContain('Confirm and start fresh fill for review')
+  })
+
   it('posts one explicit retry and refreshes only after success', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 202 })
     const randomUUID = vi.fn().mockReturnValue('retry_request_12345678')

@@ -1,5 +1,6 @@
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
+import { matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
@@ -93,12 +94,12 @@ export async function queueAutonomousApplication(input: {
   await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({
     where: { id: input.approvalId, userId: input.userId, status: "approved", type: "submit_application" },
-    select: { payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true },
+    select: { id: true, payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true },
   });
   const payload = asRecord(approval?.payload);
   const taskSnapshot = await db.applicationTask.findFirst({
     where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId },
-    select: { sessionId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
+    select: { sessionId: true, fillTurnId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
   });
   const material = {
     applicationTaskId: input.applicationTaskId,
@@ -106,32 +107,38 @@ export async function queueAutonomousApplication(input: {
     resumeId: taskSnapshot?.resumeId ?? null,
     coverLetterId: taskSnapshot?.coverLetterId ?? null,
   };
-  if (!approval || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
+  if (!approval || !taskSnapshot?.sessionId || !taskSnapshot.fillTurnId ||
+    (input.sessionId && input.sessionId !== taskSnapshot.sessionId) || approval.sessionId !== taskSnapshot.sessionId ||
+    approval.turnId !== taskSnapshot.fillTurnId || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
     payload.resumeId !== material.resumeId || payload.coverLetterId !== material.coverLetterId ||
     ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
-    !approval.turnId || !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
+    !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
     !approval.scopeHash || !input.receiptNonce) {
     throw new AutoApplyError("A current, explicit approval is required before this application can be submitted.");
   }
-  const receiptSessionId = input.sessionId ?? approval.sessionId ?? taskSnapshot?.sessionId;
-  if (!receiptSessionId) throw new AutoApplyError("The application is missing its scoped Agent session.");
+  const receiptSessionId = taskSnapshot.sessionId;
+  const fillTurnId = taskSnapshot.fillTurnId;
 
   try {
     requireLegacyPolicy({
-      userId: input.userId,
-      sessionId: receiptSessionId,
-      turnId: approval.turnId,
-      stepId: `submit:${input.applicationTaskId}`,
-      toolCallId: approval.toolCallId,
-      toolName: "application.submit",
-      domain: "application",
-      risk: "external_write",
-      capabilities: ["read", "write", "external_write"],
+      userId: input.userId, sessionId: receiptSessionId, turnId: approval.turnId,
+      stepId: `submit:${input.applicationTaskId}`, toolCallId: approval.toolCallId, toolName: "application.submit",
+      domain: "application", risk: "external_write", capabilities: ["read", "write", "external_write"],
       input: { requiresReceipt: true, receiptValidated: true, unknownSensitiveFacts: false },
     });
   } catch (error) {
     throw new AutoApplyError(error instanceof Error ? error.message : "Submission policy denied this application.");
   }
+
+  const submitPayload: ApplyTaskSubmitPayload = {
+    applicationTaskId: input.applicationTaskId, jobId: input.jobId, userId: input.userId, applyUrl,
+    personaId: "server-side", resumePath: "", operation: "submit", sessionId: receiptSessionId,
+    fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash,
+  };
+  if (!matchesApplyTaskSubmitPayload(submitPayload, {
+    applicationTaskId: input.applicationTaskId, userId: input.userId, jobId: input.jobId,
+    sessionId: receiptSessionId, fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash,
+  })) throw new AutoApplyError("The submit payload does not match the current approved application attempt.");
 
   const claimed = await db.$transaction(async tx => {
     const material = await tx.applicationTask.findFirst({
@@ -139,6 +146,8 @@ export async function queueAutonomousApplication(input: {
         id: input.applicationTaskId,
         userId: input.userId,
         jobId: input.jobId,
+        sessionId: receiptSessionId,
+        fillTurnId,
         status: "waiting_for_authorization",
         checkpoint: "form_filled",
         resumeId: { not: null },
@@ -180,6 +189,8 @@ export async function queueAutonomousApplication(input: {
         id: input.applicationTaskId,
         userId: input.userId,
         jobId: input.jobId,
+        sessionId: receiptSessionId,
+        fillTurnId,
         status: "waiting_for_authorization",
         checkpoint: "form_filled",
         resumeId: { not: null },
@@ -199,32 +210,18 @@ export async function queueAutonomousApplication(input: {
   }
 
   try {
-    const taskId = await enqueueApplyTask({
-      applicationTaskId: input.applicationTaskId,
-      jobId: input.jobId,
-      userId: input.userId,
-      applyUrl,
-      operation: "submit",
-      receiptId: input.approvalId,
-      constraintHash: approval.scopeHash ?? undefined,
-    });
+    const taskId = await enqueueApplyTask(submitPayload);
     await db.activity.create({
-      data: {
-        userId: input.userId,
-        jobId: input.jobId,
-        type: "agent_action",
-        text: "Agent queued this application after explicit per-job user authorization.",
-        color: "#7C3AED",
-      },
+      data: { userId: input.userId, jobId: input.jobId, type: "agent_action",
+        text: "Agent queued this application after explicit per-job user authorization.", color: "#7C3AED" },
     });
     await db.applicationTask.update({ where: { id: input.applicationTaskId }, data: { workerTaskId: taskId } });
     await db.applicationTaskEvent.create({
       data: {
-        taskId: input.applicationTaskId,
-        type: "submission_queued",
-        actor: "user",
+        taskId: input.applicationTaskId, type: "submission_queued", actor: "user",
         body: "User approved this job for background submission.",
-        data: { approvalId: input.approvalId, workerTaskId: taskId },
+        data: { applicationTaskId: input.applicationTaskId, userId: input.userId, jobId: input.jobId,
+          sessionId: receiptSessionId, fillTurnId, approvalId: approval.id, constraintHash: approval.scopeHash, workerTaskId: taskId },
       },
     });
     return { taskId };

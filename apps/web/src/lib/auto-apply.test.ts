@@ -56,11 +56,12 @@ describe("auto-apply authorization", () => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
     mocks.approvalFindFirst.mockResolvedValue({
+      id: "approval_1",
       payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
       expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
     });
-    mocks.taskFindFirst.mockResolvedValue({ sessionId: "session_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    mocks.taskFindFirst.mockResolvedValue({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.resumeFindFirst.mockResolvedValue({ id: "resume_1" });
     mocks.coverLetterFindFirst.mockResolvedValue({ id: "cover_1" });
     mocks.jobFindFirst.mockResolvedValue({
@@ -97,9 +98,51 @@ describe("auto-apply authorization", () => {
     await expect(queueAutonomousApplication(input)).resolves.toEqual({ taskId: "worker_1" });
     expect(mocks.enqueueApplyTask).toHaveBeenCalledWith({
       applicationTaskId: "application_1", jobId: "job_1", userId: "user_1", applyUrl: input.applyUrl, operation: "submit",
+      personaId: "server-side", resumePath: "", sessionId: "session_1", fillTurnId: "turn_1",
       receiptId: "approval_1", constraintHash: "s".repeat(64),
     });
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ sessionId: "session_1", fillTurnId: "turn_1" }),
+    }));
+    expect(mocks.taskEventCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        taskId: "application_1", type: "submission_queued",
+        data: expect.objectContaining({ applicationTaskId: "application_1", userId: "user_1", jobId: "job_1",
+          sessionId: "session_1", fillTurnId: "turn_1", approvalId: "approval_1", workerTaskId: "worker_1" }),
+      }),
+    }));
     expect(mocks.transaction).toHaveBeenCalled();
+  });
+
+  it("rejects a missing current fill Turn before enqueueing submission", async () => {
+    mocks.taskFindFirst.mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: null, resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects an approval bound to another fill Turn or session", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce({
+      id: "approval_1",
+      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
+      sessionId: "session_other", turnId: "turn_other", toolCallId: "call_1", jobId: "job_1", revision: 0,
+      expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects a caller session that does not match the current task", async () => {
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication({ ...input, sessionId: "session_other" })).rejects.toThrow("explicit approval");
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
   });
 
   it("does not reset task or job state when queue failure cleanup races with Worker progress", async () => {
@@ -221,11 +264,14 @@ describe("auto-apply authorization", () => {
 
   it("rejects a stale task whose resume does not belong to this job or the current default", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce({
-      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: null, coverLetterId: null },
+      id: "approval_1",
+      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
       expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
     });
-    mocks.taskFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+    mocks.taskFindFirst
+      .mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null })
+      .mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: null });
     mocks.resumeFindFirst.mockResolvedValueOnce(null);
     const { queueAutonomousApplication } = await import("./auto-apply");
 
@@ -236,9 +282,10 @@ describe("auto-apply authorization", () => {
 
   it("rejects a task whose stored cover letter belongs to a different application", async () => {
     mocks.taskFindFirst
-      .mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: "cover_other" })
+      .mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: "cover_other", confirmedAnswers: null })
       .mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: "cover_other" });
     mocks.approvalFindFirst.mockResolvedValueOnce({
+      id: "approval_1",
       payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: "cover_other" },
       sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
       expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),

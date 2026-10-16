@@ -24,6 +24,13 @@ describe("session action support", () => {
     expect(readBody({ type: "retry_application_fill", applicationTaskId: "task_1", requestId: "short" })).toBeNull()
   })
 
+  it("requires an explicit employer-site attestation for uncertain-submit recovery", () => {
+    expect(readBody({ type: "confirm_submission_not_received", applicationTaskId: "task_1", requestId: "confirm_12345678", confirmedNotReceived: true }))
+      .toEqual({ type: "confirm_submission_not_received", applicationTaskId: "task_1", requestId: "confirm_12345678", confirmedNotReceived: true })
+    expect(readBody({ type: "confirm_submission_not_received", applicationTaskId: "task_1", requestId: "confirm_12345678", confirmedNotReceived: false })).toBeNull()
+    expect(readBody({ type: "confirm_submission_not_received", applicationTaskId: "task_1", requestId: "short", confirmedNotReceived: true })).toBeNull()
+  })
+
   it("applies the automation draft defaults and clamps numeric inputs", () => {
     expect(readBody({ type: "create_automation", draft: { name: " Scout ", minScore: 130, dailyCap: 0 } })).toEqual({
       type: "create_automation",

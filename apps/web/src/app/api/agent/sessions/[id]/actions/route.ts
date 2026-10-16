@@ -13,7 +13,7 @@ import {
 } from "@/lib/agent/session-actions/support"
 import {
   consumeReceiptForApproval, handleApprovedResumeTailoring, handleConfirmedTailoredResume,
-  handleCreateAutomationAction, handleRetryApplicationFillAction, handleReviewApplicationApproval,
+  handleCreateAutomationAction, handleRetryApplicationFillAction, handleConfirmSubmissionNotReceivedAction, handleReviewApplicationApproval,
   validateReceiptForApproval,
 } from "@/lib/agent/session-actions/handlers"
 
@@ -33,6 +33,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (!action) return err("Unsupported action type", 400)
   if (action.type === "create_automation") return handleCreateAutomationAction(id, auth.userId, action)
   if (action.type === "retry_application_fill") return handleRetryApplicationFillAction(id, auth.userId, action)
+  if (action.type === "confirm_submission_not_received") return handleConfirmSubmissionNotReceivedAction(id, auth.userId, action)
 
   let approval: ScopedApproval | null = null
   if (action.approvalId) {
