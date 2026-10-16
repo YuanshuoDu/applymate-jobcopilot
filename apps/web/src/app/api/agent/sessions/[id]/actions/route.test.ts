@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   queryRaw: vi.fn(),
   resolveLegacyApproval: vi.fn(),
   validateLegacyReceipt: vi.fn(),
+  validatePendingApprovalReceipt: vi.fn(),
   consumeLegacyReceipt: vi.fn(),
   issueLegacyReceipt: vi.fn(),
   clientReceipt: vi.fn(),
@@ -91,6 +92,9 @@ vi.mock("@/lib/agent/approval/legacy-receipt", () => ({
   resolveLegacyApproval: mocks.resolveLegacyApproval,
   validateLegacyReceipt: mocks.validateLegacyReceipt,
 }))
+vi.mock("@/lib/agent/approval/store", () => ({
+  validatePendingApprovalReceipt: mocks.validatePendingApprovalReceipt,
+}))
 vi.mock("@/lib/agent/session/v2-turn", () => ({ ensureV2Turn: mocks.ensureV2Turn }))
 vi.mock("@/lib/agent/policy/legacy", () => ({ requireLegacyPolicy: vi.fn() }))
 
@@ -159,6 +163,7 @@ describe("agent session actions API", () => {
     mocks.queryRaw.mockReset()
     mocks.resolveLegacyApproval.mockReset()
     mocks.validateLegacyReceipt.mockReset()
+    mocks.validatePendingApprovalReceipt.mockReset().mockResolvedValue({})
     mocks.consumeLegacyReceipt.mockReset()
     mocks.issueLegacyReceipt.mockReset()
     mocks.clientReceipt.mockReset()
@@ -546,10 +551,10 @@ describe("agent session actions API", () => {
     await expect(res.json()).resolves.toMatchObject({
       event: { id: "event_queued", type: "application_queued", title: "Submission queued" },
     })
-    expect(mocks.validateLegacyReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      approvalId: "approval_1", userId: "user_1", sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1",
-      jobId: "job_1", action: "submit_application", nonce: "nonce_1", resource: { jobId: "job_1" },
-      material: payload, answers: null, revision: 0, expiresAt,
+    expect(mocks.validatePendingApprovalReceipt).toHaveBeenCalledWith(expect.anything(), "approval_1", expect.objectContaining({
+      userId: "user_1", sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1",
+      jobId: "job_1", action: "submit_application", nonce: "nonce_1", revision: 0, expiresAt,
+      resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64),
     }))
     expect(mocks.queueAutonomousApplication).toHaveBeenCalledTimes(1)
     expect(mocks.queueAutonomousApplication).toHaveBeenCalledWith({
@@ -561,6 +566,45 @@ describe("agent session actions API", () => {
     }))
     expect(mocks.sessionUpdate).toHaveBeenCalledWith({ where: { id: "session_1" }, data: { status: "running", completedAt: null } })
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+  })
+
+  it.each(["transcript", "session"] as const)("reports queued success when the %s projection fails after queue resolution", async (failedProjection) => {
+    const payload = { applicationTaskId: "task_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null }
+    const queuedEvent = {
+      id: "event_queued", sessionId: "session_1", taskId: null, type: "application_queued", speaker: "Executor",
+      title: "Submission queued", body: "Your approved application was queued for background execution.",
+      data: { taskId: "submit_task_1", jobId: "job_1" }, durationMs: null,
+      createdAt: new Date("2026-06-18T10:01:00.000Z"),
+    }
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: "submit_application", payload }))
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.example/apply" })
+    mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
+      await options?.beforeResolve?.()
+      return canonicalResolution("approved")
+    })
+    if (failedProjection === "transcript") {
+      mocks.transcriptCreate.mockRejectedValueOnce(new Error("transcript store unavailable"))
+    } else {
+      mocks.transcriptCreate.mockResolvedValueOnce(queuedEvent)
+      mocks.sessionUpdate.mockRejectedValueOnce(new Error("session store unavailable"))
+    }
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      queued: true,
+      taskId: "submit_task_1",
+      projectionPending: true,
+      event: failedProjection === "transcript" ? null : { id: "event_queued", type: "application_queued" },
+    })
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledTimes(1)
+    expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ checkpoint: "queue_retry" }),
+    }))
+    if (failedProjection === "transcript") expect(mocks.sessionUpdate).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -746,7 +790,7 @@ describe("agent session actions API", () => {
       type: "submit_application",
       payload: { applicationTaskId: "task_1", jobId: "job_1" },
     }))
-    mocks.validateLegacyReceipt.mockRejectedValueOnce(new Error("Approval nonce does not match"))
+    mocks.validatePendingApprovalReceipt.mockRejectedValueOnce(new Error("Approval nonce does not match"))
     mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
       await options?.beforeResolve?.()
       return canonicalResolution("approved")
@@ -759,7 +803,7 @@ describe("agent session actions API", () => {
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toEqual({ error: "Approval nonce does not match" })
     expect(mocks.resolveLegacyApproval).toHaveBeenCalledTimes(1)
-    expect(mocks.validateLegacyReceipt).toHaveBeenCalledTimes(1)
+    expect(mocks.validatePendingApprovalReceipt).toHaveBeenCalledTimes(1)
     expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
     expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()

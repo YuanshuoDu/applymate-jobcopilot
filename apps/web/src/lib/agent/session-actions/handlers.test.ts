@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
+import { hashAgentReceiptValue } from "@jobcopilot/shared"
+import { protocolScope, type ApprovalScopeInput } from "../approval/types"
 
 vi.mock("@/lib/api-helpers", () => ({
   err: (message: string, status = 400) => Response.json({ error: message }, { status }),
@@ -13,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   assertJobPreflight: vi.fn(),
   applicationTaskFindFirst: vi.fn(),
   jobFindFirst: vi.fn(),
+  approvalFindFirst: vi.fn(),
   queueApplicationFill: vi.fn(),
   confirmSubmissionNotReceived: vi.fn(),
 }))
@@ -21,6 +25,7 @@ vi.mock("@/lib/db", () => ({
   db: {
     applicationTask: { findFirst: mocks.applicationTaskFindFirst },
     job: { findFirst: mocks.jobFindFirst },
+    agentApproval: { findFirst: mocks.approvalFindFirst },
   },
 }))
 
@@ -38,7 +43,7 @@ vi.mock("../control-plane/commands/application-submission-recovery-command", () 
   confirmSubmissionNotReceived: mocks.confirmSubmissionNotReceived,
 }))
 
-import { handleConfirmSubmissionNotReceivedAction, handleRetryApplicationFillAction } from "./handlers"
+import { handleConfirmSubmissionNotReceivedAction, handleRetryApplicationFillAction, validateReceiptForApproval } from "./handlers"
 
 describe("session action handlers", () => {
   beforeEach(() => {
@@ -51,6 +56,35 @@ describe("session action handlers", () => {
     mocks.jobFindFirst.mockReset()
     mocks.queueApplicationFill.mockReset()
     mocks.confirmSubmissionNotReceived.mockReset()
+    mocks.approvalFindFirst.mockReset()
+  })
+
+  it("validates canonical submission receipts with the stored hashes and rejects a wrong nonce when answers exist", async () => {
+    const nonce = "canonical-submit-nonce"
+    const nonceHash = await hashApprovalNonce(nonce)
+    const expiresAt = new Date(Date.now() + 60_000)
+    const scope: ApprovalScopeInput = {
+      userId: "user_1", sessionId: "session_1", turnId: "turn_1", jobId: "job_1", toolCallId: "application-submit:task_1",
+      action: "submit_application", resourceHash: "sha256:" + "a".repeat(64), materialHash: "sha256:" + "b".repeat(64),
+      answersHash: await hashAgentReceiptValue("answers", { eligible: "yes" }), revision: 4, expiresAt,
+    }
+    const row = {
+      id: "approval_1", ...scope, type: "submit_application", status: "pending", payload: { applicationTaskId: "task_1", jobId: "job_1" },
+      nonceHash, scopeHash: await hashApprovalScope(protocolScope(scope, nonceHash)),
+      createdAt: new Date(), decidedAt: null, consumedAt: null,
+    }
+    mocks.approvalFindFirst.mockResolvedValue(row)
+
+    await expect(validateReceiptForApproval({
+      id: row.id, type: row.type, payload: row.payload, turnId: scope.turnId, toolCallId: scope.toolCallId, jobId: scope.jobId,
+      revision: scope.revision, expiresAt, resourceHash: scope.resourceHash, materialHash: scope.materialHash, answersHash: scope.answersHash,
+    }, nonce, scope.userId, scope.sessionId)).resolves.toBeUndefined()
+
+    await expect(validateReceiptForApproval({
+      id: row.id, type: row.type, payload: row.payload, turnId: scope.turnId, toolCallId: scope.toolCallId, jobId: scope.jobId,
+      revision: scope.revision, expiresAt, resourceHash: scope.resourceHash, materialHash: scope.materialHash, answersHash: scope.answersHash,
+    }, "wrong-nonce", scope.userId, scope.sessionId)).rejects.toMatchObject({ code: "approval_nonce_mismatch" })
+    expect(mocks.approvalFindFirst).toHaveBeenCalledWith({ where: { id: row.id, userId: scope.userId } })
   })
 
   it("keeps explicit fill retries unavailable when the feature is disabled", async () => {

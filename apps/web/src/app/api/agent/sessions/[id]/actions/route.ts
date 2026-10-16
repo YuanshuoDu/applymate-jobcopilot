@@ -179,20 +179,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     if (!payload) return err("Submission authorization is missing its task.", 400)
     const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { url: true } })
     if (!job) return err("Job not found", 404)
+    let queued: { taskId: string }
     try {
-      const queued = await queueAutonomousApplication({
+      queued = await queueAutonomousApplication({
         userId: auth.userId, jobId: payload.jobId, applyUrl: job.url, applicationTaskId: payload.applicationTaskId,
         approvalId: action.approvalId!, receiptNonce: action.receiptNonce!, sessionId: id,
       })
-      const event = await db.agentTranscriptEvent.create({
-        data: {
-          sessionId: id, taskId: null, type: "application_queued", speaker: "Executor",
-          title: "Submission queued", durationMs: null,
-          ...safeEventFields("application_queued", "Your approved application was queued for background execution.", { ...queued, jobId: payload.jobId }),
-        },
-      })
-      await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
-      return ok({ event: serializeEvent(event) })
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not queue the approved application."
       await db.applicationTask.updateMany({
@@ -200,6 +192,22 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message },
       })
       return err(message, 409)
+    }
+
+    let projectedEvent: ReturnType<typeof serializeEvent> | null = null
+    try {
+      const event = await db.agentTranscriptEvent.create({
+        data: {
+          sessionId: id, taskId: null, type: "application_queued", speaker: "Executor",
+          title: "Submission queued", durationMs: null,
+          ...safeEventFields("application_queued", "Your approved application was queued for background execution.", { ...queued, jobId: payload.jobId }),
+        },
+      })
+      projectedEvent = serializeEvent(event)
+      await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
+      return ok({ event: projectedEvent })
+    } catch {
+      return ok({ event: projectedEvent, queued: true, taskId: queued.taskId, projectionPending: true })
     }
   }
 

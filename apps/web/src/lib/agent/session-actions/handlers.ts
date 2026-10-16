@@ -8,6 +8,7 @@ import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
 import { applicationFillTaskGraphEnabled, queueApplicationFill } from "@/lib/auto-apply"
 import { assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, validateAutoApplyUrl } from "@/lib/auto-apply-guards"
 import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt } from "@/lib/agent/approval/legacy-receipt"
+import { validatePendingApprovalReceipt } from "@/lib/agent/approval/store"
 import { ensureV2Turn } from "@/lib/agent/session/v2-turn"
 import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
@@ -36,6 +37,17 @@ export async function consumeReceiptForApproval(approval: ScopedApproval, nonce:
 }
 
 export async function validateReceiptForApproval(approval: ScopedApproval, nonce: string, userId: string, sessionId: string, resource?: unknown) {
+  if (approval.type === "submit_application") {
+    if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.resourceHash || !approval.materialHash || !approval.answersHash || !approval.expiresAt) {
+      throw new Error("Approval is missing its immutable receipt scope")
+    }
+    await validatePendingApprovalReceipt(db, approval.id, {
+      userId, sessionId, turnId: approval.turnId, toolCallId: approval.toolCallId, jobId: approval.jobId,
+      action: "submit_application", resourceHash: approval.resourceHash, materialHash: approval.materialHash,
+      answersHash: approval.answersHash, revision: approval.revision, expiresAt: approval.expiresAt, nonce,
+    })
+    return
+  }
   await validateLegacyReceipt(db, receiptScope(approval, nonce, userId, sessionId, resource))
 }
 
