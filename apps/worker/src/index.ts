@@ -10,7 +10,6 @@ import { startSubagentMailboxOutboxConsumer } from "./runtime/mailbox/outbox-con
 import { startAgentEventOutboxConsumer } from "./runtime/events/outbox-consumer.js";
 import { startTaskGraphStopOutboxConsumer } from "./runtime/subagents/task-graph-stop-outbox.js";
 import { startTaskInterruptOutboxConsumer } from "./runtime/subagents/task-interrupt-outbox.js";
-import { startApplicationSubmitOutboxPublisher } from "./queue/application-submit-outbox.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
@@ -30,6 +29,7 @@ async function main() {
   const [
     applyResultsModule,
     applyQueueModule,
+    applicationSubmitOutboxModule,
     scoutQueueModule,
     agentRunQueueModule,
     automationSchedulerModule,
@@ -45,6 +45,7 @@ async function main() {
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
+    import("./queue/application-submit-outbox.js"),
     import("./queue/scout-queue.js"),
     import("./queue/agent-run-queue.js"),
     import("./queue/automation-scheduler.js"),
@@ -106,7 +107,7 @@ async function main() {
   let agentEventOutboxConsumer: ReturnType<typeof startAgentEventOutboxConsumer> | undefined;
   let agentTaskGraphStopOutboxConsumer: ReturnType<typeof startTaskGraphStopOutboxConsumer> | undefined;
   let agentTaskInterruptOutboxConsumer: ReturnType<typeof startTaskInterruptOutboxConsumer> | undefined;
-  let applicationSubmitOutboxPublisher: ReturnType<typeof startApplicationSubmitOutboxPublisher> | undefined;
+  let applicationSubmitOutboxPublisher: ReturnType<typeof applicationSubmitOutboxModule.startApplicationSubmitOutboxPublisher> | undefined;
   let automationScheduler: ReturnType<typeof startAutomationScheduler> | undefined;
   let adminServer: ClosableHttpServer | undefined;
   const postBootstrapFence = createPostBootstrapStartupFence(() => [
@@ -177,7 +178,7 @@ async function main() {
         console.error("[apply-worker] worker loop failed:", error);
       });
     }
-    applicationSubmitOutboxPublisher = startApplicationSubmitOutboxPublisher(pool, applyQueue);
+    applicationSubmitOutboxPublisher = applicationSubmitOutboxModule.startApplicationSubmitOutboxPublisher(pool, applyQueue);
     console.log("[worker] Application submit outbox publisher started");
 
     console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
