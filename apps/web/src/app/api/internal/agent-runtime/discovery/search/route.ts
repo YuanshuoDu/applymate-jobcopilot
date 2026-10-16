@@ -6,6 +6,7 @@ import type { DiscoveryJobMaterializerFence } from '@/lib/agent/discovery-job-ma
 import { createToolUsage, DiscoveryToolError, type DiscoveryToolContext, type ToolUsageState } from '@/lib/agent/discovery-tool-support'
 import type { JobsSearchInput } from '@/lib/agent/discovery-tool-types'
 import {
+  getAutomationRunMode,
   isValidDiscoverySearchTargetList,
   parseScheduledAutomationSnapshot,
   ScheduledAutomationSnapshotValidationError,
@@ -92,8 +93,13 @@ function toSearchInput(input: DiscoveryRequest): JobsSearchInput {
 type ScopedTurn = { id: string; sessionId: string; userId: string; rootTaskId: string | null; source: string; input: unknown }
 type ActiveScoutScope = { executionFence: DiscoveryJobMaterializerFence; turn: ScopedTurn }
 
+class AutomationRunModeValidationError extends TypeError {}
+
 function toEffectiveSearchInput(input: DiscoveryRequest, turn: ScopedTurn): JobsSearchInput {
   if (turn.source !== 'automation') return toSearchInput(input)
+  const runMode = getAutomationRunMode(turn.input)
+  if (!runMode) throw new AutomationRunModeValidationError('Automation run mode is missing or invalid')
+  if (runMode === 'manual') return toSearchInput(input)
   const persistedInput = record(turn.input)
   const snapshot = parseScheduledAutomationSnapshot(persistedInput?.scheduledAutomationSnapshot)
   return toSearchInput({ ...input, targetRoles: snapshot.targetRoles, targetLocations: snapshot.targetLocations })
@@ -148,6 +154,9 @@ function usageFor(context: DiscoveryToolContext, startedAt: number, usage: ToolU
 }
 
 function errorDetails(error: unknown): { code: string; message: string; status: number } {
+  if (error instanceof AutomationRunModeValidationError) {
+    return { code: 'invalid_automation_run_mode', message: 'Automation run mode is missing or invalid', status: 409 }
+  }
   if (error instanceof ScheduledAutomationSnapshotValidationError) {
     return { code: 'invalid_scheduled_automation_snapshot', message: 'Scheduled automation snapshot is invalid', status: 409 }
   }

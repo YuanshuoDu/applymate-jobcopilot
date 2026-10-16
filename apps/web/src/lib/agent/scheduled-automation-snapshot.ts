@@ -1,5 +1,16 @@
 import { JobsSearchInputSchema } from "./discovery-tool-types"
 
+export type AutomationRunMode = "scheduled" | "manual"
+
+export function parseAutomationRunMode(value: unknown): AutomationRunMode | null {
+  return value === "scheduled" || value === "manual" ? value : null
+}
+
+export function getAutomationRunMode(input: unknown): AutomationRunMode | null {
+  const fields = schemaRecord(input)
+  return fields ? parseAutomationRunMode(fields.automationRunMode) : null
+}
+
 export interface ScheduledAutomationSnapshotInput {
   readonly targetRoles?: unknown
   readonly targetLocations?: unknown

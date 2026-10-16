@@ -159,6 +159,11 @@ describe("agent automation run API", () => {
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_1", executionId: "execution_1" })
+    expect(mocks.turnCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        input: { goal: "Run automation: Weekday Berlin SWE Scout", automationRunMode: "manual" },
+      }),
+    }))
   })
 
   it("returns 404 for a missing or unowned automation", async () => {
@@ -284,7 +289,7 @@ describe("agent automation run API", () => {
     const res = await POST(postRequest() as never, ctx())
 
     expect(res.status).toBe(409)
-    await expect(res.json()).resolves.toMatchObject({ error: expect.stringContaining("active non-automation Turn") })
+    await expect(res.json()).resolves.toMatchObject({ error: expect.stringContaining("active Turn that cannot be reused") })
     expect(mocks.ensureExecution).not.toHaveBeenCalled()
     expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
     expect(mocks.turnFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({

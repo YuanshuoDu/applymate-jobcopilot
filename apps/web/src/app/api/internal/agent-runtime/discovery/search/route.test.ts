@@ -57,8 +57,8 @@ describe('internal provider discovery route', () => {
     activeChildAttempt = { leaseOwner: 'worker-1', attemptCount: 4, leaseExpiresAt: new Date(Date.now() + 60_000) }
     mocks.sessionFindFirst.mockResolvedValue({ id: 'session-1' })
     mocks.turnFindFirst.mockResolvedValue({
-      id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'user',
-      input: { scheduledAutomationSnapshot: snapshot({ targetRoles: ['Must not override manual search'] }) },
+      id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'automation',
+      input: { automationRunMode: 'manual' },
     })
     mocks.stepFindFirst.mockResolvedValue({ id: 'step-1', attempt: 4 })
     mocks.taskFindFirst.mockImplementation(async ({ where }: { where: { id: string; leaseOwner?: string; attemptCount?: number; leaseExpiresAt?: { gt: Date } } }) => {
@@ -80,7 +80,7 @@ describe('internal provider discovery route', () => {
     })
   })
 
-  it('authenticates the Worker, validates live Scout scope, and preserves manual criteria', async () => {
+  it('authenticates the Worker, validates live Scout scope, and preserves manual Run Now criteria', async () => {
     const { POST } = await import('./route')
     const response = await POST(request(payload))
     expect(response.status).toBe(200)
@@ -117,10 +117,23 @@ describe('internal provider discovery route', () => {
     } }, expect.any(Object))
   })
 
+  it('preserves discovery for a non-automation Turn with no run-mode marker', async () => {
+    mocks.turnFindFirst.mockResolvedValue({
+      id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'user', input: {},
+    })
+    const { POST } = await import('./route')
+    const response = await POST(request(payload))
+
+    expect(response.status).toBe(200)
+    expect(mocks.executeDiscover).toHaveBeenCalledWith(
+      { targetRoles: ['Engineer'], targetLocations: ['Dublin'], pageSize: 2 }, expect.any(Object), expect.any(Object), expect.any(Object),
+    )
+  })
+
   it('uses persisted automation criteria for paginated discovery and ignores model overrides', async () => {
     mocks.turnFindFirst.mockResolvedValue({
       id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'automation',
-      input: { scheduledAutomationSnapshot: snapshot({ targetRoles: ['Saved engineer'], targetLocations: ['Dublin'] }) },
+      input: { automationRunMode: 'scheduled', scheduledAutomationSnapshot: snapshot({ targetRoles: ['Saved engineer'], targetLocations: ['Dublin'] }) },
     })
     const { POST } = await import('./route')
     const response = await POST(request({
@@ -138,7 +151,7 @@ describe('internal provider discovery route', () => {
   it('preserves empty snapshot locations as a global search', async () => {
     mocks.turnFindFirst.mockResolvedValue({
       id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'automation',
-      input: { scheduledAutomationSnapshot: snapshot({ targetRoles: ['Saved engineer'], targetLocations: [] }) },
+      input: { automationRunMode: 'scheduled', scheduledAutomationSnapshot: snapshot({ targetRoles: ['Saved engineer'], targetLocations: [] }) },
     })
     const { POST } = await import('./route')
     const response = await POST(request({ ...payload, targetRoles: ['Model manager'], targetLocations: ['Model city'] }))
@@ -192,7 +205,8 @@ describe('internal provider discovery route', () => {
     }],
   ] as const)('fails closed before discovery for an automation Turn with %s', async (_label, turnInput) => {
     mocks.turnFindFirst.mockResolvedValue({
-      id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'automation', input: turnInput,
+      id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'automation',
+      input: { automationRunMode: 'scheduled', ...turnInput },
     })
     const { POST } = await import('./route')
     const response = await POST(request(payload))
@@ -201,6 +215,20 @@ describe('internal provider discovery route', () => {
     expect(await response.json()).toMatchObject({ error: { code: 'invalid_scheduled_automation_snapshot' } })
     expect(mocks.executeDiscover).not.toHaveBeenCalled()
   })
+
+  it.each([['missing marker', {}], ['unknown marker', { automationRunMode: 'adhoc' }]] as const)(
+    'fails closed before discovery for an automation Turn with a %s', async (_label, turnInput) => {
+      mocks.turnFindFirst.mockResolvedValue({
+        id: 'turn-1', sessionId: 'session-1', userId: 'user-1', rootTaskId: 'root-1', source: 'automation', input: turnInput,
+      })
+      const { POST } = await import('./route')
+      const response = await POST(request(payload))
+
+      expect(response.status).toBe(409)
+      expect(await response.json()).toMatchObject({ error: { code: 'invalid_automation_run_mode' } })
+      expect(mocks.executeDiscover).not.toHaveBeenCalled()
+    },
+  )
 
   it('reports provider-call failures separately from failed jobs', async () => {
     mocks.executeDiscover.mockImplementationOnce(async (_input: JobsSearchInput, _context: DiscoveryToolContext, _deps: DiscoveryToolDependencies, usage: ToolUsageState) => {
@@ -230,6 +258,7 @@ describe('internal provider discovery route', () => {
     expect((await POST(request({ ...payload, role: 'analyst' }))).status).toBe(400)
     expect((await POST(request({ ...payload, ownerId: 'forged-worker' }))).status).toBe(400)
     expect((await POST(request({ ...payload, turnSource: 'automation' }))).status).toBe(400)
+    expect((await POST(request({ ...payload, automationRunMode: 'scheduled' }))).status).toBe(400)
     expect((await POST(request({ ...payload, leaseOwner: undefined }))).status).toBe(400)
     expect((await POST(request({ ...payload, attemptCount: undefined }))).status).toBe(400)
     expect((await POST(request({ ...payload, attemptCount: -1 }))).status).toBe(400)

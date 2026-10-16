@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { buildScheduledAutomationSnapshot, type ScheduledAutomationSnapshotInput } from "./scheduled-automation-snapshot"
+import { buildScheduledAutomationSnapshot, getAutomationRunMode, type ScheduledAutomationSnapshotInput } from "./scheduled-automation-snapshot"
 
 export interface AutomationSessionRow {
   id: string
@@ -28,7 +28,7 @@ interface AutomationSessionDb {
 
 interface AutomationTurnDb {
   agentTurn: {
-    findFirst(args: { where: Record<string, unknown>; orderBy?: Record<string, unknown>; select: { id: true } }): Promise<{ id: string } | null>
+    findFirst(args: { where: Record<string, unknown>; orderBy?: Record<string, unknown>; select: { id: true; input: true } }): Promise<{ id: string; input: unknown } | null>
     create(args: { data: Record<string, unknown>; select: { id: true } }): Promise<{ id: string }>
   }
 }
@@ -39,7 +39,7 @@ export class AutomationTurnOccupiedError extends Error {
   readonly code = "automation_turn_occupied"
 
   constructor(readonly sessionId: string) {
-    super(`Automation session ${sessionId} has an active non-automation Turn`)
+    super(`Automation session ${sessionId} has an active Turn that cannot be reused`)
     this.name = "AutomationTurnOccupiedError"
   }
 }
@@ -54,18 +54,28 @@ function isUniqueViolation(error: unknown) {
   return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "P2002")
 }
 
+type EnsureAutomationTurnInput = {
+  sessionId: string; userId: string; name: string
+} & (
+  | { automationRunMode: "scheduled"; scheduledAutomationSnapshot: ScheduledAutomationSnapshotInput }
+  | { automationRunMode: "manual"; scheduledAutomationSnapshot?: never }
+)
+
 /** Returns the active run Turn or atomically creates the next automation Turn. */
 export async function ensureAutomationTurn(
   db: unknown,
-  input: { sessionId: string; userId: string; name: string; scheduledAutomationSnapshot?: ScheduledAutomationSnapshotInput },
+  input: EnsureAutomationTurnInput,
 ) {
   const store = db as AutomationTurnDb
   const where = { sessionId: input.sessionId, userId: input.userId, source: "automation", status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } }
-  const existing = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true } })
-  if (existing) return { turnId: existing.id, created: false }
+  const existing = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true, input: true } })
+  if (existing) {
+    if (getAutomationRunMode(existing.input) !== input.automationRunMode) throw new AutomationTurnOccupiedError(input.sessionId)
+    return { turnId: existing.id, created: false }
+  }
 
-  const turnInput: Record<string, unknown> = { goal: `Run automation: ${input.name}` }
-  if (input.scheduledAutomationSnapshot !== undefined) {
+  const turnInput: Record<string, unknown> = { goal: `Run automation: ${input.name}`, automationRunMode: input.automationRunMode }
+  if (input.automationRunMode === "scheduled") {
     turnInput.scheduledAutomationSnapshot = buildScheduledAutomationSnapshot(input.scheduledAutomationSnapshot)
   }
 
@@ -80,8 +90,8 @@ export async function ensureAutomationTurn(
     return { turnId: created.id, created: true }
   } catch (error: unknown) {
     if (!isUniqueViolation(error)) throw error
-    const raced = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true } })
-    if (!raced) throw new AutomationTurnOccupiedError(input.sessionId)
+    const raced = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true, input: true } })
+    if (!raced || getAutomationRunMode(raced.input) !== input.automationRunMode) throw new AutomationTurnOccupiedError(input.sessionId)
     return { turnId: raced.id, created: false }
   }
 }

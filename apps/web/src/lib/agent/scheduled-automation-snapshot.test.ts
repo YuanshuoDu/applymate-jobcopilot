@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   buildScheduledAutomationSnapshot,
+  parseAutomationRunMode,
   parseScheduledAutomationSnapshot,
   ScheduledAutomationSnapshotValidationError,
   type ScheduledAutomationSnapshotInput,
@@ -39,6 +40,16 @@ function validSnapshot() {
     ...validInput(),
   }
 }
+
+describe("parseAutomationRunMode", () => {
+  it.each([["scheduled"], ["manual"]] as const)("accepts the %s marker", mode => {
+    expect(parseAutomationRunMode(mode)).toBe(mode)
+  })
+
+  it.each([undefined, null, "unknown", "Scheduled", 1])("rejects a missing or unknown marker (%s)", value => {
+    expect(parseAutomationRunMode(value)).toBeNull()
+  })
+})
 
 describe("parseScheduledAutomationSnapshot", () => {
   it("accepts only the complete versioned snapshot envelope", () => {
