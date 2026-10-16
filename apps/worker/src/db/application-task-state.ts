@@ -3,6 +3,8 @@ import type { FormReviewNeeds } from "../harness/form-review.js";
 import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import { ensureSubmissionArtifact, ensureSubmissionArtifactWithClient } from "./submission-artifact.js";
+import type { ApplicationSubmitIdentity } from "../queue/application-submit-fence.js";
+import { withExactSubmissionClientWrite, withExactSubmissionWrite } from "./submission-guard.js";
 
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
@@ -13,52 +15,24 @@ export const CAPTCHA_USER_TAKEOVER_MESSAGE =
 export const CHALLENGE_DETECTION_FAILED_MESSAGE =
   "Challenge detection failed. User takeover is required; no bypass was attempted.";
 
-export type ApplicationSubmissionStartScope = {
-  userId: string;
-  sessionId: string;
-  turnId: string;
-  applicationTaskId: string;
-  jobId: string;
-};
+export type ApplicationSubmissionStartScope = ApplicationSubmitIdentity & { turnId: string; workerTaskId: string; executionId: string };
 
-/** Commit the start marker on its reserved connection and return it to the pool. */
-export async function markSubmissionRequestStarted(
-  client: PoolClient, scope: ApplicationSubmissionStartScope,
-): Promise<"started" | "inactive" | "uncertain"> {
-  let transactionOpen = false;
-  try {
-    await client.query("BEGIN");
-    transactionOpen = true;
-    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId]);
-    const result = await client.query(
-      `UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
-        WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4
-          AND "status" = 'filling' AND "checkpoint" = 'browser_active'
-        RETURNING "id"`,
-      [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId],
-    );
-    if (result.rowCount !== 1) {
-      await client.query("ROLLBACK");
-      transactionOpen = false;
-      return "inactive";
-    }
-
-    try {
-      await client.query("COMMIT");
-      transactionOpen = false;
-      return "started";
-    } catch {
-      if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined);
-      transactionOpen = false;
-      return "uncertain";
-    }
-  } catch (error: unknown) {
-    if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined);
-    throw error;
-  } finally {
-    client.release();
-  }
+/** Write under the exact fence and caller-owned transaction held by the stop probe. */
+export async function markSubmissionRequestStarted(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<"started" | "inactive"> {
+  const result = await client.query(
+    `WITH started AS (UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
+      WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5
+        AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id")
+    INSERT INTO application_task_events (id, "taskId", type, actor, body, data, "createdAt")
+    SELECT 'evt_' || $6, started."id", 'submission_execution_started', 'worker', 'Submit execution started',
+      jsonb_build_object('executionId', $6, 'workerTaskId', $7, 'applicationTaskId', $1, 'userId', $2, 'jobId', $3,
+        'sessionId', $4, 'fillTurnId', $5, 'approvalId', $8, 'constraintHash', $9), NOW() FROM started RETURNING "id"`,
+    [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId, scope.fillTurnId,
+      scope.executionId, scope.workerTaskId, scope.approvalId, scope.constraintHash],
+  );
+  return result.rowCount === 1 ? "started" : "inactive";
 }
+
 /** Worker-side account guard.  A state lookup failure must not open a browser. */
 export async function isUserActive(pool: Pool, userId: string): Promise<boolean> {
   try {
@@ -72,27 +46,39 @@ export async function isUserActive(pool: Pool, userId: string): Promise<boolean>
 /** Worker-side guard: a stale/revoked queue payload must never open a browser. */
 export async function claimApplicationTask(
   pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit",
+  identity?: ApplicationSubmitIdentity,
 ): Promise<boolean> {
-  const result = await pool.query(
+  if (operation === "submit" && !identity) throw new Error("Submit task claims require an exact application attempt identity.");
+  const claim = (client: Pick<PoolClient, "query">) => client.query(
     `UPDATE application_tasks
      SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
      WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND (($4 = 'submit') OR ($4 = 'fill' AND "fillTurnId" IS NULL AND "checkpoint" = 'form_fill_queued'))
        AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
        AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
+       AND ($4 = 'fill' OR ("sessionId" = $5 AND "fillTurnId" = $6))
        AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = application_tasks."userId" AND u."accountStatus" = 'active')
      RETURNING id`,
-    [taskId, userId, jobId, operation],
+    [taskId, userId, jobId, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
   );
-  return result.rowCount === 1;
+  if (operation === "fill") return (await claim(pool)).rowCount === 1;
+  const fenced = await withExactSubmissionWrite(pool, identity!, "claim_application_task", async client =>
+    (await claim(client)).rowCount === 1);
+  return fenced.kind === "current" && fenced.value;
 }
 
-export async function finishApplicationTask(pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null, operation: "fill" | "submit"): Promise<void> {
-  const transitioned = await pool.query<{ sessionId: string | null }>(
+export async function finishApplicationTask(
+  pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
+  operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,
+): Promise<"current" | "superseded"> {
+  if (operation === "submit" && !identity) throw new Error("Submit task results require an exact application attempt identity.");
+  const write = async (client: Pick<PoolClient, "query">): Promise<void> => {
+    const transitioned = await client.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
      SET status = $2, "checkpoint" = $3, error = $4,
            "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END,
            "updatedAt" = NOW()
-     WHERE id = $1 AND (($5 = 'submit') OR ($5 = 'fill' AND "fillTurnId" IS NULL)) AND (
+     WHERE id = $1 AND (($5 = 'submit') OR ($5 = 'fill' AND "fillTurnId" IS NULL))
+       AND ($5 = 'fill' OR ("sessionId" = $6 AND "fillTurnId" = $7)) AND (
          status NOT IN ('cancelled', 'submitted')
          OR (status = 'cancelled' AND "checkpoint" = 'turn_stopped_before_submit'
            AND $2 = 'waiting_for_user' AND $3 = 'submission_uncertain')
@@ -102,27 +88,41 @@ export async function finishApplicationTask(pool: Pool | PoolClient, taskId: str
          AND NOT ($2 = 'submitted' OR ($2 = 'waiting_for_user' AND $3 = 'submission_uncertain')))
        AND (status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4)
      RETURNING "sessionId"`,
-    [taskId, status, checkpoint, error, operation],
+    [taskId, status, checkpoint, error, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
   );
   if (transitioned.rowCount !== 1) return;
-  await pool.query(
+  await client.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
      VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, $2, 'worker', $3, NOW())`,
     [taskId, status, redactSensitiveText(error ?? checkpoint)],
   );
   const sessionId = transitioned.rows[0]?.sessionId;
-  if (sessionId) await refreshSessionStatus(pool, sessionId);
+  if (sessionId) await refreshSessionStatus(client as PoolClient, sessionId);
+  };
+  if (operation === "fill") {
+    await write(pool as PoolClient);
+    return "current";
+  }
+  const attempt = identity!;
+  const outcome = typeof (pool as Pool).connect === "function"
+    ? await withExactSubmissionWrite(pool as Pool, attempt, "finish_application_task", client => write(client))
+    : await withExactSubmissionClientWrite(pool as PoolClient, attempt, "finish_application_task", () => write(pool as PoolClient));
+  return outcome.kind;
 }
 
-export async function applicationTaskStillActive(pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit"): Promise<boolean> {
+export async function applicationTaskStillActive(
+  pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,
+): Promise<boolean> {
+  if (operation === "submit" && !identity) return false;
   const result = await pool.query(
     `SELECT 1 FROM application_tasks t
        JOIN "User" u ON u.id = t."userId"
       WHERE t.id = $1 AND t."userId" = $2 AND t."jobId" = $3
         AND t.status = 'filling' AND t."checkpoint" = 'browser_active' AND ($4 = 'submit' OR t."fillTurnId" IS NULL)
+        AND ($4 = 'fill' OR (t."sessionId" = $5 AND t."fillTurnId" = $6))
         AND u."accountStatus" = 'active'
       LIMIT 1`,
-    [taskId, userId, jobId, operation],
+    [taskId, userId, jobId, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
   )
   return result.rowCount === 1
 }

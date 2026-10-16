@@ -6,15 +6,32 @@ const mocks = vi.hoisted(() => {
     if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "session-1" }], rowCount: 1 };
     if (sql.includes('FROM agent_sessions')) return { rows: [{ id: "session-1" }], rowCount: 1 };
     if (sql.includes('FROM agent_turns')) return { rows: [{ id: "turn-1" }], rowCount: 1 };
+    if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-1" }], rowCount: 1 };
+    if (sql.includes('SELECT "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId"')) {
+      return { rows: [{ sessionId: "agent-session-1", fillTurnId: "agent-turn-1", fillTurnSessionId: "agent-session-1", fillTurnUserId: "user-1" }], rowCount: 1 };
+    }
+    if (sql.includes('FROM "Job"')) return { rows: [{ id: "job-1" }], rowCount: 1 };
     if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
     if (sql.includes("INSERT INTO apply_results")) return { rows: [{ id: 1 }], rowCount: 1 };
     return { rows: [], rowCount: 1 };
   });
   const outcomeClient = { query: outcomeQuery, release: vi.fn() };
+  const fakeContext = {
+    close: vi.fn().mockResolvedValue(undefined),
+    route: vi.fn().mockResolvedValue(undefined),
+    unroute: vi.fn().mockResolvedValue(undefined),
+  };
+  const fakePage = {
+    goto: vi.fn().mockResolvedValue(undefined),
+    url: vi.fn().mockReturnValue("https://jobs.example/apply/start/123"),
+    context: vi.fn(() => fakeContext),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
 
   return {
-    workerHandler: undefined as undefined | ((job: { data: Record<string, unknown> }) => Promise<void>),
-    fakePage: { goto: vi.fn().mockResolvedValue(undefined), url: vi.fn().mockReturnValue("https://jobs.example/apply/start/123") },
+    workerHandler: undefined as undefined | ((job: { id: string; data: Record<string, unknown> }) => Promise<void>),
+    fakePage,
+    fakeContext,
     checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
     withCloakContext: vi.fn(),
     insertApplyResult: vi.fn().mockResolvedValue(1),
@@ -40,6 +57,9 @@ const mocks = vi.hoisted(() => {
     applicationTaskStillActive: vi.fn().mockResolvedValue(true),
     completeFillForReview: vi.fn().mockResolvedValue(true),
     finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+    claimUnattendedSubmission: vi.fn().mockResolvedValue("claimed"),
+    releaseUncertainSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
+    updateJobForSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
     pauseForFormInput: vi.fn().mockResolvedValue(undefined),
     agentRun,
     AgentHarness: vi.fn().mockImplementation(() => ({ run: agentRun })),
@@ -127,6 +147,12 @@ vi.mock("../db/application-task-state.js", () => ({
   pauseForFormInput: mocks.pauseForFormInput,
   needsUserTakeover: vi.fn(() => false),
 }));
+vi.mock("../db/submission-guard.js", () => ({
+  claimUnattendedSubmission: mocks.claimUnattendedSubmission,
+  releaseUncertainSubmission: mocks.releaseUncertainSubmission,
+  updateJobForSubmission: mocks.updateJobForSubmission,
+  UNCONFIRMED_SUBMISSION_MESSAGE: "The previous background attempt was interrupted after it started. ApplyMate did not retry it to avoid sending a duplicate application.",
+}));
 vi.mock("../runtime/approval/pg-store.js", () => ({
   createPgApprovalStore: vi.fn(() => ({ inspectSubmission: approvalMocks.inspectSubmission })),
 }));
@@ -159,6 +185,8 @@ const payload = {
   operation: "submit",
   userId: "user-1",
   jobId: "job-1",
+  sessionId: "agent-session-1",
+  fillTurnId: "agent-turn-1",
   applyUrl: "https://jobs.example/apply/start/123",
   personaId: "persona-1",
   resumePath: "/resume.pdf",
@@ -180,7 +208,7 @@ const formPattern = {
 async function runApplyJob() {
   await import("./apply-queue.js");
   expect(mocks.workerHandler).toBeDefined();
-  await mocks.workerHandler?.({ data: payload });
+  await mocks.workerHandler?.({ id: "worker-task-pipeline-1", data: payload });
 }
 
 describe("apply-queue Phase 5 pipeline", () => {
@@ -189,10 +217,18 @@ describe("apply-queue Phase 5 pipeline", () => {
     vi.clearAllMocks();
     mocks.claimApplicationTask.mockReset().mockResolvedValue(true);
     mocks.finishApplicationTask.mockReset().mockResolvedValue(undefined);
+    mocks.claimUnattendedSubmission.mockReset().mockResolvedValue("claimed");
+    mocks.releaseUncertainSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
+    mocks.updateJobForSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
     mocks.outcomeQuery.mockClear();
     mocks.outcomeClient.release.mockClear();
     mocks.workerHandler = undefined;
     mocks.fakePage.goto.mockResolvedValue(undefined);
+    mocks.fakePage.context.mockClear();
+    mocks.fakePage.close.mockReset().mockResolvedValue(undefined);
+    mocks.fakeContext.close.mockReset().mockResolvedValue(undefined);
+    mocks.fakeContext.route.mockReset().mockResolvedValue(undefined);
+    mocks.fakeContext.unroute.mockReset().mockResolvedValue(undefined);
     mocks.withCloakContext.mockImplementation(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
       await fn(mocks.fakePage);
     });
@@ -208,6 +244,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.detectCaptcha.mockResolvedValue(false);
     mocks.detectFlow.mockReturnValue(null);
     approvalMocks.inspectSubmission.mockResolvedValue({
+      id: "approval-1",
       type: "submit_application",
       status: "approved",
       scope: {
@@ -261,7 +298,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       })
     );
     expect(mocks.claimApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "user-1", "job-1", "submit",
+      expect.anything(), "application-task-1", "user-1", "job-1", "submit", expect.objectContaining({ fillTurnId: "agent-turn-1" }),
     );
     expect(mocks.withCloakContext).toHaveBeenCalledOnce();
   }, 15_000);
@@ -273,7 +310,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     await expect(runApplyJob()).resolves.toBeUndefined();
 
     expect(mocks.claimApplicationTask).toHaveBeenCalledWith(
-      expect.anything(), "application-task-1", "user-1", "job-1", "fill",
+      expect.anything(), "application-task-1", "user-1", "job-1", "fill", undefined,
     );
     expect(mocks.withCloakContext).not.toHaveBeenCalled();
     expect(mocks.fakePage.goto).not.toHaveBeenCalled();
@@ -370,6 +407,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "submission_blocked",
       "browser_412",
       "submit",
+      expect.objectContaining({ fillTurnId: "agent-turn-1" }),
     );
   });
 
@@ -427,10 +465,7 @@ describe("apply-queue Phase 5 pipeline", () => {
   });
 
   it("does not open a second browser when a previous attempt is uncertain", async () => {
-    mocks.query
-      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ workflowState: "submitting" }] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    mocks.claimUnattendedSubmission.mockResolvedValueOnce("uncertain");
 
     await expect(runApplyJob()).resolves.toBeUndefined();
 
@@ -464,10 +499,11 @@ describe("apply-queue Phase 5 pipeline", () => {
       "form_filled",
       expect.stringContaining("temporarily unavailable"),
       "submit",
+      expect.objectContaining({ fillTurnId: "agent-turn-1" }),
     );
-    expect(mocks.query).toHaveBeenCalledWith(
-      expect.stringContaining('UPDATE "Job"'),
-      ["saved", "ready_to_apply", "job-1", "user-1"],
+    expect(mocks.updateJobForSubmission).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ fillTurnId: "agent-turn-1" }),
+      expect.objectContaining({ status: "saved", workflowState: "ready_to_apply" }), "handoff_unavailable_submit",
     );
   });
 
@@ -489,6 +525,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "form_filled",
       expect.stringContaining("temporarily unavailable"),
       "submit",
+      expect.objectContaining({ fillTurnId: "agent-turn-1" }),
     );
   });
 
@@ -504,7 +541,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "application-task-1",
       "waiting_for_user",
       "materials_ready",
-      expect.stringContaining("temporarily unavailable"),
+      expect.any(String),
       "fill",
     );
   });

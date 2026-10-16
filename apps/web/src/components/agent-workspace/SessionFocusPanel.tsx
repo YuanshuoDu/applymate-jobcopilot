@@ -8,6 +8,7 @@ import { formQuestionFields } from '@/lib/agent/application-task-input'
 import { useI18n } from '@/lib/i18n'
 import { projectTaskTree } from './agent-workspace-projection'
 import { SessionStatusCards } from './SessionStatusCards'
+import { SubmissionRecoveryControl } from './SubmissionRecoveryControl'
 import { FocusTaskTree, focusQuestionOptions } from './session-focus-parts'
 
 interface DetailResponse { session: AgentSessionDetail }
@@ -132,6 +133,7 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
               <div style={rowTitleStyle}>{task.job.company} · {task.job.role}</div>
               <div style={rowMetaStyle}>{task.status}{task.checkpoint ? ` · ${task.checkpoint}` : ''}</div>
               {task.error && <div style={{ ...rowMetaStyle, color: '#d97706' }}>{task.error}</div>}
+              {task.status === 'waiting_for_user' && task.checkpoint === 'submission_uncertain' && <SubmissionRecoveryControl sessionId={sessionId} applicationTaskId={task.id} taskStatus={task.status} checkpoint={task.checkpoint} />}
               {fields.length > 0 && !waitId && <div style={{ ...rowMetaStyle, color: '#d97706' }}>This saved form wait is missing its wait ID and cannot be safely resumed.</div>}
               {fields.map(field => field.key
                 ? <input key={formAnswerDraftKey(task.id, waitId ?? '', field.key)} name={field.key} value={answers[formAnswerDraftKey(task.id, waitId ?? '', field.key)] ?? ''} onChange={event => setAnswers(current => ({ ...current, [formAnswerDraftKey(task.id, waitId ?? '', field.key!)]: event.target.value }))} placeholder={field.label} style={answerInputStyle} />
@@ -197,7 +199,6 @@ function Section({ title, children }: { title: string; children: React.ReactNode
     </div>
   )
 }
-
 function QualityMetric({ label, value, warn = false }: { label: string; value: string; warn?: boolean }) {
   return (
     <div style={{ padding: '8px 9px', borderRight: '1px solid var(--border)', borderBottom: '1px solid var(--border)' }}>
@@ -208,7 +209,6 @@ function QualityMetric({ label, value, warn = false }: { label: string; value: s
     </div>
   )
 }
-
 function EmptyText({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ padding: '10px 11px', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.45 }}>
@@ -216,7 +216,6 @@ function EmptyText({ children }: { children: React.ReactNode }) {
     </div>
   )
 }
-
 const sectionTitleStyle: React.CSSProperties = {
   fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0,
   fontWeight: 700, marginBottom: 6,

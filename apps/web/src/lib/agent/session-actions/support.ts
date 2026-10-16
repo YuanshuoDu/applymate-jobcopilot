@@ -26,7 +26,14 @@ export type RetryApplicationFillAction = {
   requestId: string
 }
 
-export type SessionAction = ApprovalAction | CreateAutomationAction | RetryApplicationFillAction
+export type ConfirmSubmissionNotReceivedAction = {
+  type: "confirm_submission_not_received"
+  applicationTaskId: string
+  requestId: string
+  confirmedNotReceived: true
+}
+
+export type SessionAction = ApprovalAction | CreateAutomationAction | RetryApplicationFillAction | ConfirmSubmissionNotReceivedAction
 
 export type ScopedApproval = ScopedApprovalRecord & {
   resourceHash: string | null
@@ -63,6 +70,13 @@ export function readBody(body: unknown): SessionAction | null {
     const requestId = text(row.requestId)
     return applicationTaskId && /^[A-Za-z0-9_-]{8,128}$/.test(requestId)
       ? { type: "retry_application_fill", applicationTaskId, requestId }
+      : null
+  }
+  if (row.type === "confirm_submission_not_received") {
+    const applicationTaskId = text(row.applicationTaskId)
+    const requestId = text(row.requestId)
+    return applicationTaskId && row.confirmedNotReceived === true && /^[A-Za-z0-9_-]{8,128}$/.test(requestId)
+      ? { type: "confirm_submission_not_received", applicationTaskId, requestId, confirmedNotReceived: true }
       : null
   }
   if (row.type !== "approval_response") return null
