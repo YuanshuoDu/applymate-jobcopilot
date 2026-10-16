@@ -160,6 +160,17 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.some(call => call.sql.includes('UPDATE "agent_sessions" SET "status" = \'waiting_for_user\''))).toBe(true)
   })
 
+  it("completes the exact bound fill while its parent Turn waits for the TaskGraph child", async () => {
+    const test = fixture({ turnStatus: "waiting_for_dependency" })
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).resolves.toEqual({ status: "completed" })
+
+    expect(test.turn.status).toBe("waiting_for_approval")
+    expect(test.calls.some(call => call.sql.includes('UPDATE "agent_turns" SET "status" = \'waiting_for_approval\'') && call.values?.[0] === "turn-a")).toBe(true)
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"') && call.values?.[4] === "turn-a")).toBe(true)
+    expect(test.calls.filter(call => call.sql.startsWith("BEGIN"))).toHaveLength(1)
+  })
+
   it("does not write a task, artifact, approval, or wait when the lease attempt is stale", async () => {
     const test = fixture({ subtaskLive: false })
 
@@ -296,6 +307,22 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.some(call => call.sql.includes("BEGIN"))).toBe(true)
   })
 
+  it.each(["required_field", "captcha_required"] as const)("persists a %s user wait after the root Turn's dependency handoff", async detail => {
+    const test = fixture({ turnStatus: "waiting_for_dependency" })
+
+    await expect(persistApplicationFillWait(test.pool, {
+      lease: test.lease, checkpoint: "form_answer_required", detail,
+      ...(detail === "required_field" ? { needs: { missing: [{ key: "form-answer-v2-" + "c".repeat(64), label: "Work authorisation" }], sensitive: [] } } : {}),
+    })).resolves.toEqual({ status: "waiting" })
+
+    const turnWait = test.calls.find(call => call.sql.includes('UPDATE "agent_turns" SET "status" = \'waiting_for_user\''))
+    expect(turnWait?.sql).toContain("'waiting_for_dependency'")
+    expect(turnWait?.values).toEqual(["turn-a", "session-a", 4, expect.any(Date)])
+    expect(test.turn.status).toBe("waiting_for_user")
+    const event = test.calls.find(call => call.sql.includes('INSERT INTO "application_task_events"'))
+    expect(JSON.parse(String(event?.values?.[4]))).toMatchObject({ reason: detail, turnId: "turn-a" })
+  })
+
   it("leaves an existing form-answer wait unchanged on Worker recovery", async () => {
     const test = fixture({ appStatus: "waiting_for_user", appCheckpoint: "form_answer_required", turnStatus: "waiting_for_user" })
 
@@ -336,6 +363,16 @@ describe("ApplicationTask fill completion", () => {
     expect(event?.values?.[2]).toBe("Application fill could not start after the final retry attempt.")
     expect(JSON.parse(String(event?.values?.[3]))).toEqual({ turnId: "turn-a", attemptCount: 3, maxAttempts: 3 })
     expect(test.calls.some(call => call.sql.includes('UPDATE "agent_turns"') || call.sql.includes('UPDATE "agent_sessions"'))).toBe(false)
+  })
+
+  it("records a terminal pre-browser failure after the exact Turn hands off to its child", async () => {
+    const test = fixture({ appCheckpoint: "taskgraph_fill_queued", turnStatus: "waiting_for_dependency" })
+    test.lease.attemptCount = test.lease.maxAttempts
+
+    await expect(failApplicationFillBeforeBrowser(test.pool, { lease: test.lease })).resolves.toEqual({ status: "failed" })
+    expect(test.task.status).toBe("failed")
+    expect(test.task.checkpoint).toBe("fill_prestart_failed")
+    expect(test.calls.some(call => call.sql.includes('FROM "application_tasks"') && call.values?.slice(0, 3).join(",") === "turn-a,session-a,user-a")).toBe(true)
   })
 
   it("does not persist a pre-browser failure before the final attempt", async () => {

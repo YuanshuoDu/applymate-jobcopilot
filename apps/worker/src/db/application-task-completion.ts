@@ -40,7 +40,7 @@ async function lockFillScope(client: Client, lease: SubagentLease, now: Date, ca
   if (!session.rows[0]) return null
   const turnResult = await client.query<TurnRow>(`SELECT "id", "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [lease.turnId, lease.sessionId, lease.userId])
   const turn = turnResult.rows[0]
-  if (!turn || !(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval"]).includes(turn.status)) return null
+  if (!turn || !(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status)) return null
   const interruptCheck = cancellation ? "IS NOT NULL" : "IS NULL"
   const subtask = await client.query(`SELECT "subtask"."id" FROM "sub_agent_tasks" AS "subtask"
       INNER JOIN "agent_sessions" AS "session" ON "session"."id" = "subtask"."sessionId" AND "session"."userId" = $7
@@ -146,7 +146,7 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
     const awaitingApproval = task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", authorizedForSubmission = task.status === "filling" && task.checkpoint === "submission_authorized", queueRetry = task.status === "waiting_for_authorization" && task.checkpoint === "queue_retry"
     if (awaitingApproval || authorizedForSubmission || queueRetry) return turn.status === "waiting_for_approval"
       ? { status: await existingCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry) ? "completed" : "conflict" } : { status: "conflict" }
-    if (task.status !== "filling" || task.checkpoint !== "browser_active" || turn.status !== "in_progress") return { status: "conflict" }
+    if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency"].includes(turn.status)) return { status: "conflict" }
     const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
     if (transitioned.rowCount !== 1) return { status: "conflict" }
     await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
@@ -176,7 +176,7 @@ export async function failApplicationFillBeforeBrowser(pool: Pool, input: { read
     const locked = await lockFillScope(client, lease, now)
     if (!locked) return { status: "stale" }
     const { turn, task } = locked
-    if (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued" || turn.status !== "in_progress") return { status: "conflict" }
+    if (task.status !== "filling" || task.checkpoint !== "taskgraph_fill_queued" || !["in_progress", "waiting_for_dependency"].includes(turn.status)) return { status: "conflict" }
     const updated = await client.query(`UPDATE "application_tasks" SET "status" = 'failed', "checkpoint" = 'fill_prestart_failed', "error" = $4, "updatedAt" = $5 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'taskgraph_fill_queued' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, SAFE_PRESTART_FAILURE, now])
     if (updated.rowCount !== 1) return { status: "conflict" }
     await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt") VALUES ($1, $2, 'fill_prestart_failed', 'worker', $3, $4::jsonb, $5)`, [randomUUID(), task.id, SAFE_PRESTART_FAILURE, JSON.stringify({ turnId: lease.turnId, attemptCount: lease.attemptCount, maxAttempts: lease.maxAttempts }), now])
@@ -216,7 +216,7 @@ export async function persistApplicationFillWait(
     const { turn, task } = locked
     const expectedCheckpoint = input.checkpoint
     if (task.status === "waiting_for_user" && task.checkpoint === expectedCheckpoint) return { status: "waiting" }
-    if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_user"].includes(turn.status)) return { status: "conflict" }
+    if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(turn.status)) return { status: "conflict" }
     const needs = safeNeeds(input.needs), message = waitMessage(detail)
     const checkpoint: WaitCheckpoint = detail === "fill_outcome_uncertain" ? "fill_outcome_uncertain" : expectedCheckpoint
     const question = checkpoint === "form_answer_required" ? { waitId: randomUUID(), detail: message, missing: needs.missing, sensitive: needs.sensitive } : null
@@ -233,7 +233,7 @@ export async function persistApplicationFillWait(
     [randomUUID(), lease.sessionId, message, JSON.stringify({ applicationTaskId: task.id, checkpoint, turnId: lease.turnId }), now])
     const turnUpdate = await client.query(`UPDATE "agent_turns" SET "status" = 'waiting_for_user', "revision" = "revision" + 1,
       "completedAt" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "sessionId" = $2 AND "revision" = $3
-      AND "status" IN ('in_progress', 'waiting_for_user') RETURNING "id"`, [lease.turnId, lease.sessionId, turn.revision, now])
+      AND "status" IN ('in_progress', 'waiting_for_user', 'waiting_for_dependency') RETURNING "id"`, [lease.turnId, lease.sessionId, turn.revision, now])
     if (turnUpdate.rowCount !== 1) return { status: "conflict" }
     await client.query(`UPDATE "agent_sessions" SET "status" = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = $2 WHERE "id" = $1 AND "userId" = $3`, [lease.sessionId, now, lease.userId])
     return { status: "waiting" }

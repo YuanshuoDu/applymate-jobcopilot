@@ -44,7 +44,7 @@ export async function executeApplicationFillForReview(input: { pool: Pool; lease
   if (context.taskStatus !== "filling") return failed("application_task_inactive")
   if (context.checkpoint === "browser_active") return wait(pool, lease, "fill_outcome_uncertain", "fill_outcome_uncertain")
   if (context.checkpoint !== "taskgraph_fill_queued") return failed("fill_checkpoint_invalid")
-  if (!["running", "waiting_for_user"].includes(context.sessionStatus) || !["in_progress", "waiting_for_user"].includes(context.turnStatus)) return failed("fill_turn_inactive")
+  if (!["running", "waiting_for_user"].includes(context.sessionStatus) || !["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(context.turnStatus)) return failed("fill_turn_inactive")
   let task: ReturnType<typeof buildFillInput>
   try {
     task = buildFillInput(context)
@@ -212,7 +212,7 @@ async function claimBrowserStart(pool: Pool, lease: SubagentLease): Promise<"cla
     const session = await client.query<{ status: string }>('SELECT status FROM agent_sessions WHERE id=$1 AND "userId"=$2 FOR UPDATE', [lease.sessionId, lease.userId])
     if (!session.rows[0] || !["running", "waiting_for_user"].includes(session.rows[0].status)) return await txResult(client, "ROLLBACK", "stale")
     const turn = await client.query<{ status: string }>('SELECT status FROM agent_turns WHERE id=$1 AND "sessionId"=$2 AND "userId"=$3 FOR UPDATE', [lease.turnId, lease.sessionId, lease.userId])
-    if (!turn.rows[0] || !["in_progress", "waiting_for_user"].includes(turn.rows[0].status)) return await txResult(client, "ROLLBACK", "stale")
+    if (!turn.rows[0] || !["in_progress", "waiting_for_user", "waiting_for_dependency"].includes(turn.rows[0].status)) return await txResult(client, "ROLLBACK", "stale")
     const task = await client.query<{ id: string }>(
       'SELECT sub."id" FROM sub_agent_tasks sub JOIN agent_sessions s ON s."id"=sub."sessionId" AND s."userId"=$4 JOIN agent_turns t ON t."id"=sub."turnId" AND t."sessionId"=sub."sessionId" AND t."userId"=$4 WHERE sub."id"=$1 AND sub."sessionId"=$2 AND sub."turnId"=$3 AND sub."role"=$5 AND sub."taskType"=$6 AND sub.status=\'running\' AND sub."leaseOwner"=$7 AND sub."attemptCount"=$8 AND date_trunc(\'milliseconds\',sub."leaseExpiresAt")=date_trunc(\'milliseconds\',$9::timestamptz) AND sub."leaseExpiresAt">clock_timestamp() AND sub."interruptRequestedAt" IS NULL FOR UPDATE OF sub',
       [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.role, lease.taskType, lease.ownerId, lease.attemptCount, lease.leaseExpiresAt])
