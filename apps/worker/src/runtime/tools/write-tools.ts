@@ -4,11 +4,13 @@ import {
   createPgApplicationSubmitTool,
   type ApplicationSubmitProvider,
 } from "./application-submit-tool.js"
+import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
 import type { RuntimeToolDefinition } from "./types.js"
 
 export type WriteToolOptions = {
   readonly pool: pg.Pool
   readonly submit: ApplicationSubmitProvider
+  readonly identity: ApplicationSubmitIdentity
 }
 
 /** Write-capable tools are registered separately so read-only tool lists stay unchanged. */

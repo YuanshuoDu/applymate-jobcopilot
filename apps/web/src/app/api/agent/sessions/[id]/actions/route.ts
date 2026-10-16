@@ -4,16 +4,15 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { applicationFillTaskGraphEnabled, queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-apply"
 import { resolveLegacyApproval } from "@/lib/agent/approval/legacy-receipt"
 import { updateAgentSession } from "@/lib/agent/session/repository"
-import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
 import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements"
 import {
-  applicationPayload, approvalPolicyInput, approvalTitle, canonicalApprovalResponse, legacyApprovalErrorResponse,
-  policyErrorResponse, readBody, safeEventFields, serializeEvent, type ScopedApproval,
+  approvalActionPolicyError, applicationPayload, approvalTitle, canonicalApprovalResponse, legacyApprovalErrorResponse,
+  readBody, replayConsumedSubmitApproval, safeEventFields, serializeEvent, type ScopedApproval,
 } from "@/lib/agent/session-actions/support"
 import {
   consumeReceiptForApproval, handleApprovedResumeTailoring, handleConfirmedTailoredResume,
-  handleCreateAutomationAction, handleRetryApplicationFillAction, handleReviewApplicationApproval,
+  handleCreateAutomationAction, handleRetryApplicationFillAction, handleConfirmSubmissionNotReceivedAction, handleReviewApplicationApproval,
   validateReceiptForApproval,
 } from "@/lib/agent/session-actions/handlers"
 
@@ -33,8 +32,10 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (!action) return err("Unsupported action type", 400)
   if (action.type === "create_automation") return handleCreateAutomationAction(id, auth.userId, action)
   if (action.type === "retry_application_fill") return handleRetryApplicationFillAction(id, auth.userId, action)
+  if (action.type === "confirm_submission_not_received") return handleConfirmSubmissionNotReceivedAction(id, auth.userId, action)
 
   let approval: ScopedApproval | null = null
+  let canonicalSubmissionApproved = false
   if (action.approvalId) {
     approval = await db.agentApproval.findFirst({
       where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "pending" },
@@ -44,6 +45,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       },
     })
     if (!approval) {
+      if (action.decision === "approved" && action.receiptNonce) {
+        const replay = await replayConsumedSubmitApproval({
+          sessionId: id, userId: auth.userId, approvalId: action.approvalId, receiptNonce: action.receiptNonce,
+        })
+        if (replay) return replay
+      }
       if (action.decision === "approved" && applicationFillTaskGraphEnabled()) {
         const prior = await db.agentApproval.findFirst({
           where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "approved", type: "review_application" },
@@ -73,27 +80,8 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       return err("Approval is no longer pending", 409)
     }
 
-    const policy = approvalPolicyInput(approval)
-    try {
-      requireLegacyPolicy({
-        userId: auth.userId,
-        sessionId: id,
-        turnId: approval.turnId ?? "legacy-approval:" + action.approvalId,
-        stepId: "approval:" + action.approvalId,
-        toolCallId: approval.toolCallId ?? "approval:" + action.approvalId,
-        toolName: policy.toolName,
-        domain: policy.domain,
-        risk: action.decision === "approved" ? policy.risk : "internal_write",
-        capabilities: policy.capabilities,
-        input: {
-          requiresReceipt: action.decision === "approved",
-          receiptValidated: Boolean(action.receiptNonce),
-          unknownSensitiveFacts: false,
-        },
-      })
-    } catch (error) {
-      return policyErrorResponse(error)
-    }
+    const policyError = approvalActionPolicyError(approval, action.decision, Boolean(action.receiptNonce), auth.userId, id)
+    if (policyError) return policyError
     if (action.decision === "approved" && !action.receiptNonce) return err("A scoped receipt is required to approve this action", 428)
     if (action.decision === "approved" && approval.type === "tailor_resume") {
       if (!(await isFeatureAllowed(auth.userId, "tailored_resume"))) return err("This feature is not included in your current plan", 403)
@@ -112,16 +100,54 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
           ? () => validateReceiptForApproval(approval!, action.receiptNonce!, auth.userId, id)
           : undefined,
       })
-      if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
-      if (approval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: approval.turnId })
-      if (action.decision === "approved" && approval.type !== "submit_application") {
-        await consumeReceiptForApproval(approval, action.receiptNonce!, auth.userId, id)
+      if (resolution?.disposition === "canonical_wait") {
+        const canonicalSubmissionDeclined = approval.type === "submit_application"
+          && (action.decision === "rejected" || action.decision === "cancelled")
+          && resolution.decision === "rejected"
+          && resolution.result.status === "rejected"
+          && resolution.result.disposition !== "duplicate"
+        if (canonicalSubmissionDeclined && approval.turnId && approval.jobId) {
+          const payload = applicationPayload(approval.payload)
+          if (payload?.jobId === approval.jobId) {
+            const cancelled = action.decision === "cancelled"
+            const updated = await db.applicationTask.updateMany({
+              where: {
+                id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, sessionId: id,
+                fillTurnId: approval.turnId, fillTurnSessionId: id, fillTurnUserId: auth.userId,
+                status: "waiting_for_authorization", checkpoint: "form_filled",
+              },
+              data: {
+                status: cancelled ? "cancelled" : "waiting_for_user",
+                checkpoint: cancelled ? "submission_cancelled" : "review_requested",
+                completedAt: cancelled ? new Date() : null,
+              },
+            })
+            if (updated.count === 1) {
+              await db.applicationTaskEvent.create({
+                data: {
+                  taskId: payload.applicationTaskId, type: "submission_" + action.decision, actor: "user",
+                  body: safeEventFields("submission_" + action.decision, action.body, {}).body,
+                },
+              })
+            }
+          }
+        }
+        canonicalSubmissionApproved = action.decision === "approved"
+          && resolution.decision === "approved"
+          && approval.type === "submit_application"
+          && resolution.result.disposition !== "duplicate"
+        if (!canonicalSubmissionApproved) return canonicalApprovalResponse(resolution)
+      }
+      if (!canonicalSubmissionApproved) {
+        if (approval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: approval.turnId })
+        if (action.decision === "approved" && approval.type !== "submit_application") {
+          await consumeReceiptForApproval(approval, action.receiptNonce!, auth.userId, id)
+        }
       }
     } catch (error) {
       return legacyApprovalErrorResponse(error, "Approval could not be resolved")
     }
   }
-
   if (action.decision === "approved" && approval?.type === "tailor_resume") {
     return handleApprovedResumeTailoring(id, auth.userId, action, approval)
   }
@@ -138,20 +164,12 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     if (!payload) return err("Submission authorization is missing its task.", 400)
     const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { url: true } })
     if (!job) return err("Job not found", 404)
+    let queued: { taskId: string }
     try {
-      const queued = await queueAutonomousApplication({
+      queued = await queueAutonomousApplication({
         userId: auth.userId, jobId: payload.jobId, applyUrl: job.url, applicationTaskId: payload.applicationTaskId,
         approvalId: action.approvalId!, receiptNonce: action.receiptNonce!, sessionId: id,
       })
-      const event = await db.agentTranscriptEvent.create({
-        data: {
-          sessionId: id, taskId: null, type: "application_queued", speaker: "Executor",
-          title: "Submission queued", durationMs: null,
-          ...safeEventFields("application_queued", "Your approved application was queued for background execution.", { ...queued, jobId: payload.jobId }),
-        },
-      })
-      await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
-      return ok({ event: serializeEvent(event) })
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not queue the approved application."
       await db.applicationTask.updateMany({
@@ -159,6 +177,22 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message },
       })
       return err(message, 409)
+    }
+
+    let projectedEvent: ReturnType<typeof serializeEvent> | null = null
+    try {
+      const event = await db.agentTranscriptEvent.create({
+        data: {
+          sessionId: id, taskId: null, type: "application_queued", speaker: "Executor",
+          title: "Submission queued", durationMs: null,
+          ...safeEventFields("application_queued", "Your approved application was queued for background execution.", { ...queued, jobId: payload.jobId }),
+        },
+      })
+      projectedEvent = serializeEvent(event)
+      await updateAgentSession(db, { sessionId: id, status: "running", completedAt: null })
+      return ok({ event: projectedEvent })
+    } catch {
+      return ok({ event: projectedEvent, queued: true, taskId: queued.taskId, projectionPending: true })
     }
   }
 

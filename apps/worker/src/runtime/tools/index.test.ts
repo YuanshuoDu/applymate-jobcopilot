@@ -6,6 +6,7 @@ import { InMemoryToolLifecycleSink } from "./lifecycle.js"
 import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
 import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
+import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
 
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
@@ -13,6 +14,7 @@ const owner: ExecutionOwner = {
     leaseStartedAt: new Date("2026-08-31T11:59:00.000Z"), leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"),
   },
 }
+const submitIdentity: ApplicationSubmitIdentity = { sessionId: "session-1", fillTurnId: "turn-1", applicationTaskId: "application-1", userId: "user-1", jobId: "job-1", approvalId: "receipt-1", constraintHash: "a".repeat(64) }
 
 describe("worker tool runtime entry point", () => {
   it("exports a factory without opening a database connection at import time", () => {
@@ -27,7 +29,7 @@ describe("worker tool runtime entry point", () => {
       undefined,
       undefined,
       undefined,
-      { submit: async () => ({ confirmationId: "mock-confirmation" }) },
+      { submit: async () => ({ confirmationId: "mock-confirmation" }), identity: submitIdentity },
     )
 
     expect(runtime.registry.resolve("application.submit", "1").risk).toBe("external_write")

@@ -6,13 +6,17 @@ import { loadUserAiConfig } from "@/lib/model-router"
 import { isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements"
 import { tailorResumeForAgent } from "@/lib/agent/resume-tailoring"
 import { applicationFillTaskGraphEnabled, queueApplicationFill } from "@/lib/auto-apply"
+import { assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, validateAutoApplyUrl } from "@/lib/auto-apply-guards"
 import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt } from "@/lib/agent/approval/legacy-receipt"
+import { validatePendingApprovalReceipt } from "@/lib/agent/approval/store"
 import { ensureV2Turn } from "@/lib/agent/session/v2-turn"
 import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
 import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
+import { AgentCommandError } from "../control-plane/commands/errors"
+import { confirmSubmissionNotReceived } from "../control-plane/commands/application-submission-recovery-command"
 import {
   applicationPayload, canonicalApprovalResponse, legacyApprovalErrorResponse, resumeTailoringPayload,
-  safeEventFields, serializeEvent, type ApprovalAction, type CreateAutomationAction, type RetryApplicationFillAction,
+  safeEventFields, serializeEvent, type ApprovalAction, type ConfirmSubmissionNotReceivedAction, type CreateAutomationAction, type RetryApplicationFillAction,
   type ScopedApproval,
 } from "./support"
 
@@ -33,6 +37,17 @@ export async function consumeReceiptForApproval(approval: ScopedApproval, nonce:
 }
 
 export async function validateReceiptForApproval(approval: ScopedApproval, nonce: string, userId: string, sessionId: string, resource?: unknown) {
+  if (approval.type === "submit_application") {
+    if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.resourceHash || !approval.materialHash || !approval.answersHash || !approval.expiresAt) {
+      throw new Error("Approval is missing its immutable receipt scope")
+    }
+    await validatePendingApprovalReceipt(db, approval.id, {
+      userId, sessionId, turnId: approval.turnId, toolCallId: approval.toolCallId, jobId: approval.jobId,
+      action: "submit_application", resourceHash: approval.resourceHash, materialHash: approval.materialHash,
+      answersHash: approval.answersHash, revision: approval.revision, expiresAt: approval.expiresAt, nonce,
+    })
+    return
+  }
   await validateLegacyReceipt(db, receiptScope(approval, nonce, userId, sessionId, resource))
 }
 
@@ -94,6 +109,25 @@ export async function handleRetryApplicationFillAction(sessionId: string, userId
     return ok({ ...queued, retried: true })
   } catch (error) {
     return err(error instanceof Error ? error.message : "Could not retry the fill-for-review pass", 409)
+  }
+}
+
+export async function handleConfirmSubmissionNotReceivedAction(sessionId: string, userId: string, action: ConfirmSubmissionNotReceivedAction) {
+  if (!applicationFillTaskGraphEnabled()) return err("Submission recovery is unavailable while TaskGraph fill is disabled", 409)
+  const task = await db.applicationTask.findFirst({ where: { id: action.applicationTaskId, userId, sessionId }, select: { id: true, jobId: true } })
+  if (!task) return err("Application task not found", 404)
+  const job = await db.job.findFirst({ where: { id: task.jobId, userId }, select: { url: true } })
+  if (!job) return err("Job not found", 404)
+  try {
+    await assertActiveAccount(userId)
+    await assertUnattendedApplyEnabled(userId)
+    validateAutoApplyUrl(job.url)
+    await assertJobPreflight({ userId, jobId: task.jobId })
+    const result = await confirmSubmissionNotReceived(db, { ...action, sessionId, userId })
+    return ok({ ...result, recovered: true })
+  } catch (error) {
+    const status = error instanceof AgentCommandError ? error.status : 409
+    return err(error instanceof Error ? error.message : "The uncertain submission could not be recovered", status)
   }
 }
 

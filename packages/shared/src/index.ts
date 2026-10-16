@@ -60,23 +60,63 @@ export {
   type PlatformFeatureKey,
 } from "./feature-flags.js";
 
-/** Job payload pushed to the apply-tasks queue */
-export interface ApplyTaskPayload {
-  /** Durable control-plane record. Worker refuses a missing or revoked task. */
-  applicationTaskId: string;
-  /** First pass fills only; submit requires a second, explicit authorization. */
-  operation: "fill" | "submit";
-  jobId: string;
-  userId: string;
-  applyUrl: string;
-  personaId: string;
-  resumePath: string;
-  coverLetterPath?: string;
-  dryRun?: boolean;
-  /** Canonical approval receipt forwarded to the Worker submit tool; paired with constraintHash. */
-  receiptId?: string;
-  /** Canonical approval scope hash; paired with receiptId and rejected when stale. */
-  constraintHash?: string;
+interface ApplyTaskPayloadBase {
+  readonly applicationTaskId: string;
+  readonly jobId: string;
+  readonly userId: string;
+  readonly applyUrl: string;
+  readonly personaId: string;
+  readonly resumePath: string;
+  readonly coverLetterPath?: string;
+  readonly dryRun?: boolean;
+}
+
+export interface ApplyTaskSubmitIdentity {
+  readonly applicationTaskId: string;
+  readonly jobId: string;
+  readonly userId: string;
+  readonly sessionId: string;
+  /** The immutable canonical fill Turn authorized for this submit. */
+  readonly fillTurnId: string;
+  /** The existing AgentApproval.id; do not mint a parallel approval ID. */
+  readonly receiptId: string;
+  readonly constraintHash: string;
+}
+
+export interface ApplyTaskSubmitPayload extends ApplyTaskPayloadBase, ApplyTaskSubmitIdentity {
+  readonly operation: "submit";
+}
+
+interface ApplyTaskFillPayload extends ApplyTaskPayloadBase {
+  readonly operation: "fill";
+  readonly receiptId?: never;
+  readonly constraintHash?: never;
+}
+
+/** Job payload pushed to the apply-tasks queue. Submit is an identity-bound variant. */
+export type ApplyTaskPayload = ApplyTaskFillPayload | ApplyTaskSubmitPayload;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/** Checks a decoded submit payload against the current task and approval identity. */
+export function matchesApplyTaskSubmitPayload(
+  value: unknown,
+  expected: ApplyTaskSubmitIdentity,
+): value is ApplyTaskSubmitPayload {
+  if (!isRecord(value) || value.operation !== "submit" || typeof value.applyUrl !== "string" ||
+    typeof value.personaId !== "string" || typeof value.resumePath !== "string" ||
+    (value.coverLetterPath !== undefined && typeof value.coverLetterPath !== "string") ||
+    (value.dryRun !== undefined && typeof value.dryRun !== "boolean")) return false;
+  const identityKeys: (keyof ApplyTaskSubmitIdentity)[] = [
+    "applicationTaskId", "jobId", "userId", "sessionId", "fillTurnId", "receiptId", "constraintHash",
+  ];
+  return identityKeys.every(key => isNonEmptyString(value[key]) && value[key] === expected[key]);
 }
 
 /** Outcome written to apply_results after each task */
