@@ -160,7 +160,16 @@ describe("application submit outbox publisher", () => {
     fixture.state.task.checkpoint = "browser_active"
     fixture.state.job.workflowState = "submitting"
     fixture.setJobState("completed")
-    mockReconcileClaimedSubmissionUncertain.mockImplementationOnce(async () => {
+    const queueLookupsBeforeRecovery = fixture.queue.getJob.mock.calls.length
+    mockReconcileClaimedSubmissionUncertain.mockImplementationOnce(async (...args: unknown[]) => {
+      expect(args).toHaveLength(4)
+      expect(args[1]).toMatchObject({ applicationTaskId: identity.applicationTaskId, approvalId: identity.receiptId })
+      expect(args[2]).toBe(workerTaskId)
+      expect(args[3]).toBeTypeOf("function")
+      expect(fixture.queue.getJob).toHaveBeenCalledTimes(queueLookupsBeforeRecovery + 2)
+      const isCurrentTerminalDelivery = args[3] as () => Promise<boolean>
+      expect(await isCurrentTerminalDelivery()).toBe(true)
+      expect(fixture.queue.getJob).toHaveBeenCalledTimes(queueLookupsBeforeRecovery + 3)
       fixture.state.task.status = "waiting_for_user"
       fixture.state.task.checkpoint = "submission_uncertain"
       return true
@@ -177,7 +186,7 @@ describe("application submit outbox publisher", () => {
         fillTurnId: identity.fillTurnId,
         approvalId: identity.receiptId,
         constraintHash: identity.constraintHash,
-      }), workerTaskId,
+      }), workerTaskId, expect.any(Function),
     )
     expect(fixture.state.task).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain" })
     expect(fixture.state.job.workflowState).toBe("submitting")
@@ -283,6 +292,17 @@ describe("application submit outbox publisher", () => {
     const lookups = fixture.queue.getJob.mock.calls.length
     await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
     expect(fixture.queue.getJob).toHaveBeenCalledTimes(lookups)
+  })
+
+  it("terminalizes a Queue.add result whose BullMQ job ID differs from the persisted attempt ID", async () => {
+    const fixture = makeFixture()
+    fixture.queue.add.mockImplementationOnce(async (_name, data) => fixture.makeJob(`unexpected-${workerTaskId}`, data))
+
+    await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
+
+    expect(fixture.queue.add).toHaveBeenCalledWith("apply", payload, expect.objectContaining({ jobId: workerTaskId }))
+    expect(fixture.state.outbox.publishedAt).toBeNull()
+    expect(fixture.state.outbox.lastError).toBe("terminal:queue_job_identity_mismatch")
   })
 
   it("returns an exact expired preclaim attempt for fresh authorization", async () => {

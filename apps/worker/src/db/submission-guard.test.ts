@@ -40,6 +40,7 @@ function poolWith(...responses: Array<{ rowCount?: number | null; rows?: unknown
 }
 
 beforeEach(() => {
+  withExactAttemptFence.mockClear();
   withExactAttemptFence.mockImplementation(async (
     _client: unknown,
     _identity: ApplicationSubmitIdentity,
@@ -117,7 +118,7 @@ describe("submission guard", () => {
       { rowCount: 1, rows: [] },
     );
 
-    await expect(reconcileClaimedSubmissionUncertain(pool, identity, "bull-1")).resolves.toBe(true);
+    await expect(reconcileClaimedSubmissionUncertain(pool, identity, "bull-1", async () => true)).resolves.toBe(true);
 
     const transition = String(query.mock.calls[2]?.[0]);
     expect(transition).toContain('"workerTaskId" = $6');
@@ -134,11 +135,40 @@ describe("submission guard", () => {
   it("does not reconcile a task owned by another BullMQ id", async () => {
     const { pool, query } = poolWith({ rowCount: 0, rows: [] });
 
-    await expect(reconcileClaimedSubmissionUncertain(pool, identity, "bull-stale")).resolves.toBe(false);
+    await expect(reconcileClaimedSubmissionUncertain(pool, identity, "bull-stale", async () => true)).resolves.toBe(false);
 
     expect(String(query.mock.calls[2]?.[0])).toContain('"workerTaskId" = $6');
     expect(query.mock.calls[2]?.[1]?.[5]).toBe("bull-stale");
     expect(query).toHaveBeenCalledTimes(4);
+  });
+
+  it("validates the current terminal Queue delivery under the exact attempt fence before recovery writes", async () => {
+    const { pool, query } = poolWith();
+    let fenceActive = false;
+    const currentDelivery = vi.fn(async () => {
+      expect(fenceActive).toBe(true);
+      return false;
+    });
+    withExactAttemptFence.mockImplementationOnce(async (
+      _client: unknown,
+      _identity: ApplicationSubmitIdentity,
+      work: () => Promise<unknown>,
+    ) => {
+      fenceActive = true;
+      try {
+        return { kind: "current", value: await work() };
+      } finally {
+        fenceActive = false;
+      }
+    });
+
+    await expect(reconcileClaimedSubmissionUncertain(pool, identity, "bull-1", currentDelivery)).resolves.toBe(false);
+
+    expect(withExactAttemptFence).toHaveBeenCalledOnce();
+    expect(currentDelivery).toHaveBeenCalledOnce();
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("UPDATE application_tasks"))).toBe(false);
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO application_task_events"))).toBe(false);
+    expect(query).toHaveBeenCalledWith("COMMIT");
   });
 
   it("can release an uncertain submission only while it remains locked", async () => {

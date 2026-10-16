@@ -47,7 +47,12 @@ function makeQueue(options: { job?: ReturnType<typeof makeJob>; lock?: string | 
   return { queue: queue as unknown as SubmitOutboxQueue, redis }
 }
 
-beforeEach(() => mockReconcile.mockReset().mockResolvedValue(true))
+beforeEach(() => mockReconcile.mockReset().mockImplementation(async (
+  _pool: unknown,
+  _identity: unknown,
+  _workerTaskId: string,
+  isCurrentTerminalDelivery?: () => Promise<boolean>,
+) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery() : true))
 
 describe("claimed submit terminal recovery", () => {
   it("reconciles only a matching completed delivery after its exact lock is absent", async () => {
@@ -56,8 +61,36 @@ describe("claimed submit terminal recovery", () => {
 
     await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
 
+    expect(redis.get).toHaveBeenCalledTimes(2)
     expect(redis.get).toHaveBeenCalledWith(`bull:apply:${intent.workerTaskId}:lock`)
-    expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId)
+    expect(queue.getJob).toHaveBeenCalledTimes(2)
+    expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId, expect.any(Function))
+  })
+
+  it.each([
+    { name: "active state", lock: null, expectSecondJobRead: true },
+    { name: "active Redis lock", lock: "retry-lock", expectSecondJobRead: false },
+  ])("does not reconcile when the exact delivery is retried and active after terminal preflight ($name)", async ({ lock, expectSecondJobRead }) => {
+    let currentState = "failed"
+    let currentLock: string | null = null
+    const job = makeJob("failed")
+    job.getState = vi.fn(async () => currentState)
+    const { queue, redis } = makeQueue({ job })
+    redis.get.mockImplementation(async () => currentLock)
+    mockReconcile.mockImplementationOnce(async (_pool, _identity, _workerTaskId, isCurrentTerminalDelivery) => {
+      expect(job.getState).toHaveBeenCalledOnce()
+      currentState = "active"
+      currentLock = lock
+      return isCurrentTerminalDelivery ? isCurrentTerminalDelivery() : false
+    })
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("deferred")
+
+    expect(mockReconcile).toHaveBeenCalledOnce()
+    expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.anything(), intent.workerTaskId, expect.any(Function))
+    expect(redis.get).toHaveBeenCalledTimes(2)
+    expect(queue.getJob).toHaveBeenCalledTimes(expectSecondJobRead ? 2 : 1)
+    expect(job.getState).toHaveBeenCalledTimes(expectSecondJobRead ? 2 : 1)
   })
 
   it("does not reconcile a retryable failed delivery", async () => {

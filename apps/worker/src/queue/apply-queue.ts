@@ -1,6 +1,6 @@
 import { Queue, Worker, type Job } from "bullmq";
 import type { Pool } from "pg";
-import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload } from "@jobcopilot/shared";
+import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { detectCaptcha } from "../cloak/captcha.js";
@@ -1160,14 +1160,32 @@ applyWorker.on("failed", async (job) => {
 
 async function reconcileTerminalSubmissionClaim(job: Job<ApplyTaskPayload> | undefined): Promise<void> {
   if (!job || typeof job.id !== "string" || !job.id || job.data.operation !== "submit") return;
-  if (!matchesApplyTaskSubmitPayload(job.data, job.data) || !/^[a-f0-9]{64}$/.test(job.data.constraintHash)) return;
-  const lockKey = applyQueue.toKey(`${job.id}:lock`);
-  if (await redisConnection.exists(lockKey)) return;
+  const submitPayload = job.data;
+  if (!matchesApplyTaskSubmitPayload(submitPayload, submitPayload) || !/^[a-f0-9]{64}$/.test(submitPayload.constraintHash)) return;
+  const workerTaskId = job.id;
   await reconcileClaimedSubmissionUncertain(getPool(), {
-    applicationTaskId: job.data.applicationTaskId, userId: job.data.userId, jobId: job.data.jobId,
-    sessionId: job.data.sessionId, fillTurnId: job.data.fillTurnId,
-    approvalId: job.data.receiptId, constraintHash: job.data.constraintHash,
-  }, job.id);
+    applicationTaskId: submitPayload.applicationTaskId, userId: submitPayload.userId, jobId: submitPayload.jobId,
+    sessionId: submitPayload.sessionId, fillTurnId: submitPayload.fillTurnId,
+    approvalId: submitPayload.receiptId, constraintHash: submitPayload.constraintHash,
+  }, workerTaskId, async () => {
+    const currentJob = await applyQueue.getJob(workerTaskId);
+    if (!currentJob || currentJob.id !== workerTaskId || !matchesExactSubmitPayload(currentJob.data, submitPayload)) return false;
+    const state = await currentJob.getState();
+    const terminal = state === "completed" || state === "failed" && currentJob.attemptsMade >= (currentJob.opts.attempts ?? 1);
+    if (!terminal) return false;
+    const lockKey = applyQueue.toKey(`${workerTaskId}:lock`);
+    return await redisConnection.exists(lockKey) === 0;
+  });
+}
+
+function matchesExactSubmitPayload(value: unknown, expected: ApplyTaskSubmitPayload): value is ApplyTaskSubmitPayload {
+  if (!matchesApplyTaskSubmitPayload(value, expected) || typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const actual = value as unknown as Record<string, unknown>;
+  const expectedRecord = expected as unknown as Record<string, unknown>;
+  const expectedKeys = Object.keys(expectedRecord);
+  const actualKeys = Object.keys(actual);
+  return expectedKeys.length === actualKeys.length && expectedKeys.every(key =>
+    Object.prototype.hasOwnProperty.call(actual, key) && actual[key] === expectedRecord[key]);
 }
 
 async function loadApprovedTurnScope(

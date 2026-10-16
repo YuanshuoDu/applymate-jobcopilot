@@ -131,5 +131,11 @@ export async function reconcileClaimedTerminalSubmit(
     sessionId: intent.sessionId, fillTurnId: intent.fillTurnId,
     approvalId: intent.receiptId, constraintHash: intent.constraintHash,
   }
-  return await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId) ? "reconciled" : "unchanged"
+  let fencedDelivery: SubmitDeliveryState | undefined
+  const reconciled = await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async () => {
+    fencedDelivery = await inspectSubmitDelivery(queue, intent, false)
+    return fencedDelivery === "terminal"
+  })
+  if (reconciled) return "reconciled"
+  return fencedDelivery && fencedDelivery !== "terminal" ? fencedDelivery : "unchanged"
 }

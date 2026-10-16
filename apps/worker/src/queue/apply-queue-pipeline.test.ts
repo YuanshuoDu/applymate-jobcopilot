@@ -31,6 +31,14 @@ const mocks = vi.hoisted(() => {
   return {
     workerHandler: undefined as undefined | ((job: { id: string; data: Record<string, unknown> }) => Promise<void>),
     workerEvents: {} as Record<string, unknown>,
+    currentSubmitJob: undefined as undefined | {
+      id: string;
+      data: Record<string, unknown>;
+      attemptsMade: number;
+      opts: { attempts: number };
+      getState: () => Promise<string>;
+    },
+    getJob: vi.fn(),
     fakePage,
     fakeContext,
     checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
@@ -91,7 +99,12 @@ const approvalMocks = vi.hoisted(() => ({
 const submitToolMocks = vi.hoisted(() => ({ create: vi.fn() }));
 
 vi.mock("bullmq", () => ({
-  Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), isPaused: vi.fn().mockResolvedValue(false), toKey: (suffix: string) => `bull:apply-tasks:${suffix}` })),
+  Queue: vi.fn().mockImplementation(() => ({
+    add: vi.fn(),
+    getJob: mocks.getJob,
+    isPaused: vi.fn().mockResolvedValue(false),
+    toKey: (suffix: string) => `bull:apply-tasks:${suffix}`,
+  })),
   Worker: vi.fn().mockImplementation((_name, handler) => {
     mocks.workerHandler = handler;
     return { on: vi.fn((event: string, callback: unknown) => { mocks.workerEvents[event] = callback; }), close: vi.fn(), isRunning: vi.fn() };
@@ -229,8 +242,15 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.outcomeClient.release.mockClear();
     mocks.workerHandler = undefined;
     mocks.workerEvents = {};
+    mocks.currentSubmitJob = undefined;
+    mocks.getJob.mockImplementation(async (id: string) => id === mocks.currentSubmitJob?.id ? mocks.currentSubmitJob : undefined);
     mocks.redisExists.mockReset().mockResolvedValue(0);
-    mocks.reconcileClaimedSubmissionUncertain.mockReset().mockResolvedValue(true);
+    mocks.reconcileClaimedSubmissionUncertain.mockReset().mockImplementation(async (
+      _pool: unknown,
+      _identity: unknown,
+      _workerTaskId: string,
+      isCurrentTerminalDelivery?: () => Promise<boolean>,
+    ) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery() : true);
     mocks.fakePage.goto.mockResolvedValue(undefined);
     mocks.fakePage.context.mockClear();
     mocks.fakePage.close.mockReset().mockResolvedValue(undefined);
@@ -554,23 +574,50 @@ describe("apply-queue Phase 5 pipeline", () => {
     const completed = mocks.workerEvents.completed as (job: unknown) => Promise<void>;
     const failed = mocks.workerEvents.failed as (job: unknown) => Promise<void>;
     const terminalJob = { id: "worker-task-pipeline-1", data: payload, attemptsMade: 2, opts: { attempts: 2 } };
+    mocks.currentSubmitJob = {
+      ...terminalJob,
+      getState: vi.fn().mockResolvedValue("completed"),
+    };
 
     await failed({ ...terminalJob, attemptsMade: 1 });
     expect(mocks.redisExists).not.toHaveBeenCalled();
     await completed(terminalJob);
 
     expect(mocks.redisExists).toHaveBeenCalledWith("bull:apply-tasks:worker-task-pipeline-1:lock");
+    expect(mocks.getJob).toHaveBeenCalledWith("worker-task-pipeline-1");
     expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
     expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledWith(
       expect.anything(), expect.objectContaining({ applicationTaskId: "application-task-1", jobId: "job-1" }),
       "worker-task-pipeline-1",
+      expect.any(Function),
     );
+    await expect(mocks.reconcileClaimedSubmissionUncertain.mock.results[0]?.value).resolves.toBe(true);
     expect(mocks.withCloakContext).not.toHaveBeenCalled();
     expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
 
     mocks.redisExists.mockResolvedValueOnce(1);
     await completed(terminalJob);
+    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledTimes(2);
+    await expect(mocks.reconcileClaimedSubmissionUncertain.mock.results[1]?.value).resolves.toBe(false);
+  });
+
+  it("does not recover an old terminal event after the same exact Queue job has been retried and claimed", async () => {
+    mocks.claimUnattendedSubmission.mockResolvedValueOnce("unavailable");
+    await expect(runApplyJob()).resolves.toBeUndefined();
+    const completed = mocks.workerEvents.completed as (job: unknown) => Promise<void>;
+    const terminalEvent = { id: "worker-task-pipeline-1", data: payload, attemptsMade: 2, opts: { attempts: 2 } };
+    mocks.currentSubmitJob = {
+      ...terminalEvent,
+      getState: vi.fn().mockResolvedValue("active"),
+    };
+    mocks.redisExists.mockResolvedValue(1);
+
+    await completed(terminalEvent);
+
+    expect(mocks.getJob).toHaveBeenCalledWith("worker-task-pipeline-1");
     expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
+    await expect(mocks.reconcileClaimedSubmissionUncertain.mock.results[0]?.value).resolves.toBe(false);
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
   });
 
   it("does not open a browser when a known ATS policy blocks unattended work", async () => {

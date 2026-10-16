@@ -19,6 +19,7 @@ const mockRecordSubmissionExecutionSettled = vi.hoisted(() => vi.fn().mockResolv
 const mockWorkerListeners = vi.hoisted(() => new Map<string, (job?: unknown) => Promise<void>>());
 const mockRedisExists = vi.hoisted(() => vi.fn().mockResolvedValue(0));
 const mockReconcileClaimedSubmissionUncertain = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const mockQueueGetJob = vi.hoisted(() => vi.fn());
 const expectedSubmissionIdentity = {
   applicationTaskId: "application-task-1",
   userId: "user-1",
@@ -107,6 +108,7 @@ vi.mock("bullmq", () => {
   });
   const mockQueueCtor = vi.fn().mockReturnValue({
     add: vi.fn().mockResolvedValue({ id: "test-job-1" }),
+    getJob: mockQueueGetJob,
     isPaused: vi.fn().mockResolvedValue(false),
     toKey: vi.fn((key: string) => `apply-tasks:${key}`),
   });
@@ -311,7 +313,16 @@ describe("apply-queue (unit — mocked)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRedisExists.mockResolvedValue(0);
-    mockReconcileClaimedSubmissionUncertain.mockResolvedValue(true);
+    mockQueueGetJob.mockImplementation(async (id: string) => {
+      if (id !== "bull-submit-1") return undefined;
+      return { ...terminalSubmitJob(), getState: vi.fn().mockResolvedValue("completed") };
+    });
+    mockReconcileClaimedSubmissionUncertain.mockImplementation(async (
+      _pool: unknown,
+      _identity: unknown,
+      _workerTaskId: string,
+      isCurrentTerminalDelivery?: () => Promise<boolean>,
+    ) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery() : true);
     mockIsUserActive.mockResolvedValue(true);
     mockClaimApplicationTask.mockReset().mockResolvedValue(true);
     mockMarkSubmissionRequestStarted.mockReset().mockImplementation(async () =>
@@ -386,7 +397,7 @@ describe("apply-queue (unit — mocked)", () => {
     );
   }, 30_000);
 
-  it("reconciles a completed exact submit delivery only after its Redis lock is absent", async () => {
+  it("reconciles only the current completed exact submit delivery after its Redis lock is absent", async () => {
     await import("./apply-queue.js");
     const completed = mockWorkerListeners.get("completed");
     expect(completed).toBeDefined();
@@ -394,15 +405,18 @@ describe("apply-queue (unit — mocked)", () => {
 
     await completed(terminalSubmitJob());
 
+    expect(mockQueueGetJob).toHaveBeenCalledWith("bull-submit-1");
     expect(mockRedisExists).toHaveBeenCalledWith("apply-tasks:bull-submit-1:lock");
     expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledWith(
       expect.anything(),
       { ...expectedSubmissionIdentity },
       "bull-submit-1",
+      expect.any(Function),
     );
+    await expect(mockReconcileClaimedSubmissionUncertain.mock.results[0]?.value).resolves.toBe(true);
   });
 
-  it("leaves retryable or live-locked failed deliveries unchanged", async () => {
+  it("leaves retryable failures and a stale terminal event for a newly active retry unchanged", async () => {
     await import("./apply-queue.js");
     const failed = mockWorkerListeners.get("failed");
     expect(failed).toBeDefined();
@@ -414,8 +428,50 @@ describe("apply-queue (unit — mocked)", () => {
 
     mockRedisExists.mockResolvedValue(1);
     await failed(terminalSubmitJob());
+    expect(mockQueueGetJob).toHaveBeenCalledWith("bull-submit-1");
     expect(mockRedisExists).toHaveBeenCalledWith("apply-tasks:bull-submit-1:lock");
-    expect(mockReconcileClaimedSubmissionUncertain).not.toHaveBeenCalled();
+    expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
+    await expect(mockReconcileClaimedSubmissionUncertain.mock.results[0]?.value).resolves.toBe(false);
+  });
+
+  it("ignores an old terminal event when the current exact job has been retried", async () => {
+    await import("./apply-queue.js");
+    const completed = mockWorkerListeners.get("completed");
+    expect(completed).toBeDefined();
+    if (!completed) throw new Error("completed listener was not registered");
+
+    mockQueueGetJob.mockResolvedValueOnce({
+      ...terminalSubmitJob(),
+      getState: vi.fn().mockResolvedValue("active"),
+    });
+    mockRedisExists.mockResolvedValueOnce(1);
+    await completed(terminalSubmitJob());
+
+    expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
+    await expect(mockReconcileClaimedSubmissionUncertain.mock.results[0]?.value).resolves.toBe(false);
+  });
+
+  it("ignores terminal events unless the current Queue job has the exact identity and payload", async () => {
+    await import("./apply-queue.js");
+    const completed = mockWorkerListeners.get("completed");
+    expect(completed).toBeDefined();
+    if (!completed) throw new Error("completed listener was not registered");
+
+    mockQueueGetJob.mockResolvedValueOnce({
+      ...terminalSubmitJob(),
+      id: "bull-other-submit",
+      getState: vi.fn().mockResolvedValue("completed"),
+    });
+    await completed(terminalSubmitJob());
+    await expect(mockReconcileClaimedSubmissionUncertain.mock.results[0]?.value).resolves.toBe(false);
+
+    mockQueueGetJob.mockResolvedValueOnce({
+      ...terminalSubmitJob(),
+      data: { ...terminalSubmitJob().data, applyUrl: "https://example.com/changed" },
+      getState: vi.fn().mockResolvedValue("completed"),
+    });
+    await completed(terminalSubmitJob());
+    await expect(mockReconcileClaimedSubmissionUncertain.mock.results[1]?.value).resolves.toBe(false);
   });
 
   it("ignores a malformed terminal submit identity", async () => {
