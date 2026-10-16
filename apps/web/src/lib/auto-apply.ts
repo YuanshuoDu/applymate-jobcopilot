@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
-import { matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
+import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
 import { enqueueApplyTask } from "@/lib/apply-queue-client";
 import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
@@ -142,7 +142,7 @@ export async function queueAutonomousApplication(input: {
   await assertJobPreflight(input)
   const approval = await db.agentApproval.findFirst({
     where: { id: input.approvalId, userId: input.userId, status: "approved", type: "submit_application" },
-    select: { id: true, payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true },
+    select: { id: true, payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true, materialHash: true, answersHash: true },
   });
   const payload = asRecord(approval?.payload);
   const taskSnapshot = await db.applicationTask.findFirst({
@@ -155,11 +155,14 @@ export async function queueAutonomousApplication(input: {
     resumeId: taskSnapshot?.resumeId ?? null,
     coverLetterId: taskSnapshot?.coverLetterId ?? null,
   };
+  const snapshotMaterialHash = await hashAgentReceiptValue("material", material);
+  const snapshotAnswersHash = await hashAgentReceiptValue("answers", taskSnapshot?.confirmedAnswers ?? null);
   if (!approval || !taskSnapshot?.sessionId || !taskSnapshot.fillTurnId ||
     (input.sessionId && input.sessionId !== taskSnapshot.sessionId) || approval.sessionId !== taskSnapshot.sessionId ||
     approval.turnId !== taskSnapshot.fillTurnId || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
     payload.resumeId !== material.resumeId || payload.coverLetterId !== material.coverLetterId ||
     ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
+    approval.materialHash !== snapshotMaterialHash || approval.answersHash !== snapshotAnswersHash ||
     !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
     !approval.scopeHash || !input.receiptNonce) {
     throw new AutoApplyError("A current, explicit approval is required before this application can be submitted.");

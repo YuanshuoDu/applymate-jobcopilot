@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Prisma } from "@prisma/client";
+import { hashAgentReceiptValue } from "@jobcopilot/shared";
 
 const mocks = vi.hoisted(() => ({
   approvalFindFirst: vi.fn(),
@@ -60,15 +61,25 @@ describe("auto-apply authorization", () => {
     applyUrl: "https://jobs.lever.co/acme/123",
   };
 
-  beforeEach(() => {
+  const materialSnapshot = () => ({
+    applicationTaskId: "application_1",
+    jobId: "job_1",
+    resumeId: "resume_1",
+    coverLetterId: null,
+  });
+  const makeApproval = async (confirmedAnswers: unknown = null, material = materialSnapshot()) => ({
+    id: "approval_1",
+    payload: material,
+    sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
+    expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
+    materialHash: await hashAgentReceiptValue("material", material),
+    answersHash: await hashAgentReceiptValue("answers", confirmedAnswers ?? null),
+  });
+
+  beforeEach(async () => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
-    mocks.approvalFindFirst.mockResolvedValue({
-      id: "approval_1",
-      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null },
-      sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
-      expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
-    });
+    mocks.approvalFindFirst.mockResolvedValue(await makeApproval());
     mocks.taskFindFirst.mockResolvedValue({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null });
     mocks.txTaskFindFirst.mockResolvedValue({ status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null, resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null });
     mocks.txTaskEventFindMany.mockResolvedValue([]);
@@ -136,6 +147,57 @@ describe("auto-apply authorization", () => {
     expect(mocks.transaction).toHaveBeenCalled();
   }, 15_000);
 
+  it("rejects an approval whose answer hash is stale before any submission state changes", async () => {
+    const approval = await makeApproval();
+    mocks.approvalFindFirst.mockResolvedValueOnce({ ...approval, answersHash: "a".repeat(64) });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects an approval whose material hash is stale before any submission state changes", async () => {
+    const approval = await makeApproval();
+    mocks.approvalFindFirst.mockResolvedValueOnce({ ...approval, materialHash: "b".repeat(64) });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("explicit approval");
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.txTaskUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.jobUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.txTaskEventCreate).not.toHaveBeenCalled();
+    expect(mocks.outboxCreate).not.toHaveBeenCalled();
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled();
+  });
+
+  it("queues an unchanged non-null material and answer snapshot bound to approval hashes", async () => {
+    const confirmedAnswers = { Location: "Dublin", authorizedToWork: true };
+    const material = materialSnapshot();
+    mocks.approvalFindFirst.mockResolvedValueOnce(await makeApproval(confirmedAnswers, material));
+    mocks.taskFindFirst.mockResolvedValueOnce({
+      sessionId: "session_1", fillTurnId: "turn_1", resumeId: material.resumeId,
+      coverLetterId: material.coverLetterId, confirmedAnswers,
+    });
+    mocks.txTaskFindFirst.mockResolvedValueOnce({
+      status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null,
+      resumeId: material.resumeId, coverLetterId: material.coverLetterId, confirmedAnswers, question: null,
+    });
+    const { queueAutonomousApplication } = await import("./auto-apply");
+
+    await expect(queueAutonomousApplication(input)).resolves.toMatchObject({ taskId: expect.stringMatching(/^apply-submit-/) });
+    expect(mocks.txTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        resumeId: material.resumeId,
+        coverLetterId: material.coverLetterId,
+        confirmedAnswers: { equals: confirmedAnswers },
+      }),
+    }));
+    expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1);
+  });
+
   it("resolves duplicate requests to the same committed submit intent and job ID", async () => {
     const { queueAutonomousApplication } = await import("./auto-apply");
     const first = await queueAutonomousApplication(input);
@@ -156,7 +218,7 @@ describe("auto-apply authorization", () => {
     ["resume", { resumeId: "resume_2" }],
     ["cover letter", { coverLetterId: "cover_2" }],
     ["confirmed answers", { confirmedAnswers: { Location: "Cork" } }],
-  ] as const)("rejects when approved %s change before the submit transaction", async (_field, changed) => {
+  ] as const)("rejects when transactionally re-read approved %s drift", async (_field, changed) => {
     mocks.txTaskFindFirst.mockResolvedValueOnce({
       status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null,
       resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null, question: null, ...changed,
@@ -324,12 +386,7 @@ describe("auto-apply authorization", () => {
   });
 
   it("rejects a stale task whose resume does not belong to this job or the current default", async () => {
-    mocks.approvalFindFirst.mockResolvedValueOnce({
-      id: "approval_1",
-      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
-      sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
-      expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
-    });
+    mocks.approvalFindFirst.mockResolvedValueOnce(await makeApproval());
     mocks.taskFindFirst
       .mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: null, confirmedAnswers: null })
       .mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: null });
@@ -346,12 +403,7 @@ describe("auto-apply authorization", () => {
       .mockResolvedValueOnce({ sessionId: "session_1", fillTurnId: "turn_1", resumeId: "resume_1", coverLetterId: "cover_other", confirmedAnswers: null })
       .mockResolvedValueOnce({ resumeId: "resume_1", coverLetterId: "cover_other" });
     mocks.txTaskFindFirst.mockResolvedValueOnce({ status: "waiting_for_authorization", checkpoint: "form_filled", workerTaskId: null, resumeId: "resume_1", coverLetterId: "cover_other", question: null });
-    mocks.approvalFindFirst.mockResolvedValueOnce({
-      id: "approval_1",
-      payload: { applicationTaskId: "application_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: "cover_other" },
-      sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1", jobId: "job_1", revision: 0,
-      expiresAt: new Date(Date.now() + 60_000), scopeHash: "s".repeat(64),
-    });
+    mocks.approvalFindFirst.mockResolvedValueOnce(await makeApproval(null, { ...materialSnapshot(), coverLetterId: "cover_other" }));
     mocks.coverLetterFindFirst.mockResolvedValueOnce(null);
     const { queueAutonomousApplication } = await import("./auto-apply");
 
