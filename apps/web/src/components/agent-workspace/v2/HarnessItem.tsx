@@ -75,7 +75,7 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
   }
   if (item.type === 'unknown') return <Fallback label={t('agent.unknownItem')} />
   const summary = projectFinalSummary(item.type, item.phase, item.status, item.content)
-  const summaryLabel = lang === 'zh' ? '摘要' : 'Summary'
+  const summaryLabel = lang === 'zh' ? 'Agent 提供的摘要（供参考，未经独立核验）' : 'Agent-reported summary (advisory; not independently verified)'
   return <div style={{ display: 'grid', gap: 8 }}>
     {summary && <section aria-label={summaryLabel} data-agent-final-summary="true">
       <strong>{summaryLabel}</strong>

@@ -12,6 +12,18 @@ export interface QuestionHydrationPump {
   current(): Promise<void> | null
 }
 
+export interface FinalItemHydrationPumpOptions {
+  sessionId: string
+  signal?: AbortSignal
+  hydrate: (itemId: string) => Promise<void>
+}
+
+export interface FinalItemHydrationPump {
+  request(value: unknown): void
+  pump(): void
+  current(): Promise<void> | null
+}
+
 /** Queues strict live question stubs behind one targeted canonical snapshot request. */
 export function createQuestionHydrationPump(options: QuestionHydrationPumpOptions): QuestionHydrationPump {
   let current: Promise<void> | null = null
@@ -53,8 +65,64 @@ export function createQuestionHydrationPump(options: QuestionHydrationPumpOption
   }
 }
 
+/** Hydrates one canonical final item for each owned, same-session completion event. */
+export function createFinalItemHydrationPump(options: FinalItemHydrationPumpOptions): FinalItemHydrationPump {
+  let current: Promise<void> | null = null
+  let scheduled = false
+  const pending = new Set<string>()
+  const hydrating = new Set<string>()
+  const hydrated = new Set<string>()
+
+  const pump = (): void => {
+    if (scheduled || current || pending.size === 0 || options.signal?.aborted) return
+    scheduled = true
+    queueMicrotask(() => {
+      scheduled = false
+      if (current || pending.size === 0 || options.signal?.aborted) return
+      const batch = [...pending]
+      pending.clear()
+      batch.forEach(itemId => hydrating.add(itemId))
+      let failed = false
+      current = (async () => {
+        await Promise.all(batch.map(async itemId => {
+          try {
+            await options.hydrate(itemId)
+            hydrated.add(itemId)
+          } catch {
+            failed = true
+            pending.add(itemId)
+          } finally {
+            hydrating.delete(itemId)
+          }
+        }))
+        current = null
+        if (!failed) pump()
+      })()
+    })
+  }
+
+  return {
+    request(value: unknown): void {
+      const itemId = finalItemIdFromCompletion(value, options.sessionId)
+      if (!itemId || hydrated.has(itemId) || hydrating.has(itemId)) return
+      pending.add(itemId)
+      pump()
+    },
+    pump,
+    current: () => current,
+  }
+}
+
 export function filterQuestionHydrationValues(values: readonly unknown[], sessionId: string): unknown[] {
   return values.filter(value => belongsToSession(value, sessionId))
+}
+
+function finalItemIdFromCompletion(value: unknown, sessionId: string): string | null {
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.type !== 'turn.completed' || event.actor !== 'orchestrator' || event.sessionId !== sessionId ||
+    !safeId(event.id) || !safeId(event.turnId) || !safeId(event.itemId) || !isRecord(event.payload)) return null
+  const finalItemId = event.payload.finalItemId
+  return safeId(finalItemId) && finalItemId === event.itemId ? finalItemId : null
 }
 
 function questionStubKey(value: unknown, sessionId: string): string | null {

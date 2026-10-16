@@ -32,7 +32,7 @@ describe('HarnessItem renderers', () => {
     })} /></I18nProvider>)
 
     expect(live).toBe(replay)
-    expect(live).toContain('<section aria-label="Summary" data-agent-final-summary="true"><strong>Summary</strong><p>Verified two facts. Contact [REDACTED_EMAIL] [REDACTED_PHONE]; Bearer [REDACTED]; password=[REDACTED]; **Keep this literal.**</p></section>')
+    expect(live).toContain('<section aria-label="Agent-reported summary (advisory; not independently verified)" data-agent-final-summary="true"><strong>Agent-reported summary (advisory; not independently verified)</strong><p>Verified two facts. Contact [REDACTED_EMAIL] [REDACTED_PHONE]; Bearer [REDACTED]; password=[REDACTED]; **Keep this literal.**</p></section>')
     expect(live).toContain('Assistant response stays exact.')
     expect(live).not.toContain('PRIVATE_GOAL')
     expect(live).not.toContain('alex@example.test')
