@@ -4,7 +4,7 @@ import {
   ensureSubmitQueueJob,
   inspectSubmitDelivery,
   matchesSubmitJobPayload,
-  reconcilePublishedTerminalSubmit,
+  reconcileClaimedTerminalSubmit,
   resetExpiredSubmitAuthorization,
 } from "./application-submit-outbox-terminal-recovery.js"
 import type { SubmitOutboxIntent, SubmitOutboxQueue } from "./application-submit-outbox-terminal-recovery.js"
@@ -49,12 +49,12 @@ function makeQueue(options: { job?: ReturnType<typeof makeJob>; lock?: string | 
 
 beforeEach(() => mockReconcile.mockReset().mockResolvedValue(true))
 
-describe("published submit terminal recovery", () => {
+describe("claimed submit terminal recovery", () => {
   it("reconciles only a matching completed delivery after its exact lock is absent", async () => {
     const job = makeJob("completed")
     const { queue, redis } = makeQueue({ job })
 
-    await expect(reconcilePublishedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
 
     expect(redis.get).toHaveBeenCalledWith(`bull:apply:${intent.workerTaskId}:lock`)
     expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId)
@@ -64,7 +64,7 @@ describe("published submit terminal recovery", () => {
     const job = makeJob("failed", { attemptsMade: 1, attempts: 3 })
     const { queue } = makeQueue({ job })
 
-    await expect(reconcilePublishedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("deferred")
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("deferred")
     expect(mockReconcile).not.toHaveBeenCalled()
   })
 
@@ -76,7 +76,7 @@ describe("published submit terminal recovery", () => {
   ])("leaves a published claim alone with $name", async ({ options }) => {
     const { queue } = makeQueue(options)
 
-    await expect(reconcilePublishedTerminalSubmit({} as Pool, queue, intent)).resolves.not.toBe("reconciled")
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.not.toBe("reconciled")
     expect(mockReconcile).not.toHaveBeenCalled()
   })
 

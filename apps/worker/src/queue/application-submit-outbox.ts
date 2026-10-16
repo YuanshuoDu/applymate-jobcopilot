@@ -3,7 +3,7 @@ import type { Pool, PoolClient } from "pg"
 import { matchesApplyTaskSubmitPayload, type ApplyTaskSubmitIdentity, type ApplyTaskSubmitPayload } from "@jobcopilot/shared"
 import { ApplicationSubmitFenceError, withExactAttemptFence, type ApplicationSubmitIdentity } from "./application-submit-fence.js"
 import {
-  ensureSubmitQueueJob, inspectSubmitDelivery, reconcilePublishedTerminalSubmit,
+  ensureSubmitQueueJob, inspectSubmitDelivery, reconcileClaimedTerminalSubmit,
   resetExpiredSubmitAuthorization, validateCurrentSubmit, type SubmitOutboxIntent as Intent, type SubmitOutboxQueue as SubmitQueue,
 } from "./application-submit-outbox-terminal-recovery.js"
 
@@ -97,12 +97,12 @@ async function markRetry(pool: Pool, row: OutboxRow, reason: string): Promise<vo
     WHERE "id" = $1 AND "aggregateId" = $2 AND "topic" = $3 AND "publishedAt" IS NULL
       AND ("lastError" IS NULL OR "lastError" NOT LIKE 'terminal:%')`, [row.id, row.aggregateId, APPLICATION_SUBMIT_OUTBOX_TOPIC, reason]).then(() => undefined))
 }
-async function terminalizePublished(pool: Pool, queue: SubmitQueue, id: string, intent: Intent, reason: string): Promise<ProcessOutcome> {
+async function terminalizeClaimed(pool: Pool, queue: SubmitQueue, id: string, intent: Intent, reason: string, published: boolean): Promise<ProcessOutcome> {
   return transaction(pool, async client => {
-    const row = await lockOutbox(client, id, true)
+    const row = await lockOutbox(client, id, published)
     const current = row && parseIntent(row.payload)
     if (!row || !current || current.workerTaskId !== intent.workerTaskId || current.receiptId !== intent.receiptId) return "skipped"
-    return await markTerminal(client, row, reason, queue, intent.workerTaskId, true) ? "terminalized" : "skipped"
+    return await markTerminal(client, row, reason, queue, intent.workerTaskId, published) ? "terminalized" : "skipped"
   })
 }
 async function processRow(pool: Pool, queue: SubmitQueue, id: string, published = false): Promise<ProcessOutcome> {
@@ -139,7 +139,7 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
           }
           const reason = row.id !== dispatchIds(currentIntent).outboxId || row.aggregateId !== currentIntent.sessionId ||
             row.idempotencyKey !== dispatchIds(currentIntent).idempotencyKey ? "outbox_identity_mismatch"
-            : await validateCurrentSubmit(client, currentIntent, published)
+            : await validateCurrentSubmit(client, currentIntent)
           if (reason === "claimed_delivery_recovery") {
             const delivery = await inspectSubmitDelivery(queue, currentIntent, false)
             if (delivery === "terminal") { claimedRecovery = currentIntent; return "skipped" as const }
@@ -191,9 +191,9 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
       return fenced.value
     })
     if (claimedRecovery) {
-      const recovery = await reconcilePublishedTerminalSubmit(pool, queue, claimedRecovery)
-      if (recovery === "reconciled") return terminalizePublished(pool, queue, id, claimedRecovery, "terminal_submit_reconciled")
-      if (recovery === "mismatch") return terminalizePublished(pool, queue, id, claimedRecovery, "queue_job_identity_mismatch")
+      const recovery = await reconcileClaimedTerminalSubmit(pool, queue, claimedRecovery)
+      if (recovery === "reconciled") return terminalizeClaimed(pool, queue, id, claimedRecovery, "terminal_submit_reconciled", published)
+      if (recovery === "mismatch") return terminalizeClaimed(pool, queue, id, claimedRecovery, "queue_job_identity_mismatch", published)
       return "skipped"
     }
     return outcome

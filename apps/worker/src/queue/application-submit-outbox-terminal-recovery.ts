@@ -16,7 +16,7 @@ export type SubmitOutboxQueue = Pick<Queue<ApplyTaskPayload>, "add" | "getJob" |
 export type SubmitDeliveryState = "absent" | "terminal" | "deferred" | "missing" | "mismatch"
 
 export async function validateCurrentSubmit(
-  client: PoolClient, intent: SubmitOutboxIntent, published: boolean,
+  client: PoolClient, intent: SubmitOutboxIntent,
 ): Promise<string | null> {
   const task = (await client.query<{ status: string; checkpoint: string | null; workerTaskId: string | null }>(`SELECT "status", "checkpoint", "workerTaskId"
     FROM "application_tasks" WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3
@@ -25,7 +25,7 @@ export async function validateCurrentSubmit(
   if (!task) return "application_task_scope_mismatch"
   if (task.workerTaskId !== intent.workerTaskId) return "worker_task_id_mismatch"
   const claimed = task.status === "filling" && ["browser_active", "submission_request_started"].includes(task.checkpoint ?? "")
-  if (claimed && published) {
+  if (claimed) {
     const job = (await client.query<{ status: string; workflowState: string }>(`SELECT "status", "workflowState" FROM "Job"
       WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [intent.jobId, intent.userId])).rows[0]
     return job?.status === "saved" && job.workflowState === "submitting" ? "claimed_delivery_recovery" : "application_job_state_mismatch"
@@ -121,7 +121,7 @@ export async function resetExpiredSubmitAuthorization(client: PoolClient, intent
   [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.receiptId, intent.workerTaskId])
 }
 
-export async function reconcilePublishedTerminalSubmit(
+export async function reconcileClaimedTerminalSubmit(
   pool: Pool, queue: SubmitOutboxQueue, intent: SubmitOutboxIntent,
 ): Promise<SubmitDeliveryState | "reconciled" | "unchanged"> {
   const delivery = await inspectSubmitDelivery(queue, intent, false)

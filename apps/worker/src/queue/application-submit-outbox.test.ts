@@ -118,7 +118,7 @@ function makeFixture(options: FixtureOptions = {}) {
     client: Promise.resolve({ get: vi.fn(async () => options.lock ?? null) }),
   }
   const pool = { connect: vi.fn(async () => client) } as unknown as Pool
-  return { state, pool, client, queue, jobs, makeJob }
+  return { state, pool, client, queue, jobs, makeJob, setJobState: (value: string) => { jobState = value } }
 }
 function result<Row>(rows: unknown[], rowCount = rows.length) { return { rows: rows as Row[], rowCount } }
 
@@ -150,6 +150,43 @@ describe("application submit outbox publisher", () => {
     expect(fixture.state.outbox.publishedAt).toBeInstanceOf(Date)
   })
 
+  it("recovers an ack-failed exact claim after terminal delivery without requeueing it", async () => {
+    const fixture = makeFixture({ failAckOnce: true })
+    await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).rejects.toThrow("injected acknowledgement failure")
+    expect(fixture.state.outbox.publishedAt).toBeNull()
+    expect(fixture.jobs.has(workerTaskId)).toBe(true)
+
+    fixture.state.task.status = "filling"
+    fixture.state.task.checkpoint = "browser_active"
+    fixture.state.job.workflowState = "submitting"
+    fixture.setJobState("completed")
+    mockReconcileClaimedSubmissionUncertain.mockImplementationOnce(async () => {
+      fixture.state.task.status = "waiting_for_user"
+      fixture.state.task.checkpoint = "submission_uncertain"
+      return true
+    })
+
+    await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
+
+    expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({
+        applicationTaskId: identity.applicationTaskId,
+        userId: identity.userId,
+        jobId: identity.jobId,
+        sessionId: identity.sessionId,
+        fillTurnId: identity.fillTurnId,
+        approvalId: identity.receiptId,
+        constraintHash: identity.constraintHash,
+      }), workerTaskId,
+    )
+    expect(fixture.state.task).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain" })
+    expect(fixture.state.job.workflowState).toBe("submitting")
+    expect(fixture.queue.add).toHaveBeenCalledTimes(1)
+    expect(fixture.jobs.get(workerTaskId)?.retry).not.toHaveBeenCalled()
+    expect(fixture.state.outbox.publishedAt).toBeNull()
+    expect(fixture.state.outbox.lastError).toBe("terminal:terminal_submit_reconciled")
+  })
+
   it("terminalizes an intent after its fill Turn is superseded without publishing it", async () => {
     const fixture = makeFixture({ turnId: "successor-turn" })
     await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
@@ -163,7 +200,7 @@ describe("application submit outbox publisher", () => {
     await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
     expect(fixture.queue.add).not.toHaveBeenCalled()
     expect(fixture.state.outbox.publishedAt).toBeNull()
-    expect(fixture.state.outbox.lastError).toBe("terminal:attempt_already_claimed_or_terminal")
+    expect(fixture.state.outbox.lastError).toBe("terminal:claimed_delivery_missing")
   })
 
   it("re-adds an evicted published intent with the same stable ID while its exact attempt is still pre-claim", async () => {
