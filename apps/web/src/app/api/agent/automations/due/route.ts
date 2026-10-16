@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
-import { buildScheduledAutomationSnapshot, ScheduledAutomationSnapshotValidationError } from "@/lib/agent/scheduled-automation-snapshot"
+import { buildScheduledAutomationSnapshot, getAutomationRunMode, ScheduledAutomationSnapshotValidationError } from "@/lib/agent/scheduled-automation-snapshot"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
 import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
@@ -93,10 +93,10 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
   const activeTurn = automation.sessionId
     ? await db.agentTurn.findFirst({
       where: { sessionId: automation.sessionId, userId: automation.userId, source: "automation", status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } },
-      orderBy: { createdAt: "desc" }, select: { id: true },
+      orderBy: { createdAt: "desc" }, select: { id: true, input: true },
     })
     : null
-  if (!activeTurn) buildScheduledAutomationSnapshot(snapshot)
+  if (!activeTurn || getAutomationRunMode(activeTurn.input) !== "scheduled") buildScheduledAutomationSnapshot(snapshot)
 
   const claimed = await db.agentAutomation.updateMany({
     where: runnableAutomationWhere(automation, now),
@@ -132,6 +132,7 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
       sessionId: session.id,
       userId: automation.userId,
       name: automation.name,
+      automationRunMode: "scheduled",
       scheduledAutomationSnapshot: snapshot,
     })
   } catch (error: unknown) {

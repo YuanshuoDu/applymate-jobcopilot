@@ -2,9 +2,26 @@ import { describe, expect, it } from "vitest"
 
 import {
   buildScheduledAutomationSnapshot,
+  parseAutomationRunMode,
+  parseScheduledAutomationSnapshot,
   ScheduledAutomationSnapshotValidationError,
   type ScheduledAutomationSnapshotInput,
 } from "./scheduled-automation-snapshot"
+import { JobsSearchInputSchema } from "./discovery-tool-types"
+
+type SearchTargetField = "targetRoles" | "targetLocations"
+
+function schemaRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function schemaTargetBound(field: SearchTargetField, bound: "minItems" | "maxItems" | "maxLength"): number {
+  const target = schemaRecord(schemaRecord(JobsSearchInputSchema.properties)?.[field])
+  const value = bound === "maxLength" ? schemaRecord(target?.items)?.maxLength : target?.[bound]
+  const resolved = value === undefined && bound === "minItems" ? 0 : value
+  if (typeof resolved !== "number" || !Number.isSafeInteger(resolved)) throw new Error("Missing search target schema bound")
+  return resolved
+}
 
 function validInput(): ScheduledAutomationSnapshotInput {
   return {
@@ -16,6 +33,49 @@ function validInput(): ScheduledAutomationSnapshotInput {
     autoApply: true,
   }
 }
+
+function validSnapshot() {
+  return {
+    schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+    ...validInput(),
+  }
+}
+
+describe("parseAutomationRunMode", () => {
+  it.each([["scheduled"], ["manual"]] as const)("accepts the %s marker", mode => {
+    expect(parseAutomationRunMode(mode)).toBe(mode)
+  })
+
+  it.each([undefined, null, "unknown", "Scheduled", 1])("rejects a missing or unknown marker (%s)", value => {
+    expect(parseAutomationRunMode(value)).toBeNull()
+  })
+})
+
+describe("parseScheduledAutomationSnapshot", () => {
+  it("accepts only the complete versioned snapshot envelope", () => {
+    expect(parseScheduledAutomationSnapshot(validSnapshot())).toEqual({
+      schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+      ...validInput(),
+    })
+  })
+
+  it.each([
+    ["wrong schema version", { ...validSnapshot(), schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v2" }],
+    ["missing field", (() => { const value = validSnapshot(); delete (value as Record<string, unknown>).dailyCap; return value })()],
+    ["extra field", { ...validSnapshot(), automationId: "mutable-row-id" }],
+    ["out-of-range saved value", { ...validSnapshot(), dailyCap: 0 }],
+    ["too few targetRoles", {
+      ...validSnapshot(), targetRoles: Array(schemaTargetBound("targetRoles", "minItems") - 1).fill("Role"),
+    }],
+    ["out-of-range targetLocations", {
+      ...validSnapshot(), targetLocations: Array(schemaTargetBound("targetLocations", "maxItems") + 1).fill("Location"),
+    }],
+    ["overlong targetRoles entry", { ...validSnapshot(), targetRoles: ["x".repeat(schemaTargetBound("targetRoles", "maxLength") + 1)] }],
+    ["overlong targetLocations entry", { ...validSnapshot(), targetLocations: ["x".repeat(schemaTargetBound("targetLocations", "maxLength") + 1)] }],
+  ])("rejects a persisted snapshot with %s", (_label, value) => {
+    expect(() => parseScheduledAutomationSnapshot(value)).toThrow(ScheduledAutomationSnapshotValidationError)
+  })
+})
 
 describe("buildScheduledAutomationSnapshot", () => {
   it("builds the versioned snapshot while preserving values and array order", () => {
@@ -74,28 +134,31 @@ describe("buildScheduledAutomationSnapshot", () => {
       .toMatchObject({ targetRoles: ["Engineer", "Data Scientist"], targetLocations: [] })
   })
 
-  it("accepts eight roles and locations with trimmed 160-character entries", () => {
-    const maxLengthEntry = "x".repeat(160)
-    const paddedEntry = " " + maxLengthEntry + " "
+  it("accepts schema-max roles and locations with trimmed max-length entries", () => {
+    const roleMaxLengthEntry = "x".repeat(schemaTargetBound("targetRoles", "maxLength"))
+    const locationMaxLengthEntry = "x".repeat(schemaTargetBound("targetLocations", "maxLength"))
+    const paddedRoleEntry = " " + roleMaxLengthEntry + " "
     const snapshot = buildScheduledAutomationSnapshot({
       ...validInput(),
-      targetRoles: Array(8).fill(paddedEntry),
-      targetLocations: Array(8).fill(maxLengthEntry),
+      targetRoles: Array(schemaTargetBound("targetRoles", "maxItems")).fill(paddedRoleEntry),
+      targetLocations: Array(schemaTargetBound("targetLocations", "maxItems")).fill(locationMaxLengthEntry),
     })
 
-    expect(snapshot.targetRoles).toEqual(Array(8).fill(maxLengthEntry))
-    expect(snapshot.targetLocations).toEqual(Array(8).fill(maxLengthEntry))
+    expect(snapshot.targetRoles).toEqual(Array(schemaTargetBound("targetRoles", "maxItems")).fill(roleMaxLengthEntry))
+    expect(snapshot.targetLocations).toEqual(Array(schemaTargetBound("targetLocations", "maxItems")).fill(locationMaxLengthEntry))
   })
 
-  it.each(["targetRoles", "targetLocations"] as const)("rejects more than eight %s entries", field => {
-    expect(() => buildScheduledAutomationSnapshot({ ...validInput(), [field]: Array(9).fill("value") }))
+  it.each(["targetRoles", "targetLocations"] as const)("rejects %s entries above the schema maximum", field => {
+    expect(() => buildScheduledAutomationSnapshot({
+      ...validInput(), [field]: Array(schemaTargetBound(field, "maxItems") + 1).fill("value"),
+    }))
       .toThrow(ScheduledAutomationSnapshotValidationError)
   })
 
-  it.each(["targetRoles", "targetLocations"] as const)("rejects %s entries longer than 160 characters", field => {
+  it.each(["targetRoles", "targetLocations"] as const)("rejects %s entries above the schema maxLength", field => {
     expect(() => buildScheduledAutomationSnapshot({
       ...validInput(),
-      [field]: ["x".repeat(161)],
+      [field]: ["x".repeat(schemaTargetBound(field, "maxLength") + 1)],
     })).toThrow(ScheduledAutomationSnapshotValidationError)
   })
 

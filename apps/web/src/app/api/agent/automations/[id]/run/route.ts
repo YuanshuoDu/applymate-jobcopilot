@@ -149,6 +149,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       sessionId: session.id,
       userId: auth.userId,
       name: automation.name,
+      automationRunMode: "manual",
     })
   } catch (error: unknown) {
     if (error instanceof AutomationTurnOccupiedError) return err(error.message, 409)

@@ -299,6 +299,12 @@ describe("production child runtime", () => {
   it("completes the same-Turn provider discovery to Analyst read and owner shortlist path", async () => {
     const ownerUserId = "user-1"
     const providerUrl = "https://jobs.example/1"
+    const scheduledAutomationSnapshot = {
+      schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+      targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70,
+      dailyCap: 10, requireApproval: true, autoApply: false,
+    }
+    let turnInput: Record<string, unknown> = { goal: "Run scheduled automation", automationRunMode: "scheduled", scheduledAutomationSnapshot }
     type PersistedJobRow = {
       readonly id: string; readonly userId: string; readonly company: string; readonly role: string; readonly location: string | null
       readonly status: string; readonly score: number | null; readonly url: string; readonly source: string | null
@@ -340,7 +346,10 @@ describe("production child runtime", () => {
         $queryRaw: async <R>(query: { sql: string }): Promise<R> => {
           const sql = query.sql
           if (sql.includes('FROM "agent_sessions"')) return [{ id: "session-1", status: "running" }] as R
-          if (sql.includes('FROM "agent_turns"')) return [{ id: "turn-1", rootTaskId: "root-1", status: "in_progress" }] as R
+          if (sql.includes('FROM "agent_turns"')) return [{
+            id: "turn-1", sessionId: "session-1", userId: ownerUserId, rootTaskId: "root-1", status: "in_progress",
+            source: "automation", input: turnInput,
+          }] as R
           if (sql.includes('FROM "agent_steps"')) return [{ id: "scout-step" }] as R
           if (sql.includes("clock_timestamp()")) return [{ status: "running", interruptRequestedAt: null, closedAt: null,
             leaseOwner: "worker-1", attemptCount: 1, live: true }] as R
@@ -358,7 +367,10 @@ describe("production child runtime", () => {
         },
       }),
       agentSession: { findFirst: vi.fn(async () => ({ id: "session-1" })) },
-      agentTurn: { findFirst: vi.fn(async () => ({ id: "turn-1", rootTaskId: "root-1" })) },
+      agentTurn: { findFirst: vi.fn(async () => ({
+        id: "turn-1", sessionId: "session-1", userId: ownerUserId, rootTaskId: "root-1",
+        source: "automation", input: turnInput,
+      })) },
       agentStep: { findFirst: vi.fn(async () => ({ id: "scout-step", attempt: 1 })) },
       subAgentTask: { findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => where.parentTaskId === null
         ? { id: "root-1" }
@@ -471,6 +483,17 @@ describe("production child runtime", () => {
     expect(jobDelegate.create.mock.calls[0]?.[0].data).toMatchObject({
       id: jobId, userId: ownerUserId, url: providerUrl, source: "greenhouse", status: "saved",
     })
+
+    turnInput = { goal: "Run automation manually", automationRunMode: "manual" }
+    const firstDiscoveryRequest = discoveryRequests[0]
+    if (!firstDiscoveryRequest) throw new Error("Worker did not send the scheduled discovery request")
+    const manualOutput = await discoveryClient.discover({
+      ...firstDiscoveryRequest, targetRoles: ["Manual engineer"], targetLocations: [],
+    }, new AbortController().signal)
+    expect(manualOutput.jobs).toHaveLength(1)
+    expect(providerDiscover).toHaveBeenLastCalledWith(expect.objectContaining({
+      targetRoles: ["Manual engineer"], targetLocations: [],
+    }))
 
     const scoutCandidate = (scoutResult.candidates as Array<Record<string, unknown>>)[0]
     const analystContext = materializeTaskGraphDependencyContext({}, taskScope(), ["scout"], [{

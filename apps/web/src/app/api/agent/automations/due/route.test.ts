@@ -155,6 +155,7 @@ describe("agent automation due scheduler API", () => {
       data: expect.objectContaining({
         input: {
           goal: "Run automation: Weekday Berlin SWE Scout",
+          automationRunMode: "scheduled",
           scheduledAutomationSnapshot: {
             schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
             targetRoles: ["SWE"],
@@ -380,7 +381,7 @@ describe("agent automation due scheduler API", () => {
       minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
     }])
     mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1" })
-    mocks.turnFindFirst.mockResolvedValue({ id: "turn_active" })
+    mocks.turnFindFirst.mockResolvedValue({ id: "turn_active", input: { automationRunMode: "scheduled" } })
     const { POST } = await import("./route")
 
     const res = await POST(postRequest() as never)
@@ -397,7 +398,7 @@ describe("agent automation due scheduler API", () => {
         status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] },
       },
       orderBy: { createdAt: "desc" },
-      select: { id: true },
+      select: { id: true, input: true },
     })
     expect(mocks.turnFindFirst).toHaveBeenCalledTimes(2)
     expect(mocks.turnCreate).not.toHaveBeenCalled()
@@ -420,7 +421,7 @@ describe("agent automation due scheduler API", () => {
         return null
       }
       events.push("initial-turn-lookup")
-      return activeTurnId ? { id: activeTurnId } : null
+      return activeTurnId ? { id: activeTurnId, input: { automationRunMode: "scheduled" } } : null
     })
     mocks.automationUpdateMany.mockImplementationOnce(async () => {
       events.push("schedule-claim")
@@ -451,6 +452,7 @@ describe("agent automation due scheduler API", () => {
       data: expect.objectContaining({
         input: {
           goal: "Run automation: Weekday Berlin SWE Scout",
+          automationRunMode: "scheduled",
           scheduledAutomationSnapshot: {
             schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
             targetRoles: ["SWE"],
@@ -474,7 +476,8 @@ describe("agent automation due scheduler API", () => {
       minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
     }])
     mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1" })
-    mocks.turnFindFirst.mockResolvedValueOnce({ id: "turn_stale" }).mockResolvedValueOnce({ id: "turn_winner" })
+    mocks.turnFindFirst.mockResolvedValueOnce({ id: "turn_stale", input: { automationRunMode: "scheduled" } })
+      .mockResolvedValueOnce({ id: "turn_winner", input: { automationRunMode: "scheduled" } })
     const { POST } = await import("./route")
 
     const res = await POST(postRequest() as never)
@@ -488,6 +491,31 @@ describe("agent automation due scheduler API", () => {
     expect(mocks.turnUpdate).not.toHaveBeenCalled()
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_winner", executionId: "execution_1" })
     expect(mocks.enqueueAgentRun).not.toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn_stale" }))
+  })
+
+  it("does not adopt or silently suppress a manual Run Now Turn during scheduled dispatch", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1", status: "paused" })
+    mocks.turnFindFirst.mockResolvedValue({ id: "turn_manual", input: { automationRunMode: "manual" } })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.turnFindFirst).toHaveBeenCalledTimes(2)
+    expect(mocks.turnFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+      select: { id: true, input: true },
+    }))
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.automationUpdate).toHaveBeenCalledWith({
+      where: { id: "automation_1", userId: "user_1" }, data: { nextRunAt: expect.any(Date) },
+    })
   })
 
   it.each([
