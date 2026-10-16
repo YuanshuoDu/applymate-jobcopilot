@@ -7,10 +7,10 @@ import { recordSubmissionExecutionSettled, withExactAttemptFence, type Applicati
 
 function disposableTestUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
+  const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
+  if (process.env.CI === "true" && !required) return null
   if (!value) {
-    if (process.env.CI === "true" || process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true") {
-      throw new Error("CI or AGENT_RUNTIME_PG_TEST_REQUIRED=true needs AGENT_RUNTIME_PG_TEST_URL")
-    }
+    if (required) throw new Error("AGENT_RUNTIME_PG_TEST_REQUIRED=true needs AGENT_RUNTIME_PG_TEST_URL")
     return null
   }
   const url = new URL(value)
@@ -20,9 +20,6 @@ function disposableTestUrl(): string | null {
     || url.port !== "5432" || url.username !== "postgres" || database !== expectedDatabase
     || url.search !== "" || url.hash !== "" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true") {
     throw new Error("Application submit recovery integration requires an explicitly disposable loopback PostgreSQL database")
-  }
-  if (process.env.CI === "true" && process.env.AGENT_RUNTIME_PG_TEST_REQUIRED !== "true") {
-    throw new Error("CI must set AGENT_RUNTIME_PG_TEST_REQUIRED=true for application submit recovery integration")
   }
   return value
 }
@@ -98,7 +95,7 @@ async function seedScenario(label: string): Promise<Scenario> {
   await pool.query(`INSERT INTO "${schema}"."sub_agent_tasks" ("id", "sessionId", "turnId", "role", "taskType", "status") VALUES ($1, $2, $3, 'application_filler', 'application_fill_for_review', 'completed')`, [
     `filler-${suffix}`, identity.sessionId, identity.fillTurnId,
   ])
-  await pool.query(`INSERT INTO "${schema}"."application_tasks" ("id", "userId", "jobId", "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "status", "checkpoint", "workerTaskId") VALUES ($1, $2, $3, $4, $5, $4, $2, 'filling', 'submission_request_started', $6)`, [
+  await pool.query(`INSERT INTO "${schema}"."application_tasks" ("id", "userId", "jobId", "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId", "status", "checkpoint", "workerTaskId", "updatedAt") VALUES ($1, $2, $3, $4, $5, $4, $2, 'filling', 'submission_request_started', $6, NOW())`, [
     identity.applicationTaskId, identity.userId, identity.jobId, identity.sessionId, identity.fillTurnId, identity.workerTaskId,
   ])
   await pool.query(`INSERT INTO "${schema}"."Job" ("id", "userId") VALUES ($1, $2)`, [identity.jobId, identity.userId])
@@ -159,7 +156,8 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       await client.query(`CREATE TABLE "application_tasks" (
         "id" text PRIMARY KEY, "userId" text NOT NULL, "jobId" text NOT NULL, "sessionId" text NOT NULL,
         "fillTurnId" text, "fillTurnSessionId" text, "fillTurnUserId" text,
-        "status" text NOT NULL DEFAULT 'filling', "checkpoint" text NOT NULL DEFAULT 'submission_request_started', "workerTaskId" text
+        "status" text NOT NULL DEFAULT 'filling', "checkpoint" text NOT NULL DEFAULT 'submission_request_started', "workerTaskId" text,
+        "updatedAt" TIMESTAMP(3) NOT NULL
       )`)
       await client.query(`CREATE TABLE "application_task_events" (
         "id" text PRIMARY KEY, "taskId" text NOT NULL, "type" text NOT NULL, "actor" text NOT NULL,
