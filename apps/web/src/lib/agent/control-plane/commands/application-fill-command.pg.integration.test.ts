@@ -21,6 +21,12 @@ vi.mock("../../../../../../worker/src/cloak/pool.js", async (importOriginal) => 
 })
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const LOCK_SERIALIZATION_TEST_TIMEOUT_MS = 20_000
+const LOCK_HANDSHAKE_TIMEOUT_MS = 5_000
+const CLEANUP_WAIT_TIMEOUT_MS = 2_000
+const BINDING_LOCK_TIMEOUT_MS = 3_000
+const BINDING_TRANSACTION_TIMEOUT_MS = 4_000
+const BINDING_ATTEMPT_WAIT_TIMEOUT_MS = 4_000
 
 function disposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
@@ -44,9 +50,10 @@ function disposableUrl(): string | null {
 const databaseUrl = disposableUrl()
 const describePg = databaseUrl ? describe : describe.skip
 const schema = `application_fill_${randomUUID().replaceAll("-", "")}`
+const applicationName = `applymate-fill-${schema.slice(-12)}`
 const ids = { user: `fill-user-${randomUUID()}`, session: `fill-session-${randomUUID()}`, task: `fill-task-${randomUUID()}`, job: `fill-job-${randomUUID()}`, resume: `fill-resume-${randomUUID()}` }
 const fixture = readFileSync(fileURLToPath(new URL("./application-fill-command.pg.fixture.sql", import.meta.url)), "utf8")
-type WorkerPgClient = { query(sql: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>; release(): void }
+type WorkerPgClient = { query(sql: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>; release(error?: Error | boolean): void }
 type WorkerPgPool = { connect(): Promise<WorkerPgClient>; end(): Promise<void> }
 const workerRequire = createRequire(new URL("../../../../../../worker/package.json", import.meta.url))
 const WorkerPool = (workerRequire("pg") as { Pool: new (options: { connectionString: string; max: number }) => WorkerPgPool }).Pool
@@ -55,6 +62,58 @@ let prisma: PrismaClient | undefined
 let workerPool: WorkerPgPool | undefined
 let workerSchemaPool: Parameters<typeof completeApplicationFillForReview>[0] | undefined
 let schemaCreated = false
+
+async function waitForSignal(signal: Promise<void>, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      signal,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), LOCK_HANDSHAKE_TIMEOUT_MS)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function waitUntilSettled(promise: Promise<unknown> | undefined, timeoutMs = CLEANUP_WAIT_TIMEOUT_MS): Promise<boolean> {
+  if (!promise) return true
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function rollbackWithin(client: WorkerPgClient): Promise<boolean> {
+  let rolledBack = false
+  const rollback = client.query("ROLLBACK").then(() => { rolledBack = true }, () => undefined)
+  return await waitUntilSettled(rollback) && rolledBack
+}
+
+async function disconnectPrismaWithin(client: PrismaClient): Promise<boolean> {
+  let disconnected = false
+  const disconnect = client.$disconnect().then(() => { disconnected = true }, () => undefined)
+  return await waitUntilSettled(disconnect) && disconnected
+}
+
+function createLockBoundedPrisma(): PrismaClient {
+  const url = new URL(databaseUrl!)
+  url.searchParams.set("schema", schema)
+  url.searchParams.set("options", `-c lock_timeout=${BINDING_LOCK_TIMEOUT_MS}ms`)
+  url.searchParams.set("application_name", applicationName)
+  return new PrismaClient({
+    datasources: { db: { url: url.toString() } },
+    transactionOptions: { maxWait: 1_000, timeout: BINDING_TRANSACTION_TIMEOUT_MS },
+  })
+}
 
 type FillScenario = { userId: string; sessionId: string; taskId: string; jobId: string; resumeId: string }
 
@@ -77,8 +136,13 @@ async function seedFillScenario(): Promise<FillScenario> {
 
 async function connectWorkerClient(): Promise<WorkerPgClient> {
   const client = await workerPool!.connect()
-  await client.query(`SET search_path TO "${schema}"`)
-  return client
+  try {
+    await client.query(`SET search_path TO "${schema}"`)
+    return client
+  } catch (error) {
+    client.release(true)
+    throw error
+  }
 }
 
 async function writeLegacyRaceOutcome(client: Parameters<typeof persistLegacyApplicationTaskOutcome>[0], value: FillScenario): Promise<void> {
@@ -120,8 +184,11 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
 
     const scopedUrl = new URL(databaseUrl!)
     scopedUrl.searchParams.set("schema", schema)
+    scopedUrl.searchParams.set("application_name", applicationName)
     prisma = new PrismaClient({ datasources: { db: { url: scopedUrl.toString() } } })
-    workerPool = new WorkerPool({ connectionString: databaseUrl!, max: 4 })
+    const workerUrl = new URL(databaseUrl!)
+    workerUrl.searchParams.set("application_name", applicationName)
+    workerPool = new WorkerPool({ connectionString: workerUrl.toString(), max: 4 })
     workerSchemaPool = {
       connect: connectWorkerClient,
     } as unknown as Parameters<typeof completeApplicationFillForReview>[0]
@@ -196,18 +263,25 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
 
     const workerFirst = await seedFillScenario()
     await prisma!.$executeRaw`UPDATE "Job" SET status = 'saved', "workflowState" = 'queued' WHERE id = ${workerFirst.jobId}`
-    const workerClient = await connectWorkerClient()
-    const observer = await connectWorkerClient()
+    await prisma!.$executeRaw`UPDATE application_tasks SET status = 'filling', "checkpoint" = 'browser_active' WHERE id = ${workerFirst.taskId}`
+    let workerClient: WorkerPgClient | undefined
+    let observerClient: WorkerPgClient | undefined
+    let bindingPrisma: PrismaClient | undefined
     let releaseWriter!: () => void
     let writerLocked!: () => void
     let outcomePromise: Promise<unknown> | undefined
+    let bindingAttemptPromise: Promise<unknown> | undefined
     const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve })
     const writerHasLock = new Promise<void>((resolve) => { writerLocked = resolve })
     try {
-      await workerClient.query("BEGIN")
-      await workerClient.query("SELECT set_config($1, $2, true)", ["app.user_id", workerFirst.userId])
+      workerClient = await connectWorkerClient()
+      observerClient = await connectWorkerClient()
+      const worker = workerClient
+      const observer = observerClient
+      await worker.query("BEGIN")
+      await worker.query("SELECT set_config($1, $2, true)", ["app.user_id", workerFirst.userId])
       const outcome = (async () => {
-        const result = await persistLegacyApplicationTaskOutcome(workerClient as unknown as Parameters<typeof persistLegacyApplicationTaskOutcome>[0], {
+        const result = await persistLegacyApplicationTaskOutcome(worker as unknown as Parameters<typeof persistLegacyApplicationTaskOutcome>[0], {
           applicationTaskId: workerFirst.taskId, userId: workerFirst.userId, jobId: workerFirst.jobId,
         }, async (client) => {
           writerLocked()
@@ -215,20 +289,24 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
           await writeLegacyRaceOutcome(client, workerFirst)
           return "legacy-committed"
         })
-        await workerClient.query("COMMIT")
+        await worker.query("COMMIT")
         return result
       })()
       outcomePromise = outcome
-      await writerHasLock
+      await waitForSignal(writerHasLock, "legacy outcome writer lock")
 
-      const bindingAttempt = startApplicationFillForReview(prisma!, {
+      const bindingDb = createLockBoundedPrisma()
+      bindingPrisma = bindingDb
+      const bindingAttempt = startApplicationFillForReview(bindingDb, {
         sessionId: workerFirst.sessionId, userId: workerFirst.userId, applicationTaskId: workerFirst.taskId,
         clientMessageId: `race-worker-first-${randomUUID()}`,
       })
+      bindingAttemptPromise = bindingAttempt
       let blocked = false
       for (let attempt = 0; attempt < 200; attempt++) {
         const state = await observer.query(`SELECT pid FROM pg_stat_activity
-          WHERE wait_event_type = 'Lock' AND query ILIKE '%agent_sessions%' AND query ILIKE '%FOR UPDATE%'`)
+          WHERE wait_event_type = 'Lock' AND query ILIKE '%agent_sessions%' AND query ILIKE '%FOR UPDATE%'
+            AND application_name = $1`, [applicationName])
         if (state.rows.length > 0) {
           blocked = true
           break
@@ -241,10 +319,33 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       await expect(bindingAttempt).rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
     } finally {
       releaseWriter()
-      await outcomePromise?.catch(() => undefined)
-      await workerClient.query("ROLLBACK").catch(() => undefined)
-      workerClient.release()
-      observer.release()
+      const outcomeSettled = await waitUntilSettled(outcomePromise)
+      let workerClientReleased = false
+      if (workerClient) {
+        if (!outcomeSettled) {
+          workerClient.release(true)
+          workerClientReleased = true
+        } else if (!(await rollbackWithin(workerClient))) {
+          workerClient.release(true)
+          workerClientReleased = true
+        }
+      }
+      const bindingSettled = await waitUntilSettled(bindingAttemptPromise, BINDING_ATTEMPT_WAIT_TIMEOUT_MS)
+      let bindingCleanupFailure: string | undefined
+      if (bindingPrisma) {
+        if (!bindingSettled) {
+          const disconnected = await disconnectPrismaWithin(bindingPrisma)
+          const settledAfterDisconnect = await waitUntilSettled(bindingAttemptPromise)
+          bindingCleanupFailure = !disconnected || !settledAfterDisconnect
+            ? "Application-fill binding attempt exceeded its bounded wait and did not settle after dedicated client disconnect"
+            : "Application-fill binding attempt exceeded its bounded wait; its dedicated Prisma client was disconnected during cleanup"
+        } else if (!(await disconnectPrismaWithin(bindingPrisma))) {
+          bindingCleanupFailure = "Application-fill binding Prisma client did not disconnect during cleanup"
+        }
+      }
+      if (workerClient && !workerClientReleased) workerClient.release()
+      observerClient?.release()
+      if (bindingCleanupFailure) throw new Error(bindingCleanupFailure)
     }
     await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${workerFirst.jobId}`)
       .resolves.toEqual([{ count: 1 }])
@@ -252,7 +353,7 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       .resolves.toEqual({ fillTurnId: null, status: "failed", checkpoint: "worker_failed" })
     await expect(prisma!.$queryRaw<Array<{ status: string; workflowState: string }>>`SELECT status, "workflowState" FROM "Job" WHERE id = ${workerFirst.jobId}`)
       .resolves.toEqual([{ status: "saved", workflowState: "ready_to_apply" }])
-  })
+  }, LOCK_SERIALIZATION_TEST_TIMEOUT_MS)
 
   it("suppresses a legacy fill outcome after cancellation and serializes cancellation against an in-flight outcome", async () => {
     const cancelledFirst = await seedFillScenario()
@@ -282,15 +383,22 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
     const outcomeFirst = await seedFillScenario()
     await prisma!.$executeRaw`UPDATE "Job" SET status = 'saved', "workflowState" = 'queued' WHERE id = ${outcomeFirst.jobId}`
     await prisma!.$executeRaw`UPDATE application_tasks SET status = 'filling', "checkpoint" = 'browser_active' WHERE id = ${outcomeFirst.taskId}`
-    const worker = await connectWorkerClient()
-    const canceller = await connectWorkerClient()
-    const cancellationObserver = await connectWorkerClient()
+    let workerClient: WorkerPgClient | undefined
+    let cancellerClient: WorkerPgClient | undefined
+    let cancellationObserverClient: WorkerPgClient | undefined
     let releaseWriter!: () => void
     let writerLocked!: () => void
     let outcomePromise: Promise<unknown> | undefined
+    let cancellationPromise: Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }> | undefined
     const writerGate = new Promise<void>((resolve) => { releaseWriter = resolve })
     const writerHasLock = new Promise<void>((resolve) => { writerLocked = resolve })
     try {
+      workerClient = await connectWorkerClient()
+      cancellerClient = await connectWorkerClient()
+      cancellationObserverClient = await connectWorkerClient()
+      const worker = workerClient
+      const canceller = cancellerClient
+      const cancellationObserver = cancellationObserverClient
       await worker.query("BEGIN")
       await worker.query("SELECT set_config($1, $2, true)", ["app.user_id", outcomeFirst.userId])
       const outcome = (async () => {
@@ -306,9 +414,9 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
         return result
       })()
       outcomePromise = outcome
-      await writerHasLock
+      await waitForSignal(writerHasLock, "legacy outcome writer lock")
 
-      const cancellation = canceller.query(`UPDATE application_tasks SET status = 'cancelled', "checkpoint" = 'cancelled_by_user', "completedAt" = NOW()
+      cancellationPromise = canceller.query(`UPDATE application_tasks SET status = 'cancelled', "checkpoint" = 'cancelled_by_user', "completedAt" = NOW()
         WHERE id = $1 AND "userId" = $2 AND "sessionId" = $3 AND "fillTurnId" IS NULL
           AND "fillTurnSessionId" IS NULL AND "fillTurnUserId" IS NULL
           AND status NOT IN ('submitted', 'skipped', 'cancelled')
@@ -317,27 +425,39 @@ describePg("application fill command PostgreSQL binding and idempotency", () => 
       let blocked = false
       for (let attempt = 0; attempt < 200; attempt++) {
         const state = await cancellationObserver.query(`SELECT pid FROM pg_stat_activity
-          WHERE wait_event_type = 'Lock' AND query ILIKE '%UPDATE application_tasks%'`)
+          WHERE wait_event_type = 'Lock' AND query ILIKE '%UPDATE application_tasks%'
+            AND application_name = $1`, [applicationName])
         if (state.rows.length > 0) { blocked = true; break }
         await new Promise((resolve) => setTimeout(resolve, 10))
       }
       expect(blocked).toBe(true)
       releaseWriter()
       await expect(outcome).resolves.toEqual({ status: "persisted", value: "legacy-committed" })
-      await expect(cancellation).resolves.toMatchObject({ rowCount: 1 })
+      await expect(cancellationPromise).resolves.toMatchObject({ rowCount: 1 })
     } finally {
       releaseWriter()
-      await outcomePromise?.catch(() => undefined)
-      await worker.query("ROLLBACK").catch(() => undefined)
-      worker.release()
-      canceller.release()
-      cancellationObserver.release()
+      const outcomeSettled = await waitUntilSettled(outcomePromise)
+      let workerClientReleased = false
+      if (workerClient) {
+        if (!outcomeSettled) {
+          workerClient.release(true)
+          workerClientReleased = true
+        } else if (!(await rollbackWithin(workerClient))) {
+          workerClient.release(true)
+          workerClientReleased = true
+        }
+      }
+      const cancellationSettled = await waitUntilSettled(cancellationPromise)
+      if (!cancellationSettled) cancellerClient?.release(true)
+      if (workerClient && !workerClientReleased) workerClient.release()
+      if (cancellationSettled) cancellerClient?.release()
+      cancellationObserverClient?.release()
     }
     await expect(prisma!.$queryRaw<Array<{ count: number }>>`SELECT COUNT(*)::int AS count FROM apply_results WHERE job_id = ${outcomeFirst.jobId}`)
       .resolves.toEqual([{ count: 1 }])
     await expect(prisma!.applicationTask.findUnique({ where: { id: outcomeFirst.taskId }, select: { status: true, checkpoint: true } }))
       .resolves.toEqual({ status: "cancelled", checkpoint: "cancelled_by_user" })
-  })
+  }, LOCK_SERIALIZATION_TEST_TIMEOUT_MS)
 
   it("rejects a Turn id whose stored session/user composite does not match the task", async () => {
     const original = await prisma!.$queryRaw<Array<{ fillTurnId: string; fillTurnSessionId: string; fillTurnUserId: string }>>`
