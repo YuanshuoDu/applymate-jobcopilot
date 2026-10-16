@@ -204,6 +204,7 @@ function durableCompositionPool(input: {
     id: string
     userId: string
     sessionId: string
+    source: string
     rootTaskId: string | null
     status: string
     leaseOwnerId: string | null
@@ -213,7 +214,7 @@ function durableCompositionPool(input: {
     createdAt: Date
   }
   const turn: DurableCompositionTurn = {
-    id: String(input.root.turnId), userId: input.root.userId, sessionId: input.root.sessionId, rootTaskId: input.root.rootTaskId,
+    id: String(input.root.turnId), userId: input.root.userId, sessionId: input.root.sessionId, source: "user", rootTaskId: input.root.rootTaskId,
     status: "in_progress", leaseOwnerId: "worker_root", leaseVersion: 1,
     leaseExpiresAt: new Date(input.now.getTime() + 60_000), leaseStartedAt: input.now, createdAt: input.now,
   }
@@ -260,7 +261,7 @@ function durableCompositionPool(input: {
         const admitted = owned && (admission ? state.session.status === "running" && !paused : !["aborted", "archived"].includes(state.session.status))
         return response<T>(admitted ? [{ id: state.session.id }] : [], admitted ? 1 : 0)
       }
-      if (sql.includes('SELECT "id", "sessionId", "userId", "status", "leaseOwnerId"') && sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE")) {
+      if (sql.includes('SELECT "id", "sessionId", "userId", "source", "status", "leaseOwnerId"') && sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE")) {
         const queryNow = params[5] instanceof Date ? params[5] : new Date(String(params[5]))
         const owned = String(params[0]) === state.turn.id && String(params[1]) === state.turn.sessionId && String(params[2]) === state.turn.userId &&
           String(params[3]) === state.turn.leaseOwnerId && Number(params[4]) === state.turn.leaseVersion && state.turn.status === "in_progress" &&
