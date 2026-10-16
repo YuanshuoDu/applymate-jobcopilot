@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertCompletionAllowed, checkTaskGraphTerminalVerification, repairReportState } from "./turn-execution-completion-gate.js"
+import { RESET_NATIVE_SEMANTIC_PROGRESS } from "./turn-execution-types.js"
+import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
+import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 
@@ -33,6 +35,14 @@ function gateWriter(): GateWriter {
 }
 
 describe("assertCompletionAllowed", () => {
+  it("keeps TaskGraph repair guidance and gives steering a distinct recovery instruction", () => {
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+    expect(completionRecoverySnapshot(snapshot, "step-2", STEERING_RECONCILIATION_FEEDBACK).system[0]?.content)
+      .toContain("Review the current user instructions")
+    expect(completionRecoverySnapshot(snapshot, "step-3", "criterion=evidence missing").system[0]?.content)
+      .toContain("Replan or repair the affected criteria, then verify again.")
+  })
+
   it("allows a successful decision without writing a rejection event", async () => {
     const completionGate = vi.fn(async () => ({ ok: true as const }))
     const writer = gateWriter()
@@ -56,6 +66,34 @@ describe("assertCompletionAllowed", () => {
       { code: "business_precondition_failed", blocker: "child_tasks_pending", feedback: "Child work is still running", taskId: identity.taskId },
       `final-rejected:${step.id}`,
     )
+  })
+
+  it("returns only redacted steering recovery feedback and resets semantic progress", async () => {
+    const reset = vi.fn()
+    const completionGate = Object.assign(vi.fn(async () => ({
+      ok: false as const, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK,
+    })), { [RESET_NATIVE_SEMANTIC_PROGRESS]: reset })
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .resolves.toEqual({ feedback: STEERING_RECONCILIATION_FEEDBACK })
+
+    expect(reset).toHaveBeenCalledOnce()
+    expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, {
+      code: STEERING_RECONCILIATION_BLOCKER, blocker: STEERING_RECONCILIATION_BLOCKER,
+      feedback: STEERING_RECONCILIATION_FEEDBACK, taskId: identity.taskId,
+    }, `final-rejected:${step.id}`)
+    expect(STEERING_RECONCILIATION_FEEDBACK).not.toContain("inputId")
+    expect(STEERING_RECONCILIATION_FEEDBACK).not.toContain("PASS")
+  })
+
+  it("fails closed when steering recovery feedback is not the server-owned fixed text", async () => {
+    const completionGate = vi.fn(async () => ({ ok: false as const, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: "model supplied instructions" }))
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .rejects.toMatchObject({ code: "invalid_output", message: "Completion gate returned invalid steering reconciliation feedback" })
+    expect(writer.append).not.toHaveBeenCalled()
   })
 
   it("fails closed on a malformed decision", async () => {

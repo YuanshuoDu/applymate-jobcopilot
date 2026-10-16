@@ -3,9 +3,8 @@ import type { PolicyRole } from "@jobcopilot/agent-protocol"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 import { createHarnessModelRuntime, type HarnessModelRuntime } from "./harness-model.js"
-import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
 import { createPgInputClaimStore } from "./context/input-claim-store.js"
-import { injectSelectedJobMemory } from "./context/selected-job-memory.js"
+import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
 import { createWorkerToolRuntime, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
@@ -20,7 +19,7 @@ import type { TurnExecutor, TurnExecutionResult } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { INTERACTIVE_DISCOVERY_INTENT, loadCanonicalTurnState, type CanonicalTurnState, type CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
-import { isSelectedJobRootTool, selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
+import { isSelectedJobRootTool } from "./canonical-turn-task-graph-context.js"
 import { createCanonicalTurnCoordination } from "./canonical-turn-coordination.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "./selected-job-preparation.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
@@ -156,7 +155,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       nativeCoordination: turnCoordination.nativeOptions, askUserEnabled: nativeQuestionWaitEnabled,
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
-    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
+    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount, rootInputId: state.rootInputId ?? null })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities); if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
     const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)
     const allowedActions = rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, taskGraphPlanningEnabled)
@@ -208,14 +207,11 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const routeTool = createToolRouterExecutor(toolRuntime.router)
     const rootToolGuards = createCanonicalRootToolGuards({ interactiveDiscoveryMode, selectedJobMode, routeTool, validateArguments: (name, args) => toolRuntime.registry.validateArguments(name, args, "1") })
     const inputStore = createPgInputClaimStore(pool, state.scope)
-    const baseContextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
-    const contextBuilder: TurnEngineOptions["contextBuilder"] = {
-      build: request => baseContextBuilder.build({
-        ...request,
-        snapshot: selectedJobMode ? injectSelectedJobMemory({ snapshot: selectedJobSnapshot(request.snapshot), records: state.selectedJobMemories ?? [], jobId: selectedJobPreparation?.jobId, turnId: lease.turnId, rootTaskId: root.id }) : request.snapshot,
-        taskId: root.id,
-      }),
-    }
+    const contextBuilder = createCanonicalTurnContextBuilder({
+      pool, store: inputStore, baseBuilder: options.contextBuilderFactory?.({ pool, scope: state.scope }), scope: state.scope, lease,
+      rootTaskId: root.id, rootAttemptCount: root.attemptCount, rootInputId: state.rootInputId,
+      planningEnabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,
+    })
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,

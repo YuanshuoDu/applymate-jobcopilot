@@ -3,9 +3,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const lifecycle = vi.hoisted(() => ({ prepareGraphTransition: vi.fn(), persistGraphTransition: vi.fn() }))
 const graph = vi.hoisted(() => ({ loadTaskGraph: vi.fn() }))
 const nativeAppend = vi.hoisted(() => ({ appendNativeGraphCommand: vi.fn() }))
+const steering = vi.hoisted(() => ({ assertNoUnresolvedSteering: vi.fn() }))
 vi.mock("./task-graph-pg-lifecycle.js", () => lifecycle)
 vi.mock("./task-graph-pg-state.js", () => graph)
 vi.mock("./task-graph-native-pg.js", () => nativeAppend)
+vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./steering-reconciliation-ledger.js")>(),
+  assertNoUnresolvedSteering: steering.assertNoUnresolvedSteering,
+}))
 
 import type { PoolClient } from "pg"
 import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "./task-graph-command-port.js"
@@ -50,7 +55,7 @@ const loaded = {
   state: { revision: 4, nodes: [{ key: "source-node", taskId: "source", status: "queued" }] }, tasks: new Map(),
 } as unknown as LoadedGraph
 const afterCancellation = { ...loaded, state: { ...loaded.state!, revision: 5 } } as LoadedGraph
-const parent = {} as GraphParent
+const parent = { allowedActions: [] } as unknown as GraphParent
 const receipt: TaskGraphNativeCommandReceipt = {
   status: "accepted", replay: false, operationId: "new-operation", requestFingerprint: "b".repeat(64), graphRevision: 6,
   nodeKey: "replacement-node", dispatchDisposition: "pending",
@@ -76,6 +81,7 @@ function client(
 
 beforeEach(() => {
   vi.clearAllMocks()
+  steering.assertNoUnresolvedSteering.mockResolvedValue(undefined)
   lifecycle.prepareGraphTransition.mockResolvedValue({ scope, itemId: "task-graph:root", taskId: "source", expectedRevision: 4,
     snapshot: loaded.snapshot, event: {}, state: loaded.state, duplicate: false })
   lifecycle.persistGraphTransition.mockResolvedValue({ ...loaded.state, revision: 5 })
@@ -102,6 +108,19 @@ describe("native pending replacement transaction helper", () => {
     const appended = nativeAppend.appendNativeGraphCommand.mock.calls[0]?.[2]
     expect(appended.request).toMatchObject({ mode: "replace_unstarted", expectedRevision: 4, goal: input.request.goal,
       sourceTaskId: "source", constraints: ["read only"], successCriteria: ["Preserve criteria"], context: { note: "new attempt" } })
+  })
+
+  it("blocks raw replace_unstarted while steering is unresolved before source reads or cancellation", async () => {
+    const db = client()
+    steering.assertNoUnresolvedSteering.mockRejectedValueOnce(new Error("steering_reconciliation_pending"))
+    const planningParent = { allowedActions: ["agent.plan"] } as unknown as GraphParent
+    await expect(replaceUnstartedNativeFollowup(db, input, normalizeNativeCommand(input), planningParent, loaded))
+      .rejects.toThrow("steering_reconciliation_pending")
+    expect(steering.assertNoUnresolvedSteering).toHaveBeenCalledWith(db, scope)
+    expect(db.query).not.toHaveBeenCalled()
+    expect(lifecycle.prepareGraphTransition).not.toHaveBeenCalled()
+    expect(lifecycle.persistGraphTransition).not.toHaveBeenCalled()
+    expect(nativeAppend.appendNativeGraphCommand).not.toHaveBeenCalled()
   })
 
   it("rejects a typed planner node before querying or mutating its source", async () => {

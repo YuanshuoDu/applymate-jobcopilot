@@ -16,10 +16,10 @@ describe("interactive discovery contract", () => {
   })
 
   it("restricts the root tools and preserves accepted items as partial on terminal failure", () => {
-    expect(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user"].every(interactiveDiscoveryRootToolAllowed)).toBe(true)
+    expect(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"].every(interactiveDiscoveryRootToolAllowed)).toBe(true)
     expect(interactiveDiscoveryRootToolAllowed("jobs.search")).toBe(false)
-    const tools = [{ name: "agent.plan" }, { name: "jobs.search" }, { name: "selected.read" }]
-    expect(rootToolNames(rootToolSurface(tools, false, true, tool => tool.name === "selected.read"))).toEqual(["agent.plan"])
+    const tools = [{ name: "agent.plan" }, { name: "agent.reconcile" }, { name: "jobs.search" }, { name: "selected.read" }]
+    expect(rootToolNames(rootToolSurface(tools, false, true, tool => tool.name === "selected.read"))).toEqual(["agent.plan", "agent.reconcile"])
     expect(rootToolNames(rootToolSurface(tools, true, false, tool => tool.name === "selected.read"))).toEqual(["selected.read"])
     expect(terminalInteractiveDiscoveryShortlist("failed", completed)).toEqual({
       ...completed, status: "partial", failures: ["discovery_runtime_failed"],

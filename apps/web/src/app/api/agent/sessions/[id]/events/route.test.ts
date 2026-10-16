@@ -189,6 +189,44 @@ describe("agent session events API", () => {
     await reader?.cancel()
   })
 
+  it("filters private reconciliation receipts before V2 SSE delivery while advancing its cursor", async () => {
+    const controller = new AbortController()
+    const privateMarker = "private-reconciliation-payload-marker"
+    mocks.featureEnabled.mockResolvedValueOnce(true)
+    mocks.findSession.mockResolvedValueOnce({ id: "session_1" })
+    mocks.findAgentEvents.mockResolvedValueOnce([
+      {
+        id: "private-reconciliation-event", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "root_1",
+        sequence: BigInt(2), type: "agent.plan.reconciliation", actor: "system", correlationId: "turn_1",
+        causationId: null, idempotencyKey: "private-receipt-key",
+        payload: { inputIds: [privateMarker], receiptVersion: privateMarker, rationale: privateMarker },
+      },
+      {
+        id: "event_3", sessionId: "session_1", turnId: "turn_1", itemId: "item_1", taskId: null,
+        sequence: BigInt(3), type: "item.completed", actor: "orchestrator", correlationId: "turn_1",
+        causationId: null, idempotencyKey: null, payload: { text: "visible event" },
+      },
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(getRequest("?afterSequence=1", { signal: controller.signal }) as never, params)
+    const reader = response.body?.getReader()
+    const text = new TextDecoder().decode((await reader?.read())?.value)
+
+    expect(text).toContain("event: item.completed\nid: 3\n")
+    expect(text).toContain("visible event")
+    expect(text).not.toContain("agent.plan.reconciliation")
+    expect(text).not.toContain("private-reconciliation-event")
+    expect(text).not.toContain("private-receipt-key")
+    expect(text).not.toContain(privateMarker)
+    expect(mocks.findAgentEvents).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", sequence: { gt: BigInt(1) } },
+    }))
+
+    controller.abort()
+    await reader?.cancel()
+  })
+
   it("rejects an invalid durable cursor before querying the session", async () => {
     mocks.featureEnabled.mockResolvedValueOnce(true)
     const { GET } = await import("./route")

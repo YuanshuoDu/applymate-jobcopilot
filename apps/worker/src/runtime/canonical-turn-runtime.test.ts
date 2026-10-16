@@ -6,11 +6,12 @@ vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type pg from "pg"
-import type { StepContext } from "./context/step-context-builder.js"
+import { StepContextBuilder, type ContextOwnerFence, type StepContext } from "./context/step-context-builder.js"
+import type { InputClaimStore, InputClaimTransaction, StoredAgentInput } from "./context/input-claim-store.js"
 import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -24,6 +25,10 @@ import { nativeCoordinationReceipts } from "./canonical-turn-native-graph-contex
 import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
 import type { NativeVerificationEnsureResult, NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
+import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
+import type { SteeringReconciliationOperation } from "./subagents/steering-reconciliation-contract.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -79,6 +84,47 @@ function model(script: () => ModelStreamEvent[]): ModelAdapter {
 
 function rootStore() {
   return { ensure: vi.fn(async () => ({ id: "root-1", attemptCount: 1 } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
+}
+
+/** Gives planning-enabled runtime fakes a valid, empty reconciliation ledger instead of bypassing its SQL guard. */
+function emptyPlanningLedgerPool(base?: Pick<pg.Pool, "connect"> & Partial<Pick<pg.Pool, "query">>): pg.Pool {
+  const connect = vi.fn(async () => {
+    const downstream = base ? await base.connect() : undefined
+    let scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", attempt: 1 }
+    const query = vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+      if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: values[0] }], rowCount: 1 }
+      if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: values[0] }], rowCount: 1 }
+      if (sql.includes('SELECT "id" FROM "agent_turns"') && !sql.includes('SELECT turn."input"')) return { rows: [{ id: values[0] }], rowCount: 1 }
+      if (sql.includes('SELECT task.*, session."userId" AS "userId" FROM "sub_agent_tasks"')) {
+        scope = { userId: String(values[4]), sessionId: String(values[1]), turnId: String(values[2]), rootTaskId: String(values[3]), attempt: Number(values[6]) }
+        return { rows: [{ id: values[0], userId: values[4], status: "running", allowedActions: ["agent.plan"] }], rowCount: 1 }
+      }
+      if (sql.includes("WITH wall_clock AS MATERIALIZED")) return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
+      if (sql.includes('SELECT turn."input" FROM "agent_turns"')) return { rows: [{ input: {} }], rowCount: 1 }
+      if (sql.includes('FROM "agent_inputs" WHERE "sessionId"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT item."revision" FROM "agent_items" AS item')) return { rows: [], rowCount: 0 }
+      if (sql.includes('event."type" = $3 ORDER BY event."sequence" ASC')) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT "id" FROM "agent_steps"')) return { rows: [{ id: values[0] }], rowCount: 1 }
+      if (sql.includes('SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"')) {
+        return { rows: [{ id: values[0], taskId: scope.rootTaskId, ordinal: 0, attempt: scope.attempt, status: "streaming", inputThroughSequence: 0n, consumedInputIds: [] }], rowCount: 1 }
+      }
+      if (sql.includes('event."type" = \'cognitive.agenda\'')) {
+        const stepId = String(values[3])
+        const context = { schemaVersion: "agent-harness.v2" as const, sessionId: scope.sessionId, turnId: scope.turnId, stepId,
+          inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}", taskGraphRevision: 0 }
+        const payload = buildCognitiveAgendaReceipt({ sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, stepId,
+          inputThroughSequence: 0n, consumedInputIds: [], agenda: buildCognitiveActionAgenda(context) })
+        return { rows: [{ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: stepId, payload }], rowCount: 1 }
+      }
+      if (downstream) return downstream.query(sql, values as never)
+      return { rows: [], rowCount: 0 }
+    })
+    return { query, release: () => downstream?.release() } as unknown as pg.PoolClient
+  })
+  return { connect, query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+    if (base?.query) return base.query(sql, values as never)
+    return { rows: [], rowCount: 0 }
+  }) } as unknown as pg.Pool
 }
 
 function nativeVerificationRuntime(childStatus: "passed" | "failed" = "passed"): NativeVerificationRuntime {
@@ -419,7 +465,7 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const runtimeTools = tools(true)
     const runner = vi.fn(async () => ({ status: "compacted" as const }))
-    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1",
       productionFlags: resolveProductionAgentFlags({
         ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
@@ -518,7 +564,7 @@ describe("createCanonicalTurnRuntime", () => {
     const planningFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
-    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
       selectedJobPreparationLoader: async () => undefined,
@@ -572,6 +618,158 @@ describe("createCanonicalTurnRuntime", () => {
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
+  it("revises through the registered planner after question recovery while carrying untrusted root background", async () => {
+    const originalText = "Original request: find English-first, remote engineering roles in Germany and cite each employer source."
+    const steerParts = [
+      `Prioritize fully remote teams and retain these constraints: ${"Do not include employers requiring relocation. ".repeat(220)}`,
+      "Prefer roles with explicit English-language requirements and cite each employer source.",
+    ]
+    const questionText = "Which country should I prioritize?"
+    const answerText = "Germany, please."
+    const originalInput: StoredAgentInput = {
+      id: "original-root-input", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "original-client-message", delivery: "follow_up", status: "consumed",
+      content: [{ type: "text", text: originalText }], acceptedSequence: 1n,
+      consumedByStepId: "original-step", consumedAt: new Date("2026-09-07T00:00:00.000Z"), createdAt: new Date("2026-09-07T00:00:00.000Z"),
+    }
+    const steer: StoredAgentInput = {
+      id: "resumed-steer-input", sessionId: lease.sessionId, targetTurnId: lease.turnId, userId: lease.userId,
+      clientMessageId: "steer-client-message", delivery: "steer", status: "consumed",
+      content: steerParts.map(text => ({ type: "text" as const, text })), acceptedSequence: 3n, consumedByStepId: "question-step-0", consumedAt: new Date("2026-09-07T00:00:01.000Z"),
+      createdAt: new Date("2026-09-07T00:00:01.000Z"),
+    }
+    let cursor = 3n, steerReconciled = false
+    const checkpoints: Array<{ inputThroughSequence: bigint; consumedInputIds: readonly string[] }> = []
+    const transaction: InputClaimTransaction = {
+      getCheckpoint: async () => ({ inputThroughSequence: cursor, consumedInputIds: [] }),
+      claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+      persistCheckpoint: async request => { cursor = request.checkpoint.inputThroughSequence; checkpoints.push(request.checkpoint) },
+      loadRootInputContext: async request => request.inputId === originalInput.id ? originalInput : null,
+      loadUnresolvedSteeringInputs: async () => steerReconciled ? [] : [steer],
+    }
+    const inputStore: InputClaimStore = { scope: { userId: lease.userId }, withTransaction: async work => work(transaction) }
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const contexts: StepContext[] = [], requests: HarnessModelRequest[] = [], events: RuntimeEvent[] = []
+    const builder = new StepContextBuilder(inputStore, ownerFence, () => new Date("2026-09-07T00:00:02.000Z"), {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1, rootInputId: originalInput.id,
+    })
+    const rootQuestionId = "question-wait-1"
+    const questionStore = {
+      ...store(events),
+      stageQuestionUsage: vi.fn(async () => undefined),
+      cancelPausedQuestion: vi.fn(async () => "cancelled" as const),
+      waitForQuestion: vi.fn(async () => ({ status: "waiting_for_user" as const, disposition: "created" as const,
+        waitId: rootQuestionId, itemId: "question-item-1", turnId: lease.turnId, toolCallId: "question-call-1", nextTurnRevision: 4 })),
+      readPendingQuestion: vi.fn(async () => ({ status: "answered" as const, stepId: "question-step-0", toolCallId: "question-call-1",
+        waitId: rootQuestionId, itemId: "question-item-1", turnId: lease.turnId })),
+    }
+    const node = {
+      key: "research", templateId: "scout", goal: "Find sourced roles", successCriteria: ["Return employer links"], dependsOn: [],
+      taskId: "planned-child", status: "queued" as const, readiness: "ready" as const, resultSummary: null, failureReason: null,
+    }
+    let planRevision = 0
+    const appendAndScheduleWithReconciliation = vi.fn(async (_input: TaskGraphScheduleInput, _operation: SteeringReconciliationOperation) => {
+      planRevision = 1
+      steerReconciled = true
+      return { status: "accepted" as const, revision: 1, nodes: [{ key: node.key, taskId: node.taskId, status: "queued" as const }], readyTaskIds: [node.taskId] }
+    })
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => { throw new Error("raw planning command was used") }),
+      appendAndScheduleWithReconciliation,
+      reconcileSteering: vi.fn(async () => ({ decision: "keep" as const, revision: planRevision, reconciledInputCount: 0 })),
+      readCurrent: vi.fn(async (_scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> => ({ revision: planRevision, nodes: planRevision === 0 ? [] : [node] })),
+    }
+    const resumed = state({
+      rootInputId: originalInput.id,
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 3n, consumedInputIds: ["previous-step-steer"], usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 } },
+      snapshot: {
+        ...state().snapshot, goal: { id: "canonical-goal", content: "Find software engineering roles." },
+        steerHistory: [
+          { id: "agent-question:question-item-1:question", content: { role: "assistant", type: "question", question: questionText, options: [{ label: "Germany", value: "de" }] } },
+          { id: "agent-question:question-item-1:answer", content: { role: "user", type: "answer", questionId: rootQuestionId, text: answerText } },
+        ],
+      },
+    })
+    const proposal = {
+      expectedRevision: 0,
+      nodes: [{ key: node.key, templateId: "scout", goal: node.goal, successCriteria: [...node.successCriteria], dependsOn: [],
+        verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } }],
+    }
+    const modelAdapter: ModelAdapter = {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "plan-after-answer", name: "agent.plan", arguments: proposal }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "I found sourced roles." }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }), nativeQuestionWaitEnabled: true, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => undefined, stateLoader: async () => resumed, rootTaskStore: rootStore() as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(), turnEngineStoreFactory: () => questionStore,
+      contextBuilderFactory: () => ({ build: async request => { const context = await builder.build(request); contexts.push(context); return context } }),
+      modelRuntimeFactory: async () => ({ adapter: modelAdapter, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    const executionResult = await runtime.execute({ lease, signal: new AbortController().signal })
+    expect(["completed", "failed"]).toContain(executionResult.status)
+    expect(questionStore.readPendingQuestion).toHaveBeenCalledOnce()
+    expect(appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    const [scheduled, operation] = appendAndScheduleWithReconciliation.mock.calls[0]!
+    expect(scheduled.proposal.expectedRevision).toBe(0)
+    expect(operation).toMatchObject({ decision: "revise", expectedRevision: 0, callId: "plan-after-answer", rootInputId: originalInput.id })
+    expect(operation.scope.stepId).toBe(contexts[0]?.stepId)
+    const tools = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
+    expect(tools).toEqual(expect.arrayContaining(["agent.plan", "agent.reconcile", "agent.ask_user"]))
+    expect(contexts).toHaveLength(2)
+    expect(contexts.map(context => context.taskGraphRevision)).toEqual([0, 1])
+    for (const context of contexts) {
+      const reference = context.blocks.find(block => block.layer === "pending_input" && block.content !== null && typeof block.content === "object" && !Array.isArray(block.content) && block.content.inputId === originalInput.id)
+      expect(reference).toMatchObject({ trust: "external_untrusted", content: { inputId: originalInput.id, text: originalText } })
+      expect(context.blocks.some(block => block.layer === "steer_history" && JSON.stringify(block.content).includes(questionText))).toBe(true)
+      expect(context.blocks.some(block => block.layer === "steer_history" && JSON.stringify(block.content).includes(answerText))).toBe(true)
+    }
+    expect(contexts[0]?.blocks.filter(block => block.layer === "pending_input" && JSON.stringify(block.content).includes("resumed-steer-input"))).toHaveLength(2)
+    expect(contexts[0]?.blocks.some(block => block.layer === "pending_input" && JSON.stringify(block.content).includes(steerParts[0]!))).toBe(true)
+    expect(contexts[0]?.blocks.some(block => block.layer === "pending_input" && JSON.stringify(block.content).includes(steerParts[1]!))).toBe(true)
+    expect(contexts[1]?.blocks.some(block => block.layer === "pending_input" && JSON.stringify(block.content).includes("resumed-steer-input"))).toBe(false)
+    expect(contexts.map(context => context.inputThroughSequence)).toEqual([3n, 3n])
+    expect(contexts.map(context => context.consumedInputIds)).toEqual([[], []])
+    const requestMessages = requests.map(request => JSON.stringify(request.messages))
+    expect(requestMessages).toHaveLength(2)
+    for (const messages of requestMessages) {
+      expect(messages).toContain(originalText)
+      expect(messages).toContain(questionText)
+      expect(messages).toContain(answerText)
+    }
+    expect(requestMessages[0]).toContain(steerParts[0])
+    expect(requestMessages[0]).toContain(steerParts[1])
+    expect(requestMessages[1]).not.toContain(steerParts[0])
+    expect(requestMessages[1]).not.toContain(steerParts[1])
+    const agendas = events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE).map(event => event.payload as { planRevision: number; signals: { pendingInputs: { ids: readonly string[] } } })
+    expect(agendas.map(agenda => agenda.planRevision)).toEqual([0, 1])
+    expect(agendas.map(agenda => agenda.signals.pendingInputs.ids)).toEqual([[steer.id], []])
+    expect(JSON.stringify(agendas)).not.toContain(originalInput.id)
+    expect(JSON.stringify(events)).not.toContain(originalText)
+    expect(JSON.stringify(events)).not.toContain(answerText)
+    expect(steerParts.every(part => !JSON.stringify(events).includes(part))).toBe(true)
+    expect(checkpoints.map(checkpoint => checkpoint.consumedInputIds)).toEqual([[], []])
+    expect(checkpoints.map(checkpoint => checkpoint.inputThroughSequence)).toEqual([3n, 3n])
+  })
+
   it("keeps the native receipt graph gate on planner roots without a root-store graph checker", async () => {
     const digest = "c".repeat(64)
     const child = { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1, role: "scout", taskType: "research", status: "queued" as const }
@@ -600,7 +798,7 @@ describe("createCanonicalTurnRuntime", () => {
       ...call, status: "completed" as const, output: { ...child, replay: false, nativeCoordination }, errorCode: null,
     }))
     let modelCalls = 0
-    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
         ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
       }),
@@ -666,7 +864,7 @@ describe("createCanonicalTurnRuntime", () => {
     const events: RuntimeEvent[] = []
     const modelSnapshots: CanonicalTurnState["snapshot"][] = []
     let modelCalls = 0
-    const runtime = await createCanonicalTurnRuntime(pool as never, {
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(pool as unknown as Pick<pg.Pool, "connect">), {
       workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
         ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
       }),
@@ -750,7 +948,7 @@ describe("createCanonicalTurnRuntime", () => {
     const planningFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
-    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
       selectedJobPreparationLoader: async () => ({ jobId: "job-42" }),
@@ -1338,7 +1536,7 @@ describe("createCanonicalTurnRuntime", () => {
     const productionFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
-    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn(async () => artifactClient) } as never, {
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool({ connect: vi.fn(async () => artifactClient) } as unknown as Pick<pg.Pool, "connect">), {
       workerId: "worker-1", productionFlags, taskGraphCommandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
       selectedJobArtifactHeadReader: artifactHeadReader,
@@ -1437,7 +1635,7 @@ describe("createCanonicalTurnRuntime", () => {
     const productionFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
-    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags, taskGraphCommandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
       selectedJobArtifactHeadReader: artifactHeadReader,
