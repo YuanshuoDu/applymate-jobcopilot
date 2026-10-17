@@ -97,7 +97,8 @@ local previous = waitCount == 1 and "wait" or (pausedCount == 1 and "paused" or 
 local maxEventsRaw = redis.call("HGET", KEYS[13], "opts.maxLenEvents")
 local maxEvents = tonumber(maxEventsRaw or "10000")
 if not maxEvents or maxEvents < 1 or maxEvents > 2147483647 or maxEvents % 1 ~= 0 then return 0 end
-if redis.call("SET", receiptKey, ARGV[13], "NX") ~= "OK" then return 0 end
+local receiptSet = redis.call("SET", receiptKey, ARGV[13], "NX")
+if not receiptSet or receiptSet.ok ~= "OK" then return 0 end
 local removed = previous == "wait" and redis.call("LREM", KEYS[3], 1, jobId)
   or (previous == "paused" and redis.call("LREM", KEYS[4], 1, jobId)
   or redis.call("ZREM", KEYS[5], jobId))
