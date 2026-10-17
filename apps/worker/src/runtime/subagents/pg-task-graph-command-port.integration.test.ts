@@ -651,6 +651,10 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       [owner.rootTaskId, owner.sessionId, owner.turnId, JSON.stringify(rootAllowedActions), owner.parentLeaseOwner],
     )
     expect(actionGrant.rowCount).toBe(1)
+    await seedReconciliationAgenda(adminPool!, owner, {
+      id: owner.stepId, sequence: await nextEventSequence(adminPool!, owner), cursor: 0n, planRevision: 0,
+      consumedInputIds: [],
+    })
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, owner.userId))
     const emptyRows = await graphRows(adminPool!, owner)
 
@@ -820,6 +824,10 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       [value.rootTaskId, value.sessionId, value.turnId, JSON.stringify(rootAllowedActions), value.parentLeaseOwner],
     )
     expect(actionGrant.rowCount).toBe(1)
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.stepId, sequence: await nextEventSequence(adminPool!, value), cursor: 0n, planRevision: 0,
+      consumedInputIds: [],
+    })
 
     const racingPool = new PgPool({ connectionString: databaseUrl!, max: 2 })
     try {
