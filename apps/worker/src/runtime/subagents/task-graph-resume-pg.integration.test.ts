@@ -2366,7 +2366,7 @@ async function prepareSelectedJobTerminalCase(pool: Pool, value: Fixture) {
   await engineStore.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null, inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now: new Date() })
   await engineStore.appendEvent({
     owner, id: `p3-finalization-step-event-${value.suffix}`, itemId: null, type: "step.completed", correlationId: stepId, causationId: null,
-    idempotencyKey: `turn:${value.turnId}:event:step-completed:${stepId}`, payload: { stepId, status: "completed" },
+    idempotencyKey: `turn:${value.turnId}:event:step-completed:${stepId}`, payload: { taskId: owner.taskId, stepId, status: "completed" },
   })
   return {
     value, sources, preparation, tasks, root, rootLease, lease, commandPort, artifacts, artifactRef, graphScope,
