@@ -1,9 +1,17 @@
 import { Buffer } from "node:buffer"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import type { AgentArtifactReviewRow } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
+import type { SubagentLease, SubagentTaskRecord } from "./types.js"
+
+const graphMocks = vi.hoisted(() => ({
+  hasPersistedTaskGraphMembership: vi.fn(),
+  loadTaskGraph: vi.fn(),
+}))
+vi.mock("./task-graph-pg-state.js", () => graphMocks)
+
 import {
-  createTaskGraphWriterReviewFeedbackFrame, TASK_GRAPH_WRITER_REVIEW_FEEDBACK_BYTE_LIMIT,
+  assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TASK_GRAPH_WRITER_REVIEW_FEEDBACK_BYTE_LIMIT,
   TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext,
 } from "./task-graph-writer-review-feedback.js"
 
@@ -45,8 +53,77 @@ function review(findings: unknown = [finding()], overrides: Partial<AgentArtifac
   } as AgentArtifactReviewRow
 }
 
+function writerFixture(templateId: string, dependsOn: string[], context: unknown) {
+  const task = {
+    id: "writer-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+    role: "writer", taskType: "selected_job", status: "running", leaseOwner: "worker-1", attemptCount: 1, context,
+  } as unknown as SubagentTaskRecord
+  const lease = { ...task, ownerId: "worker-1", leaseExpiresAt: new Date("2099-01-01T00:00:00Z"), signal: new AbortController().signal } as SubagentLease
+  const graph = {
+    rootTaskId: "root-1",
+    snapshot: { nodes: [
+      { key: "writer-node", taskId: task.id, templateId, dependsOn },
+      { key: "analyst-node", taskId: "analyst-1", templateId: "analyst", dependsOn: [] },
+      { key: "reviewer-node", taskId: "reviewer-1", templateId: "cover_letter_reviewer", dependsOn: [] },
+    ] },
+    tasks: new Map([
+      [task.id, { id: task.id, role: "writer", status: "running", failureReason: null }],
+      ["analyst-1", { id: "analyst-1", role: "analyst", status: "completed", failureReason: null }],
+      ["reviewer-1", { id: "reviewer-1", role: "reviewer", status: "completed", failureReason: null }],
+    ]),
+  }
+  graphMocks.loadTaskGraph.mockResolvedValue(graph)
+  const queries: string[] = []
+  const client = {
+    query: vi.fn(async (sql: string) => { queries.push(sql); return { rows: [], rowCount: 0 } }),
+    release: vi.fn(),
+  }
+  const pool = { connect: vi.fn(async () => client) }
+  return { task, lease, pool, queries, client }
+}
+
 describe("private Writer review feedback handoff", () => {
-  it("leaves initial Writers unchanged and accepts one exact direct completed Reviewer receipt", () => {
+  it("allows a native TaskGraph first draft with no Reviewer feedback dependency", async () => {
+    const context = {
+      selectedJobPreparation: { jobId: scope.jobId },
+      taskGraphDependencyResults: {
+        schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{ role: "analyst" }],
+      },
+    }
+    const fixture = writerFixture("native", ["analyst-node"], context)
+    const dependency = writerReviewDependencyFromTaskContext(context, scope.jobId)
+    const feedbackRead = vi.fn()
+    const modelCall = vi.fn()
+
+    expect(dependency).toBeNull()
+    await assertPersistedWriterReviewDependency(fixture.pool as never, fixture.task, fixture.lease, dependency)
+    if (dependency) feedbackRead()
+    modelCall()
+
+    expect(fixture.queries).toContain("COMMIT")
+    expect(feedbackRead).not.toHaveBeenCalled()
+    expect(modelCall).toHaveBeenCalledOnce()
+  })
+
+  it("rejects caller-forged Reviewer context before feedback or model calls without a persisted edge", async () => {
+    const context = dependencyContext()
+    const fixture = writerFixture("native", [], context)
+    const dependency = writerReviewDependencyFromTaskContext(context, scope.jobId)
+    const feedbackRead = vi.fn()
+    const modelCall = vi.fn()
+    const runWriter = async () => {
+      await assertPersistedWriterReviewDependency(fixture.pool as never, fixture.task, fixture.lease, dependency)
+      feedbackRead()
+      modelCall()
+    }
+
+    await expect(runWriter()).rejects.toMatchObject({ code: "writer_review_dependency_invalid" })
+    expect(fixture.queries).toContain("ROLLBACK")
+    expect(feedbackRead).not.toHaveBeenCalled()
+    expect(modelCall).not.toHaveBeenCalled()
+  })
+
+  it("accepts one exact direct completed Reviewer receipt at the context parser", () => {
     expect(writerReviewDependencyFromTaskContext({ selectedJobPreparation: { jobId: scope.jobId } }, scope.jobId)).toBeNull()
     expect(writerReviewDependencyFromTaskContext(dependencyContext(), scope.jobId)).toEqual({
       dependencyTaskId: "reviewer-1", artifactRef, reviewHash,
