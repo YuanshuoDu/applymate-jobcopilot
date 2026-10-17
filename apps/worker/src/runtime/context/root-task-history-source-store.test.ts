@@ -132,6 +132,8 @@ describe("Root history source scan", () => {
       expect(results).toHaveLength(1)
       expect(queries).toHaveLength(2)
       expect(queries[0]?.sql).toContain('FROM "agent_objective_history_index_readiness"')
+      expect(queries[0]?.sql).toContain('"isReady" = TRUE')
+      expect(queries[0]?.sql).toContain("FOR SHARE")
       expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, 64])
       expect(queries[1]?.sql).toContain('FROM "agent_events" AS event')
       expect(queries[1]?.sql).not.toContain('FROM "agent_turns" AS turn\n')

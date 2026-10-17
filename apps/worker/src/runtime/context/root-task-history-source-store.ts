@@ -113,7 +113,8 @@ function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHi
 async function objectiveHistoryIndexReady(client: Client): Promise<boolean> {
   const result = await client.query<Row>(`SELECT "indexName", "semanticsVersion", "isReady"
     FROM "agent_objective_history_index_readiness"
-    WHERE "indexName" = $1 AND "semanticsVersion" = $2`,
+    WHERE "indexName" = $1 AND "semanticsVersion" = $2 AND "isReady" = TRUE
+    FOR SHARE`,
   ["agent_turns_objective_history", OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
   return result.rows.length === 1 && result.rows[0]?.indexName === "agent_turns_objective_history"
     && result.rows[0]?.semanticsVersion === OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION

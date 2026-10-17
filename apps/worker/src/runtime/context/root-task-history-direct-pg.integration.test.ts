@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool as PgPool } from "pg"
+import { Pool as PgPool, type PoolClient } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
-import { projectRootTaskHistory } from "./root-task-history.js"
+import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import type { TurnLease } from "../turns/lease.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -27,6 +27,14 @@ function gate() {
   let open!: () => void
   const promise = new Promise<void>(resolve => { open = resolve })
   return { open, promise }
+}
+
+function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(message)), 10_000) }),
+  ]).finally(() => { if (timeout) clearTimeout(timeout) })
 }
 
 function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonly unknown[]) => Promise<void>): Pick<PgPool, "connect"> {
@@ -468,6 +476,61 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       expect(graphLoads).toEqual([matching[1]!.turnId, matching[0]!.turnId])
       const fillerTurnIds = new Set(sameSessionUnrelated.map(source => source.turnId))
       expect(graphLoads.filter(turnId => fillerTurnIds.has(turnId))).toEqual([])
+    })
+  })
+
+  it("holds readiness through indexed candidate selection while an explicit reset is attempted", async () => {
+    await withObjectiveHistoryIndexReady(async () => {
+      const readinessRead = gate(), continueCandidateSelection = gate()
+      let readinessPaused = false
+      let candidateSql: string | undefined
+      const observed = observeQueries(pool!, async sql => {
+        if (!readinessPaused && sql.includes('FROM "agent_objective_history_index_readiness"')) {
+          readinessPaused = true
+          readinessRead.open()
+          await continueCandidateSelection.promise
+        }
+        if (sql.includes("WITH terminal_window")) candidateSql = sql
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), objectiveHistoryIndexEnabled: true }
+      let reader: Promise<readonly ValidatedRootTaskHistoryOutcome[]> | undefined
+      let resetter: PoolClient | undefined
+      try {
+        reader = createPgDirectRootTaskHistoryStore(observed).load(input)
+        await withTimeout(readinessRead.promise, "readiness row was not read")
+
+        resetter = await pool!.connect()
+        await resetter.query("BEGIN")
+        await resetter.query("SET LOCAL lock_timeout = '1000ms'")
+        let resetError: unknown
+        let resetCommitted = false
+        try {
+          await resetter.query(`UPDATE "agent_objective_history_index_readiness"
+            SET "isReady" = FALSE, "updatedAt" = CURRENT_TIMESTAMP
+            WHERE "indexName" = $1 AND "semanticsVersion" = $2`,
+          ["agent_turns_objective_history", OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
+          await resetter.query("COMMIT")
+          resetCommitted = true
+        } catch (error: unknown) {
+          resetError = error
+          await resetter.query("ROLLBACK").catch(() => undefined)
+        }
+        expect(resetCommitted).toBe(false)
+        expect(errorCode(resetError)).toBe("55P03")
+
+        continueCandidateSelection.open()
+        const history = await withTimeout(reader, "indexed candidate selection did not finish")
+        expect(candidateSql).toContain('FROM "agent_turns" AS turn')
+        expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      } finally {
+        continueCandidateSelection.open()
+        if (resetter) {
+          await resetter.query("ROLLBACK").catch(() => undefined)
+          resetter.release()
+        }
+        if (reader) await reader.catch(() => undefined)
+      }
     })
   })
 
