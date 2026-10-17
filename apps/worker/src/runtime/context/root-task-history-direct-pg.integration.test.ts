@@ -160,7 +160,7 @@ const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, ro
   failureChildren: [{ key: "foreign-user", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" }] }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
-  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1101,
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 2101,
   terminalCreatedAt: new Date("2031-01-01T00:00:00.000Z") }
 const equalCutoff: Source = { turnId: `root-history-equal-cutoff-${suffix}`, rootTaskId: `root-history-equal-cutoff-root-${suffix}`,
   childId: `root-history-equal-cutoff-child-${suffix}`, finalItemId: `root-history-equal-cutoff-final-${suffix}`,
@@ -328,7 +328,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }
     await insertUser(userId)
     await insertUser(otherUserId)
-    await insertSession(sessionId, userId, 1200)
+    await insertSession(sessionId, userId, 2200)
     await insertSession(otherSessionId, userId, 500)
     await insertSession(foreignSessionId, otherUserId, 4)
     await insertSession(archivedSessionId, userId, 4)
@@ -700,26 +700,37 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       childId: `root-history-manual-child-${suffix}`, finalItemId: `root-history-manual-final-${suffix}`,
       sessionId, userId, turnSource: "automation", goal: objective, criteria,
       input: { goal: objective, successCriteria: criteria, automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "invalid" } },
-      startSequence: 1900, terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
+      startSequence: 460, terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
     }
     const legacyAutomationSource: Source = {
       turnId: `root-history-legacy-automation-source-${suffix}`, rootTaskId: `root-history-legacy-automation-root-${suffix}`,
       childId: `root-history-legacy-automation-child-${suffix}`, finalItemId: `root-history-legacy-automation-final-${suffix}`,
       sessionId, userId, turnSource: "automation", goal: objective, criteria,
-      input: { goal: objective, successCriteria: criteria }, startSequence: 1920,
+      input: { goal: objective, successCriteria: criteria }, startSequence: 480,
       terminalCreatedAt: new Date("2022-01-02T00:00:00.000Z"),
     }
     await insertSource(manualSource)
     await insertSource(legacyAutomationSource)
+    await projectSources([manualSource, legacyAutomationSource])
     await updateCurrentTurn("automation", { goal: objective, successCriteria: criteria, automationRunMode: "manual" })
     try {
-      const history = await createPgDirectRootTaskHistoryStore(pool!).load({
+      const legacyHistory = await createPgDirectRootTaskHistoryStore(pool!).load({
         lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+        objectiveHistoryIndexEnabled: false,
       })
-      expect(history.map(item => item.sourceTurnId)).toContain(manualSource.turnId)
-      expect(history.map(item => item.sourceTurnId)).toContain(legacyAutomationSource.turnId)
-      expect(history.map(item => item.sourceTurnId)).toContain(matching[0]!.turnId)
-      expect(history.map(item => item.sourceTurnId)).toContain(matching[1]!.turnId)
+      expect(legacyHistory.map(item => item.sourceTurnId)).toContain(manualSource.turnId)
+      expect(legacyHistory.map(item => item.sourceTurnId)).toContain(legacyAutomationSource.turnId)
+      const indexedHistory = await withObjectiveHistoryIndexReady(() => createPgDirectRootTaskHistoryStore(pool!).load({
+        lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+        objectiveHistoryIndexEnabled: true,
+      }))
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(manualSource.turnId)
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(legacyAutomationSource.turnId)
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(matching[0]!.turnId)
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(matching[1]!.turnId)
+      const scheduledTurnIds = new Set([...malformedSameSession, ...mismatchedCriteria, hugeExponentMalformed,
+        matchingSameSession, numericBoundaryMatch, matchingCrossSession].map(source => source.turnId))
+      expect(indexedHistory.some(item => scheduledTurnIds.has(item.sourceTurnId))).toBe(false)
     } finally {
       await updateCurrentTurn("user", { goal: objective, successCriteria: criteria })
     }
