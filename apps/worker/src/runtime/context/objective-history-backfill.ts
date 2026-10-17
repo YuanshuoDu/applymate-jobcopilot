@@ -218,13 +218,11 @@ export async function backfillObjectiveHistoryProjection(
         })
       } catch (error) {
         if (!(error instanceof TerminalIneligibleBatchError)) throw error
-        batches += 1
-        terminalIneligible += pageCounts.terminalIneligible
+        batches += 1; terminalIneligible += pageCounts.terminalIneligible
         break
       }
       evaluated += pageCounts.evaluated; unindexable += pageCounts.unindexable
-      ineligible += pageCounts.ineligible; conflicts += pageCounts.conflicts
-      terminalIneligible += pageCounts.terminalIneligible
+      ineligible += pageCounts.ineligible; conflicts += pageCounts.conflicts; terminalIneligible += pageCounts.terminalIneligible
       batches += 1
       if (!page.length) break
       cursor = page[page.length - 1]!.turnId
