@@ -2,9 +2,14 @@ import type { Queue } from "bullmq"
 import type { Pool, PoolClient } from "pg"
 import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload, type ApplyTaskSubmitIdentity, type ApplyTaskSubmitPayload } from "@jobcopilot/shared"
 import { reconcileClaimedSubmissionUncertain } from "../db/submission-guard.js"
-import type { ApplicationSubmitIdentity } from "./application-submit-fence.js"
+import {
+  isValidApplicationSubmitTerminalObservation,
+  matchesExactApplicationSubmitTerminalProof,
+  type ApplicationSubmitIdentity,
+  type ApplicationSubmitTerminalObservation,
+} from "./application-submit-fence.js"
 
-const ADD_OPTIONS = { attempts: 3, backoff: { type: "exponential" as const, delay: 60_000 }, removeOnComplete: 100, removeOnFail: 200 }
+const ADD_OPTIONS = { attempts: 3, backoff: { type: "exponential" as const, delay: 60_000 }, removeOnComplete: false, removeOnFail: false }
 const RETRY_OPTIONS = { resetAttemptsMade: true, resetAttemptsStarted: true }
 const RUNNABLE_STATES = new Set(["waiting", "wait", "active", "delayed", "prioritized", "waiting-children"])
 
@@ -14,6 +19,7 @@ export type SubmitOutboxIntent = ApplyTaskSubmitIdentity & Readonly<{
 }>
 export type SubmitOutboxQueue = Pick<Queue<ApplyTaskPayload>, "add" | "getJob" | "isPaused" | "client" | "toKey">
 export type SubmitDeliveryState = "absent" | "terminal" | "deferred" | "missing" | "mismatch"
+export type SubmitTerminalObservation = ApplicationSubmitTerminalObservation
 
 export async function validateCurrentSubmit(
   client: PoolClient, intent: SubmitOutboxIntent,
@@ -121,15 +127,123 @@ export async function resetExpiredSubmitAuthorization(client: PoolClient, intent
   [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.receiptId, intent.workerTaskId])
 }
 
+async function readTerminalProof(client: PoolClient, intent: SubmitOutboxIntent): Promise<{ present: boolean; valid: boolean }> {
+  const rows = await client.query<{ data: unknown }>(`SELECT "data" FROM "application_task_events"
+    WHERE "taskId" = $1 AND "type" = 'submission_terminal_observed' AND "actor" = 'worker'
+      AND "data"->>'fillTurnId' = $2 FOR SHARE`, [intent.applicationTaskId, intent.fillTurnId])
+  return { present: rows.rows.length > 0, valid: rows.rows.length === 1 && matchesExactApplicationSubmitTerminalProof(rows.rows[0]?.data, intent) }
+}
+
+async function persistTerminalProof(
+  client: PoolClient, intent: SubmitOutboxIntent, observation: SubmitTerminalObservation,
+): Promise<boolean> {
+  if (!isValidApplicationSubmitTerminalObservation(observation)) return false
+  const existing = await readTerminalProof(client, intent)
+  if (existing.present) return existing.valid
+  const data = {
+    applicationTaskId: intent.applicationTaskId, userId: intent.userId, jobId: intent.jobId,
+    sessionId: intent.sessionId, fillTurnId: intent.fillTurnId, workerTaskId: intent.workerTaskId,
+    approvalId: intent.receiptId, receiptId: intent.receiptId, constraintHash: intent.constraintHash,
+    terminalState: observation.terminalState, attemptsMade: observation.attemptsMade, attempts: observation.attempts,
+  }
+  const inserted = await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
+    VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, 'submission_terminal_observed', 'worker',
+      'Worker observed a final terminal submit delivery', $2::jsonb, NOW())`, [intent.applicationTaskId, JSON.stringify(data)])
+  return inserted.rowCount === 1
+}
+
+async function observedTerminalJob(queue: SubmitOutboxQueue, intent: SubmitOutboxIntent): Promise<SubmitTerminalObservation | null> {
+  const job = await queue.getJob(intent.workerTaskId)
+  if (!job || job.id !== intent.workerTaskId || !matchesSubmitJobPayload(job.data, intent)) return null
+  const attempts = job.opts.attempts ?? 1, attemptsMade = job.attemptsMade
+  const state = await job.getState()
+  if (state !== "completed" && (state !== "failed" || attemptsMade < attempts)) return null
+  return { terminalState: state, attemptsMade, attempts }
+}
+
+async function removeTerminalJobAfterProof(
+  queue: SubmitOutboxQueue, intent: SubmitOutboxIntent,
+): Promise<"removed" | "absent" | "deferred" | "mismatch"> {
+  const job = await queue.getJob(intent.workerTaskId)
+  if (!job) return "absent"
+  if (job.id !== intent.workerTaskId || !matchesSubmitJobPayload(job.data, intent)) return "mismatch"
+  const state = await job.getState()
+  if (state !== "completed" && (state !== "failed" || job.attemptsMade < (job.opts.attempts ?? 1))) return "deferred"
+  if (await (await queue.client).get(queue.toKey(`${intent.workerTaskId}:lock`)) !== null) return "deferred"
+  await job.remove()
+  return "removed"
+}
+
+async function terminalAttemptDisposition(client: PoolClient, intent: SubmitOutboxIntent): Promise<"claimed" | "uncertain" | "final" | "stale"> {
+  const task = (await client.query<{ status: string; checkpoint: string | null }>(`SELECT "status", "checkpoint" FROM "application_tasks"
+    WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6 FOR UPDATE`,
+  [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.workerTaskId])).rows[0]
+  if (!task) return "stale"
+  if (task.status === "filling" && ["browser_active", "submission_request_started"].includes(task.checkpoint ?? "")) return "claimed"
+  if (task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain") return "uncertain"
+  if (["submitted", "failed"].includes(task.status) || task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" ||
+    task.status === "waiting_for_user" && ["submission_blocked", "user_takeover"].includes(task.checkpoint ?? "") ||
+    task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit") return "final"
+  return "stale"
+}
+
 export async function reconcileClaimedTerminalSubmit(
-  pool: Pool, queue: SubmitOutboxQueue, intent: SubmitOutboxIntent,
+  pool: Pool, queue: SubmitOutboxQueue, intent: SubmitOutboxIntent, observed?: SubmitTerminalObservation,
 ): Promise<SubmitDeliveryState | "reconciled" | "unchanged"> {
-  const delivery = await inspectSubmitDelivery(queue, intent, false)
-  if (delivery !== "terminal") return delivery
+  // A missing queue record is not terminal evidence by itself; the attempt fence must find proof.
+  const delivery = await inspectSubmitDelivery(queue, intent, true)
+  if (delivery !== "terminal" && delivery !== "absent") return delivery
   const identity: ApplicationSubmitIdentity = {
     applicationTaskId: intent.applicationTaskId, userId: intent.userId, jobId: intent.jobId,
     sessionId: intent.sessionId, fillTurnId: intent.fillTurnId,
     approvalId: intent.receiptId, constraintHash: intent.constraintHash,
   }
-  return await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId) ? "reconciled" : "unchanged"
+  let fencedDelivery: SubmitDeliveryState | undefined
+  let terminalOutcomeDurable = false
+  const reconciled = await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async client => {
+    fencedDelivery = await inspectSubmitDelivery(queue, intent, true)
+    if (fencedDelivery !== "terminal" && fencedDelivery !== "absent") return false
+    const disposition = await terminalAttemptDisposition(client, intent)
+    if (disposition === "final") { terminalOutcomeDurable = true; return false }
+    if (disposition === "stale") return false
+    if (fencedDelivery === "absent") {
+      terminalOutcomeDurable = observed
+        ? await persistTerminalProof(client, intent, observed)
+        : (await readTerminalProof(client, intent)).valid
+      return terminalOutcomeDurable
+    }
+    const terminal = await observedTerminalJob(queue, intent)
+    terminalOutcomeDurable = disposition === "uncertain" && !terminal && !observed
+      ? (await readTerminalProof(client, intent)).valid
+      : terminal ? await persistTerminalProof(client, intent, terminal)
+      : observed ? await persistTerminalProof(client, intent, observed) : false
+    return terminalOutcomeDurable
+  })
+  if (terminalOutcomeDurable) {
+    const removal = await removeTerminalJobAfterProof(queue, intent)
+    if (removal === "mismatch") return "mismatch"
+    if (removal === "deferred") return "deferred"
+    return "reconciled"
+  }
+  if (reconciled) return "reconciled"
+  return fencedDelivery && fencedDelivery !== "terminal" && fencedDelivery !== "absent" ? fencedDelivery : "unchanged"
+}
+
+export async function reconcileTerminalSubmitJob(
+  pool: Pool,
+  queue: SubmitOutboxQueue,
+  job: { id?: string; data: ApplyTaskPayload; attemptsMade?: number; opts?: { attempts?: number } } | undefined,
+  terminalState?: "completed" | "failed",
+): Promise<void> {
+  if (!job || typeof job.id !== "string" || !job.id || job.data.operation !== "submit") return
+  const submitPayload = job.data
+  if (!matchesApplyTaskSubmitPayload(submitPayload, submitPayload) || !/^[a-f0-9]{64}$/.test(submitPayload.constraintHash)) return
+  const attemptsMade = job.attemptsMade ?? 0, attempts = job.opts?.attempts ?? 1
+  if (terminalState === "failed" && attemptsMade < attempts) return
+  const observed = terminalState ? { terminalState, attemptsMade, attempts } : undefined
+  await reconcileClaimedTerminalSubmit(pool, queue, {
+    ...submitPayload,
+    workerTaskId: job.id,
+    submitPayload,
+  }, observed)
 }

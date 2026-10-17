@@ -1,9 +1,10 @@
-import { Queue, type Job } from "bullmq";
+import { Queue } from "bullmq";
 import { Redis } from "ioredis";
 import { createHash } from "node:crypto";
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
 import { asRecord, AutoApplyError } from "./auto-apply-guards";
+import { removePendingSubmitJobWithReceipt } from "./apply-queue-removal";
 
 type ApplyQueuePayload = EnqueueApplyInput;
 
@@ -110,6 +111,8 @@ export interface VerifySubmissionJobInput {
   /** Exact BullMQ job ID resolved from submission_queued for the old Turn and approval. */
   workerTaskId: string | null | undefined;
   expected: ApplyQueueSubmissionIdentity | null | undefined;
+  /** Set only after the transaction found exact Worker terminal evidence for this attempt. */
+  allowMissingTerminalProof?: boolean;
   /** The caller runs removePendingJob inside the exact database attempt fence. */
   withExactAttemptFence?: (removePendingJob: () => Promise<boolean>) => Promise<boolean>;
 }
@@ -131,6 +134,28 @@ function hasExpectedIdentity(data: unknown, expected: ApplyQueueSubmissionIdenti
     && payload.constraintHash === expected.constraintHash;
 }
 
+export function hasExactTerminalSubmitProof(events: readonly unknown[], expected: ApplyQueueSubmissionIdentity & { workerTaskId: string }): boolean {
+  if (events.length !== 1) return false;
+  const proof = asRecord(events[0]), attemptsMade = proof.attemptsMade, attempts = proof.attempts;
+  return proof.applicationTaskId === expected.applicationTaskId && proof.userId === expected.userId
+    && proof.jobId === expected.jobId && proof.sessionId === expected.sessionId && proof.fillTurnId === expected.fillTurnId
+    && proof.workerTaskId === expected.workerTaskId && proof.approvalId === expected.receiptId && proof.receiptId === expected.receiptId
+    && proof.constraintHash === expected.constraintHash && (proof.terminalState === "completed" || proof.terminalState === "failed")
+    && Number.isSafeInteger(attemptsMade) && Number(attemptsMade) >= 0 && Number.isSafeInteger(attempts) && Number(attempts) >= 1
+    && (proof.terminalState !== "failed" || Number(attemptsMade) >= Number(attempts));
+}
+
+export async function readExactTerminalSubmitProof(
+  tx: Prisma.TransactionClient,
+  expected: ApplyQueueSubmissionIdentity & { workerTaskId: string },
+): Promise<"missing" | "valid" | "mismatch"> {
+  const events = await tx.$queryRaw<Array<{ data: unknown }>>(Prisma.sql`SELECT "data" FROM "application_task_events"
+    WHERE "taskId" = ${expected.applicationTaskId} AND "type" = 'submission_terminal_observed' AND "actor" = 'worker'
+      AND "data"->>'fillTurnId' = ${expected.fillTurnId} FOR SHARE`);
+  if (!events.length) return "missing";
+  return hasExactTerminalSubmitProof(events.map(event => event.data), expected) ? "valid" : "mismatch";
+}
+
 function isValidIdentity(expected: ApplyQueueSubmissionIdentity | null | undefined): expected is ApplyQueueSubmissionIdentity {
   return expected !== null && expected !== undefined
     && isNonEmptyString(expected.applicationTaskId)
@@ -140,16 +165,6 @@ function isValidIdentity(expected: ApplyQueueSubmissionIdentity | null | undefin
     && isNonEmptyString(expected.fillTurnId)
     && isNonEmptyString(expected.receiptId)
     && isNonEmptyString(expected.constraintHash);
-}
-
-async function getMatchingSubmissionJob(
-  queue: Queue<ApplyQueuePayload>,
-  workerTaskId: string,
-  expected: ApplyQueueSubmissionIdentity,
-): Promise<Job<ApplyQueuePayload> | undefined> {
-  const job = await queue.getJob(workerTaskId);
-  if (!job || job.id !== workerTaskId || !hasExpectedIdentity(job.data, expected)) return undefined;
-  return job;
 }
 
 async function hasNoExactLock(queue: Queue<ApplyQueuePayload>, workerTaskId: string): Promise<boolean> {
@@ -165,32 +180,35 @@ export async function verifyAndCancelSubmissionJob(input: VerifySubmissionJobInp
 
   try {
     const queue = getApplyQueue();
-    const job = await getMatchingSubmissionJob(queue, workerTaskId, expected);
-    if (!job) return false;
-    const state = await job.getState();
+    const found = await queue.getJob(workerTaskId);
+    if (!found && input.allowMissingTerminalProof === true && await hasNoExactLock(queue, workerTaskId)) return true;
+    if (found && (found.id !== workerTaskId || found.name !== "apply" || !hasExpectedIdentity(found.data, expected))) return false;
+    const state = found ? await found.getState() : "missing";
+    if (!found || state === "unknown") {
+      const redis = _redis;
+      if (!redis || !input.withExactAttemptFence) return false;
+      let receiptCheckInvoked = false;
+      const fencedResult = await input.withExactAttemptFence(async () => {
+        if (receiptCheckInvoked) return false;
+        receiptCheckInvoked = true;
+        return await removePendingSubmitJobWithReceipt(redis, queue.toKey, { ...expected, workerTaskId }, { mode: "receipt-only" });
+      });
+      return receiptCheckInvoked && fencedResult === true;
+    }
+    const job = found;
     if (!await hasNoExactLock(queue, workerTaskId)) return false;
-    if (state === "completed" || state === "failed") return true;
+    if (state === "completed") return true;
+    if (state === "failed" && job.attemptsMade >= (job.opts.attempts ?? 1)) return true;
     if ((state !== "waiting" && state !== "delayed") || !input.withExactAttemptFence) return false;
 
     let removalInvoked = false;
-    let removalSucceeded = false;
     const fencedResult = await input.withExactAttemptFence(async () => {
       if (removalInvoked) return false;
       removalInvoked = true;
-      const current = await getMatchingSubmissionJob(queue, workerTaskId, expected);
-      if (!current) return false;
-      const currentState = await current.getState();
-      if (currentState !== "waiting" && currentState !== "delayed") return false;
-      if (!await hasNoExactLock(queue, workerTaskId)) return false;
-      await current.remove();
-      removalSucceeded = true;
-      return true;
+      if (!_redis) return false;
+      return await removePendingSubmitJobWithReceipt(_redis, queue.toKey, { ...expected, workerTaskId });
     });
-    if (!fencedResult || !removalSucceeded) return false;
-
-    const remaining = await queue.getJob(workerTaskId);
-    return (remaining === undefined || remaining === null)
-      && await hasNoExactLock(queue, workerTaskId);
+    return removalInvoked && fencedResult === true;
   } catch {
     return false;
   }

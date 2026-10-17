@@ -1,6 +1,6 @@
 import { Prisma, type PrismaClient } from "@prisma/client"
 
-import { verifyAndCancelSubmissionJob } from "@/lib/apply-queue-client"
+import { readExactTerminalSubmitProof, verifyAndCancelSubmissionJob } from "@/lib/apply-queue-client"
 import { AgentCommandError, invalidCommand, isUniqueViolation } from "./errors"
 import { assertApplicationFillPreflight } from "./application-fill-preflight"
 import { acceptInputFacts, createRootTurn, lockOpenSession, type CommandTransaction } from "./transaction"
@@ -8,7 +8,6 @@ import type { CommandIdentity, CommandResult } from "./types"
 
 const TERMINAL_TURNS = new Set(["completed", "failed", "interrupted", "cancelled"])
 const FILL_CONTENT = [{ type: "text" as const, text: "Fill the server-bound application form for user review. Never submit it." }]
-
 export type ConfirmSubmissionRecoveryCommand = { sessionId: string; userId: string; applicationTaskId: string; requestId: string;
   confirmedNotReceived: true }
 
@@ -22,26 +21,21 @@ type TaskEvent = { id: string; data: unknown }
 type ApprovalFence = { id: string; sessionId: string; userId: string; turnId: string | null; jobId: string | null; type: string; status: string; scopeHash: string | null; payload: unknown }
 type JobFence = { id: string; status: string; workflowState: "queued" | "submitting" | "ready_to_apply"; appliedAt: Date | null }
 type SubmissionAttemptFence = { userId: string; jobId: string; receiptId: string; constraintHash: string; state: string }
-
 function conflict(message: string): never {
   throw new AgentCommandError("retry_target_invalid", message, 409)
 }
-
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
-
 function nonEmpty(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0
 }
-
 function sameAttempt(task: RecoveryTask, candidate: RecoveryTask): boolean {
   return task.id === candidate.id && task.userId === candidate.userId && task.sessionId === candidate.sessionId
     && task.jobId === candidate.jobId && task.status === candidate.status && task.checkpoint === candidate.checkpoint
     && task.fillTurnId === candidate.fillTurnId && task.fillTurnSessionId === candidate.fillTurnSessionId
     && task.fillTurnUserId === candidate.fillTurnUserId && task.workerTaskId === candidate.workerTaskId
 }
-
 function validateCommand(command: ConfirmSubmissionRecoveryCommand): CommandIdentity {
   for (const [name, value] of Object.entries(command)) {
     if (name === "confirmedNotReceived") continue
@@ -52,7 +46,6 @@ function validateCommand(command: ConfirmSubmissionRecoveryCommand): CommandIden
   }
   return { sessionId: command.sessionId, userId: command.userId, clientMessageId: recoveryMessageId(command), source: "user" }
 }
-
 function recoveryMessageId(command: ConfirmSubmissionRecoveryCommand): string {
   return `application-submit-recovery:${command.applicationTaskId}:${command.requestId}`
 }
@@ -117,7 +110,7 @@ async function assertOldAttemptFenced(tx: CommandTransaction, task: RecoveryTask
   }
 }
 
-async function resolveSubmission(tx: CommandTransaction, task: RecoveryTask, identity: CommandIdentity): Promise<{ workerTaskId: string; receiptId: string; constraintHash: string }> {
+async function resolveSubmission(tx: CommandTransaction, task: RecoveryTask, identity: CommandIdentity): Promise<{ workerTaskId: string; receiptId: string; constraintHash: string; terminalProof: boolean }> {
   if (!nonEmpty(task.workerTaskId)) conflict("The uncertain submission has no current Worker task binding")
   const rows = await tx.$queryRaw<TaskEvent[]>(Prisma.sql`
     SELECT "id", "data" FROM "application_task_events"
@@ -135,8 +128,6 @@ async function resolveSubmission(tx: CommandTransaction, task: RecoveryTask, ide
     || (nonEmpty(eventData.receiptId) && nonEmpty(eventData.approvalId) && eventData.receiptId !== eventData.approvalId)) {
     conflict("The exact submit queue event conflicts with the current attempt")
   }
-  const execution = await tx.$queryRaw<{ safe: boolean }[]>(Prisma.sql`SELECT COUNT(*) = 0 OR (COUNT(*) = 2 AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_started') = 1 AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_settled') = 1 AND COUNT(DISTINCT "data"->>'executionId') = 1 AND COUNT(*) FILTER (WHERE "actor" = 'worker' AND "data"->>'applicationTaskId' = ${task.id} AND "data"->>'userId' = ${identity.userId} AND "data"->>'jobId' = ${task.jobId} AND "data"->>'sessionId' = ${identity.sessionId} AND "data"->>'fillTurnId' = ${task.fillTurnId} AND "data"->>'workerTaskId' = ${task.workerTaskId} AND "data"->>'approvalId' = ${receiptId} AND "data"->>'constraintHash' = ${constraintHash} AND "data"->>'executionId' <> '') = 2) AS safe FROM "application_task_events" WHERE "taskId" = ${task.id} AND "type" IN ('submission_execution_started', 'submission_execution_settled') AND ("data"->>'fillTurnId' = ${task.fillTurnId} OR "data"->>'workerTaskId' = ${task.workerTaskId})`)
-  if (execution[0]?.safe !== true) conflict("The prior Worker browser execution is not durably settled")
   const attempts = await tx.$queryRaw<SubmissionAttemptFence[]>(Prisma.sql`SELECT "userId", "jobId", "receiptId", "constraintHash", "state" FROM "submission_attempt" WHERE "receiptId" = ${receiptId} FOR UPDATE`)
   const attempt = attempts[0]
   if (attempts.length !== 1 || attempt?.userId !== identity.userId || attempt?.jobId !== task.jobId
@@ -158,7 +149,53 @@ async function resolveSubmission(tx: CommandTransaction, task: RecoveryTask, ide
     || payload?.applicationTaskId !== task.id || payload?.jobId !== task.jobId) {
     conflict("The original submission approval no longer matches its immutable attempt")
   }
-  return { workerTaskId: task.workerTaskId!, receiptId, constraintHash }
+  const execution = await tx.$queryRaw<{ noExecutionEvidence: boolean; exactSettledPair: boolean; exactStartedOnly: boolean }[]>(Prisma.sql`
+    SELECT
+      COUNT(*) = 0 AS "noExecutionEvidence",
+      (
+        COUNT(*) = 2
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_started') = 1
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_settled') = 1
+        AND COUNT(DISTINCT "data"->>'executionId') = 1
+        AND COUNT(*) FILTER (WHERE "actor" = 'worker'
+          AND "data"->>'applicationTaskId' = ${task.id}
+          AND "data"->>'userId' = ${identity.userId}
+          AND "data"->>'jobId' = ${task.jobId}
+          AND "data"->>'sessionId' = ${identity.sessionId}
+          AND "data"->>'fillTurnId' = ${task.fillTurnId}
+          AND "data"->>'workerTaskId' = ${task.workerTaskId}
+          AND "data"->>'approvalId' = ${receiptId}
+          AND "data"->>'constraintHash' = ${constraintHash}
+          AND "data"->>'executionId' <> '') = 2
+      ) AS "exactSettledPair",
+      (
+        COUNT(*) = 1
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_started') = 1
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_settled') = 0
+        AND COUNT(*) FILTER (WHERE "actor" = 'worker'
+          AND "data"->>'applicationTaskId' = ${task.id}
+          AND "data"->>'userId' = ${identity.userId}
+          AND "data"->>'jobId' = ${task.jobId}
+          AND "data"->>'sessionId' = ${identity.sessionId}
+          AND "data"->>'fillTurnId' = ${task.fillTurnId}
+          AND "data"->>'workerTaskId' = ${task.workerTaskId}
+          AND "data"->>'approvalId' = ${receiptId}
+          AND "data"->>'constraintHash' = ${constraintHash}
+          AND "data"->>'executionId' <> '') = 1
+      ) AS "exactStartedOnly"
+    FROM "application_task_events"
+    WHERE "taskId" = ${task.id}
+      AND "type" IN ('submission_execution_started', 'submission_execution_settled')
+      AND ("data"->>'fillTurnId' = ${task.fillTurnId} OR "data"->>'workerTaskId' = ${task.workerTaskId})
+  `)
+  const terminalEvidence = await readExactTerminalSubmitProof(tx, {
+    applicationTaskId: task.id, userId: identity.userId, jobId: task.jobId, sessionId: identity.sessionId,
+    fillTurnId: task.fillTurnId!, workerTaskId: task.workerTaskId!, receiptId, constraintHash,
+  })
+  if (terminalEvidence === "mismatch") conflict("The Worker terminal evidence does not match the exact submit attempt")
+  if (execution[0]?.noExecutionEvidence !== true && execution[0]?.exactSettledPair !== true
+    && (execution[0]?.exactStartedOnly !== true || terminalEvidence !== "valid")) conflict("The prior Worker browser execution is not durably settled")
+  return { workerTaskId: task.workerTaskId!, receiptId, constraintHash, terminalProof: terminalEvidence === "valid" }
 }
 async function lockUnsubmittedJob(tx: CommandTransaction, task: RecoveryTask, identity: CommandIdentity): Promise<void> {
   const rows = await tx.$queryRaw<JobFence[]>(Prisma.sql`
@@ -231,6 +268,7 @@ export async function confirmSubmissionNotReceived(db: PrismaClient, command: Co
       // DB changes stay uncommitted until exact queue cancellation and lock verification succeed.
       const verified = await verifyAndCancelSubmissionJob({
         workerTaskId: submission.workerTaskId,
+        allowMissingTerminalProof: submission.terminalProof,
         expected: { applicationTaskId: task.id, userId: identity.userId, jobId: task.jobId,
           sessionId: identity.sessionId, fillTurnId: task.fillTurnId!, receiptId: submission.receiptId, constraintHash: submission.constraintHash },
         withExactAttemptFence: removePendingJob => removePendingJob(),

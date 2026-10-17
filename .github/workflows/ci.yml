@@ -111,19 +111,27 @@ jobs:
           src/queue/application-submit-outbox.test.ts
           src/queue/application-submit-outbox-terminal-recovery.test.ts
           src/queue/apply-queue-pipeline.test.ts
-      - name: Verify application submit recovery commit orders on disposable PostgreSQL
+      - name: Verify application submit publisher and recovery commit orders on disposable PostgreSQL and Redis
         env:
           CI: "true"
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
           AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
           AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
           AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          REDIS_URL: redis://127.0.0.1:6379/15
         run: |
           test "$CI" = "true"
           test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
           test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/queue/apply-queue-submit-recovery-pg.integration.test.ts
       - name: Verify application fill Stop and late Worker callbacks on disposable PostgreSQL
         env:
