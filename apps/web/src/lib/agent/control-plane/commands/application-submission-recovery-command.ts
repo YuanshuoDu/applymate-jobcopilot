@@ -128,8 +128,6 @@ async function resolveSubmission(tx: CommandTransaction, task: RecoveryTask, ide
     || (nonEmpty(eventData.receiptId) && nonEmpty(eventData.approvalId) && eventData.receiptId !== eventData.approvalId)) {
     conflict("The exact submit queue event conflicts with the current attempt")
   }
-  const execution = await tx.$queryRaw<{ safe: boolean }[]>(Prisma.sql`SELECT COUNT(*) = 0 OR (COUNT(*) = 2 AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_started') = 1 AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_settled') = 1 AND COUNT(DISTINCT "data"->>'executionId') = 1 AND COUNT(*) FILTER (WHERE "actor" = 'worker' AND "data"->>'applicationTaskId' = ${task.id} AND "data"->>'userId' = ${identity.userId} AND "data"->>'jobId' = ${task.jobId} AND "data"->>'sessionId' = ${identity.sessionId} AND "data"->>'fillTurnId' = ${task.fillTurnId} AND "data"->>'workerTaskId' = ${task.workerTaskId} AND "data"->>'approvalId' = ${receiptId} AND "data"->>'constraintHash' = ${constraintHash} AND "data"->>'executionId' <> '') = 2) AS safe FROM "application_task_events" WHERE "taskId" = ${task.id} AND "type" IN ('submission_execution_started', 'submission_execution_settled') AND ("data"->>'fillTurnId' = ${task.fillTurnId} OR "data"->>'workerTaskId' = ${task.workerTaskId})`)
-  if (execution[0]?.safe !== true) conflict("The prior Worker browser execution is not durably settled")
   const attempts = await tx.$queryRaw<SubmissionAttemptFence[]>(Prisma.sql`SELECT "userId", "jobId", "receiptId", "constraintHash", "state" FROM "submission_attempt" WHERE "receiptId" = ${receiptId} FOR UPDATE`)
   const attempt = attempts[0]
   if (attempts.length !== 1 || attempt?.userId !== identity.userId || attempt?.jobId !== task.jobId
@@ -151,11 +149,52 @@ async function resolveSubmission(tx: CommandTransaction, task: RecoveryTask, ide
     || payload?.applicationTaskId !== task.id || payload?.jobId !== task.jobId) {
     conflict("The original submission approval no longer matches its immutable attempt")
   }
+  const execution = await tx.$queryRaw<{ noExecutionEvidence: boolean; exactSettledPair: boolean; exactStartedOnly: boolean }[]>(Prisma.sql`
+    SELECT
+      COUNT(*) = 0 AS "noExecutionEvidence",
+      (
+        COUNT(*) = 2
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_started') = 1
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_settled') = 1
+        AND COUNT(DISTINCT "data"->>'executionId') = 1
+        AND COUNT(*) FILTER (WHERE "actor" = 'worker'
+          AND "data"->>'applicationTaskId' = ${task.id}
+          AND "data"->>'userId' = ${identity.userId}
+          AND "data"->>'jobId' = ${task.jobId}
+          AND "data"->>'sessionId' = ${identity.sessionId}
+          AND "data"->>'fillTurnId' = ${task.fillTurnId}
+          AND "data"->>'workerTaskId' = ${task.workerTaskId}
+          AND "data"->>'approvalId' = ${receiptId}
+          AND "data"->>'constraintHash' = ${constraintHash}
+          AND "data"->>'executionId' <> '') = 2
+      ) AS "exactSettledPair",
+      (
+        COUNT(*) = 1
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_started') = 1
+        AND COUNT(*) FILTER (WHERE "type" = 'submission_execution_settled') = 0
+        AND COUNT(*) FILTER (WHERE "actor" = 'worker'
+          AND "data"->>'applicationTaskId' = ${task.id}
+          AND "data"->>'userId' = ${identity.userId}
+          AND "data"->>'jobId' = ${task.jobId}
+          AND "data"->>'sessionId' = ${identity.sessionId}
+          AND "data"->>'fillTurnId' = ${task.fillTurnId}
+          AND "data"->>'workerTaskId' = ${task.workerTaskId}
+          AND "data"->>'approvalId' = ${receiptId}
+          AND "data"->>'constraintHash' = ${constraintHash}
+          AND "data"->>'executionId' <> '') = 1
+      ) AS "exactStartedOnly"
+    FROM "application_task_events"
+    WHERE "taskId" = ${task.id}
+      AND "type" IN ('submission_execution_started', 'submission_execution_settled')
+      AND ("data"->>'fillTurnId' = ${task.fillTurnId} OR "data"->>'workerTaskId' = ${task.workerTaskId})
+  `)
   const terminalEvidence = await readExactTerminalSubmitProof(tx, {
     applicationTaskId: task.id, userId: identity.userId, jobId: task.jobId, sessionId: identity.sessionId,
     fillTurnId: task.fillTurnId!, workerTaskId: task.workerTaskId!, receiptId, constraintHash,
   })
   if (terminalEvidence === "mismatch") conflict("The Worker terminal evidence does not match the exact submit attempt")
+  if (execution[0]?.noExecutionEvidence !== true && execution[0]?.exactSettledPair !== true
+    && (execution[0]?.exactStartedOnly !== true || terminalEvidence !== "valid")) conflict("The prior Worker browser execution is not durably settled")
   return { workerTaskId: task.workerTaskId!, receiptId, constraintHash, terminalProof: terminalEvidence === "valid" }
 }
 async function lockUnsubmittedJob(tx: CommandTransaction, task: RecoveryTask, identity: CommandIdentity): Promise<void> {

@@ -20,6 +20,11 @@ vi.mock("@/lib/apply-queue-client", async importOriginal => ({
 import { confirmSubmissionNotReceived } from "./application-submission-recovery-command"
 
 type Row = Record<string, unknown>
+const startedExecutionData: Row = { executionId: "execution_old", workerTaskId: "bull_old", applicationTaskId: "application_1",
+  userId: "user_1", jobId: "job_1", sessionId: "session_1", fillTurnId: "turn_old", approvalId: "approval_1", constraintHash: "constraint_1" }
+const terminalProofData: Row = { applicationTaskId: "application_1", userId: "user_1", jobId: "job_1", sessionId: "session_1",
+  fillTurnId: "turn_old", workerTaskId: "bull_old", approvalId: "approval_1", receiptId: "approval_1", constraintHash: "constraint_1",
+  terminalState: "completed", attemptsMade: 2, attempts: 3 }
 const command = {
   sessionId: "session_1", userId: "user_1", applicationTaskId: "application_1",
   requestId: "confirm_12345678", confirmedNotReceived: true as const,
@@ -61,7 +66,7 @@ function harness(options: {
   let sessionStatus = "waiting_for_user"
   const query = vi.fn(async (sql: unknown) => {
     const text = ((sql as { strings?: readonly string[] }).strings ?? []).join(" ")
-    if (text.includes("COUNT(DISTINCT") && text.includes("submission_execution_started")) {
+    if (text.includes('AS "noExecutionEvidence"') && text.includes('AS "exactStartedOnly"')) {
       const scoped = executionEvents.filter(event => {
         const data = event.data as Row
         return data.fillTurnId === task.fillTurnId || data.workerTaskId === task.workerTaskId
@@ -78,7 +83,9 @@ function harness(options: {
       const exactPair = scoped.length === 2 && starts.length === 1 && settled.length === 1
         && scoped.every(event => event.actor === "worker") && matches(start) && matches(terminal)
         && start?.executionId === terminal?.executionId
-      return [{ safe: scoped.length === 0 || exactPair }]
+      const exactStartedOnly = scoped.length === 1 && starts.length === 1 && settled.length === 0
+        && scoped[0]?.actor === "worker" && matches(start)
+      return [{ noExecutionEvidence: scoped.length === 0, exactSettledPair: exactPair, exactStartedOnly }]
     }
     if (text.includes('FROM "application_task_events"') && text.includes("submission_not_received_confirmed")) return options.duplicate ?? []
     if (text.includes('FROM "application_task_events"') && text.includes("submission_terminal_observed")) return options.terminalEvents ?? []
@@ -184,6 +191,30 @@ describe("confirmSubmissionNotReceived", () => {
     await expect(confirmSubmissionNotReceived(test.db, command)).resolves.toMatchObject({ disposition: "started" })
     expect(mocks.verifyAndCancelSubmissionJob).toHaveBeenCalledOnce()
     expect(mocks.createRootTurn).toHaveBeenCalledOnce()
+  })
+
+  it("accepts one exact started-only execution with persisted terminal proof and queue verification", async () => {
+    const test = harness({ executionEvents: [{ type: "submission_execution_started", actor: "worker", data: startedExecutionData }],
+      queueMissing: true, terminalEvents: [{ id: "terminal_1", data: terminalProofData }] })
+    await expect(confirmSubmissionNotReceived(test.db, command)).resolves.toMatchObject({ disposition: "started" })
+    expect(mocks.verifyAndCancelSubmissionJob).toHaveBeenCalledWith(expect.objectContaining({ allowMissingTerminalProof: true }))
+    expect(mocks.createRootTurn).toHaveBeenCalledOnce()
+    const queries = test.query.mock.calls.map(([sql]) => ((sql as { strings?: readonly string[] }).strings ?? []).join(" "))
+    const executionIndex = queries.findIndex(sql => sql.includes('AS "exactStartedOnly"'))
+    const proofIndex = queries.findIndex(sql => sql.includes("submission_terminal_observed"))
+    expect(executionIndex).toBeGreaterThanOrEqual(0)
+    expect(proofIndex).toBeGreaterThan(executionIndex)
+  })
+
+  it.each([
+    ["missing", []],
+    ["mismatched", [{ id: "terminal_1", data: { ...terminalProofData, workerTaskId: "bull_other" } }]],
+  ])("rejects a started-only execution with %s terminal proof", async (_label, terminalEvents) => {
+    const test = harness({ executionEvents: [{ type: "submission_execution_started", actor: "worker", data: startedExecutionData }],
+      queueMissing: true, terminalEvents })
+    await expect(confirmSubmissionNotReceived(test.db, command)).rejects.toMatchObject({ status: 409 })
+    expect(mocks.verifyAndCancelSubmissionJob).not.toHaveBeenCalled()
+    expect(mocks.createRootTurn).not.toHaveBeenCalled()
   })
 
   it("keeps an absent queue job blocked without exact Worker terminal evidence", async () => {
