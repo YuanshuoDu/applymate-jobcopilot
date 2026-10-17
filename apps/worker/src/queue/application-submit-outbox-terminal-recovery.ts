@@ -140,3 +140,18 @@ export async function reconcileClaimedTerminalSubmit(
   if (reconciled) return "reconciled"
   return fencedDelivery && fencedDelivery !== "terminal" && fencedDelivery !== "absent" ? fencedDelivery : "unchanged"
 }
+
+export async function reconcileTerminalSubmitJob(
+  pool: Pool,
+  queue: SubmitOutboxQueue,
+  job: { id?: string; data: ApplyTaskPayload } | undefined,
+): Promise<void> {
+  if (!job || typeof job.id !== "string" || !job.id || job.data.operation !== "submit") return
+  const submitPayload = job.data
+  if (!matchesApplyTaskSubmitPayload(submitPayload, submitPayload) || !/^[a-f0-9]{64}$/.test(submitPayload.constraintHash)) return
+  await reconcileClaimedTerminalSubmit(pool, queue, {
+    ...submitPayload,
+    workerTaskId: job.id,
+    submitPayload,
+  })
+}

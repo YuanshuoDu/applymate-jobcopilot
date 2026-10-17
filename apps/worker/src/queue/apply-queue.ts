@@ -1,6 +1,6 @@
 import { Queue, Worker, type Job } from "bullmq";
 import type { Pool } from "pg";
-import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
+import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload } from "@jobcopilot/shared";
 import { checkRateLimit } from "../rate-limit.js";
 import { withCloakContext } from "../cloak/pool.js";
 import { detectCaptcha } from "../cloak/captcha.js";
@@ -8,7 +8,6 @@ import { insertApplyResult, getPool, type InsertApplyResult } from "../db/apply-
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
 import {
   claimUnattendedSubmission,
-  reconcileClaimedSubmissionUncertain,
   updateJobForSubmission,
   UNCONFIRMED_SUBMISSION_MESSAGE,
 } from "../db/submission-guard.js";
@@ -51,6 +50,7 @@ import {
 import { redisConnection } from "../redis.js";
 import { createPgApplicationSubmitTool, type ApplicationSubmitOutput } from "../runtime/tools/application-submit-tool.js";
 import { recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js";
+import { reconcileTerminalSubmitJob } from "./application-submit-outbox-terminal-recovery.js";
 import { createBrowserApplicationSubmitProvider } from "../runtime/tools/browser-submit-provider.js";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import { linkAbortSignals } from "../runtime/interrupt/bridge.js";
@@ -1149,47 +1149,14 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 );
 
 applyWorker.on("completed", async (job) => {
-  try { await reconcileTerminalSubmissionClaim(job); }
+  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job); }
   catch (error: unknown) { console.warn("[apply-worker] Terminal submit recovery failed:", error instanceof Error ? error.message : String(error)); }
 });
 applyWorker.on("failed", async (job) => {
   if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
-  try { await reconcileTerminalSubmissionClaim(job); }
+  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job); }
   catch (error: unknown) { console.warn("[apply-worker] Terminal submit recovery failed:", error instanceof Error ? error.message : String(error)); }
 });
-
-async function reconcileTerminalSubmissionClaim(job: Job<ApplyTaskPayload> | undefined): Promise<void> {
-  if (!job || typeof job.id !== "string" || !job.id || job.data.operation !== "submit") return;
-  const submitPayload = job.data;
-  if (!matchesApplyTaskSubmitPayload(submitPayload, submitPayload) || !/^[a-f0-9]{64}$/.test(submitPayload.constraintHash)) return;
-  const workerTaskId = job.id;
-  await reconcileClaimedSubmissionUncertain(getPool(), {
-    applicationTaskId: submitPayload.applicationTaskId, userId: submitPayload.userId, jobId: submitPayload.jobId,
-    sessionId: submitPayload.sessionId, fillTurnId: submitPayload.fillTurnId,
-    approvalId: submitPayload.receiptId, constraintHash: submitPayload.constraintHash,
-  }, workerTaskId, async () => {
-    if (await applyQueue.isPaused()) return false;
-    const currentJob = await applyQueue.getJob(workerTaskId);
-    const lockKey = applyQueue.toKey(`${workerTaskId}:lock`);
-    // The terminal event supplies the exact identity when retention prunes its queue record.
-    if (!currentJob) return await redisConnection.exists(lockKey) === 0;
-    if (currentJob.id !== workerTaskId || !matchesExactSubmitPayload(currentJob.data, submitPayload)) return false;
-    const state = await currentJob.getState();
-    const terminal = state === "completed" || state === "failed" && currentJob.attemptsMade >= (currentJob.opts.attempts ?? 1);
-    if (!terminal) return false;
-    return await redisConnection.exists(lockKey) === 0;
-  });
-}
-
-function matchesExactSubmitPayload(value: unknown, expected: ApplyTaskSubmitPayload): value is ApplyTaskSubmitPayload {
-  if (!matchesApplyTaskSubmitPayload(value, expected) || typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const actual = value as unknown as Record<string, unknown>;
-  const expectedRecord = expected as unknown as Record<string, unknown>;
-  const expectedKeys = Object.keys(expectedRecord);
-  const actualKeys = Object.keys(actual);
-  return expectedKeys.length === actualKeys.length && expectedKeys.every(key =>
-    Object.prototype.hasOwnProperty.call(actual, key) && actual[key] === expectedRecord[key]);
-}
 
 async function loadApprovedTurnScope(
   pool: Pool,

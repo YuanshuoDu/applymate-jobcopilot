@@ -5,6 +5,7 @@ import {
   inspectSubmitDelivery,
   matchesSubmitJobPayload,
   reconcileClaimedTerminalSubmit,
+  reconcileTerminalSubmitJob,
   resetExpiredSubmitAuthorization,
 } from "./application-submit-outbox-terminal-recovery.js"
 import type { SubmitOutboxIntent, SubmitOutboxQueue } from "./application-submit-outbox-terminal-recovery.js"
@@ -65,6 +66,25 @@ describe("claimed submit terminal recovery", () => {
     expect(redis.get).toHaveBeenCalledWith(`bull:apply:${intent.workerTaskId}:lock`)
     expect(queue.getJob).toHaveBeenCalledTimes(2)
     expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId, expect.any(Function))
+  })
+
+  it("routes a valid terminal submit event through exact delivery reconciliation", async () => {
+    const job = makeJob("completed")
+    const { queue } = makeQueue({ job })
+
+    await reconcileTerminalSubmitJob({} as Pool, queue, job as never)
+
+    expect(mockReconcile).toHaveBeenCalledOnce()
+    expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId, expect.any(Function))
+  })
+
+  it("ignores malformed terminal submit event identities", async () => {
+    const job = makeJob("completed", { data: { ...intent.submitPayload, constraintHash: "invalid" } })
+    const { queue } = makeQueue({ job })
+
+    await reconcileTerminalSubmitJob({} as Pool, queue, job as never)
+
+    expect(mockReconcile).not.toHaveBeenCalled()
   })
 
   it("recovers an exact claimed attempt when BullMQ has pruned its terminal job", async () => {
@@ -149,6 +169,7 @@ describe("claimed submit terminal recovery", () => {
     const { queue } = makeQueue({ job })
 
     expect(matchesSubmitJobPayload(job.data, intent)).toBe(false)
+    expect(matchesSubmitJobPayload({ ...intent.submitPayload, unexpected: "field" }, intent)).toBe(false)
     await expect(inspectSubmitDelivery(queue, intent, false)).resolves.toBe("mismatch")
     await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("mismatch")
     expect(mockReconcile).not.toHaveBeenCalled()
