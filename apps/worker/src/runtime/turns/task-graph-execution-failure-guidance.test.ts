@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 import type { StepContext } from "../context/step-context-builder.js"
-import { buildTaskGraphExecutionFailureInstruction } from "./task-graph-execution-failure-guidance.js"
+import {
+  buildTaskGraphExecutionFailureInstruction,
+  lookupTaskGraphExecutionFailureAdvice,
+} from "./task-graph-execution-failure-guidance.js"
 
 const graphId = "observation:task-graph-current"
 const categories = [
@@ -8,6 +11,64 @@ const categories = [
   ["resume_state_unavailable", "For resume-state cues, inspect the current resume state and available evidence."],
   ["structured_output_invalid", "For structured-output cues, inspect the existing typed output contract and current available result evidence."],
 ] as const
+
+describe("lookupTaskGraphExecutionFailureAdvice", () => {
+  it.each(categories)("returns fixed advice for exact category %s", (category, expected) => {
+    expect(lookupTaskGraphExecutionFailureAdvice(category)).toBe(expected)
+  })
+
+  it("rejects non-exact values without coercing them", () => {
+    const nonMatching: unknown[] = [
+      "unknown_category",
+      " execution_setup_unavailable",
+      "execution_setup_unavailable ",
+      "Execution_setup_unavailable",
+      "execution_setup_unavailable: process launch failed",
+      "The execution setup is unavailable because the browser failed.",
+      undefined,
+      null,
+      1,
+      true,
+      Symbol("execution_setup_unavailable"),
+      0n,
+      new String("execution_setup_unavailable"),
+      [],
+    ]
+    for (const value of nonMatching) expect(lookupTaskGraphExecutionFailureAdvice(value)).toBeUndefined()
+  })
+
+  it("rejects inherited and accessor-backed values without invoking getters or toString", () => {
+    let getterInvocations = 0
+    let toStringInvocations = 0
+    const inherited = Object.create({
+      executionFailureCategory: categories[0][0],
+      toString() {
+        toStringInvocations += 1
+        return categories[0][0]
+      },
+    })
+    const accessor = Object.defineProperty({}, "executionFailureCategory", {
+      get() {
+        getterInvocations += 1
+        return categories[1][0]
+      },
+    })
+    Object.defineProperty(accessor, "toString", {
+      get() {
+        getterInvocations += 1
+        return () => {
+          toStringInvocations += 1
+          return categories[1][0]
+        }
+      },
+    })
+
+    expect(lookupTaskGraphExecutionFailureAdvice(inherited)).toBeUndefined()
+    expect(lookupTaskGraphExecutionFailureAdvice(accessor)).toBeUndefined()
+    expect(getterInvocations).toBe(0)
+    expect(toStringInvocations).toBe(0)
+  })
+})
 
 function failedNode(category: unknown, extra: Record<string, unknown> = {}) {
   return { key: "private-node", taskId: "private-task", goal: "PRIVATE_GOAL", status: "failed",
