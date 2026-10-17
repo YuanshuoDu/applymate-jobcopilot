@@ -8,6 +8,7 @@ import { rootTaskObjectiveDigest } from "./root-task-objective.js"
 type Row = Record<string, unknown>
 type Options = Readonly<{
   turnInput?: unknown
+  turnSource?: string
   rootGoal?: string
   rootCriteria?: readonly string[]
   stepAttempt?: number
@@ -45,7 +46,7 @@ function fixture(options: Options = {}) {
       }] }
       if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "source", "input"')) return { rows: [{
         id: "turn-current", sessionId: "session-1", userId: "user-1", rootTaskId: "root-current", status: "in_progress",
-        source: "user",
+        source: options.turnSource ?? "user",
         input: options.turnInput ?? { goal: " Plan a role " },
       }] }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [start()] }
@@ -101,6 +102,49 @@ describe("root task history current fence", () => {
       await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toBeUndefined()
       expect(test.queries.some(sql => sql.includes("turn.started"))).toBe(false)
     }
+  })
+
+  it("records validated scheduled criteria on the current fence", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "scheduled", scheduledAutomationSnapshot: {
+        schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+        targetRoles: [" Engineer "], targetLocations: ["Dublin"], minScore: 70,
+        dailyCap: 10, requireApproval: true, autoApply: false,
+      } },
+    })
+
+    await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toMatchObject({
+      scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 },
+    })
+  })
+
+  it("returns no history fence for a scheduled Turn with a malformed snapshot", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "scheduled", scheduledAutomationSnapshot: {
+        schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+        targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70,
+        dailyCap: 10, requireApproval: true, autoApply: "false",
+      } },
+    })
+
+    await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toBeUndefined()
+    expect(test.queries.some(sql => sql.includes("turn.started"))).toBe(false)
+  })
+
+  it("keeps manual automation history ordinary even if a scheduled snapshot is malformed", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "wrong" } },
+    })
+
+    const result = await readRootTaskHistoryFence(test.client, test.input)
+
+    expect(result?.scheduledAutomationCriteria).toBeUndefined()
+    expect(result?.objectiveDigest).toBe(rootTaskObjectiveDigest({
+      goal: "Plan a role", criteria: [{ criterionId: "criterion-1", requirement: "Compare roles" }],
+    }))
   })
 
   it("requires one canonical current Root start receipt", async () => {
