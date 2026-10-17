@@ -117,6 +117,15 @@ describe("root history planning guidance", () => {
     expect(textOf(withCategory)).toBe(`${baseline} Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning. For resume-state cues, inspect the current resume state and available evidence.`)
     expect(textOf(withCategory)).not.toContain("resume_state_unavailable")
 
+    const categoryWithHiddenTools = textOf(buildRootHistoryPlanningInstruction(
+      context([historyBlock(categoryContent)]), [{ name: "jobs.search" }],
+    ))
+    expect(categoryWithHiddenTools).toContain("Historical execution-category cues are hypotheses")
+    expect(categoryWithHiddenTools).toContain("No result-page command is visible")
+    expect(categoryWithHiddenTools).toContain("No current plan-replacement command is visible")
+    expect(categoryWithHiddenTools).not.toContain("agent.list")
+    expect(categoryWithHiddenTools).not.toContain("agent.plan")
+
     const completedContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
       { taskKind: "scout", status: "completed", lesson: categoryLesson },
     ] }] }
