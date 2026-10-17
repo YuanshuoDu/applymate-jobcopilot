@@ -11,6 +11,7 @@ import { attachTurnQuestionStore } from "./turn-question-store-factory.js"
 import { resolveNativeSemanticProgressModeWithClient } from "./native-semantic-mode-store.js"
 import { completeNativeSemanticRejectionStepWithClient } from "./native-semantic-rejection-completion.js"
 import { nativeSemanticSchemaConflict, readNativeSemanticRejectionsWithClient } from "./native-semantic-rejection-ledger.js"
+import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
 function conflict(resource: string): Error {
   const error = new Error(`TurnEngine persistence conflict: ${resource}`)
@@ -43,6 +44,10 @@ async function repairEventOutbox(client: QueryClient, expected: AgentOutboxIdent
   const existing = await client.query<Row>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox" WHERE "idempotencyKey" = $1 FOR UPDATE`, [expected.idempotencyKey])
   if (!matchesAgentOutboxIdentity(existing.rows[0], expected)) throw conflict(`event outbox ${expected.idempotencyKey} identity`)
 }
+async function projectRootTerminalEvent(client: QueryClient, owner: ExecutionOwnerFence, type: string, eventId: string): Promise<void> {
+  if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId || !["turn.failed", "turn.interrupted"].includes(type)) return
+  if (!(await updateRootObjectiveHistoryProjection(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }, { terminalEventId: eventId }))) throw conflict(`terminal objective history ${eventId}`)
+}
 async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngineEventInput[]): Promise<readonly { id: string }[]> {
   if (inputs.length === 0) return []
   const owner = inputs[0]!.owner
@@ -71,6 +76,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
           id: `agent-outbox-${row.id}`, topic: "agent.events", aggregateId: owner.sessionId, idempotencyKey: `agent-event:${row.id}`,
           payload: eventOutboxPayload({ owner, eventId: String(row.id), itemId: input.itemId, sequence: String(row.sequence), type: input.type, actor: String(row.actor), correlationId: input.correlationId, causationId: row.causationId === null ? null : String(row.causationId), idempotencyKey: input.idempotencyKey, payload: input.payload }),
         })
+        await projectRootTerminalEvent(client, owner, input.type, String(row.id))
         result.push({ id: String(row.id) }); previousId = String(row.id); continue
       }
       if (input.itemId) {
@@ -82,6 +88,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
       if (next === undefined) throw conflict(`session ${owner.sessionId}`)
       await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`, [input.id, owner.sessionId, owner.turnId, input.itemId, owner.taskId, BigInt(next).toString(), input.type, actor, input.correlationId, causationId, input.idempotencyKey, json(input.payload)])
       await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb)`, [`agent-outbox-${input.id}`, owner.sessionId, `agent-event:${input.id}`, json({ eventId: input.id, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: input.itemId, sequence: BigInt(next).toString(), type: input.type, actor, correlationId: input.correlationId, causationId, idempotencyKey: input.idempotencyKey, payload: input.payload })])
+      await projectRootTerminalEvent(client, owner, input.type, input.id)
       result.push({ id: input.id }); previousId = input.id
     }
     return result

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
@@ -14,10 +14,13 @@ import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summa
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
 vi.mock("../subagents/steering-reconciliation-ledger.js", async importOriginal => ({
   ...await importOriginal<typeof import("../subagents/steering-reconciliation-ledger.js")>(),
   assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
 }))
+vi.mock("../context/objective-history-projection.js", () => ({ updateRootObjectiveHistoryProjection: updateRootObjectiveHistoryProjectionMock }))
+beforeEach(() => updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true))
 
 const now = new Date("2026-09-25T10:00:00.000Z")
 const owner = {
@@ -142,6 +145,31 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
 }
 
 describe("atomic Turn terminal commit", () => {
+  it("projects the persisted Root-owned completion receipt and accepts the same event on replay", async () => {
+    const fake = makePool()
+    await commitTurnTerminal(fake.pool, input)
+    const terminalId = [...fake.events.values()].find(event => event.type === "turn.completed")?.id
+    await commitTurnTerminal(fake.pool, input)
+
+    expect(terminalId).toBeDefined()
+    expect(updateRootObjectiveHistoryProjectionMock).toHaveBeenNthCalledWith(1, fake.client, {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    }, { terminalEventId: terminalId })
+    expect(updateRootObjectiveHistoryProjectionMock).toHaveBeenNthCalledWith(2, fake.client, {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    }, { terminalEventId: terminalId })
+    expect(fake.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(3)
+  })
+
+  it("rolls back Root and Turn completion when the terminal receipt cannot be projected", async () => {
+    updateRootObjectiveHistoryProjectionMock.mockResolvedValueOnce(false)
+    const fake = makePool()
+
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toThrow(/terminal objective history/)
+    expect(fake.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
+    expect(fake.calls.some(call => call.sql === "COMMIT")).toBe(false)
+  })
+
   it("blocks native planning Root completion while steering remains unresolved", async () => {
     const fake = makePool([], undefined, { planningRoot: true })
     assertNoUnresolvedSteeringMock.mockReset().mockRejectedValueOnce(new Error("steering_reconciliation_pending"))
