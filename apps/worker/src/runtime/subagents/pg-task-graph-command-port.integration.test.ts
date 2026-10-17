@@ -23,6 +23,7 @@ import type { StepContext } from "../context/step-context-builder.js"
 import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_EVENT_TYPE } from "./steering-reconciliation-contract.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const ROOT_TASK_GOAL = "P3 TaskGraph command-port integration test"
 const ANALYST_VERIFICATION = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   role: "analyst",
@@ -176,7 +177,11 @@ function scheduleInput(value: Fixture, nodeCount = 8, typed = true, preparation?
   }
 }
 
-async function seed(pool: PgPool, value: Fixture): Promise<void> {
+async function seed(
+  pool: PgPool,
+  value: Fixture,
+  ownedTurnObjective?: Readonly<{ goal: string; successCriteria: readonly string[] }>,
+): Promise<void> {
   await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES
     ($1, $2, CURRENT_TIMESTAMP), ($3, $4, CURRENT_TIMESTAMP)`, [
     value.userId, `${value.userId}@example.invalid`, value.foreignUserId, `${value.foreignUserId}@example.invalid`,
@@ -192,19 +197,22 @@ async function seed(pool: PgPool, value: Fixture): Promise<void> {
   await pool.query(`INSERT INTO "agent_turns"
     ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
      "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-    VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+    VALUES ($1, $2, $3, 'in_progress', 'user', $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
       $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`, [
     value.turnId, value.sessionId, value.userId, value.turnLeaseOwner,
+    JSON.stringify(ownedTurnObjective
+      ? { input: { goal: ownedTurnObjective.goal, successCriteria: [...ownedTurnObjective.successCriteria] } }
+      : {}),
   ])
   await pool.query(`INSERT INTO "sub_agent_tasks"
     ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
      "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot",
      "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
-    VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'P3 TaskGraph command-port integration test',
+    VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', $5,
       '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
       '{"subagentPolicy":{"maxConcurrency":8,"maxDepth":8,"maxFanOut":8,"maxAttempts":2}}'::jsonb,
       1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`, [
-    value.rootTaskId, value.sessionId, value.turnId, value.parentLeaseOwner,
+    value.rootTaskId, value.sessionId, value.turnId, value.parentLeaseOwner, ROOT_TASK_GOAL,
   ])
   await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [value.rootTaskId])
   await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [value.rootTaskId, value.turnId])
@@ -1470,7 +1478,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
   it("pins the whole owned objective in the plan snapshot, replays it, and preserves it on later omission", async () => {
     const criteriaOwner = fixture()
     additionalFixtures.push(criteriaOwner)
-    await seed(adminPool!, criteriaOwner)
+    await seed(adminPool!, criteriaOwner, { goal: ROOT_TASK_GOAL, successCriteria: [] })
     const base = scheduleInput(criteriaOwner)
     const first = { ...base, proposal: { ...base.proposal, nodes: [base.proposal.nodes[0]!] }, rootSuccessCriteria: ["Include evidence for each result"] }
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, criteriaOwner.userId))
@@ -1538,7 +1546,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
   it("rolls back every graph write when the final event-outbox insert fails", async () => {
     const rollbackOwner = fixture()
     additionalFixtures.push(rollbackOwner)
-    await seed(adminPool!, rollbackOwner)
+    await seed(adminPool!, rollbackOwner, { goal: ROOT_TASK_GOAL, successCriteria: [] })
     const input = { ...scheduleInput(rollbackOwner, 7, true), rootSuccessCriteria: ["No partial plan criterion may persist"] }
     const before = await graphRows(adminPool!, rollbackOwner)
     const criteriaBefore = await adminPool!.query(`SELECT "successCriteria" FROM "sub_agent_tasks" WHERE "id" = $1`, [rollbackOwner.rootTaskId])
