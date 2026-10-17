@@ -700,13 +700,13 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       childId: `root-history-manual-child-${suffix}`, finalItemId: `root-history-manual-final-${suffix}`,
       sessionId, userId, turnSource: "automation", goal: objective, criteria,
       input: { goal: objective, successCriteria: criteria, automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "invalid" } },
-      startSequence: 460, terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
+      startSequence: 490, terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
     }
     const legacyAutomationSource: Source = {
       turnId: `root-history-legacy-automation-source-${suffix}`, rootTaskId: `root-history-legacy-automation-root-${suffix}`,
       childId: `root-history-legacy-automation-child-${suffix}`, finalItemId: `root-history-legacy-automation-final-${suffix}`,
       sessionId, userId, turnSource: "automation", goal: objective, criteria,
-      input: { goal: objective, successCriteria: criteria }, startSequence: 480,
+      input: { goal: objective, successCriteria: criteria }, startSequence: 495,
       terminalCreatedAt: new Date("2022-01-02T00:00:00.000Z"),
     }
     await insertSource(manualSource)
