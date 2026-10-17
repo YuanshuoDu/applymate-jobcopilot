@@ -14,6 +14,11 @@ export type SubmitOutboxIntent = ApplyTaskSubmitIdentity & Readonly<{
 }>
 export type SubmitOutboxQueue = Pick<Queue<ApplyTaskPayload>, "add" | "getJob" | "isPaused" | "client" | "toKey">
 export type SubmitDeliveryState = "absent" | "terminal" | "deferred" | "missing" | "mismatch"
+export type SubmitTerminalObservation = Readonly<{
+  terminalState: "completed" | "failed"
+  attemptsMade: number
+  attempts: number
+}>
 
 export async function validateCurrentSubmit(
   client: PoolClient, intent: SubmitOutboxIntent,
@@ -121,10 +126,75 @@ export async function resetExpiredSubmitAuthorization(client: PoolClient, intent
   [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.receiptId, intent.workerTaskId])
 }
 
+function proofData(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function validTerminalObservation(value: SubmitTerminalObservation): boolean {
+  return Number.isSafeInteger(value.attemptsMade) && value.attemptsMade >= 0
+    && Number.isSafeInteger(value.attempts) && value.attempts >= 1
+    && (value.terminalState === "completed" || (value.terminalState === "failed" && value.attemptsMade >= value.attempts))
+}
+
+function matchesTerminalProof(value: unknown, intent: SubmitOutboxIntent): boolean {
+  const data = proofData(value)
+  if (!data) return false
+  return data.applicationTaskId === intent.applicationTaskId && data.userId === intent.userId
+    && data.jobId === intent.jobId && data.sessionId === intent.sessionId && data.fillTurnId === intent.fillTurnId
+    && data.workerTaskId === intent.workerTaskId && data.approvalId === intent.receiptId
+    && data.receiptId === intent.receiptId && data.constraintHash === intent.constraintHash
+    && (data.terminalState === "completed" || data.terminalState === "failed")
+    && Number.isSafeInteger(data.attemptsMade) && Number(data.attemptsMade) >= 0
+    && Number.isSafeInteger(data.attempts) && Number(data.attempts) >= 1
+    && (data.terminalState !== "failed" || Number(data.attemptsMade) >= Number(data.attempts))
+}
+
+async function readTerminalProof(client: PoolClient, intent: SubmitOutboxIntent): Promise<{ present: boolean; valid: boolean }> {
+  const rows = await client.query<{ data: unknown }>(`SELECT "data" FROM "application_task_events"
+    WHERE "taskId" = $1 AND "type" = 'submission_terminal_observed' AND "actor" = 'worker'
+      AND "data"->>'fillTurnId' = $2 FOR SHARE`, [intent.applicationTaskId, intent.fillTurnId])
+  return { present: rows.rows.length > 0, valid: rows.rows.length === 1 && matchesTerminalProof(rows.rows[0]?.data, intent) }
+}
+
+async function persistTerminalProof(
+  client: PoolClient, intent: SubmitOutboxIntent, observation: SubmitTerminalObservation,
+): Promise<boolean> {
+  if (!validTerminalObservation(observation)) return false
+  const existing = await readTerminalProof(client, intent)
+  if (existing.present) return existing.valid
+  const data = {
+    applicationTaskId: intent.applicationTaskId, userId: intent.userId, jobId: intent.jobId,
+    sessionId: intent.sessionId, fillTurnId: intent.fillTurnId, workerTaskId: intent.workerTaskId,
+    approvalId: intent.receiptId, receiptId: intent.receiptId, constraintHash: intent.constraintHash,
+    terminalState: observation.terminalState, attemptsMade: observation.attemptsMade, attempts: observation.attempts,
+  }
+  const inserted = await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
+    VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, 'submission_terminal_observed', 'worker',
+      'Worker observed a final terminal submit delivery', $2::jsonb, NOW())`, [intent.applicationTaskId, JSON.stringify(data)])
+  return inserted.rowCount === 1
+}
+
+async function observedTerminalJob(queue: SubmitOutboxQueue, intent: SubmitOutboxIntent): Promise<SubmitTerminalObservation | null> {
+  const job = await queue.getJob(intent.workerTaskId)
+  if (!job || job.id !== intent.workerTaskId || !matchesSubmitJobPayload(job.data, intent)) return null
+  const attempts = job.opts.attempts ?? 1, attemptsMade = job.attemptsMade
+  const state = await job.getState()
+  if (state !== "completed" && (state !== "failed" || attemptsMade < attempts)) return null
+  return { terminalState: state, attemptsMade, attempts }
+}
+
+async function verifyClaimedAttempt(client: PoolClient, intent: SubmitOutboxIntent): Promise<boolean> {
+  const result = await client.query(`SELECT 1 FROM "application_tasks" WHERE "id" = $1 AND "userId" = $2
+    AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6
+    AND "status" = 'filling' AND "checkpoint" IN ('browser_active', 'submission_request_started') FOR UPDATE`,
+  [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.workerTaskId])
+  return result.rowCount === 1
+}
+
 export async function reconcileClaimedTerminalSubmit(
-  pool: Pool, queue: SubmitOutboxQueue, intent: SubmitOutboxIntent,
+  pool: Pool, queue: SubmitOutboxQueue, intent: SubmitOutboxIntent, observed?: SubmitTerminalObservation,
 ): Promise<SubmitDeliveryState | "reconciled" | "unchanged"> {
-  // A durable exact claim may only recover as uncertain after a pruned job also has no exact lock.
+  // A missing queue record is not terminal evidence by itself; the attempt fence must find proof.
   const delivery = await inspectSubmitDelivery(queue, intent, true)
   if (delivery !== "terminal" && delivery !== "absent") return delivery
   const identity: ApplicationSubmitIdentity = {
@@ -133,9 +203,16 @@ export async function reconcileClaimedTerminalSubmit(
     approvalId: intent.receiptId, constraintHash: intent.constraintHash,
   }
   let fencedDelivery: SubmitDeliveryState | undefined
-  const reconciled = await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async () => {
+  const reconciled = await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async client => {
     fencedDelivery = await inspectSubmitDelivery(queue, intent, true)
-    return fencedDelivery === "terminal" || fencedDelivery === "absent"
+    if (fencedDelivery !== "terminal" && fencedDelivery !== "absent") return false
+    if (!await verifyClaimedAttempt(client, intent)) return false
+    if (fencedDelivery === "absent") {
+      if (!observed) return (await readTerminalProof(client, intent)).valid
+      return await persistTerminalProof(client, intent, observed)
+    }
+    const terminal = await observedTerminalJob(queue, intent)
+    return terminal ? persistTerminalProof(client, intent, terminal) : observed ? persistTerminalProof(client, intent, observed) : false
   })
   if (reconciled) return "reconciled"
   return fencedDelivery && fencedDelivery !== "terminal" && fencedDelivery !== "absent" ? fencedDelivery : "unchanged"
@@ -144,14 +221,18 @@ export async function reconcileClaimedTerminalSubmit(
 export async function reconcileTerminalSubmitJob(
   pool: Pool,
   queue: SubmitOutboxQueue,
-  job: { id?: string; data: ApplyTaskPayload } | undefined,
+  job: { id?: string; data: ApplyTaskPayload; attemptsMade?: number; opts?: { attempts?: number } } | undefined,
+  terminalState?: "completed" | "failed",
 ): Promise<void> {
   if (!job || typeof job.id !== "string" || !job.id || job.data.operation !== "submit") return
   const submitPayload = job.data
   if (!matchesApplyTaskSubmitPayload(submitPayload, submitPayload) || !/^[a-f0-9]{64}$/.test(submitPayload.constraintHash)) return
+  const attemptsMade = job.attemptsMade ?? 0, attempts = job.opts?.attempts ?? 1
+  if (terminalState === "failed" && attemptsMade < attempts) return
+  const observed = terminalState ? { terminalState, attemptsMade, attempts } : undefined
   await reconcileClaimedTerminalSubmit(pool, queue, {
     ...submitPayload,
     workerTaskId: job.id,
     submitPayload,
-  })
+  }, observed)
 }

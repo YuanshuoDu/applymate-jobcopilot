@@ -71,11 +71,13 @@ const identityMismatches: Array<[string, { id?: string; data?: Record<string, un
 
 function createJob(
   state: string,
-  overrides: { id?: string; data?: Record<string, unknown>; removeError?: Error } = {},
+  overrides: { id?: string; data?: Record<string, unknown>; removeError?: Error; attemptsMade?: number; attempts?: number } = {},
 ) {
   return {
     id: overrides.id ?? workerTaskId,
     data: { ...expected, operation: "submit", ...overrides.data } as EnqueueApplyInput,
+    attemptsMade: overrides.attemptsMade ?? 3,
+    opts: { attempts: overrides.attempts ?? 3 },
     getState: vi.fn().mockResolvedValue(state),
     remove: overrides.removeError
       ? vi.fn().mockRejectedValue(overrides.removeError)
@@ -116,8 +118,21 @@ describe("apply queue submission recovery check", () => {
 
   it.each(identityMismatches)("rejects a mismatched %s", async (_label, overrides) => {
     mocks.getJob.mockResolvedValue(createJob("completed", overrides));
-    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected })).resolves.toBe(false);
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, allowMissingTerminalProof: true })).resolves.toBe(false);
     expect(mocks.redis.exists).not.toHaveBeenCalled();
+  });
+
+  it("accepts a pruned exact job only when terminal proof is supplied and its exact lock is absent", async () => {
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected })).resolves.toBe(false);
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, allowMissingTerminalProof: true })).resolves.toBe(true);
+    expect(mocks.redis.exists).toHaveBeenLastCalledWith(`bull:apply-tasks:${workerTaskId}:lock`);
+    mocks.redis.exists.mockResolvedValue(1);
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, allowMissingTerminalProof: true })).resolves.toBe(false);
+  });
+
+  it("rejects a retryable failed job even when no exact lock is present", async () => {
+    mocks.getJob.mockResolvedValue(createJob("failed", { attemptsMade: 1, attempts: 3 }));
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, allowMissingTerminalProof: true })).resolves.toBe(false);
   });
 
   it.each(["completed", "failed", "waiting", "delayed"])("rejects %s while the exact lock exists", async status => {

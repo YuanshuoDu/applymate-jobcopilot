@@ -12,7 +12,10 @@ vi.mock("./transaction", () => ({
   createRootTurn: mocks.createRootTurn,
   lockOpenSession: mocks.lockOpenSession,
 }))
-vi.mock("@/lib/apply-queue-client", () => ({ verifyAndCancelSubmissionJob: mocks.verifyAndCancelSubmissionJob }))
+vi.mock("@/lib/apply-queue-client", async importOriginal => ({
+  ...await importOriginal<typeof import("@/lib/apply-queue-client")>(),
+  verifyAndCancelSubmissionJob: mocks.verifyAndCancelSubmissionJob,
+}))
 
 import { confirmSubmissionNotReceived } from "./application-submission-recovery-command"
 
@@ -26,7 +29,7 @@ function harness(options: {
   task?: Partial<Row>; turn?: Partial<Row>; job?: Partial<Row>; fillers?: Row[]; queuedEvents?: Row[]; approvals?: Row[]
   executionEvents?: Row[]
   submissionAttempt?: Partial<Row>; attemptMissing?: boolean; fillMaterials?: Row[]; coverLetters?: Row[]
-  duplicate?: Row[]; unsafeQueue?: boolean; activeTurn?: Row | null; notFound?: boolean
+  duplicate?: Row[]; terminalEvents?: Row[]; queueMissing?: boolean; unsafeQueue?: boolean; activeTurn?: Row | null; notFound?: boolean
 } = {}) {
   const task: Row = {
     id: "application_1", userId: "user_1", sessionId: "session_1", jobId: "job_1",
@@ -78,6 +81,7 @@ function harness(options: {
       return [{ safe: scoped.length === 0 || exactPair }]
     }
     if (text.includes('FROM "application_task_events"') && text.includes("submission_not_received_confirmed")) return options.duplicate ?? []
+    if (text.includes('FROM "application_task_events"') && text.includes("submission_terminal_observed")) return options.terminalEvents ?? []
     if (text.includes('FROM "application_task_events"') && text.includes("submission_queued")) return options.queuedEvents ?? [queued]
     if (text.includes('FROM "submission_attempt"')) return options.attemptMissing ? [] : [{ ...submissionAttempt }]
     if (text.includes('FROM "agent_approvals"')) return options.approvals ?? [approval]
@@ -142,8 +146,9 @@ function harness(options: {
     return newTurn
   })
   mocks.acceptInputFacts.mockResolvedValue({ inputId: "input_new", turnId: "turn_new", sequence: "42" })
-  mocks.verifyAndCancelSubmissionJob.mockImplementation(async (input: { withExactAttemptFence: (remove: () => Promise<boolean>) => Promise<boolean> }) => {
-    return options.unsafeQueue ? false : input.withExactAttemptFence(async () => true)
+  mocks.verifyAndCancelSubmissionJob.mockImplementation(async (input: { allowMissingTerminalProof?: boolean; withExactAttemptFence: (remove: () => Promise<boolean>) => Promise<boolean> }) => {
+    return options.unsafeQueue || (options.queueMissing && input.allowMissingTerminalProof !== true)
+      ? false : input.withExactAttemptFence(async () => true)
   })
   return { db, tx, query, task, job, turns, inputs, taskEvents, get sessionStatus() { return sessionStatus } }
 }
@@ -179,6 +184,44 @@ describe("confirmSubmissionNotReceived", () => {
     await expect(confirmSubmissionNotReceived(test.db, command)).resolves.toMatchObject({ disposition: "started" })
     expect(mocks.verifyAndCancelSubmissionJob).toHaveBeenCalledOnce()
     expect(mocks.createRootTurn).toHaveBeenCalledOnce()
+  })
+
+  it("keeps an absent queue job blocked without exact Worker terminal evidence", async () => {
+    const test = harness({ queueMissing: true })
+    await expect(confirmSubmissionNotReceived(test.db, command)).rejects.toMatchObject({ status: 409 })
+    expect(mocks.verifyAndCancelSubmissionJob).toHaveBeenCalledWith(expect.objectContaining({ allowMissingTerminalProof: false }))
+    expect(test.turns).toHaveLength(1)
+  })
+
+  it("accepts a pruned queue job only with exact final Worker terminal evidence", async () => {
+    const evidence = { applicationTaskId: "application_1", userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      fillTurnId: "turn_old", workerTaskId: "bull_old", approvalId: "approval_1", receiptId: "approval_1",
+      constraintHash: "constraint_1", terminalState: "completed", attemptsMade: 2, attempts: 3 }
+    const test = harness({ queueMissing: true, terminalEvents: [{ id: "terminal_1", data: evidence }] })
+    await expect(confirmSubmissionNotReceived(test.db, command)).resolves.toMatchObject({ disposition: "started" })
+    expect(mocks.verifyAndCancelSubmissionJob).toHaveBeenCalledWith(expect.objectContaining({ allowMissingTerminalProof: true }))
+  })
+
+  it("accepts a final failed proof after all Worker attempts are exhausted", async () => {
+    const evidence = { applicationTaskId: "application_1", userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      fillTurnId: "turn_old", workerTaskId: "bull_old", approvalId: "approval_1", receiptId: "approval_1",
+      constraintHash: "constraint_1", terminalState: "failed", attemptsMade: 3, attempts: 3 }
+    const test = harness({ queueMissing: true, terminalEvents: [{ id: "terminal_1", data: evidence }] })
+    await expect(confirmSubmissionNotReceived(test.db, command)).resolves.toMatchObject({ disposition: "started" })
+    expect(mocks.verifyAndCancelSubmissionJob).toHaveBeenCalledWith(expect.objectContaining({ allowMissingTerminalProof: true }))
+  })
+
+  it.each([
+    ["mismatched identity", { applicationTaskId: "another_task" }],
+    ["retryable failure", { terminalState: "failed", attemptsMade: 1, attempts: 3 }],
+  ])("rejects pruned queue evidence with %s", async (_label, mismatch) => {
+    const evidence = { applicationTaskId: "application_1", userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      fillTurnId: "turn_old", workerTaskId: "bull_old", approvalId: "approval_1", receiptId: "approval_1",
+      constraintHash: "constraint_1", terminalState: "completed", attemptsMade: 2, attempts: 3, ...mismatch }
+    const test = harness({ queueMissing: true, terminalEvents: [{ id: "terminal_1", data: evidence }] })
+    await expect(confirmSubmissionNotReceived(test.db, command)).rejects.toMatchObject({ status: 409 })
+    expect(mocks.verifyAndCancelSubmissionJob).not.toHaveBeenCalled()
+    expect(mocks.createRootTurn).not.toHaveBeenCalled()
   })
 
   it("ignores settled execution evidence from an older fill Turn", async () => {

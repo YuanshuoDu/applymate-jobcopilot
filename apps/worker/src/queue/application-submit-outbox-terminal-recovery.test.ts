@@ -11,6 +11,7 @@ import {
 import type { SubmitOutboxIntent, SubmitOutboxQueue } from "./application-submit-outbox-terminal-recovery.js"
 
 const mockReconcile = vi.hoisted(() => vi.fn().mockResolvedValue(true))
+const mockProofQuery = vi.hoisted(() => vi.fn())
 vi.mock("../db/submission-guard.js", () => ({ reconcileClaimedSubmissionUncertain: mockReconcile }))
 
 const identity = {
@@ -21,6 +22,7 @@ const intent: SubmitOutboxIntent = {
   ...identity, workerTaskId: "bull-submit-1",
   submitPayload: { ...identity, operation: "submit", applyUrl: "https://jobs.example/apply", personaId: "server", resumePath: "" },
 }
+let terminalProofRows: Array<{ data: unknown }> = []
 
 function makeJob(state: string, options: { id?: string; data?: unknown; attemptsMade?: number; attempts?: number } = {}) {
   return {
@@ -48,12 +50,25 @@ function makeQueue(options: { job?: ReturnType<typeof makeJob>; lock?: string | 
   return { queue: queue as unknown as SubmitOutboxQueue, redis }
 }
 
-beforeEach(() => mockReconcile.mockReset().mockImplementation(async (
+beforeEach(() => {
+  terminalProofRows = []
+  mockProofQuery.mockReset().mockImplementation(async (sql: unknown, values?: unknown[]) => {
+    const query = String(sql)
+    if (query.includes('FROM "application_tasks"')) return { rows: [{ id: intent.applicationTaskId }], rowCount: 1 }
+    if (query.includes('FROM "application_task_events"')) return { rows: terminalProofRows, rowCount: terminalProofRows.length }
+    if (query.includes('INSERT INTO "application_task_events"') && query.includes("submission_terminal_observed")) {
+      terminalProofRows.push({ data: JSON.parse(String(values?.[1])) as unknown })
+      return { rows: [], rowCount: 1 }
+    }
+    return { rows: [], rowCount: 0 }
+  })
+  mockReconcile.mockReset().mockImplementation(async (
   _pool: unknown,
   _identity: unknown,
   _workerTaskId: string,
-  isCurrentTerminalDelivery?: () => Promise<boolean>,
-) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery() : true))
+  isCurrentTerminalDelivery?: (client: unknown) => Promise<boolean>,
+) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery({ query: mockProofQuery }) : true)
+})
 
 describe("claimed submit terminal recovery", () => {
   it("reconciles only a matching completed delivery after its exact lock is absent", async () => {
@@ -64,15 +79,16 @@ describe("claimed submit terminal recovery", () => {
 
     expect(redis.get).toHaveBeenCalledTimes(2)
     expect(redis.get).toHaveBeenCalledWith(`bull:apply:${intent.workerTaskId}:lock`)
-    expect(queue.getJob).toHaveBeenCalledTimes(2)
+    expect(queue.getJob).toHaveBeenCalledTimes(3)
     expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId, expect.any(Function))
+    expect(terminalProofRows[0]?.data).toMatchObject({ ...identity, workerTaskId: intent.workerTaskId, terminalState: "completed" })
   })
 
   it("routes a valid terminal submit event through exact delivery reconciliation", async () => {
     const job = makeJob("completed")
     const { queue } = makeQueue({ job })
 
-    await reconcileTerminalSubmitJob({} as Pool, queue, job as never)
+    await reconcileTerminalSubmitJob({} as Pool, queue, job as never, "completed")
 
     expect(mockReconcile).toHaveBeenCalledOnce()
     expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId, expect.any(Function))
@@ -87,14 +103,43 @@ describe("claimed submit terminal recovery", () => {
     expect(mockReconcile).not.toHaveBeenCalled()
   })
 
-  it("recovers an exact claimed attempt when BullMQ has pruned its terminal job", async () => {
+  it("does not recover a missing job without persisted terminal proof", async () => {
     const { queue, redis } = makeQueue()
 
-    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("unchanged")
 
     expect(queue.getJob).toHaveBeenCalledTimes(2)
     expect(redis.get).toHaveBeenCalledTimes(2)
     expect(mockReconcile).toHaveBeenCalledOnce()
+  })
+
+  it("persists terminal callback evidence when BullMQ prunes the job before reconciliation", async () => {
+    const { queue } = makeQueue()
+    const job = makeJob("completed")
+
+    await reconcileTerminalSubmitJob({} as Pool, queue, job as never, "completed")
+
+    expect(mockReconcile).toHaveBeenCalledOnce()
+    expect(terminalProofRows).toHaveLength(1)
+    expect(terminalProofRows[0]?.data).toMatchObject({ ...identity, workerTaskId: intent.workerTaskId,
+      terminalState: "completed", attemptsMade: 3, attempts: 3 })
+  })
+
+  it("persists only a final failed callback as terminal evidence", async () => {
+    const { queue } = makeQueue()
+    const job = makeJob("failed", { attemptsMade: 3, attempts: 3 })
+    await reconcileTerminalSubmitJob({} as Pool, queue, job as never, "failed")
+    expect(terminalProofRows[0]?.data).toMatchObject({ terminalState: "failed", attemptsMade: 3, attempts: 3 })
+    const retryable = makeJob("failed", { attemptsMade: 1, attempts: 3 })
+    await reconcileTerminalSubmitJob({} as Pool, queue, retryable as never, "failed")
+    expect(terminalProofRows).toHaveLength(1)
+    expect(mockReconcile).toHaveBeenCalledOnce()
+  })
+
+  it("does not accept mismatched persisted proof for a pruned job", async () => {
+    terminalProofRows = [{ data: { ...identity, workerTaskId: "other-job", terminalState: "completed", attemptsMade: 3, attempts: 3 } }]
+    const { queue } = makeQueue()
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("unchanged")
   })
 
   it("defers if the exact lock appears after the absent-job preflight", async () => {
@@ -132,7 +177,7 @@ describe("claimed submit terminal recovery", () => {
       expect(job.getState).toHaveBeenCalledOnce()
       currentState = "active"
       currentLock = lock
-      return isCurrentTerminalDelivery ? isCurrentTerminalDelivery() : false
+      return isCurrentTerminalDelivery ? isCurrentTerminalDelivery({ query: mockProofQuery }) : false
     })
 
     await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("deferred")

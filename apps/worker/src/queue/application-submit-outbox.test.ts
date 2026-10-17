@@ -75,6 +75,12 @@ function makeFixture(options: FixtureOptions = {}) {
         return result([{ sessionId: identity.sessionId, fillTurnId: state.task.fillTurnId,
           fillTurnSessionId: identity.sessionId, fillTurnUserId: identity.userId }])
       }
+      if (sql.startsWith('SELECT 1 FROM "application_tasks"')) {
+        const exactClaim = values[0] === identity.applicationTaskId && values[1] === identity.userId && values[2] === identity.jobId
+          && values[3] === identity.sessionId && values[4] === identity.fillTurnId && values[5] === workerTaskId
+          && state.task.status === "filling" && ["browser_active", "submission_request_started"].includes(state.task.checkpoint)
+        return result(exactClaim ? [{ id: identity.applicationTaskId }] : [])
+      }
       if (sql.includes('FROM "Job"') && sql.includes('SELECT "id"')) return result([{ id: identity.jobId }])
       if (sql.includes('SELECT "status", "checkpoint", "workerTaskId" FROM "application_tasks"')) {
         const exact = values[0] === identity.applicationTaskId && values[1] === identity.userId && values[2] === identity.jobId
@@ -84,6 +90,7 @@ function makeFixture(options: FixtureOptions = {}) {
       if (sql.includes('SELECT "status", "workflowState" FROM "Job"')) return result([{ ...state.job }])
       if (sql.includes('SELECT "accountStatus" FROM "User"')) return result([{ accountStatus: options.accountStatus ?? "active" }])
       if (sql.includes('FROM "agent_approvals"')) return options.approvalProblem ? result([], 0) : result([{ expired: options.approvalExpired ?? false }], 1)
+      if (sql.includes('FROM "application_task_events"') && sql.includes("submission_terminal_observed")) return result([])
       if (sql.includes('FROM "application_task_events"')) return result([{ id: "queued-event" }])
       if (sql.startsWith("UPDATE application_tasks SET status = 'waiting_for_authorization'")) {
         state.task.status = "waiting_for_authorization"; state.task.checkpoint = "form_filled"; return result([], 1)
@@ -92,6 +99,7 @@ function makeFixture(options: FixtureOptions = {}) {
         state.job.workflowState = "ready_to_apply"; return result([], 1)
       }
       if (sql.startsWith("INSERT INTO application_task_events")) return result([], 1)
+      if (sql.startsWith('INSERT INTO "application_task_events"') && sql.includes("submission_terminal_observed")) return result([], 1)
       if (sql.startsWith('UPDATE "agent_outbox"') && sql.includes('"publishedAt" = CURRENT_TIMESTAMP')) {
         if (failAckOnce) { failAckOnce = false; throw new Error("injected acknowledgement failure") }
         state.outbox.publishedAt = new Date("2026-10-16T12:00:00.000Z")
@@ -177,9 +185,9 @@ describe("application submit outbox publisher", () => {
       expect(args[2]).toBe(workerTaskId)
       expect(args[3]).toBeTypeOf("function")
       expect(fixture.queue.getJob).toHaveBeenCalledTimes(queueLookupsBeforeRecovery + 2)
-      const isCurrentTerminalDelivery = args[3] as () => Promise<boolean>
-      expect(await isCurrentTerminalDelivery()).toBe(true)
-      expect(fixture.queue.getJob).toHaveBeenCalledTimes(queueLookupsBeforeRecovery + 3)
+      const isCurrentTerminalDelivery = args[3] as (client: unknown) => Promise<boolean>
+      expect(await isCurrentTerminalDelivery({ query: fixture.client.query })).toBe(true)
+      expect(fixture.queue.getJob).toHaveBeenCalledTimes(queueLookupsBeforeRecovery + 4)
       fixture.state.task.status = "waiting_for_user"
       fixture.state.task.checkpoint = "submission_uncertain"
       return true
@@ -412,12 +420,12 @@ describe("application submit outbox publisher", () => {
     expect(fixture.state.outbox.lastError).toBe("terminal:terminal_submit_reconciled")
   })
 
-  it("recovers an exact claimed attempt after its job is pruned without republishing", async () => {
+  it("does not recover an exact claimed attempt after pruning without terminal proof", async () => {
     const fixture = makeFixture({ checkpoint: "browser_active", jobWorkflow: "submitting" })
     fixture.state.outbox.publishedAt = new Date("2026-10-16T12:00:00.000Z")
     mockReconcileClaimedSubmissionUncertain.mockImplementationOnce(async (...args: unknown[]) => {
-      const validateDelivery = args[3] as (() => Promise<boolean>) | undefined
-      const safeToRecover = validateDelivery ? await validateDelivery() : false
+      const validateDelivery = args[3] as ((client: unknown) => Promise<boolean>) | undefined
+      const safeToRecover = validateDelivery ? await validateDelivery({ query: fixture.client.query }) : false
       if (safeToRecover) {
         fixture.state.task.status = "waiting_for_user"
         fixture.state.task.checkpoint = "submission_uncertain"
@@ -428,11 +436,11 @@ describe("application submit outbox publisher", () => {
     await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
 
     expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce()
-    expect(fixture.state.task).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain" })
+    expect(fixture.state.task).toMatchObject({ status: "filling", checkpoint: "browser_active" })
     expect(fixture.state.job).toEqual({ status: "saved", workflowState: "submitting" })
     expect(fixture.queue.add).not.toHaveBeenCalled()
     expect(fixture.state.outbox.publishedAt).toBeInstanceOf(Date)
-    expect(fixture.state.outbox.lastError).toBe("terminal:terminal_submit_reconciled")
+    expect(fixture.state.outbox.lastError).toBeNull()
   })
 
   it("defers a pruned claimed delivery while its exact Redis lock remains", async () => {

@@ -252,8 +252,14 @@ describe("apply-queue Phase 5 pipeline", () => {
       _pool: unknown,
       _identity: unknown,
       _workerTaskId: string,
-      isCurrentTerminalDelivery?: () => Promise<boolean>,
-    ) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery() : true);
+      isCurrentTerminalDelivery?: (client: unknown) => Promise<boolean>,
+    ) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery({
+      query: async (sql: string) => sql.includes('FROM "application_tasks"')
+        ? { rows: [{ id: "application-task-1" }], rowCount: 1 }
+        : sql.includes('FROM "application_task_events"')
+          ? { rows: [], rowCount: 0 }
+          : { rows: [], rowCount: 1 },
+    }) : true);
     mocks.fakePage.goto.mockResolvedValue(undefined);
     mocks.fakePage.context.mockClear();
     mocks.fakePage.close.mockReset().mockResolvedValue(undefined);

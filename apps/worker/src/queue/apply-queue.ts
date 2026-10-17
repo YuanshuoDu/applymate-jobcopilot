@@ -1149,12 +1149,12 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 );
 
 applyWorker.on("completed", async (job) => {
-  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job); }
+  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job, "completed"); }
   catch (error: unknown) { console.warn("[apply-worker] Terminal submit recovery failed:", error instanceof Error ? error.message : String(error)); }
 });
 applyWorker.on("failed", async (job) => {
   if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
-  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job); }
+  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job, "failed"); }
   catch (error: unknown) { console.warn("[apply-worker] Terminal submit recovery failed:", error instanceof Error ? error.message : String(error)); }
 });
 

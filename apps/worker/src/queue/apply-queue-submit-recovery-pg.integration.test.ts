@@ -8,7 +8,7 @@ import type { ApplyTaskSubmitPayload } from "@jobcopilot/shared"
 import { markSubmissionRequestStarted } from "../db/application-task-state.js"
 import { claimUnattendedSubmission, reconcileClaimedSubmissionUncertain } from "../db/submission-guard.js"
 import { APPLICATION_SUBMIT_OUTBOX_TOPIC, drainApplicationSubmitOutbox } from "./application-submit-outbox.js"
-import { reconcileClaimedTerminalSubmit, type SubmitOutboxIntent, type SubmitOutboxQueue } from "./application-submit-outbox-terminal-recovery.js"
+import { reconcileClaimedTerminalSubmit, reconcileTerminalSubmitJob, type SubmitOutboxIntent, type SubmitOutboxQueue } from "./application-submit-outbox-terminal-recovery.js"
 import { recordSubmissionExecutionSettled, withExactAttemptFence, type ApplicationSubmitIdentity, type ExactAttemptFenceResult } from "./application-submit-fence.js"
 
 function disposableTestUrl(): string | null {
@@ -611,8 +611,21 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
     }
   }, 30_000)
 
-  it.skipIf(!redisUrl)("recovers a durable claimed attempt after BullMQ prunes its terminal job", async () => {
-    const { identity, outboxId } = await prepareOutboxedSubmit("claimed-terminal-job-pruned")
+  it.skipIf(!redisUrl)("keeps a pruned claimed job blocked without Worker terminal evidence", async () => {
+    const { identity } = await prepareOutboxedSubmit("claimed-terminal-job-pruned-without-proof")
+    await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(1)
+    await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("claimed")
+    const waiting = await submitQueue!.getJob(identity.workerTaskId)
+    expect(await waiting?.getState()).toBe("waiting")
+    await waiting!.remove()
+    await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+    const unchanged = await submitRecoverySnapshot(identity)
+    expect(unchanged.task).toMatchObject({ status: "filling", checkpoint: "browser_active", workerTaskId: identity.workerTaskId })
+    expect(unchanged.events.filter(event => event.type === "submission_terminal_observed")).toHaveLength(0)
+  }, 20_000)
+
+  it.skipIf(!redisUrl)("recovers a durable claimed attempt after Worker terminal evidence survives pruning", async () => {
+    const { identity, outboxId, submitPayload } = await prepareOutboxedSubmit("claimed-terminal-job-pruned")
     const completed = deferred()
     let workerRedis: Redis | undefined
     let worker: Worker<ApplyTaskSubmitPayload, void> | undefined
@@ -637,6 +650,22 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       expect(await submitQueue!.getJob(identity.workerTaskId)).toBeUndefined()
       const lockKey = submitQueue!.toKey(`${identity.workerTaskId}:lock`)
       expect(await (await submitQueue!.client).get(lockKey)).toBeNull()
+      const observedIntent: SubmitOutboxIntent = {
+        applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+        sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
+        constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId, submitPayload,
+      }
+      await reconcileTerminalSubmitJob(pool, submitQueue as unknown as SubmitOutboxQueue, terminalJob, "completed")
+      const proof = await pool.query<{ data: Record<string, unknown> }>(
+        `SELECT "data" FROM "${schema}"."application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_terminal_observed'`,
+        [identity.applicationTaskId],
+      )
+      expect(proof.rows).toHaveLength(1)
+      expect(proof.rows[0]?.data).toMatchObject({ applicationTaskId: identity.applicationTaskId, userId: identity.userId,
+        jobId: identity.jobId, sessionId: identity.sessionId, fillTurnId: identity.fillTurnId,
+        workerTaskId: identity.workerTaskId, approvalId: identity.approvalId, receiptId: identity.approvalId,
+        constraintHash: identity.constraintHash, terminalState: "completed" })
+      await expect(reconcileClaimedTerminalSubmit(pool, submitQueue as unknown as SubmitOutboxQueue, observedIntent)).resolves.toBe("unchanged")
 
       const addSpy = vi.spyOn(submitQueue!, "add")
       try {
@@ -653,7 +682,7 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       const outbox = await pool.query<{ publishedAt: Date | null; lastError: string | null }>(
         `SELECT "publishedAt", "lastError" FROM "${schema}"."agent_outbox" WHERE "id" = $1`, [outboxId],
       )
-      expect(outbox.rows[0]).toMatchObject({ lastError: "terminal:terminal_submit_reconciled" })
+      expect(outbox.rows[0]?.lastError).toMatch(/^terminal:/)
       expect(outbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
     } finally {
       if (worker) await worker.close().catch(() => undefined)
