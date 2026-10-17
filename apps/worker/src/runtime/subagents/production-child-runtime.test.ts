@@ -1191,6 +1191,8 @@ describe("production child runtime", () => {
       }],
     )
     const revisionRef = { ...artifactRef, version: 2, contentHash: hashArtifactContent(revisedBody) }
+    const findingEchoCanary = `PRIVATE_REVIEW_FINDING_CANARY: ${finding.message}`
+    const echoedRevisionFinalText = `{"schemaVersion":${JSON.stringify(ROLE_RESULT_SCHEMA)},"role":"writer","status":"completed","artifactRef":{"artifactId":${JSON.stringify(findingEchoCanary)},"artifactId":${JSON.stringify(revisionRef.artifactId)},"version":${revisionRef.version},"contentHash":${JSON.stringify(revisionRef.contentHash)},"sourceDigest":${JSON.stringify(revisionRef.sourceDigest)}}}`
     const revisionRequests: HarnessModelRequest[] = []
     const revisionModel: ModelAdapter = {
       id: "fixture-model", profile,
@@ -1208,9 +1210,7 @@ describe("production child runtime", () => {
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        yield { type: "text_delta", text: JSON.stringify({
-          schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: revisionRef,
-        }) }
+        yield { type: "text_delta", text: echoedRevisionFinalText }
         yield { type: "completed", finishReason: "stop" }
       },
     }
@@ -1229,7 +1229,13 @@ describe("production child runtime", () => {
     })
     const revised = await revisionExecutor({ lease: revisionLease })
 
-    expect(revised).toMatchObject({ status: "completed", result: { structuredResult: { role: "writer", artifactRef: revisionRef } } })
+    const canonicalRevisionResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: revisionRef,
+    }
+    expect(revised).toMatchObject({ status: "completed", result: {
+      finalText: JSON.stringify(canonicalRevisionResult), structuredResult: canonicalRevisionResult,
+    } })
+    expect(JSON.stringify(revised.result)).not.toContain(findingEchoCanary)
     expect(revisionPool.transactionQueries).toEqual([
       "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
       "SELECT set_config('app.user_id', $1, true)",
@@ -1261,6 +1267,7 @@ describe("production child runtime", () => {
     expect(JSON.stringify(writerPersistence.writes)).not.toContain(finding.message)
     expect(JSON.stringify(reviewerPersistence.writes)).not.toContain(finding.message)
     expect(JSON.stringify(revisionPersistence.writes)).not.toContain(finding.message)
+    expect(JSON.stringify(revisionPersistence.writes)).not.toContain(findingEchoCanary)
     expect(JSON.stringify(revisionPersistence.writes)).not.toContain("The opening does not identify the strongest experience.")
 
     expect(revisionContext).toMatchObject({
