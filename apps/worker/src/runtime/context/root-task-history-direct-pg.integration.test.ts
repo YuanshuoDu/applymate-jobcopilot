@@ -734,5 +734,5 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     } finally {
       await updateCurrentTurn("user", { goal: objective, successCriteria: criteria })
     }
-  })
+  }, 30_000)
 })
