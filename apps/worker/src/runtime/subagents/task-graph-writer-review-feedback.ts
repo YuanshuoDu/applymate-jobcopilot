@@ -4,6 +4,7 @@ import { redactSensitiveText } from "@jobcopilot/shared"
 import type { AgentArtifactReviewRow } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext, ArtifactVersionRef } from "../tools/artifact-tools.js"
 import { hasPersistedTaskGraphMembership, loadTaskGraph } from "./task-graph-pg-state.js"
+import { TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { parseArtifactReference, type ArtifactVersionReference } from "./role-results.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
@@ -81,7 +82,12 @@ export async function assertPersistedWriterReviewDependency(
     }
     const writerNode = graph.snapshot?.nodes.find(node => node.taskId === lease.id)
     const writer = graph.tasks.get(lease.id)
-    if (graph.rootTaskId !== lease.rootTaskId || !writerNode || writerNode.templateId !== "cover_letter_writer"
+    const registeredWriter = writerNode?.templateId === "cover_letter_writer"
+    const nativeWriter = writerNode?.templateId === TASK_GRAPH_NATIVE_TEMPLATE_ID
+      && writerNode.nativeDelegation?.callerTaskId === lease.parentTaskId
+      && writerNode.nativeDelegation.role === "writer"
+      && writerNode.nativeDelegation.taskType === task.taskType
+    if (graph.rootTaskId !== lease.rootTaskId || !writerNode || (!registeredWriter && !nativeWriter)
       || !writer || writer.role !== "writer") {
       throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     }
@@ -271,7 +277,6 @@ function safeText(value: string, maxBytes: number): { text: string; truncated: b
   const text = utf8Prefix(redacted, maxBytes)
   return { text, truncated: text.length < redacted.length }
 }
-
 function utf8Prefix(value: string, maxBytes: number): string {
   let bytes = 0, prefix = ""
   for (const character of value) {
@@ -281,7 +286,6 @@ function utf8Prefix(value: string, maxBytes: number): string {
   }
   return prefix
 }
-
 function byteLength(value: unknown): number { return Buffer.byteLength(JSON.stringify(value), "utf8") }
 function scopeDigest(ref: ArtifactVersionReference): string { return ref.sourceDigest }
 function plainRecord(value: unknown): Record<string, unknown> | null {
@@ -291,7 +295,6 @@ function plainRecord(value: unknown): Record<string, unknown> | null {
       && Object.getOwnPropertySymbols(value).length === 0 ? value as Record<string, unknown> : null
   } catch { return null }
 }
-
 function safeRecord(value: unknown): Record<string, unknown> {
   return plainRecord(value) ?? {}
 }

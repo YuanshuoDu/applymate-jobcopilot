@@ -56,13 +56,18 @@ function review(findings: unknown = [finding()], overrides: Partial<AgentArtifac
 function writerFixture(templateId: string, dependsOn: string[], context: unknown) {
   const task = {
     id: "writer-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
-    role: "writer", taskType: "selected_job", status: "running", leaseOwner: "worker-1", attemptCount: 1, context,
+    role: "writer", taskType: "cover_letter_draft", status: "running", leaseOwner: "worker-1", attemptCount: 1, interruptRequestedAt: null, context,
   } as unknown as SubagentTaskRecord
   const lease = { ...task, ownerId: "worker-1", leaseExpiresAt: new Date("2099-01-01T00:00:00Z"), signal: new AbortController().signal } as SubagentLease
+  const nativeDelegation = templateId === "native" ? {
+    schemaVersion: "agent-harness.v2.task-graph.native-delegation.v1", operationKind: "spawn",
+    operationId: "native-writer-operation", requestFingerprint: "d".repeat(64), callerTaskId: "root-1",
+    role: "writer", taskType: task.taskType, contextDigest: "e".repeat(64), contextBytes: 0,
+  } : undefined
   const graph = {
     rootTaskId: "root-1",
     snapshot: { nodes: [
-      { key: "writer-node", taskId: task.id, templateId, dependsOn },
+      { key: "writer-node", taskId: task.id, templateId, dependsOn, ...(nativeDelegation ? { nativeDelegation } : {}) },
       { key: "analyst-node", taskId: "analyst-1", templateId: "analyst", dependsOn: [] },
       { key: "reviewer-node", taskId: "reviewer-1", templateId: "cover_letter_reviewer", dependsOn: [] },
     ] },
@@ -75,7 +80,18 @@ function writerFixture(templateId: string, dependsOn: string[], context: unknown
   graphMocks.loadTaskGraph.mockResolvedValue(graph)
   const queries: string[] = []
   const client = {
-    query: vi.fn(async (sql: string) => { queries.push(sql); return { rows: [], rowCount: 0 } }),
+    query: vi.fn(async (sql: string) => {
+      queries.push(sql)
+      const isWriterLeaseRead = sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session')
+      return {
+        rows: isWriterLeaseRead ? [{
+          id: task.id, userId: task.userId, sessionId: task.sessionId, turnId: task.turnId,
+          rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, status: task.status, role: task.role,
+          leaseOwner: task.leaseOwner, attemptCount: task.attemptCount, interruptRequestedAt: null,
+        }] : [],
+        rowCount: isWriterLeaseRead ? 1 : 0,
+      }
+    }),
     release: vi.fn(),
   }
   const pool = { connect: vi.fn(async () => client) }
@@ -83,7 +99,29 @@ function writerFixture(templateId: string, dependsOn: string[], context: unknown
 }
 
 describe("private Writer review feedback handoff", () => {
-  it("allows a selected-job Writer first draft with no Reviewer feedback dependency", async () => {
+  it("allows a native selected-job Writer first draft with no Reviewer feedback dependency", async () => {
+    const context = {
+      selectedJobPreparation: { jobId: scope.jobId },
+      taskGraphDependencyResults: {
+        schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{ role: "analyst" }],
+      },
+    }
+    const fixture = writerFixture("native", [], context)
+    const dependency = writerReviewDependencyFromTaskContext(context, scope.jobId)
+    const feedbackRead = vi.fn()
+    const modelCall = vi.fn()
+
+    expect(dependency).toBeNull()
+    await assertPersistedWriterReviewDependency(fixture.pool as never, fixture.task, fixture.lease, dependency)
+    if (dependency) feedbackRead()
+    modelCall()
+
+    expect(fixture.queries).toContain("COMMIT")
+    expect(feedbackRead).not.toHaveBeenCalled()
+    expect(modelCall).toHaveBeenCalledOnce()
+  })
+
+  it("allows a registered selected-job Writer first draft with no Reviewer feedback dependency", async () => {
     const context = {
       selectedJobPreparation: { jobId: scope.jobId },
       taskGraphDependencyResults: {
@@ -121,6 +159,24 @@ describe("private Writer review feedback handoff", () => {
     expect(fixture.queries).toContain("ROLLBACK")
     expect(feedbackRead).not.toHaveBeenCalled()
     expect(modelCall).not.toHaveBeenCalled()
+  })
+
+  it("allows feedback and model access for one persisted direct Reviewer edge assigned to the Writer", async () => {
+    const context = dependencyContext()
+    const fixture = writerFixture("cover_letter_writer", ["reviewer-node"], context)
+    const dependency = writerReviewDependencyFromTaskContext(context, scope.jobId)
+    const feedbackRead = vi.fn()
+    const modelCall = vi.fn()
+    const runWriter = async () => {
+      await assertPersistedWriterReviewDependency(fixture.pool as never, fixture.task, fixture.lease, dependency)
+      feedbackRead()
+      modelCall()
+    }
+
+    await expect(runWriter()).resolves.toBeUndefined()
+    expect(fixture.queries).toContain("COMMIT")
+    expect(feedbackRead).toHaveBeenCalledOnce()
+    expect(modelCall).toHaveBeenCalledOnce()
   })
 
   it("accepts one exact direct completed Reviewer receipt at the context parser", () => {
