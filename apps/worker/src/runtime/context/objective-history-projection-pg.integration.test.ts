@@ -21,7 +21,7 @@ function disposableUrl(): string | null {
 }
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip
-const suffix = randomUUID(), userId = "objective-history-user-" + suffix, sessionId = "objective-history-session-" + suffix
+const suffix = randomUUID(), userId = "objective-history-user-" + suffix
 const goal = "Find senior platform roles", criteria = ["Use the saved EU locations"]
 const requirements = { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
   { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
@@ -29,7 +29,7 @@ const requirements = { schemaVersion: "agent-harness.v2.objective-requirements.v
 const turnInput = { input: { goal, successCriteria: criteria, verificationRequirements: requirements,
   intent: { kind: "interactive_discovery_shortlist", version: 1 } } }
 const identities = Object.fromEntries(["objective", "failed", "interrupted", "completed"].map(name => [name, {
-  userId, sessionId, turnId: "objective-history-" + name + "-turn-" + suffix,
+  userId, sessionId: "objective-history-session-" + name + "-" + suffix, turnId: "objective-history-" + name + "-turn-" + suffix,
   rootTaskId: "objective-history-" + name + "-root-" + suffix,
 }])) as Record<string, RootObjectiveHistoryIdentity>
 const eventIds: Record<string, string> = {}, terminalAt = new Date("2026-10-16T12:30:00.321Z")
@@ -39,16 +39,16 @@ async function seedTurn(identity: RootObjectiveHistoryIdentity, turnStatus = "in
   await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input",
     "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
     VALUES ($1, $2, $3, $4, 'user', $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
-  [identity.turnId, sessionId, userId, turnStatus, JSON.stringify(turnInput)])
+  [identity.turnId, identity.sessionId, userId, turnStatus, JSON.stringify(turnInput)])
   await pool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "parentTaskId", "path", "depth", "role", "taskType", "status",
     "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot",
     "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
     VALUES ($1, $2, $3, NULL, '/root', 0, 'orchestrator', 'root', $4, $5, '[]'::jsonb, $6::jsonb, '[]'::jsonb,
     '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 1, CURRENT_TIMESTAMP)`,
-  [identity.rootTaskId, sessionId, identity.turnId, rootStatus, goal, JSON.stringify(criteria)])
-  await pool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1 AND "sessionId" = $2`, [identity.rootTaskId, sessionId])
+  [identity.rootTaskId, identity.sessionId, identity.turnId, rootStatus, goal, JSON.stringify(criteria)])
+  await pool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1 AND "sessionId" = $2`, [identity.rootTaskId, identity.sessionId])
   await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2 AND "sessionId" = $3`,
-    [identity.rootTaskId, identity.turnId, sessionId])
+    [identity.rootTaskId, identity.turnId, identity.sessionId])
 }
 
 async function insertEvent(input: {
@@ -84,8 +84,10 @@ describePg("objective history projection on disposable PostgreSQL", () => {
     pool = new Pool({ connectionString: databaseUrl!, max: 2 })
     await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
       [userId, userId + "@example.invalid"])
-    await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "eventSequence", "updatedAt")
-      VALUES ($1, $2, $3, 'running', 'test', 100, CURRENT_TIMESTAMP)`, [sessionId, userId, goal])
+    for (const identity of Object.values(identities)) {
+      await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "eventSequence", "updatedAt")
+        VALUES ($1, $2, $3, 'running', 'test', 100, CURRENT_TIMESTAMP)`, [identity.sessionId, userId, goal])
+    }
     await seedTurn(identities.objective!)
     await seedTurn(identities.failed!)
     await seedTurn(identities.interrupted!)
@@ -103,11 +105,11 @@ describePg("objective history projection on disposable PostgreSQL", () => {
     await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
       "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
       VALUES ($1, $2, $3, $4, 1, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [stepId, sessionId, identities.completed!.turnId, identities.completed!.rootTaskId])
+    [stepId, identities.completed!.sessionId, identities.completed!.turnId, identities.completed!.rootTaskId])
     await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase",
       "revision", "content", "startedAt", "completedAt", "updatedAt")
       VALUES ($1, $2, $3, $4, $5, 'agent_message', 'completed', 'final_answer', 1, '{"text":"done"}'::jsonb, $6, $6, $6)`,
-    [itemId, sessionId, identities.completed!.turnId, stepId, identities.completed!.rootTaskId, terminalAt])
+    [itemId, identities.completed!.sessionId, identities.completed!.turnId, stepId, identities.completed!.rootTaskId, terminalAt])
     await insertEvent({ id: randomUUID(), identity: identities.completed!, sequence: 107, type: "step.completed",
       taskId: identities.completed!.rootTaskId, correlationId: stepId,
       idempotencyKey: "turn:" + identities.completed!.turnId + ":event:step-completed:" + stepId,

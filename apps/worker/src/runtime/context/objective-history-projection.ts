@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
-import { rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin } from "./root-task-history-fence.js"
+import { hasSelectedJobPreparation, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin } from "./root-task-history-fence.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -97,9 +97,10 @@ async function updateObjective(client: Queryable, identity: RootObjectiveHistory
     FOR UPDATE OF turn, root`, [identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId])
   if (found.rows.length !== 1) return false
   const row = found.rows[0]!
-  const objectiveDigest = rootTaskHistoryObjectiveDigest(row.input, row, false) ?? null
-  const crossSessionDigest = rootTaskHistoryObjectiveDigest(row.input, row, true)
-  const canonicalOrigin = rootTaskHistoryOrigin(row.source, row.input)
+  const selectedJobScoped = hasSelectedJobPreparation(row.input)
+  const objectiveDigest = selectedJobScoped ? null : rootTaskHistoryObjectiveDigest(row.input, row, false) ?? null
+  const crossSessionDigest = selectedJobScoped ? undefined : rootTaskHistoryObjectiveDigest(row.input, row, true)
+  const canonicalOrigin = selectedJobScoped ? undefined : rootTaskHistoryOrigin(row.source, row.input)
   const canonicalOriginDigest = crossSessionDigest && canonicalOrigin
     ? createHash("sha256").update(JSON.stringify({ objectiveDigest: crossSessionDigest, canonicalOrigin })).digest("hex")
     : null
@@ -155,7 +156,7 @@ async function updateTerminal(client: Queryable, identity: RootObjectiveHistoryI
     WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4
       AND root."id" = $4 AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."taskType" = 'root'
       AND ((turn."status" = 'in_progress' AND root."status" = 'running')
-        OR (turn."status" IN ('completed', 'failed', 'interrupted') AND root."status" = turn."status'))
+        OR (turn."status" IN ('completed', 'failed', 'interrupted') AND root."status" = turn."status"))
     FOR UPDATE OF turn, root, event`, [identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId, eventId])
   if (found.rows.length !== 1) return false
   const row = found.rows[0]!, terminal = validTerminal(row, identity)

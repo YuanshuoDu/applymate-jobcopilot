@@ -63,6 +63,16 @@ describe("objective history projection", () => {
     expect(calls[1]?.sql).not.toContain("terminalEvent")
   })
 
+  it("leaves all objective keys unavailable for selected-job-scoped Turn input", async () => {
+    const input = { input: { goal, successCriteria: criteria, selectedJobPreparation: { selectedJobId: "job-1" } } }
+    expect(rootTaskHistoryObjectiveDigest(input, { goal, successCriteria: criteria })).toBeDefined()
+    const { client, calls } = clientWith({ rows: [turnRow(input)], rowCount: 1 }, { rowCount: 1 })
+
+    await expect(updateRootObjectiveHistoryProjection(client, identity)).resolves.toBe(true)
+
+    expect(calls[1]?.values?.slice(0, 3)).toEqual([null, null, null])
+  })
+
   it("keeps the same-session key but leaves cross-session indexing unavailable for invalid verification requirements", async () => {
     const input = { goal, successCriteria: criteria, verificationRequirements: { schemaVersion: "unknown", requirements: [] } }
     const { client, calls } = clientWith({ rows: [turnRow(input)], rowCount: 1 }, { rowCount: 1 })
