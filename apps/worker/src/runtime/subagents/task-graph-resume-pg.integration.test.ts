@@ -2282,7 +2282,7 @@ async function prepareSelectedJobTerminalCase(pool: Pool, value: Fixture) {
   const preparation = await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId)
   const tasks = new PgSubagentTaskStore(pool, 300_000)
   const root = await tasks.create({
-    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, role: "supervisor", taskType: "task_graph",
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, role: "orchestrator", taskType: "root",
     goal: "Complete the selected-job draft review before finalizing",
     allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft", "artifact.version.read", "artifact.review"],
     expectedOutputSchema: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 16, maxToolCalls: 16 } }, policy: defaultSubagentPolicy(),
@@ -2363,6 +2363,11 @@ async function prepareSelectedJobTerminalCase(pool: Pool, value: Fixture) {
   if (ownerFence.kind !== "turn") throw new Error("Finalization fixture owner is not a Turn lease")
   const owner = ownerFence
   const engineStore = createPgTurnEngineStore(pool)
+  await engineStore.appendEvent({
+    owner, id: `p3-finalization-turn-started-event-${value.suffix}`, itemId: null, type: "turn.started",
+    correlationId: value.turnId, causationId: null, idempotencyKey: `turn:${value.turnId}:event:turn-started`,
+    payload: { taskId: owner.taskId, rootTaskId: owner.taskId },
+  })
   await engineStore.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null, inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now: new Date() })
   await engineStore.appendEvent({
     owner, id: `p3-finalization-step-event-${value.suffix}`, itemId: null, type: "step.completed", correlationId: stepId, causationId: null,
