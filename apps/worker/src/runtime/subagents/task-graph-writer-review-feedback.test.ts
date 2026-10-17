@@ -83,14 +83,14 @@ function writerFixture(templateId: string, dependsOn: string[], context: unknown
 }
 
 describe("private Writer review feedback handoff", () => {
-  it("allows a native TaskGraph first draft with no Reviewer feedback dependency", async () => {
+  it("allows a selected-job Writer first draft with no Reviewer feedback dependency", async () => {
     const context = {
       selectedJobPreparation: { jobId: scope.jobId },
       taskGraphDependencyResults: {
         schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{ role: "analyst" }],
       },
     }
-    const fixture = writerFixture("native", ["analyst-node"], context)
+    const fixture = writerFixture("cover_letter_writer", ["analyst-node"], context)
     const dependency = writerReviewDependencyFromTaskContext(context, scope.jobId)
     const feedbackRead = vi.fn()
     const modelCall = vi.fn()

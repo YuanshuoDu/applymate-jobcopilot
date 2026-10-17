@@ -81,7 +81,8 @@ export async function assertPersistedWriterReviewDependency(
     }
     const writerNode = graph.snapshot?.nodes.find(node => node.taskId === lease.id)
     const writer = graph.tasks.get(lease.id)
-    if (graph.rootTaskId !== lease.rootTaskId || !writerNode || !writer || writer.role !== "writer") {
+    if (graph.rootTaskId !== lease.rootTaskId || !writerNode || writerNode.templateId !== "cover_letter_writer"
+      || !writer || writer.role !== "writer") {
       throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     }
     const directReviewers = graph.snapshot!.nodes.filter(node => node.templateId === "cover_letter_reviewer"
@@ -92,9 +93,6 @@ export async function assertPersistedWriterReviewDependency(
       throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     }
     if (!dependency) {
-      if (writerNode.templateId !== "native" && writerNode.templateId !== "cover_letter_writer") {
-        throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
-      }
       if (writer.status !== "running" || task.status !== "running" || lease.status !== "running") {
         throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
       }
@@ -102,7 +100,6 @@ export async function assertPersistedWriterReviewDependency(
       committed = true
       return
     }
-    if (writerNode.templateId !== "cover_letter_writer") throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     const reviewerNode = directReviewers[0]!
     const reviewer = graph.tasks.get(reviewerNode.taskId)
     if (!reviewer || reviewer.role !== "reviewer") throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
