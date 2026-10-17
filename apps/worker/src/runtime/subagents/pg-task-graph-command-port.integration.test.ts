@@ -881,8 +881,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       expect(accepted).toHaveLength(1)
       expect(accepted[0]!.value).toMatchObject({ status: "accepted", revision: 2 })
       expect(rejected).toHaveLength(1)
-      // The serialized loser observes the winner's newer revision before the graph conflict guard runs.
-      expect(rejected[0]!.reason).toMatchObject({ code: "revision_mismatch" })
+      // Different proposals at the same expected revision share an idempotency key, so the competing loser is rejected as an idempotency conflict.
+      expect(rejected[0]!.reason).toMatchObject({ code: "idempotency_conflict" })
 
       const afterRace = await durableGraphRows(adminPool!, value)
       expect(afterRace.children).toHaveLength(2)
