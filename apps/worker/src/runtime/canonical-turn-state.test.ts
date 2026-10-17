@@ -118,6 +118,36 @@ function nativeHistoryControl(goal = "Find jobs", requirement = "Use verified jo
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("restores the fenced Turn source and exact flat automation run mode", async () => {
+    const scheduledSnapshotMarker = "PRIVATE_SCHEDULED_AUTOMATION_SNAPSHOT"
+    const cases: Array<{ name: string; source: string; input: Record<string, unknown>; expectedMode?: "scheduled" | "manual" }> = [
+      { name: "scheduled automation", source: "automation", input: { goal: "Run scheduled automation", automationRunMode: "scheduled", scheduledAutomationSnapshot: { marker: scheduledSnapshotMarker } }, expectedMode: "scheduled" },
+      { name: "manual automation", source: "automation", input: { goal: "Run manual automation", automationRunMode: "manual" }, expectedMode: "manual" },
+      { name: "missing run mode", source: "automation", input: { goal: "Run automation" } },
+      { name: "unknown run mode", source: "automation", input: { goal: "Run automation", automationRunMode: "adhoc" } },
+      { name: "ordinary user turn", source: "user", input: { goal: "Find jobs" } },
+    ]
+
+    for (const testCase of cases) {
+      const fake = pool({ turn: { source: testCase.source, input: testCase.input, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+      const value = await loadCanonicalTurnState(fake, lease)
+      expect(value.source, testCase.name).toBe(testCase.source)
+      expect(value.turnInput, testCase.name).toEqual(testCase.input)
+      if (testCase.expectedMode) expect(value.automationRunMode, testCase.name).toBe(testCase.expectedMode)
+      else expect(value).not.toHaveProperty("automationRunMode")
+      if (testCase.name === "scheduled automation") {
+        expect(JSON.stringify(value.snapshot)).not.toContain(scheduledSnapshotMarker)
+        const turnQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_turns"'))?.[0]
+        expect(turnQuery).toContain('SELECT "id", "sessionId", "userId", "source", "status"')
+        expect(turnQuery).toContain('"input", "rootTaskId"')
+        expect(turnQuery).toContain('"leaseOwnerId" = $4')
+        expect(turnQuery).toContain('"leaseVersion" = $5')
+        expect(turnQuery).toContain('"leaseExpiresAt" > $6')
+        expect(turnQuery).toContain("FOR UPDATE")
+      }
+    }
+  })
+
   it("keeps answered Q/A beside exact-goal historical verifier advice across reload", async () => {
     const control = nativeHistoryControl()
     const content: InputContentPart[] = [{ type: "text", text: "Find jobs" }]
