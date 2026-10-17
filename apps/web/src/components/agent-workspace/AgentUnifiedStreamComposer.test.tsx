@@ -17,4 +17,13 @@ describe('Agent unified stream composer', () => {
     expect(source).toContain('attachmentComposerContext(attachedFiles)')
     expect(source).toContain("t('agent.quickThinkingPrompt')")
   })
+
+  it('offers explicit objectives only outside an active Turn and keeps ordinary sends independent', () => {
+    expect(source).toContain("!turnComposer && !objectiveFormOpen")
+    expect(source).toContain("!turnComposer && objectiveFormOpen")
+    expect(source).toContain("admissionOwnerRef.current === 'objective'")
+    expect(source).toContain('attachedFiles={attachedFiles}')
+    expect(source).toContain('setAttachedFiles([])')
+    expect(source).toContain("sendAgentTurnMessage(recordedSessionId, outgoing, 'steer'")
+  })
 })
