@@ -10,6 +10,7 @@ import { steeringReconciliationRecoveryError, TASK_GRAPH_VERIFICATION_BLOCKER } 
 import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { assertPlanningRootHasNoUnresolvedSteering } from "../subagents/pg-store-create.js"
+import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
@@ -135,6 +136,7 @@ function events(input: TerminalInput, startedBy: string): TurnEngineEventInput[]
 export async function commitTurnTerminal(pool: Pool, input: TerminalInput, finalizationGuard?: TurnEngineTerminalGuard): Promise<AtomicTurnCompletionResult> {
   if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
   const owner = input.owner
+  if (owner.taskId !== owner.rootTaskId) throw conflict(`root task ${owner.taskId}`)
   return transaction(pool, owner.userId, async client => {
     const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [owner.sessionId, owner.userId])
     if (!session.rows[0]) throw conflict(`session ${owner.sessionId}`)
@@ -227,6 +229,9 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       if (updatedTurn.rowCount !== 1) throw conflict(`turn ${owner.turnId} completion`)
       if (pendingFollowUp) await promoteFollowUp(client, owner, turnRow.source, turnRow.input, pendingFollowUp, input.now)
     }
+    const terminalEvent = saved[saved.length - 1]
+    if (!terminalEvent || terminalEvent.type !== "turn.completed" || !(await updateRootObjectiveHistoryProjection(client,
+      { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }, { terminalEventId: terminalEvent.id }))) throw conflict(`terminal objective history ${owner.turnId}`)
     return { status: "completed", finalItemId: input.finalItemId, events: saved }
   }, Boolean(finalizationGuard))
 }
