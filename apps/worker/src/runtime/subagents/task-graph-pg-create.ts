@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
+import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
 import { taskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
 import { hasOverlappingTaskGraphRepair } from "./task-graph-repair-conflicts.js"
 import { APPLICATION_FILLER_TEMPLATE_ID, isApplicationFillerTemplate, isHarnessSubagentRole } from "./role-policy.js"
@@ -36,6 +36,19 @@ function safeProposalSize(proposal: TaskGraphProposal): void {
   if (Buffer.byteLength(JSON.stringify(proposal), "utf8") > TASK_GRAPH_LIMITS.maxProposalBytes) throw new Error("task_graph_proposal_too_large")
 }
 
+function assertWriterReviewPlan(nodes: readonly TaskGraphNodeProposal[]): void {
+  const byKey = new Map(nodes.map(node => [node.key, node] as const))
+  const usedReviewers = new Set<string>()
+  for (const writer of nodes) {
+    if (writer.templateId !== "cover_letter_writer") continue
+    const reviewers = writer.dependsOn.filter(key => byKey.get(key)?.templateId === "cover_letter_reviewer")
+    if (reviewers.length > 1 || reviewers.some(key => usedReviewers.has(key))) {
+      throw Object.assign(new Error("Selected-job Writer and Reviewer dependencies conflict"), { code: "task_graph_writer_review_conflict" })
+    }
+    reviewers.forEach(key => usedReviewers.add(key))
+  }
+}
+
 export async function createGraphTasks(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>): Promise<CreatedGraphTasks> {
   const parentTask = { budgetSnapshot: parent.budgetSnapshot } as Pick<SubagentTaskRecord, "budgetSnapshot">
   const policy = policyFromTask(parentTask)
@@ -53,6 +66,7 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   }
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
+  assertWriterReviewPlan([...current.nodes, ...appended.addedNodes])
   if (hasOverlappingTaskGraphRepair(current.nodes, appended.addedNodes)) throw Object.assign(new Error("Overlapping TaskGraph repair"), { code: "task_graph_repair_conflict" })
   const capacity = taskGraphNodeCapacity({
     nodeCount: current.nodes.length,

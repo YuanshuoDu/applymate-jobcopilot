@@ -1,9 +1,13 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { SessionPauseRequestedError, SESSION_WORK_ADMISSION } from "../session-gate.js"
+
+const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
+vi.mock("../context/objective-history-projection.js", () => ({ updateRootObjectiveHistoryProjection: updateRootObjectiveHistoryProjectionMock }))
+beforeEach(() => updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true))
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1", userId: "user-1", leaseVersion: 3,
@@ -60,6 +64,64 @@ function turnStartBudgetFixture(input: {
 }
 
 describe("PostgreSQL TurnEngine store", () => {
+  it("projects only the persisted root-owned terminal event and reuses its id on replay", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const events = new Map<string, Record<string, unknown>>()
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"')) {
+        const row = events.get(String(values?.[1]))
+        return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+      }
+      if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: 12n }], rowCount: 1 }
+      if (sql.includes('INSERT INTO "agent_events"')) {
+        const [id, sessionId, turnId, itemId, taskId, sequence, type, actor, correlationId, causationId, key, payload] = values ?? []
+        events.set(String(key), { id, sessionId, turnId, itemId, taskId, sequence, type, actor, correlationId, causationId, payload: JSON.parse(String(payload)) })
+        return { rows: [], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    const input = { owner, id: "terminal-event-1", itemId: null, type: "turn.interrupted", correlationId: owner.turnId, causationId: null,
+      idempotencyKey: "turn:turn-1:event:turn-interrupted", payload: { turnId: owner.turnId, taskId: owner.taskId, errorCode: "stopped" } }
+
+    await store.appendEvent(input)
+    await store.appendEvent(input)
+
+    expect(updateRootObjectiveHistoryProjectionMock).toHaveBeenNthCalledWith(1, client, {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    }, { terminalEventId: "terminal-event-1" })
+    expect(updateRootObjectiveHistoryProjectionMock).toHaveBeenNthCalledWith(2, client, {
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    }, { terminalEventId: "terminal-event-1" })
+    expect(calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(1)
+    expect(calls.filter(call => call.sql.includes('UPDATE "agent_sessions"'))).toHaveLength(1)
+    const eventInsertOrder = client.query.mock.invocationCallOrder[calls.findIndex(call => call.sql.includes('INSERT INTO "agent_events"'))]!
+    expect(updateRootObjectiveHistoryProjectionMock.mock.invocationCallOrder[0]).toBeGreaterThan(eventInsertOrder)
+  })
+
+  it("rolls back a terminal event when its expected root projection is ineligible", async () => {
+    updateRootObjectiveHistoryProjectionMock.mockResolvedValueOnce(false)
+    const calls: string[] = []
+    const client = { query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: 12n }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+
+    await expect(store.appendEvent({ owner, id: "terminal-event-2", itemId: null, type: "turn.failed", correlationId: owner.turnId, causationId: null,
+      idempotencyKey: "turn:turn-1:event:turn-failed:provider_error", payload: { turnId: owner.turnId, taskId: owner.taskId, errorCode: "provider_error", finalItemId: null, final: {} } })).rejects.toThrow(/terminal objective history/)
+    expect(calls).toContain("ROLLBACK")
+    expect(calls).not.toContain("COMMIT")
+  })
+
   it("keeps flag-off mode resolution in the owner-scoped transaction without probing the new ledger", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = {

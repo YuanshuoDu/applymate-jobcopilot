@@ -22,6 +22,43 @@ function plannedNode(node: Omit<TaskGraphNodeProposal, "verification">): TaskGra
   return { ...node, verification: analystVerification }
 }
 
+type WriterReviewSeed = Readonly<{
+  key: string
+  templateId: "cover_letter_writer" | "cover_letter_reviewer"
+  dependsOn: readonly string[]
+  status?: TaskGraphState["nodes"][number]["status"]
+}>
+
+const writerReviewTemplates = {
+  cover_letter_writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: [] },
+  cover_letter_reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: [] },
+} as const
+
+function writerReviewNode(seed: WriterReviewSeed): TaskGraphNodeProposal {
+  return { key: seed.key, templateId: seed.templateId, goal: "Prepare a selected-job cover letter", successCriteria: ["Complete the task"], dependsOn: seed.dependsOn }
+}
+
+function writerReviewState(seeds: readonly WriterReviewSeed[], revision = 1): TaskGraphState {
+  const byKey = new Map(seeds.map(seed => [seed.key, seed] as const))
+  const depth = (seed: WriterReviewSeed): number => seed.dependsOn.length
+    ? Math.max(...seed.dependsOn.map(key => depth(byKey.get(key)!))) + 1 : 1
+  return {
+    revision, appliedEvents: [],
+    nodes: seeds.map(seed => ({ ...writerReviewNode(seed), depth: depth(seed), status: seed.status ?? "completed" })),
+  }
+}
+
+function writerReviewInput(nodes: readonly WriterReviewSeed[], expectedRevision: number): TaskGraphScheduleInput {
+  return {
+    scope: {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1,
+    },
+    proposal: { expectedRevision, nodes: nodes.map(writerReviewNode) },
+    templates: writerReviewTemplates,
+  }
+}
+
 function ownedTurnScopeRow(sql: string, values?: unknown[]) {
   if (sql.startsWith('SELECT "rootTaskId", "turnId" FROM "sub_agent_tasks"')) {
     return values?.[0] === "root-1" && values?.[1] === "session-1"
@@ -114,6 +151,75 @@ describe("createGraphTasks", () => {
     await expect(createGraphTasks(client, inputFor([fillerNode("fill-new")], 1), parent, priorFill, new Map([["fill-old", "task-old"]])))
       .rejects.toMatchObject({ code: "task_graph_application_filler_limit" })
 
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it("rejects one Reviewer reused by multiple Writers in the same proposal before database access", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 0 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input = writerReviewInput([
+      { key: "writer-v1", templateId: "cover_letter_writer", dependsOn: [] },
+      { key: "reviewer-v1", templateId: "cover_letter_reviewer", dependsOn: ["writer-v1"] },
+      { key: "writer-v2", templateId: "cover_letter_writer", dependsOn: ["reviewer-v1"] },
+      { key: "writer-v3", templateId: "cover_letter_writer", dependsOn: ["reviewer-v1"] },
+    ], 0)
+
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
+      .rejects.toMatchObject({ code: "task_graph_writer_review_conflict" })
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it.each(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"] as const)(
+    "rejects reusing a Reviewer across proposals when the prior Writer is %s", async status => {
+      const query = vi.fn(async () => ({ rows: [], rowCount: 0 }))
+      const client = { query } as unknown as Pick<pg.PoolClient, "query">
+      const current = writerReviewState([
+        { key: "writer-v1", templateId: "cover_letter_writer", dependsOn: [] },
+        { key: "reviewer-v1", templateId: "cover_letter_reviewer", dependsOn: ["writer-v1"] },
+        { key: "writer-v2", templateId: "cover_letter_writer", dependsOn: ["reviewer-v1"], status },
+      ])
+      const input = writerReviewInput([
+        { key: "writer-v3", templateId: "cover_letter_writer", dependsOn: ["reviewer-v1"] },
+      ], current.revision)
+
+      await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }, current,
+        new Map([["writer-v1", "task-writer-v1"], ["reviewer-v1", "task-reviewer-v1"], ["writer-v2", "task-writer-v2"]])))
+        .rejects.toMatchObject({ code: "task_graph_writer_review_conflict" })
+      expect(query).not.toHaveBeenCalled()
+    },
+  )
+
+  it("allows a later Writer after a fresh direct Reviewer", async () => {
+    const query = vi.fn(async () => { throw new Error("expected_database_read") })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const current = writerReviewState([
+      { key: "writer-v1", templateId: "cover_letter_writer", dependsOn: [] },
+      { key: "reviewer-v1", templateId: "cover_letter_reviewer", dependsOn: ["writer-v1"] },
+      { key: "writer-v2", templateId: "cover_letter_writer", dependsOn: ["reviewer-v1"] },
+      { key: "reviewer-v2", templateId: "cover_letter_reviewer", dependsOn: ["writer-v2"] },
+    ])
+    const input = writerReviewInput([
+      { key: "writer-v3", templateId: "cover_letter_writer", dependsOn: ["reviewer-v2"] },
+    ], current.revision)
+    const priorIds = new Map(current.nodes.map(node => [node.key, `task-${node.key}`] as const))
+
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }, current, priorIds))
+      .rejects.toThrow("expected_database_read")
+    expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it("rejects a Writer with multiple direct Reviewer prerequisites before database access", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 0 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input = writerReviewInput([
+      { key: "writer-v1", templateId: "cover_letter_writer", dependsOn: [] },
+      { key: "reviewer-v1", templateId: "cover_letter_reviewer", dependsOn: ["writer-v1"] },
+      { key: "reviewer-v2", templateId: "cover_letter_reviewer", dependsOn: ["writer-v1"] },
+      { key: "writer-v2", templateId: "cover_letter_writer", dependsOn: ["reviewer-v1", "reviewer-v2"] },
+    ], 0)
+
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
+      .rejects.toMatchObject({ code: "task_graph_writer_review_conflict" })
     expect(query).not.toHaveBeenCalled()
   })
 

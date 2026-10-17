@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { computeArtifactSourceDigest, InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
-import { bindSelectedJobReadInput, loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
+import { bindSelectedJobReadInput, loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, selectedJobToolAllowed } from "./selected-job-artifact-context.js"
 import { resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 
 type PersonaFactFixture = {
@@ -49,6 +49,14 @@ function pool(options: { job?: boolean; resume?: boolean; resumeName?: string; p
 }
 
 describe("loadSelectedJobArtifactContext", () => {
+  it("keeps the exact artifact read hidden from default Writers and grants only the revision Writer path", () => {
+    expect(selectedJobToolAllowed("writer", "artifact.version.read")).toBe(false)
+    expect(selectedJobToolAllowed("writer", "artifact.version.read", true)).toBe(true)
+    expect(selectedJobToolAllowed("writer", "cover_letter.draft")).toBe(true)
+    expect(selectedJobToolAllowed("reviewer", "artifact.version.read", true)).toBe(true)
+    expect(selectedJobToolAllowed("analyst", "artifact.version.read", true)).toBe(false)
+  })
+
   it("returns only a source digest when reading selected-job evidence through a caller-owned client", async () => {
     const client = pool()
 

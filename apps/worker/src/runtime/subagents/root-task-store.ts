@@ -9,6 +9,7 @@ import { parseRootTaskFinishMetadata, parseTerminalRootResult, type RootTaskTerm
 import { cleanupFailedRootTaskGraph } from "./task-graph-pg-root-failure-cleanup.js"
 import { checkTaskGraphTerminalVerification } from "../turns/turn-execution-completion-gate.js"
 import { assertPlanningRootCanFinish } from "./pg-store-create.js"
+import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 export type RootTaskReconciliation = RootTaskTerminalReconciliation
 export type RootTaskFinishMetadata = Readonly<{ interactiveDiscoveryShortlist: InteractiveDiscoveryShortlistProjection }>
 export type RootTaskStore = {
@@ -116,6 +117,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
           if (rebound.rowCount !== 1) throw new Error("root_task_terminal")
           const current = await client.query<Row>(SELECT_ROOT, [existingId, lease.sessionId, lease.turnId])
           if (!current.rows[0]) throw new Error("root_task_missing")
+          if (!(await updateRootObjectiveHistoryProjection(client, { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: existingId }))) throw new Error("root_objective_history_projection_failed")
           return task(current.rows[0])
         }
         const id = `root-${lease.turnId}`
@@ -136,6 +138,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         if (linked.rowCount !== 1) throw new Error("root_turn_fenced")
         const created = await client.query<Row>(SELECT_ROOT, [id, lease.sessionId, lease.turnId])
         if (!created.rows[0]) throw new Error("root_task_missing")
+        if (!(await updateRootObjectiveHistoryProjection(client, { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: id }))) throw new Error("root_objective_history_projection_failed")
         return task(created.rows[0])
       })
     },

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { createPgRootTaskStore } from "./root-task-store.js"
@@ -7,10 +7,14 @@ import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } fro
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
 vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
   ...await importOriginal<typeof import("./steering-reconciliation-ledger.js")>(),
   assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
 }))
+vi.mock("../context/objective-history-projection.js", () => ({ updateRootObjectiveHistoryProjection: updateRootObjectiveHistoryProjectionMock }))
+
+beforeEach(() => updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true))
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 3,
@@ -252,6 +256,25 @@ function legacyGraphNode() {
 }
 
 describe("createPgRootTaskStore", () => {
+  it("projects the linked root objective in the same transaction", async () => {
+    const fake = fakePool()
+    await createPgRootTaskStore(fake.pool).ensure({ lease, goal: "Find jobs" })
+    const link = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_turns" SET "rootTaskId"'))
+    expect(updateRootObjectiveHistoryProjectionMock).toHaveBeenCalledWith(fake.client, {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1",
+    })
+    expect(updateRootObjectiveHistoryProjectionMock.mock.invocationCallOrder[0]).toBeGreaterThan(fake.client.query.mock.invocationCallOrder[link]!)
+    expect(fake.calls).toContain("COMMIT")
+  })
+
+  it("rolls back a Root link when objective projection cannot resolve it", async () => {
+    updateRootObjectiveHistoryProjectionMock.mockResolvedValueOnce(false)
+    const fake = fakePool()
+    await expect(createPgRootTaskStore(fake.pool).ensure({ lease, goal: "Find jobs" })).rejects.toThrow("root_objective_history_projection_failed")
+    expect(fake.calls).toContain("ROLLBACK")
+    expect(fake.calls).not.toContain("COMMIT")
+  })
+
   it("creates a scoped root with explicit allowed actions and keeps secrets out", async () => {
     const fake = fakePool()
     const root = await createPgRootTaskStore(fake.pool).ensure({
@@ -272,6 +295,9 @@ describe("createPgRootTaskStore", () => {
   it("rebinds a stale waiting root before resume", async () => {
     const fake = fakePool(row())
     await createPgRootTaskStore(fake.pool).ensure({ lease, goal: "Find jobs", allowedActions: ["jobs.search", "jobs.get"] })
+    expect(updateRootObjectiveHistoryProjectionMock).toHaveBeenCalledWith(fake.client, {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1",
+    })
     const update = fake.client.query.mock.calls.find(([sql]) => sql.includes("SET \"status\" = 'running'"))
     expect(update?.[1]).toContain("worker-1")
     expect(update?.[1]).toContain(JSON.stringify(["jobs.search", "jobs.get"]))

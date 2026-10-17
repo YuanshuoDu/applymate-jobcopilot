@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
 
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
-import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
@@ -14,6 +14,9 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "../selected-job-preparation.js"
 import type { TurnLease } from "../turns/lease.js"
 import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { INTERACTIVE_DISCOVERY_ROOT_TOOLS, rootTaskAllowedActions, rootToolSurface } from "../interactive-discovery-contract.js"
+import { isSelectedJobRootTool } from "../canonical-turn-task-graph-context.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -120,6 +123,32 @@ function fixture(): Fixture {
 }
 
 function selectedJobId(value: Fixture): string { return `p3-task-graph-selected-job-${value.sessionId}` }
+
+function completedReviewerResultEnvelope() {
+  const digest = `sha256:${"a".repeat(64)}`
+  return {
+    status: "completed",
+    stepCount: 1,
+    toolCallCount: 1,
+    finalItemId: null,
+    finalText: "Review passed",
+    structuredResult: {
+      schemaVersion: ROLE_RESULT_SCHEMA,
+      role: "reviewer",
+      status: "completed",
+      artifactRef: { artifactId: "fixture-cover-letter", version: 1, contentHash: digest, sourceDigest: digest },
+      reviewStatus: "passed",
+      reviewHash: digest,
+    },
+  }
+}
+
+function selectedJobRootAllowedActions(templates: TaskGraphScheduleInput["templates"]): string[] {
+  const rootTools = rootToolSurface(
+    INTERACTIVE_DISCOVERY_ROOT_TOOLS.map(name => ({ name })), true, false, isSelectedJobRootTool,
+  )
+  return rootTaskAllowedActions(rootTools, templates, true)
+}
 
 function scheduleInput(value: Fixture, nodeCount = 8, typed = true, preparation?: SelectedJobPreparation): TaskGraphScheduleInput {
   const templateId = typed ? "analyst" : "cover_letter_writer"
@@ -235,6 +264,21 @@ async function graphRows(pool: PgPool, value: Fixture): Promise<Record<string, u
     pool.query(`SELECT "id", "revision" FROM "agent_items" WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task_graph'`, [value.sessionId, value.rootTaskId]),
     pool.query(`SELECT "id", "idempotencyKey" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [value.sessionId, taskGraphProposalKey(value.rootTaskId, 0)]),
     pool.query(`SELECT "topic", "idempotencyKey" FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "idempotencyKey"`, [value.sessionId]),
+  ])
+  return { children: children.rows, item: item.rows, events: events.rows, outbox: outbox.rows }
+}
+
+async function durableGraphRows(pool: PgPool, value: Fixture): Promise<Record<string, unknown>> {
+  const graphItemId = taskGraphItemId(value.rootTaskId)
+  const [children, item, events, outbox] = await Promise.all([
+    pool.query(`SELECT "id", "status", "role", "taskType", "goal", "allowedActions" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [value.sessionId, value.rootTaskId]),
+    pool.query(`SELECT "id", "revision", "content", "status" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "type" = 'task_graph'`, [graphItemId, value.sessionId]),
+    pool.query(`SELECT "id", "itemId", "taskId", "sequence", "type", "idempotencyKey", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 ORDER BY "sequence"`, [value.sessionId, value.turnId, graphItemId]),
+    pool.query(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload", "attemptCount", "publishedAt", "lastError"
+      FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "idempotencyKey"`, [value.sessionId]),
   ])
   return { children: children.rows, item: item.rows, events: events.rows, outbox: outbox.rows }
 }
@@ -609,14 +653,6 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const selectedId = selectedJobId(owner)
     await adminPool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [owner.turnId,
       JSON.stringify({ selectedJobPreparation: { jobId: selectedId } })])
-    const actionGrant = await adminPool!.query(
-      `UPDATE "sub_agent_tasks" SET "allowedActions" = $4::jsonb
-       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1
-         AND "parentTaskId" IS NULL AND "leaseOwner" = $5 AND "attemptCount" = 1
-         AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`,
-      [owner.rootTaskId, owner.sessionId, owner.turnId, JSON.stringify(["cover_letter.draft"]), owner.parentLeaseOwner],
-    )
-    expect(actionGrant.rowCount).toBe(1)
     const lease: TurnLease = {
       turnId: owner.turnId, sessionId: owner.sessionId, userId: owner.userId, ownerId: owner.turnLeaseOwner,
       leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 60_000),
@@ -624,6 +660,21 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const preparation = await loadSelectedJobPreparation(commandPool!, lease)
     if (!preparation || preparation.jobId !== selectedId) throw new Error("selected-job preparation was not owner-validated")
     const input = scheduleInput(owner, 8, false, preparation)
+    const rootAllowedActions = selectedJobRootAllowedActions(input.templates)
+    const templateActions = Object.values(input.templates).flatMap(template => template.allowedActions)
+    expect(templateActions.every(action => rootAllowedActions.includes(action))).toBe(true)
+    const actionGrant = await adminPool!.query(
+      `UPDATE "sub_agent_tasks" SET "allowedActions" = $4::jsonb
+       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1
+         AND "parentTaskId" IS NULL AND "leaseOwner" = $5 AND "attemptCount" = 1
+         AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`,
+      [owner.rootTaskId, owner.sessionId, owner.turnId, JSON.stringify(rootAllowedActions), owner.parentLeaseOwner],
+    )
+    expect(actionGrant.rowCount).toBe(1)
+    await seedReconciliationAgenda(adminPool!, owner, {
+      id: owner.stepId, sequence: await nextEventSequence(adminPool!, owner), cursor: 0n, planRevision: 0,
+      consumedInputIds: [],
+    })
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, owner.userId))
     const emptyRows = await graphRows(adminPool!, owner)
 
@@ -766,6 +817,131 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     )
     expect(planEvents.rows).toHaveLength(1)
     expect(beforeReplay.item).toEqual([{ id: taskGraphItemId(owner.rootTaskId), revision: 1 }])
+  }, 60_000)
+
+  it("serializes competing Writers for one completed Reviewer and leaves rejected reuse without durable writes", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const selectedId = selectedJobId(value)
+    await adminPool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId,
+      JSON.stringify({ selectedJobPreparation: { jobId: selectedId } })])
+    const lease: TurnLease = {
+      turnId: value.turnId, sessionId: value.sessionId, userId: value.userId, ownerId: value.turnLeaseOwner,
+      leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 60_000),
+    }
+    const preparation = await loadSelectedJobPreparation(commandPool!, lease)
+    if (!preparation || preparation.jobId !== selectedId) throw new Error("selected-job preparation was not owner-validated")
+    const baseInput = scheduleInput(value, 1, false, preparation)
+    const rootAllowedActions = selectedJobRootAllowedActions(baseInput.templates)
+    const templateActions = Object.values(baseInput.templates).flatMap(template => template.allowedActions)
+    expect(templateActions.every(action => rootAllowedActions.includes(action))).toBe(true)
+    const actionGrant = await adminPool!.query(
+      `UPDATE "sub_agent_tasks" SET "allowedActions" = $4::jsonb
+       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1
+         AND "parentTaskId" IS NULL AND "leaseOwner" = $5 AND "attemptCount" = 1
+         AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`,
+      [value.rootTaskId, value.sessionId, value.turnId, JSON.stringify(rootAllowedActions), value.parentLeaseOwner],
+    )
+    expect(actionGrant.rowCount).toBe(1)
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.stepId, sequence: await nextEventSequence(adminPool!, value), cursor: 0n, planRevision: 0,
+      consumedInputIds: [],
+    })
+
+    const racingPool = new PgPool({ connectionString: databaseUrl!, max: 2 })
+    try {
+      const command = createPgTaskGraphCommandPort(restrictedTransactionPool(racingPool, roleName, value.userId))
+      const initialReviewer = await command.appendAndSchedule({
+        ...baseInput,
+        proposal: { expectedRevision: 0, nodes: [{
+          key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft",
+          successCriteria: ["Persist a review receipt"], dependsOn: [],
+        }] },
+      })
+      expect(initialReviewer).toMatchObject({ status: "accepted", revision: 1, nodes: [{ key: "reviewer", status: "queued" }] })
+      const completedReviewer = await adminPool!.query(
+        `UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = $4::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+         WHERE "id" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "status" = 'queued'`,
+        [initialReviewer.nodes[0]!.taskId, value.sessionId, value.rootTaskId, JSON.stringify(completedReviewerResultEnvelope())],
+      )
+      expect(completedReviewer.rowCount).toBe(1)
+
+      const writerPlan = (key: string): TaskGraphScheduleInput => ({
+        ...baseInput,
+        proposal: { expectedRevision: 1, nodes: [{
+          key, templateId: "cover_letter_writer", goal: `Draft using completed Reviewer ${key}`,
+          successCriteria: ["Persist the selected-job draft"], dependsOn: ["reviewer"],
+        }] },
+      })
+      const competingPlans = [writerPlan("writer-a"), writerPlan("writer-b")]
+      const results = await Promise.allSettled(competingPlans.map(plan => command.appendAndSchedule(plan)))
+      const accepted = results.filter((result): result is PromiseFulfilledResult<TaskGraphScheduleReceipt> => result.status === "fulfilled")
+      const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      expect(accepted).toHaveLength(1)
+      expect(accepted[0]!.value).toMatchObject({ status: "accepted", revision: 2 })
+      expect(rejected).toHaveLength(1)
+      // Different proposals at the same expected revision share an idempotency key, so the competing loser is rejected as an idempotency conflict.
+      expect(rejected[0]!.reason).toMatchObject({ code: "idempotency_conflict" })
+
+      const afterRace = await durableGraphRows(adminPool!, value)
+      expect(afterRace.children).toHaveLength(2)
+      expect(afterRace.item).toMatchObject([{ id: taskGraphItemId(value.rootTaskId), revision: 2 }])
+      expect(afterRace.events).toHaveLength(2)
+      expect(afterRace.outbox).toHaveLength(4)
+      const persistedWriters = await adminPool!.query<{ id: string; status: string; allowedActions: string[] }>(
+        `SELECT "id", "status", "allowedActions" FROM "sub_agent_tasks"
+         WHERE "sessionId" = $1 AND "parentTaskId" = $2 AND "role" = 'writer' ORDER BY "id"`,
+        [value.sessionId, value.rootTaskId],
+      )
+      expect(persistedWriters.rows).toHaveLength(1)
+      expect(persistedWriters.rows[0]!.status).toBe("queued")
+      expect(persistedWriters.rows[0]!.allowedActions).toEqual(baseInput.templates.cover_letter_writer!.allowedActions)
+      expect(persistedWriters.rows[0]!.allowedActions.every(action => rootAllowedActions.includes(action))).toBe(true)
+      const graphAfterRace = await command.readCurrent(readScope(value))
+      const writerAfterRace = graphAfterRace.nodes.filter(node => node.templateId === "cover_letter_writer")
+      expect(writerAfterRace).toHaveLength(1)
+      expect(writerAfterRace[0]!.dependsOn).toEqual(["reviewer"])
+
+      const beforeReuse = await durableGraphRows(adminPool!, value)
+      await expect(command.appendAndSchedule({
+        ...baseInput,
+        proposal: { expectedRevision: 2, nodes: [{
+          key: "writer-reuse", templateId: "cover_letter_writer", goal: "Reuse the completed Reviewer",
+          successCriteria: ["Persist another selected-job draft"], dependsOn: ["reviewer"],
+        }] },
+      })).rejects.toMatchObject({ code: "task_graph_writer_review_conflict" })
+      expect(await durableGraphRows(adminPool!, value)).toEqual(beforeReuse)
+
+      const freshReviewer = await command.appendAndSchedule({
+        ...baseInput,
+        proposal: { expectedRevision: 2, nodes: [{
+          key: "reviewer-fresh", templateId: "cover_letter_reviewer", goal: "Review a fresh selected-job draft",
+          successCriteria: ["Persist the fresh review receipt"], dependsOn: [],
+        }] },
+      })
+      expect(freshReviewer).toMatchObject({ status: "accepted", revision: 3 })
+      const completedFreshReviewer = await adminPool!.query(
+        `UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = $4::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+         WHERE "id" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "status" = 'queued'`,
+        [freshReviewer.nodes[0]!.taskId, value.sessionId, value.rootTaskId, JSON.stringify(completedReviewerResultEnvelope())],
+      )
+      expect(completedFreshReviewer.rowCount).toBe(1)
+      const freshWriter = await command.appendAndSchedule({
+        ...baseInput,
+        proposal: { expectedRevision: 3, nodes: [{
+          key: "writer-fresh", templateId: "cover_letter_writer", goal: "Draft after the fresh Reviewer",
+          successCriteria: ["Persist the fresh selected-job draft"], dependsOn: ["reviewer-fresh"],
+        }] },
+      })
+      expect(freshWriter).toMatchObject({ status: "accepted", revision: 4 })
+      const finalGraph = await command.readCurrent(readScope(value))
+      const finalWriters = finalGraph.nodes.filter(node => node.templateId === "cover_letter_writer")
+      expect(finalWriters).toHaveLength(2)
+      expect(finalWriters.map(node => node.dependsOn)).toEqual([["reviewer"], ["reviewer-fresh"]])
+    } finally {
+      await racingPool.end()
+    }
   }, 60_000)
 
   it("reserves the first typed repair slot across ordinary appends", async () => {

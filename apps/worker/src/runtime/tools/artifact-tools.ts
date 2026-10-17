@@ -1,7 +1,7 @@
 import { Type, type Static } from "@sinclair/typebox"
 import type { Pool } from "pg"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
-import type { AgentArtifactReviewRow, AgentArtifactTaskFence, AgentArtifactVersionRow } from "../../db/agent-artifact-repo.js"
+import type { AgentArtifactReviewRow, AgentArtifactSourceDigestReader, AgentArtifactTaskFence, AgentArtifactVersionRow } from "../../db/agent-artifact-repo.js"
 import type { RuntimeToolDefinition, ToolExecutionContext } from "./types.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
 
@@ -17,13 +17,14 @@ const Findings = Type.Array(Finding, { maxItems: 64 })
 const MAX_DRAFT_CONTENT_LENGTH = 20_000
 const DraftContent = Type.String({ minLength: 1, maxLength: MAX_DRAFT_CONTENT_LENGTH, pattern: "\\S" })
 const DraftConstraints = Type.Object({ maxWords: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })) }, { additionalProperties: false })
-const DraftInput = Type.Object({ baseArtifactId: Id, baseHash: Digest, content: DraftContent, constraints: DraftConstraints, expectedPreviousHash: Type.Optional(Type.Union([Digest, Type.Null()])) }, { additionalProperties: false })
+const DraftInput = Type.Object({ baseArtifactId: Id, baseHash: Digest, content: DraftContent, constraints: DraftConstraints, expectedPreviousHash: Type.Optional(Type.Union([Digest, Type.Null()])), expectedPreviousVersion: Type.Optional(Type.Integer({ minimum: 1 })) }, { additionalProperties: false })
 const VersionReadInput = Type.Object({ artifactRef: ArtifactRefSchema }, { additionalProperties: false })
 const ReviewInput = Type.Object({ artifactRef: ArtifactRefSchema, decision: Type.Union([Type.Literal("passed"), Type.Literal("needs_revision"), Type.Literal("rejected")]), findings: Findings }, { additionalProperties: false })
 
 export type ArtifactToolDraftInput = Static<typeof DraftInput>
 export type ArtifactToolReviewInput = Static<typeof ReviewInput>
 export type ArtifactVersionRef = Static<typeof ArtifactRefSchema>
+export type ArtifactToolRevisionContext = Readonly<{ dependencyTaskId: string; artifactRef: ArtifactVersionRef; currentSourceDigest: string; reviewHash: string }>
 export type ArtifactFindingInput = Static<typeof Finding>
 export type ArtifactSourceMaterial = { readonly sourceRef: string; readonly content: unknown }
 export type SelectedJobPreparation = { readonly jobId: string; readonly sourceDigest: string; readonly evidenceRefs: readonly string[] }
@@ -35,6 +36,7 @@ export type ArtifactToolRecord = { readonly id: string; readonly type: "resume" 
 export interface ArtifactToolStore {
   read(userId: string, artifactId: string): Promise<ArtifactToolRecord | null>
   readVersion(scope: Pick<ArtifactToolScope, "userId" | "sessionId" | "jobId">, ref: ArtifactVersionRef): Promise<AgentArtifactVersionRow | null>
+  readRevisionReview(scope: ArtifactToolScope, revision: ArtifactToolRevisionContext): Promise<AgentArtifactReviewRow | null>
   writeDraft(scope: ArtifactToolScope, input: ArtifactToolDraftInput & { readonly requestHash: string }): Promise<AgentArtifactVersionRow>
   saveReview(input: Omit<AgentArtifactReviewRow, "id" | "artifactVersionId" | "createdAt"> & { readonly taskFence: AgentArtifactTaskFence }): Promise<AgentArtifactReviewRow>
   findReview(scope: Pick<ArtifactToolScope, "userId" | "sessionId" | "jobId">, ref: ArtifactVersionRef): Promise<AgentArtifactReviewRow | null>
@@ -89,6 +91,12 @@ function assertDraftConstraints(value: unknown): asserts value is Static<typeof 
   }
 }
 
+function assertDraftCompareAndSwap(input: ArtifactToolDraftInput): void {
+  if (input.expectedPreviousVersion !== undefined && (!Number.isSafeInteger(input.expectedPreviousVersion) || input.expectedPreviousVersion < 1)) {
+    throw new ArtifactToolError("precondition_failed", "Draft previous version must be a positive safe integer.")
+  }
+}
+
 const SAFE_REVIEW_PATHS = new Set(["text", "$.text", "opening", "$.opening", "body", "$.body", "closing", "$.closing", "signature", "$.signature"])
 const SAFE_REVIEW_INDEX_PATH = /^(?:\$\.)?(?:paragraphs|sentences)\[(?:0|[1-9]\d{0,2})\]$/
 const SAFE_REVIEW_IDENTIFIER = /^[a-z][a-z0-9_-]{0,39}$/
@@ -130,6 +138,7 @@ export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefini
         const scope = scopeOf(context)
         assertDraftContent(value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).content : undefined)
         const input = value as ArtifactToolDraftInput
+        assertDraftCompareAndSwap(input)
         assertDraftConstraints(input.constraints)
         const base = await store.read(scope.userId, input.baseArtifactId)
         if (!base || base.jobId !== scope.jobId || base.type !== "cover_letter" || base.lifecycle !== "base" || base.hash !== input.baseHash) throw new ArtifactToolError("stale_hash", "Selected-job cover-letter base is stale or unavailable.")
@@ -203,7 +212,9 @@ export class InMemoryArtifactToolStore implements ArtifactToolStore {
     const id = artifactId(scope.userId, scope.jobId)
     const previous = this.records.get(id)
     if (previous?.lifecycle === "base") throw new ArtifactToolError("precondition_failed", "A base artifact cannot be replaced by a draft.")
-    if (previous && input.expectedPreviousHash !== undefined && input.expectedPreviousHash !== previous.hash) throw new ArtifactToolError("precondition_failed", "Draft update has a stale previous hash.")
+    assertDraftCompareAndSwap(input)
+    if (input.expectedPreviousVersion !== undefined && (!previous || input.expectedPreviousVersion !== previous.version)) throw new ArtifactToolError("precondition_failed", "Draft update has a stale previous version.")
+    if (input.expectedPreviousHash !== undefined && (previous ? input.expectedPreviousHash !== previous.hash : input.expectedPreviousHash !== null)) throw new ArtifactToolError("precondition_failed", "Draft update has a stale previous hash.")
     const hash = hashArtifactContent(input.content)
     const version = (previous?.version ?? 0) + 1
     const row: AgentArtifactVersionRow = { id: `version:${id}:${version}`, artifactId: id, version, userId: scope.userId, sessionId: scope.sessionId, jobId: scope.jobId, artifactType: "cover_letter", content: input.content, contentHash: hash, sourceDigest: scope.sourceDigest, constraintHash: hashArtifactContent(input.constraints), provenanceRefs: [...scope.evidenceRefs], evidenceRefs: [...scope.evidenceRefs], baseId: base.id, baseHash: base.hash, previousHash: previous?.hash ?? null, taskId: scope.taskId, toolCallId: scope.toolCallId, requestHash: input.requestHash, createdAt: new Date() }
@@ -215,6 +226,18 @@ export class InMemoryArtifactToolStore implements ArtifactToolStore {
   async readVersion(scope: Pick<ArtifactToolScope, "userId" | "sessionId" | "jobId">, ref: ArtifactVersionRef): Promise<AgentArtifactVersionRow | null> {
     const row = this.versions.get(`${ref.artifactId}:${ref.version}`)
     return row?.userId === scope.userId && row.sessionId === scope.sessionId && row.jobId === scope.jobId ? row : null
+  }
+
+  async readRevisionReview(scope: ArtifactToolScope, revision: ArtifactToolRevisionContext): Promise<AgentArtifactReviewRow | null> {
+    const ref = revision.artifactRef
+    if (!revision.dependencyTaskId.trim() || revision.currentSourceDigest !== scope.sourceDigest || ref.sourceDigest !== revision.currentSourceDigest) return null
+    const matches = [...this.reviewReceipts.values()].filter(row => row.userId === scope.userId && row.sessionId === scope.sessionId
+      && row.jobId === scope.jobId && row.artifactId === ref.artifactId && row.version === ref.version
+      && row.contentHash === ref.contentHash && row.sourceDigest === ref.sourceDigest
+      && row.currentSourceDigest === revision.currentSourceDigest && row.status === "needs_revision"
+      && row.taskId === revision.dependencyTaskId && row.reviewHash === revision.reviewHash)
+    const head = this.records.get(ref.artifactId)
+    return matches.length === 1 && head?.lifecycle === "draft" && head.version === ref.version && head.hash === ref.contentHash ? matches[0]! : null
   }
 
   async saveReview(input: Omit<AgentArtifactReviewRow, "id" | "artifactVersionId" | "createdAt"> & { readonly taskFence: AgentArtifactTaskFence }): Promise<AgentArtifactReviewRow> {
@@ -247,4 +270,6 @@ export class InMemoryArtifactToolStore implements ArtifactToolStore {
   }
 }
 
-export function createArtifactToolStore(pool: Pool): ArtifactToolStore { return new PgArtifactToolStore(pool) }
+export function createArtifactToolStore(pool: Pool, readCurrentSourceDigest?: AgentArtifactSourceDigestReader): ArtifactToolStore {
+  return new PgArtifactToolStore(pool, readCurrentSourceDigest)
+}
