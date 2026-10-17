@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto"
-
 import type { PrismaClient } from "@prisma/client"
+import { startApplicationFillForReview } from "./application-fill-command"
 import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation, objectiveReplacementStateConflict, retryActiveConflict, retryTargetChanged, retryTargetInvalid, turnWaitRequiresDedicatedAction } from "./errors"
 import { assertContent, dispositionFromEvent } from "./command-content"
 import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import { isRetryableTurnStatus, parsePersistedRetryContent } from "./retry-input"
+import { assertSteeringCapacity } from "./steering-capacity"
 import {
   acceptInputFacts,
   assertExpectedTurn,
@@ -29,14 +30,11 @@ import type {
 } from "./types"
 
 function activeTurnHasIntent(input: unknown, expected: NonNullable<StartCommand["intent"]>): boolean {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return false
-  const intent = (input as Record<string, unknown>).intent
-  return Boolean(intent && typeof intent === "object" && !Array.isArray(intent) &&
-    (intent as Record<string, unknown>).kind === expected.kind &&
-    (intent as Record<string, unknown>).version === expected.version)
+  const intent = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>).intent : null
+  return Boolean(intent && typeof intent === "object" && !Array.isArray(intent) && (intent as Record<string, unknown>).kind === expected.kind && (intent as Record<string, unknown>).version === expected.version)
 }
 
-async function duplicateCommandResult(
+export async function duplicateCommandResult(
   tx: CommandTransaction,
   command: { sessionId: string; clientMessageId: string },
   existing: { id: string; targetTurnId: string | null; delivery: string; acceptedSequence: bigint },
@@ -78,6 +76,10 @@ async function duplicateInterruptResult(
 
 export class AgentCommandService {
   constructor(private readonly db: PrismaClient) {}
+
+  startApplicationFillForReview(command: Parameters<typeof startApplicationFillForReview>[1]): Promise<CommandResult> {
+    return startApplicationFillForReview(this.db, command)
+  }
 
   async start(command: StartCommand): Promise<CommandResult> {
     assertContent(command.content)
@@ -171,6 +173,9 @@ export class AgentCommandService {
           .then((facts) => ({ ...facts, disposition: "started" as const }))
       }
 
+      if (command.delivery === "steer" && command.source === "user") {
+        await assertSteeringCapacity(tx, { sessionId: command.sessionId, userId: command.userId, turnId: active.id })
+      }
       const disposition = command.delivery === "steer" ? "steered" : "queued_follow_up"
       return acceptInputFacts(tx, command, command.content, active, command.delivery, disposition, false)
         .then((facts) => ({ ...facts, disposition }))
@@ -242,5 +247,4 @@ export class AgentCommandService {
       return { ...facts, disposition: "started" as const }
     })
   }
-
 }

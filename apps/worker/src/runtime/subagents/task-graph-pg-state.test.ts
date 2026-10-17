@@ -6,6 +6,8 @@ import type { GraphIdentityScope, GraphScope } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
@@ -65,6 +67,33 @@ function typedSnapshot() {
     ...snapshot,
     nodes: snapshot.nodes.map(node => ({ ...node, verification: analystVerification, verificationDisposition: "typed" as const })),
   }
+}
+
+function typedSnapshotForRole(role: "scout" | "analyst") {
+  const snapshot = validSnapshot()
+  const verification = role === "scout" ? scoutVerification : analystVerification
+  return {
+    ...snapshot,
+    nodes: snapshot.nodes.map(node => ({ ...node, templateId: role, verification, verificationDisposition: "typed" as const })),
+  }
+}
+
+const structuredFailureReport = {
+  verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "unverified", reasonCode: "result_invalid",
+  criteria: [{ criterionId: "finding-count", status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null,
+} as const
+function structuredFailureReportFor(role: "scout" | "analyst") {
+  return role === "analyst" ? structuredFailureReport : { ...structuredFailureReport,
+    criteria: [{ ...structuredFailureReport.criteria[0], criterionId: "candidate-count" }] }
+}
+
+function structuredFailureRow(role: "scout" | "analyst", category: unknown, overrides: Record<string, unknown> = {}) {
+  return validTaskRow({
+    status: "failed", role, taskType: role === "scout" ? "job_discovery" : "job_analysis",
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role }, failureReason: "task_graph_verification_unverified",
+    result: { status: "failed", structuredOutputFailureCategory: category, taskGraphVerificationReport: structuredFailureReportFor(role), privateResult: "raw private payload" },
+    ...overrides,
+  })
 }
 
 function completedEnvelope(structuredResult: unknown, finalText = "persisted child text") {
@@ -146,7 +175,8 @@ describe("TaskGraph PostgreSQL state loading", () => {
       status: "failed", role: "analyst", result: { taskGraphVerificationReport: findingReport, raw: "private raw output" },
     })] })
     const node = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes[0]!
-    expect(node).toMatchObject({ verificationCriterionIds: ["finding-count"], verificationReport: findingReport })
+    expect(node).toMatchObject({ verification: analystVerification, verificationCriterionIds: ["finding-count"], verificationReport: findingReport })
+    expect(fake.calls.filter(call => call.sql.startsWith('SELECT item."id"')).length).toBe(1)
     expect(JSON.stringify(node)).not.toContain("private raw output")
     const malformed = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({
       status: "failed", role: "analyst", result: { taskGraphVerificationReport: report },
@@ -162,6 +192,76 @@ describe("TaskGraph PostgreSQL state loading", () => {
       status: "completed", role: "analyst", result: { taskGraphVerificationReport: { ...findingReport, status: "passed", reasonCode: "criteria_met" } },
     })] })
     await expect(loadTaskGraph(incoherent.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+  })
+
+  it.each(["missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid"] as const)(
+    "projects only the closed structured-output category %s for current failed typed children",
+    async category => {
+      for (const role of ["scout", "analyst"] as const) {
+        const fake = fakeClient({ itemContent: typedSnapshotForRole(role), taskRows: [structuredFailureRow(role, category)] })
+        const node = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes[0]!
+        expect(node.structuredOutputFailureCategory).toBe(category)
+        expect(JSON.stringify(node)).not.toContain("raw private payload")
+        expect(JSON.stringify(node)).not.toContain("structuredFailureReport")
+      }
+    },
+  )
+
+  it("omits structured-output categories for forged, mismatched, legacy, native, and repair nodes", async () => {
+    const category = "result_shape_invalid"
+    const typed = typedSnapshot()
+    const ordinaryCases: Array<[string, Record<string, unknown>]> = [
+      ["unknown category", structuredFailureRow("analyst", "provider_error")],
+      ["top-level category only", validTaskRow({ status: "failed", role: "analyst", failureReason: "task_graph_verification_unverified",
+        structuredOutputFailureCategory: category, result: { status: "failed", taskGraphVerificationReport: structuredFailureReport } })],
+      ["task role mismatch", structuredFailureRow("analyst", category, { role: "scout" })],
+      ["expected schema mismatch", structuredFailureRow("analyst", category, { expectedOutputSchema: { schemaVersion: "other", role: "analyst" } })],
+      ["result status mismatch", structuredFailureRow("analyst", category, { result: {
+        status: "completed", structuredOutputFailureCategory: category, taskGraphVerificationReport: structuredFailureReport,
+      } })],
+      ["different valid report category", structuredFailureRow("analyst", category, { result: {
+        status: "failed", structuredOutputFailureCategory: category,
+        taskGraphVerificationReport: { ...structuredFailureReport, reasonCode: "contract_invalid",
+          criteria: [{ ...structuredFailureReport.criteria[0], reasonCode: "contract_invalid" }] },
+      } })],
+      ["verified failure reason", structuredFailureRow("analyst", category, {
+        failureReason: "task_graph_verification_failed",
+        result: { status: "failed", structuredOutputFailureCategory: category, taskGraphVerificationReport: findingReport },
+      })],
+    ]
+    for (const [label, taskRow] of ordinaryCases) {
+      const fake = fakeClient({ itemContent: typed, taskRows: [taskRow] })
+      const node = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes[0]!
+      expect(node, label).not.toHaveProperty("structuredOutputFailureCategory")
+    }
+
+    const legacy = fakeClient({ itemContent: validSnapshot(), taskRows: [structuredFailureRow("analyst", category, {
+      failureReason: "invalid_structured_result", result: { status: "failed", structuredOutputFailureCategory: category },
+    })] })
+    expect(currentTaskGraph(await loadTaskGraph(legacy.client, identity)).nodes[0]).not.toHaveProperty("structuredOutputFailureCategory")
+
+    const nativeContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+      key: "child", templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, goal: "Inspect the source", successCriteria: [], dependsOn: [], depth: 1,
+      taskId: "child-1", verificationDisposition: "legacy_unverified",
+      nativeDelegation: { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn", operationId: "native-1",
+        requestFingerprint: "a".repeat(64), callerTaskId: "root-1", role: "auditor", taskType: "audit",
+        contextDigest: "b".repeat(64), contextBytes: 1 },
+    }] }
+    const native = fakeClient({ itemContent: nativeContent, taskRows: [validTaskRow({
+      status: "failed", role: "auditor", taskType: "audit", failureReason: "invalid_structured_result",
+      result: { status: "failed", structuredOutputFailureCategory: category },
+    })] })
+    expect(currentTaskGraph(await loadTaskGraph(native.client, identity)).nodes[0]).not.toHaveProperty("structuredOutputFailureCategory")
+
+    const source = typed.nodes[0]!
+    const repairNode = { ...source, key: "repair", taskId: "child-2", repairOf: {
+      graphRootTaskId: "root-1", nodeKey: source.key, taskId: source.taskId, criterionIds: ["finding-count"],
+    } }
+    const repair = fakeClient({ itemContent: { ...typed, nodes: [source, repairNode] }, taskRows: [
+      validTaskRow({ id: "child-1", status: "failed", role: "analyst", result: { taskGraphVerificationReport: findingReport } }),
+      structuredFailureRow("analyst", category, { id: "child-2" }),
+    ] })
+    expect(currentTaskGraph(await loadTaskGraph(repair.client, identity)).nodes[1]).not.toHaveProperty("structuredOutputFailureCategory")
   })
 
   it("projects repair receipts separately and preserves the original failed target report", async () => {
@@ -208,6 +308,7 @@ describe("TaskGraph PostgreSQL state loading", () => {
 
   it("keeps legacy and specialized terminal nodes compatible without generic reports", async () => {
     const legacy = fakeClient({ itemContent: validSnapshot(), taskRows: [validTaskRow({ status: "completed" })] })
+    expect(currentTaskGraph(await loadTaskGraph(legacy.client, identity)).nodes[0]).not.toHaveProperty("verification")
     expect(currentTaskGraph(await loadTaskGraph(legacy.client, identity)).nodes[0]).not.toHaveProperty("verificationReport")
     const specialized = {
       schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,

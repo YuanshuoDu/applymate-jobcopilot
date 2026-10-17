@@ -1,13 +1,15 @@
 'use client'
 
 import React, { useMemo } from 'react'
-import { parsePlanLedger } from '@jobcopilot/agent-protocol'
 
+import { parseTaskGraphVerificationSummary, type TaskGraphVerificationSummary as TaskGraphVerificationSummaryDto } from '@jobcopilot/agent-protocol'
 import { useI18n, type Lang } from '@/lib/i18n'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
+import { parsePlanLedgerWithRepairTargets, type PlanLedgerWithRepairTargetGoals } from '@/lib/task-graph-repair-display'
 
-import { projectCurrentTaskGraph, type TaskGraphEvidencePreview, type TaskGraphPlan, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
+import { projectCurrentTaskGraph, type TaskGraphEvidencePreview, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
 import { selectedTaskGraphIdentity, type TaskGraphIdentity } from './task-graph-plan-query'
+import { TaskGraphVerificationSummary } from './TaskGraphVerificationSummary'
 import type { SupervisorTaskSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
 
@@ -50,15 +52,16 @@ export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryS
     const current = projectCurrentTaskGraph(graphItems, scopedTasks, sessionId)
     const response = parsePlanLedgerResponse(ledger)
     const shortlist = parseDiscoveryShortlistResponse(discoveryShortlist)
+    const matched = response && sameTaskGraphIdentity(response.identity, identity) ? response : null
     return {
-      plan: response && sameTaskGraphIdentity(response.identity, identity) ? response.projection : current,
+      plan: matched?.projection ?? current, verificationSummary: matched?.verificationSummary ?? null,
       shortlist: shortlist && sameTaskGraphIdentity(shortlist.identity, identity) ? shortlist.result : null,
     }
   }, [discoveryShortlist, items, ledger, selectedPreparationTurnId, sessionId, tasks])
   if (!view.plan && !view.shortlist) return null
 
   return <>
-    {view.plan && <TaskGraphPlanSection plan={view.plan} sessionId={sessionId} lang={lang} t={t} />}
+    {view.plan && <TaskGraphPlanSection plan={view.plan} verificationSummary={view.verificationSummary} sessionId={sessionId} lang={lang} t={t} />}
     {view.shortlist && <DiscoveryShortlistSection result={view.shortlist} lang={lang} />}
   </>
 }
@@ -71,17 +74,20 @@ interface DiscoveryShortlistResult {
   readonly failures: readonly string[]
 }
 
-function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: TaskGraphPlan } | null {
+function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: PlanLedgerWithRepairTargetGoals; verificationSummary: TaskGraphVerificationSummaryDto | null } | null {
   const response = record(value)
   const identity = response ? record(response.identity) : null
-  if (!response || !identity || Object.keys(response).length !== 2 || Object.keys(identity).length !== 5
+  const keys = response ? Object.keys(response).sort().join(',') : ''
+  if (!response || !identity || keys !== 'identity,projection' && keys !== 'identity,projection,verificationSummary' || Object.keys(identity).length !== 5
     || typeof identity.sessionId !== 'string' || typeof identity.graphItemId !== 'string'
     || typeof identity.turnId !== 'string' || typeof identity.rootTaskId !== 'string'
     || ![identity.sessionId, identity.graphItemId, identity.turnId, identity.rootTaskId].every(value => value.length > 0 && value.length <= 128 && value.trim() === value)
     || !Number.isSafeInteger(identity.revision) || Number(identity.revision) < 1) return null
-  const projection = parsePlanLedger(response.projection)
+  const projection = parsePlanLedgerWithRepairTargets(response.projection)
   if (!projection || projection.sessionId !== identity.sessionId || projection.revision !== identity.revision) return null
-  return { identity: identity as unknown as TaskGraphIdentity, projection }
+  const verificationSummary = keys === 'identity,projection,verificationSummary'
+    ? parseTaskGraphVerificationSummary(response.verificationSummary, projection.nodes.length) : null
+  return { identity: identity as unknown as TaskGraphIdentity, projection, verificationSummary }
 }
 
 const DISCOVERY_FAILURE_CODES = new Set([
@@ -134,8 +140,9 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-function TaskGraphPlanSection({ plan, sessionId, lang, t }: {
-  readonly plan: TaskGraphPlan
+function TaskGraphPlanSection({ plan, verificationSummary, sessionId, lang, t }: {
+  readonly plan: PlanLedgerWithRepairTargetGoals
+  readonly verificationSummary: TaskGraphVerificationSummaryDto | null
   readonly sessionId: string
   readonly lang: Lang
   readonly t: (key: string) => string
@@ -152,9 +159,11 @@ function TaskGraphPlanSection({ plan, sessionId, lang, t }: {
       <div><span>{t('agent.approvalLedger.revision')}:</span> {plan.revision}</div>
       {plan.goal && <p data-agent-task-graph-goal="true" style={planGoalStyle}>{plan.goal}</p>}
       <ol style={listStyle}>
-        {plan.nodes.map(node => (
+        {plan.nodes.map((node, index) => (
           <li key={node.key} style={nodeStyle}>
             <strong style={goalStyle}>{node.goal}</strong>
+            {node.repairTargetGoal && <div data-task-graph-repair-target="true">{taskGraphPlanLabel(lang, 'agent.taskGraph.repairAttemptFor')} {node.repairTargetGoal}</div>}
+            {verificationSummary && <TaskGraphVerificationSummary node={verificationSummary.nodes[index]} lang={lang} />}
             <div>{t('agent.status')}: {node.status ? taskGraphPlanLabel(lang, STATUS_LABELS[node.status]) : taskGraphPlanLabel(lang, 'agent.taskGraph.statusUnavailable')}</div>
             {node.evidencePreview
               ? <TaskGraphEvidenceSummary preview={node.evidencePreview} lang={lang} />

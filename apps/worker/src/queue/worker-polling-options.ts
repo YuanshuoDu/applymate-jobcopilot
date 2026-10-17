@@ -25,11 +25,12 @@ function boundedInteger(
 
 export function workerPollingOptions(
   env: NodeJS.ProcessEnv = process.env,
+  stalledIntervalFallbackMs: 30_000 | typeof DEFAULT_STALLED_INTERVAL_MS = DEFAULT_STALLED_INTERVAL_MS,
 ): WorkerPollingOptions {
   return {
     // BullMQ internally limits this value to 10 seconds.
     drainDelay: boundedInteger(env.BULLMQ_DRAIN_DELAY_SECONDS, DEFAULT_DRAIN_DELAY_SECONDS, 1, 10),
-    // A failed worker is still recovered within two minutes by default.
-    stalledInterval: boundedInteger(env.BULLMQ_STALLED_INTERVAL_MS, DEFAULT_STALLED_INTERVAL_MS, 30_000, 300_000),
+    // Candidate marking and recovery need separate scans, so this is not a deadline.
+    stalledInterval: boundedInteger(env.BULLMQ_STALLED_INTERVAL_MS, stalledIntervalFallbackMs, 30_000, 300_000),
   }
 }

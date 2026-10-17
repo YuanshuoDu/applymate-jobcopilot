@@ -47,6 +47,34 @@ describe("recoverPersistedToolCalls", () => {
     expect(JSON.stringify(fixture.updates)).toContain("tool_result_replay_uncertain")
     expect(fixture.events.some(event => event.type === "tool_call.failed" && JSON.stringify(event.payload).includes("tool_result_replay_uncertain"))).toBe(true)
   })
+
+  it("does not replay a confirmed pre-intent paused ask call after the root wait store returns none", async () => {
+    const ask: ToolCallRecovery = { ...pending, call: { id: "ask-old", name: "agent.ask_user", arguments: { question: "Old question?" } } }
+    const execute = vi.fn()
+    const fixture = execution(ask, execute)
+    fixture.options = { ...fixture.options, store: { ...fixture.options.store, readPendingQuestion: async () => ({ status: "none" }) } }
+
+    await expect(recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date())).resolves.toEqual([])
+    expect(execute).not.toHaveBeenCalled()
+    expect(fixture.updates).toEqual([])
+    expect(fixture.events).toEqual([])
+  })
+  it("keeps a recoverable ask_user intent pending when its idempotent replay throws", async () => {
+    const arguments_ = { question: "Which city?", choices: [{ label: "Berlin", value: "berlin" }] }
+    const ask: ToolCallRecovery = { ...pending, action: "replay", stepId: "step-1", callItem: { id: "ask-item", revision: 0 },
+      call: { id: "ask-1", name: "agent.ask_user", arguments: arguments_ } }
+    const execute = vi.fn(async () => { throw new Error("transient tool failure") })
+    const fixture = execution(ask, execute as never)
+    fixture.options = { ...fixture.options, store: { ...fixture.options.store, readPendingQuestion: async () => ({
+      status: "replayable", stepId: "step-1", toolCallId: "ask-1", callItemId: "ask-item",
+      intent: { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [{ label: "Berlin", value: "berlin" }] },
+    }) } }
+
+    await expect(recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date())).rejects.toMatchObject({ code: "prepared_question_wait_retry_required" })
+    expect(execute).toHaveBeenCalledOnce()
+    expect(fixture.updates).toEqual([])
+    expect(fixture.events).toEqual([])
+  })
 })
 
 describe("executeTools persisted replay", () => {
@@ -210,6 +238,43 @@ describe("executeTools persisted replay", () => {
 
     expect(result.wait).toBeNull()
     expect(result.snapshot).toBe(fixture.options.snapshot)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it.each(["agent.wait", "wait_subagents"] as const)("fails closed when %s replay has only an archived result reference", async toolName => {
+    const reference = { $ref: "tool-result-00000000-0000-4000-8000-000000000002", sizeBytes: 9_000, sha256: "a".repeat(64) }
+    const persistedCall = { ...call, name: toolName }
+    const fixture = replayFixture(reference, persistedCall, [projection(resolvedOutput)])
+
+    await expect(replay(fixture, persistedCall)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it.each(["agent.wait", "wait_subagents"] as const)("fails closed on a fresh %s archived interruption without its canonical projection", async toolName => {
+    const reference = { $ref: "tool-result-00000000-0000-4000-8000-000000000002", sizeBytes: 9_000, sha256: "a".repeat(64) }
+    const modelCall = { ...call, name: toolName }
+    const executeTool = vi.fn(async () => ({ id: modelCall.id, toolName, toolVersion: "1", status: "completed" as const, output: reference, errorCode: null }))
+    const fixture = execution(pending, executeTool as never)
+    const readByInvocation = vi.fn(async () => ({ waitId: durableWaitId, status: "interrupted" as const }))
+    fixture.options = { ...fixture.options, durableWaitControlReader: { readByInvocation } }
+
+    await expect(executeTools(
+      fixture.options, fixture.writer, { id: "step-1", ordinal: 1 },
+      { text: "", reasoningSummary: "", toolCalls: [modelCall], provider: "fixture", model: "fixture-model", finishReason: "tool_calls", usage: null, continuation: null },
+      fixture.options.snapshot, new Set(), fixture.options.signal!, () => new Date("2026-09-09T00:00:00.000Z"), undefined, vi.fn(),
+    )).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(executeTool).toHaveBeenCalledOnce()
+    expect(readByInvocation).toHaveBeenCalledWith(expect.objectContaining({ stepId: "step-1" }), "fresh_streaming_root")
+  })
+
+  it("does not apply archived-wait replay fencing to an ordinary tool reference", async () => {
+    const reference = { $ref: "tool-result-00000000-0000-4000-8000-000000000002", sizeBytes: 9_000, sha256: "a".repeat(64) }
+    const ordinaryCall = { id: "search-call", name: "jobs.search", arguments: { query: "Dublin" } }
+    const fixture = replayFixture(reference, ordinaryCall)
+
+    const result = await replay(fixture, ordinaryCall)
+
+    expect(result.wait).toBeNull()
     expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 

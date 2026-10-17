@@ -4,15 +4,15 @@ export const MIGRATED_ROLES = ["scout", "analyst"] as const
 export type MigratedRole = (typeof MIGRATED_ROLES)[number]
 
 export const ROLE_TOOL_NAMES = [
-  "jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state",
+  "jobs.search", "jobs.get", "jobs.discover", "persona.retrieve", "resume.get_base", "application.get_state",
 ] as const
 export type RoleToolName = (typeof ROLE_TOOL_NAMES)[number]
 
 export type RoleToolContract = {
   readonly name: RoleToolName
-  readonly risk: "read"
+  readonly risk: "read" | "internal_write"
   readonly domain: "jobs" | "persona" | "resume" | "application"
-  readonly capabilities: readonly ["read"]
+  readonly capabilities: readonly ["read"] | readonly ["read", "write"]
 }
 
 export type RoleContract = {
@@ -31,6 +31,7 @@ const readTool = (name: RoleToolName, domain: RoleToolContract["domain"]): RoleT
 export const ROLE_TOOL_CONTRACTS: Readonly<Record<RoleToolName, RoleToolContract>> = {
   "jobs.search": readTool("jobs.search", "jobs"),
   "jobs.get": readTool("jobs.get", "jobs"),
+  "jobs.discover": { name: "jobs.discover", risk: "internal_write", domain: "jobs", capabilities: ["read", "write"] },
   "persona.retrieve": readTool("persona.retrieve", "persona"),
   "resume.get_base": readTool("resume.get_base", "resume"),
   "application.get_state": readTool("application.get_state", "application"),
@@ -48,7 +49,7 @@ const commonContract = (role: MigratedRole, allowedTools: readonly RoleToolName[
   ],
 })
 
-export const SCOUT_ROLE_CONTRACT = commonContract("scout", ["jobs.search", "jobs.get"])
+export const SCOUT_ROLE_CONTRACT = commonContract("scout", ["jobs.search", "jobs.get", "jobs.discover"])
 export const ANALYST_ROLE_CONTRACT = commonContract("analyst", [
   "jobs.search", "jobs.get", "persona.retrieve", "resume.get_base",
 ])
@@ -68,9 +69,20 @@ export function assertMigratedRole(role: string): asserts role is MigratedRole {
   if (!MIGRATED_ROLES.includes(role as MigratedRole)) throw new RoleCapabilityError("role_unknown", `Unsupported migrated role: ${role}`)
 }
 
+function isExactScoutDiscovery(name: string, risk: ToolRisk, capabilities: readonly ToolCapability[]): boolean {
+  return name === "jobs.discover" && risk === "internal_write"
+    && capabilities.length === 2 && capabilities.includes("read") && capabilities.includes("write")
+}
+
 export function assertRoleToolAllowed(role: MigratedRole, tool: RoleToolContract): void {
   const contract = roleContract(role)
   if (!contract.allowedTools.includes(tool.name)) throw new RoleCapabilityError("tool_not_allowed", `${role} cannot use ${tool.name}`)
+  if (tool.name === "jobs.discover") {
+    if (role !== "scout" || !isExactScoutDiscovery(tool.name, tool.risk, tool.capabilities)) {
+      throw new RoleCapabilityError("risk_denied", "Only Scout may use the bounded jobs.discover internal write capability")
+    }
+    return
+  }
   if (tool.risk !== "read") throw new RoleCapabilityError("risk_denied", `${role} may only use read tools`)
   if (!tool.capabilities.every(capability => capability === "read")) {
     throw new RoleCapabilityError("capability_denied", `${role} may only use read capability tools`)
@@ -79,6 +91,13 @@ export function assertRoleToolAllowed(role: MigratedRole, tool: RoleToolContract
 
 export function assertRoleActionAllowed(role: MigratedRole, action: { readonly name: string; readonly risk: ToolRisk; readonly capabilities: readonly ToolCapability[] }): void {
   if (!ROLE_TOOL_NAMES.includes(action.name as RoleToolName)) throw new RoleCapabilityError("tool_not_allowed", `${role} cannot use ${action.name}`)
+  if (!roleContract(role).allowedTools.includes(action.name as RoleToolName)) throw new RoleCapabilityError("tool_not_allowed", `${role} cannot use ${action.name}`)
+  if (action.name === "jobs.discover") {
+    if (role !== "scout" || !isExactScoutDiscovery(action.name, action.risk, action.capabilities)) {
+      throw new RoleCapabilityError("risk_denied", "Only Scout may use the bounded jobs.discover internal write capability")
+    }
+    return
+  }
   if (action.risk !== "read") throw new RoleCapabilityError("risk_denied", `${role} may only use read tools`)
   if (!action.capabilities.every(capability => capability === "read")) throw new RoleCapabilityError("capability_denied", `${role} may only use read capability tools`)
   assertRoleToolAllowed(role, ROLE_TOOL_CONTRACTS[action.name as RoleToolName])

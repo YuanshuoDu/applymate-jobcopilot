@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 
+const bullMqMocks = vi.hoisted(() => ({ queueConstructor: vi.fn(), workerConstructor: vi.fn() }))
+vi.mock("bullmq", async importOriginal => {
+  const actual = await importOriginal<typeof import("bullmq")>()
+  return { ...actual, Queue: bullMqMocks.queueConstructor, Worker: bullMqMocks.workerConstructor }
+})
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
-import { markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry, type TurnExecutionResult } from "./turn-queue.js"
+import { createTurnQueue, markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry, type TurnExecutionResult } from "./turn-queue.js"
 import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID } from "./dlq.js"
@@ -14,13 +19,44 @@ const lease: TurnLease = {
   leaseStartedAt: new Date("2026-09-01T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-01T00:01:00.000Z"),
 }
 
+describe("Turn queue worker polling", () => {
+  it("uses the canonical Turn fallback while preserving a valid explicit override", async () => {
+    const priorStalledInterval = process.env.BULLMQ_STALLED_INTERVAL_MS
+    const priorDrainDelay = process.env.BULLMQ_DRAIN_DELAY_SECONDS
+    bullMqMocks.queueConstructor.mockImplementation(() => ({
+      add: vi.fn(), getJob: vi.fn().mockResolvedValue(undefined), close: vi.fn(),
+    }))
+    bullMqMocks.workerConstructor.mockImplementation(() => ({ close: vi.fn() }))
+    try {
+      delete process.env.BULLMQ_STALLED_INTERVAL_MS
+      delete process.env.BULLMQ_DRAIN_DELAY_SECONDS
+      const defaultTurn = createTurnQueue({ pool: {} as never, execute: vi.fn() })
+      expect(bullMqMocks.workerConstructor.mock.calls.at(-1)?.[2]).toMatchObject({ drainDelay: 10, stalledInterval: 30_000 })
+      await defaultTurn.close()
+
+      process.env.BULLMQ_STALLED_INTERVAL_MS = "180000"
+      const overriddenTurn = createTurnQueue({ pool: {} as never, execute: vi.fn() })
+      expect(bullMqMocks.workerConstructor.mock.calls.at(-1)?.[2]).toMatchObject({ drainDelay: 10, stalledInterval: 180_000 })
+      await overriddenTurn.close()
+    } finally {
+      if (priorStalledInterval === undefined) delete process.env.BULLMQ_STALLED_INTERVAL_MS
+      else process.env.BULLMQ_STALLED_INTERVAL_MS = priorStalledInterval
+      if (priorDrainDelay === undefined) delete process.env.BULLMQ_DRAIN_DELAY_SECONDS
+      else process.env.BULLMQ_DRAIN_DELAY_SECONDS = priorDrainDelay
+      bullMqMocks.queueConstructor.mockReset()
+      bullMqMocks.workerConstructor.mockReset()
+    }
+  })
+})
+
 function pool() {
   const calls: string[] = []
+  const queries: Array<[string, unknown[] | undefined]> = []
   const client = {
-    query: vi.fn(async (sql: string) => { calls.push(sql); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 } }),
+    query: vi.fn(async (sql: string, params?: unknown[]) => { calls.push(sql); queries.push([sql, params]); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 } }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls, queries }
 }
 
 function interruptedAfterHeartbeatPool() {
@@ -103,6 +139,22 @@ describe("Turn queue processor", () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ lease, signal: expect.any(AbortSignal) }))
     expect(registry.size).toBe(0)
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+  })
+
+  it("releases a resolved context-admission failure as failed without requeueing or retrying", async () => {
+    const fake = pool()
+    const execute = vi.fn().mockResolvedValue({ status: "failed", errorCode: "context_estimate_exceeded" })
+
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute },
+    )).resolves.toEqual({ status: "failed", errorCode: "context_estimate_exceeded" })
+
+    expect(execute).toHaveBeenCalledTimes(1)
+    const release = fake.queries.find(([sql]) => sql.includes('SET "status" = $5'))
+    expect(release?.[1]?.[4]).toBe("failed")
+    expect(fake.queries.some(([sql, params]) => sql.includes('SET "status" = $5') && params?.[4] === "queued")).toBe(false)
+    expect(fake.calls.some(sql => sql.includes("agent.turn.dlq"))).toBe(false)
   })
 
   it("requeues a pause-fenced execution without consuming a queue retry or writing a dead letter", async () => {

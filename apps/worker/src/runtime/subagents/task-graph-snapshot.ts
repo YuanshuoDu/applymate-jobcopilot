@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto"
 import { isValidTaskGraphRepairRelation, TASK_GRAPH_LIMITS, type TaskGraphEvent, type TaskGraphNodeProposal, type TaskGraphRepairOf, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
-import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
+import { taskGraphVerificationRole, validateTaskGraphVerificationContract, validateTaskGraphVerificationDependencySelectors, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
+import { parseRegisteredScoutEnvelope, taskGraphNodeKeysMatch, type RegisteredScoutEnvelope } from "./task-graph-command-port.js"
+import { APPLICATION_FILLER_TEMPLATE_ID } from "./role-policy.js"
 
 export const TASK_GRAPH_ITEM_TYPE = "task_graph"
 export const TASK_GRAPH_SNAPSHOT_VERSION = "agent-harness.v2.task-graph"
@@ -13,6 +15,7 @@ export type StoredTaskGraphNode = TaskGraphNodeProposal & Readonly<{
   taskId: string
   verification?: TaskGraphVerificationContract
   verificationDisposition?: TaskGraphVerificationDisposition
+  registeredScoutEnvelope?: RegisteredScoutEnvelope
 }>
 export type TaskGraphSnapshot = Readonly<{
   schemaVersion: typeof TASK_GRAPH_SNAPSHOT_VERSION
@@ -34,7 +37,7 @@ const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
 const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
 const NODE_KEYS_WITH_REPAIR = "dependsOn,depth,goal,key,repairOf,successCriteria,taskId,templateId,verification,verificationDisposition"
 const NATIVE_NODE_KEYS = "dependsOn,depth,goal,key,nativeDelegation,successCriteria,taskId,templateId,verificationDisposition"
-const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer"])
+const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID])
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
@@ -52,7 +55,6 @@ function exactKeys(value: Record<string, unknown>, expected: string): boolean {
   const keys = Reflect.ownKeys(value)
   return keys.every((key): key is string => typeof key === "string") && keys.sort().join(",") === expected
 }
-
 function text(value: unknown, maxLength = Number.MAX_SAFE_INTEGER): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
 }
@@ -75,7 +77,6 @@ function parsedRepairOf(value: unknown): TaskGraphRepairOf | undefined {
     || !stringList(row.criterionIds, MAX_CRITERIA, 64, false) || new Set(row.criterionIds).size !== row.criterionIds.length) return undefined
   return { graphRootTaskId: row.graphRootTaskId, nodeKey: row.nodeKey, taskId: row.taskId, criterionIds: [...row.criterionIds] }
 }
-
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
   const row = object(value)
   if (!row || !exactKeys(row, "nodes,schemaVersion") || row.schemaVersion !== TASK_GRAPH_SNAPSHOT_VERSION
@@ -85,10 +86,10 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
   const nodes: StoredTaskGraphNode[] = []
   for (const value of row.nodes) {
     const node = object(value)
-    const oldShape = node !== null && exactKeys(node, LEGACY_NODE_KEYS)
-    const dispositionShape = node !== null && exactKeys(node, NODE_KEYS_WITH_DISPOSITION)
-    const verificationShape = node !== null && exactKeys(node, NODE_KEYS_WITH_VERIFICATION)
-    const repairShape = node !== null && exactKeys(node, NODE_KEYS_WITH_REPAIR)
+    const oldShape = node !== null && taskGraphNodeKeysMatch(node, LEGACY_NODE_KEYS)
+    const dispositionShape = node !== null && taskGraphNodeKeysMatch(node, NODE_KEYS_WITH_DISPOSITION)
+    const verificationShape = node !== null && taskGraphNodeKeysMatch(node, NODE_KEYS_WITH_VERIFICATION)
+    const repairShape = node !== null && taskGraphNodeKeysMatch(node, NODE_KEYS_WITH_REPAIR)
     const nativeShape = node !== null && exactKeys(node, NATIVE_NODE_KEYS)
     if (!node || (!oldShape && !dispositionShape && !verificationShape && !repairShape && !nativeShape)
       || !text(node.key, MAX_KEY_LENGTH) || !text(node.templateId, MAX_TEMPLATE_ID_LENGTH)
@@ -98,6 +99,7 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
       || !Number.isSafeInteger(node.depth) || Number(node.depth) < 1 || Number(node.depth) > MAX_DEPTH) throw new Error("task_graph_snapshot_invalid")
     const hasVerification = Object.hasOwn(node, "verification")
     const hasRepair = Object.hasOwn(node, "repairOf")
+    const hasRegisteredScoutEnvelope = Object.hasOwn(node, "registeredScoutEnvelope")
     const hasDisposition = dispositionShape || verificationShape || repairShape || nativeShape
     const declaredDisposition = hasDisposition ? node.verificationDisposition : undefined
     const verificationDisposition = hasDisposition ? declaredDisposition : (hasVerification ? "typed" : "legacy_unverified")
@@ -118,6 +120,8 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
     if (hasRepair && !repairOf) throw new Error("task_graph_snapshot_repair_invalid")
     const nativeDelegation = nativeShape ? parseTaskGraphNativeDelegation(node.nativeDelegation) : undefined
     if (nativeShape && (!nativeDelegation || node.templateId !== TASK_GRAPH_NATIVE_TEMPLATE_ID || verificationDisposition !== "legacy_unverified")) throw new Error("task_graph_snapshot_native_delegation_invalid")
+    const registeredScoutEnvelope = hasRegisteredScoutEnvelope ? parseRegisteredScoutEnvelope(node.registeredScoutEnvelope) : undefined
+    if (hasRegisteredScoutEnvelope && (node.templateId !== "scout" || verificationDisposition !== "typed" || !registeredScoutEnvelope)) throw new Error("task_graph_snapshot_registered_scout_envelope_invalid")
     if (keys.has(node.key) || ids.has(node.taskId)) throw new Error("task_graph_snapshot_duplicate")
     keys.add(node.key); ids.add(node.taskId)
     nodes.push({
@@ -126,6 +130,7 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
       ...(verification ? { verification } : {}),
       ...(repairOf ? { repairOf } : {}),
       ...(nativeDelegation ? { nativeDelegation } : {}),
+      ...(registeredScoutEnvelope ? { registeredScoutEnvelope } : {}),
     })
   }
   const positions = new Map(nodes.map((node, index) => [node.key, index] as const))
@@ -145,6 +150,7 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
       children.get(dependency)!.push(node.key)
     }
   }
+  if (!validateTaskGraphVerificationDependencySelectors(nodes)) throw new Error("task_graph_snapshot_verification_dependency_invalid")
   const ready = nodes.filter(node => indegree.get(node.key) === 0).map(node => node.key)
   let visited = 0
   for (let cursor = 0; cursor < ready.length; cursor++) {

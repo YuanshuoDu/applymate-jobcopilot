@@ -1,35 +1,57 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({
-  workerHandler: undefined as undefined | ((job: { data: Record<string, unknown> }) => Promise<void>),
-  fakePage: {
+const mocks = vi.hoisted(() => {
+  const fakePage = {
     goto: vi.fn().mockResolvedValue(undefined),
     url: vi.fn().mockReturnValue("https://jobs.example/apply"),
-  },
-  checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
-  withCloakContext: vi.fn(),
-  insertApplyResult: vi.fn().mockResolvedValue(1),
-  query: vi.fn().mockResolvedValue({ rowCount: 1 }),
-  loadTaskContext: vi.fn(),
-  detectCaptcha: vi.fn(),
-  detectFlow: vi.fn(),
-  runGreenhouseFlow: vi.fn(),
-  runSmartRecruitersFlow: vi.fn(),
-  claimApplicationTask: vi.fn().mockResolvedValue(true),
-  isUserActive: vi.fn().mockResolvedValue(true),
-  completeFillForReview: vi.fn().mockResolvedValue(true),
-  finishApplicationTask: vi.fn().mockResolvedValue(undefined),
-  pauseForFormInput: vi.fn().mockResolvedValue(undefined),
-  applicationTaskStillActive: vi.fn().mockResolvedValue(true),
-  createNotification: vi.fn().mockResolvedValue(undefined),
-  notifyApplyResult: vi.fn().mockResolvedValue(undefined),
-  agentRun: vi.fn(),
-  runtimeFeatureEnabled: vi.fn().mockResolvedValue(true),
-  loadAtsPolicy: vi.fn(),
-  canUseAtsSource: vi.fn().mockReturnValue(true),
-}));
+    context: vi.fn(),
+    close: vi.fn().mockResolvedValue(undefined),
+    evaluate: vi.fn().mockResolvedValue(false),
+    mainFrame: vi.fn(),
+  };
+  const fakeContext = {
+    close: vi.fn().mockResolvedValue(undefined),
+    pages: vi.fn(() => [fakePage]),
+    route: vi.fn().mockResolvedValue(undefined),
+    unroute: vi.fn().mockResolvedValue(undefined),
+  };
+  fakePage.context.mockReturnValue(fakeContext);
+  fakePage.mainFrame.mockReturnValue({ page: () => fakePage });
+
+  return {
+    workerHandler: undefined as undefined | ((job: { id: string; data: Record<string, unknown> }) => Promise<void>),
+    fakePage,
+    fakeContext,
+    checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
+    withCloakContext: vi.fn(),
+    insertApplyResult: vi.fn().mockResolvedValue(1),
+    query: vi.fn().mockResolvedValue({ rowCount: 1 }),
+    loadTaskContext: vi.fn(),
+    detectCaptcha: vi.fn(),
+    detectFlow: vi.fn(),
+    runGreenhouseFlow: vi.fn(),
+    runSmartRecruitersFlow: vi.fn(),
+    claimApplicationTask: vi.fn().mockResolvedValue(true),
+    isUserActive: vi.fn().mockResolvedValue(true),
+    completeFillForReview: vi.fn().mockResolvedValue(true),
+    finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+    pauseForFormInput: vi.fn().mockResolvedValue(undefined),
+    applicationTaskStillActive: vi.fn().mockResolvedValue(true),
+    createNotification: vi.fn().mockResolvedValue(undefined),
+    notifyApplyResult: vi.fn().mockResolvedValue(undefined),
+    agentRun: vi.fn(),
+    runtimeFeatureEnabled: vi.fn().mockResolvedValue(true),
+    loadAtsPolicy: vi.fn(),
+    canUseAtsSource: vi.fn().mockReturnValue(true),
+    claimUnattendedSubmission: vi.fn().mockResolvedValue("claimed"),
+    releaseUncertainSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
+    updateJobForSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
+    recordSubmissionExecutionSettled: vi.fn().mockResolvedValue(true),
+  };
+});
 const approvalMocks = vi.hoisted(() => ({
   inspectSubmission: vi.fn().mockResolvedValue({
+    id: "approval-1",
     type: "submit_application",
     status: "approved",
     scope: {
@@ -121,6 +143,15 @@ vi.mock("../db/application-task-state.js", () => ({
   applicationTaskStillActive: mocks.applicationTaskStillActive,
   needsUserTakeover: vi.fn(() => false),
 }));
+vi.mock("../db/submission-guard.js", () => ({
+  claimUnattendedSubmission: mocks.claimUnattendedSubmission,
+  releaseUncertainSubmission: mocks.releaseUncertainSubmission,
+  updateJobForSubmission: mocks.updateJobForSubmission,
+  UNCONFIRMED_SUBMISSION_MESSAGE: "The previous background attempt was interrupted after it started. ApplyMate did not retry it to avoid sending a duplicate application.",
+}));
+vi.mock("./application-submit-fence.js", () => ({
+  recordSubmissionExecutionSettled: mocks.recordSubmissionExecutionSettled,
+}));
 vi.mock("../runtime/approval/pg-store.js", () => ({
   createPgApprovalStore: vi.fn(() => ({ inspectSubmission: approvalMocks.inspectSubmission })),
 }));
@@ -153,11 +184,23 @@ const payload = {
   operation: "submit",
   userId: "user-1",
   jobId: "job-1",
+  sessionId: "agent-session-1",
+  fillTurnId: "agent-turn-1",
   applyUrl: "https://jobs.example/apply",
   personaId: "persona-1",
   resumePath: "/resume.pdf",
   dryRun: true,
   receiptId: "approval-1",
+  constraintHash: "c".repeat(64),
+};
+
+const submissionIdentity = {
+  sessionId: "agent-session-1",
+  fillTurnId: "agent-turn-1",
+  applicationTaskId: "application-task-1",
+  userId: "user-1",
+  jobId: "job-1",
+  approvalId: "approval-1",
   constraintHash: "c".repeat(64),
 };
 
@@ -189,6 +232,7 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.runSmartRecruitersFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     mocks.agentRun.mockResolvedValue({ status: "submitted", durationMs: 1 });
     approvalMocks.inspectSubmission.mockResolvedValue({
+      id: "approval-1",
       type: "submit_application",
       status: "approved",
       scope: {
@@ -208,7 +252,7 @@ describe("apply-queue CAPTCHA handling", () => {
   it("stops for human takeover without trying to bypass a CAPTCHA", async () => {
     mocks.detectCaptcha.mockResolvedValueOnce(true);
 
-    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+    await expect(mocks.workerHandler?.({ id: "captcha-worker-task-1", data: payload })).resolves.toBeUndefined();
 
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -227,7 +271,7 @@ describe("apply-queue CAPTCHA handling", () => {
     expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
     expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
       expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
-      "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+      "CAPTCHA detected. User takeover is required; no bypass was attempted.", "submit", submissionIdentity,
     );
   });
 
@@ -235,7 +279,7 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.detectFlow.mockReturnValueOnce("greenhouse");
     mocks.fakePage.url.mockReturnValue("https://boards.greenhouse.io/example/jobs/123/apply");
 
-    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+    await expect(mocks.workerHandler?.({ id: "captcha-worker-task-1", data: payload })).resolves.toBeUndefined();
 
     expect(mocks.fakePage.goto).toHaveBeenCalledTimes(1);
     expect(mocks.runGreenhouseFlow).toHaveBeenCalled();
@@ -248,16 +292,18 @@ describe("apply-queue CAPTCHA handling", () => {
       body: "Engineer",
       jobId: "job-1",
     });
-    expect(mocks.query).toHaveBeenLastCalledWith(
-      expect.stringContaining('"workflowState" = $2'),
-      ["applied", "submitted", "job-1", "user-1"]
+    expect(mocks.updateJobForSubmission).toHaveBeenCalledWith(
+      expect.anything(),
+      submissionIdentity,
+      { status: "applied", workflowState: "submitted", applied: true },
+      "finish_apply_job_state",
     );
   });
 
   it("fails closed when challenge detection is unavailable", async () => {
     mocks.detectCaptcha.mockRejectedValueOnce(new Error("page evaluation failed"));
 
-    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+    await expect(mocks.workerHandler?.({ id: "captcha-worker-task-1", data: payload })).resolves.toBeUndefined();
 
     expect(mocks.runGreenhouseFlow).not.toHaveBeenCalled();
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
@@ -266,7 +312,7 @@ describe("apply-queue CAPTCHA handling", () => {
     }));
     expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
       expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
-      "Challenge detection failed. User takeover is required; no bypass was attempted.",
+      "Challenge detection failed. User takeover is required; no bypass was attempted.", "submit", submissionIdentity,
     );
   });
 
@@ -279,7 +325,7 @@ describe("apply-queue CAPTCHA handling", () => {
         : { status: "submission_blocked", durationMs: 1, error: "Submission blocked: runtime authorization guard denied the submit." };
     });
 
-    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+    await expect(mocks.workerHandler?.({ id: "captcha-worker-task-1", data: payload })).resolves.toBeUndefined();
 
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
       status: "manual",
@@ -287,7 +333,7 @@ describe("apply-queue CAPTCHA handling", () => {
     }));
     expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
       expect.anything(), "application-task-1", "waiting_for_user", "user_takeover",
-      "CAPTCHA detected. User takeover is required; no bypass was attempted.",
+      "CAPTCHA detected. User takeover is required; no bypass was attempted.", "submit", submissionIdentity,
     );
   });
 
@@ -295,7 +341,7 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.detectFlow.mockReturnValueOnce("smartrecruiters");
     mocks.fakePage.url.mockReturnValue("https://jobs.smartrecruiters.com/Example/123");
 
-    await expect(mocks.workerHandler?.({ data: payload })).resolves.toBeUndefined();
+    await expect(mocks.workerHandler?.({ id: "captcha-worker-task-1", data: payload })).resolves.toBeUndefined();
 
     expect(mocks.runSmartRecruitersFlow).toHaveBeenCalledWith(
       mocks.fakePage,

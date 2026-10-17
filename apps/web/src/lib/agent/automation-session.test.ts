@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { AutomationTurnOccupiedError, ensureAutomationTurn, resolveAutomationSession } from "./automation-session"
+import { ScheduledAutomationSnapshotValidationError } from "./scheduled-automation-snapshot"
 
 function session(id: string, options: { status?: string } = {}) {
   return {
@@ -60,20 +61,67 @@ describe("resolveAutomationSession", () => {
 })
 
 describe("ensureAutomationTurn", () => {
+  const scheduledAutomationSnapshot = {
+    targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], minScore: 82, dailyCap: 5,
+    requireApproval: true, autoApply: false,
+  }
+  const runInput = (automationRunMode: "scheduled" | "manual") => automationRunMode === "scheduled"
+    ? { sessionId: "session_1", userId: "user_1", name: "Weekday Scout", automationRunMode, scheduledAutomationSnapshot }
+    : { sessionId: "session_1", userId: "user_1", name: "Weekday Scout", automationRunMode }
+
   it("creates one queued Turn after terminal history", async () => {
     const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: "turn_2" }) } }
 
-    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+    await expect(ensureAutomationTurn(db, runInput("manual")))
       .resolves.toEqual({ turnId: "turn_2", created: true })
     expect(db.agentTurn.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation", status: "queued" }),
+      data: expect.objectContaining({
+        sessionId: "session_1", userId: "user_1", source: "automation", status: "queued",
+        input: { goal: "Run automation: Weekday Scout", automationRunMode: "manual" },
+      }),
     }))
   })
 
-  it("reuses an active Turn and does not create a duplicate run", async () => {
-    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue({ id: "turn_active" }), create: vi.fn() } }
+  it("stores a validated versioned snapshot only on a newly created scheduled Turn", async () => {
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: "turn_scheduled" }) } }
 
-    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+    await ensureAutomationTurn(db, runInput("scheduled"))
+
+    expect(db.agentTurn.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        input: {
+          goal: "Run automation: Weekday Scout",
+          automationRunMode: "scheduled",
+          scheduledAutomationSnapshot: {
+            schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+            ...scheduledAutomationSnapshot,
+          },
+        },
+      }),
+    }))
+  })
+
+  it("validates a scheduled snapshot before creating a new Turn", async () => {
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn() } }
+
+    await expect(ensureAutomationTurn(db, {
+      sessionId: "session_1", userId: "user_1", name: "Weekday Scout", automationRunMode: "scheduled",
+      scheduledAutomationSnapshot: {
+        targetRoles: "invalid", targetLocations: [], minScore: 82, dailyCap: 5, requireApproval: true, autoApply: false,
+      },
+    })).rejects.toBeInstanceOf(ScheduledAutomationSnapshotValidationError)
+    expect(db.agentTurn.create).not.toHaveBeenCalled()
+  })
+
+  it("reuses an active Turn without validating a refreshed snapshot or creating a duplicate", async () => {
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue({ id: "turn_active", input: { automationRunMode: "scheduled" } }), create: vi.fn() } }
+
+    await expect(ensureAutomationTurn(db, {
+      sessionId: "session_1", userId: "user_1", name: "Weekday Scout", automationRunMode: "scheduled",
+      scheduledAutomationSnapshot: {
+        targetRoles: "invalid", targetLocations: [], minScore: 82, dailyCap: 5, requireApproval: true, autoApply: false,
+      },
+    }))
       .resolves.toEqual({ turnId: "turn_active", created: false })
     expect(db.agentTurn.findFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation" }),
@@ -81,19 +129,69 @@ describe("ensureAutomationTurn", () => {
     expect(db.agentTurn.create).not.toHaveBeenCalled()
   })
 
-  it("handles a concurrent create race by returning the active Turn", async () => {
+  it.each([["scheduled", "manual"], ["manual", "scheduled"]] as const)(
+    "does not reuse a %s request's active %s Turn",
+    async (requestedMode, storedMode) => {
+      const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue({ id: "turn_active", input: { automationRunMode: storedMode } }), create: vi.fn() } }
+
+      await expect(ensureAutomationTurn(db, runInput(requestedMode)))
+        .rejects.toBeInstanceOf(AutomationTurnOccupiedError)
+      expect(db.agentTurn.create).not.toHaveBeenCalled()
+    },
+  )
+
+  it("does not reuse a legacy active automation Turn without a mode marker", async () => {
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue({ id: "turn_legacy", input: { goal: "Run automation" } }), create: vi.fn() } }
+
+    await expect(ensureAutomationTurn(db, runInput("manual")))
+      .rejects.toBeInstanceOf(AutomationTurnOccupiedError)
+    expect(db.agentTurn.create).not.toHaveBeenCalled()
+  })
+
+  it("handles a concurrent create race without rewriting the winning Turn", async () => {
     const db = {
       agentTurn: {
-        findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "turn_raced" }),
+        findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "turn_raced", input: { automationRunMode: "scheduled" } }),
+        create: vi.fn().mockRejectedValue({ code: "P2002" }),
+        update: vi.fn(),
+      },
+    }
+
+    await expect(ensureAutomationTurn(db, runInput("scheduled")))
+      .resolves.toEqual({ turnId: "turn_raced", created: false })
+    expect(db.agentTurn.findFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation" }),
+      select: { id: true, input: true },
+    }))
+    expect(db.agentTurn.create).toHaveBeenCalledTimes(1)
+    expect(db.agentTurn.update).not.toHaveBeenCalled()
+  })
+
+  it.each([["scheduled", "manual"], ["manual", "scheduled"]] as const)(
+    "rejects a unique-create race won by a %s-mode Turn for a %s request",
+    async (storedMode, requestedMode) => {
+      const db = {
+        agentTurn: {
+          findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "turn_raced", input: { automationRunMode: storedMode } }),
+          create: vi.fn().mockRejectedValue({ code: "P2002" }),
+        },
+      }
+
+      await expect(ensureAutomationTurn(db, runInput(requestedMode)))
+        .rejects.toBeInstanceOf(AutomationTurnOccupiedError)
+    },
+  )
+
+  it("rejects a unique-create race won by a legacy Turn without a mode marker", async () => {
+    const db = {
+      agentTurn: {
+        findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "turn_legacy", input: {} }),
         create: vi.fn().mockRejectedValue({ code: "P2002" }),
       },
     }
 
-    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
-      .resolves.toEqual({ turnId: "turn_raced", created: false })
-    expect(db.agentTurn.findFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation" }),
-    }))
+    await expect(ensureAutomationTurn(db, runInput("scheduled")))
+      .rejects.toBeInstanceOf(AutomationTurnOccupiedError)
   })
 
   it("fails closed when the create race belongs to a non-automation Turn", async () => {
@@ -104,7 +202,7 @@ describe("ensureAutomationTurn", () => {
       },
     }
 
-    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+    await expect(ensureAutomationTurn(db, runInput("manual")))
       .rejects.toMatchObject({
         name: "AutomationTurnOccupiedError",
         code: "automation_turn_occupied",
@@ -121,7 +219,7 @@ describe("ensureAutomationTurn", () => {
       },
     }
 
-    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+    await expect(ensureAutomationTurn(db, runInput("manual")))
       .rejects.toBe(databaseError)
     expect(databaseError).not.toBeInstanceOf(AutomationTurnOccupiedError)
   })

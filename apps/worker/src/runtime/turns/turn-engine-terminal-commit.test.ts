@@ -2,8 +2,22 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
-import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
+import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
+import { createCanonicalTurnTerminalGuard } from "../canonical-turn-native-verification-runtime.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
+import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
+import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
+import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
+
+const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+vi.mock("../subagents/steering-reconciliation-ledger.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../subagents/steering-reconciliation-ledger.js")>(),
+  assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
+}))
 
 const now = new Date("2026-09-25T10:00:00.000Z")
 const owner = {
@@ -19,7 +33,7 @@ const input = {
 type Row = Record<string, unknown>
 type Call = { sql: string; values?: readonly unknown[] }
 
-function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: { pause?: boolean } = {}) {
+function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: { pause?: boolean; planningRoot?: boolean } = {}) {
   const calls: Call[] = []
   const events = new Map<string, Row>()
   const outboxes = new Map<string, Row>()
@@ -33,7 +47,8 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
   }))
   let sequence = 10n
   let turn: Row = { id: owner.turnId, status: "in_progress", finalResponse: null, source: "user", ...(currentTurnInput === undefined ? {} : { input: currentTurnInput }) }
-  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, interruptRequestedAt: null }
+  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, interruptRequestedAt: null,
+    allowedActions: options.planningRoot ? ["agent.plan"] : [] }
   const client = {
     query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
@@ -127,6 +142,21 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
 }
 
 describe("atomic Turn terminal commit", () => {
+  it("blocks native planning Root completion while steering remains unresolved", async () => {
+    const fake = makePool([], undefined, { planningRoot: true })
+    assertNoUnresolvedSteeringMock.mockReset().mockRejectedValueOnce(new Error("steering_reconciliation_pending"))
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toThrow("steering_reconciliation_pending")
+    expect(assertNoUnresolvedSteeringMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.taskId, parentTaskId: owner.taskId,
+      turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion, parentLeaseOwner: owner.ownerId, parentAttemptCount: 1,
+    }))
+    expect(fake.state.turn.status).toBe("in_progress")
+    expect(fake.state.root.status).toBe("running")
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+  })
+
   it("completes the Turn and promotes only the oldest pending session follow-up atomically", async () => {
     const fake = makePool([
       { id: "later", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId, acceptedSequence: 8 },
@@ -264,6 +294,29 @@ describe("atomic Turn terminal commit", () => {
     })).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
   })
 
+  it("keeps the private graph binding out of receipts and requires exact summary replay", async () => {
+    const fake = makePool()
+    const binding = { graphRevision: 1, summary: reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [] }) }
+    const final = { schemaVersion: "agent-harness.v2.final", response: "Final answer", summary: formatTaskGraphFinalSummary(binding.summary) }
+    const boundInput = { ...input, response: JSON.stringify(final), finalContent: { text: final.response, final }, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
+    const guard = vi.fn(async (_client: pg.PoolClient, terminal: Parameters<TurnEngineTerminalGuard>[1]) => {
+      expect(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
+      return { ok: true as const }
+    })
+
+    await expect(commitTurnTerminal(fake.pool, boundInput, guard)).resolves.toMatchObject({ status: "completed" })
+    await expect(commitTurnTerminal(fake.pool, boundInput, guard)).resolves.toMatchObject({ status: "completed" })
+    expect(guard).toHaveBeenCalledOnce()
+    expect(fake.state.turn.finalResponse).toBe(boundInput.response)
+    expect(JSON.stringify(fake.state.root.result)).not.toContain("task_graph_final_summary_binding")
+
+    const changedFinal = { ...final, summary: "Task-reported results: discovered jobs: 1 (complete)." }
+    await expect(commitTurnTerminal(fake.pool, {
+      ...boundInput, response: JSON.stringify(changedFinal), finalContent: { text: changedFinal.response, final: changedFinal },
+    }, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+    expect(guard).toHaveBeenCalledOnce()
+  })
+
   it("validates before terminal writes and bypasses the guard on committed replay after source changes", async () => {
     const fake = makePool()
     let sourceCurrent = true
@@ -310,6 +363,38 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
   })
 
+  it("rolls back when the canonical terminal guard cannot rebind a graph summary", async () => {
+    const fake = makePool()
+    const binding = { graphRevision: 1, summary: reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [] }) }
+    const final = { schemaVersion: "agent-harness.v2.final", response: "Final answer", summary: formatTaskGraphFinalSummary(binding.summary) }
+    const boundInput = {
+      ...input, response: JSON.stringify(final), finalContent: { text: final.response, final },
+      [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding,
+    }
+    const checkRootGraph = vi.fn(async () => ({ ok: true as const }))
+    const guard = createCanonicalTurnTerminalGuard({
+      enabled: true,
+      nativeVerification: { checkTerminal: vi.fn(async () => ({ nativeVerificationPassed: true })) },
+      checkRootGraph,
+    })
+    if (!guard) throw new Error("terminal guard was not enabled")
+
+    await expect(commitTurnTerminal(fake.pool, boundInput, guard)).rejects.toMatchObject({
+      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified",
+    })
+
+    expect(checkRootGraph).toHaveBeenCalledOnce()
+    expect(fake.calls[0]?.sql).toBe("BEGIN ISOLATION LEVEL READ COMMITTED")
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+    expect(fake.state.root).toMatchObject({ status: "running", result: null })
+    expect(fake.state.turn).toMatchObject({ status: "in_progress", finalResponse: null })
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+    expect(fake.calls.some(({ sql }) => sql === "COMMIT")).toBe(false)
+  })
+
   it("does not terminalize a Turn after durable pause admission is denied", async () => {
     const fake = makePool([], undefined, { pause: true })
 
@@ -322,10 +407,70 @@ describe("atomic Turn terminal commit", () => {
 
   it("surfaces a TaskGraph race denial as a same-Turn recovery receipt", async () => {
     const fake = makePool()
-    const guard = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved." }))
-    await expect(commitTurnTerminal(fake.pool, input, guard)).rejects.toMatchObject({
-      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved.",
+    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing. issue=verification_report nodeOrdinal=2 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing"
+    const decision = { ok: false as const, blocker: "task_graph_verification_unverified", feedback }
+    Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: 41 })
+    const guard = vi.fn(async () => decision)
+    let recoveryError: unknown
+    try { await commitTurnTerminal(fake.pool, input, guard) } catch (error: unknown) { recoveryError = error }
+    expect(recoveryError).toMatchObject({
+      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback,
     })
+    expect(recoveryError && typeof recoveryError === "object" ? Reflect.get(recoveryError, "recoveryFeedback") : undefined)
+      .toBe(tagTaskGraphRepairRecovery(feedback, 41))
+    expect(JSON.stringify(recoveryError)).not.toContain("task-graph-repair-recovery.v1:")
+    expect(JSON.stringify(recoveryError)).not.toContain("graphRevision")
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("carries the gate revision through atomic race recovery without changing rejection evidence", async () => {
+    const fake = makePool()
+    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing. issue=verification_report nodeOrdinal=2 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing"
+    const decision = { ok: false as const, blocker: "task_graph_verification_unverified", feedback }
+    Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: 41, enumerable: true })
+    const guard = vi.fn(async () => decision)
+    const snapshot = applyCompletionRecovery({ system: [], profile: [], steerHistory: [], businessRefs: [{ id: "evidence-1", kind: "artifact" as const, ownerId: owner.userId }], toolObservations: [] },
+      "older-step", tagTaskGraphRepairRecovery(feedback, 17))
+    const options = {
+      identity: owner, goal: "complete the task", snapshot,
+      store: {
+        updateStep: vi.fn(async () => undefined),
+        recordFinalResponse: vi.fn(async (candidate: Parameters<NonNullable<TurnExecutionOptions["store"]["recordFinalResponse"]>>[0]) => {
+          if (!candidate.terminal) return undefined
+          if (candidate.identity.kind !== "turn") throw new Error("Expected a root Turn owner")
+          return commitTurnTerminal(fake.pool, { ...candidate.terminal, owner: candidate.identity, response: candidate.response, now: candidate.now }, guard)
+        }),
+      },
+      idFactory: (value: string) => value,
+    } as unknown as TurnExecutionOptions
+    const appended: Array<{ type: string; payload: unknown }> = []
+    const writer = { append: vi.fn(async (type: string, _stepId: string, _itemId: string | null, payload: unknown) => { appended.push({ type, payload }) }) }
+
+    const outcome = await completeTurnCandidate({
+      options, writer: writer as unknown as TurnExecutionEventWriter, step: { id: input.stepId, ordinal: 1 },
+      output: { text: "candidate answer", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null },
+      snapshot,
+      stepCount: 2, toolCallCount: 1, usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 },
+      signal: new AbortController().signal, now: () => now, onStepClosed: vi.fn(),
+    })
+
+    const rejected = appended.find(event => event.type === "final.rejected")
+    expect(rejected?.payload).toEqual({ code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback, taskId: owner.taskId })
+    expect(JSON.stringify(rejected)).not.toContain("task-graph-repair-recovery.v1:")
+    expect(JSON.stringify(rejected)).not.toContain("graphRevision")
+    expect(outcome).toEqual({ kind: "replan", feedback: tagTaskGraphRepairRecovery(feedback, 41) })
+    if (outcome.kind !== "replan") throw new Error("Expected atomic TaskGraph recovery to replan")
+    const refreshed = applyCompletionRecovery(snapshot, "step-after-race", outcome.feedback)
+    expect(refreshed.system).toEqual([expect.objectContaining({ id: "completion-recovery:task-graph:41" })])
+    expect(refreshed.system[0]?.content).toContain("graph revision 41")
+    expect(guard).toHaveBeenCalledOnce()
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
     expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
     expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
   })

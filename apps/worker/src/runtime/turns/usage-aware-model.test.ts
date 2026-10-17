@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { estimateSharedAiCost } from "@jobcopilot/shared"
+import { createHarnessModelRuntime, type HarnessFetch } from "../harness-model.js"
 
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
+import { ContextEstimateExceededError } from "./model-request-admission.js"
+import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../subagents/tree-budget-types.js"
 
@@ -41,6 +45,59 @@ function adapter(events: readonly ModelStreamEvent[] = [{ type: "usage", inputTo
   return { id: "fixture", profile, async *stream(_input) { yield* events } }
 }
 
+function rejectingAdapter(error: unknown): ModelAdapter {
+  return { id: "fixture-rejecting", profile, async *stream() { throw error } }
+}
+
+function setRouteContextWindow(runtime: ReturnType<typeof createHarnessModelRuntime>, provider: string, maxContextTokens: number): void {
+  const route = runtime.registry.list().find(item => item.profile.provider === provider)
+  if (!route) throw new Error(`fixture route missing: ${provider}`)
+  runtime.registry.unregister(route.id)
+  runtime.registry.register({ ...route, profile: { ...route.profile, maxContextTokens, defaultMaxOutputTokens: 64 } })
+}
+
+function oversizedRequest(): HarnessModelRequest {
+  return { ...request, maxOutputTokens: 64, messages: [{ role: "user", content: [{ type: "text", text: "x".repeat(9000) }] }] }
+}
+
+function failedMinimaxStreamResponse(): Response {
+  const data = JSON.stringify({
+    choices: [{ delta: {
+      content: "Primary partial text",
+      tool_calls: [{ index: 0, id: "primary-call", type: "function", function: { name: "jobs.search", arguments: '{"query":"hidden"}' } }],
+    } }],
+    usage: { prompt_tokens: 29, completion_tokens: 31 },
+  })
+  let emitted = false
+  return new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!emitted) {
+        emitted = true
+        controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`))
+      } else controller.error(new Error("provider stream interrupted"))
+    },
+  }), { headers: { "Content-Type": "text/event-stream" } })
+}
+
+function expectedCost(provider: string, model: string, inputTokens: number, outputTokens: number): number {
+  return estimateSharedAiCost({ provider, model, credentialSource: "user", inputTokens, outputTokens, latencyMs: 0, status: "success" })
+}
+
+function harnessRuntime(fetcher: HarnessFetch, contexts: readonly [number, number?], onRequestAdmission?: () => void) {
+  const runtime = createHarnessModelRuntime({
+    primary: { provider: "minimax", model: "MiniMax-M3", apiKey: "minimax-key" },
+    ...(contexts[1] === undefined ? {} : { fallbacks: [{ provider: "anthropic", model: "claude-sonnet-5", apiKey: "anthropic-key" }] }),
+    allowEnvironmentFallbacks: false, fetch: fetcher, onRequestAdmission,
+  })
+  setRouteContextWindow(runtime, "minimax", contexts[0])
+  if (contexts[1] !== undefined) setRouteContextWindow(runtime, "anthropic", contexts[1])
+  return runtime
+}
+
+function spreadPrivateOutputAdapter(adapter: ModelAdapter): ModelAdapter {
+  return { ...adapter, async *stream(input) { yield* adapter.stream({ ...input }) } }
+}
+
 describe("usage-aware model owner seam", () => {
   it("sends a child owner envelope and consumes one shared tree step", async () => {
     const fixture = store()
@@ -77,5 +134,210 @@ describe("usage-aware model owner seam", () => {
     })
     await expect((async () => { for await (const _event of model.stream(request)) return undefined })()).rejects.toThrow("account_settlement_unknown")
     expect(fixture.statuses).toEqual([])
+  })
+
+  it("releases a child reservation after a known zero-usage local context rejection", async () => {
+    const fixture = store(), settlements: unknown[] = []
+    const settle = vi.fn(async (value: WorkerUsageSettlementInput) => { settlements.push(value) })
+    const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
+      provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: true,
+    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ settle })) })
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
+      .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: true })
+    expect(settlements).toEqual([{ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0,
+      errorCode: "context_estimate_exceeded" }])
+    expect(fixture.statuses).toEqual(["released"])
+  })
+
+  it("consumes the reservation when a local rejection follows an earlier route attempt", async () => {
+    const fixture = store()
+    const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
+      provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: false,
+    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
+      .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: false })
+    expect(fixture.statuses).toEqual(["consumed"])
+  })
+
+  it("keeps a local rejection reservation active when zero-usage settlement is unknown", async () => {
+    const fixture = store()
+    const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
+      provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: true,
+    })), { owner, treeBudget: fixture.store,
+      authorize: vi.fn(async () => ({ settle: vi.fn(async () => { throw new Error("account settlement unknown") }) })) })
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
+      .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: true })
+    expect(fixture.statuses).toEqual([])
+  })
+
+  it("releases the child reservation without authorizing or settling when every Harness route fails preflight through a spread wrapper", async () => {
+    const fixture = store(), settlement = vi.fn(), authorize = vi.fn(async () => ({ settle: settlement }))
+    const fetcher = vi.fn(async () => { throw new Error("preflight reached fetch") })
+    const runtime = harnessRuntime(fetcher, [500, 500])
+    const model = createUsageAwareModelAdapter(spreadPrivateOutputAdapter(runtime.adapter), { owner, authorize, treeBudget: fixture.store })
+
+    await expect((async () => { for await (const _event of model.stream(oversizedRequest())) return undefined })())
+      .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: true })
+    expect(authorize).not.toHaveBeenCalled()
+    expect(settlement).not.toHaveBeenCalled()
+    expect(fixture.statuses).toEqual(["released"])
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it("authorizes the fitting fallback after its preflight and settles only that route through a spread wrapper", async () => {
+    const order: string[] = [], fixture = store()
+    const fetcher: HarnessFetch = vi.fn(async url => {
+      order.push("fetch")
+      expect(url).toContain("anthropic")
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3}}}',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}',
+        'event: message_stop\ndata: {"type":"message_stop"}',
+      ].join("\n\n"), { headers: { "Content-Type": "text/event-stream" } })
+    })
+    const runtime = harnessRuntime(fetcher, [500, 5000], () => { order.push("preflight") })
+    const settlement = vi.fn(async () => undefined)
+    const authorize = vi.fn(async input => { order.push(`authorize:${input.provider}`); return { settle: settlement, release: vi.fn() } })
+    const model = createUsageAwareModelAdapter(spreadPrivateOutputAdapter(runtime.adapter), { owner, authorize, treeBudget: fixture.store })
+
+    const events: ModelStreamEvent[] = []
+    for await (const event of model.stream(oversizedRequest())) events.push(event)
+    expect(events.some(event => event.type === "text_delta" && event.text === "ok")).toBe(true)
+    expect(order).toEqual(["preflight", "preflight", "authorize:anthropic", "fetch"])
+    expect(authorize).toHaveBeenCalledTimes(1)
+    expect(settlement).toHaveBeenCalledOnce()
+    expect(fixture.statuses).toEqual(["consumed"])
+  })
+
+  it("authorizes and settles each provider fallback independently, without refund after provider start", async () => {
+    const fixture = store(), settled = new Map<string, ReturnType<typeof vi.fn>>(), released = new Map<string, ReturnType<typeof vi.fn>>()
+    const fetcher = vi.fn(async () => new Response("provider unavailable", { status: 503 }))
+    const runtime = harnessRuntime(fetcher, [5000, 5000])
+    const authorize = vi.fn(async input => {
+      const settle = vi.fn(async () => undefined), release = vi.fn(async () => undefined)
+      settled.set(input.provider, settle); released.set(input.provider, release)
+      return { settle, release }
+    })
+    const model = createUsageAwareModelAdapter(runtime.adapter, { owner, authorize, treeBudget: fixture.store })
+
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })()).rejects.toMatchObject({ code: "provider_error" })
+    expect(authorize.mock.calls.map(([input]) => `${input.provider}/${input.model}`)).toEqual([
+      "minimax/MiniMax-M3", "anthropic/claude-sonnet-5",
+    ])
+    expect(settled.get("minimax")).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_rerouted" })
+    expect(settled.get("anthropic")).toHaveBeenCalledWith({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "provider_error" })
+    expect([...released.values()].every(release => !release.mock.calls.length)).toBe(true)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fixture.statuses).toEqual(["consumed"])
+  })
+
+  it("settles failed-route usage before fallback and attributes success only to the fallback", async () => {
+    const order: string[] = [], fixture = store()
+    const settled = new Map<string, ReturnType<typeof vi.fn>>(), released = new Map<string, ReturnType<typeof vi.fn>>()
+    const fetcher: HarnessFetch = vi.fn(async url => {
+      const provider = url.includes("anthropic") ? "anthropic" : "minimax"
+      order.push(`fetch:${provider}`)
+      if (provider === "minimax") return failedMinimaxStreamResponse()
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3}}}',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Fitting fallback"}}',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}',
+        'event: message_stop\ndata: {"type":"message_stop"}',
+      ].join("\n\n"), { headers: { "Content-Type": "text/event-stream" } })
+    })
+    const modelRuntime = harnessRuntime(fetcher, [5000, 5000])
+    const authorize = vi.fn(async input => {
+      order.push(`authorize:${input.provider}`)
+      const settle = vi.fn(async () => { order.push(`settle:${input.provider}`) })
+      const release = vi.fn()
+      settled.set(input.provider, settle); released.set(input.provider, release)
+      return { settle, release }
+    })
+    const model = createUsageAwareModelAdapter(spreadPrivateOutputAdapter(modelRuntime.adapter), { owner, authorize, treeBudget: fixture.store })
+    const events: ModelStreamEvent[] = []
+    for await (const event of model.stream(request)) events.push(event)
+
+    const minimaxCost = expectedCost("minimax", "MiniMax-M3", 29, 31)
+    const anthropicCost = expectedCost("anthropic", "claude-sonnet-5", 3, 4)
+    expect(events).toContainEqual({ type: "text_delta", text: "Fitting fallback" })
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "text_delta", text: "Primary partial text" }))
+    expect(events.some(event => event.type.startsWith("tool_") && "callId" in event && event.callId === "primary-call")).toBe(false)
+    expect(order).toEqual([
+      "authorize:minimax", "fetch:minimax", "settle:minimax",
+      "authorize:anthropic", "fetch:anthropic", "settle:anthropic",
+    ])
+    expect(settled.get("minimax")).toHaveBeenCalledOnce()
+    expect(settled.get("minimax")).toHaveBeenCalledWith({
+      status: "error", inputTokens: 29, outputTokens: 31, estimatedCostUsd: minimaxCost, errorCode: "provider_rerouted",
+    })
+    expect(settled.get("anthropic")).toHaveBeenCalledOnce()
+    expect(settled.get("anthropic")).toHaveBeenCalledWith({
+      status: "success", inputTokens: 3, outputTokens: 4, estimatedCostUsd: anthropicCost,
+    })
+    expect(minimaxCost).not.toBe(anthropicCost)
+    expect([...released.values()].every(release => !release.mock.calls.length)).toBe(true)
+    expect(fixture.statuses).toEqual(["consumed"])
+  })
+
+  it("releases account and child credit once when async authorization resolves after cancellation", async () => {
+    const controller = new AbortController(), fixture = store()
+    let beginAuthorization!: () => void, finishAuthorization!: (value: { settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }) => void
+    const authorizationStarted = new Promise<void>(resolve => { beginAuthorization = resolve })
+    const authorization = new Promise<{ settle: ReturnType<typeof vi.fn>; release: ReturnType<typeof vi.fn> }>(resolve => { finishAuthorization = resolve })
+    const settle = vi.fn(), release = vi.fn(async () => undefined), fetcher = vi.fn(async () => { throw new Error("cancelled request reached provider") })
+    const runtime = harnessRuntime(fetcher, [5000])
+    const model = createUsageAwareModelAdapter(runtime.adapter, {
+      owner, treeBudget: fixture.store, authorize: vi.fn(() => { beginAuthorization(); return authorization }),
+    })
+    const pending = (async () => { for await (const _event of model.stream({ ...request, signal: controller.signal })) return undefined })()
+    await authorizationStarted
+    controller.abort(new Error("cancelled during authorization"))
+    finishAuthorization({ settle, release })
+
+    await expect(pending).rejects.toThrow("cancelled during authorization")
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(settle).not.toHaveBeenCalled()
+    expect(release).toHaveBeenCalledOnce()
+    expect(fixture.statuses).toEqual(["released"])
+  })
+
+  it("does not admit or fetch when cancellation precedes route authorization", async () => {
+    const controller = new AbortController(), fixture = store()
+    controller.abort(new Error("already cancelled"))
+    const fetcher = vi.fn(async () => { throw new Error("cancelled request reached provider") })
+    const authorize = vi.fn(async () => ({ settle: vi.fn(), release: vi.fn() }))
+    const model = createUsageAwareModelAdapter(harnessRuntime(fetcher, [5000]).adapter, { owner, treeBudget: fixture.store, authorize })
+
+    await expect((async () => { for await (const _event of model.stream({ ...request, signal: controller.signal })) return undefined })())
+      .rejects.toThrow("already cancelled")
+    expect(authorize).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(fixture.statuses).toEqual(["released"])
+  })
+
+  it("does not fetch or try a fallback when deferred authorization is denied", async () => {
+    const diagnostics: string[] = [], fetcher = vi.fn(async () => { throw new Error("authorization reached fetch") })
+    const runtime = harnessRuntime(fetcher, [5000, 5000], () => { diagnostics.push("preflight") })
+    const authorize = vi.fn(async () => { throw new Error("usage_denied") })
+    const model = createUsageAwareModelAdapter(runtime.adapter, { owner, authorize })
+
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })()).rejects.toMatchObject({ message: "usage_denied" })
+    expect(authorize).toHaveBeenCalledOnce()
+    expect(diagnostics).toEqual(["preflight"])
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it("keeps eager authorization for ordinary non-Harness adapters", async () => {
+    const order: string[] = []
+    const ordinary = adapter([{ type: "completed", finishReason: "stop" }])
+    const wrapped = createUsageAwareModelAdapter({
+      ...ordinary, async *stream() { order.push("provider"); yield { type: "completed", finishReason: "stop" } },
+    }, { owner, authorize: vi.fn(async () => { order.push("authorize"); return { settle: vi.fn(async () => undefined) } }) })
+
+    for await (const _event of wrapped.stream(request)) undefined
+    expect(order).toEqual(["authorize", "provider"])
   })
 })

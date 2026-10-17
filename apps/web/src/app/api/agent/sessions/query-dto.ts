@@ -1,5 +1,7 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { projectFinalSummary } from "@/lib/agent/session/final-summary-projection"
 import { projectLegacySubAgentTask } from "@/lib/agent/session/subagent-task-compat"
+import { redactTaskGraphTimelineContent } from "@/lib/task-graph-repair-display"
 
 import { toIso, type CursorRow } from "./query-helpers"
 import { projectTaskEvidencePreview } from "./task-evidence-preview"
@@ -72,7 +74,10 @@ export function itemDto(row: ItemQueryRow) {
   const raw = record(row.content)
   let content: unknown
   if (row.type === "user_message") content = { parts: displayParts(row.content) }
-  else if (row.type === "agent_message") content = { text: displayText(row.content) }
+  else if (row.type === "agent_message") {
+    const summary = projectFinalSummary(row.type, row.phase, row.status, row.content)
+    content = { text: displayText(row.content), ...(summary ? { summary } : {}) }
+  }
   else if (row.type === "approval_request") content = {
     waitKind: "approval",
     approvalId: typeof raw.approvalId === "string" ? raw.approvalId : null,
@@ -105,7 +110,7 @@ export function itemDto(row: ItemQueryRow) {
     errorCode: typeof raw.errorCode === "string" ? raw.errorCode : null,
     outputAvailable: true,
   }
-  else content = redactValue(row.content)
+  else content = redactTaskGraphTimelineContent(row.type, row.content, redactValue)
   return {
     schemaVersion,
     id: row.id,

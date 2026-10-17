@@ -3,7 +3,7 @@ import { PolicyEngine, type PolicySnapshot } from "@jobcopilot/agent-policy"
 const COORDINATION_WRITE_TOOL_NAMES = [
   "spawn_subagent", "agent.spawn", "agent.followup",
   "send_message", "agent.send", "wait_subagents", "agent.wait",
-  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
+  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "agent.ask_user",
 ]
 const COORDINATION_READ_TOOL_NAMES = ["list_subagents", "agent.list"]
 
@@ -23,7 +23,7 @@ const FALLBACK_POLICY: PolicySnapshot = {
     },
     {
       id: "canonical-root-task-graph-plan",
-      roles: ["orchestrator"], tools: ["agent.plan"], risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
+      roles: ["orchestrator"], tools: ["agent.plan", "agent.reconcile"], risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
       outcome: "allow", reasonCode: "server_task_graph_planning_gate", reason: "The server enabled scoped task graph planning",
     },
     {

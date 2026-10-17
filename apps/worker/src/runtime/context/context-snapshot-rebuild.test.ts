@@ -88,7 +88,7 @@ describe("context snapshot Step rebuild", () => {
     expect(requestText).toContain('"evidenceBodiesIncluded":false')
   })
 
-  it("does not send an oversized compacted goal after the working-state projection is unavailable", async () => {
+  it("rejects an oversized compacted goal before rebuilding model context", async () => {
     const base = await makeSnapshot("user-a", false)
     const oversizedGoal = `oversized-compacted-goal-${"x".repeat(16_100)}`
     const state = {
@@ -102,13 +102,9 @@ describe("context snapshot Step rebuild", () => {
     const compaction = { itemId, digest: sha256Hex({ state, summary: narrativeSummary, measurement: tokenMeasurement, sourceItemIds, itemId }), state, narrativeSummary, tokenMeasurement, sourceItemIds }
     const withMemory = { ...base, content: { ...base.content, compaction } }
     const snapshot = { ...withMemory, checksum: snapshotChecksum(withMemory), canonicalJson: snapshotCanonicalJson(withMemory) }
-    const step = await rebuildStepFromSnapshot(snapshot, { scope, turnId: "turn-a", stepId: "step-a" })
-    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
-    const request = buildModelRequest({ context: step, model, tools: [], sessionId: "session-a", turnId: "turn-a", stepId: "step-a", userId: "user-a", taskId: "root-a", signal: new AbortController().signal })
-    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
 
-    expect(requestText).toContain("Durable context snapshot unavailable (projection limit exceeded).")
-    expect(requestText).not.toContain(oversizedGoal)
-    expect(requestText).not.toContain("oversized-compacted-goal-")
+    await expect(rebuildStepFromSnapshot(snapshot, { scope, turnId: "turn-a", stepId: "step-a" })).rejects.toMatchObject({
+      code: "store_conflict", message: "Selected model goal exceeds the projection limit",
+    })
   })
 })

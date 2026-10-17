@@ -34,6 +34,23 @@ describe('POST /api/admin/v1/applications/[id]/action', () => {
     } }))
   })
 
+  it('blocks admin retry of an uncertain submission before mutation or queueing', async () => {
+    mocks.findUnique.mockResolvedValueOnce({ id: 'task-1', userId: 'user-1', jobId: 'job-1', status: 'waiting_for_user', checkpoint: 'submission_uncertain', job: { url: 'https://jobs.lever.co/acme/1' } })
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/admin/v1/applications/task-1/action', {
+      method: 'POST',
+      headers: { Origin: 'http://localhost', 'Idempotency-Key': 'retry-uncertain', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'retry', reason: 'Retry after confirming the application outcome' }),
+    }), { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(409)
+    expect(mocks.run).not.toHaveBeenCalled()
+    expect(mocks.updateMany).not.toHaveBeenCalled()
+    expect(mocks.eventCreate).not.toHaveBeenCalled()
+    expect(mocks.queue).not.toHaveBeenCalled()
+    expect(mocks.audit).not.toHaveBeenCalled()
+  })
+
   it('rejects unsupported actions before touching the task', async () => {
     const { POST } = await import('./route')
     const response = await POST(new NextRequest('http://localhost/api/admin/v1/applications/task-1/action', { method: 'POST', headers: { Origin: 'http://localhost', 'Idempotency-Key': 'bad-1', 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'delete', reason: 'This action is not supported here' }) }), { params: Promise.resolve({ id: 'task-1' }) })

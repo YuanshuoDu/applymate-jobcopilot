@@ -11,6 +11,8 @@ describe("workerPollingOptions", () => {
       BULLMQ_DRAIN_DELAY_SECONDS: "8",
       BULLMQ_STALLED_INTERVAL_MS: "180000",
     })).toEqual({ drainDelay: 8, stalledInterval: 180_000 })
+    expect(workerPollingOptions({ BULLMQ_STALLED_INTERVAL_MS: "180000" }, 30_000))
+      .toEqual({ drainDelay: 10, stalledInterval: 180_000 })
   })
 
   it("rejects unsafe or ineffective overrides", () => {
@@ -18,5 +20,7 @@ describe("workerPollingOptions", () => {
       BULLMQ_DRAIN_DELAY_SECONDS: "60",
       BULLMQ_STALLED_INTERVAL_MS: "5000",
     })).toEqual({ drainDelay: 10, stalledInterval: 120_000 })
+    expect(workerPollingOptions({ BULLMQ_STALLED_INTERVAL_MS: "5000" }, 30_000))
+      .toEqual({ drainDelay: 10, stalledInterval: 30_000 })
   })
 })

@@ -1,6 +1,6 @@
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 
-export async function runAdmittedModelStep<T>(input: {
+export async function runAdmittedModelStep<T extends { readonly toolCalls: readonly unknown[] }>(input: {
   readonly writer: Pick<TurnExecutionEventWriter, "append">
   readonly stepId: string
   readonly taskId?: string
@@ -19,6 +19,6 @@ export async function runAdmittedModelStep<T>(input: {
     await writer.append("model.failed", stepId, null, { taskId, provider, model, errorCode }, `model-failed:${stepId}`).catch(() => undefined)
     throw error
   }
-  await writer.append("model.completed", stepId, null, { taskId, provider, model }, `model-completed:${stepId}`)
+  await writer.append("model.completed", stepId, null, { taskId, provider, model, toolCallCount: output.toolCalls.length }, `model-completed:${stepId}`)
   return output
 }

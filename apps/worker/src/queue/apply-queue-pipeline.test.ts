@@ -2,14 +2,43 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
   const agentRun = vi.fn().mockResolvedValue({ status: "submitted", durationMs: 11 });
+  const outcomeQuery = vi.fn(async (sql: string) => {
+    if (sql.includes('SELECT "sessionId" FROM application_tasks')) return { rows: [{ sessionId: "session-1" }], rowCount: 1 };
+    if (sql.includes('FROM agent_sessions')) return { rows: [{ id: "session-1" }], rowCount: 1 };
+    if (sql.includes('FROM agent_turns')) return { rows: [{ id: "turn-1" }], rowCount: 1 };
+    if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "filler-1" }], rowCount: 1 };
+    if (sql.includes('SELECT "sessionId", "fillTurnId", "fillTurnSessionId", "fillTurnUserId"')) {
+      return { rows: [{ sessionId: "agent-session-1", fillTurnId: "agent-turn-1", fillTurnSessionId: "agent-session-1", fillTurnUserId: "user-1" }], rowCount: 1 };
+    }
+    if (sql.includes('FROM "Job"')) return { rows: [{ id: "job-1" }], rowCount: 1 };
+    if (sql.includes('SELECT "id", "fillTurnId", "sessionId"')) return { rows: [{ id: "application-task-1", fillTurnId: null, sessionId: "session-1", status: "filling", checkpoint: "form_fill_queued" }], rowCount: 1 };
+    if (sql.includes("INSERT INTO apply_results")) return { rows: [{ id: 1 }], rowCount: 1 };
+    return { rows: [], rowCount: 1 };
+  });
+  const outcomeClient = { query: outcomeQuery, release: vi.fn() };
+  const fakeContext = {
+    close: vi.fn().mockResolvedValue(undefined),
+    route: vi.fn().mockResolvedValue(undefined),
+    unroute: vi.fn().mockResolvedValue(undefined),
+  };
+  const fakePage = {
+    goto: vi.fn().mockResolvedValue(undefined),
+    url: vi.fn().mockReturnValue("https://jobs.example/apply/start/123"),
+    context: vi.fn(() => fakeContext),
+    close: vi.fn().mockResolvedValue(undefined),
+  };
 
   return {
-    workerHandler: undefined as undefined | ((job: { data: Record<string, unknown> }) => Promise<void>),
-    fakePage: { goto: vi.fn().mockResolvedValue(undefined), url: vi.fn().mockReturnValue("https://jobs.example/apply/start/123") },
+    workerHandler: undefined as undefined | ((job: { id: string; data: Record<string, unknown> }) => Promise<void>),
+    workerEvents: {} as Record<string, unknown>,
+    fakePage,
+    fakeContext,
     checkRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
     withCloakContext: vi.fn(),
     insertApplyResult: vi.fn().mockResolvedValue(1),
     query: vi.fn().mockResolvedValue({ rowCount: 1 }),
+    outcomeQuery,
+    outcomeClient,
     loadTaskContext: vi.fn(),
     detectCaptcha: vi.fn().mockResolvedValue(false),
     detectFlow: vi.fn().mockReturnValue(null),
@@ -29,6 +58,11 @@ const mocks = vi.hoisted(() => {
     applicationTaskStillActive: vi.fn().mockResolvedValue(true),
     completeFillForReview: vi.fn().mockResolvedValue(true),
     finishApplicationTask: vi.fn().mockResolvedValue(undefined),
+    claimUnattendedSubmission: vi.fn().mockResolvedValue("claimed"),
+    releaseUncertainSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
+    updateJobForSubmission: vi.fn().mockResolvedValue({ kind: "current", value: true }),
+    reconcileClaimedSubmissionUncertain: vi.fn().mockResolvedValue(true),
+    redisExists: vi.fn().mockResolvedValue(0),
     pauseForFormInput: vi.fn().mockResolvedValue(undefined),
     agentRun,
     AgentHarness: vi.fn().mockImplementation(() => ({ run: agentRun })),
@@ -57,16 +91,17 @@ const approvalMocks = vi.hoisted(() => ({
 const submitToolMocks = vi.hoisted(() => ({ create: vi.fn() }));
 
 vi.mock("bullmq", () => ({
-  Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), isPaused: vi.fn().mockResolvedValue(false) })),
+  Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), isPaused: vi.fn().mockResolvedValue(false), toKey: (suffix: string) => `bull:apply-tasks:${suffix}` })),
   Worker: vi.fn().mockImplementation((_name, handler) => {
     mocks.workerHandler = handler;
-    return { on: vi.fn(), close: vi.fn(), isRunning: vi.fn() };
+    return { on: vi.fn((event: string, callback: unknown) => { mocks.workerEvents[event] = callback; }), close: vi.fn(), isRunning: vi.fn() };
   }),
 }));
 
 vi.mock("ioredis", () => ({
   Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })),
 }));
+vi.mock("../redis.js", () => ({ redisConnection: { exists: mocks.redisExists } }));
 
 vi.mock("../rate-limit.js", () => ({ checkRateLimit: mocks.checkRateLimit }));
 vi.mock("../cloak/pool.js", () => ({ withCloakContext: mocks.withCloakContext }));
@@ -75,7 +110,7 @@ vi.mock("../cloak/captcha.js", () => ({
 }));
 vi.mock("../db/apply-results.js", () => ({
   insertApplyResult: mocks.insertApplyResult,
-  getPool: vi.fn(() => ({ query: mocks.query })),
+  getPool: vi.fn(() => ({ query: mocks.query, connect: vi.fn().mockResolvedValue(mocks.outcomeClient) })),
 }));
 vi.mock("../db/budget.js", () => ({
   checkBudget: mocks.checkBudget,
@@ -116,6 +151,13 @@ vi.mock("../db/application-task-state.js", () => ({
   pauseForFormInput: mocks.pauseForFormInput,
   needsUserTakeover: vi.fn(() => false),
 }));
+vi.mock("../db/submission-guard.js", () => ({
+  claimUnattendedSubmission: mocks.claimUnattendedSubmission,
+  reconcileClaimedSubmissionUncertain: mocks.reconcileClaimedSubmissionUncertain,
+  releaseUncertainSubmission: mocks.releaseUncertainSubmission,
+  updateJobForSubmission: mocks.updateJobForSubmission,
+  UNCONFIRMED_SUBMISSION_MESSAGE: "The previous background attempt was interrupted after it started. ApplyMate did not retry it to avoid sending a duplicate application.",
+}));
 vi.mock("../runtime/approval/pg-store.js", () => ({
   createPgApprovalStore: vi.fn(() => ({ inspectSubmission: approvalMocks.inspectSubmission })),
 }));
@@ -148,6 +190,8 @@ const payload = {
   operation: "submit",
   userId: "user-1",
   jobId: "job-1",
+  sessionId: "agent-session-1",
+  fillTurnId: "agent-turn-1",
   applyUrl: "https://jobs.example/apply/start/123",
   personaId: "persona-1",
   resumePath: "/resume.pdf",
@@ -169,15 +213,30 @@ const formPattern = {
 async function runApplyJob() {
   await import("./apply-queue.js");
   expect(mocks.workerHandler).toBeDefined();
-  await mocks.workerHandler?.({ data: payload });
+  await mocks.workerHandler?.({ id: "worker-task-pipeline-1", data: payload });
 }
 
 describe("apply-queue Phase 5 pipeline", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    mocks.claimApplicationTask.mockReset().mockResolvedValue(true);
+    mocks.finishApplicationTask.mockReset().mockResolvedValue(undefined);
+    mocks.claimUnattendedSubmission.mockReset().mockResolvedValue("claimed");
+    mocks.releaseUncertainSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
+    mocks.updateJobForSubmission.mockReset().mockResolvedValue({ kind: "current", value: true });
+    mocks.outcomeQuery.mockClear();
+    mocks.outcomeClient.release.mockClear();
     mocks.workerHandler = undefined;
+    mocks.workerEvents = {};
+    mocks.redisExists.mockReset().mockResolvedValue(0);
+    mocks.reconcileClaimedSubmissionUncertain.mockReset().mockResolvedValue(true);
     mocks.fakePage.goto.mockResolvedValue(undefined);
+    mocks.fakePage.context.mockClear();
+    mocks.fakePage.close.mockReset().mockResolvedValue(undefined);
+    mocks.fakeContext.close.mockReset().mockResolvedValue(undefined);
+    mocks.fakeContext.route.mockReset().mockResolvedValue(undefined);
+    mocks.fakeContext.unroute.mockReset().mockResolvedValue(undefined);
     mocks.withCloakContext.mockImplementation(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
       await fn(mocks.fakePage);
     });
@@ -193,6 +252,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.detectCaptcha.mockResolvedValue(false);
     mocks.detectFlow.mockReturnValue(null);
     approvalMocks.inspectSubmission.mockResolvedValue({
+      id: "approval-1",
       type: "submit_application",
       status: "approved",
       scope: {
@@ -245,7 +305,136 @@ describe("apply-queue Phase 5 pipeline", () => {
         error: null,
       })
     );
+    expect(mocks.claimApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.claimUnattendedSubmission).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        applicationTaskId: "application-task-1", userId: "user-1", jobId: "job-1",
+        sessionId: "agent-session-1", fillTurnId: "agent-turn-1", approvalId: "approval-1",
+      }),
+      "worker-task-pipeline-1",
+    );
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
   }, 15_000);
+
+  it("lets only one concurrent delivery reach browser setup before the submit-start marker", async () => {
+    let claimCount = 0;
+    mocks.claimUnattendedSubmission.mockImplementation(async () => ++claimCount === 1 ? "claimed" : "unavailable");
+    let browserSetupStarted!: () => void;
+    let allowBrowserSetup!: () => void;
+    const browserStarted = new Promise<void>(resolve => { browserSetupStarted = resolve; });
+    const browserGate = new Promise<void>(resolve => { allowBrowserSetup = resolve; });
+    mocks.withCloakContext.mockImplementationOnce(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
+      browserSetupStarted();
+      await browserGate;
+      await fn(mocks.fakePage);
+    });
+
+    const owner = runApplyJob();
+    await browserStarted;
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.claimUnattendedSubmission).toHaveBeenCalledTimes(2);
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+    expect(mocks.releaseUncertainSubmission).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+
+    allowBrowserSetup();
+    await expect(owner).resolves.toBeUndefined();
+    expect(mocks.updateJobForSubmission).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ applicationTaskId: "application-task-1" }),
+      expect.objectContaining({ status: "applied", workflowState: "submitted", applied: true }), "finish_apply_job_state",
+    );
+    expect(mocks.updateJobForSubmission.mock.calls.some(([, , state]) =>
+      (state as { workflowState?: string }).workflowState === "ready_to_apply")).toBe(false);
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+  }, 15_000);
+
+  it("keeps a claimed task terminal and uncertain when browser setup fails", async () => {
+    mocks.withCloakContext.mockRejectedValueOnce(new Error("Cloak context failed to start"));
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.withCloakContext).toHaveBeenCalledOnce();
+    expect(mocks.releaseUncertainSubmission).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+      status: "manual", error: expect.stringContaining("did not retry"),
+    }));
+    expect(mocks.finishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain",
+      expect.stringContaining("did not retry"), "submit", expect.objectContaining({ fillTurnId: "agent-turn-1" }),
+    );
+  }, 15_000);
+
+  it("rejects a stale legacy fill delivery for a TaskGraph-bound task before starting a browser", async () => {
+    payload.operation = "fill";
+    mocks.claimApplicationTask.mockResolvedValueOnce(false);
+
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.claimApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "user-1", "job-1",
+    );
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.completeFillForReview).not.toHaveBeenCalled();
+    expect(mocks.pauseForFormInput).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
+  });
+
+  it("rejects a duplicate legacy fill while the owner returns the task to materials review", async () => {
+    payload.operation = "fill";
+    let status = "filling";
+    let checkpoint = "form_fill_queued";
+    mocks.claimApplicationTask.mockImplementation(async (_pool, _taskId, _userId, _jobId, operation) => {
+      const claimable = operation === "submit"
+        || (status === "filling" && checkpoint === "form_fill_queued");
+      if (claimable) checkpoint = "browser_active";
+      return claimable;
+    });
+    let releaseControl!: (enabled: boolean) => void;
+    let controlStarted!: () => void;
+    const ownerReachedControl = new Promise<void>(resolve => { controlStarted = resolve; });
+    const ownerControl = new Promise<boolean>(resolve => { releaseControl = resolve; });
+    mocks.runtimeFeatureEnabled.mockImplementationOnce(async () => {
+      controlStarted();
+      return ownerControl;
+    });
+    mocks.finishApplicationTask.mockImplementationOnce(async (_pool, _taskId, nextStatus, nextCheckpoint) => {
+      status = nextStatus;
+      checkpoint = nextCheckpoint;
+    });
+
+    const owner = runApplyJob();
+    await ownerReachedControl;
+    await expect(runApplyJob()).resolves.toBeUndefined();
+
+    expect(mocks.claimApplicationTask).toHaveBeenCalledTimes(2);
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+    expect(mocks.query).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+
+    releaseControl(false);
+    await expect(owner).resolves.toBeUndefined();
+
+    expect(status).toBe("waiting_for_user");
+    expect(checkpoint).toBe("materials_ready");
+    expect(mocks.finishApplicationTask).toHaveBeenCalledOnce();
+    expect(mocks.outcomeQuery.mock.calls.filter(([sql]) => sql.includes("INSERT INTO apply_results"))).toHaveLength(1);
+    expect(mocks.outcomeQuery.mock.calls.some(([sql]) => sql.includes('UPDATE "Job"'))).toBe(true);
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.agentRun).not.toHaveBeenCalled();
+  });
 
   it("pattern cache authorization block is terminal and does not fall back to AI", async () => {
     mocks.findFormPattern.mockResolvedValueOnce(formPattern);
@@ -284,6 +473,8 @@ describe("apply-queue Phase 5 pipeline", () => {
       "waiting_for_authorization",
       "submission_blocked",
       "browser_412",
+      "submit",
+      expect.objectContaining({ fillTurnId: "agent-turn-1" }),
     );
   });
 
@@ -340,22 +531,46 @@ describe("apply-queue Phase 5 pipeline", () => {
     );
   });
 
-  it("does not open a second browser when a previous attempt is uncertain", async () => {
-    mocks.query
-      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ workflowState: "submitting" }] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+  it("does not mutate state or open a browser when the exact submit claim is unavailable", async () => {
+    mocks.claimUnattendedSubmission.mockResolvedValueOnce("unavailable");
 
     await expect(runApplyJob()).resolves.toBeUndefined();
 
-    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
-    expect(mocks.AgentHarness).not.toHaveBeenCalled();
-    expect(mocks.insertApplyResult).toHaveBeenCalledWith(
-      expect.objectContaining({
-        status: "manual",
-        error: expect.stringContaining("did not retry"),
-      }),
+    expect(mocks.claimUnattendedSubmission).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ applicationTaskId: "application-task-1" }), "worker-task-pipeline-1",
     );
+    expect(mocks.fakePage.goto).not.toHaveBeenCalled();
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.AgentHarness).not.toHaveBeenCalled();
+    expect(mocks.insertApplyResult).not.toHaveBeenCalled();
+    expect(mocks.finishApplicationTask).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+    expect(mocks.releaseUncertainSubmission).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a stranded claim only after terminal delivery and exact lock release", async () => {
+    mocks.claimUnattendedSubmission.mockResolvedValueOnce("unavailable");
+    await expect(runApplyJob()).resolves.toBeUndefined();
+    const completed = mocks.workerEvents.completed as (job: unknown) => Promise<void>;
+    const failed = mocks.workerEvents.failed as (job: unknown) => Promise<void>;
+    const terminalJob = { id: "worker-task-pipeline-1", data: payload, attemptsMade: 2, opts: { attempts: 2 } };
+
+    await failed({ ...terminalJob, attemptsMade: 1 });
+    expect(mocks.redisExists).not.toHaveBeenCalled();
+    await completed(terminalJob);
+
+    expect(mocks.redisExists).toHaveBeenCalledWith("bull:apply-tasks:worker-task-pipeline-1:lock");
+    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
+    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ applicationTaskId: "application-task-1", jobId: "job-1" }),
+      "worker-task-pipeline-1",
+    );
+    expect(mocks.withCloakContext).not.toHaveBeenCalled();
+    expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
+
+    mocks.redisExists.mockResolvedValueOnce(1);
+    await completed(terminalJob);
+    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
   });
 
   it("does not open a browser when a known ATS policy blocks unattended work", async () => {
@@ -377,10 +592,12 @@ describe("apply-queue Phase 5 pipeline", () => {
       "waiting_for_authorization",
       "form_filled",
       expect.stringContaining("temporarily unavailable"),
+      "submit",
+      expect.objectContaining({ fillTurnId: "agent-turn-1" }),
     );
-    expect(mocks.query).toHaveBeenCalledWith(
-      expect.stringContaining('UPDATE "Job"'),
-      ["saved", "ready_to_apply", "job-1", "user-1"],
+    expect(mocks.updateJobForSubmission).toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ fillTurnId: "agent-turn-1" }),
+      expect.objectContaining({ status: "saved", workflowState: "ready_to_apply" }), "handoff_unavailable_submit",
     );
   });
 
@@ -401,6 +618,8 @@ describe("apply-queue Phase 5 pipeline", () => {
       "waiting_for_authorization",
       "form_filled",
       expect.stringContaining("temporarily unavailable"),
+      "submit",
+      expect.objectContaining({ fillTurnId: "agent-turn-1" }),
     );
   });
 
@@ -416,7 +635,8 @@ describe("apply-queue Phase 5 pipeline", () => {
       "application-task-1",
       "waiting_for_user",
       "materials_ready",
-      expect.stringContaining("temporarily unavailable"),
+      expect.any(String),
+      "fill",
     );
   });
 
@@ -432,6 +652,11 @@ describe("apply-queue Phase 5 pipeline", () => {
 
     expect(capturedTask.current).not.toBeNull();
     expect(capturedTask.current?.beforeSubmit).toBeUndefined();
+    const commitIndex = mocks.outcomeQuery.mock.calls.findIndex(([sql]) => sql === "COMMIT");
+    const commitOrder = mocks.outcomeQuery.mock.invocationCallOrder[commitIndex];
+    expect(commitIndex).toBeGreaterThanOrEqual(0);
+    expect(mocks.createNotification.mock.invocationCallOrder[0]).toBeGreaterThan(commitOrder!);
+    expect(mocks.notifyApplyResult.mock.invocationCallOrder[0]).toBeGreaterThan(commitOrder!);
   });
 
   it("fails closed without opening a browser when the platform control store is unavailable", async () => {

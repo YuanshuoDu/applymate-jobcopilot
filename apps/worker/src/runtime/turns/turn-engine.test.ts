@@ -60,7 +60,7 @@ function contextBuilder(seen: StepContextSnapshot[]) {
         { id: "goal", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: "Find jobs" },
         ...request.snapshot.toolObservations.map((observation) => ({ id: observation.id, layer: "tool_observation" as const, role: "data" as const, trust: "external_untrusted" as const, source: "tool_or_subagent", content: toRepositoryJson(observation.content) })),
       ]
-      return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: BigInt(seen.length), consumedInputIds: seen.length === 1 ? ["steer-1"] : ["steer-1"], blocks, canonicalJson: JSON.stringify(blocks) }
+      return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 1n, consumedInputIds: seen.length === 1 ? ["steer-1"] : ["steer-1"], blocks, canonicalJson: JSON.stringify(blocks) }
     },
   }
 }
@@ -125,6 +125,18 @@ describe("TurnEngine", () => {
     }
     await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
     expect(seen[0]).toBe("root-1")
+  })
+
+  it("keeps claim identity at ordinal zero and forwards a separate root context identity on every Step", async () => {
+    const fixture = baseOptions({ rootInputId: "root-input" })
+    const seen: Array<Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]> = []
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: { build: async request => { seen.push(request); return contextBuilder([]).build(request) } },
+    }
+    await new TurnEngine(options).run()
+    expect(seen.map(request => request.rootInputId)).toEqual(["root-input", undefined, undefined])
+    expect(seen.map(request => request.rootContextInputId)).toEqual(["root-input", "root-input", "root-input"])
   })
 
   it("forwards the active steering marker through the bound context builder", async () => {

@@ -37,6 +37,8 @@ export interface CognitiveAgendaView extends CognitiveAgendaScope {
   readonly schemaVersion: typeof SCHEMA_VERSION
   readonly externalDataPolicy: typeof EXTERNAL_DATA_POLICY
   readonly nextAction: CognitiveAgendaAction
+  readonly goalRevision: number | null
+  readonly planRevision: number | null
   readonly blockedBy: { readonly kind: CognitiveAgendaBlocker | null; readonly ids: readonly string[] }
   readonly signals: {
     readonly pendingInputs: CognitiveAgendaSignal
@@ -85,6 +87,10 @@ function member<T extends string>(values: readonly T[], value: unknown): value i
   return typeof value === 'string' && (values as readonly string[]).includes(value)
 }
 
+function safeRevision(value: unknown, minimum: 0 | 1): value is number | null {
+  return value === null || typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum
+}
+
 function validSignal(value: unknown): value is CognitiveAgendaSignal {
   if (!plain(value) || !exact(value, signalKeys) || typeof value.count !== 'number' || !Number.isSafeInteger(value.count) || value.count < 0 || value.count > MAX_COUNT || !Array.isArray(value.ids) || value.ids.length > MAX_IDS || value.count < value.ids.length) return false
   let previous = ''
@@ -120,7 +126,7 @@ function validAgendaFields(value: Row): boolean {
     if (!safeId(id) || (previous !== '' && previous >= id)) return false
     previous = id
   }
-  if (value.goalRevision !== null || value.planRevision !== null) return false
+  if (!safeRevision(value.goalRevision, 1) || !safeRevision(value.planRevision, 0)) return false
   const signals = value.signals
   if (!plain(signals) || !exact(signals, ['pendingInputs', 'approvals', 'activeWaits', 'unresolved', 'completionVerification', 'steering'])) return false
   if (!validSignal(signals.pendingInputs) || !validSignal(signals.approvals) || !validSignal(signals.activeWaits) || !validSignal(signals.unresolved) || !validSignal(signals.completionVerification)) return false
@@ -144,6 +150,8 @@ function safeView(value: Row): CognitiveAgendaView {
     stepId: value.stepId as string,
     externalDataPolicy: EXTERNAL_DATA_POLICY,
     nextAction: value.nextAction as CognitiveAgendaAction,
+    goalRevision: value.goalRevision as number | null,
+    planRevision: value.planRevision as number | null,
     blockedBy: { kind: blocked.kind as CognitiveAgendaBlocker | null, ids: [...(blocked.ids as string[])] },
     signals: {
       pendingInputs: copySignal(signals.pendingInputs as CognitiveAgendaSignal),

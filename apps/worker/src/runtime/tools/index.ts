@@ -17,6 +17,9 @@ import { createGmailTools } from "./gmail-tools.js"
 import type { GmailToolOptions } from "./gmail-types.js"
 import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
 import type { RuntimeToolDefinition } from "./types.js"
+import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
+import { createAskUserTool } from "./ask-user.js"
+import { createJobsDiscoverTool, type JobDiscoverToolOptions } from "./job-discover-tool.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -37,6 +40,7 @@ export * from "./gmail-types.js"
 export * from "./artifact-tools.js"
 export * from "./application-submit-tool.js"
 export * from "./write-tools.js"
+export * from "./ask-user.js"
 export * from "./tool-result-reference-repo.js"
 export * from "./tool-result-reference-types.js"
 export * from "./tool-results-read-tool.js"
@@ -47,6 +51,8 @@ export type WorkerCoordinationOptions = {
   readonly store?: CoordinationStore
   readonly wait?: DurableWaitPort
   readonly nativeCoordination?: NativeCoordinationRuntimeOptions
+  readonly verificationRequirements?: RootTaskVerificationRequirementsResolution
+  readonly askUserEnabled?: boolean
 }
 
 export type WorkerGmailOptions = GmailToolOptions
@@ -61,6 +67,7 @@ export function createWorkerToolRuntime(
   gmail?: WorkerGmailOptions,
   artifacts?: WorkerArtifactOptions,
   write?: WorkerWriteOptions,
+  jobDiscovery?: JobDiscoverToolOptions,
 ): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
   const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
@@ -74,12 +81,15 @@ export function createWorkerToolRuntime(
       store: coordination.store ?? new PgCoordinationStore(pool),
       wait: coordination.wait,
       nativeCoordination: coordination.nativeCoordination,
+      verificationRequirements: coordination.verificationRequirements,
     }
     definitions.push(...createCoordinationTools(options))
+    if (coordination.askUserEnabled) definitions.push(createAskUserTool() as RuntimeToolDefinition)
   }
   if (gmail) definitions.push(...createGmailTools(gmail))
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   if (write) definitions.push(...createWriteTools({ pool, ...write }))
+  if (jobDiscovery) definitions.push(createJobsDiscoverTool(jobDiscovery) as RuntimeToolDefinition)
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
   return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }

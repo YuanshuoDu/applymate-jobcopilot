@@ -11,6 +11,8 @@ describe("production agent flags", () => {
       consumeWaitOutcomes: false,
       canonicalAutomationEnabled: false,
       turnBoundaryCompactionEnabled: false,
+      nativeSemanticProgressMemoryEnabled: false,
+      crossSessionRootTaskHistoryEnabled: false,
     })
   })
 
@@ -95,6 +97,23 @@ describe("production agent flags", () => {
       consumeWaitOutcomes: true,
       canonicalAutomationEnabled: true,
       turnBoundaryCompactionEnabled: false,
+      nativeSemanticProgressMemoryEnabled: false,
+      crossSessionRootTaskHistoryEnabled: false,
     })
+  })
+
+  it("enables native semantic progress memory only with its exact server flag", () => {
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS_MEMORY: "1" }).nativeSemanticProgressMemoryEnabled).toBe(true)
+    for (const value of [undefined, "", "0", "false", "true", "01", " 1", "1 "]) {
+      expect(resolveProductionAgentFlags({ ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS_MEMORY: value }).nativeSemanticProgressMemoryEnabled).toBe(false)
+    }
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS: "1" }).nativeSemanticProgressMemoryEnabled).toBe(false)
+  })
+
+  it("enables cross-session Root history only with its exact server flag", () => {
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1" }).crossSessionRootTaskHistoryEnabled).toBe(true)
+    for (const value of [undefined, "", "0", "false", "true", "01", " 1", "1 "]) {
+      expect(resolveProductionAgentFlags({ ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: value }).crossSessionRootTaskHistoryEnabled).toBe(false)
+    }
   })
 })

@@ -62,6 +62,7 @@ function profileOverrides(
     supportsReasoningSummary: requestOptions.reasoningSplit,
     maxContextTokens: 512_000,
     ...overrides,
+    defaultMaxOutputTokens: requestOptions.maxCompletionTokens,
   }
 }
 

@@ -1,73 +1,13 @@
 import { db } from "@/lib/db";
 import { Prisma } from "@prisma/client";
-import { enqueueApplyTask } from "@/lib/apply-queue-client";
-import { assessApplicationPreflight, isSupportedAutomatedApplyUrl } from "@/lib/agent/application-preflight";
-import { isRuntimeFeatureEnabled } from '@/lib/runtime-feature-flags'
-import { isFeatureAllowed, resolveAiAccess } from '@/lib/entitlements'
+import { hashApprovalNonce, hashApprovalScope, type ApprovalScope } from "@jobcopilot/agent-protocol";
+import { hashAgentReceiptValue, matchesApplyTaskSubmitPayload, type ApplyTaskSubmitPayload } from "@jobcopilot/shared";
+import { createSubmitIntent, enqueueApplyTask, isReplayableSubmitState, resolveExistingSubmitIntent } from "@/lib/apply-queue-client";
+import { AgentCommandService } from '@/lib/agent/control-plane/commands/agent-command-service'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
+import { applicationFillTaskGraphEnabled, asRecord, assertActiveAccount, assertJobPreflight, assertUnattendedApplyEnabled, AutoApplyError, validateAutoApplyUrl } from "./auto-apply-guards";
 
-export class AutoApplyError extends Error {}
-
-async function assertActiveAccount(userId: string): Promise<void> {
-  const user = await db.user.findUnique({ where: { id: userId }, select: { accountStatus: true } })
-  if (user?.accountStatus !== 'active') throw new AutoApplyError('Account is not active.')
-}
-
-async function assertUnattendedApplyEnabled(userId: string): Promise<void> {
-  try {
-    if (!await isFeatureAllowed(userId, 'auto_apply')) throw new AutoApplyError('This feature is not included in your current plan.')
-    const aiAccess = await resolveAiAccess(userId)
-    if (aiAccess === 'disabled') throw new AutoApplyError('This feature is not included in your current plan.')
-    if (aiAccess === 'exhausted') throw new AutoApplyError('Monthly AI credits exhausted.')
-    if (!await isRuntimeFeatureEnabled('unattended_apply', userId)) {
-      throw new AutoApplyError('Unattended applications are temporarily unavailable.')
-    }
-  } catch (error) {
-    if (error instanceof AutoApplyError) throw error
-    throw new AutoApplyError('Unattended applications are temporarily unavailable.')
-  }
-}
-
-export function validateAutoApplyUrl(rawUrl: string | null | undefined): string {
-  const url = rawUrl?.trim();
-  if (!url) throw new AutoApplyError("This job has no application URL.");
-
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new AutoApplyError("The application URL is invalid.");
-  }
-
-  if (parsed.protocol !== "https:") {
-    throw new AutoApplyError("Automatic applications require an HTTPS destination.");
-  }
-
-  if (!isSupportedAutomatedApplyUrl(parsed.toString())) {
-    throw new AutoApplyError("Automatic application requires a direct supported ATS link, not a job-board or unknown destination.");
-  }
-
-  return parsed.toString();
-}
-
-async function assertJobPreflight(input: { userId: string; jobId: string }) {
-  const job = await db.job.findFirst({
-    where: { id: input.jobId, userId: input.userId },
-    select: { company: true, description: true, source: true, url: true },
-  })
-  if (!job) throw new AutoApplyError("The job could not be found for application preflight.")
-  try {
-    requireLegacyPolicy({
-      userId: input.userId, sessionId: `application-preflight:${input.jobId}`, turnId: `preflight:${input.jobId}`,
-      stepId: "application.preflight", toolCallId: `preflight:${input.jobId}`, toolName: "application.preflight",
-      domain: "application", risk: "read", capabilities: ["read"], input: { jobId: input.jobId, unknownSensitiveFacts: false },
-    })
-  } catch (error) {
-    throw new AutoApplyError(error instanceof Error ? error.message : "Application preflight was denied by policy.")
-  }
-  const preflight = assessApplicationPreflight(job)
-  if (!preflight.canAutomate) throw new AutoApplyError(preflight.issues.map(issue => issue.message).join(" "))
-}
+export { AutoApplyError, applicationFillTaskGraphEnabled, validateAutoApplyUrl } from "./auto-apply-guards";
 
 /** Dispatches the safe first browser pass: fill fields, then stop for review. */
 export async function queueApplicationFill(input: {
@@ -76,7 +16,10 @@ export async function queueApplicationFill(input: {
   applyUrl: string | null | undefined;
   applicationTaskId: string;
   resumeAfterUserInput?: boolean;
-}): Promise<{ taskId: string }> {
+  sessionId?: string;
+  retry?: boolean;
+  retryId?: string;
+}): Promise<{ taskId: string; turnId?: string; disposition?: string }> {
   await assertActiveAccount(input.userId)
   await assertUnattendedApplyEnabled(input.userId)
   const applyUrl = validateAutoApplyUrl(input.applyUrl);
@@ -90,6 +33,28 @@ export async function queueApplicationFill(input: {
     })
   } catch (error) {
     throw new AutoApplyError(error instanceof Error ? error.message : "Application fill was denied by policy.")
+  }
+  if (applicationFillTaskGraphEnabled()) {
+    if (input.retry && (!input.retryId || !/^[A-Za-z0-9_-]{8,128}$/.test(input.retryId))) {
+      throw new AutoApplyError("A valid retry request ID is required for an explicit application fill retry.")
+    }
+    const task = await db.applicationTask.findFirst({
+      where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId },
+      select: { sessionId: true, fillTurnId: true },
+    })
+    if (!task?.sessionId || (input.sessionId && input.sessionId !== task.sessionId)) {
+      throw new AutoApplyError("The application is missing its scoped Agent session.")
+    }
+    const clientMessageId = input.retry
+      ? `application-fill-retry:${input.applicationTaskId}:${input.retryId}`
+      : input.resumeAfterUserInput
+        ? `application-fill-resume:${input.applicationTaskId}`
+        : `application-fill:${input.applicationTaskId}`
+    const result = await new AgentCommandService(db).startApplicationFillForReview({
+      sessionId: task.sessionId, userId: input.userId, clientMessageId,
+      applicationTaskId: input.applicationTaskId, retry: input.retry, resumeAfterUserInput: input.resumeAfterUserInput,
+    })
+    return { taskId: result.turnId, turnId: result.turnId, disposition: result.disposition }
   }
   const claimed = await db.applicationTask.updateMany({
     where: {
@@ -123,19 +88,26 @@ export async function queueAutonomousApplication(input: {
   approvalId: string;
   receiptNonce?: string;
   sessionId?: string;
+  /** Read-only replay of an already persisted submit intent. */
+  replayOnly?: boolean;
 }): Promise<{ taskId: string }> {
   await assertActiveAccount(input.userId)
-  await assertUnattendedApplyEnabled(input.userId)
-  const applyUrl = validateAutoApplyUrl(input.applyUrl);
-  await assertJobPreflight(input)
+  let applyUrl = input.replayOnly ? "" : validateAutoApplyUrl(input.applyUrl)
+  if (!input.replayOnly) {
+    await assertUnattendedApplyEnabled(input.userId)
+    await assertJobPreflight(input)
+  }
   const approval = await db.agentApproval.findFirst({
-    where: { id: input.approvalId, userId: input.userId, status: "approved", type: "submit_application" },
-    select: { payload: true, sessionId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true },
+    where: {
+      id: input.approvalId, userId: input.userId, type: "submit_application",
+      status: input.replayOnly ? { in: ["approved", "consumed"] } : "approved",
+    },
+    select: { id: true, status: true, payload: true, sessionId: true, taskId: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true, scopeHash: true, nonceHash: true, resourceHash: true, materialHash: true, answersHash: true },
   });
   const payload = asRecord(approval?.payload);
   const taskSnapshot = await db.applicationTask.findFirst({
     where: { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId },
-    select: { sessionId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
+    select: { sessionId: true, fillTurnId: true, workerTaskId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true },
   });
   const material = {
     applicationTaskId: input.applicationTaskId,
@@ -143,148 +115,132 @@ export async function queueAutonomousApplication(input: {
     resumeId: taskSnapshot?.resumeId ?? null,
     coverLetterId: taskSnapshot?.coverLetterId ?? null,
   };
-  if (!approval || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
+  const snapshotMaterialHash = await hashAgentReceiptValue("material", material);
+  const snapshotAnswersHash = await hashAgentReceiptValue("answers", taskSnapshot?.confirmedAnswers ?? null);
+  let replayReceiptValid = !input.replayOnly;
+  if (input.replayOnly && approval && input.receiptNonce && approval.nonceHash && approval.resourceHash && approval.materialHash && approval.answersHash && approval.expiresAt && approval.sessionId && approval.turnId && approval.toolCallId && approval.jobId) {
+    const scope: ApprovalScope = {
+      userId: input.userId, sessionId: approval.sessionId, turnId: approval.turnId, jobId: approval.jobId,
+      toolCallId: approval.toolCallId, action: "submit_application", resourceHash: approval.resourceHash,
+      materialHash: approval.materialHash, answersHash: approval.answersHash, revision: approval.revision,
+      nonceHash: approval.nonceHash, expiresAt: approval.expiresAt.toISOString(),
+    };
+    replayReceiptValid = approval.nonceHash === await hashApprovalNonce(input.receiptNonce) &&
+      approval.scopeHash === await hashApprovalScope(scope);
+  }
+  if (!approval || !taskSnapshot?.sessionId || !taskSnapshot.fillTurnId ||
+    (input.sessionId && input.sessionId !== taskSnapshot.sessionId) || approval.sessionId !== taskSnapshot.sessionId ||
+    approval.turnId !== taskSnapshot.fillTurnId || payload.applicationTaskId !== input.applicationTaskId || payload.jobId !== input.jobId ||
     payload.resumeId !== material.resumeId || payload.coverLetterId !== material.coverLetterId ||
     ("confirmedAnswers" in payload && JSON.stringify(payload.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot?.confirmedAnswers ?? null)) ||
-    !approval.turnId || !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
-    !approval.scopeHash || !input.receiptNonce) {
+    approval.materialHash !== snapshotMaterialHash || approval.answersHash !== snapshotAnswersHash ||
+    !approval.toolCallId || approval.jobId !== input.jobId || !approval.expiresAt ||
+    !approval.scopeHash || !input.receiptNonce || !replayReceiptValid) {
     throw new AutoApplyError("A current, explicit approval is required before this application can be submitted.");
   }
-  const receiptSessionId = input.sessionId ?? approval.sessionId ?? taskSnapshot?.sessionId;
-  if (!receiptSessionId) throw new AutoApplyError("The application is missing its scoped Agent session.");
+  const receiptSessionId = taskSnapshot.sessionId;
+  const fillTurnId = taskSnapshot.fillTurnId;
+
+  const submitIdentity = { applicationTaskId: input.applicationTaskId, jobId: input.jobId, userId: input.userId,
+    personaId: "server-side", resumePath: "", operation: "submit" as const, sessionId: receiptSessionId,
+    fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash };
+  const stableWorkerTaskId = createSubmitIntent({ ...submitIdentity, applyUrl }).payload.workerTaskId;
+  let expectedJobUrl: string | undefined = input.replayOnly ? undefined : input.applyUrl ?? undefined;
+  if (input.replayOnly && taskSnapshot.workerTaskId !== stableWorkerTaskId && approval.status === "approved") {
+    if (approval.expiresAt <= new Date()) throw new AutoApplyError("The approval expired before its submit intent was committed.");
+    await assertUnattendedApplyEnabled(input.userId);
+    const job = await db.job.findFirst({ where: { id: input.jobId, userId: input.userId }, select: { url: true } });
+    if (!job?.url) throw new AutoApplyError("The job could not be found for application preflight.");
+    expectedJobUrl = job.url;
+    applyUrl = validateAutoApplyUrl(job.url);
+    await assertJobPreflight(input);
+  }
+  const submitPayload: ApplyTaskSubmitPayload = { ...submitIdentity, applyUrl };
+  const intent = createSubmitIntent(submitPayload);
 
   try {
-    requireLegacyPolicy({
-      userId: input.userId,
-      sessionId: receiptSessionId,
-      turnId: approval.turnId,
-      stepId: `submit:${input.applicationTaskId}`,
-      toolCallId: approval.toolCallId,
-      toolName: "application.submit",
-      domain: "application",
-      risk: "external_write",
-      capabilities: ["read", "write", "external_write"],
+    if (!input.replayOnly) requireLegacyPolicy({
+      userId: input.userId, sessionId: receiptSessionId, turnId: approval.turnId,
+      stepId: `submit:${input.applicationTaskId}`, toolCallId: approval.toolCallId, toolName: "application.submit",
+      domain: "application", risk: "external_write", capabilities: ["read", "write", "external_write"],
       input: { requiresReceipt: true, receiptValidated: true, unknownSensitiveFacts: false },
     });
   } catch (error) {
     throw new AutoApplyError(error instanceof Error ? error.message : "Submission policy denied this application.");
   }
 
-  const claimed = await db.$transaction(async tx => {
-    const material = await tx.applicationTask.findFirst({
-      where: {
-        id: input.applicationTaskId,
-        userId: input.userId,
-        jobId: input.jobId,
-        status: "waiting_for_authorization",
-        checkpoint: "form_filled",
-        resumeId: { not: null },
-        question: { equals: Prisma.DbNull },
-      },
-      select: { resumeId: true, coverLetterId: true },
-    });
-    if (!material?.resumeId) return false;
+  if (!matchesApplyTaskSubmitPayload(submitPayload, {
+    applicationTaskId: input.applicationTaskId, userId: input.userId, jobId: input.jobId,
+    sessionId: receiptSessionId, fillTurnId, receiptId: approval.id, constraintHash: approval.scopeHash,
+  })) throw new AutoApplyError("The submit payload does not match the current approved application attempt.");
 
-    // A stale task must not submit a resume from another job. A candidate's
-    // current default resume is valid fallback material; any adapted resume
-    // must be explicitly linked to this job.
+  const taskId = await db.$transaction(async tx => {
+    const taskWhere = { id: input.applicationTaskId, userId: input.userId, jobId: input.jobId, sessionId: receiptSessionId, fillTurnId };
+    const current = await tx.applicationTask.findFirst({
+      where: taskWhere,
+      select: { status: true, checkpoint: true, workerTaskId: true, resumeId: true, coverLetterId: true, confirmedAnswers: true, question: true },
+    });
+    if (!current) return false;
+    if (current.resumeId !== material.resumeId || current.coverLetterId !== material.coverLetterId ||
+      JSON.stringify(current.confirmedAnswers ?? null) !== JSON.stringify(taskSnapshot.confirmedAnswers ?? null)) return false;
+    if (current.workerTaskId === intent.payload.workerTaskId) {
+      if (!isReplayableSubmitState(current.status, current.checkpoint)) return false;
+      return resolveExistingSubmitIntent(tx, intent);
+    }
+    if (input.replayOnly && approval.status !== "approved") return false;
+    if (current.status !== "waiting_for_authorization" || current.checkpoint !== "form_filled" || !current.resumeId || current.question !== null) return false;
+
     const resume = await tx.resume.findFirst({
-      where: {
-        id: material.resumeId,
-        userId: input.userId,
-        OR: [{ targetJobId: input.jobId }, { isDefault: true }],
-      },
-      select: { id: true },
+      where: { id: current.resumeId, userId: input.userId, OR: [{ targetJobId: input.jobId }, { isDefault: true }] }, select: { id: true },
     });
     if (!resume) return false;
+    if (current.coverLetterId && !await tx.coverLetter.findFirst({
+      where: { id: current.coverLetterId, userId: input.userId, jobId: input.jobId, resumeId: current.resumeId }, select: { id: true },
+    })) return false;
 
-    // Cover letters are optional, but when a task has one it must be the
-    // current user's artifact for this exact job and selected resume.
-    if (material.coverLetterId) {
-      const coverLetter = await tx.coverLetter.findFirst({
-        where: {
-          id: material.coverLetterId,
-          userId: input.userId,
-          jobId: input.jobId,
-          resumeId: material.resumeId,
-        },
-        select: { id: true },
-      });
-      if (!coverLetter) return false;
-    }
-    const task = await tx.applicationTask.updateMany({
-      where: {
-        id: input.applicationTaskId,
-        userId: input.userId,
-        jobId: input.jobId,
-        status: "waiting_for_authorization",
-        checkpoint: "form_filled",
-        resumeId: { not: null },
-        question: { equals: Prisma.DbNull },
-      },
-      data: { status: "filling", checkpoint: "submission_authorized", question: Prisma.DbNull, startedAt: new Date() },
+    const claim = await tx.applicationTask.updateMany({
+      where: { ...taskWhere, workerTaskId: current.workerTaskId, status: "waiting_for_authorization", checkpoint: "form_filled",
+        resumeId: material.resumeId, coverLetterId: material.coverLetterId,
+        confirmedAnswers: { equals: taskSnapshot.confirmedAnswers === null ? Prisma.DbNull : taskSnapshot.confirmedAnswers as Prisma.InputJsonValue }, question: { equals: Prisma.DbNull } },
+      data: { status: "filling", checkpoint: "submission_authorized", question: Prisma.DbNull, workerTaskId: intent.payload.workerTaskId, startedAt: new Date() },
     });
-    if (task.count !== 1) return false;
+    if (claim.count !== 1) {
+      const raced = await tx.applicationTask.findFirst({ where: taskWhere, select: { workerTaskId: true, status: true, checkpoint: true } });
+      return raced?.workerTaskId === intent.payload.workerTaskId && isReplayableSubmitState(raced.status, raced.checkpoint)
+        ? resolveExistingSubmitIntent(tx, intent) : false;
+    }
     const job = await tx.job.updateMany({
-      where: { id: input.jobId, userId: input.userId, status: "saved", workflowState: "ready_to_apply" },
+      where: { id: input.jobId, userId: input.userId, ...(expectedJobUrl ? { url: expectedJobUrl } : {}), status: "saved", workflowState: "ready_to_apply" },
       data: { workflowState: "queued", analysisNote: "[Approved submission] Applying in the background after explicit user authorization." },
     });
-    return job.count === 1;
+    if (job.count !== 1) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
+
+    const lockedApproval = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+      SELECT "id" FROM "agent_approvals"
+      WHERE "id" = ${approval.id} AND "userId" = ${input.userId} AND "sessionId" = ${receiptSessionId}
+        AND "taskId" IS NOT DISTINCT FROM ${approval.taskId} AND "turnId" = ${fillTurnId}
+        AND "jobId" = ${input.jobId} AND "toolCallId" = ${approval.toolCallId}
+        AND "type" = 'submit_application' AND "status" = 'approved' AND "scopeHash" = ${approval.scopeHash}
+        AND "nonceHash" = ${approval.nonceHash} AND "resourceHash" = ${approval.resourceHash}
+        AND "materialHash" = ${snapshotMaterialHash} AND "answersHash" = ${snapshotAnswersHash}
+        AND "revision" = ${approval.revision} AND "expiresAt" = ${approval.expiresAt} AND "expiresAt" > CURRENT_TIMESTAMP
+        AND "payload" = ${JSON.stringify(approval.payload)}::jsonb
+      FOR UPDATE
+    `);
+    if (lockedApproval.length !== 1) throw new AutoApplyError("The approved submission receipt changed before its intent was committed.");
+
+    const identity = intent.payload;
+    await tx.applicationTaskEvent.create({ data: {
+      taskId: input.applicationTaskId, type: "submission_queued", actor: "user", body: "User approved this job for background submission.",
+      data: { applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+        sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, approvalId: identity.receiptId, receiptId: identity.receiptId,
+        constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId },
+    } });
+    await tx.agentOutbox.create({ data: { ...intent, payload: intent.payload as unknown as Prisma.InputJsonObject } });
+    await tx.activity.create({ data: { userId: input.userId, jobId: input.jobId, type: "agent_action",
+      text: "Agent queued this application after explicit per-job user authorization.", color: "#7C3AED" } });
+    return identity.workerTaskId;
   });
-  if (!claimed) {
-    throw new AutoApplyError("This application is no longer ready for the approved submission step.");
-  }
-
-  try {
-    const taskId = await enqueueApplyTask({
-      applicationTaskId: input.applicationTaskId,
-      jobId: input.jobId,
-      userId: input.userId,
-      applyUrl,
-      operation: "submit",
-      receiptId: input.approvalId,
-      constraintHash: approval.scopeHash ?? undefined,
-    });
-    await db.activity.create({
-      data: {
-        userId: input.userId,
-        jobId: input.jobId,
-        type: "agent_action",
-        text: "Agent queued this application after explicit per-job user authorization.",
-        color: "#7C3AED",
-      },
-    });
-    await db.applicationTask.update({ where: { id: input.applicationTaskId }, data: { workerTaskId: taskId } });
-    await db.applicationTaskEvent.create({
-      data: {
-        taskId: input.applicationTaskId,
-        type: "submission_queued",
-        actor: "user",
-        body: "User approved this job for background submission.",
-        data: { approvalId: input.approvalId, workerTaskId: taskId },
-      },
-    });
-    return { taskId };
-  } catch (error) {
-    await db.$transaction(async tx => {
-      const resetTask = await tx.applicationTask.updateMany({
-        where: {
-          id: input.applicationTaskId,
-          userId: input.userId,
-          jobId: input.jobId,
-          status: "filling",
-          checkpoint: "submission_authorized",
-        },
-        data: { status: "waiting_for_authorization", checkpoint: "queue_retry" },
-      })
-      if (resetTask.count === 1) {
-        await tx.job.updateMany({ where: { id: input.jobId, userId: input.userId, workflowState: "queued" }, data: { workflowState: "ready_to_apply" } })
-      }
-    }).catch(() => undefined);
-    throw error;
-  }
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  if (!taskId) throw new AutoApplyError("This application is no longer ready for the approved submission step.");
+  return { taskId };
 }

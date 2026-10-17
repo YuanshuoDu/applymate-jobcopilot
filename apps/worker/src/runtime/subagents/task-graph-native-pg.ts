@@ -1,7 +1,7 @@
 import { materializeTaskGraphDependencyContext, isTaskGraphDependencyContextError } from "./task-graph-dependency-context.js"
-import { createSubagentTask } from "./pg-store-create.js"
+import { assertPlanningRootHasNoUnresolvedSteering, createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
-import { getSubagentRolePolicy } from "./role-policy.js"
+import { getSubagentRolePolicy, isHarnessSubagentRole } from "./role-policy.js"
 import { appendTaskGraphNativeNode, TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 import { enqueueGraphTask } from "./task-graph-pg-create.js"
@@ -58,7 +58,7 @@ export async function appendNativeGraphCommand(
   const role = source?.provenance.role ?? (operation.kind === "spawn" ? operation.role : "")
   const taskType = source?.provenance.taskType ?? (operation.kind === "spawn" ? operation.taskType : "")
   const rolePolicy = getSubagentRolePolicy(role)
-  if (!rolePolicy || rolePolicy.actorRole !== "subagent" || rolePolicy.canManageChildren || rolePolicy.externalWritesEnabled) {
+  if (!isHarnessSubagentRole(role) || !rolePolicy || rolePolicy.actorRole !== "subagent" || rolePolicy.canManageChildren || rolePolicy.externalWritesEnabled) {
     throw commandError("native_role_not_allowed")
   }
   const baseContext = source ? followupContext(command.request.context, source) : command.request.context
@@ -72,14 +72,16 @@ export async function appendNativeGraphCommand(
   const allowedActions = source
     ? intersect(taskActions(source.allowedActions), taskActions(parent.allowedActions))
     : [...(operation.kind === "spawn" ? operation.allowedActions ?? [] : [])]
+  if (input.scope.parentTaskId === input.scope.rootTaskId) {
+    await assertPlanningRootHasNoUnresolvedSteering(client, parent.allowedActions, input.scope)
+  }
   const child = await createSubagentTask(client, {
     userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
     parentTaskId: input.scope.parentTaskId, role, taskType, goal: operation.goal,
     constraints: operation.constraints, successCriteria: operation.successCriteria,
     allowedActions, context, expectedOutputSchema, policy,
-  }, true)
+  }, true, { preserveEmptyAllowedActions: Boolean(source) })
   if (child.status === "queued") await enqueueGraphTask(client, input.scope.sessionId, child)
-  if (source) await persistFollowupActions(client, input, child.id, allowedActions)
   const graphState: TaskGraphState = loaded.state ?? { revision: 0, nodes: [], appliedEvents: [] }
   const dependencyKeys = enriched.verifiedNodeKey ? [enriched.verifiedNodeKey] : []
   const key = `native-${command.operationId.slice("native-".length)}`
@@ -190,13 +192,6 @@ function followupContext(callerContext: unknown, source: Source): unknown {
       priorResult: waitResult(source.result), source: source.provenance,
     },
   }
-}
-
-async function persistFollowupActions(client: Queryable, input: TaskGraphNativeCommandInput, taskId: string, actions: readonly string[]): Promise<void> {
-  const updated = await client.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $6::jsonb
-    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $5`,
-  [taskId, input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.parentTaskId, json(actions, [], "native_allowed_actions")])
-  if (updated.rowCount !== 1) throw new Error("native_followup_policy_persist_failed")
 }
 
 function taskActions(value: unknown): string[] {

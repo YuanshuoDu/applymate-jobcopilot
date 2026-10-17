@@ -3,14 +3,14 @@ import type { PolicyRole } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 import { Buffer } from "node:buffer"
-
 import { executionOwnerFence } from "../execution-owner.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA, roleResultOutputSchema, type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
-import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
+import { createObservedEvidenceIndex, hydrateObservedEvidence, recordReadToolOutput } from "./child-evidence.js"
+import { parseAndBindStructuredResultOutcome } from "./child-structured-result-outcome.js"
 import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, type PrivateArtifactToolContext } from "./child-private-artifact.js"
 import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, selectedJobToolAllowed, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
 import { dispatchNativeVerificationTask } from "./native-verification-executor.js"
@@ -231,12 +231,12 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       finalItemId: result.finalItemId ?? null,
     }
     if (result.status === "completed" && structuredRole) {
-      if (typeof result.finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
-      const structuredResult = parseAndBindStructuredResult(result.finalText, structuredRole, observedEvidence)
-      if (!structuredResult) return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
+      const finalText = result.finalText, outcome = parseAndBindStructuredResultOutcome(finalText, structuredRole, observedEvidence)
+      if (outcome.kind === "invalid") return { status: "failed", result: { ...childResult, status: "failed" as const, ...((structuredRole === "scout" || structuredRole === "analyst") && outcome.category ? { structuredOutputFailureCategory: outcome.category } : {}) }, failureReason: "invalid_structured_result" }
+      if (typeof finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }; const structuredResult = outcome.result
       const selectedEvidenceRole = Boolean(selectedJobPreparation && (structuredRole === "scout" || structuredRole === "analyst"))
       const safeStructuredResult = selectedEvidenceRole ? redactSelectedEvidenceResult(structuredResult, runtime.selectedJobArtifactContext!) : structuredResult
-      const safeFinalText = selectedEvidenceRole ? JSON.stringify(safeStructuredResult) : result.finalText
+      const safeFinalText = selectedEvidenceRole ? JSON.stringify(safeStructuredResult) : finalText
       return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, finalText: projectChildFinalText(safeFinalText), structuredResult: safeStructuredResult }, failureReason: result.errorCode }
     }
     const status = resultStatus(result.status)

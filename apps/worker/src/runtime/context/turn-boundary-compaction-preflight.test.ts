@@ -25,11 +25,11 @@ const compactionSourceCalls: unknown[][] = []
 const publishedItemIds: string[] = []
 const startedItemIds: string[] = []
 const compactionPort = {
-  loadLatest: vi.fn(async () => null),
+  loadLatest: vi.fn(async (): Promise<{ id: string; sessionId: string; throughSequence: bigint; version: number } | null> => null),
   recordStarted: vi.fn(async (item: { id: string }) => { startedItemIds.push(item.id) }),
-  publishAtomically: vi.fn(async (input: { startedItem: { id: string } }) => {
+  publishAtomically: vi.fn(async (input: { startedItem: { id: string }; draft: { state: { throughSequence: bigint } } }) => {
     publishedItemIds.push(input.startedItem.id)
-    return { id: "snapshot-2", sessionId: "session-1", throughSequence: 100n, version: 2 }
+    return { id: "snapshot-2", sessionId: "session-1", throughSequence: input.draft.state.throughSequence, version: 2 }
   }),
   recordFailed: vi.fn(async () => undefined),
 }
@@ -247,14 +247,22 @@ describe("turn-boundary context compaction preflight", () => {
   it("keeps the prior summary when a real post-cursor tail needs compaction", async () => {
     const sourceWithTail: CompactionSource = {
       ...source,
-      state: { ...source.state, throughSequence: 110n },
+      state: { ...source.state, throughSequence: 199n },
       items: [
-        { id: "context-compaction-summary:snapshot-2", sessionId: "session-1", turnId: "turn-1", sequence: 100n, type: "compaction_summary", status: "completed", content: "Prior narrative summary" },
-        { id: "fresh-tail", sessionId: "session-1", turnId: "turn-1", sequence: 110n, type: "agent_message", status: "completed", content: "Fresh tail sentinel ".repeat(2_400) },
+        { id: "context-compaction-summary:snapshot-prior", sessionId: "session-1", turnId: "turn-1", sequence: 100n, type: "compaction_summary", status: "completed", content: "Prior narrative summary" },
+        ...Array.from({ length: 99 }, (_, index) => ({
+          id: `fresh-tail-${index + 1}`, sessionId: "session-1", turnId: "turn-1", sequence: BigInt(index + 101),
+          type: "agent_message", status: "completed", content: `Fresh tail sentinel ${index + 1} ${"x".repeat(280)}`,
+        })),
       ],
     }
     loadSource.mockReset().mockResolvedValue(sourceWithTail)
-    compactionPort.recordStarted.mockClear(); compactionPort.publishAtomically.mockClear()
+    compactionPort.loadLatest.mockReset().mockResolvedValue(null).mockResolvedValueOnce({ id: "snapshot-prior", sessionId: "session-1", throughSequence: 100n, version: 1 })
+    compactionPort.publishAtomically.mockReset().mockImplementation(async input => {
+      publishedItemIds.push(input.startedItem.id)
+      return { id: "snapshot-2", sessionId: "session-1", throughSequence: input.draft.state.throughSequence, version: 2 }
+    })
+    compactionPort.recordStarted.mockClear()
     startedItemIds.length = 0; publishedItemIds.length = 0
     const requests: HarnessModelRequest[] = []
 
@@ -263,7 +271,7 @@ describe("turn-boundary context compaction preflight", () => {
     })
     const narrative = requests[0]?.messages[1]?.content[0]
 
-    expect(result.status).toBe("compacted")
+    expect(result).toMatchObject({ status: "compacted", trigger: { reason: "item_count" } })
     expect(narrative).toMatchObject({ type: "text" })
     if (narrative?.type === "text") {
       expect(narrative.text).toContain("Prior narrative summary")
@@ -271,8 +279,18 @@ describe("turn-boundary context compaction preflight", () => {
       expect(narrative.text.split("Prior narrative summary")).toHaveLength(2)
       expect(narrative.text.split("Fresh tail sentinel").length).toBeGreaterThan(2)
     }
+    const published = (compactionPort.publishAtomically as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+      draft: { sourceItemIds: readonly string[]; state: { throughSequence: bigint } }
+    }
+    expect(published.draft.sourceItemIds.length).toBeLessThan(100)
+    expect(published.draft.state.throughSequence).toBeGreaterThan(100n)
+    expect(published.draft.state.throughSequence).toBeLessThan(sourceWithTail.state.throughSequence)
+    if (result.status !== "compacted") throw new Error("Expected the preflight compaction to publish a snapshot")
+    expect(result.snapshot?.throughSequence).toBe(published.draft.state.throughSequence)
+    expect(published.draft.sourceItemIds).toEqual(sourceWithTail.items
+      .filter(item => item.sequence <= published.draft.state.throughSequence).map(({ id }) => id))
     expect(compactionPort.publishAtomically).toHaveBeenCalledOnce()
-    expect(publishedItemIds).toEqual(["context-compaction:turn-1:2:110"])
+    expect(publishedItemIds).toEqual(["context-compaction:turn-1:2:199"])
   })
 
   it("skips an empty source tail", async () => {

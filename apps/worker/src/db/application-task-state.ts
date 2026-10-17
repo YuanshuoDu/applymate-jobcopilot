@@ -2,8 +2,9 @@ import type { Pool, PoolClient } from "pg";
 import type { FormReviewNeeds } from "../harness/form-review.js";
 import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
-import { ensureSubmissionArtifact } from "./submission-artifact.js";
-
+import { ensureSubmissionArtifact, ensureSubmissionArtifactWithClient } from "./submission-artifact.js";
+import type { ApplicationSubmitIdentity } from "../queue/application-submit-fence.js";
+import { withExactSubmissionClientWrite, withExactSubmissionWrite } from "./submission-guard.js";
 type TerminalStatus = "submitted" | "failed" | "waiting_for_user" | "waiting_for_authorization";
 
 /** Stable checkpoint shared by CAPTCHA, login-wall, and MFA user handoffs. */
@@ -13,52 +14,24 @@ export const CAPTCHA_USER_TAKEOVER_MESSAGE =
 export const CHALLENGE_DETECTION_FAILED_MESSAGE =
   "Challenge detection failed. User takeover is required; no bypass was attempted.";
 
-export type ApplicationSubmissionStartScope = {
-  userId: string;
-  sessionId: string;
-  turnId: string;
-  applicationTaskId: string;
-  jobId: string;
-};
+export type ApplicationSubmissionStartScope = ApplicationSubmitIdentity & { turnId: string; workerTaskId: string; executionId: string };
 
-/** Commit the start marker on its reserved connection and return it to the pool. */
-export async function markSubmissionRequestStarted(
-  client: PoolClient, scope: ApplicationSubmissionStartScope,
-): Promise<"started" | "inactive" | "uncertain"> {
-  let transactionOpen = false;
-  try {
-    await client.query("BEGIN");
-    transactionOpen = true;
-    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId]);
-    const result = await client.query(
-      `UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
-        WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4
-          AND "status" = 'filling' AND "checkpoint" = 'browser_active'
-        RETURNING "id"`,
-      [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId],
-    );
-    if (result.rowCount !== 1) {
-      await client.query("ROLLBACK");
-      transactionOpen = false;
-      return "inactive";
-    }
-
-    try {
-      await client.query("COMMIT");
-      transactionOpen = false;
-      return "started";
-    } catch {
-      if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined);
-      transactionOpen = false;
-      return "uncertain";
-    }
-  } catch (error: unknown) {
-    if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined);
-    throw error;
-  } finally {
-    client.release();
-  }
+/** Write under the exact fence and caller-owned transaction held by the stop probe. */
+export async function markSubmissionRequestStarted(client: PoolClient, scope: ApplicationSubmissionStartScope): Promise<"started" | "inactive"> {
+  const result = await client.query(
+    `WITH started AS (UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
+      WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5
+        AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id")
+    INSERT INTO application_task_events (id, "taskId", type, actor, body, data, "createdAt")
+    SELECT 'evt_' || $6, started."id", 'submission_execution_started', 'worker', 'Submit execution started',
+      jsonb_build_object('executionId', $6, 'workerTaskId', $7::text, 'applicationTaskId', $1, 'userId', $2, 'jobId', $3,
+        'sessionId', $4, 'fillTurnId', $5, 'approvalId', $8::text, 'constraintHash', $9::text), NOW() FROM started RETURNING "id"`,
+    [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId, scope.fillTurnId,
+      scope.executionId, scope.workerTaskId, scope.approvalId, scope.constraintHash],
+  );
+  return result.rowCount === 1 ? "started" : "inactive";
 }
+
 /** Worker-side account guard.  A state lookup failure must not open a browser. */
 export async function isUserActive(pool: Pool, userId: string): Promise<boolean> {
   try {
@@ -74,27 +47,27 @@ export async function claimApplicationTask(
   pool: Pool, taskId: string, userId: string, jobId: string,
 ): Promise<boolean> {
   const result = await pool.query(
-    `UPDATE application_tasks
-     SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
-     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'
-       AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
-       AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
-       AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = application_tasks."userId" AND u."accountStatus" = 'active')
-     RETURNING id`,
+    `UPDATE application_tasks SET status = 'filling', "checkpoint" = 'browser_active', "updatedAt" = NOW()
+     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND "fillTurnId" IS NULL
+       AND "checkpoint" = 'form_fill_queued'
+       AND EXISTS (SELECT 1 FROM "User" u WHERE u.id = application_tasks."userId" AND u."accountStatus" = 'active') RETURNING id`,
     [taskId, userId, jobId],
   );
   return result.rowCount === 1;
 }
-
 export async function finishApplicationTask(
-  pool: Pool, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
-): Promise<void> {
-  const transitioned = await pool.query<{ sessionId: string | null }>(
+  pool: Pool | PoolClient, taskId: string, status: TerminalStatus, checkpoint: string, error: string | null,
+  operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,
+): Promise<"current" | "superseded"> {
+  if (operation === "submit" && !identity) throw new Error("Submit task results require an exact application attempt identity.");
+  const write = async (client: Pick<PoolClient, "query">): Promise<void> => {
+    const transitioned = await client.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
      SET status = $2, "checkpoint" = $3, error = $4,
            "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END,
            "updatedAt" = NOW()
-     WHERE id = $1 AND (
+     WHERE id = $1 AND (($5 = 'submit') OR ($5 = 'fill' AND "fillTurnId" IS NULL))
+       AND ($5 = 'fill' OR ("sessionId" = $6 AND "fillTurnId" = $7)) AND (
          status NOT IN ('cancelled', 'submitted')
          OR (status = 'cancelled' AND "checkpoint" = 'turn_stopped_before_submit'
            AND $2 = 'waiting_for_user' AND $3 = 'submission_uncertain')
@@ -104,32 +77,46 @@ export async function finishApplicationTask(
          AND NOT ($2 = 'submitted' OR ($2 = 'waiting_for_user' AND $3 = 'submission_uncertain')))
        AND (status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4)
      RETURNING "sessionId"`,
-    [taskId, status, checkpoint, error],
+    [taskId, status, checkpoint, error, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
   );
   if (transitioned.rowCount !== 1) return;
-  await pool.query(
+  await client.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
      VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, $2, 'worker', $3, NOW())`,
     [taskId, status, redactSensitiveText(error ?? checkpoint)],
   );
   const sessionId = transitioned.rows[0]?.sessionId;
-  if (sessionId) await refreshSessionStatus(pool, sessionId);
+  if (sessionId) await refreshSessionStatus(client as PoolClient, sessionId);
+  };
+  if (operation === "fill") {
+    await write(pool as PoolClient);
+    return "current";
+  }
+  const attempt = identity!;
+  const outcome = typeof (pool as Pool).connect === "function"
+    ? await withExactSubmissionWrite(pool as Pool, attempt, "finish_application_task", client => write(client))
+    : await withExactSubmissionClientWrite(pool as PoolClient, attempt, "finish_application_task", () => write(pool as PoolClient));
+  return outcome.kind;
 }
 
-export async function applicationTaskStillActive(pool: Pool, taskId: string, userId: string, jobId: string): Promise<boolean> {
+export async function applicationTaskStillActive(
+  pool: Pool, taskId: string, userId: string, jobId: string, operation: "fill" | "submit", identity?: ApplicationSubmitIdentity,
+): Promise<boolean> {
+  if (operation === "submit" && !identity) return false;
   const result = await pool.query(
     `SELECT 1 FROM application_tasks t
        JOIN "User" u ON u.id = t."userId"
       WHERE t.id = $1 AND t."userId" = $2 AND t."jobId" = $3
-        AND t.status = 'filling' AND t."checkpoint" = 'browser_active'
+        AND t.status = 'filling' AND t."checkpoint" = 'browser_active' AND ($4 = 'submit' OR t."fillTurnId" IS NULL)
+        AND ($4 = 'fill' OR (t."sessionId" = $5 AND t."fillTurnId" = $6))
         AND u."accountStatus" = 'active'
       LIMIT 1`,
-    [taskId, userId, jobId],
+    [taskId, userId, jobId, operation, identity?.sessionId ?? null, identity?.fillTurnId ?? null],
   )
   return result.rowCount === 1
 }
 
-async function refreshSessionStatus(pool: Pool, sessionId: string): Promise<void> {
+async function refreshSessionStatus(pool: Pool | PoolClient, sessionId: string): Promise<void> {
   const result = await pool.query(`SELECT status FROM application_tasks WHERE "sessionId" = $1`, [sessionId]);
   const statuses = result.rows.map(row => String(row.status));
   const status = statuses.includes("filling")
@@ -145,13 +132,12 @@ async function refreshSessionStatus(pool: Pool, sessionId: string): Promise<void
 }
 
 /** Completes a non-submitting fill pass and creates the only authorization that unlocks submission. */
-export async function completeFillForReview(
-  pool: Pool, taskId: string, userId: string, jobId: string,
-): Promise<boolean> {
-  const transitioned = await pool.query<{ sessionId: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }>(
+export async function completeFillForReview(pool: Pool, taskId: string, userId: string, jobId: string, transactionClient?: PoolClient): Promise<boolean> {
+  const client = transactionClient ?? pool;
+  const transitioned = await client.query<{ sessionId: string | null; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }>(
     `UPDATE application_tasks
        SET status = 'waiting_for_authorization', "checkpoint" = 'form_filled', error = NULL, "updatedAt" = NOW()
-     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling'
+     WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND status = 'filling' AND "fillTurnId" IS NULL
        AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
        AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
         RETURNING "sessionId", "resumeId", "coverLetterId", "confirmedAnswers"`,
@@ -164,22 +150,29 @@ export async function completeFillForReview(
   const title = "Final submission authorization";
   const body = "The form was filled without submission. Review the current job, material alignment, required answers, and any sensitive declarations before authorizing this external submission.";
   const payload = { applicationTaskId: taskId, jobId, resumeId: transitioned.rows[0]?.resumeId ?? null, coverLetterId: transitioned.rows[0]?.coverLetterId ?? null };
-  const turn = await pool.query<{ id: string; revision: number }>(
+  const turn = await client.query<{ id: string; revision: number }>(
     `SELECT "id", "revision" FROM agent_turns WHERE "sessionId" = $1 AND "userId" = $2 ORDER BY "createdAt" DESC LIMIT 1`,
     [sessionId, userId],
   );
   const turnRow = turn.rows[0];
   if (!turnRow) throw new Error("Filled application is missing its Agent turn");
   const answersHash = await hashAgentReceiptValue("answers", transitioned.rows[0]?.confirmedAnswers ?? null);
-  const artifact = await ensureSubmissionArtifact(pool, {
+  const artifactInput = {
     applicationTaskId: taskId,
     userId,
     jobId,
     resumeId: transitioned.rows[0]?.resumeId ?? null,
     coverLetterId: transitioned.rows[0]?.coverLetterId ?? null,
     answersHash,
-  });
-  const receipt = await createPgApprovalStore(pool, { userId }).issue({
+  };
+  const artifact = transactionClient
+    ? await ensureSubmissionArtifactWithClient(transactionClient, artifactInput)
+    : await ensureSubmissionArtifact(pool, artifactInput);
+  const approvalStore = createPgApprovalStore(pool, { userId });
+  const issueApproval = (input: Parameters<typeof approvalStore.issue>[0]) => transactionClient
+    ? approvalStore.issueInTransaction(transactionClient, input)
+    : approvalStore.issue(input);
+  const receipt = await issueApproval({
     approvalId,
     taskId,
     scope: {
@@ -193,32 +186,30 @@ export async function completeFillForReview(
     },
     title, body, impact: { externalSubmission: true, jobId }, payload,
   });
-  await pool.query(
+  await client.query(
     `INSERT INTO agent_transcript_events (id, "sessionId", "taskId", type, speaker, title, body, data, "createdAt")
      VALUES ($1, $2, NULL, 'approval_request', 'Executor', $3, $4,
              jsonb_build_object('approval', jsonb_build_object('id', $5, 'type', 'submit_application', 'title', $3, 'body', $4, 'impact', jsonb_build_object('externalSubmission', true, 'jobId', $6), 'payload', $7::jsonb, 'scopeHash', $8, 'status', 'pending')), NOW())`,
     [`evt_${randomId()}`, sessionId, title, body, approvalId, jobId, JSON.stringify(payload), receipt.approval.scopeHash],
   );
-  await pool.query(
+  await client.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
      VALUES ($1, $2, 'form_filled', 'worker', $3, NOW())`,
     [`evt_${randomId()}`, taskId, "Form filled without submission; final user authorization requested."],
   );
-  await pool.query(
+  await client.query(
     `UPDATE agent_sessions SET status = 'waiting_for_user', "completedAt" = NULL, "updatedAt" = NOW() WHERE id = $1`,
     [sessionId],
   );
   return true;
 }
 
-export async function pauseForFormInput(
-  pool: Pool, taskId: string, detail: string, needs: FormReviewNeeds,
-): Promise<void> {
+export async function pauseForFormInput(pool: Pool | PoolClient, taskId: string, detail: string, needs: FormReviewNeeds): Promise<void> {
   const transitioned = await pool.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
        SET status = 'waiting_for_user', "checkpoint" = 'form_answer_required', error = $2,
            question = jsonb_build_object('detail', $2, 'missing', $3::jsonb, 'sensitive', $4::jsonb), "updatedAt" = NOW()
-     WHERE id = $1
+     WHERE id = $1 AND "fillTurnId" IS NULL
        AND "checkpoint" IS DISTINCT FROM 'submission_request_started'
        AND "checkpoint" IS DISTINCT FROM 'submission_uncertain'
      RETURNING "sessionId"`,

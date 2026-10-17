@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto"
 import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
-import { getSubagentRolePolicy } from "./role-policy.js"
+import { taskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
+import { hasOverlappingTaskGraphRepair } from "./task-graph-repair-conflicts.js"
+import { APPLICATION_FILLER_TEMPLATE_ID, isApplicationFillerTemplate, isHarnessSubagentRole } from "./role-policy.js"
 import { createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord } from "./types.js"
@@ -22,17 +24,16 @@ export type CreatedGraphTasks = Readonly<{
   readyTaskIds: readonly string[]
 }>
 
-function safeTemplate(template: TaskGraphTaskTemplate): void {
-  if (!getSubagentRolePolicy(template.role) || !Array.isArray(template.allowedActions)
-    || template.allowedActions.some(action => typeof action !== "string" || !action.trim() || EXTERNAL_ACTION.test(action))) {
+function safeTemplate(templateId: string, template: TaskGraphTaskTemplate): void {
+  const applicationFiller = isApplicationFillerTemplate(templateId, template.role, template.taskType)
+  if ((!applicationFiller && (!isHarnessSubagentRole(template.role) || templateId === APPLICATION_FILLER_TEMPLATE_ID)) || !Array.isArray(template.allowedActions)
+    || applicationFiller && template.allowedActions.length !== 0 || template.allowedActions.some(action => typeof action !== "string" || !action.trim() || EXTERNAL_ACTION.test(action))) {
     throw new Error("task_graph_template_policy_rejected")
   }
 }
 
 function safeProposalSize(proposal: TaskGraphProposal): void {
-  if (Buffer.byteLength(JSON.stringify(proposal), "utf8") > TASK_GRAPH_LIMITS.maxProposalBytes) {
-    throw new Error("task_graph_proposal_too_large")
-  }
+  if (Buffer.byteLength(JSON.stringify(proposal), "utf8") > TASK_GRAPH_LIMITS.maxProposalBytes) throw new Error("task_graph_proposal_too_large")
 }
 
 export async function createGraphTasks(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>): Promise<CreatedGraphTasks> {
@@ -40,7 +41,9 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   const policy = policyFromTask(parentTask)
   safeProposalSize(input.proposal)
   if (input.proposal.nodes.length > policy.maxFanOut) throw new Error("task_graph_proposal_fan_out_limit")
-  for (const template of Object.values(input.templates)) safeTemplate(template)
+  for (const [id, template] of Object.entries(input.templates)) safeTemplate(id, template)
+  const applicationFillerCount = current.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length + input.proposal.nodes.filter(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID).length
+  if (applicationFillerCount > 1) throw Object.assign(new Error("TaskGraph Turn may contain at most one application filler"), { code: "task_graph_application_filler_limit" })
   const options = {
     registeredTemplateIds: new Set(Object.keys(input.templates)),
     // Lifetime DAG size is independent from the active-child fan-out limit.
@@ -50,6 +53,15 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   }
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
+  if (hasOverlappingTaskGraphRepair(current.nodes, appended.addedNodes)) throw Object.assign(new Error("Overlapping TaskGraph repair"), { code: "task_graph_repair_conflict" })
+  const capacity = taskGraphNodeCapacity({
+    nodeCount: current.nodes.length,
+    hasTypedVerification: appended.state.nodes.some(node => (node.verification?.criteria.length ?? 0) > 0),
+    repairRecorded: appended.state.nodes.some(node => node.repairOf !== undefined),
+  })
+  if (!capacity || input.proposal.nodes.length > capacity.ordinaryRemaining) {
+    throw Object.assign(new Error("TaskGraph node limit exceeded"), { code: "node_limit" })
+  }
   const existingIds = new Map(priorTaskIds)
   const previewTaskIds = new Map(existingIds)
   input.proposal.nodes.forEach((node, index) => previewTaskIds.set(node.key, `subagent-${String(index).padStart(36, "0")}`))
@@ -111,7 +123,7 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
       goal: node.goal, constraints: template.constraints ?? [], successCriteria: node.successCriteria,
       allowedActions: template.allowedActions, context,
       expectedOutputSchema: template.expectedOutputSchema ?? {}, policy: childPolicy,
-    }, true)
+    }, true, { preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType) })
     if (status === "waiting") {
       const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'waiting', "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $5 AND "status" = 'queued'`,

@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
-import { findNativeCommandReplay } from "./task-graph-native-pg.js"
+import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
 import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt, TaskGraphNativeSourceProvenance } from "./task-graph-native-command.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
 import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { Queryable } from "./pg-store-persistence.js"
+import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
 
 const scope: TaskGraphNativeCommandInput["scope"] = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -99,5 +100,33 @@ describe("durable native TaskGraph replay", () => {
     }
     const value = persisted(input), altered = { ...value.event, taskId: "foreign-root" }, fake = queryFor(altered)
     await expect(findNativeCommandReplay(fake.client, input, value.command)).rejects.toThrow("task_graph_native_receipt_invalid")
+  })
+})
+
+describe("native TaskGraph role admission", () => {
+  it("rejects Application Filler from native spawn before writes", async () => {
+    const input: TaskGraphNativeCommandInput = {
+      scope, request: { kind: "spawn", idempotencyKey: "native-filler-spawn", role: "application_filler", taskType: "application_fill_for_review", goal: "Prepare for review" },
+    }
+    const fake = queryFor(null)
+    await expect(appendNativeGraphCommand(fake.client, input, normalizeNativeCommand(input), {} as GraphParent, {} as LoadedGraph))
+      .rejects.toMatchObject({ code: "native_role_not_allowed" })
+    expect(fake.query).not.toHaveBeenCalled()
+  })
+
+  it("rejects native follow-up that would inherit Application Filler role", async () => {
+    const input: TaskGraphNativeCommandInput = {
+      scope, request: { kind: "followup", idempotencyKey: "native-filler-followup", sourceTaskId: "filler-source", goal: "Continue filling" },
+    }
+    const fake = queryFor({
+      id: "filler-source", rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId, turnId: scope.turnId,
+      role: "application_filler", taskType: "application_fill_for_review", status: "completed", attemptCount: 1,
+      result: null, context: {}, expectedOutputSchema: {}, allowedActions: [], budgetSnapshot: {},
+    })
+    const loaded = { state: null, snapshot: null, tasks: new Map() } as unknown as LoadedGraph
+
+    await expect(appendNativeGraphCommand(fake.client, input, normalizeNativeCommand(input), {} as GraphParent, loaded))
+      .rejects.toMatchObject({ code: "native_role_not_allowed" })
+    expect(fake.query).toHaveBeenCalledTimes(1)
   })
 })

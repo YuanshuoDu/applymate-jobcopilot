@@ -10,6 +10,7 @@ export interface FantasticJobsQuery {
   title?: string
   location?: string
   datePosted?: string
+  onProviderFailure?: () => void
 }
 
 export interface FantasticJob extends DiscoveredJob {
@@ -101,6 +102,12 @@ export async function fetchFantasticJobs(query: FantasticJobsQuery): Promise<Fan
   if (query.location?.trim()) params.set('location', query.location.trim())
 
   await acquire({ ats: 'fantasticjobs' })
+  let failureReported = false
+  const reportFailure = () => {
+    if (failureReported) return
+    failureReported = true
+    query.onProviderFailure?.()
+  }
   try {
     const response = await trackedJobApiFetch(`${BASE_URL}?${params}`, {
       headers: { Accept: 'application/json', Authorization: `Bearer ${apiKey}` },
@@ -110,14 +117,20 @@ export async function fetchFantasticJobs(query: FantasticJobsQuery): Promise<Fan
     }, {
       provider: 'fantasticjobs', operation: 'list', credentialSource: 'platform', userId: query.userId,
     })
-    if (!response.ok) return []
+    if (!response.ok) { reportFailure(); return [] }
     const payload = await response.json()
-    const values: unknown[] = Array.isArray(payload)
-      ? payload
-      : Array.isArray(record(payload).data) ? record(payload).data as unknown[] : []
+    const data = record(payload).data
+    if (!Array.isArray(payload) && !Array.isArray(data)) { reportFailure(); return [] }
+    const values: unknown[] = Array.isArray(payload) ? payload : data as unknown[]
     await reportJobApiJobs(response, values.length)
-    return values.map(mapJob).filter((job): job is FantasticJob => Boolean(job))
+    const jobs = values.map(value => {
+      const job = mapJob(value)
+      if (!job) reportFailure()
+      return job
+    }).filter((job): job is FantasticJob => Boolean(job))
+    return jobs
   } catch {
+    reportFailure()
     return []
   }
 }

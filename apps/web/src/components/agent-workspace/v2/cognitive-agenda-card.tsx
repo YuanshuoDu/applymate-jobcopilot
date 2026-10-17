@@ -37,12 +37,16 @@ export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: Cognit
     [t('agent.cognitiveAgenda.signal.steeringNewlyObserved'), agenda.signals.steering.newlyObserved],
   ]
   const blocker = agenda.blockedBy.kind ? t(BLOCKER_KEYS[agenda.blockedBy.kind]) : t('agent.cognitiveAgenda.none')
+  const revisions = revisionLabels(t, agenda)
   const scopedRows = scopedAgendaRows(agendas, agenda, taskLabels).slice(0, 6)
   return (
     <section data-agent-cognitive-agenda="true" aria-label={t('agent.cognitiveAgenda.title')} style={cardStyle}>
       <div style={headingStyle}><strong>{t('agent.cognitiveAgenda.brain')}</strong><span style={metaStyle}>{t('agent.cognitiveAgenda.serverOwned')}</span></div>
       <div style={rowStyle}><span>{t('agent.cognitiveAgenda.nextAction')}</span><strong>{t(ACTION_KEYS[agenda.nextAction])}</strong></div>
       <div style={rowStyle}><span>{t('agent.cognitiveAgenda.blockedBy')}</span><span>{blocker}</span></div>
+      {revisions.length > 0 && <div data-agent-cognitive-agenda-revisions="true" style={revisionStyle}>
+        {revisions.map(label => <span key={label}>{label}</span>)}
+      </div>}
       <div style={signalsStyle}>{signals.map(([label, signal]) => <span key={label}>{label}: {signal.count}</span>)}</div>
       {agenda.steeringMarkers && <div data-agent-steering-lifecycle="true" style={signalsStyle}>
         <span>{t('agent.cognitiveAgenda.steering.observed')}: {agenda.steeringMarkers.observedCount}</span>
@@ -53,11 +57,24 @@ export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: Cognit
         <strong>{t('agent.cognitiveAgenda.scopedTitle')}</strong>
         {scopedRows.map((row, index) => <div key={`${row.entry.turnId}:${row.entry.taskId}`} style={rowStyle}>
           <span>{t(row.kind)} · {row.label || `${t('agent.cognitiveAgenda.task')} ${index + 1}`}</span>
-          <strong>{t(ACTION_KEYS[row.entry.latest.nextAction])}</strong>
+          <span style={scopedActionStyle}>
+            <strong>{t(ACTION_KEYS[row.entry.latest.nextAction])}</strong>
+            {revisionLabels(t, row.entry.latest).map(label => <small key={label}>{label}</small>)}
+          </span>
         </div>)}
       </div>}
     </section>
   )
+}
+
+function revisionLabels(
+  t: (key: string) => string,
+  agenda: Pick<CognitiveAgendaView, 'goalRevision' | 'planRevision'>,
+): string[] {
+  return [
+    agenda.goalRevision === null ? null : `${t('agent.cognitiveAgenda.goalRevision')}: ${agenda.goalRevision}`,
+    agenda.planRevision === null ? null : `${t('agent.cognitiveAgenda.planRevision')}: ${agenda.planRevision}`,
+  ].filter((label): label is string => label !== null)
 }
 
 function scopedAgendaRows(
@@ -65,9 +82,10 @@ function scopedAgendaRows(
   current: CognitiveAgendaView,
   taskLabels?: ReadonlyMap<string, CognitiveAgendaTaskLabel>,
 ): Array<{ entry: TimelineCognitiveAgendaEntry; label: string; kind: string }> {
-  const currentEntry = agendas.find(entry => entry.turnId === current.turnId && entry.taskId === current.taskId)
-  const rootEntry = agendas.find(entry => taskLabels?.get(entry.taskId)?.root)
-  const ordered = [...agendas.filter(entry => entry === rootEntry || entry === currentEntry), ...agendas.filter(entry => entry !== rootEntry && entry !== currentEntry)]
+  const currentScope = agendas.filter(entry => entry.sessionId === current.sessionId && entry.turnId === current.turnId)
+  const currentEntry = currentScope.find(entry => entry.taskId === current.taskId)
+  const rootEntry = currentScope.find(entry => taskLabels?.get(entry.taskId)?.root)
+  const ordered = [...currentScope.filter(entry => entry === rootEntry || entry === currentEntry), ...currentScope.filter(entry => entry !== rootEntry && entry !== currentEntry)]
   return ordered.map(entry => ({
     entry,
     label: safeTaskLabel(taskLabels?.get(entry.taskId)?.label ?? ''),
@@ -85,3 +103,5 @@ const metaStyle: React.CSSProperties = { color: 'var(--text-muted)', fontSize: 9
 const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text-muted)', fontSize: 10 }
 const signalsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 3, color: 'var(--text-muted)', fontSize: 9 }
 const scopedStyle: React.CSSProperties = { display: 'grid', gap: 4, paddingTop: 5, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 9 }
+const revisionStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8, color: 'var(--text-muted)', fontSize: 9 }
+const scopedActionStyle: React.CSSProperties = { display: 'grid', justifyItems: 'end', textAlign: 'right' }

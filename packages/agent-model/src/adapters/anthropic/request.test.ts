@@ -44,6 +44,11 @@ describe("Anthropic request mapper", () => {
     expect(result.toolNameMap.get("jobs_x2e_search")).toBe("jobs.search")
   })
 
+  it("keeps an explicit request output cap ahead of the adapter default", () => {
+    const result = buildAnthropicRequest(request({ maxOutputTokens: 512 }), config)
+    expect(result.body.max_tokens).toBe(512)
+  })
+
   it("preserves tool-result correlation and places results before text", () => {
     const messages = [
       { role: "user", content: [{ type: "text", text: "Search" }] },

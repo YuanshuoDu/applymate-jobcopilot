@@ -14,6 +14,7 @@ import {
 import type { InterruptCommand, InterruptResult } from "./types"
 
 export type CancelExecutionCommand = { executionId: string; userId: string; sessionId?: string | null }
+type InterruptOptions = { executionOwner?: { id: string }; taskGraphFillCancellation?: "cancel" | "preserve" }
 
 const CANCELLABLE_EXECUTION_STATUSES = ["queued", "running", "waiting_for_user", "paused"] as const
 
@@ -57,37 +58,38 @@ async function interruptActiveSubagentTree(
   `)
 }
 
-async function cancelAuthorizedApplicationsBeforeSubmit(
-  tx: CommandTransaction,
-  scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date },
-): Promise<number> {
+async function cancelAuthorizedApplicationsBeforeSubmit(tx: CommandTransaction, scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date }, cancelBoundTaskGraphFill = true): Promise<number> {
   return tx.$executeRaw(Prisma.sql`
     WITH stop AS (SELECT ${scope.requestedAt}::timestamptz AS "requestedAt")
     UPDATE "application_tasks" AS application
-    SET "status" = 'cancelled',
-        "checkpoint" = 'turn_stopped_before_submit',
-        "completedAt" = stop."requestedAt",
-        "updatedAt" = stop."requestedAt"
+    SET "status" = 'cancelled', "checkpoint" = 'turn_stopped_before_submit',
+        "completedAt" = stop."requestedAt", "updatedAt" = stop."requestedAt"
     FROM stop
     WHERE application."userId" = ${scope.userId}
       AND application."sessionId" = ${scope.sessionId}
       AND (
-        (application."status" = 'filling'
-          AND application."checkpoint" IS DISTINCT FROM 'submission_request_started'
-          AND application."checkpoint" IS DISTINCT FROM 'submission_uncertain')
-        OR (application."status" = 'waiting_for_authorization'
-          AND application."checkpoint" IN ('form_filled', 'queue_retry'))
-        OR (application."status" = 'waiting_for_user'
-          AND application."checkpoint" = 'user_takeover')
-      )
-      AND EXISTS (
-        SELECT 1 FROM "agent_approvals" AS approval
-        WHERE approval."userId" = ${scope.userId}
-          AND approval."sessionId" = ${scope.sessionId}
-          AND approval."turnId" = ${scope.turnId}
-          AND approval."type" = 'submit_application'
-          AND approval."status" IN ('approved', 'consumed')
-          AND approval."payload"->>'applicationTaskId' = application."id"
+        (
+          (application."status" = 'filling' AND application."checkpoint" IS DISTINCT FROM 'submission_request_started' AND application."checkpoint" IS DISTINCT FROM 'submission_uncertain')
+          OR (application."status" = 'waiting_for_authorization' AND application."checkpoint" IN ('form_filled', 'queue_retry'))
+          OR (application."status" = 'waiting_for_user' AND application."checkpoint" = 'user_takeover')
+        )
+        AND EXISTS (
+          SELECT 1 FROM "agent_approvals" AS approval
+          WHERE approval."userId" = ${scope.userId} AND approval."sessionId" = ${scope.sessionId}
+            AND approval."turnId" = ${scope.turnId} AND approval."type" = 'submit_application'
+            AND approval."status" IN ('approved', 'consumed')
+            AND approval."payload"->>'applicationTaskId' = application."id"
+        )
+        OR (
+          (
+            (application."status" = 'filling' AND application."checkpoint" IN ('taskgraph_fill_queued', 'browser_active'))
+            OR (application."status" = 'waiting_for_user' AND application."checkpoint" IN ('form_answer_required', 'fill_outcome_uncertain'))
+          )
+          AND application."fillTurnId" = ${scope.turnId}
+          AND application."fillTurnSessionId" = ${scope.sessionId}
+          AND application."fillTurnUserId" = ${scope.userId}
+          AND ${cancelBoundTaskGraphFill}
+        )
       )
       AND EXISTS (
         SELECT 1 FROM "agent_sessions" AS session
@@ -117,7 +119,7 @@ async function cancelActiveTurnFollowUps(tx: CommandTransaction, scope: { userId
   return cancelled.count
 }
 
-export async function interruptActiveTurn(tx: CommandTransaction, command: InterruptCommand, active: ActiveTurn, executionOwner?: { id: string }): Promise<InterruptResult> {
+export async function interruptActiveTurn(tx: CommandTransaction, command: InterruptCommand, active: ActiveTurn, options: InterruptOptions = {}): Promise<InterruptResult> {
   const requestedAt = new Date()
   const interrupted = await tx.agentTurn.updateMany({ where: { id: active.id, sessionId: command.sessionId, userId: command.userId, status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] }, revision: active.revision }, data: { status: "interrupted", revision: { increment: 1 }, completedAt: requestedAt } })
   if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
@@ -125,7 +127,7 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
   // Fence the execution before touching ApplicationTask rows.
   const executionFence = await tx.agentExecution.updateMany({
     where: {
-      ...(executionOwner ? { id: executionOwner.id } : {}),
+      ...(options.executionOwner ? { id: options.executionOwner.id } : {}),
       userId: command.userId,
       sessionId: command.sessionId,
       status: { in: [...CANCELLABLE_EXECUTION_STATUSES] },
@@ -137,20 +139,22 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
       completedAt: requestedAt,
     },
   })
-  if (executionOwner && executionFence.count !== 1) {
+  if (options.executionOwner && executionFence.count !== 1) {
     const current = await tx.agentExecution.findFirst({
-      where: { id: executionOwner.id, userId: command.userId, sessionId: command.sessionId },
+      where: { id: options.executionOwner.id, userId: command.userId, sessionId: command.sessionId },
       select: { status: true },
     })
-    if (current?.status !== "cancelled") throw executionChanged(executionOwner.id)
+    if (current?.status !== "cancelled") throw executionChanged(options.executionOwner.id)
   }
 
-  await cancelAuthorizedApplicationsBeforeSubmit(tx, {
+  await interruptActiveSubagentTree(tx, {
     userId: command.userId,
     sessionId: command.sessionId,
     turnId: active.id,
     requestedAt,
   })
+
+  await cancelAuthorizedApplicationsBeforeSubmit(tx, { userId: command.userId, sessionId: command.sessionId, turnId: active.id, requestedAt }, options.taskGraphFillCancellation !== "preserve")
 
   await cancelActiveTurnFollowUps(tx, {
     userId: command.userId,
@@ -159,12 +163,6 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
     requestedAt,
   })
 
-  await interruptActiveSubagentTree(tx, {
-    userId: command.userId,
-    sessionId: command.sessionId,
-    turnId: active.id,
-    requestedAt,
-  })
   await enqueueTaskGraphStopIntent(tx, { sessionId: command.sessionId, turnId: active.id })
 
   await cancelPendingWaitsInTransaction(tx, {
@@ -214,7 +212,7 @@ export async function cancelExecutionInTransaction(
 
   const willInterruptActiveTurn = Boolean(interruptCommand && !existing && active)
   if (willInterruptActiveTurn && interruptCommand && active) {
-    await interruptActiveTurn(tx, interruptCommand, active, { id: execution.id })
+    await interruptActiveTurn(tx, interruptCommand, active, { executionOwner: { id: execution.id } })
   } else if (lockedExecution.status !== "cancelled") {
     const updated = await tx.agentExecution.updateMany({
       where: {

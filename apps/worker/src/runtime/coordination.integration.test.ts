@@ -221,7 +221,8 @@ class IntegrationPg {
     if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "userId"') && sql.includes('"consumedAt" IS NULL')) return this.state.wait.consumedAt === null && (this.state.wait.status === "waiting" || this.state.wait.status === "ready" || this.state.wait.status === "timed_out") ? { rows: [this.waitRow()], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "id" = $1') && sql.includes("FOR UPDATE")) return { rows: [this.waitRow()], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id" = $1') && !sql.includes("ANY")) return { rows: [this.taskRow(this.store.records.get(this.state.turn.rootTaskId)!)], rowCount: 1 }
-    if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: this.state.turn.rootTaskId, attempt: 1, status: this.state.stepStatus }], rowCount: 1 }
+    if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: this.state.turn.rootTaskId, attempt: 1, status: this.state.stepStatus, inputThroughSequence: "0" }], rowCount: 1 }
+    if (sql.includes('FROM "agent_inputs" AS input') && sql.includes('input."acceptedSequence" > $4::bigint')) return { rows: [{ pending: false }], rowCount: 1 }
     if (sql.includes('ANY($1::text[])')) {
       const child = [...this.store.records.values()].find(task => task.id === this.state.wait.targetTaskIds[0])
       return child ? { rows: [{ ...this.taskRow(child), role: child.role, result: child.result, failureReason: child.failureReason }], rowCount: 1 } : { rows: [], rowCount: 0 }
@@ -332,6 +333,7 @@ describe("canonical child wait resume composition", () => {
     expect(retry).toMatchObject({ taskId: childPayload.taskId, status: "retrying" })
     expect(store.records.get(childPayload.taskId)?.status).toBe("queued")
     await expect(reconcileDurableWaits(db.pool, { now: NOW, ownerId: "resolver-1" })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
+    expect(db.calls.filter(sql => sql.includes('FROM "agent_inputs" AS input') && sql.includes('input."acceptedSequence" > $4::bigint'))).toHaveLength(1)
     expect(db.state.wait.status).toBe("waiting")
     expect(db.events).toHaveLength(0)
     expect(db.outbox).toHaveLength(0)

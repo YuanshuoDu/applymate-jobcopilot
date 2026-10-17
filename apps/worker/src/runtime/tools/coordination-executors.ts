@@ -1,20 +1,14 @@
-import { CoordinationError, type CoordinationTaskView } from "./coordination-types.js"
-import {
-  assertFollowupReplay,
-  followupContext,
-  followupOutput,
-  followupProvenance,
-} from "./coordination-followup.js"
+import { assertRootChildCreationUsesCoveragePlan, CoordinationError, type CoordinationTaskView } from "./coordination-types.js"
+import { executeFollowup as runFollowup } from "./coordination-pending-replacement.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import type { ToolExecutionContext } from "./types.js"
-import { getSubagentRolePolicy } from "../subagents/role-policy.js"
+import { APPLICATION_FILLER_ROLE, getSubagentRolePolicy, isHarnessSubagentRole } from "../subagents/role-policy.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { appendNativeCoordination, nativeCoordinationKey, nativeCoordinationOutput, plannerEnabledRoot } from "./task-graph-coordination-bridge.js"
 import { buildScoutAnalystAggregate } from "./coordination-result-aggregate.js"
 import {
   activity,
   assertSpawnReplay,
-  currentFollowupParent,
   currentTurnTask,
   followupSource,
   managerError,
@@ -22,7 +16,6 @@ import {
   spawnOutput,
   taskOutput,
   uniqueTasks,
-  waitResult,
   waitTaskOutput,
   type CoordinationExecutorOptions,
 } from "./coordination-executor-support.js"
@@ -48,8 +41,9 @@ function managerKey(value: string | undefined): string {
   return value
 }
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
+  assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
   const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null
-  if (!policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
+  if (!isHarnessSubagentRole(input.role) || !policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
   const expectedSchema = expectedOutputSchema(context.delegateOutputSchemaMarker, input.role)
   const lineage = await resolveSpawnLineage(context, input.parentTaskId, options)
   const parentTaskId = lineage.parentTaskId
@@ -132,73 +126,15 @@ export async function executeSendMessage(context: ToolExecutionContext, input: S
   await activity(context, options, "send_message", target.id, { kind: input.kind, duplicate: result.duplicate }, input.idempotencyKey)
   return { messageId: result.message.id, taskId: target.id, status: result.duplicate ? "duplicate" as const : "queued" as const }
 }
-export async function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
-  if (plannerEnabledRoot(context, options.nativeCoordination?.enabled === true)) {
-    const idempotencyKey = nativeCoordinationKey(context, "followup", input.idempotencyKey)
-    const request = {
-      kind: "followup" as const, idempotencyKey, sourceTaskId: input.taskId, goal: input.goal,
-      ...(input.constraints === undefined ? {} : { constraints: [...input.constraints] }),
-      ...(input.successCriteria === undefined ? {} : { successCriteria: [...input.successCriteria] }),
-      ...(input.context === undefined ? {} : { context: input.context }),
-    }
-    const result = await appendNativeCoordination({ context, options: options.nativeCoordination!, request })
-    if (result.receipt.source && result.receipt.source.taskId !== input.taskId) throw new CoordinationError("coordination_idempotency_conflict", "Follow-up receipt belongs to a different source task")
-    await activity(context, options, "agent.followup", result.receipt.child.taskId, { path: result.receipt.child.path, status: result.receipt.child.status, sourceTaskId: input.taskId, native: true }, idempotencyKey)
-    return { ...nativeCoordinationOutput("followup", result.rootTaskId, result.receipt), sourceTaskId: input.taskId }
+export function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
+  assertRootChildCreationUsesCoveragePlan(context, options.verificationRequirements)
+  if (!("mode" in input) && !plannerEnabledRoot(context, options.nativeCoordination?.enabled === true)) {
+    return followupSource(context, input.taskId, options).then(source => {
+      if (source.role === APPLICATION_FILLER_ROLE) throw new CoordinationError("coordination_invalid_input", "Application filler follow-up is only allowed through TaskGraph")
+      return runFollowup(context, input, options)
+    })
   }
-  const idempotencyKey = managerKey(input.idempotencyKey)
-  const replay = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey })
-  if (replay) {
-    const provenance = followupProvenance(replay.context)
-    if (!provenance || provenance.sourceTaskId !== input.taskId) throw new CoordinationError("coordination_idempotency_conflict", "Follow-up idempotency key was reused for a different source task")
-    const source = await followupSource(context, input.taskId, options)
-    const parent = await currentFollowupParent(context, options)
-    assertFollowupReplay(replay, source, parent, provenance, context.turnId)
-    await activity(context, options, "agent.followup", replay.id, { path: replay.path, status: replay.status, sourceTaskId: source.id, replay: true }, idempotencyKey)
-    return followupOutput(replay, source.id, true)
-  }
-
-  const source = await followupSource(context, input.taskId, options)
-  const parent = await currentFollowupParent(context, options)
-  const spec = {
-    userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, parentTaskId: parent.id,
-    role: source.role, taskType: source.taskType, goal: input.goal, constraints: input.constraints,
-    successCriteria: input.successCriteria, context: followupContext(input.context, source, value => waitResult(value)),
-  }
-  const atomic = typeof options.manager.supportsAtomicSpawn === "function" && options.manager.supportsAtomicSpawn()
-  let task: CoordinationTaskView
-  if (atomic) {
-    let result: Awaited<ReturnType<typeof options.manager.spawnAtomic>>
-    try { result = await options.manager.spawnAtomic(spec, idempotencyKey) } catch (error: unknown) { throw managerError(error) }
-    if (result.duplicate || !result.task) {
-      const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey })
-      if (!winner) throw new CoordinationError("coordination_idempotency_conflict", "Follow-up idempotency record was lost")
-      const winnerProvenance = followupProvenance(winner.context)
-      assertFollowupReplay(winner, source, parent, winnerProvenance, context.turnId)
-      await activity(context, options, "agent.followup", winner.id, { path: winner.path, status: winner.status, sourceTaskId: input.taskId, replay: true }, idempotencyKey)
-      return followupOutput(winner, input.taskId, true)
-    }
-    task = result.task
-  } else {
-    try { task = await options.manager.spawn(spec) } catch (error: unknown) { throw managerError(error) }
-    try {
-      const recorded = await options.store.recordSpawn({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey, task })
-      if (!recorded) {
-        const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey })
-        await options.manager.close(task.id, context.sessionId)
-        if (!winner) throw new CoordinationError("coordination_idempotency_conflict", "Follow-up idempotency record was lost")
-        const winnerProvenance = followupProvenance(winner.context)
-        assertFollowupReplay(winner, source, parent, winnerProvenance, context.turnId)
-        await activity(context, options, "agent.followup", winner.id, { path: winner.path, status: winner.status, sourceTaskId: input.taskId, replay: true }, idempotencyKey)
-        return followupOutput(winner, input.taskId, true)
-      }
-    } catch (error: unknown) {
-      await options.manager.close(task.id, context.sessionId).catch(() => false)
-      throw error
-    }
-  }
-  await activity(context, options, "agent.followup", task.id, { path: task.path, status: task.status, sourceTaskId: source.id }, idempotencyKey)
-  return followupOutput(task, source.id, false)
+  return runFollowup(context, input, options)
 }
 export async function executeWaitSubagents(context: ToolExecutionContext, input: WaitSubagentsInput, options: CoordinationExecutorOptions) {
   if (!options.wait) throw new CoordinationError("coordination_wait_unavailable", "Durable wait integration from AH2-025 is not available")

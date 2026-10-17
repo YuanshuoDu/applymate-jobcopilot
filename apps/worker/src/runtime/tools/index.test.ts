@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { createWorkerToolRuntime } from "./index.js"
+import { createJobDiscoveryClient } from "./job-discovery-client.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
 import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
 import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
+import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
 
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
@@ -12,6 +14,7 @@ const owner: ExecutionOwner = {
     leaseStartedAt: new Date("2026-08-31T11:59:00.000Z"), leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"),
   },
 }
+const submitIdentity: ApplicationSubmitIdentity = { sessionId: "session-1", fillTurnId: "turn-1", applicationTaskId: "application-1", userId: "user-1", jobId: "job-1", approvalId: "receipt-1", constraintHash: "a".repeat(64) }
 
 describe("worker tool runtime entry point", () => {
   it("exports a factory without opening a database connection at import time", () => {
@@ -26,10 +29,26 @@ describe("worker tool runtime entry point", () => {
       undefined,
       undefined,
       undefined,
-      { submit: async () => ({ confirmationId: "mock-confirmation" }) },
+      { submit: async () => ({ confirmationId: "mock-confirmation" }), identity: submitIdentity },
     )
 
     expect(runtime.registry.resolve("application.submit", "1").risk).toBe("external_write")
+  })
+
+  it("registers jobs.discover only when a trusted Scout bridge is explicitly supplied", () => {
+    const disabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink() })
+    expect(() => disabled.registry.resolve("jobs.discover", "1")).toThrow("not registered")
+    const enabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink() }, undefined, undefined, undefined, undefined, undefined,
+      {
+        client: createJobDiscoveryClient({ endpointUrl: "https://web.example/discovery", secret: "secret", fetch: vi.fn(async () => Response.json({})) }),
+        fence: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1", rootTaskId: "root-1", role: "scout", leaseOwner: "worker-1", attemptCount: 1 },
+      },
+    )
+    expect(enabled.registry.resolve("jobs.discover", "1")).toMatchObject({
+      risk: "internal_write", domain: "jobs", capabilities: ["read", "write"], requiredCapabilities: ["read"],
+    })
+    expect(enabled.registry.validateArguments("jobs.discover", { targetRoles: ["Engineer"], targetLocations: [], userId: "forged" })).not.toBe(true)
   })
 
   it("registers the durable private-result read tool with the runtime owner resolver", () => {
@@ -59,6 +78,23 @@ describe("worker tool runtime entry point", () => {
     expect(enabled.registry.list(["canManageChildren"]).map(definition => definition.name).filter(name => name.includes("subagent") || name === "agent.followup" || name === "send_message" || name === "wait_subagents" || name === "interrupt_subagent" || name === "close_subagent")).toEqual([
       "spawn_subagent", "agent.followup", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
+  })
+
+  it("registers ask-user only when the trusted runtime explicitly exposes its native wait store", () => {
+    const coordination = { manager: {} as never, store: {} as unknown as CoordinationStore, wait: {} as unknown as DurableWaitPort }
+    const disabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined, coordination,
+    )
+    expect(() => disabled.registry.resolve("agent.ask_user", "1")).toThrow("not registered")
+
+    const enabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined,
+      { ...coordination, askUserEnabled: true },
+    )
+    const tool = enabled.registry.resolve("agent.ask_user", "1")
+    expect(tool).toMatchObject({ risk: "internal_write", domain: "coordination", idempotency: "idempotent", requiredCapabilities: ["canManageChildren"] })
+    expect(enabled.registry.validateArguments("agent.ask_user", { question: "Where?", choices: [] })).toBe(true)
+    expect(enabled.registry.validateArguments("agent.ask_user", { question: "Where?", turnId: "model-id" })).not.toBe(true)
   })
 
   it("passes the supplied durable wait port to the wait tool", async () => {

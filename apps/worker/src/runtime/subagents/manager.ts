@@ -10,11 +10,13 @@ import {
   type SubagentStore,
   type SubagentTaskRecord,
   type SubagentTaskSpec,
+  isTerminalSubagentStatus,
 } from "./types.js"
 import { isSubagentRetryDue } from "./retry-policy.js"
 import { isTaskPathWithin, normalizeTaskPath, policyFromTask } from "./manager-task-scope.js"
 import { runClaimedSubagent, type SubagentRunOutcome } from "./manager-run-outcome.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
+import { SubagentDispatchIdentityMismatchError, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, type SubagentDispatchIdentity } from "./dispatch-identity.js"
 export type { SubagentRunOutcome } from "./manager-run-outcome.js"
 
 export interface SubagentClock {
@@ -72,14 +74,23 @@ export class AgentTreeManager {
     return { ...(await createWithSpawn.call(this.store, { ...spec, policy, spawnIdempotencyKey })), atomic: true }
   }
 
-  async claim(payload: SubagentJobPayload, now = this.now()): Promise<SubagentLease | null> {
+  async claim(payload: SubagentJobPayload, now = this.now(), dispatchIdentity?: SubagentDispatchIdentity): Promise<SubagentLease | null> {
     if (this.active.has(payload.taskId)) return null
     const task = await this.store.get(payload.taskId, payload.sessionId)
     if (!task || task.rootTaskId !== payload.rootTaskId) return null
+    if (isTerminalSubagentStatus(task.status)) return null
     if (task.status === "queued" && !isSubagentRetryDue(task.nextAttemptAt, now)) return null
     const policy = policyFromTask(task)
-    const slot = this.limiter.reserve(payload.sessionId, payload.taskId, policy)
-    const claimed = await this.store.claim({ ...payload, policy, now }).catch(error => {
+    let slot: SlotReservation
+    try { slot = this.limiter.reserve(payload.sessionId, payload.taskId, policy) }
+    catch (error: unknown) {
+      if (dispatchIdentity && error instanceof SubagentLimitError && error.code === "concurrency") {
+        const current = await this.store.matchesPublishedDispatch?.({ payload, dispatchIdentity })
+        if (!current) throw new SubagentDispatchIdentityMismatchError()
+      }
+      throw error
+    }
+    const claimed = await this.store.claim({ ...payload, policy, now, ...(dispatchIdentity ? { dispatchIdentity } : {}) }).catch(error => {
       slot.release()
       throw error
     })
@@ -102,10 +113,11 @@ export class AgentTreeManager {
     this.active.set(payload.taskId, execution)
     return execution.lease
   }
-  async run(payload: SubagentJobPayload, execute: (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>): Promise<SubagentRunOutcome> {
+  async run(payload: SubagentJobPayload, execute: (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>, dispatchIdentity?: SubagentDispatchIdentity): Promise<SubagentRunOutcome> {
     let lease: SubagentLease | null
-    try { lease = await this.claim(payload) } catch (error: unknown) {
+    try { lease = await this.claim(payload, this.now(), dispatchIdentity) } catch (error: unknown) {
       if (isSessionPauseRequestedError(error)) return { taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }
+      if (error instanceof SubagentDispatchIdentityMismatchError) return { taskId: payload.taskId, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH }
       if (error instanceof SubagentLeaseError) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
       throw error
     }

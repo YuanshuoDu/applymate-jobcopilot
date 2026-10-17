@@ -9,7 +9,7 @@ import {
 } from "../../contracts.js"
 import { readServerSentEvents } from "../openai-compatible/sse.js"
 import { AnthropicMessagesParser } from "./parser.js"
-import { buildAnthropicRequest } from "./request.js"
+import { ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS, buildAnthropicRequest } from "./request.js"
 import type {
   AnthropicAdapter,
   AnthropicAdapterOptions,
@@ -60,6 +60,7 @@ function capabilityProfile(
     maxOutputTokens: null,
     costClass: "unknown" as const,
     ...overrides,
+    defaultMaxOutputTokens: ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
   }
 }
 

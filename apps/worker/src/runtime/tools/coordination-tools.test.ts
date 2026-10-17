@@ -4,6 +4,7 @@ import { AgentTreeManager } from "../subagents/manager.js"
 import { ToolRegistry } from "./registry.js"
 import { ToolSchemaValidator } from "./schema-validator.js"
 import { createCoordinationTools } from "./coordination-tools.js"
+import { TASK_GRAPH_RESULT_PAGE_SCHEMA } from "../subagents/task-graph-result-page-contract.js"
 import type { CoordinationStore } from "./coordination-types.js"
 
 const options = {
@@ -92,10 +93,10 @@ describe("coordination tool definitions", () => {
     const legacyList = definitions.find(definition => definition.name === "list_subagents")
     const canonicalList = definitions.find(definition => definition.name === "agent.list")
     expect(legacyList).toBeDefined()
+    expect(legacyList?.description).toBe("List visible tasks in the current session and task tree")
     expect(canonicalList).toMatchObject({
       schemaVersion: legacyList?.schemaVersion,
       version: legacyList?.version,
-      description: legacyList?.description,
       capabilities: legacyList?.capabilities,
       risk: legacyList?.risk,
       domain: legacyList?.domain,
@@ -103,9 +104,9 @@ describe("coordination tool definitions", () => {
       timeoutMs: legacyList?.timeoutMs,
       requiredCapabilities: legacyList?.requiredCapabilities,
     })
-    expect(canonicalList?.inputSchema).toBe(legacyList?.inputSchema)
-    expect(canonicalList?.outputSchema).toBe(legacyList?.outputSchema)
-    expect(canonicalList?.execute).toBe(legacyList?.execute)
+    expect(canonicalList?.inputSchema).not.toBe(legacyList?.inputSchema)
+    expect(canonicalList?.outputSchema).not.toBe(legacyList?.outputSchema)
+    expect(canonicalList?.execute).not.toBe(legacyList?.execute)
     const legacyClose = definitions.find(definition => definition.name === "close_subagent")
     const canonicalClose = definitions.find(definition => definition.name === "agent.close")
     expect(legacyClose).toBeDefined()
@@ -130,13 +131,131 @@ describe("coordination tool definitions", () => {
       "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
     ])
     const registry = new ToolRegistry(definitions)
+    expect(registry.resolve("list_subagents", "1").description).toBe("List visible tasks in the current session and task tree")
+    const listDescription = registry.resolve("agent.list", "1").description
+    expect(listDescription).toContain("Choose exactly one mode")
+    expect(listDescription).toContain("offset 0")
+    expect(listDescription).toContain("exact returned nextOffset")
+    expect(listDescription).toContain("same nodeKey and expectedRevision")
+    expect(listDescription).toContain("exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null")
+    expect(listDescription).toContain("at most three items")
+    expect(listDescription).toContain("totalCount/evidenceCount describe only this node's source")
+    expect(listDescription).toContain("Use those reported counts rather than page length")
+    expect(listDescription).toContain("ends paging for this node at this revision only; it does not establish task or verification completion")
+    expect(listDescription).toContain("stale or unavailable, refresh current state")
+    expect(listDescription).toContain("Never invent offsets, silently switch modes")
+    expect(listDescription).toContain("verification proof")
+    const spawnDescription = registry.resolve("agent.spawn", "1").description
+    const followupDescription = registry.resolve("agent.followup", "1").description
+    expect(spawnDescription).toContain("eight-node lifetime cap separate from active-child concurrency")
+    expect(spawnDescription).toContain("task_graph_current.nodeCapacity")
+    expect(spawnDescription).toContain("nodeCount, maxNodes, remaining, ordinaryRemaining, reserveActive, and repairRecorded")
+    expect(spawnDescription).toContain("leave the final slot for one exact failed-criterion repair")
+    expect(spawnDescription).toContain("An accepted repair sets repairRecorded and consumes the reserve")
+    expect(followupDescription).toContain("replacement retains its canceled source and appends its successor")
+    expect(followupDescription).toContain("An accepted repair relation consumes the one reserve even if queued or failed")
+    expect(followupDescription).toContain("does not make its target successful or guarantee another retry")
     expect(registry.resolve("agent.send", "1").execute).toBe(registry.resolve("send_message", "1").execute)
     expect(registry.resolve("agent.spawn", "1").execute).toBe(registry.resolve("spawn_subagent", "1").execute)
     expect(registry.resolve("agent.wait", "1").execute).toBe(registry.resolve("wait_subagents", "1").execute)
     expect(registry.resolve("agent.interrupt", "1").execute).toBe(registry.resolve("interrupt_subagent", "1").execute)
-    expect(registry.resolve("agent.list", "1").execute).toBe(registry.resolve("list_subagents", "1").execute)
+    expect(registry.resolve("agent.list", "1").execute).not.toBe(registry.resolve("list_subagents", "1").execute)
     expect(registry.resolve("agent.close", "1").execute).toBe(registry.resolve("close_subagent", "1").execute)
     expect(new ToolRegistry(definitions).list(["other"])).toHaveLength(0)
+  })
+
+  it("gives only agent.list the strict exclusive current-result page mode", () => {
+    const definitions = createCoordinationTools(options)
+    const registry = new ToolRegistry(definitions)
+    const request = { nodeKey: "candidate-node", expectedRevision: 2, offset: 3 }
+    expect(registry.validateArguments("agent.list", request)).toBe(true)
+    expect(registry.validateArguments("list_subagents", request)).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, includeTerminal: true })).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, taskId: "forged" })).not.toBe(true)
+    const page = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 2,
+      role: "scout", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
+      offset: 0, nextOffset: null, items: [{ jobId: "00000000-0000-4000-8000-000000000000", source: "other", evidenceKinds: ["job"] }],
+    }
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, page, "agent.list output")).not.toThrow()
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()
+  })
+
+  it("accepts exact legacy or complete current wait task outputs with canonical timestamps", () => {
+    const registry = new ToolRegistry(createCoordinationTools(options))
+    const schema = registry.resolve("agent.wait", "1").outputSchema
+    const legacy = {
+      waitId: "wait-1", status: "timed_out", taskIds: ["task-1"], deadlineAt: "2026-10-12T10:15:00.000Z",
+      matchedTaskIds: [], tasks: [{ taskId: "task-1", status: "retrying", role: "scout", result: null, failureReason: null }],
+    }
+    const current = {
+      ...legacy,
+      tasks: [{ ...legacy.tasks[0]!, attemptCount: 2, maxAttempts: 4,
+        leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: null }],
+    }
+    expect(() => registry.validators.validate(schema, legacy, "agent.wait output")).not.toThrow()
+    expect(() => registry.validators.validate(schema, current, "agent.wait output")).not.toThrow()
+    expect(Object.keys(legacy.tasks[0]!)).toHaveLength(5)
+    expect(Object.keys(current.tasks[0]!)).toHaveLength(9)
+
+    const extendedTimestamps = [
+      new Date(Date.UTC(10_000, 0, 1)).toISOString(),
+      new Date("-000001-01-01T00:00:00.000Z").toISOString(),
+      new Date("+010000-02-29T00:00:00.000Z").toISOString(),
+      new Date("-000004-02-29T00:00:00.000Z").toISOString(),
+      new Date("+275760-09-13T00:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T00:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T00:00:00.001Z").toISOString(),
+      new Date("-271821-04-20T12:00:00.000Z").toISOString(),
+      new Date("-271821-04-20T23:59:59.999Z").toISOString(),
+    ]
+    expect(extendedTimestamps).toEqual([
+      "+010000-01-01T00:00:00.000Z",
+      "-000001-01-01T00:00:00.000Z",
+      "+010000-02-29T00:00:00.000Z",
+      "-000004-02-29T00:00:00.000Z",
+      "+275760-09-13T00:00:00.000Z",
+      "-271821-04-20T00:00:00.000Z",
+      "-271821-04-20T00:00:00.001Z",
+      "-271821-04-20T12:00:00.000Z",
+      "-271821-04-20T23:59:59.999Z",
+    ])
+
+    for (const field of ["leaseExpiresAt", "interruptRequestedAt"] as const) {
+      for (const value of ["2026-10-12T10:15:30.000Z", "2024-02-29T10:15:30.000Z", "2000-02-29T10:15:30.000Z", ...extendedTimestamps, null]) {
+        const task = { ...current.tasks[0]!, [field]: value }
+        expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).not.toThrow()
+      }
+      for (const value of [
+        "not-a-date",
+        "2026-10-12T10:15:30Z",
+        "2026-10-12T10:15:30.000+00:00",
+        "2026-10-12T10:15:30.000Z\n",
+        "+000001-01-01T00:00:00.000Z",
+        "-000000-01-01T00:00:00.000Z",
+        "+010000-02-30T00:00:00.000Z",
+        "+275761-01-01T00:00:00.000Z",
+        "+275760-09-13T00:00:00.001Z",
+        "-271822-04-20T00:00:00.000Z",
+        "-271821-04-19T23:59:59.999Z",
+        "2026-02-30T10:15:30.000Z",
+        "2026-02-29T10:15:30.000Z",
+        "1900-02-29T10:15:30.000Z",
+      ]) {
+        const task = { ...current.tasks[0]!, [field]: value }
+        expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).toThrow()
+      }
+    }
+
+    for (const task of [
+      { ...current.tasks[0]!, interruptRequestedAt: undefined },
+      { ...current.tasks[0]!, attemptCount: -1 },
+      { ...current.tasks[0]!, maxAttempts: 0 },
+      { ...current.tasks[0]!, leaseExpiresAt: 123 },
+      { ...current.tasks[0]!, leaseOwner: "private-lease-owner" },
+    ]) {
+      expect(() => registry.validators.validate(schema, { ...current, tasks: [task] }, "agent.wait output")).toThrow()
+    }
   })
 
   it("rejects forged tenant, ownership, lineage, and unknown fields before execution", () => {
@@ -167,6 +286,28 @@ describe("coordination tool definitions", () => {
     }
     expect(registry.validateArguments("spawn_subagent", { ...valid, extra: true })).not.toBe(true)
     expect(registry.validateArguments("wait_subagents", { idempotencyKey: "wait-1", taskIds: ["task-1"], mode: "any", timeoutMs: 30_001 })).not.toBe(true)
+  })
+
+  it("requires the explicit unstarted-replacement mode and bounded revision as a pair", () => {
+    const registry = new ToolRegistry(createCoordinationTools(options))
+    const legacy = { idempotencyKey: "followup-legacy", taskId: "task-1", goal: "Continue" }
+    const replacement = { ...legacy, idempotencyKey: "followup-replace", mode: "replace_unstarted", expectedRevision: 0 }
+
+    expect(registry.validateArguments("agent.followup", legacy)).toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...replacement, expectedRevision: 2_147_483_644 })).toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...legacy, mode: "replace_unstarted" })).not.toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...legacy, expectedRevision: 0 })).not.toBe(true)
+    for (const expectedRevision of [-1, 1.5, 2_147_483_645, null]) {
+      expect(registry.validateArguments("agent.followup", { ...replacement, expectedRevision })).not.toBe(true)
+    }
+    expect(registry.validateArguments("agent.followup", { ...replacement, mode: null })).not.toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...replacement, mode: "replace_any" })).not.toBe(true)
+    for (const authorityField of ["ownerId", "rootTaskId", "parentTaskId", "expectedOutputSchema"]) {
+      expect(registry.validateArguments("agent.followup", { ...replacement, [authorityField]: "forged" })).not.toBe(true)
+    }
+    expect(registry.validateArguments("agent.followup", { ...replacement, constraints: ["caller-controlled"] })).not.toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...replacement, successCriteria: ["caller-controlled"] })).not.toBe(true)
+    expect(registry.list().map(tool => tool.name).filter(name => name.includes("replace"))).toEqual([])
   })
 
   it("allows server-derived root invocation keys while enforcing explicit keys on other writes", () => {

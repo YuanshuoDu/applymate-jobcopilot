@@ -11,6 +11,7 @@ import {
   executeWaitSubagents,
 } from "./coordination-executors.js"
 import { createCoordinationTools } from "./coordination-tools.js"
+import { createCanonicalRootToolGuards } from "../interactive-discovery-runtime.js"
 import type {
   CloseSubagentInput,
   FollowupInput,
@@ -33,11 +34,16 @@ import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import type { TaskGraphCommandPort, TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
+import { resolveRootTaskVerificationRequirements, type RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 
 const baseTask: CoordinationTaskView = {
   id: "root-1", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-1", parentTaskId: null,
   path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "root goal",
   attemptCount: 1, maxAttempts: 1, leaseOwner: "worker-1", leaseExpiresAt: null, interruptRequestedAt: null,
+}
+
+const validRequirements: RootTaskVerificationRequirementsResolution = {
+  status: "valid", requirements: [{ id: "minimum-candidates", kind: "candidate_count_gte", minimum: 2 }],
 }
 
 function makeTask(overrides: Partial<CoordinationTaskView> = {}): CoordinationTaskView {
@@ -128,7 +134,7 @@ function makeRuntime() {
     }),
   } as unknown as AgentTreeManager
   const wait = {
-    wait: vi.fn(async (input: { targetTaskIds: readonly string[] }) => ({ waitId: "wait-1", status: "ready" as const, deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [...input.targetTaskIds] })),
+    wait: vi.fn<DurableWaitPort["wait"]>(async input => ({ waitId: "wait-1", status: "ready", deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [...input.targetTaskIds] })),
     cancel: vi.fn(async () => undefined),
   } satisfies DurableWaitPort
   const options: CoordinationRuntimeOptions = { manager, store, wait }
@@ -143,6 +149,117 @@ function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionCo
 }
 
 describe("coordination executors", () => {
+  it("requires a coverage-checked plan before either root spawn alias reaches legacy or native persistence", async () => {
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    for (const toolName of ["spawn_subagent", "agent.spawn"]) {
+      for (const native of [false, true]) {
+        const runtime = makeRuntime()
+        const appendNativeCoordination = vi.fn()
+        const options: CoordinationRuntimeOptions = {
+          ...runtime.options,
+          verificationRequirements: validRequirements,
+          ...(native ? { nativeCoordination: {
+            enabled: true, commandPort: { appendNativeCoordination } as unknown as TaskGraphCommandPort,
+            turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+          } } : {}),
+        }
+        const tool = createCoordinationTools(options).find(candidate => candidate.name === toolName)
+        if (!tool) throw new Error(`${toolName} definition missing`)
+        const getSpawnReplay = vi.spyOn(runtime.store, "getSpawnReplay")
+        const recordSpawn = vi.spyOn(runtime.store, "recordSpawn")
+
+        await expect(tool.execute(rootContext, { role: "scout", taskType: "inspect", goal: "Inspect" }))
+          .rejects.toMatchObject({ code: "coordination_objective_requirements_require_plan" })
+        expect(runtime.manager.spawn).not.toHaveBeenCalled()
+        expect(getSpawnReplay).not.toHaveBeenCalled()
+        expect(recordSpawn).not.toHaveBeenCalled()
+        expect(runtime.store.activities).toHaveLength(0)
+        expect(appendNativeCoordination).not.toHaveBeenCalled()
+      }
+    }
+  })
+
+  it("keeps root spawn behavior unchanged when requirements are absent or invalid", async () => {
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    for (const requirements of [
+      { status: "absent" },
+      { status: "invalid" },
+    ] satisfies readonly RootTaskVerificationRequirementsResolution[]) {
+      const runtime = makeRuntime()
+      const result = await executeSpawn(rootContext, {
+        idempotencyKey: `prose-only-${requirements.status}`, role: "scout", taskType: "inspect", goal: "Inspect",
+      }, { ...runtime.options, verificationRequirements: requirements })
+
+      expect(result).toMatchObject({ taskId: "child-1", parentTaskId: "root-1", replay: false })
+      expect(runtime.manager.spawn).toHaveBeenCalledOnce()
+    }
+  })
+
+  it("preserves native and legacy follow-up routes for invalid canonical requirements", async () => {
+    const invalidRequirements = resolveRootTaskVerificationRequirements({ input: {
+      verificationRequirements: { schemaVersion: "unsupported", privateMalformedValue: "must-not-be-used" },
+    } })
+    expect(invalidRequirements).toEqual({ status: "invalid" })
+
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const source = makeTask({
+      id: "terminal-source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/terminal-source", depth: 1,
+      role: "scout", taskType: "research", status: "failed",
+    })
+    const legacy = makeRuntime()
+    legacy.store.tasks.set(source.id, source)
+    const legacyResult = await executeFollowup(rootContext, {
+      idempotencyKey: "invalid-legacy-followup", taskId: source.id, goal: "Continue the investigation",
+    }, { ...legacy.options, verificationRequirements: invalidRequirements })
+    expect(legacyResult).toMatchObject({ sourceTaskId: source.id, parentTaskId: "root-1", replay: false })
+    expect(legacy.manager.spawn).toHaveBeenCalledOnce()
+
+    const nativeReceipt: TaskGraphNativeCommandReceipt = {
+      status: "accepted", replay: false, operationId: "invalid-followup-operation", requestFingerprint: "e".repeat(64),
+      graphRevision: 2, nodeKey: "followup-node", dispatchDisposition: "pending",
+      child: { taskId: "native-followup-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/native-followup-child",
+        depth: 1, role: "scout", taskType: "research", status: "queued" },
+    }
+    const nativeRequests: TaskGraphNativeCommandInput[] = []
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 0, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      appendNativeCoordination: vi.fn(async input => { nativeRequests.push(input); return nativeReceipt }),
+    }
+    const native = makeRuntime()
+    const nativeOptions = {
+      ...native.options,
+      verificationRequirements: invalidRequirements,
+      nativeCoordination: {
+        enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
+        parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+      },
+    }
+    const nativeResult = await executeFollowup(rootContext, {
+      idempotencyKey: "invalid-native-followup", taskId: source.id, goal: "Continue natively",
+    }, nativeOptions)
+    const replacementResult = await executeFollowup(rootContext, {
+      idempotencyKey: "invalid-native-replacement", taskId: "queued-source", goal: "Replace the unstarted task",
+      mode: "replace_unstarted", expectedRevision: 1,
+    }, nativeOptions)
+    expect(nativeResult).toMatchObject({ taskId: "native-followup-child", sourceTaskId: source.id, replay: false })
+    expect(replacementResult).toMatchObject({ taskId: "native-followup-child", sourceTaskId: "queued-source", replay: false })
+    expect(nativeRequests.map(request => request.request.kind)).toEqual(["followup", "followup"])
+    expect(nativeRequests[1]?.request).toMatchObject({ mode: "replace_unstarted", expectedRevision: 1 })
+    expect(commandPort.appendNativeCoordination).toHaveBeenCalledTimes(2)
+    expect(native.manager.spawn).not.toHaveBeenCalled()
+
+    const legacyReplacement = makeRuntime()
+    const legacyReplacementLookup = vi.spyOn(legacyReplacement.store, "getTask")
+    await expect(executeFollowup(rootContext, {
+      idempotencyKey: "invalid-legacy-replacement", taskId: "queued-source", goal: "Replace the unstarted task",
+      mode: "replace_unstarted", expectedRevision: 1,
+    }, { ...legacyReplacement.options, verificationRequirements: invalidRequirements }))
+      .rejects.toMatchObject({ code: "coordination_native_replacement_unavailable" })
+    expect(legacyReplacement.manager.spawn).not.toHaveBeenCalled()
+    expect(legacyReplacementLookup).not.toHaveBeenCalled()
+  })
+
   it("spawns through the manager, records durable dispatch, and replays by key", async () => {
     const runtime = makeRuntime()
     const input: SpawnSubagentInput = { idempotencyKey: "spawn-1", role: "scout", taskType: "inspect", goal: "Inspect the job" }
@@ -153,6 +270,17 @@ describe("coordination executors", () => {
     expect((runtime.manager.spawn as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce()
     expect(runtime.store.spawnOperations.get("session-a:spawn-1")).toBe("child-1")
     expect(runtime.store.activities).toContain("spawn_subagent")
+  })
+
+  it("rejects Application Filler through generic agent.spawn before dispatch", async () => {
+    const runtime = makeRuntime()
+    await expect(executeSpawn(context(), {
+      idempotencyKey: "generic-application-filler", role: "application_filler",
+      taskType: "application_fill_for_review", goal: "Prepare this application for review",
+    }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
   })
 
   it("routes planner-root spawn aliases through the native command with stable replay identity", async () => {
@@ -225,6 +353,90 @@ describe("coordination executors", () => {
     expect(replay).toMatchObject({ taskId: "followup-child", sourceTaskId: source.taskId, status: "waiting", replay: true })
     expect(lookup).not.toHaveBeenCalled()
     expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
+  it("routes explicit unstarted replacement only through the native command without mutable source prechecks", async () => {
+    const runtime = makeRuntime()
+    const received: TaskGraphNativeCommandInput[] = []
+    const source = { taskId: "queued-source", rootTaskId: "root-1", parentTaskId: "root-1", turnId: "turn-a", role: "scout", taskType: "research", status: "cancelled" as const, attemptCount: 0, resultDigest: "c".repeat(64), graphNodeKey: "source-node", origin: "task_graph" as const }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 0, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      appendNativeCoordination: vi.fn(async input => {
+        received.push(input)
+        const replay = received.length > 1
+        return { status: replay ? "duplicate" as const : "accepted" as const, replay, operationId: "replace-op", requestFingerprint: "d".repeat(64), graphRevision: 3,
+          nodeKey: "replacement-node", dispatchDisposition: "pending" as const,
+          child: { taskId: "replacement-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/replacement-child", depth: 1, role: "scout", taskType: "research", status: "queued" as const }, source }
+      }),
+    }
+    const options = { ...runtime.options, nativeCoordination: { enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2 } }
+    const input: FollowupInput = { taskId: source.taskId, idempotencyKey: "replace-native", goal: "Inspect the updated evidence", mode: "replace_unstarted", expectedRevision: 1 }
+    const root = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const mutableLookup = vi.spyOn(runtime.store, "getTask")
+
+    const first = await executeFollowup(root, input, options)
+    const replay = await executeFollowup(root, input, options)
+
+    expect(received).toHaveLength(2)
+    expect(received[0]?.request).toMatchObject({
+      kind: "followup", sourceTaskId: source.taskId, goal: input.goal, mode: "replace_unstarted", expectedRevision: 1,
+    })
+    expect(received[1]?.request).toMatchObject({ idempotencyKey: received[0]?.request.idempotencyKey, mode: "replace_unstarted", expectedRevision: 1 })
+    expect(mutableLookup).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(first).toMatchObject({ taskId: "replacement-child", sourceTaskId: source.taskId, replay: false, nativeCoordination: { graphRevision: 3 } })
+    expect(replay).toMatchObject({ taskId: "replacement-child", sourceTaskId: source.taskId, replay: true })
+  })
+
+  it("fails closed for replacement mode outside the general native root surface", async () => {
+    const runtime = makeRuntime()
+    const appendNativeCoordination = vi.fn()
+    const options = { ...runtime.options, nativeCoordination: {
+      enabled: true, commandPort: { appendNativeCoordination } as unknown as TaskGraphCommandPort,
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+    } }
+    const input: FollowupInput = { taskId: "source", idempotencyKey: "replace-child-origin", goal: "Continue", mode: "replace_unstarted", expectedRevision: 1 }
+
+    await expect(executeFollowup(context({ taskId: "child", rootTaskId: "root-1", actorRole: "subagent" }), input, options))
+      .rejects.toMatchObject({ code: "coordination_native_replacement_unavailable" })
+    expect(appendNativeCoordination).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("blocks a selected-job root replacement call before routing or appending", async () => {
+    const runtime = makeRuntime()
+    const appendNativeCoordination = vi.fn()
+    const commandPort = { appendNativeCoordination } as unknown as TaskGraphCommandPort
+    const options = { ...runtime.options, nativeCoordination: {
+      enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
+      parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+    } }
+    const selectedJobRoot = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const input: FollowupInput = {
+      taskId: "source", idempotencyKey: "selected-job-replace", goal: "Continue", mode: "replace_unstarted", expectedRevision: 1,
+    }
+    const routeTool = vi.fn(async () => {
+      await executeFollowup(selectedJobRoot, input, options)
+      return { id: "call-selected-job-replace", toolName: "agent.followup", toolVersion: "1", status: "completed" as const }
+    })
+    const validateArguments = vi.fn(() => true)
+    const guards = createCanonicalRootToolGuards({
+      interactiveDiscoveryMode: false, selectedJobMode: true, routeTool: routeTool as never, validateArguments,
+    })
+    const request = { call: { id: "call-selected-job-replace", toolName: "agent.followup", toolVersion: "1", input } } as never
+
+    await expect(guards.executeTool(request)).resolves.toMatchObject({
+      status: "failed", errorCode: "selected_job_root_tool_disabled",
+    })
+    expect(guards.validateToolArguments("agent.followup", input)).toBe("selected_job_root_tool_disabled")
+    expect(routeTool).not.toHaveBeenCalled()
+    expect(validateArguments).not.toHaveBeenCalled()
+    expect(appendNativeCoordination).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
   })
 
   it("fails closed on missing native support and preserves session pause through the executor boundary", async () => {
@@ -465,6 +677,39 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toHaveLength(0)
   })
 
+  it("rejects generic legacy follow-up from an Application Filler task", async () => {
+    const runtime = makeRuntime()
+    const source = makeTask({
+      id: "application-filler", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/fill", depth: 1,
+      role: "application_filler", taskType: "application_fill_for_review", status: "completed",
+    })
+    runtime.store.tasks.set(source.id, source)
+
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      taskId: source.id, idempotencyKey: "generic-filler-followup", goal: "Continue filling",
+    }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("checks objective coverage before looking up a legacy follow-up source", async () => {
+    const runtime = makeRuntime()
+    const lookup = vi.spyOn(runtime.store, "getTask")
+
+    let thrown: unknown
+    try { executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" }), {
+      taskId: "missing", idempotencyKey: "followup-without-plan", goal: "Continue",
+    }, {
+      ...runtime.options,
+      verificationRequirements: { status: "valid", requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 2 }] },
+    }) } catch (error: unknown) { thrown = error }
+
+    expect(thrown).toMatchObject({ code: "coordination_objective_requirements_require_plan" })
+    expect(lookup).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
   it("rejects foreign sources and a missing, terminal, or cross-turn runtime parent", async () => {
     const runtime = makeRuntime()
     const source = makeTask({ id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source", depth: 1, status: "completed" })
@@ -571,12 +816,38 @@ describe("coordination executors", () => {
 
     const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-ready", taskIds: [child.id, large.id], mode: "any", timeoutMs: 5000 }, runtime.options)
     expect(result.tasks).toEqual([
-      { taskId: "child", status: "completed", role: "scout", result: { apiKey: "[REDACTED]", summary: "ready" }, failureReason: null },
-      { taskId: "large", status: "failed", role: "scout", result: expect.objectContaining({ $truncated: true }), failureReason: expect.any(String) },
+      { taskId: "child", status: "completed", role: "scout", attemptCount: 1, maxAttempts: 1, leaseExpiresAt: null, interruptRequestedAt: null, result: { apiKey: "[REDACTED]", summary: "ready" }, failureReason: null },
+      { taskId: "large", status: "failed", role: "scout", attemptCount: 1, maxAttempts: 1, leaseExpiresAt: null, interruptRequestedAt: null, result: expect.objectContaining({ $truncated: true }), failureReason: expect.any(String) },
     ])
     expect(result.tasks[0]).not.toHaveProperty("userId")
     expect(Buffer.byteLength(result.tasks[1]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
     expect(runtime.store.activities).toContain("wait_subagents")
+  })
+
+  it("refreshes timed-out targets and returns their current safe execution state", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "retrying-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/retrying-child", depth: 1,
+      role: "scout", status: "running", attemptCount: 1, maxAttempts: 4,
+      leaseExpiresAt: new Date("2026-10-12T10:10:00.000Z"), interruptRequestedAt: null })
+    runtime.store.tasks.set(child.id, child)
+    runtime.wait.wait = vi.fn(async () => {
+      runtime.store.tasks.set(child.id, makeTask({ ...child, status: "retrying", attemptCount: 2,
+        leaseExpiresAt: new Date("2026-10-12T10:15:30.000Z"),
+        interruptRequestedAt: new Date("2026-10-12T10:12:00.000Z") }))
+      return { waitId: "wait-timeout", status: "timed_out" as const, deadlineAt: "2026-10-12T10:15:00.000Z", matchedTaskIds: [] }
+    })
+
+    const output = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-timeout", taskIds: [child.id], mode: "all", timeoutMs: 1000,
+    }, runtime.options)
+
+    expect(output.status).toBe("timed_out")
+    expect(output.tasks).toEqual([{
+      taskId: child.id, status: "retrying", role: "scout", attemptCount: 2, maxAttempts: 4,
+      leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: "2026-10-12T10:12:00.000Z",
+      result: null, failureReason: null,
+    }])
+    expect(JSON.stringify(output)).not.toContain("leaseOwner")
   })
 
   it("projects the same verifier feedback for agent.list and immediate agent.wait", async () => {
@@ -645,7 +916,7 @@ describe("coordination executors", () => {
     } satisfies DurableWaitPort
 
     const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-pending", taskIds: [child.id], mode: "all", timeoutMs: 5000 }, { ...runtime.options, wait: pendingWait })
-    expect(result.tasks).toEqual([{ taskId: "child", status: "queued", role: "scout", result: { apiKey: "[REDACTED]", summary: "pending" }, failureReason: expect.any(String) }])
+    expect(result.tasks).toEqual([{ taskId: "child", status: "queued", role: "scout", attemptCount: 1, maxAttempts: 1, leaseExpiresAt: null, interruptRequestedAt: null, result: { apiKey: "[REDACTED]", summary: "pending" }, failureReason: expect.any(String) }])
     expect(result.tasks[0]).not.toHaveProperty("sessionId")
     expect(Buffer.byteLength(result.tasks[0]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
   })

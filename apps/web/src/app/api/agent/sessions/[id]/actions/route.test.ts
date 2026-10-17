@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { hashApprovalNonce } from "@jobcopilot/agent-protocol"
+import { POST } from "./route"
 
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(),
@@ -14,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   queryRaw: vi.fn(),
   resolveLegacyApproval: vi.fn(),
   validateLegacyReceipt: vi.fn(),
+  validatePendingApprovalReceipt: vi.fn(),
   consumeLegacyReceipt: vi.fn(),
   issueLegacyReceipt: vi.fn(),
   clientReceipt: vi.fn(),
@@ -26,8 +29,11 @@ const mocks = vi.hoisted(() => ({
   jobFindFirst: vi.fn(),
   jobUpdate: vi.fn(),
   applicationTaskUpdateMany: vi.fn(),
+  applicationTaskFindFirst: vi.fn(),
   applicationTaskEventCreate: vi.fn(),
   queueApplicationFill: vi.fn(),
+  confirmSubmissionNotReceived: vi.fn(),
+  applicationFillTaskGraphEnabled: vi.fn(),
   queueAutonomousApplication: vi.fn(),
   tailorResumeForAgent: vi.fn(),
   loadUserAiConfig: vi.fn(),
@@ -57,7 +63,7 @@ vi.mock("@/lib/db", () => ({
     agentTranscriptEvent: { create: mocks.transcriptCreate },
     resume: { findFirst: mocks.resumeFindFirst },
     job: { findFirst: mocks.jobFindFirst, update: mocks.jobUpdate },
-    applicationTask: { updateMany: mocks.applicationTaskUpdateMany },
+    applicationTask: { findFirst: mocks.applicationTaskFindFirst, updateMany: mocks.applicationTaskUpdateMany },
     applicationTaskEvent: { create: mocks.applicationTaskEventCreate },
   },
 }))
@@ -66,8 +72,18 @@ vi.mock("@/lib/model-router", () => ({ loadUserAiConfig: mocks.loadUserAiConfig 
 vi.mock("@/lib/entitlements", () => ({ isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }))
 vi.mock("@/lib/agent/resume-tailoring", () => ({ tailorResumeForAgent: mocks.tailorResumeForAgent }))
 vi.mock("@/lib/auto-apply", () => ({
+  applicationFillTaskGraphEnabled: mocks.applicationFillTaskGraphEnabled,
   queueApplicationFill: mocks.queueApplicationFill,
   queueAutonomousApplication: mocks.queueAutonomousApplication,
+}))
+vi.mock("@/lib/auto-apply-guards", () => ({
+  assertActiveAccount: vi.fn(),
+  assertUnattendedApplyEnabled: vi.fn(),
+  validateAutoApplyUrl: (url: string) => url,
+  assertJobPreflight: vi.fn(),
+}))
+vi.mock("@/lib/agent/control-plane/commands/application-submission-recovery-command", () => ({
+  confirmSubmissionNotReceived: mocks.confirmSubmissionNotReceived,
 }))
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }))
 vi.mock("@/lib/agent/approval/legacy-receipt", () => ({
@@ -76,6 +92,9 @@ vi.mock("@/lib/agent/approval/legacy-receipt", () => ({
   issueLegacyReceipt: mocks.issueLegacyReceipt,
   resolveLegacyApproval: mocks.resolveLegacyApproval,
   validateLegacyReceipt: mocks.validateLegacyReceipt,
+}))
+vi.mock("@/lib/agent/approval/store", () => ({
+  validatePendingApprovalReceipt: mocks.validatePendingApprovalReceipt,
 }))
 vi.mock("@/lib/agent/session/v2-turn", () => ({ ensureV2Turn: mocks.ensureV2Turn }))
 vi.mock("@/lib/agent/policy/legacy", () => ({ requireLegacyPolicy: vi.fn() }))
@@ -123,12 +142,15 @@ function canonicalResolution(decision: "approved" | "rejected", disposition: "re
 }
 
 const ctx = { params: Promise.resolve({ id: "session_1" }) }
+
+async function callPost(request: unknown, context: unknown) {
+  return POST(request as never, context as never)
+}
 let turnStatus = "waiting_for_approval"
 let applicationTaskStatus = "waiting_for_authorization"
 
 describe("agent session actions API", () => {
   beforeEach(() => {
-    vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.sessionFindFirst.mockReset()
     mocks.sessionUpdate.mockReset()
@@ -142,6 +164,7 @@ describe("agent session actions API", () => {
     mocks.queryRaw.mockReset()
     mocks.resolveLegacyApproval.mockReset()
     mocks.validateLegacyReceipt.mockReset()
+    mocks.validatePendingApprovalReceipt.mockReset().mockResolvedValue({})
     mocks.consumeLegacyReceipt.mockReset()
     mocks.issueLegacyReceipt.mockReset()
     mocks.clientReceipt.mockReset()
@@ -154,8 +177,11 @@ describe("agent session actions API", () => {
     mocks.jobFindFirst.mockReset()
     mocks.jobUpdate.mockReset()
     mocks.applicationTaskUpdateMany.mockReset()
+    mocks.applicationTaskFindFirst.mockReset().mockResolvedValue(null)
     mocks.applicationTaskEventCreate.mockReset()
     mocks.queueApplicationFill.mockReset()
+    mocks.confirmSubmissionNotReceived.mockReset()
+    mocks.applicationFillTaskGraphEnabled.mockReset().mockReturnValue(false)
     mocks.queueAutonomousApplication.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
@@ -216,6 +242,42 @@ describe("agent session actions API", () => {
     })
   })
 
+  it("returns the bound Turn for a replayed approval response after the approval is consumed", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.approvalFindFirst.mockReset()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(approvalRecord({ type: "review_application", payload: { applicationTaskId: "task_1", jobId: "job_1" } }))
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ fillTurnId: "turn_fill_1" })
+
+    const post = callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+    const res = await post
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ turnId: "turn_fill_1", taskId: "turn_fill_1", duplicate: true })
+    expect(mocks.resolveLegacyApproval).not.toHaveBeenCalled()
+    expect(mocks.queueApplicationFill).not.toHaveBeenCalled()
+  })
+
+  it("allows only an authenticated, scoped explicit fill retry with a stable request ID", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ id: "task_1", jobId: "job_1" })
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.lever.co/acme/123" })
+    mocks.queueApplicationFill.mockResolvedValueOnce({ taskId: "turn_fill_2", turnId: "turn_fill_2", disposition: "started" })
+
+    const res = await callPost(postRequest({
+      type: "retry_application_fill", applicationTaskId: "task_1", requestId: "retry_req_12345678",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ turnId: "turn_fill_2", retried: true })
+    expect(mocks.queueApplicationFill).toHaveBeenCalledWith(expect.objectContaining({
+      userId: "user_1", jobId: "job_1", applicationTaskId: "task_1", sessionId: "session_1", retry: true, retryId: "retry_req_12345678",
+    }))
+  })
+
   it("creates an automation from a transcript draft action", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
       id: "automation_approval",
@@ -238,9 +300,8 @@ describe("agent session actions API", () => {
       durationMs: null,
       createdAt: new Date("2026-06-18T10:05:00Z"),
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "create_automation",
       approvalId: "automation_approval",
       receiptNonce: "nonce_1",
@@ -340,9 +401,8 @@ describe("agent session actions API", () => {
       durationMs: null,
       createdAt: new Date("2026-06-18T10:06:00Z"),
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "create_automation",
       approvalId: "automation_approval",
       receiptNonce: "nonce_1",
@@ -391,9 +451,8 @@ describe("agent session actions API", () => {
   })
 
   it("records an approval response and updates the approval when approvalId is provided", async () => {
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision: "approved",
@@ -450,9 +509,8 @@ describe("agent session actions API", () => {
     ["rejected", "rejected"],
   ] as const)("returns a 202 canonical %s disposition without legacy side effects", async (decision, expectedDisposition) => {
     mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution(decision))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision,
@@ -471,6 +529,188 @@ describe("agent session actions API", () => {
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
   })
 
+  it("queues an approved canonical submission after validating its scoped receipt", async () => {
+    const payload = { applicationTaskId: "task_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null }
+    const expiresAt = new Date("2026-06-18T10:15:00.000Z")
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: "submit_application", payload, expiresAt }))
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.example/apply" })
+    mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
+      await options?.beforeResolve?.()
+      return canonicalResolution("approved")
+    })
+    mocks.transcriptCreate.mockResolvedValueOnce({
+      id: "event_queued", sessionId: "session_1", taskId: null, type: "application_queued", speaker: "Executor",
+      title: "Submission queued", body: "Your approved application was queued for background execution.",
+      data: { taskId: "submit_task_1", jobId: "job_1" }, durationMs: null,
+      createdAt: new Date("2026-06-18T10:01:00.000Z"),
+    })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      event: { id: "event_queued", type: "application_queued", title: "Submission queued" },
+    })
+    expect(mocks.validatePendingApprovalReceipt).toHaveBeenCalledWith(expect.anything(), "approval_1", expect.objectContaining({
+      userId: "user_1", sessionId: "session_1", turnId: "turn_1", toolCallId: "call_1",
+      jobId: "job_1", action: "submit_application", nonce: "nonce_1", revision: 0, expiresAt,
+      resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64),
+    }))
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledTimes(1)
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledWith({
+      userId: "user_1", jobId: "job_1", applyUrl: "https://jobs.example/apply", applicationTaskId: "task_1",
+      approvalId: "approval_1", receiptNonce: "nonce_1", sessionId: "session_1",
+    })
+    expect(mocks.transcriptCreate).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ type: "application_queued", title: "Submission queued" }),
+    }))
+    expect(mocks.sessionUpdate).toHaveBeenCalledWith({ where: { id: "session_1" }, data: { status: "running", completedAt: null } })
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+  })
+
+  it("returns the persisted intent after its approval was consumed without replaying approval side effects", async () => {
+    const payload = { applicationTaskId: "task_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null }
+    const nonceHash = await hashApprovalNonce("nonce_1")
+    mocks.approvalFindFirst.mockReset()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(approvalRecord({ type: "submit_application", status: "consumed", payload, nonceHash }))
+    mocks.queueAutonomousApplication.mockResolvedValueOnce({ taskId: "apply-submit-original" })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({ queued: true, taskId: "apply-submit-original", duplicate: true })
+    expect(mocks.approvalFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: { id: "approval_1", sessionId: "session_1", userId: "user_1", status: { in: ["approved", "consumed"] }, type: "submit_application" },
+    }))
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledTimes(1)
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledWith({
+      userId: "user_1", jobId: "job_1", applyUrl: null, applicationTaskId: "task_1",
+      approvalId: "approval_1", receiptNonce: "nonce_1", sessionId: "session_1", replayOnly: true,
+    })
+    expect(mocks.resolveLegacyApproval).not.toHaveBeenCalled()
+    expect(mocks.validatePendingApprovalReceipt).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.approvalUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskEventCreate).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).not.toHaveBeenCalled()
+  })
+
+  it("does not replay a committed intent when the retry receipt nonce differs", async () => {
+    mocks.approvalFindFirst.mockReset()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(approvalRecord({ type: "submit_application", nonceHash: "0".repeat(64) }))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(409)
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+    expect(mocks.resolveLegacyApproval).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it.each(["transcript", "session"] as const)("reports queued success when the %s projection fails after queue resolution", async (failedProjection) => {
+    const payload = { applicationTaskId: "task_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null }
+    const queuedEvent = {
+      id: "event_queued", sessionId: "session_1", taskId: null, type: "application_queued", speaker: "Executor",
+      title: "Submission queued", body: "Your approved application was queued for background execution.",
+      data: { taskId: "submit_task_1", jobId: "job_1" }, durationMs: null,
+      createdAt: new Date("2026-06-18T10:01:00.000Z"),
+    }
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: "submit_application", payload }))
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.example/apply" })
+    mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
+      await options?.beforeResolve?.()
+      return canonicalResolution("approved")
+    })
+    if (failedProjection === "transcript") {
+      mocks.transcriptCreate.mockRejectedValueOnce(new Error("transcript store unavailable"))
+    } else {
+      mocks.transcriptCreate.mockResolvedValueOnce(queuedEvent)
+      mocks.sessionUpdate.mockRejectedValueOnce(new Error("session store unavailable"))
+    }
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      queued: true,
+      taskId: "submit_task_1",
+      projectionPending: true,
+      event: failedProjection === "transcript" ? null : { id: "event_queued", type: "application_queued" },
+    })
+    expect(mocks.queueAutonomousApplication).toHaveBeenCalledTimes(1)
+    expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ checkpoint: "queue_retry" }),
+    }))
+    if (failedProjection === "transcript") expect(mocks.sessionUpdate).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { decision: "rejected", status: "waiting_for_user", checkpoint: "review_requested", cancelled: false, eventType: "submission_rejected" },
+    { decision: "cancelled", status: "cancelled", checkpoint: "submission_cancelled", cancelled: true, eventType: "submission_cancelled" },
+  ] as const)("projects a canonical submission $decision onto its exact fill task", async ({ decision, status, checkpoint, cancelled, eventType }) => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("rejected"))
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 1 })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision,
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    await expect(res.json()).resolves.toEqual({ disposition: "rejected", duplicate: false })
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1",
+        fillTurnId: "turn_1", fillTurnSessionId: "session_1", fillTurnUserId: "user_1",
+        status: "waiting_for_authorization", checkpoint: "form_filled",
+      },
+      data: {
+        status, checkpoint, completedAt: cancelled ? expect.any(Date) : null,
+      },
+    })
+    expect(mocks.applicationTaskEventCreate).toHaveBeenCalledTimes(1)
+    expect(mocks.applicationTaskEventCreate).toHaveBeenCalledWith({
+      data: {
+        taskId: "task_1", type: eventType, actor: "user",
+        body: decision === "cancelled" ? "Cancelled the requested action." : "Rejected the requested action.",
+      },
+    })
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("does not append a canonical submission decision event when the exact fill task no longer matches", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("rejected"))
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "rejected",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    expect(mocks.applicationTaskEventCreate).not.toHaveBeenCalled()
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+  })
+
   it("does not reopen a submission task when Stop cancels it during queue continuation", async () => {
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
       type: "submit_application",
@@ -482,9 +722,8 @@ describe("agent session actions API", () => {
       applicationTaskStatus = "cancelled"
       throw new Error("This application is no longer ready for the approved submission step.")
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision: "approved",
@@ -506,9 +745,8 @@ describe("agent session actions API", () => {
 
   it("returns a duplicate canonical disposition without replaying the action", async () => {
     mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved", "duplicate"))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
     }) as never, ctx)
 
@@ -520,11 +758,28 @@ describe("agent session actions API", () => {
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
+  it("does not queue a duplicate canonical submission", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved", "duplicate"))
+
+    const res = await callPost(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    await expect(res.json()).resolves.toEqual({ disposition: "approved", duplicate: true })
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+    expect(mocks.jobFindFirst).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
   it("fails closed when another approval wait is active in the same Turn", async () => {
     mocks.resolveLegacyApproval.mockRejectedValueOnce(Object.assign(new Error("Another approval wait is already active for this Turn"), { code: "approval_wait_active" }))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
     }) as never, ctx)
 
@@ -562,9 +817,8 @@ describe("agent session actions API", () => {
       turnStatus = "interrupted"
       return { disposition: "legacy_only", decision: "approved" }
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest(action) as never, ctx)
+    const res = await callPost(postRequest(action) as never, ctx)
 
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toEqual({ error: "Approval turn is no longer active" })
@@ -581,31 +835,34 @@ describe("agent session actions API", () => {
   })
 
   it("stops before canonical delegation when the scoped receipt is invalid", async () => {
-    mocks.validateLegacyReceipt.mockRejectedValueOnce(new Error("Approval nonce does not match"))
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.validatePendingApprovalReceipt.mockRejectedValueOnce(new Error("Approval nonce does not match"))
     mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
       await options?.beforeResolve?.()
       return canonicalResolution("approved")
     })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "bad_nonce",
     }) as never, ctx)
 
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toEqual({ error: "Approval nonce does not match" })
     expect(mocks.resolveLegacyApproval).toHaveBeenCalledTimes(1)
-    expect(mocks.validateLegacyReceipt).toHaveBeenCalledTimes(1)
+    expect(mocks.validatePendingApprovalReceipt).toHaveBeenCalledTimes(1)
     expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
   it("rejects stale approval responses without writing transcript events", async () => {
     mocks.resolveLegacyApproval.mockRejectedValueOnce(new Error("Approval is no longer pending"))
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response",
       approvalId: "approval_1",
       decision: "approved",
@@ -624,9 +881,8 @@ describe("agent session actions API", () => {
       payload: { applicationTaskId: "task_1", jobId: "job_1" },
     }))
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({
+    const res = await callPost(postRequest({
       type: "approval_response", approvalId: "approval_1", decision: "rejected", body: "Declined review",
     }) as never, ctx)
 
@@ -652,9 +908,8 @@ describe("agent session actions API", () => {
       payload: { applicationTaskId: "task_1", jobId: "job_1" },
     }))
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({ type: "approval_response", approvalId: "approval_1", decision }) as never, ctx)
+    const res = await callPost(postRequest({ type: "approval_response", approvalId: "approval_1", decision }) as never, ctx)
 
     expect(res.status).toBe(200)
     const update = mocks.applicationTaskUpdateMany.mock.calls[0]?.[0]
@@ -670,9 +925,8 @@ describe("agent session actions API", () => {
     mocks.transcriptCreate
       .mockResolvedValueOnce({ id: 'event_tailored', sessionId: 'session_1', taskId: null, type: 'resume_tailored', speaker: 'Writer', title: 'Tailored resume ready', body: 'Ready', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:01:00Z') })
       .mockResolvedValueOnce({ id: 'event_review', sessionId: 'session_1', taskId: null, type: 'approval_request', speaker: 'Reviewer', title: 'Final resume review', body: 'Review it', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:02:00Z') })
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ events: [{ type: 'resume_tailored' }, { type: 'approval_request' }] })
@@ -685,9 +939,8 @@ describe("agent session actions API", () => {
     mocks.resolveAiAccess.mockResolvedValueOnce('disabled')
     mocks.tailorResumeForAgent.mockClear()
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } }))
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(403)
     expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
@@ -697,9 +950,8 @@ describe("agent session actions API", () => {
     mocks.isFeatureAllowed.mockResolvedValueOnce(false)
     mocks.tailorResumeForAgent.mockClear()
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } }))
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(403)
     expect(mocks.resolveAiAccess).not.toHaveBeenCalled()
@@ -711,9 +963,8 @@ describe("agent session actions API", () => {
     mocks.resolveAiAccess.mockResolvedValueOnce('exhausted')
     mocks.tailorResumeForAgent.mockClear()
     mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({ type: 'tailor_resume', payload: { resumeId: 'resume_1', jobId: 'job_1' } }))
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_writer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(429)
     expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
@@ -725,9 +976,8 @@ describe("agent session actions API", () => {
     mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', company: 'N26', role: 'Backend Engineer', url: 'https://jobs.example/apply', status: 'saved' })
     mocks.jobUpdate.mockResolvedValue({})
     mocks.transcriptCreate.mockResolvedValueOnce({ id: 'event_ready', sessionId: 'session_1', taskId: null, type: 'resume_finalized', speaker: 'Reviewer', title: 'Application pack ready', body: 'Ready', data: {}, durationMs: null, createdAt: new Date('2026-06-18T10:03:00Z') })
-    const { POST } = await import('./route')
 
-    const res = await POST(postRequest({ type: 'approval_response', approvalId: 'approval_reviewer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
+    const res = await callPost(postRequest({ type: 'approval_response', approvalId: 'approval_reviewer', decision: 'approved', receiptNonce: 'nonce_1' }) as never, ctx)
 
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ event: { type: 'resume_finalized', title: 'Application pack ready' } })
@@ -738,19 +988,36 @@ describe("agent session actions API", () => {
   })
 
   it("rejects unsupported action types", async () => {
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({ type: "unknown" }) as never, ctx)
+    const res = await callPost(postRequest({ type: "unknown" }) as never, ctx)
 
     expect(res.status).toBe(400)
     await expect(res.json()).resolves.toEqual({ error: "Unsupported action type" })
   })
 
+  it("routes an explicit uncertain-submission attestation to the safe recovery command", async () => {
+    mocks.applicationFillTaskGraphEnabled.mockReturnValue(true)
+    mocks.applicationTaskFindFirst.mockResolvedValueOnce({ id: "application_1", jobId: "job_1" })
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.lever.co/acme/123" })
+    mocks.confirmSubmissionNotReceived.mockResolvedValueOnce({ inputId: "input_1", turnId: "turn_new", sequence: "10", disposition: "started" })
+
+    const res = await callPost(postRequest({
+      type: "confirm_submission_not_received", applicationTaskId: "application_1", requestId: "confirm_12345678", confirmedNotReceived: true,
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ turnId: "turn_new", disposition: "started", recovered: true })
+    expect(mocks.confirmSubmissionNotReceived).toHaveBeenCalledWith(expect.anything(), {
+      type: "confirm_submission_not_received", applicationTaskId: "application_1", requestId: "confirm_12345678",
+      confirmedNotReceived: true, sessionId: "session_1", userId: "user_1",
+    })
+    expect(mocks.queueAutonomousApplication).not.toHaveBeenCalled()
+  })
+
   it("returns 404 when the session is not owned by the user", async () => {
     mocks.sessionFindFirst.mockResolvedValueOnce(null)
-    const { POST } = await import("./route")
 
-    const res = await POST(postRequest({ type: "approval_response", decision: "rejected" }) as never, ctx)
+    const res = await callPost(postRequest({ type: "approval_response", decision: "rejected" }) as never, ctx)
 
     expect(res.status).toBe(404)
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()

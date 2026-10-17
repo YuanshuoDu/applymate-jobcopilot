@@ -31,30 +31,41 @@ function event(overrides: Partial<TimelineEvent> = {}, eventScope = scope): Time
 }
 
 describe('timeline cognitive agenda reducer', () => {
-  it('folds replay and live receipts by increasing event sequence', () => {
+  it('retains revision checkpoints across replay and live updates, ignoring stale revisions', () => {
+    const events = [
+      event({ id: 'agenda-1', sequence: '1', payload: { ...receipt(), goalRevision: 2, planRevision: 4 } }),
+      event({ id: 'agenda-2', sequence: '2', payload: { ...receipt(), goalRevision: 3, planRevision: 5 } }),
+    ]
     let state = createCognitiveAgendaState(scope.sessionId)
-    state = reduceCognitiveAgenda(state, event({ id: 'agenda-1', sequence: '1' }))
-    state = reduceCognitiveAgenda(state, event({ id: 'agenda-2', sequence: '2', payload: receipt('continue_turn') }))
+    for (const entry of events) state = reduceCognitiveAgenda(state, entry)
 
     expect(state.latest?.nextAction).toBe('continue_turn')
+    expect(state.latest).toMatchObject({ goalRevision: 3, planRevision: 5 })
     expect(state.sequence).toBe('2')
     expect(state.eventId).toBe('agenda-2')
     expect(state.scoped).toHaveLength(1)
     expect(state.scoped[0].latest.nextAction).toBe('continue_turn')
-    expect(reduceCognitiveAgenda(state, event({ id: 'agenda-old', sequence: '1', payload: receipt('replan') }))).toBe(state)
+    expect(state.scoped[0].latest).toMatchObject({ goalRevision: 3, planRevision: 5 })
+
+    const replayed = events.reduce(reduceCognitiveAgenda, createCognitiveAgendaState(scope.sessionId))
+    expect(replayed).toEqual(state)
+    expect(reduceCognitiveAgenda(state, event({ id: 'agenda-old', sequence: '1', payload: { ...receipt(), goalRevision: 1, planRevision: 2 } }))).toBe(state)
+    expect(state.latest).toMatchObject({ goalRevision: 3, planRevision: 5 })
   })
 
   it('keeps root and child task scopes independent even when sequences arrive out of order', () => {
     const childScope = { ...scope, taskId: 'task-child' }
     let state = createCognitiveAgendaState(scope.sessionId)
-    state = reduceCognitiveAgenda(state, event({ id: 'root-10', sequence: '10' }))
-    state = reduceCognitiveAgenda(state, event({ id: 'child-4', sequence: '4', payload: receipt('await_children', childScope) }, childScope))
-    state = reduceCognitiveAgenda(state, event({ id: 'root-old', sequence: '9', payload: receipt('replan') }))
+    state = reduceCognitiveAgenda(state, event({ id: 'root-10', sequence: '10', payload: { ...receipt(), goalRevision: 5, planRevision: 10 } }))
+    state = reduceCognitiveAgenda(state, event({ id: 'child-4', sequence: '4', payload: { ...receipt('await_children', childScope), planRevision: 0 } }, childScope))
+    state = reduceCognitiveAgenda(state, event({ id: 'root-old', sequence: '9', payload: { ...receipt(), goalRevision: 4, planRevision: 9 } }))
 
     expect(state.latest?.taskId).toBe(scope.taskId)
     expect(state.scoped.map(entry => entry.taskId)).toEqual([scope.taskId, childScope.taskId])
     expect(state.scoped.find(entry => entry.taskId === childScope.taskId)?.latest.nextAction).toBe('await_children')
-    expect(reduceCognitiveAgenda(state, event({ id: 'child-old', sequence: '3', payload: receipt('replan', childScope) }, childScope))).toBe(state)
+    expect(state.scoped.find(entry => entry.taskId === scope.taskId)?.latest).toMatchObject({ goalRevision: 5, planRevision: 10 })
+    expect(state.scoped.find(entry => entry.taskId === childScope.taskId)?.latest).toMatchObject({ goalRevision: null, planRevision: 0 })
+    expect(reduceCognitiveAgenda(state, event({ id: 'child-old', sequence: '3', payload: { ...receipt('continue_turn', childScope), planRevision: 1 } }, childScope))).toBe(state)
   })
 
   it('is idempotent for duplicate delivery and ignores malformed or foreign events', () => {
@@ -65,5 +76,8 @@ describe('timeline cognitive agenda reducer', () => {
     expect(reduceCognitiveAgenda(state, event({ id: 'foreign', sequence: '2', sessionId: 'other-session' }))).toBe(state)
     expect(reduceCognitiveAgenda(state, event({ id: 'item-bound', sequence: '2', itemId: 'item-1' }))).toBe(state)
     expect(reduceCognitiveAgenda(state, event({ id: 'foreign-actor', sequence: '2', actor: 'system' }))).toBe(state)
+    expect(reduceCognitiveAgenda(state, event({
+      id: 'foreign-turn', sequence: '2', turnId: 'turn-2', payload: { ...receipt(), goalRevision: 9, planRevision: 9 },
+    }))).toBe(state)
   })
 })

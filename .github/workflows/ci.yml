@@ -1,7 +1,7 @@
 name: CI
 on:
   pull_request:
-    branches: [master]
+    branches: [master, 'feat/**', 'fix/**', 'refactor/**', 'chore/**', 'codex/**']
   push:
     branches: [master]
 concurrency:
@@ -87,6 +87,40 @@ jobs:
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify submit outbox retry and duplicate-delivery fencing
+        run: >-
+          pnpm --filter @jobcopilot/worker exec vitest run
+          src/queue/application-submit-outbox.test.ts
+          src/queue/application-submit-outbox-terminal-recovery.test.ts
+          src/queue/apply-queue-pipeline.test.ts
+      - name: Verify application submit recovery commit orders on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/queue/apply-queue-submit-recovery-pg.integration.test.ts
+      - name: Verify application fill Stop and late Worker callbacks on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run src/lib/agent/control-plane/commands/application-fill-command.pg.integration.test.ts
       - name: Verify durable child task interruption on disposable PostgreSQL
         env:
           CI: "true"
@@ -124,7 +158,46 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test -n "$AGENT_RUNTIME_PG_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/pg-task-graph-command-port.integration.test.ts
-      - name: Verify native delegation, independent verification, and terminal proof on disposable PostgreSQL/Redis
+      - name: Verify selected-job history provenance on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/context/selected-job-history-pg.integration.test.ts
+      - name: Verify direct selected-job history on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/context/selected-job-history-direct-pg.integration.test.ts
+      - name: Verify ordinary Root task history on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/context/root-task-history-direct-pg.integration.test.ts
+      - name: Verify native delegation, independent proof, and durable questions/planning clarifications on disposable PostgreSQL/Redis
         env:
           CI: "true"
           AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
@@ -146,7 +219,38 @@ jobs:
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
             src/runtime/subagents/task-graph-native-pg.integration.test.ts \
             src/runtime/subagents/native-verification-pg.integration.test.ts \
-            src/runtime/subagents/native-brain-pg.integration.test.ts
+            src/runtime/subagents/native-verification-history-pg.integration.test.ts \
+            src/runtime/subagents/native-brain-pg.integration.test.ts \
+            src/runtime/turns/turn-question-store-pg.integration.test.ts \
+            src/runtime/turns/turn-question-planning-pg.integration.test.ts
+      - name: Verify native steering proof and reconciliation on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/subagents/native-steering-proof-pg.integration.test.ts \
+            src/runtime/subagents/steering-reconciliation-pg.integration.test.ts \
+            src/runtime/subagents/root-task-store-pg.integration.test.ts
+      - name: Verify native semantic rejection memory on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run \
+            src/runtime/subagents/native-semantic-memory-pg.integration.test.ts
       - name: Verify interactive discovery Stop recovery without subagent execution
         env:
           CI: "true"
@@ -180,6 +284,20 @@ jobs:
           AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
           AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-redis.integration.test.ts
+      - name: Verify apply queue recovery lock and cancellation on disposable Redis/BullMQ
+        env:
+          CI: "true"
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          REDIS_URL: redis://127.0.0.1:6379/15
+        run: |
+          test "$CI" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/lib/apply-queue-client.redis.integration.test.ts
       - name: Verify production subagent dispatch and durable parent wake on disposable Redis/BullMQ
         env:
           RUN_AGENT_TURN_REDIS_INTEGRATION: "1"

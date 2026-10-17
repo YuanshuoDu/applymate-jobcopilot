@@ -1,4 +1,5 @@
 import {
+  isNativeVerificationUserSelfAttestationReference,
   NATIVE_VERIFICATION_REPORT_SCHEMA,
   type NativeVerificationDisposition,
   type NativeVerificationReasonCode,
@@ -95,11 +96,15 @@ function feedback(reportValue: unknown): NativeVerificationFeedback | null {
     if (!item || item.criterionId !== `criterion-${index + 1}` || !isDisposition(item.disposition) || !isReason(item.reasonCode)
       || !denseArray(item.evidenceReferenceIds, 8, 0)) return null
     const references: string[] = []
+    const seenReferences = new Set<string>()
+    let citedReferences = 0
     for (const reference of item.evidenceReferenceIds) {
-      if (!isId(reference) || references.includes(reference)) return null
-      references.push(reference)
+      if (!isId(reference) || seenReferences.has(reference)) return null
+      seenReferences.add(reference)
+      citedReferences += 1
+      if (!isNativeVerificationUserSelfAttestationReference(reference)) references.push(reference)
     }
-    if (item.disposition === "passed" && (item.reasonCode !== "meets_criterion" || references.length === 0)) return null
+    if (item.disposition === "passed" && (item.reasonCode !== "meets_criterion" || citedReferences === 0)) return null
     if (item.disposition === "failed" && !["does_not_meet_criterion", "evidence_conflict", "unsupported_claim"].includes(item.reasonCode)) return null
     if (item.disposition === "uncertain" && !["evidence_missing", "evidence_conflict", "ambiguous", "unsupported_claim"].includes(item.reasonCode)) return null
     criteria.push({ criterionId: item.criterionId, disposition: item.disposition, reasonCode: item.reasonCode, evidenceReferenceIds: references })
@@ -113,17 +118,19 @@ function feedback(reportValue: unknown): NativeVerificationFeedback | null {
 export function projectNativeVerificationResult(value: unknown): unknown {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value
   let reportDescriptor: PropertyDescriptor | undefined
-  try { reportDescriptor = Object.getOwnPropertyDescriptor(value, REPORT_KEY) } catch { return null }
-  if (!reportDescriptor) return value
+  try {
+    reportDescriptor = Object.getOwnPropertyDescriptor(value, REPORT_KEY)
+    if (!reportDescriptor && !(REPORT_KEY in value) && !(FEEDBACK_KEY in value)) return value
+  } catch { return null }
 
-  const projected: Record<string, unknown> = {}
+  const projected = Object.create(null) as Record<string, unknown>
   try {
     for (const key of Reflect.ownKeys(value)) {
       if (typeof key !== "string" || key === REPORT_KEY || key === FEEDBACK_KEY) continue
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
       if (descriptor?.enumerable && "value" in descriptor) projected[key] = descriptor.value
     }
-    if (reportDescriptor.enumerable && "value" in reportDescriptor) {
+    if (reportDescriptor?.enumerable && "value" in reportDescriptor) {
       const safeFeedback = feedback(reportDescriptor.value)
       if (safeFeedback) projected[FEEDBACK_KEY] = safeFeedback
     }

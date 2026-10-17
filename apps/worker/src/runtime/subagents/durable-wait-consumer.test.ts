@@ -1,10 +1,13 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
 import type { TurnLease } from "../turns/lease.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./task-graph-command-port.js"
+
+const { loadGraph } = vi.hoisted(() => ({ loadGraph: vi.fn() }))
+vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: loadGraph }))
 
 const lease: TurnLease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -28,7 +31,7 @@ function fixture(input: { waitStatus?: string; mode?: "any" | "all"; matchedTask
   const outcome = { waitId: input.corruptConsumed ? "wait-other" : "wait-1", status: "ready", targetTaskIds: input.archivedTargetTaskIds ?? targetIds, matchedTaskIds: input.archivedMatchedTaskIds ?? matchedTaskIds, tasks: targetIds.map((taskId, index) => ({ taskId, status: input.archivedTargetStatuses?.[index] ?? input.targetStatuses?.[index] ?? "completed", ...(input.archivedTargetRole !== undefined ? { role: input.archivedTargetRole } : {}), result: null, failureReason: null, ...(input.storedReport ? { verificationReport: input.storedReport } : {}), ...(input.storedReceipt ? { repairReceipt: input.storedReceipt } : {}) })) }
   const result: Record<string, unknown> = input.consumed ? { request: { mode }, ...(input.missingConsumedOutcome ? {} : { outcome }) } : { request: { mode } }
   const wait: Record<string, unknown> = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: input.waitTargetTaskIds ?? targetIds, mode, status: input.waitStatus ?? "ready", matchedTaskIds: input.waitMatchedTaskIds ?? matchedTaskIds, result, suspendedAt: now, consumedAt: input.consumed ? now : null }
-  const state: { wait: Record<string, unknown>; consumedAt: Date | null; result: Record<string, unknown>; updates: number; sessionStatus: string; sessionSource: string } = { wait, consumedAt: input.consumed ? now : null, result, updates: 0, sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation" }
+  const state: { wait: Record<string, unknown>; consumedAt: Date | null; result: Record<string, unknown>; updates: number; sessionStatus: string; sessionSource: string; targetStatuses: string[] | null } = { wait, consumedAt: input.consumed ? now : null, result, updates: 0, sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation", targetStatuses: input.targetStatuses ? [...input.targetStatuses] : null }
   const calls: string[] = []
   const client = {
     query: async (sql: string, values: readonly unknown[] = []) => {
@@ -41,7 +44,7 @@ function fixture(input: { waitStatus?: string; mode?: "any" | "all"; matchedTask
         return { rows: [state.wait], rowCount: 1 }
       }
       if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: input.foreign ? [] : targetIds.map((id, index) => {
-        const status = input.targetStatuses?.[index] ?? input.targetStatus ?? "completed"
+        const status = state.targetStatuses?.[index] ?? input.targetStatus ?? "completed"
         const defaultResult = input.malformed ? (() => { const value: Record<string, unknown> = { bigint: BigInt(1) }; value.circular = value; return value })() : { safe: input.large ? "x".repeat(10_000) : true, secret: "hide-me" }
         return { id, rootTaskId: input.targetRootTaskId ?? "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: input.targetRole ?? "scout", status, result: input.targetResults?.[index] ?? defaultResult, failureReason: input.targetFailureReasons?.[index] ?? (status === "failed" ? "provider failed" : null) }
       }), rowCount: input.foreign ? 0 : targetIds.length }
@@ -75,7 +78,31 @@ function legacyWaitSnapshot(targetIds: readonly string[]) {
   })) }
 }
 
+const dependencyVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+  criteria: [{ id: "source-match", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } }],
+} as const
+const dependencyReport = {
+  verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+  criteria: [{ criterionId: "source-match", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+} as const
+const boundDependencyReport = { ...dependencyReport, dependencyBindings: [{ nodeKey: "scout", taskId: "scout-task", attemptCount: 1,
+  nodeDigest: "c".repeat(64), resultDigest: "d".repeat(64), evidenceDigest: "e".repeat(64), reportDigest: "f".repeat(64) }] }
+function dependencySnapshot() {
+  return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    { key: "scout", taskId: "scout-task", templateId: "scout", goal: "Search", successCriteria: ["Find"], dependsOn: [], depth: 1,
+      verification: scoutVerification, verificationDisposition: "typed" },
+    { key: "analyst", taskId: "child-1", templateId: "analyst", goal: "Assess", successCriteria: ["Score"], dependsOn: ["scout"], depth: 2,
+      verification: dependencyVerification, verificationDisposition: "typed" },
+  ] }
+}
+function dependencyLoadedGraph(snapshot: ReturnType<typeof dependencySnapshot>, result: unknown) {
+  return { rootTaskId: "root-1", item: { id: "task-graph:root-1", revision: 2, content: snapshot, createdAt: now }, snapshot, state: null,
+    tasks: new Map([["child-1", { id: "child-1", status: "completed", role: "analyst", failureReason: null, result }]]) }
+}
+
 describe("durable wait outcome consumer", () => {
+  beforeEach(() => loadGraph.mockReset())
   it("projects a ready all result and consumes it once", async () => {
     const fake = fixture()
     const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
@@ -128,6 +155,35 @@ describe("durable wait outcome consumer", () => {
     expect(fake.state.updates).toBe(0)
     const corrupt = fixture({ consumed: true, snapshot, targetStatuses: ["failed"], storedReport: { ...waitVerificationReport, criteria: [] } })
     await expect(consumeDurableWaitOutcomes({ client: corrupt.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+  })
+
+  it("revalidates live cross-node wait output and exposes only the public report", async () => {
+    const snapshot = dependencySnapshot(), result = { structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "ok" }, taskGraphVerificationReport: boundDependencyReport }
+    loadGraph.mockResolvedValue(dependencyLoadedGraph(snapshot, result))
+    const fake = fixture({ snapshot, targetStatus: "completed", targetRole: "analyst", targetResults: [result] })
+    const output = outputOf((await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]!.content)
+    expect(loadGraph).toHaveBeenCalledTimes(1)
+    expect(loadGraph.mock.calls[0]?.[2]).toBe(false)
+    expect(output.tasks[0]?.verificationReport).toEqual(dependencyReport)
+    expect(JSON.stringify(output)).not.toContain("dependencyBindings")
+  })
+
+  it("rejects a stale archived cross-node report even when the current source binding revalidates", async () => {
+    const snapshot = dependencySnapshot(), currentReport = { ...boundDependencyReport, evidenceDigest: "9".repeat(64) }
+    const result = { taskGraphVerificationReport: currentReport }
+    loadGraph.mockResolvedValue(dependencyLoadedGraph(snapshot, result))
+    const fake = fixture({ consumed: true, snapshot, targetStatus: "completed", targetRole: "analyst", targetResults: [result], storedReport: dependencyReport })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+    expect(loadGraph).toHaveBeenCalledTimes(1)
+    expect(fake.state.updates).toBe(0)
+  })
+
+  it.each([false, true])("blocks %s cross-node wait output when fresh source binding validation fails", async consumed => {
+    loadGraph.mockResolvedValue({ rootTaskId: "root-1", item: null, snapshot: null, state: null, tasks: new Map() })
+    const snapshot = dependencySnapshot(), fake = fixture({ consumed, snapshot, targetStatus: "completed", targetRole: "analyst",
+      targetResults: [{ taskGraphVerificationReport: boundDependencyReport }], storedReport: dependencyReport })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_verification_report_invalid")
+    expect(fake.state.updates).toBe(0)
   })
 
   it("rejects a terminal typed task with a missing server report and keeps legacy snapshots compatible", async () => {
@@ -183,6 +239,37 @@ describe("durable wait outcome consumer", () => {
     const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
     expect(projections[0]?.content).toMatchObject({ output: { status: "timed_out", tasks: [{ status: "failed", failureReason: "provider failed" }] } })
     expect(JSON.stringify(projections)).not.toContain("hide-me")
+  })
+
+  it("persists and replays an interrupted wait without rewriting live child statuses", async () => {
+    const fake = fixture({ waitStatus: "interrupted", matchedTaskIds: [], targetCount: 2, targetStatuses: ["running", "queued"] })
+    const first = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    const firstOutput = outputOf(first!.content)
+    expect(firstOutput).toMatchObject({ status: "interrupted", matchedTaskIds: [], tasks: [
+      { taskId: "child-1", status: "running", result: null, failureReason: null },
+      { taskId: "child-2", status: "queued", result: null, failureReason: null },
+    ] })
+    fake.state.targetStatuses = ["completed", "failed"]
+    const replay = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    expect(outputOf(replay!.content)).toEqual(firstOutput)
+    expect(fake.state.targetStatuses).toEqual(["completed", "failed"])
+    expect(fake.state.wait.status).toBe("interrupted")
+    expect(fake.state.updates).toBe(1)
+  })
+
+  it("replays an interrupted all wait with a partial terminal match after another child finishes", async () => {
+    const fake = fixture({ waitStatus: "interrupted", mode: "all", matchedTaskIds: ["child-1"], targetCount: 2, targetStatuses: ["completed", "running"] })
+    const first = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    const firstOutput = outputOf(first!.content)
+    expect(firstOutput).toMatchObject({ status: "interrupted", matchedTaskIds: ["child-1"], tasks: [
+      { taskId: "child-1", status: "completed" },
+      { taskId: "child-2", status: "running", result: null },
+    ] })
+    fake.state.targetStatuses = ["completed", "failed"]
+    const replay = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    expect(outputOf(replay!.content)).toEqual(firstOutput)
+    expect(fake.state.targetStatuses).toEqual(["completed", "failed"])
+    expect(fake.state.updates).toBe(1)
   })
 
   it("bounds a large child result in the durable projection", async () => {

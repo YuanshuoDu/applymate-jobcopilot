@@ -1,7 +1,19 @@
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 
-import type { ContextBlock, ContextOwnerFence, ContextRole, ContextLayer, ContextTrust } from "./step-context-builder.js"
-import type { StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
+import type { ContextBlock, ContextOwnerFence, ContextRole, ContextLayer, ContextTrust, StepContext, StepContextRequest, StepSteeringMarkerControl } from "./step-context-builder.js"
+import { InputClaimStoreError, type InputClaimTransaction, type StepCheckpoint, type StoredAgentInput, type TurnExecutionFence } from "./input-claim-store.js"
+import type { HydrationScope } from "./steering-reconciliation-context.js"
+import type { ClaimedInputs } from "./input-claim-types.js"
+import { activeMarkerInputIds, assertHydratedSteeringInputs, mergeSteeringInputs } from "./steering-marker-hydration.js"
+import { buildObservedSteeringMarker } from "./steering-marker-store.js"
+
+export function safeTaskGraphRevision(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+export function ensureTurnInputs(inputs: readonly StoredAgentInput[], request: { readonly sessionId: string; readonly turnId: string; readonly scope: TenantScope }, createError: (inputId: string) => Error): void {
+  for (const input of inputs) if (input.sessionId !== request.sessionId || input.targetTurnId !== request.turnId || input.userId !== request.scope.userId || !["steer", "follow_up"].includes(input.delivery)) throw createError(input.id)
+}
 
 export function ensureClaimTenant(inputs: readonly StoredAgentInput[], request: { readonly sessionId: string; readonly turnId: string; readonly scope: TenantScope }, createError?: (inputId: string) => Error): void {
   for (const input of inputs) {
@@ -11,6 +23,50 @@ export function ensureClaimTenant(inputs: readonly StoredAgentInput[], request: 
 
 type BlockFactory = (layer: ContextLayer, role: ContextRole, trust: ContextTrust, source: string, blockId: string, content: unknown) => ContextBlock
 type AttachmentError = (message: string) => Error
+
+export function rootInputTextMatchesGoal(input: StoredAgentInput, rootInputId: string | undefined, goal: unknown): boolean {
+  if (input.id !== rootInputId || typeof goal !== "string") return false
+  return input.content.filter(part => part.type === "text").map(part => part.text).join("\n").trim() === goal
+}
+
+export function mergeRootContextInput(inputs: readonly StoredAgentInput[], root: StoredAgentInput | null): StoredAgentInput[] {
+  const byId = new Map(inputs.map(input => [input.id, input]))
+  if (root) byId.set(root.id, root)
+  return [...byId.values()].sort((left, right) => left.acceptedSequence < right.acceptedSequence ? -1 : left.acceptedSequence > right.acceptedSequence ? 1 : left.id.localeCompare(right.id))
+}
+
+export async function mergeDurableRootContextInput(
+  inputs: readonly StoredAgentInput[], transaction: InputClaimTransaction,
+  request: { readonly sessionId: string; readonly turnId: string; readonly rootContextInputId?: string; readonly lease?: TurnExecutionFence },
+  assertOwner: (input: StoredAgentInput) => void,
+): Promise<StoredAgentInput[]> {
+  const inputId = request.rootContextInputId
+  if (!inputId) return mergeRootContextInput(inputs, null)
+  const readRoot = transaction.loadRootInputContext
+  if (!readRoot) throw new InputClaimStoreError("store_conflict", "Durable root context reader is unavailable")
+  const root = await readRoot({ sessionId: request.sessionId, turnId: request.turnId, inputId, lease: request.lease })
+  if (root) assertOwner(root)
+  return mergeRootContextInput(inputs, root)
+}
+
+export function hasNewlyAcceptedInput(context: StepContext, previouslyConsumedIds: readonly string[]): boolean {
+  const previous = new Set(previouslyConsumedIds)
+  if (context.consumedInputIds.some(id => !previous.has(id))) return true
+  const markers = context.steeringMarkerControl
+  return Boolean(markers && (
+    markers.newlyObservedInputIds.some(id => !previous.has(id)) ||
+    markers.newlyObservedMarkers.some(marker => !previous.has(marker.inputId))
+  ))
+}
+
+export function contextForAgenda(context: StepContext, ordinal: number, rootContextInputId?: string): StepContext {
+  const readOnlyRootInputId = ordinal > 0 && rootContextInputId && !context.consumedInputIds.includes(rootContextInputId) ? rootContextInputId : undefined
+  if (!readOnlyRootInputId) return context
+  return { ...context, blocks: context.blocks.filter(block => {
+    const content = block.content
+    return block.layer !== "pending_input" || content === null || typeof content !== "object" || Array.isArray(content) || content.inputId !== readOnlyRootInputId
+  }) }
+}
 
 export function pendingInputBlocks(input: StoredAgentInput, ownerFence: ContextOwnerFence, scope: TenantScope, createBlock: BlockFactory, attachmentError?: AttachmentError): Promise<ContextBlock[]> {
   return Promise.all(input.content.map(async (part, partIndex) => {
@@ -34,4 +90,55 @@ export function checkpointWithInputs(checkpoint: StepCheckpoint, inputs: readonl
     if (input.acceptedSequence > through) through = input.acceptedSequence
   }
   return { inputThroughSequence: through, consumedInputIds: ids }
+}
+
+type StepSteeringContext = Readonly<{
+  renderInputs: readonly StoredAgentInput[]
+  activeInputIds: readonly string[]
+  markerInputs: readonly StoredAgentInput[]
+}>
+
+export async function loadStepSteeringContext(
+  transaction: InputClaimTransaction,
+  request: StepContextRequest,
+  claimed: ClaimedInputs,
+  scope?: HydrationScope,
+  fail: (message: string) => Error = message => new Error(message),
+): Promise<StepSteeringContext> {
+  let unresolvedInputs: readonly StoredAgentInput[] = []
+  if (scope) {
+    if (scope.sessionId !== request.sessionId || scope.turnId !== request.turnId) throw fail("Steering hydration scope differs from the current Turn")
+    const unresolvedLoader = transaction.loadUnresolvedSteeringInputs
+    if (!unresolvedLoader) throw fail("Unresolved steering hydration is unavailable")
+    unresolvedInputs = await unresolvedLoader({ ...scope, lease: request.lease })
+  }
+  const activeInputIds = activeMarkerInputIds(request.steeringMarkerState?.active, request.rootInputId, request.steeringMarkerState?.active.length ? {
+    sessionId: request.sessionId, turnId: request.turnId, taskId: request.taskId ?? "",
+    ...(request.steeringMarkerContext ? { obligationId: request.steeringMarkerContext.obligationId, goalRevision: request.steeringMarkerContext.goalRevision, planRevision: request.steeringMarkerContext.planRevision } : {}),
+  } : undefined)
+  const markerLoader = transaction.loadActiveSteeringInputs
+  if (activeInputIds.length > 0 && !markerLoader) throw fail("Active steering marker hydration is unavailable")
+  const markerInputs = activeInputIds.length > 0
+    ? [...await markerLoader!({ sessionId: request.sessionId, turnId: request.turnId, inputIds: activeInputIds, lease: request.lease })]
+    : []
+  assertHydratedSteeringInputs(activeInputIds, markerInputs)
+  return { activeInputIds, markerInputs, renderInputs: mergeSteeringInputs(mergeSteeringInputs(claimed.inputs, markerInputs), unresolvedInputs) }
+}
+
+export function stepSteeringMarkerControl(
+  request: StepContextRequest,
+  claimed: ClaimedInputs,
+  steering: StepSteeringContext,
+  newlyClaimedSteerInputIds: readonly string[],
+): StepSteeringMarkerControl {
+  const newlyObservedInputIds = request.steeringMarkerContext
+    ? newlyClaimedSteerInputIds.filter(inputId => inputId !== request.rootInputId)
+    : []
+  const newlyObservedMarkers = request.steeringMarkerContext
+    ? claimed.inputs.filter(input => newlyObservedInputIds.includes(input.id)).map(markerInput => buildObservedSteeringMarker({
+      sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+      context: request.steeringMarkerContext!, markerInput,
+    }))
+    : []
+  return { activeInputIds: steering.markerInputs.map(input => input.id), newlyObservedInputIds, newlyObservedMarkers }
 }

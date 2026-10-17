@@ -2,16 +2,18 @@ import { describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   insertBase: vi.fn(),
+  insertBaseWithClient: vi.fn(),
   find: vi.fn(),
 }))
 
 vi.mock("./agent-artifact-repo.js", () => ({
   createAgentArtifactRepository: () => mocks,
+  insertAgentArtifactBaseWithClient: mocks.insertBaseWithClient,
 }))
 
 import type { Pool } from "pg"
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
-import { ensureSubmissionArtifact } from "./submission-artifact.js"
+import { ensureSubmissionArtifact, ensureSubmissionArtifactWithClient } from "./submission-artifact.js"
 
 const input = { applicationTaskId: "task-1", userId: "user-1", jobId: "job-1", resumeId: "resume-1", coverLetterId: null, answersHash: "a".repeat(64) }
 const row = {
@@ -21,6 +23,18 @@ const row = {
 }
 
 describe("ensureSubmissionArtifact", () => {
+  it("inserts through the caller transaction and compares the same-client result", async () => {
+    const content = { schemaVersion: "agent-harness.application-submission.v1", applicationTaskId: input.applicationTaskId,
+      jobId: input.jobId, resumeId: input.resumeId, coverLetterId: input.coverLetterId, answersHash: input.answersHash }
+    const expected = { ...row, hash: hashArtifactContent(content) }
+    mocks.insertBaseWithClient.mockResolvedValueOnce(expected)
+    const client = { query: vi.fn() }
+    await expect(ensureSubmissionArtifactWithClient(client as never, input)).resolves.toBe(expected)
+    expect(mocks.insertBaseWithClient).toHaveBeenCalledWith(client, expect.objectContaining({
+      id: "application:task-1", artifactType: "application", content: expect.objectContaining({ answersHash: input.answersHash }),
+    }))
+  })
+
   it("writes an immutable non-sensitive manifest", async () => {
     mocks.insertBase.mockResolvedValueOnce(row)
     await expect(ensureSubmissionArtifact({} as Pool, input)).resolves.toBe(row)

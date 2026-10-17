@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { AgentTreeManager, type SubagentClock } from "./manager.js"
+import { SessionConcurrencyLimiter } from "./limiter.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import { parseSubagentDispatchJobId, SubagentDispatchIdentityMismatchError, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, subagentDispatchJobId, type SubagentDispatchIdentity } from "./dispatch-identity.js"
 import {
   type SubagentExecutionResult,
   type SubagentJobPayload,
@@ -11,6 +13,7 @@ import {
   type SubagentTaskRecord,
   type SubagentTaskSpec,
 } from "./types.js"
+import { normalizeSubagentPolicy } from "./types.js"
 
 class FakeClock implements SubagentClock {
   clearCount = 0
@@ -24,6 +27,8 @@ class MemoryStore implements SubagentStore {
   readonly finishCalls: Array<{ taskId: string; status: SubagentExecutionResult["status"]; attemptCount: number }> = []
   readonly finishMailboxMessageIds: Array<readonly string[] | undefined> = []
   readonly finishRetryDispositions: Array<SubagentExecutionResult["retryDisposition"]> = []
+  readonly claimDispatchIdentities: Array<SubagentDispatchIdentity | undefined> = []
+  matchesPublishedDispatch: SubagentStore["matchesPublishedDispatch"]
   heartbeatResult: "renewed" | "interrupted" | "lost" | null = null
   claimError: unknown = null
   readonly releaseCalls: Array<{ taskId: string; attemptCount: number }> = []
@@ -49,7 +54,8 @@ class MemoryStore implements SubagentStore {
 
   async get(taskId: string): Promise<SubagentTaskRecord | null> { return this.records.get(taskId) ?? null }
 
-  async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
+  async claim(input: Parameters<SubagentStore["claim"]>[0]): Promise<SubagentTaskRecord | null> {
+    this.claimDispatchIdentities.push(input.dispatchIdentity)
     if (this.claimError) throw this.claimError
     const task = this.records.get(input.taskId)
     const running = [...this.records.values()].filter(row => row.sessionId === input.sessionId && row.status === "running").length
@@ -149,7 +155,128 @@ function payload(task: SubagentTaskRecord, ownerId = "worker-1"): SubagentJobPay
   return { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId }
 }
 
+async function fullLimiterFixture() {
+  const store = new MemoryStore()
+  const limiter = new SessionConcurrencyLimiter()
+  const manager = new AgentTreeManager(store, { clock: new FakeClock(), limiter })
+  const policy = normalizeSubagentPolicy({ maxConcurrency: 1 })
+  const task = await manager.spawn(spec({ policy }))
+  const occupied = limiter.reserve(task.sessionId, "already-running", policy)
+  const identity = parseSubagentDispatchJobId(subagentDispatchJobId(task.id, 2), task.id)
+  if (!identity) throw new Error("Fixture dispatch ID did not parse")
+  return { store, limiter, manager, task, occupied, identity }
+}
+
 describe("AgentTreeManager", () => {
+  it("passes dispatch identity to claim and releases its slot when the current outbox rejects it", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec())
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(task.id, 2), task.id)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    store.claimError = new SubagentDispatchIdentityMismatchError()
+    const execute = vi.fn(async () => ({ status: "completed" as const }))
+
+    await expect(manager.run(payload(task), execute, identity)).resolves.toEqual({
+      taskId: task.id, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH,
+    })
+    expect(store.claimDispatchIdentities).toEqual([identity])
+    expect(execute).not.toHaveBeenCalled()
+    expect(store.records.get(task.id)).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null })
+    expect(store.finishCalls).toEqual([])
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
+  it("fails closed when an identity-bearing job hits local concurrency without a dispatch validator", async () => {
+    const fixture = await fullLimiterFixture()
+    const execute = vi.fn(async () => ({ status: "completed" as const }))
+    try {
+      await expect(fixture.manager.run(payload(fixture.task), execute, fixture.identity)).resolves.toEqual({
+        taskId: fixture.task.id, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH,
+      })
+      expect(fixture.store.matchesPublishedDispatch).toBeUndefined()
+      expect(fixture.store.claimDispatchIdentities).toEqual([])
+      expect(execute).not.toHaveBeenCalled()
+      expect(fixture.store.records.get(fixture.task.id)).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null })
+      expect(fixture.limiter.activeCount(fixture.task.sessionId)).toBe(1)
+    } finally { fixture.occupied.release() }
+  })
+
+  it("skips a stale published generation on local concurrency denial", async () => {
+    const fixture = await fullLimiterFixture()
+    const execute = vi.fn(async () => ({ status: "completed" as const }))
+    fixture.store.matchesPublishedDispatch = vi.fn(async ({ payload: checkedPayload, dispatchIdentity }) => {
+      expect(checkedPayload).toEqual(payload(fixture.task))
+      expect(dispatchIdentity).toEqual(fixture.identity)
+      return false
+    })
+    try {
+      await expect(fixture.manager.run(payload(fixture.task), execute, fixture.identity)).resolves.toEqual({
+        taskId: fixture.task.id, status: "skipped", reason: SUBAGENT_DISPATCH_IDENTITY_MISMATCH,
+      })
+      expect(fixture.store.matchesPublishedDispatch).toHaveBeenCalledOnce()
+      expect(fixture.store.claimDispatchIdentities).toEqual([])
+      expect(execute).not.toHaveBeenCalled()
+      expect(fixture.store.records.get(fixture.task.id)).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null })
+    } finally { fixture.occupied.release() }
+  })
+
+  it("preserves the original concurrency denial for the matching published generation", async () => {
+    const fixture = await fullLimiterFixture()
+    const execute = vi.fn(async () => ({ status: "completed" as const }))
+    fixture.store.matchesPublishedDispatch = vi.fn(async () => true)
+    try {
+      await expect(fixture.manager.run(payload(fixture.task), execute, fixture.identity)).rejects.toMatchObject({ code: "concurrency" })
+      expect(fixture.store.matchesPublishedDispatch).toHaveBeenCalledOnce()
+      expect(fixture.store.claimDispatchIdentities).toEqual([])
+      expect(execute).not.toHaveBeenCalled()
+      expect(fixture.store.records.get(fixture.task.id)).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null })
+    } finally { fixture.occupied.release() }
+  })
+
+  it("propagates an operational dispatch-check failure without spending an attempt", async () => {
+    const fixture = await fullLimiterFixture()
+    const error = new Error("temporary store read failure")
+    const execute = vi.fn(async () => ({ status: "completed" as const }))
+    fixture.store.matchesPublishedDispatch = vi.fn(async () => { throw error })
+    try {
+      await expect(fixture.manager.run(payload(fixture.task), execute, fixture.identity)).rejects.toBe(error)
+      expect(fixture.store.matchesPublishedDispatch).toHaveBeenCalledOnce()
+      expect(fixture.store.claimDispatchIdentities).toEqual([])
+      expect(execute).not.toHaveBeenCalled()
+      expect(fixture.store.records.get(fixture.task.id)).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null })
+    } finally { fixture.occupied.release() }
+  })
+
+  it("keeps identity-free direct calls on the legacy concurrency path", async () => {
+    const fixture = await fullLimiterFixture()
+    const execute = vi.fn(async () => ({ status: "completed" as const }))
+    fixture.store.matchesPublishedDispatch = vi.fn(async () => false)
+    try {
+      await expect(fixture.manager.run(payload(fixture.task), execute)).rejects.toMatchObject({ code: "concurrency" })
+      expect(fixture.store.matchesPublishedDispatch).not.toHaveBeenCalled()
+      expect(fixture.store.claimDispatchIdentities).toEqual([])
+      expect(execute).not.toHaveBeenCalled()
+    } finally { fixture.occupied.release() }
+  })
+
+  it("skips a terminal identity-bearing task before limiter or dispatch validation", async () => {
+    const fixture = await fullLimiterFixture()
+    fixture.store.records.set(fixture.task.id, { ...fixture.task, status: "cancelled" })
+    fixture.store.matchesPublishedDispatch = vi.fn(async () => true)
+    const execute = vi.fn(async () => ({ status: "completed" as const }))
+    try {
+      await expect(fixture.manager.run(payload(fixture.task), execute, fixture.identity)).resolves.toEqual({
+        taskId: fixture.task.id, status: "skipped", reason: "not_available",
+      })
+      expect(fixture.store.matchesPublishedDispatch).not.toHaveBeenCalled()
+      expect(fixture.store.claimDispatchIdentities).toEqual([])
+      expect(execute).not.toHaveBeenCalled()
+      expect(fixture.store.records.get(fixture.task.id)).toMatchObject({ status: "cancelled", attemptCount: 0, leaseOwner: null })
+      expect(fixture.limiter.activeCount(fixture.task.sessionId)).toBe(1)
+    } finally { fixture.occupied.release() }
+  })
+
   it("creates a task tree and inherits the parent's restrictive policy", async () => {
     const store = new MemoryStore()
     const manager = new AgentTreeManager(store, { clock: new FakeClock() })

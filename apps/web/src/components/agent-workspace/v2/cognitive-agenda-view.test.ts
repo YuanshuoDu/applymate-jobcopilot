@@ -39,14 +39,13 @@ function receipt(includeResumeFence = true) {
 }
 
 describe('cognitive agenda receipt parser', () => {
-  it('accepts a Worker-shaped fenced receipt and returns a copied safe view without cursor or planning fields', () => {
+  it('accepts a Worker-shaped fenced receipt and returns a copied safe view without its cursor', () => {
     const source = receipt()
     const view = parseCognitiveAgendaReceipt(source, scope)
 
     expect(view).toMatchObject({ nextAction: 'await_approval' })
     expect(view).not.toHaveProperty('resumeFence')
-    expect(view).not.toHaveProperty('goalRevision')
-    expect(view).not.toHaveProperty('planRevision')
+    expect(view).toMatchObject({ goalRevision: null, planRevision: null })
     expect(view).not.toBe(source)
     expect(JSON.stringify(view)).not.toContain('objective')
     ;(source.signals.approvals.ids as string[])[0] = 'mutated-after-parse'
@@ -72,13 +71,25 @@ describe('cognitive agenda receipt parser', () => {
     expect(parseCognitiveAgendaReceipt({ ...value, extra: 'raw user objective' }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...value, nextAction: 'execute_external_tool' }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...value, blockedBy: { kind: 'unknown-blocker', ids: [] } }, scope)).toBeNull()
-    expect(parseCognitiveAgendaReceipt({ ...value, goalRevision: 1 }, scope)).toBeNull()
-    expect(parseCognitiveAgendaReceipt({ ...value, planRevision: 0 }, scope)).toBeNull()
     for (const nextAction of ['replan', 'continue_plan', 'verify_completion']) {
       expect(parseCognitiveAgendaReceipt({ ...value, nextAction }, scope)).toBeNull()
     }
     for (const kind of ['replan_required', 'completion_verification']) {
       expect(parseCognitiveAgendaReceipt({ ...value, blockedBy: { kind, ids: ['blocker:1'] } }, scope)).toBeNull()
+    }
+  })
+
+  it('preserves null or field-specific safe-integer revisions and rejects invalid values', () => {
+    expect(parseCognitiveAgendaReceipt({ ...receipt(), goalRevision: 1, planRevision: 0 }, scope))
+      .toMatchObject({ goalRevision: 1, planRevision: 0 })
+    expect(parseCognitiveAgendaReceipt({ ...receipt(), goalRevision: Number.MAX_SAFE_INTEGER, planRevision: Number.MAX_SAFE_INTEGER }, scope))
+      .toMatchObject({ goalRevision: Number.MAX_SAFE_INTEGER, planRevision: Number.MAX_SAFE_INTEGER })
+
+    for (const revision of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '1', undefined, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(parseCognitiveAgendaReceipt({ ...receipt(), goalRevision: revision }, scope)).toBeNull()
+    }
+    for (const revision of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '0', undefined, Number.NaN, Number.NEGATIVE_INFINITY]) {
+      expect(parseCognitiveAgendaReceipt({ ...receipt(), planRevision: revision }, scope)).toBeNull()
     }
   })
 

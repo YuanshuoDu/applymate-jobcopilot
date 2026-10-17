@@ -12,6 +12,7 @@ import { redactAgentEvent } from "@jobcopilot/shared"
 
 import { AgentRepositoryConflictError } from "./errors"
 import { mapEvent, mapItem, mapStep, mapTurn } from "./mapping"
+import { agentTurnProjectionSelect } from "./turn-select"
 
 type Transaction = Prisma.TransactionClient
 
@@ -67,6 +68,7 @@ function createUnitOfWork(tx: Transaction, scope: TenantScope): AgentRepositoryU
 
       const turn = await tx.agentTurn.findFirst({
         where: { id: input.turnId, sessionId: input.sessionId, userId: scope.userId },
+        select: agentTurnProjectionSelect,
       })
       return turn ? mapTurn(turn) : null
     },
@@ -80,6 +82,7 @@ function createUnitOfWork(tx: Transaction, scope: TenantScope): AgentRepositoryU
           userId: scope.userId,
           revision: input.expectedTurnRevision,
         },
+        select: { id: true },
       })
       if (!turn) throw conflict(`turn ${input.turnId}`)
 
@@ -134,6 +137,7 @@ function createUnitOfWork(tx: Transaction, scope: TenantScope): AgentRepositoryU
 
       const turn = await tx.agentTurn.findFirst({
         where: { id: input.turnId, sessionId: input.sessionId, userId: scope.userId },
+        select: { id: true },
       })
       if (!turn) throw conflict(`turn ${input.turnId}`)
       if (input.itemId) {
@@ -201,6 +205,7 @@ export function createPrismaAgentStore(db: PrismaClient, scope: TenantScope): Ag
         if (!(await ownsSession(tx, input.sessionId, scope))) return null
         const turn = await tx.agentTurn.findFirst({
           where: { id: input.turnId, sessionId: input.sessionId, userId: scope.userId },
+          select: agentTurnProjectionSelect,
         })
         if (!turn) return null
 

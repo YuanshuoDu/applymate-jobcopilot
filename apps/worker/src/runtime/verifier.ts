@@ -138,10 +138,10 @@ export function snapshotEvidence(snapshot: StepContextSnapshot): FinalEvidence[]
     try {
       const content = plainRecord(observation.content)
       if (!content || typeof content.toolCallId !== "string") return []
-      return [
-        { id: content.toolCallId, status: content.status === "completed" ? "verified" as const : "conflicting" as const },
-        ...readEvidence(content),
-      ]
+      const invocation = content.status === "completed"
+        ? [{ id: content.toolCallId, status: "verified" as const }]
+        : []
+      return [...invocation, ...readEvidence(content)]
     } catch {
       return []
     }

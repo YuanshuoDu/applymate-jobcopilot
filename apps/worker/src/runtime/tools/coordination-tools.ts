@@ -12,6 +12,8 @@ import {
   executeWaitSubagents,
   type CoordinationExecutorOptions,
 } from "./coordination-executors.js"
+import { executeAgentList } from "./task-graph-result-page-executor.js"
+import { TaskGraphResultPageRequestSchema, TaskGraphResultPageSchema } from "../subagents/task-graph-result-page-contract.js"
 import type { RuntimeToolDefinition } from "./types.js"
 
 const IdSchema = Type.String({ minLength: 1, maxLength: 256 })
@@ -47,8 +49,7 @@ export const SpawnSubagentInputSchema = Type.Object({
   parentTaskId: Type.Optional(IdSchema),
 }, { additionalProperties: false })
 export type SpawnSubagentInput = Static<typeof SpawnSubagentInputSchema>
-
-export const FollowupInputSchema = Type.Object({
+const LegacyFollowupInputSchema = Type.Object({
   idempotencyKey: Type.Optional(KeySchema),
   taskId: IdSchema,
   goal: TextSchema,
@@ -56,8 +57,13 @@ export const FollowupInputSchema = Type.Object({
   successCriteria: Type.Optional(StringListSchema),
   context: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false })
+const ReplaceUnstartedFollowupInputSchema = Type.Object({
+  idempotencyKey: Type.Optional(KeySchema), taskId: IdSchema, goal: TextSchema,
+  context: Type.Optional(Type.Unknown()), mode: Type.Literal("replace_unstarted"),
+  expectedRevision: Type.Integer({ minimum: 0, maximum: 2_147_483_644 }),
+}, { additionalProperties: false })
+export const FollowupInputSchema = Type.Union([LegacyFollowupInputSchema, ReplaceUnstartedFollowupInputSchema])
 export type FollowupInput = Static<typeof FollowupInputSchema>
-
 export const SendMessageInputSchema = Type.Object({
   idempotencyKey: KeySchema,
   taskId: IdSchema,
@@ -65,7 +71,6 @@ export const SendMessageInputSchema = Type.Object({
   payload: Type.Unknown(),
 }, { additionalProperties: false })
 export type SendMessageInput = Static<typeof SendMessageInputSchema>
-
 export const WaitSubagentsInputSchema = Type.Object({
   idempotencyKey: KeySchema,
   taskIds: Type.Array(IdSchema, { minItems: 1, maxItems: 50 }),
@@ -94,10 +99,35 @@ const SpawnOutputSchema = Type.Object({
   status: StatusSchema, replay: Type.Boolean(), nativeCoordination: Type.Optional(NativeCoordinationOutputSchema),
 }, { additionalProperties: false })
 const SendOutputSchema = Type.Object({ taskId: IdSchema, messageId: IdSchema, status: Type.Union([Type.Literal("queued"), Type.Literal("duplicate")]) }, { additionalProperties: false })
-const WaitTaskOutputSchema = Type.Object({
+const WaitTaskBaseOutputProperties = {
   taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
   failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
-}, { additionalProperties: false })
+}
+const EXTENDED_YEAR_PATTERN = "\\+(?:01[0-9]{4}|0[2-9][0-9]{4}|1[0-9]{5}|2[0-6][0-9]{4}|27[0-4][0-9]{3}|275[0-6][0-9]{2}|2757[0-5][0-9]|275760)" +
+  "|-(?:00000[1-9]|0000[1-9][0-9]|000[1-9][0-9]{2}|00[1-9][0-9]{3}|0[1-9][0-9]{4}|1[0-9]{5}|2[0-6][0-9]{4}|270[0-9]{3}|271[0-7][0-9]{2}|2718[01][0-9]|27182[01])"
+const CANONICAL_YEAR_PATTERN = "(?:[0-9]{4}|" + EXTENDED_YEAR_PATTERN + ")"
+const LEAP_SUFFIX_PATTERN = "(?:0[48]|[2468][048]|[13579][26])"
+const CENTURY_LEAP_PREFIX_PATTERN = "(?:00|04|08|12|16|20|24|28|32|36|40|44|48|52|56|60|64|68|72|76|80|84|88|92|96)"
+const EXTENDED_LEAP_YEAR_PATTERN = "(?=" + EXTENDED_YEAR_PATTERN + "-)(?:[+-][0-9]{4}" + LEAP_SUFFIX_PATTERN + "|[+-][0-9]{2}" + CENTURY_LEAP_PREFIX_PATTERN + "00)"
+const LEAP_YEAR_PATTERN = "(?:(?:[0-9]{2}" + LEAP_SUFFIX_PATTERN + "|" + CENTURY_LEAP_PREFIX_PATTERN + "00)|" + EXTENDED_LEAP_YEAR_PATTERN + ")"
+const OUT_OF_DATE_RANGE_PATTERN = "(?:\\+275760-(?:10|11|12)-|\\+275760-09-(?:1[4-9]|[23][0-9]|30)T|\\+275760-09-13T(?!00:00:00[.]000Z)|-271821-(?:01|02|03)-|-271821-04-(?:0[1-9]|1[0-9])T)"
+const CANONICAL_UTC_MILLIS_PATTERN = [
+  "^(?!" + OUT_OF_DATE_RANGE_PATTERN + ")(?:" + CANONICAL_YEAR_PATTERN + "-(?:",
+  "(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])",
+  ")|" + LEAP_YEAR_PATTERN + "-02-29)",
+  "T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][.][0-9]{3}Z(?![\\s\\S])",
+].join("")
+const CanonicalUtcTimestampOrNullSchema = Type.Union([
+  Type.String({ pattern: CANONICAL_UTC_MILLIS_PATTERN }), Type.Null(),
+])
+const WaitTaskOutputSchema = Type.Union([
+  Type.Object(WaitTaskBaseOutputProperties, { additionalProperties: false }),
+  Type.Object({
+    ...WaitTaskBaseOutputProperties,
+    attemptCount: Type.Integer({ minimum: 0 }), maxAttempts: Type.Integer({ minimum: 1 }),
+    leaseExpiresAt: CanonicalUtcTimestampOrNullSchema, interruptRequestedAt: CanonicalUtcTimestampOrNullSchema,
+  }, { additionalProperties: false }),
+])
 const WaitAggregateSchema = Type.Object({
   status: Type.Union([Type.Literal("completed"), Type.Literal("partial"), Type.Literal("failed"), Type.Literal("pending")]),
   successfulRoles: Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 }),
@@ -124,6 +154,8 @@ const TaskOutputSchema = Type.Object({
   result: Type.Unknown(), failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
 const ListOutputSchema = Type.Object({ tasks: Type.Array(TaskOutputSchema, { maxItems: 50 }) }, { additionalProperties: false })
+const AgentListInputSchema = Type.Union([ListSubagentsInputSchema, TaskGraphResultPageRequestSchema])
+const AgentListOutputSchema = Type.Union([ListOutputSchema, TaskGraphResultPageSchema])
 const InterruptOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, status: Type.Literal("interrupt_requested"),
   affectedCount: Type.Integer({ minimum: 0 }), reason: Type.Union([Type.String(), Type.Null()]),
@@ -131,6 +163,7 @@ const InterruptOutputSchema = Type.Object({
 const CloseOutputSchema = Type.Object({
   taskId: IdSchema, status: StatusSchema, closed: Type.Boolean(),
 }, { additionalProperties: false })
+const NATIVE_CAPACITY_GUIDANCE = " For a graph-backed root, TaskGraph maxNodes is an eight-node lifetime cap separate from active-child concurrency. Read the current task_graph_current.nodeCapacity fields nodeCount, maxNodes, remaining, ordinaryRemaining, reserveActive, and repairRecorded before appending. If reserveActive is true, leave the final slot for one exact failed-criterion repair through agent.plan. A native append consumes one lifetime slot. An accepted repair sets repairRecorded and consumes the reserve even while queued or if it fails; that does not pass the target or promise another retry. If remaining is zero, stop with the fixed capacity denial; do not infer room from concurrency."
 
 function metadata(name: string, description: string, risk: "read" | "internal_write", idempotency: "read_only" | "idempotent" | "requires_key"): Pick<RuntimeToolDefinition, "schemaVersion" | "name" | "version" | "description" | "capabilities" | "risk" | "domain" | "idempotency" | "timeoutMs" | "requiredCapabilities"> {
   return {
@@ -149,17 +182,17 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
   const closeExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeCloseSubagent(context, input as CloseSubagentInput, options)
   return [
     {
-      ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
+      ...metadata("spawn_subagent", `Create one permission-scoped child task and durably enqueue it.${NATIVE_CAPACITY_GUIDANCE}`, "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
       execute: spawnExecutor,
     },
     {
-      ...metadata("agent.spawn", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
+      ...metadata("agent.spawn", `Create one permission-scoped child task and durably enqueue it.${NATIVE_CAPACITY_GUIDANCE}`, "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
       execute: spawnExecutor,
     },
     {
-      ...metadata("agent.followup", "Create a durable follow-up task from a terminal task result", "internal_write", "requires_key"),
+      ...metadata("agent.followup", `Create a follow-up from a terminal result, or on a general native root replace an unstarted leaf with mode=replace_unstarted and its current graph expectedRevision; replacement inherits source criteria and policy.${NATIVE_CAPACITY_GUIDANCE} A replacement retains its canceled source and appends its successor, so it also consumes a lifetime slot. An accepted repair relation consumes the one reserve even if queued or failed, but does not make its target successful or guarantee another retry.`, "internal_write", "requires_key"),
       inputSchema: FollowupInputSchema, outputSchema: FollowupOutputSchema,
       execute: (context, input) => executeFollowup(context, input as FollowupInput, options),
     },
@@ -189,9 +222,9 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       execute: listExecutor,
     },
     {
-      ...metadata("agent.list", "List visible tasks in the current session and task tree", "read", "read_only"),
-      inputSchema: ListSubagentsInputSchema, outputSchema: ListOutputSchema,
-      execute: listExecutor,
+      ...metadata("agent.list", "List visible tasks. Choose exactly one mode: legacy includeTerminal listing or paged current TaskGraph results. For pages, use offset 0 with a nodeKey and expectedRevision from the current owner-scoped graph observation; continue only with the exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null. Each page contains at most three items; totalCount/evidenceCount describe only this node's source, not aggregate graph or historical counts. Use those reported counts rather than page length. A null nextOffset ends paging for this node at this revision only; it does not establish task or verification completion. If results are stale or unavailable, refresh current state before retrying. Never invent offsets, silently switch modes, or treat page data as verification proof.", "read", "read_only"),
+      inputSchema: AgentListInputSchema, outputSchema: AgentListOutputSchema,
+      execute: (context, input) => executeAgentList(context, input, options),
     },
     {
       ...metadata("interrupt_subagent", "Request interruption of a visible task tree", "internal_write", "idempotent"),

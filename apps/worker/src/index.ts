@@ -29,6 +29,7 @@ async function main() {
   const [
     applyResultsModule,
     applyQueueModule,
+    applicationSubmitOutboxModule,
     scoutQueueModule,
     agentRunQueueModule,
     automationSchedulerModule,
@@ -44,6 +45,7 @@ async function main() {
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
+    import("./queue/application-submit-outbox.js"),
     import("./queue/scout-queue.js"),
     import("./queue/agent-run-queue.js"),
     import("./queue/automation-scheduler.js"),
@@ -105,9 +107,11 @@ async function main() {
   let agentEventOutboxConsumer: ReturnType<typeof startAgentEventOutboxConsumer> | undefined;
   let agentTaskGraphStopOutboxConsumer: ReturnType<typeof startTaskGraphStopOutboxConsumer> | undefined;
   let agentTaskInterruptOutboxConsumer: ReturnType<typeof startTaskInterruptOutboxConsumer> | undefined;
+  let applicationSubmitOutboxPublisher: ReturnType<typeof applicationSubmitOutboxModule.startApplicationSubmitOutboxPublisher> | undefined;
   let automationScheduler: ReturnType<typeof startAutomationScheduler> | undefined;
   let adminServer: ClosableHttpServer | undefined;
   const postBootstrapFence = createPostBootstrapStartupFence(() => [
+    () => applicationSubmitOutboxPublisher?.close(),
     () => scoutWorker.close(),
     () => applyWorker.close(),
     () => agentTaskInterruptOutboxConsumer?.close(),
@@ -169,6 +173,12 @@ async function main() {
     };
     const workerRuntimeState = await restoreWorkerRuntimeState(connection, workerControls);
     console.log(`[worker] Runtime control state: ${workerRuntimeState.status}`);
+    if (workerRuntimeState.status === "running") {
+      void applyWorker.run().catch((error: unknown) => {
+        console.error("[apply-worker] worker loop failed:", error);
+      });
+    }
+    applicationSubmitOutboxPublisher = applicationSubmitOutboxModule.startApplicationSubmitOutboxPublisher(pool, applyQueue);
 
     console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
     console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);

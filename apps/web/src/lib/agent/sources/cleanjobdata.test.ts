@@ -86,23 +86,53 @@ describe('fetchCleanJobData', () => {
   })
 
   it('does not call the provider when the platform key is missing', async () => {
-    await expect(fetchCleanJobData({ apiKey: ' ', title: 'Engineer' })).resolves.toEqual([])
+    const onProviderFailure = vi.fn()
+    await expect(fetchCleanJobData({ apiKey: ' ', title: 'Engineer', onProviderFailure })).resolves.toEqual([])
     expect(mocks.pinnedFetch).not.toHaveBeenCalled()
+    expect(onProviderFailure).not.toHaveBeenCalled()
   })
 
   it.each([401, 429, 503])('fails open on HTTP %s', async status => {
     mocks.pinnedFetch.mockResolvedValue(new Response(null, { status }))
-    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer' })).resolves.toEqual([])
+    const onProviderFailure = vi.fn()
+    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer', onProviderFailure })).resolves.toEqual([])
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
   })
 
   it('fails open on malformed JSON shapes', async () => {
     mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify({ data: {} }), { status: 200 }))
-    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer' })).resolves.toEqual([])
+    const onProviderFailure = vi.fn()
+    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer', onProviderFailure })).resolves.toEqual([])
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
   })
 
   it('fails open on network errors and timeouts', async () => {
     mocks.pinnedFetch.mockRejectedValue(new DOMException('Timed out', 'AbortError'))
-    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer' })).resolves.toEqual([])
+    const onProviderFailure = vi.fn()
+    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer', onProviderFailure })).resolves.toEqual([])
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports a late page failure once and preserves earlier results', async () => {
+    mocks.pinnedFetch
+      .mockResolvedValueOnce(response([providerJob()], 'next-token'))
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+    const onProviderFailure = vi.fn()
+
+    const jobs = await fetchCleanJobData({ apiKey: 'key', title: 'Engineer', maxPages: 3, onProviderFailure })
+
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]?.externalId).toBe('123')
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not report a successful empty page as a provider failure', async () => {
+    mocks.pinnedFetch.mockResolvedValue(response([]))
+    const onProviderFailure = vi.fn()
+
+    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer', onProviderFailure })).resolves.toEqual([])
+
+    expect(onProviderFailure).not.toHaveBeenCalled()
   })
 
   it('drops records without a company or valid direct application URL', async () => {
@@ -111,5 +141,31 @@ describe('fetchCleanJobData', () => {
       providerJob({ id: 2, application_url: 'javascript:alert(1)' }),
     ]))
     await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer' })).resolves.toEqual([])
+  })
+
+  it('reports malformed rows once and preserves valid partial results', async () => {
+    mocks.pinnedFetch.mockResolvedValue(response([
+      providerJob({ id: 1, application_url: 'https://jobs.example.com/1' }),
+      providerJob({ id: 2, company: null }),
+      providerJob({ id: 3, application_url: 'javascript:alert(1)' }),
+    ]))
+    const onProviderFailure = vi.fn()
+
+    const jobs = await fetchCleanJobData({ apiKey: 'key', title: 'Engineer', onProviderFailure })
+
+    expect(jobs.map(job => job.externalId)).toEqual(['1'])
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports all-invalid rows once and preserves the empty fallback', async () => {
+    mocks.pinnedFetch.mockResolvedValue(response([
+      providerJob({ company: null }),
+      providerJob({ id: 2, application_url: 'javascript:alert(1)' }),
+    ]))
+    const onProviderFailure = vi.fn()
+
+    await expect(fetchCleanJobData({ apiKey: 'key', title: 'Engineer', onProviderFailure })).resolves.toEqual([])
+
+    expect(onProviderFailure).toHaveBeenCalledTimes(1)
   })
 })

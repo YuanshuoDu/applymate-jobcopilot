@@ -210,11 +210,12 @@ function durableCompositionPool(input: {
     leaseVersion: number
     leaseExpiresAt: Date | null
     leaseStartedAt: Date | null
+    createdAt: Date
   }
   const turn: DurableCompositionTurn = {
     id: String(input.root.turnId), userId: input.root.userId, sessionId: input.root.sessionId, rootTaskId: input.root.rootTaskId,
     status: "in_progress", leaseOwnerId: "worker_root", leaseVersion: 1,
-    leaseExpiresAt: new Date(input.now.getTime() + 60_000), leaseStartedAt: input.now,
+    leaseExpiresAt: new Date(input.now.getTime() + 60_000), leaseStartedAt: input.now, createdAt: input.now,
   }
   const state = {
     session: { id: input.root.sessionId, userId: input.root.userId, status: "running", eventSequence: 40 },
@@ -328,6 +329,16 @@ function durableCompositionPool(input: {
       if (sql.includes('JOIN "agent_turns" AS turn')) {
         const active = ["in_progress", "waiting_for_dependency"].includes(state.turn.status)
         return response<T>(active ? [turnRow()] : [], active ? 1 : 0)
+      }
+      if (
+        sql.includes('SELECT active_turn."createdAt" FROM "agent_turns" AS active_turn')
+        && sql.includes('JOIN "agent_sessions" AS session ON session."id" = active_turn."sessionId" AND session."userId" = $2')
+        && sql.includes('WHERE active_turn."id" = $1 AND active_turn."sessionId" = $3 AND active_turn."userId" = $2')
+      ) {
+        const owned = String(params[0]) === state.turn.id && String(params[1]) === state.turn.userId
+          && String(params[2]) === state.turn.sessionId && state.turn.sessionId === state.session.id
+          && state.turn.userId === state.session.userId
+        return response<T>(owned ? [{ createdAt: state.turn.createdAt }] : [], owned ? 1 : 0)
       }
       if (sql.includes('FROM "agent_turns" AS turn')) return response<T>([turnRow()])
 
@@ -1045,7 +1056,7 @@ describe("production Worker bootstrap", () => {
         expect(durableFixture.state.wait?.consumedAt).toEqual(recoveryNow)
         expect(durableFixture.state.calls.filter(sql => sql.includes('SET "result" = jsonb_set'))).toHaveLength(1)
         expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE"))).toBe(true)
-        expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('"parentTaskId" = $4') && sql.includes('"status" IN (\'ready\', \'timed_out\')'))).toBe(true)
+        expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('"parentTaskId" = $4') && sql.includes('"status" IN (\'ready\', \'timed_out\', \'interrupted\')'))).toBe(true)
         expect(durableFixture.state.turn).toMatchObject({ status: "completed", leaseOwnerId: null, leaseVersion: 2 })
         const resumedMessages = JSON.stringify(resumeRequests[0]?.messages).replaceAll('\\"', '"')
         expect(resumedMessages).toContain(String(durableFixture.state.wait?.id))

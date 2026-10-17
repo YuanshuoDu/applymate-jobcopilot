@@ -38,8 +38,12 @@ export interface ModelCapabilityProfile extends ModelCapabilities {
   supportsResponseContinuation: boolean
   supportsProviderConversation: boolean
   supportsBackgroundResponse: boolean
+  /** Declared total input-plus-output context capacity, or null when unknown. */
   maxContextTokens: number | null
+  /** Known model output capability maximum; this is not the adapter's default cap. */
   maxOutputTokens: number | null
+  /** Effective completion cap when a request omits maxOutputTokens; absent/null means unknown or unbounded. */
+  defaultMaxOutputTokens?: number | null
   costClass: ModelCostClass
 }
 

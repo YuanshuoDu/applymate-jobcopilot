@@ -106,4 +106,61 @@ describe("capability-aware model fallback", () => {
       { target: { provider: "minimax", model: "MiniMax-M3" } },
     ], invoke)).resolves.toMatchObject({ value: "recovered", attempt: 2 })
   })
+
+  it("uses a local context-estimate rejection to move only through configured route slots", async () => {
+    class LocalContextEstimateError extends AgentModelError {
+      constructor(provider: string, model: string) {
+        super({ code: "context_estimate_exceeded", message: "Approximate request context exceeds route window", provider, model })
+      }
+    }
+    const firstFailure = new LocalContextEstimateError("minimax", "MiniMax-M3")
+    const invoke = vi.fn()
+      .mockRejectedValueOnce(firstFailure)
+      .mockResolvedValueOnce({ value: "larger-window-route" })
+    const result = await executeWithModelFallback(registry(), [
+      { target: { provider: "minimax", model: "MiniMax-M3" } },
+      { target: { provider: "anthropic", model: "claude-test" } },
+    ], invoke)
+    expect(result.value).toBe("larger-window-route")
+    expect(invoke).toHaveBeenCalledTimes(2)
+
+    const zeroReroute = vi.fn().mockRejectedValue(firstFailure)
+    await expect(executeWithModelFallback(registry(), [
+      { target: { provider: "minimax", model: "MiniMax-M3" } },
+      { target: { provider: "anthropic", model: "claude-test" } },
+    ], zeroReroute, { maxReroutes: 0 })).rejects.toBe(firstFailure)
+    expect(zeroReroute).toHaveBeenCalledTimes(1)
+
+    const bounded = vi.fn().mockImplementation((candidate: ModelAdapter) => Promise.reject(
+      new LocalContextEstimateError(candidate.profile.provider, candidate.profile.model),
+    ))
+    await expect(executeWithModelFallback(registry(), [
+      { target: { provider: "minimax", model: "MiniMax-M3" } },
+      { target: { provider: "anthropic", model: "claude-test" } },
+      { target: { provider: "openai-compatible", model: "gpt-test" } },
+    ], bounded, { maxReroutes: 1 })).rejects.toMatchObject({ code: "context_estimate_exceeded" })
+    expect(bounded).toHaveBeenCalledTimes(2)
+  })
+
+  it("preserves local rejection identity and the irreversible-action fallback fence", async () => {
+    class LocalContextEstimateError extends AgentModelError {
+      constructor() {
+        super({ code: "context_estimate_exceeded", message: "Approximate request context exceeds route window", provider: "minimax", model: "MiniMax-M3" })
+      }
+    }
+    const failure = new LocalContextEstimateError()
+    const invoke = vi.fn().mockRejectedValue(failure)
+    await expect(executeWithModelFallback(registry(), [
+      { target: { provider: "minimax", model: "MiniMax-M3" } },
+      { target: { provider: "anthropic", model: "claude-test" } },
+    ], invoke, { irreversibleActionStarted: true })).rejects.toBe(failure)
+    expect(invoke).toHaveBeenCalledTimes(1)
+
+    const predicateFailure = vi.fn().mockRejectedValue(failure)
+    await expect(executeWithModelFallback(registry(), [
+      { target: { provider: "minimax", model: "MiniMax-M3" } },
+      { target: { provider: "anthropic", model: "claude-test" } },
+    ], predicateFailure, { irreversibleActionStarted: () => { throw new Error("state unavailable") } })).rejects.toBe(failure)
+    expect(predicateFailure).toHaveBeenCalledTimes(1)
+  })
 })

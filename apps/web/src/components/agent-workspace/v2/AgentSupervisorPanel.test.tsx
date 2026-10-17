@@ -1,8 +1,13 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('@/lib/hooks', () => ({ useApi: () => ({ data: null, loading: false, error: null, refetch: () => undefined }) }))
+const supervisorApi = vi.hoisted(() => ({ calls: [] as string[], responses: new Map<string, unknown>() }))
+vi.mock('@/lib/hooks', () => ({ useApi: (url: string) => {
+  supervisorApi.calls.push(url)
+  return supervisorApi.responses.get(url) ?? { data: null, loading: false, error: null, refetch: () => undefined }
+} }))
+vi.mock('next-auth/react', () => ({ useSession: () => ({ data: null, status: 'unauthenticated' }) }))
 
 import { translate } from '@/lib/i18n'
 import { AgentSupervisorPanel, EvidenceSummary, projectSelectedEvidence } from './AgentSupervisorPanel'
@@ -11,6 +16,8 @@ import { TaskInterruptControl } from './TaskTreePanel'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 import type { TimelineItem } from './timeline-reducer'
 import type { TaskTreeNode } from './types'
+import { SELECTED_JOB_PREPARATION_MESSAGE_TEXT } from './selected-job-preparation-action'
+import { buildTaskGraphTaskLookupUrl } from './task-graph-plan-query'
 
 function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
   return {
@@ -23,6 +30,8 @@ function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
 const t = (key: string) => translate('en', key)
 
 describe('AgentSupervisorPanel selected evidence', () => {
+  beforeEach(() => { supervisorApi.calls = []; supervisorApi.responses.clear() })
+
   it('projects an eligible selected child into the accessible interrupt action', () => {
     const task = {
       id: 'child-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1', parentTaskId: 'root-1',
@@ -57,6 +66,35 @@ describe('AgentSupervisorPanel selected evidence', () => {
     } satisfies AgentTimelineSnapshot
 
     expect(renderToStaticMarkup(<AgentSupervisorPanel sessionId={null} timeline={timeline} />)).toBe('')
+  })
+
+  it('keeps the current preparation query and restored draft bound to the preparation Turn', () => {
+    const now = '2026-10-01T12:00:00.000Z'
+    const graph = item({ id: 'graph-current', turnId: 'turn-current', taskId: 'root-current', type: 'task_graph', revision: 2,
+      content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [{ key: 'writer', templateId: 'writer', goal: 'Prepare a cover letter', successCriteria: ['Save the draft'], dependsOn: [], depth: 1, taskId: 'writer-current' }] } })
+    const request = item({ id: 'request-current', turnId: 'turn-current', taskId: null, type: 'user_message', revision: 1,
+      content: { parts: [{ type: 'text', text: SELECTED_JOB_PREPARATION_MESSAGE_TEXT }] }, sequence: '42', createdAt: now, updatedAt: now })
+    const timeline = {
+      sessionId: 'session-1', items: [graph, request], lastEventId: null, lifecycleRevision: 0, cognitiveAgenda: null, cognitiveAgendas: [],
+      approvalLedger: { sessionId: 'session-1', approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 },
+      connection: 'connected', restoring: false, error: null,
+    } satisfies AgentTimelineSnapshot
+    const currentUrl = buildTaskGraphTaskLookupUrl('session-1', [graph, request], 'turn-current')!
+    const artifactRef = { artifactId: 'draft-current', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
+    supervisorApi.responses.set(currentUrl, { data: { tasks: [
+      { id: 'root-current', sessionId: 'session-1', turnId: 'turn-current', rootTaskId: 'root-current', role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Current root', hasResult: false },
+      { id: 'writer-current', sessionId: 'session-1', turnId: 'turn-current', rootTaskId: 'root-current', role: 'writer', taskType: 'cover_letter_draft', status: 'completed', goal: 'Current draft', hasResult: true, artifactRef },
+      { id: 'writer-old', sessionId: 'session-1', turnId: 'turn-old', rootTaskId: 'root-old', role: 'writer', taskType: 'cover_letter_draft', status: 'completed', goal: 'Older draft', hasResult: true,
+        artifactRef: { ...artifactRef, artifactId: 'draft-old', version: 99 } },
+    ] }, loading: false, error: null, refetch: () => undefined })
+
+    const html = renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={timeline} />)
+    expect(supervisorApi.calls).toContain(currentUrl)
+    expect(currentUrl).toContain('graphTurnId=turn-current')
+    expect(html).toContain('data-selected-job-draft="true"')
+    expect(html).toContain('data-draft-version="2"')
+    expect(html).not.toContain('data-draft-version="99"')
+    expect(html).not.toContain('Plan for selected turn')
   })
 
   it('projects bounded audit metadata and renders only safe references', () => {

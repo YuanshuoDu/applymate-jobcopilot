@@ -10,20 +10,17 @@ import { prepareDurableWaitOutput, prepareLifecycleValue, prepareSafeValue, prep
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
-
+import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
-
 export interface ToolLifecycleEvent {
   readonly phase: ToolLifecyclePhase
   readonly eventType: string
   readonly item: ToolCallItem | ToolResultItem
   readonly payload: ToolLifecyclePayload
 }
-
 export interface ToolLifecycleSink {
   append(event: ToolLifecycleEvent): Promise<void>
 }
-
 export type ToolLifecycleOwnerContext = {
   readonly sessionId: string
   readonly turnId: string
@@ -32,9 +29,7 @@ export type ToolLifecycleOwnerContext = {
   readonly rootTaskId?: string
   readonly toolCallId?: string
 }
-
 export type ToolLifecycleOwnerResolver = (context: ToolLifecycleOwnerContext) => ExecutionOwner
-
 export class InMemoryToolLifecycleSink implements ToolLifecycleSink {
   readonly events: ToolLifecycleEvent[] = []
 
@@ -61,6 +56,7 @@ export class ToolLifecycle {
   private readonly now: () => string
   private readonly maxEventBytes: number
   private readonly inputs = new Map<string, unknown>()
+  private readonly pageCalls = new Set<string>()
 
   constructor(private readonly options: ToolLifecycleOptions) {
     this.now = options.now ?? (() => new Date().toISOString())
@@ -69,7 +65,10 @@ export class ToolLifecycle {
 
   async started(call: LifecycleCall, input: unknown): Promise<void> {
     const timestamp = this.now()
-    const safeInput = sanitizeLifecyclePreview(input, this.maxEventBytes)
+    const listInput = call.toolName === "agent.list" ? prepareAgentListLifecycleInput(input, this.maxEventBytes) : null
+    if (listInput?.pageRequest) this.pageCalls.add(call.id)
+    else this.pageCalls.delete(call.id)
+    const safeInput = listInput?.safeInput ?? sanitizeLifecyclePreview(input, this.maxEventBytes)
     this.inputs.set(call.id, safeInput)
     const item: ToolCallItem = {
       schemaVersion,
@@ -108,19 +107,19 @@ export class ToolLifecycle {
     await this.append({ phase: "progress", eventType: "tool_call.progress", item, payload: this.payload(call, "streaming", { progress: safeProgress }) })
   }
 
-  async completed(call: LifecycleCall, output: unknown): Promise<unknown> {
-    return this.result(call, "completed", null, output)
-  }
+  async completed(call: LifecycleCall, output: unknown, signal?: AbortSignal): Promise<unknown> { return this.result(call, "completed", null, output, signal) }
 
   async failed(call: LifecycleCall, phase: "failed" | "cancelled", errorCode: string, detail?: unknown): Promise<unknown> {
     return this.result(call, phase, errorCode, detail)
   }
 
-  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown): Promise<unknown> {
+  private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal): Promise<unknown> {
     const timestamp = this.now()
+    const pageCall = this.pageCalls.delete(call.id)
     const safeOutput = phase === "completed"
-      ? await this.persistCompletedOutput(call, output ?? null)
+      ? await this.persistCompletedOutput(call, output ?? null, pageCall)
       : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
+    if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     const item: ToolResultItem = {
       schemaVersion,
       id: `tool-result-item:${call.id}`,
@@ -135,15 +134,19 @@ export class ToolLifecycle {
       output: safeOutput,
       errorCode,
     }
+    if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     await this.append({ phase, eventType: phase === "completed" ? "tool_call.completed" : "tool_call.failed", item, payload: this.payload(call, phase, { output: safeOutput, errorCode }) })
     this.inputs.delete(call.id)
     return safeOutput
   }
 
-  private async persistCompletedOutput(call: LifecycleCall, output: unknown): Promise<unknown> {
+  private async persistCompletedOutput(call: LifecycleCall, output: unknown, pageCall: boolean): Promise<unknown> {
     let prepared: ReturnType<typeof prepareLifecycleValue>
     const nativeFollowup = call.toolName === "agent.followup" && hasNativeCoordinationEnvelope(output)
-    if (call.toolName === "agent.plan") {
+    if (call.toolName === "agent.list" && (pageCall || isTaskGraphResultPageLike(output))) {
+      try { prepared = prepareTaskGraphResultPageOutput(output) }
+      catch { throw new ToolExecutionError("task_graph_result_page_invalid", "TaskGraph result page is invalid") }
+    } else if (call.toolName === "agent.plan") {
       try {
         prepared = prepareTaskGraphPlanReceipt(output)
       } catch {
@@ -167,7 +170,7 @@ export class ToolLifecycle {
       } catch {
         throw new ToolExecutionError("durable_wait_receipt_invalid", "Durable wait receipt is invalid")
       }
-    } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get") {
+    } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get" || call.toolName === "jobs.discover") {
       prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
     } else if (call.toolName === "tool_results.read") {
       let owner: ExecutionOwner | undefined
@@ -182,7 +185,8 @@ export class ToolLifecycle {
     if (prepared.sizeBytes > MAX_TOOL_RESULT_BYTES) {
       throw new ToolExecutionError("tool_result_too_large", "Tool result exceeds the 1 MiB limit")
     }
-    if (prepared.sizeBytes <= this.maxEventBytes) return prepared.safe
+    const inlineLimit = call.toolName === "jobs.discover" ? Math.min(this.maxEventBytes, 6 * 1024) : this.maxEventBytes
+    if (prepared.sizeBytes <= inlineLimit) return prepared.safe
     if (call.toolName === "agent.plan" || call.toolName === "agent.spawn" || call.toolName === "spawn_subagent" || nativeFollowup) {
       throw new ToolExecutionError("tool_result_too_large", "Agent receipt exceeds the lifecycle event limit")
     }

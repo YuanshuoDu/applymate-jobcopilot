@@ -21,4 +21,15 @@ describe("agent model errors", () => {
       code: "cancelled", recoverable: true, retryable: false,
     })
   })
+
+  it("represents a local context estimate rejection as a distinct non-retryable error", () => {
+    const error = new AgentModelError({
+      code: "context_estimate_exceeded", message: "Approximate request context exceeds this route's window",
+      provider: "minimax", model: "MiniMax-M3", retryable: false, recoverable: false,
+    })
+    expect(error.descriptor()).toMatchObject({
+      code: "context_estimate_exceeded", provider: "minimax", model: "MiniMax-M3",
+      retryable: false, recoverable: false,
+    })
+  })
 })

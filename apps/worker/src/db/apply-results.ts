@@ -1,4 +1,6 @@
 import pg from "pg";
+import type { ApplicationSubmitIdentity } from "../queue/application-submit-fence.js";
+import { withExactSubmissionWrite } from "./submission-guard.js";
 
 const { Pool } = pg;
 
@@ -45,14 +47,35 @@ export interface InsertApplyResult {
   status: string;
   error?: string | null;
   durationMs?: number | null;
+  /** Present for every canonical submit result; omitted for fill-only outcomes. */
+  submissionIdentity?: ApplicationSubmitIdentity;
 }
 
 /** Insert a row into apply_results */
 export async function insertApplyResult(
   result: InsertApplyResult
-): Promise<number> {
-  const client = await getPool().connect();
+): Promise<number | null> {
+  if (result.flowUsed === "application.submit" && !result.submissionIdentity) {
+    throw new Error("Canonical submit results require an exact application attempt identity.");
+  }
+  const pool = getPool();
+  if (result.submissionIdentity) {
+    const fenced = await withExactSubmissionWrite(pool, result.submissionIdentity, "insert_apply_result", client =>
+      insertApplyResultWithClient(client, result));
+    return fenced.kind === "current" ? fenced.value : null;
+  }
+  const client = await pool.connect();
   try {
+    return await insertApplyResultWithClient(client, result);
+  } finally {
+    client.release();
+  }
+}
+
+async function insertApplyResultWithClient(
+  client: Pick<pg.PoolClient, "query">,
+  result: InsertApplyResult,
+): Promise<number> {
     const res = await client.query(
       `INSERT INTO apply_results (user_id, job_id, mode, ats_type, flow_used, status, error, duration_ms)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -69,9 +92,6 @@ export async function insertApplyResult(
       ]
     );
     return res.rows[0].id;
-  } finally {
-    client.release();
-  }
 }
 
 /** Close the pool (for tests) */

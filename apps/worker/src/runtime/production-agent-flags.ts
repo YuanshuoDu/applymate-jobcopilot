@@ -5,6 +5,8 @@ export type ProductionAgentFlags = {
   readonly consumeWaitOutcomes: boolean
   readonly canonicalAutomationEnabled: boolean
   readonly turnBoundaryCompactionEnabled: boolean
+  readonly nativeSemanticProgressMemoryEnabled?: boolean
+  readonly crossSessionRootTaskHistoryEnabled?: boolean
 }
 
 /** Resolve server-owned production gates; model input and policy snapshots cannot change them. */
@@ -23,5 +25,7 @@ export function resolveProductionAgentFlags(env: Record<string, string | undefin
     consumeWaitOutcomes: coordinationEnabled,
     canonicalAutomationEnabled: env.ENABLE_AGENT_CANONICAL_AUTOMATION === "1",
     turnBoundaryCompactionEnabled: env.ENABLE_AGENT_TURN_BOUNDARY_COMPACTION === "1",
+    nativeSemanticProgressMemoryEnabled: env.ENABLE_AGENT_NATIVE_SEMANTIC_PROGRESS_MEMORY === "1",
+    crossSessionRootTaskHistoryEnabled: env.ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY === "1",
   }
 }

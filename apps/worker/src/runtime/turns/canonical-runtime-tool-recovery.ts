@@ -33,6 +33,28 @@ export function assertCanonicalCoordinationSurface(registry: { readonly list: (c
   } catch { throw new Error("canonical_coordination_tools_unconfigured") }
 }
 
+export function assertCanonicalQuestionSurface(registry: { readonly list: (capabilities?: readonly string[]) => readonly unknown[] }, capabilities: readonly string[]): void {
+  try {
+    const names = new Set(registry.list(capabilities).map(item => item && typeof item === "object" ? (item as { name?: unknown }).name : undefined))
+    if (!names.has("agent.ask_user")) throw new Error("missing canonical question tool")
+  } catch { throw new Error("canonical_question_tool_unconfigured") }
+}
+
+export function assertCanonicalQuestionStore(store: {
+  readonly stageQuestionUsage?: unknown; readonly cancelPausedQuestion?: unknown; readonly waitForQuestion?: unknown; readonly readPendingQuestion?: unknown
+}, required: boolean): void {
+  if (required && [store.stageQuestionUsage, store.cancelPausedQuestion, store.waitForQuestion, store.readPendingQuestion].some(method => typeof method !== "function")) {
+    throw new Error("canonical_question_wait_unconfigured")
+  }
+}
+
+export function isNativeQuestionWaitEnabled(input: Readonly<{
+  coordination: boolean; nativeRoot: boolean; requested?: boolean; customAdapters: boolean
+}>): boolean {
+  if (!input.coordination || !input.nativeRoot) return false
+  return input.requested ?? !input.customAdapters
+}
+
 export function classifyToolCallRecovery(
   pending: readonly PersistedToolCallRecovery[],
   resolve: (name: string, version: string) => { readonly idempotency: ToolIdempotency },

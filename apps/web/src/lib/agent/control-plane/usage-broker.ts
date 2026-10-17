@@ -28,7 +28,9 @@ type UsageAdmissionCommon = {
 
 export type UsageAdmissionInput = UsageAdmissionCommon & UsageAdmissionOwnerInput
 
-export type UsageSettlementInput = {
+export type UsageReleaseInput = UsageAdmissionInput & { status: "released" }
+
+export type UsageSettlementInput = UsageReleaseInput | {
   operationId: string
   userId: string
   provider: string
@@ -49,9 +51,7 @@ export class UsageBrokerError extends Error {
   }
 }
 
-function month(now: Date): string {
-  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`
-}
+function month(now: Date): string { return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}` }
 
 function operationId(input: UsageAdmissionInput, owner: UsageExecutionOwner): string {
   const ownerIdentity = owner.kind === "task"
@@ -61,14 +61,20 @@ function operationId(input: UsageAdmissionInput, owner: UsageExecutionOwner): st
   return `agent-usage-${createHash("sha256").update(identity).digest("hex")}`
 }
 
-function numberValue(value: number, integer = false): number {
-  if (!Number.isFinite(value) || value < 0) return 0
-  return integer ? Math.trunc(value) : value
-}
+function numberValue(value: number, integer = false): number { return !Number.isFinite(value) || value < 0 ? 0 : integer ? Math.trunc(value) : value }
 
-function stableErrorCode(value: string | undefined): string | null {
-  if (!value) return null
-  return /^[a-z0-9_.-]{1,64}$/i.test(value) ? value : "provider_error"
+function stableErrorCode(value: string | undefined): string | null { return !value ? null : /^[a-z0-9_.-]{1,64}$/i.test(value) ? value : "provider_error" }
+function ownerFor(input: UsageAdmissionInput): UsageExecutionOwner {
+  try { return normalizeUsageOwner(input) } catch (error: unknown) {
+    if (error instanceof UsageOwnerFenceError) throw new UsageBrokerError("usage_fence_rejected", 409)
+    throw error
+  }
+}
+function rejectExisting(row: { id: string; status: string; userId: string | null; provider: string; model: string }, input: UsageAdmissionInput): never {
+  if (row.userId !== input.userId || row.provider !== input.provider || row.model !== input.model) throw new UsageBrokerError("usage_attempt_conflict", 409)
+  if (row.status === "released") throw new UsageBrokerError("usage_attempt_released", 409)
+  if (row.status !== "reserved") throw new UsageBrokerError("usage_attempt_settled", 409)
+  throw new UsageBrokerError("usage_attempt_in_flight", 409)
 }
 
 async function assertOwnerStep(tx: UsageBrokerQuery, input: UsageAdmissionInput, owner: UsageExecutionOwner): Promise<void> {
@@ -139,17 +145,12 @@ async function reserveCredit(tx: UsageBrokerQuery, input: UsageAdmissionInput, l
   if (!updated[0]) throw new UsageBrokerError("ai_credits_exhausted", 429)
 }
 
-/** Atomically claim one AI credit and create the provider-attempt ledger row. */
 export async function admitAiUsage(
   db: UsageBrokerDatabase,
   input: UsageAdmissionInput,
   now = new Date(),
 ): Promise<UsageAdmissionResult> {
-  let owner: UsageExecutionOwner
-  try { owner = normalizeUsageOwner(input) } catch (error: unknown) {
-    if (error instanceof UsageOwnerFenceError) throw new UsageBrokerError("usage_fence_rejected", 409)
-    throw error
-  }
+  const owner = ownerFor(input)
   const entitlements = await getEffectiveEntitlements(input.userId)
   if (!Object.prototype.hasOwnProperty.call(entitlements.limits, "ai_credits")) throw new UsageBrokerError("ai_credits_disabled", 403)
   const limit = entitlements.limits.ai_credits
@@ -160,24 +161,61 @@ export async function admitAiUsage(
     const existing = await tx.$queryRaw<Array<{ id: string; status: string; userId: string | null; provider: string; model: string }>>(Prisma.sql`
       SELECT id, user_id AS "userId", provider, model, status FROM ai_usage_events WHERE id = ${id} FOR UPDATE`)
     const row = existing[0]
-    if (row) {
-      if (row.userId !== input.userId || row.provider !== input.provider || row.model !== input.model) throw new UsageBrokerError("usage_attempt_conflict", 409)
-      if (row.status !== "reserved") throw new UsageBrokerError("usage_attempt_settled", 409)
-      throw new UsageBrokerError("usage_attempt_in_flight", 409)
-    }
-    await tx.$queryRaw(Prisma.sql`
+    if (row) rejectExisting(row, input)
+    const creditMonth = limit === null || limit === undefined ? null : month(now)
+    const inserted = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       INSERT INTO ai_usage_events
         (id, user_id, feature_key, provider, model, input_tokens, output_tokens, estimated_cost_usd,
          latency_ms, status, error_code, credential_source, runtime, created_at)
       VALUES (${id}, ${input.userId}, ${input.featureKey}, ${input.provider}, ${input.model}, 0, 0, 0,
-         0, 'reserved', NULL, ${input.credentialSource ?? "platform"}, 'worker', CURRENT_TIMESTAMP)`)
+         0, 'reserved', ${creditMonth ? `credit_reserved_${creditMonth}` : null}, ${input.credentialSource ?? "platform"}, 'worker', CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO NOTHING RETURNING id`)
+    if (!inserted[0]) {
+      const raced = (await tx.$queryRaw<Array<{ id: string; status: string; userId: string | null; provider: string; model: string }>>(Prisma.sql`
+        SELECT id, user_id AS "userId", provider, model, status FROM ai_usage_events WHERE id = ${id} FOR UPDATE`))[0]
+      if (raced) rejectExisting(raced, input)
+      throw new UsageBrokerError("usage_attempt_conflict", 409)
+    }
     if (limit !== null && limit !== undefined) await reserveCredit(tx, input, limit, month(now))
     return { operationId: id }
   })
 }
 
-/** Settle a provider-attempt ledger row; repeated identical settlement is safe. */
 export async function settleAiUsage(db: UsageBrokerDatabase, input: UsageSettlementInput): Promise<void> {
+  if (input.status === "released") {
+    const owner = ownerFor(input), id = operationId(input, owner)
+    await db.$transaction(async (tx) => {
+      await setUserScope(tx, input.userId)
+      const read = () => tx.$queryRaw<Array<{ userId: string | null; provider: string; model: string; status: string; errorCode: string | null }>>(Prisma.sql`
+        SELECT user_id AS "userId", provider, model, status, error_code AS "errorCode"
+        FROM ai_usage_events WHERE id = ${id} FOR UPDATE`)
+      let row = (await read())[0]
+      if (!row) {
+        const inserted = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+          INSERT INTO ai_usage_events
+            (id, user_id, feature_key, provider, model, input_tokens, output_tokens, estimated_cost_usd,
+             latency_ms, status, error_code, credential_source, runtime, created_at)
+          VALUES (${id}, ${input.userId}, ${input.featureKey}, ${input.provider}, ${input.model}, 0, 0, 0,
+             0, 'released', 'cancelled_before_provider', ${input.credentialSource ?? "platform"}, 'worker', CURRENT_TIMESTAMP)
+          ON CONFLICT (id) DO NOTHING RETURNING id`)
+        if (inserted[0]) return
+        row = (await read())[0]
+      }
+      if (!row) throw new UsageBrokerError("usage_attempt_missing", 409)
+      if (row.userId !== input.userId || row.provider !== input.provider || row.model !== input.model) throw new UsageBrokerError("usage_attempt_conflict", 409)
+      if (row.status === "released") return
+      if (row.status !== "reserved") throw new UsageBrokerError("usage_attempt_settled", 409)
+      const reservedMonth = /^credit_reserved_(\d{4}-\d{2})$/.exec(row.errorCode ?? "")?.[1]
+      if (reservedMonth) await tx.$queryRaw(Prisma.sql`
+        UPDATE ai_budgets SET used = GREATEST(used - 1, 0), updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ${input.userId} AND month = ${reservedMonth}`)
+      await tx.$queryRaw(Prisma.sql`
+        UPDATE ai_usage_events SET status = 'released', input_tokens = 0, output_tokens = 0,
+          estimated_cost_usd = 0, error_code = 'cancelled_before_provider'
+        WHERE id = ${id} AND status = 'reserved'`)
+    })
+    return
+  }
   const inputTokens = numberValue(input.inputTokens, true)
   const outputTokens = numberValue(input.outputTokens, true)
   const estimatedCostUsd = numberValue(input.estimatedCostUsd)

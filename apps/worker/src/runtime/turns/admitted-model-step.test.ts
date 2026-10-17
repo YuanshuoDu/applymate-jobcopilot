@@ -12,11 +12,12 @@ function writer(events: string[], failStart = false) {
 
 describe("admitted model step", () => {
   it("persists start before provider invocation and settles completion afterward", async () => {
-    const events: string[] = [], sink = writer(events), result = { text: "answer" }
+    const events: string[] = [], sink = writer(events), result = { text: "answer", toolCalls: [{ id: "call-1" }, { id: "call-2" }] }
     const invoke = vi.fn(async () => { events.push("provider"); return result })
     await expect(runAdmittedModelStep({ writer: sink, stepId: "step-1", taskId: "root-1", provider: "fixture", model: "test", invoke })).resolves.toBe(result)
     expect(events).toEqual(["model.started", "provider", "model.completed"])
     expect(sink.append.mock.calls.map(call => call[4])).toEqual(["model-started:step-1", "model-completed:step-1"])
+    expect(sink.append.mock.calls[1]?.[3]).toEqual({ taskId: "root-1", provider: "fixture", model: "test", toolCallCount: 2 })
   })
 
   it("never invokes a provider when the durable start fence is denied", async () => {

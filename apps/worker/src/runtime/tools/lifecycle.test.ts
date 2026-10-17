@@ -16,6 +16,7 @@ import type { RuntimeToolDefinition, ToolExecutionContext } from "./types.js"
 import type { ToolResultChunk, ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
 import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_RESULT_PAGE_SCHEMA } from "../subagents/task-graph-result-page-contract.js"
 
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
 const ordinaryCall: LifecycleCall = { ...call, toolName: "notes.read" }
@@ -25,6 +26,26 @@ const numericUuidV1 = "00000000-0000-1000-8000-000000000000"
 const phoneLikeId = "+353 87 123 4567"
 const prefixedFixtureId = `p3-discovery-failure-job-${numericUuidV4}`
 const cuidJobId = "c123456789012345678901234"
+function discoverJob(description: string) {
+  return {
+    id: cuidJobId, title: "Engineer", company: "Example", location: "Dublin", url: "https://jobs.example/1",
+    description, fullDescription: description, salary: null, logo: null, source: "greenhouse", evidenceRefs: ["evidence-source-1"],
+  }
+}
+function discoverEvidence() {
+  return {
+    evidenceId: "evidence-source-1", jobId: cuidJobId, kind: "source", source: "greenhouse",
+    url: "https://jobs.example/1", summary: "Source listing",
+  }
+}
+function discoverUsage(toolCallId: string) {
+  return {
+    ledgerKey: "ledger-discover", toolName: "jobs.discover", toolVersion: "1", toolCallId,
+    sessionId: "session-1", turnId: "turn-1", stepId: "step-1", requests: 1,
+    jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0, aiCalls: 0,
+    providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1,
+  }
+}
 const planReceipt = {
   status: "accepted",
   revision: 1,
@@ -236,6 +257,32 @@ describe("ToolLifecycle", () => {
     expect(sink.events[0]?.payload.output).toEqual(output)
   })
 
+  it("preserves canonical jobs.discover job and evidence references in lifecycle events", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const callId = "call-discover"
+    const output = await lifecycle.completed({ ...call, id: callId, toolName: "jobs.discover" }, {
+      jobs: [discoverJob("Contact " + phoneLikeId)], evidence: [discoverEvidence()],
+      nextCursor: null, usage: discoverUsage(callId),
+    })
+
+    expect(output).toMatchObject({
+      jobs: [{ id: cuidJobId, description: "Contact [REDACTED_PHONE]", evidenceRefs: ["evidence-source-1"] }],
+      evidence: [{ jobId: cuidJobId, source: "greenhouse" }],
+      usage: {
+        toolName: "jobs.discover", toolVersion: "1", requests: 1, jobsProcessed: 1,
+        jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0, aiCalls: 0,
+        providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1,
+      },
+    })
+    for (const key of ["ledgerKey", "toolCallId", "sessionId", "turnId", "stepId"]) {
+      expect(output).not.toHaveProperty(`usage.${key}`)
+      expect(sink.events[0]?.payload.output).not.toHaveProperty(`usage.${key}`)
+    }
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output })
+    expect(sink.events[0]?.payload.output).toEqual(output)
+  })
+
   it.each([
     { toolName: "jobs.search", output: { jobs: [{ id: phoneLikeId }], page: 1, hasMore: false } },
     { toolName: "jobs.get", output: { job: { id: numericUuidV1 } } },
@@ -279,6 +326,88 @@ describe("ToolLifecycle", () => {
       id: "[REDACTED_PHONE]",
     })
     expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output })
+    expect(sink.events[0]?.payload.output).toEqual(output)
+  })
+
+  it("stores canonical jobs.discover IDs in durable references after lifecycle redaction", async () => {
+    const put = vi.fn(async (_owner: ExecutionOwner, input: { stepId: string; toolCallId: string; value: unknown }) => ({
+      id: "tool-result-discover", userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: input.stepId,
+      taskId: "root-1", toolCallId: input.toolCallId, sanitizedJson: input.value as never, sha256: "a".repeat(64),
+      byteCount: 9_000, createdAt: new Date(), updatedAt: new Date(),
+    }))
+    const repository = { put, read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink, durableResults: repository, resolveOwner: () => owner, maxEventBytes: 256 })
+    const longDescription = "x".repeat(600)
+    const callId = "call-discover-durable"
+    const result = await lifecycle.completed({ ...call, id: callId, toolName: "jobs.discover" }, {
+      jobs: [discoverJob(longDescription)], evidence: [discoverEvidence()],
+      nextCursor: null, usage: discoverUsage(callId),
+    })
+
+    expect(result).toMatchObject({ $ref: "tool-result-discover" })
+    expect(put).toHaveBeenCalledTimes(1)
+    expect(put.mock.calls[0]?.[1].value).toMatchObject({
+      jobs: [{ id: cuidJobId, description: longDescription, evidenceRefs: ["evidence-source-1"] }],
+      evidence: [{ jobId: cuidJobId }],
+    })
+    expect(sink.events[0]?.payload.output).toEqual(result)
+  })
+
+  it("uses the 6 KiB resume limit only for jobs.discover lifecycle output", async () => {
+    const put = vi.fn(async (_owner: ExecutionOwner, input: { stepId: string; toolCallId: string; value: unknown }) => ({
+      id: "tool-result-discover-boundary", userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: input.stepId,
+      taskId: "root-1", toolCallId: input.toolCallId, sanitizedJson: input.value as never, sha256: "b".repeat(64),
+      byteCount: Buffer.byteLength(canonicalJson(input.value as never), "utf8"), createdAt: new Date(), updatedAt: new Date(),
+    }))
+    const repository = { put, read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), durableResults: repository, resolveOwner: () => owner })
+    const callId = "call-discover-at-limit"
+    const discoveryOutput = (toolCallId: string, description: string) => ({
+      jobs: [{ ...discoverJob(description), title: "EngineerX" }], evidence: [discoverEvidence()],
+      nextCursor: null, usage: discoverUsage(toolCallId),
+    })
+    const emptyDescription = discoveryOutput(callId, "")
+    const baseBytes = Buffer.byteLength(canonicalJson(redactJobReadOutput("jobs.discover", emptyDescription)), "utf8")
+    const exactDescriptionLength = (6 * 1024 - baseBytes) / 2
+    expect(Number.isInteger(exactDescriptionLength)).toBe(true)
+    const atLimit = discoveryOutput(callId, "x".repeat(exactDescriptionLength))
+    expect(Buffer.byteLength(canonicalJson(redactJobReadOutput("jobs.discover", atLimit)), "utf8")).toBe(6 * 1024)
+
+    const inline = await lifecycle.completed({ ...call, id: callId, toolName: "jobs.discover" }, atLimit)
+    expect(inline).toEqual(redactJobReadOutput("jobs.discover", atLimit))
+    expect(put).not.toHaveBeenCalled()
+
+    const overLimit = discoveryOutput("call-discover-over-limit", "x".repeat(exactDescriptionLength + 1))
+    const durable = await lifecycle.completed({ ...call, id: "call-discover-over-limit", toolName: "jobs.discover" }, overLimit)
+    expect(durable).toMatchObject({ $ref: "tool-result-discover-boundary" })
+    expect(put).toHaveBeenCalledTimes(1)
+
+    const searchOutput = {
+      jobs: [{ id: cuidJobId, description: "x".repeat(7_000) }], page: 1, hasMore: false,
+    }
+    const searchBytes = Buffer.byteLength(canonicalJson(redactJobReadOutput("jobs.search", searchOutput)), "utf8")
+    expect(searchBytes).toBeGreaterThan(6 * 1024)
+    expect(searchBytes).toBeLessThan(8 * 1024)
+    await expect(lifecycle.completed({ ...call, id: "call-search-under-eight-kib", toolName: "jobs.search" }, searchOutput))
+      .resolves.toEqual(redactJobReadOutput("jobs.search", searchOutput))
+    expect(put).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps jobs.discover IDs redacted under every non-job tool", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const output = await lifecycle.completed(ordinaryCall, {
+      jobs: [{ id: numericUuidV4, metadata: { id: numericUuidV4 } }],
+      evidence: [{ evidenceId: "evidence-source-1", jobId: numericUuidV4 }],
+      nextCursor: null, usage: { requests: 1 },
+    })
+
+    expect(output).toEqual({
+      jobs: [{ id: "[REDACTED_PHONE]", metadata: { id: "[REDACTED_PHONE]" } }],
+      evidence: [{ evidenceId: "evidence-source-1", jobId: "[REDACTED_PHONE]" }],
+      nextCursor: null, usage: { requests: 1 },
+    })
     expect(sink.events[0]?.payload.output).toEqual(output)
   })
 
@@ -608,5 +737,61 @@ describe("ToolLifecycle", () => {
       await expect(lifecycle.completed(planCall, receipt)).rejects.toMatchObject({ code: "task_graph_receipt_invalid" })
       expect(sink.events).toHaveLength(0)
     }
+  })
+
+  it("preserves canonical numeric UUID job IDs only for a validated agent.list page", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const pageCall = { ...call, id: "call-result-page", toolName: "agent.list" }
+    const request = { nodeKey: "node-1", expectedRevision: 5, offset: 0 }
+    const page = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 5,
+      role: "analyst", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
+      offset: 0, nextOffset: null,
+      items: [{ jobId: "00000000-0000-4000-8000-000000000000", score: 8, evidenceKinds: ["job"] }],
+    }
+    await lifecycle.started(pageCall, request)
+    const output = await lifecycle.completed(pageCall, page)
+    expect(output).toMatchObject({ items: [{ jobId: "00000000-0000-4000-8000-000000000000" }] })
+    expect(sink.events.at(-1)?.item).toMatchObject({ type: "tool_result", output })
+  })
+
+  it("previews only validated agent.list inputs without reading hostile invalid values", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const legacyCall = { ...call, id: "call-list-legacy-input", toolName: "agent.list" }
+    await lifecycle.started(legacyCall, { includeTerminal: true })
+    expect(sink.events.at(-1)?.item).toMatchObject({ input: { includeTerminal: true } })
+
+    const getter = vi.fn(() => "candidate@example.com")
+    const malformed = { expectedRevision: 1, offset: 0 }
+    Object.defineProperty(malformed, "nodeKey", { enumerable: true, get: getter })
+    await lifecycle.started({ ...legacyCall, id: "call-list-getter" }, malformed)
+    expect(getter).not.toHaveBeenCalled()
+    expect(sink.events.at(-1)?.item).toMatchObject({ input: "[invalid agent.list input]" })
+
+    const trap = vi.fn(() => { throw new Error("proxy trap executed") })
+    const hostile = new Proxy({}, { ownKeys: trap, get: trap, getOwnPropertyDescriptor: trap })
+    await lifecycle.started({ ...legacyCall, id: "call-list-proxy" }, hostile)
+    expect(trap).not.toHaveBeenCalled()
+    expect(sink.events.at(-1)?.item).toMatchObject({ input: "[invalid agent.list input]" })
+  })
+
+  it("fails closed for malformed page mode and page-like legacy output", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const pageCall = { ...call, id: "call-result-page-malformed", toolName: "agent.list" }
+    await lifecycle.started(pageCall, { nodeKey: "node-1", expectedRevision: 1, offset: 0 })
+    await expect(lifecycle.completed(pageCall, { tasks: [] })).rejects.toMatchObject({ code: "task_graph_result_page_invalid" })
+    await expect(lifecycle.completed({ ...pageCall, id: "call-page-marker" }, {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, availability: "available", email: "secret@example.com",
+    })).rejects.toMatchObject({ code: "task_graph_result_page_invalid" })
+    expect(sink.events).toHaveLength(1)
+  })
+
+  it("keeps generic redaction for legacy agent.list task IDs", async () => {
+    const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
+    const output = await lifecycle.completed({ ...call, toolName: "agent.list" }, { tasks: [{ taskId: "+353 87 123 4567" }] })
+    expect(output).toEqual({ tasks: [{ taskId: "[REDACTED_PHONE]" }] })
   })
 })

@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { describe, expect, it } from "vitest"
 
-import { getSubagentRolePolicy, isHarnessSubagentRole, preflightSubagentTool, visibleSubagentTools, visibleToolPolicy } from "./role-policy.js"
+import { APPLICATION_FILLER_ROLE, APPLICATION_FILLER_TASK_TYPE, APPLICATION_FILLER_TEMPLATE_ID, getSubagentRolePolicy, isApplicationFillerTemplate, isHarnessSubagentRole, preflightSubagentTool, visibleSubagentTools, visibleToolPolicy } from "./role-policy.js"
 import type { RuntimeToolDefinition } from "../tools/types.js"
 
 function tool(name: string, risk: RuntimeToolDefinition["risk"], domain: RuntimeToolDefinition["domain"]): RuntimeToolDefinition {
@@ -11,6 +11,14 @@ function tool(name: string, risk: RuntimeToolDefinition["risk"], domain: Runtime
     inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({}, { additionalProperties: false }),
     risk, domain, idempotency: risk === "read" ? "read_only" : "non_repeatable", timeoutMs: 1_000, requiredCapabilities: [],
     execute: async () => ({}),
+  }
+}
+
+function discoverTool(overrides: Partial<RuntimeToolDefinition> = {}): RuntimeToolDefinition {
+  return {
+    ...tool("jobs.discover", "internal_write", "jobs"),
+    version: "1", capabilities: ["read", "write"], requiredCapabilities: ["read"], idempotency: "requires_key",
+    ...overrides,
   }
 }
 
@@ -31,9 +39,50 @@ describe("subagent role policy", () => {
     expect(preflightSubagentTool("executor", mislabeled)).toMatchObject({ allowed: false, execute: false, externalWriteBlocked: true, reasonCode: "external_write_disabled" })
   })
 
+  it.each(["scout", "analyst", "writer", "reviewer", "auditor", "executor"] as const)("denies outcome summaries to the %s role", role => {
+    const outcomes = tool("application.outcomes_summary", "read", "application")
+    expect(visibleToolPolicy(role, outcomes)).toEqual({ visible: false, reason: "root_only_tool" })
+    expect(visibleSubagentTools(role, [outcomes])).toEqual([])
+    expect(preflightSubagentTool(role, outcomes)).toMatchObject({ allowed: false, execute: false, reasonCode: "root_only_tool" })
+  })
+
   it("fails closed for an unknown role and missing tools", () => {
     expect(visibleSubagentTools("future-role", [tool("jobs.search", "read", "jobs")])).toEqual([])
     expect(preflightSubagentTool("executor", null)).toMatchObject({ allowed: false, execute: false })
+  })
+
+  it("allows only the exact jobs.discover internal-write tuple to generic Scout", () => {
+    const discover = discoverTool()
+    expect(visibleToolPolicy("scout", discover)).toEqual({ visible: true, reason: "role_allowed" })
+    expect(preflightSubagentTool("scout", discover)).toMatchObject({ allowed: true, execute: false, reasonCode: "role_allowed" })
+
+    for (const role of ["analyst", "writer", "reviewer", "auditor", "executor"] as const) {
+      expect(visibleToolPolicy(role, discover).visible).toBe(false)
+      expect(visibleSubagentTools(role, [discover])).toEqual([])
+    }
+    for (const invalid of [
+      { ...discover, version: "2" },
+      { ...discover, risk: "read" as const },
+      { ...discover, domain: "persona" as const },
+      { ...discover, capabilities: ["read"] as const },
+      { ...discover, capabilities: ["read", "external_write"] as const },
+      { ...discover, requiredCapabilities: ["read", "write"] },
+      { ...discover, name: "jobs.lookup" },
+    ]) {
+      expect(visibleToolPolicy("scout", invalid).visible).toBe(false)
+    }
+    expect(visibleToolPolicy("scout", discoverTool({ name: "jobs.search" })).visible).toBe(false)
+  })
+
+  it("registers Application Filler as a server-owned role with no model-visible tools", () => {
+    expect(getSubagentRolePolicy(APPLICATION_FILLER_ROLE)).toMatchObject({
+      role: APPLICATION_FILLER_ROLE, actorRole: "subagent", capabilities: [], allowedRisks: [], allowedDomains: [],
+      canManageChildren: false, externalWritesEnabled: false,
+    })
+    expect(isHarnessSubagentRole(APPLICATION_FILLER_ROLE)).toBe(false)
+    expect(isApplicationFillerTemplate(APPLICATION_FILLER_TEMPLATE_ID, APPLICATION_FILLER_ROLE, APPLICATION_FILLER_TASK_TYPE)).toBe(true)
+    expect(isApplicationFillerTemplate("caller_template", APPLICATION_FILLER_ROLE, APPLICATION_FILLER_TASK_TYPE)).toBe(false)
+    expect(visibleSubagentTools(APPLICATION_FILLER_ROLE, [tool("application.get_state", "read", "application")])).toEqual([])
   })
 
   it("hides every canonical and legacy coordination tool from children", () => {

@@ -2,7 +2,14 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { PrismaClient } from "@prisma/client"
 
+const applicationFillMocks = vi.hoisted(() => ({ startApplicationFillForReview: vi.fn() }))
+
+vi.mock("./application-fill-command", () => ({
+  startApplicationFillForReview: applicationFillMocks.startApplicationFillForReview,
+}))
+
 import { AgentCommandService } from "./agent-command-service"
+import { ObjectiveStartCommandService } from "./objective-start"
 
 type Row = Record<string, unknown>
 
@@ -24,6 +31,9 @@ function makeDb(options: {
   activeInput?: unknown
   activeRootTaskId?: string | null
   activeStatus?: string
+  steeringRootTaskId?: string | null
+  steeringInputRows?: Row[]
+  initialInputs?: Row[]
   retryTarget?: Row & { revision: number }
 } = {}) {
   const ownerId = options.ownerId ?? "user_1"
@@ -40,7 +50,7 @@ function makeDb(options: {
   const rawQueries: unknown[] = []
   let rollbacks = 0
   let sequence = BigInt(0)
-  let inputs: Row[] = []
+  let inputs: Row[] = [...(options.initialInputs ?? [])]
   let items: Row[] = []
   let events: Row[] = []
   let outbox: Row[] = []
@@ -56,6 +66,11 @@ function makeDb(options: {
         const available = sessionExists && sessionOwnerId === ownerId && (!openFence || !["aborted", "archived"].includes(sessionStatus))
         return available ? [{ id: "session_1", status: sessionStatus }] : []
       }
+      if (sql.includes('SELECT "input", "rootTaskId" FROM "agent_turns"')) {
+        return [{ input: options.activeInput ?? {}, rootTaskId: options.steeringRootTaskId ?? null }]
+      }
+      if (sql.includes('FROM "agent_inputs" AS input')) return options.steeringInputRows ?? []
+      if (sql.includes("event.\"type\" = 'agent.plan.reconciliation'")) return []
       if (sql.includes("SELECT")) {
         return [{ id: "session_1" }]
       }
@@ -249,6 +264,20 @@ function startCommand(clientMessageId: string, source: "user" | "automation" = "
   return { sessionId: "session_1", userId: "user_1", clientMessageId, source, content: [...content] }
 }
 
+function acceptedSteeringRows(count: number): Row[] {
+  return Array.from({ length: count }, (_, index) => {
+    const id = `steer-${index}`, clientMessageId = `client-${index}`, acceptedSequence = BigInt(index + 1)
+    return {
+      id, clientMessageId, delivery: "steer", status: index % 2 ? "queued" : "accepted", acceptedSequence,
+      consumedByStepId: null, consumedAt: null, cancelledAt: null, acceptedType: "input.accepted", acceptedActor: "user",
+      acceptedTaskId: null, acceptedCorrelationId: "turn_1", acceptedItemId: `${id}-item`, acceptedEventSequence: acceptedSequence,
+      acceptedPayload: { inputId: id, clientMessageId, delivery: "steer", source: "user", disposition: "steered" },
+      acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
+      acceptedItemContent: { parts: [{ type: "text", text: "private" }], clientMessageId, source: "user", disposition: "steered" },
+    }
+  })
+}
+
 function retryTarget(status = "failed", input: unknown = { goal: "Find backend roles", content: [...content] }) {
   return { id: "turn_failed", sessionId: "session_1", userId: "user_1", status, source: "user", revision: 4, input }
 }
@@ -266,7 +295,123 @@ function replacementCommand(clientMessageId: string, expectedTurnId: string, exp
   }
 }
 
+function objectiveStartCommand(clientMessageId: string, source: "user" | "automation" = "user") {
+  return {
+    sessionId: "session_1", userId: "user_1", clientMessageId, source,
+    objective: "  Find senior backend roles in Dublin  ",
+    content: [{ type: "text" as const, text: "\nReference: preserve this context exactly.\n" }],
+  }
+}
+
 describe("AgentCommandService", () => {
+  it("forwards application fill review commands and returns the delegated result", async () => {
+    const fake = makeDb()
+    const command = {
+      sessionId: "session_1",
+      userId: "user_1",
+      clientMessageId: "fill_review_client_1",
+      applicationTaskId: "application_task_1",
+      resumeAfterUserInput: true,
+    }
+    const delegatedResult = {
+      inputId: "input_fill_1",
+      turnId: "turn_fill_1",
+      disposition: "started" as const,
+      sequence: "12",
+    }
+    applicationFillMocks.startApplicationFillForReview.mockReset().mockResolvedValueOnce(delegatedResult)
+
+    await expect(new AgentCommandService(fake.db).startApplicationFillForReview(command)).resolves.toBe(delegatedResult)
+
+    expect(applicationFillMocks.startApplicationFillForReview).toHaveBeenCalledOnce()
+    expect(applicationFillMocks.startApplicationFillForReview.mock.calls[0]?.[0]).toBe(fake.db)
+    expect(applicationFillMocks.startApplicationFillForReview.mock.calls[0]?.[1]).toBe(command)
+  })
+
+  it("starts a fresh root with a separate exact objective and preserved context", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    const longContext = "x".repeat(20_000)
+    const result = await new ObjectiveStartCommandService(fake.db).start({
+      ...objectiveStartCommand("objective_start_1"), content: [{ type: "text", text: longContext }],
+    })
+
+    expect(result).toMatchObject({ disposition: "started", turnId: fake.state.active?.id })
+    expect(fake.state.active?.input).toMatchObject({
+      goal: "Find senior backend roles in Dublin",
+      content: [{ type: "text", text: longContext }],
+    })
+    expect(fake.state.inputs[0]).toMatchObject({
+      targetTurnId: result.turnId,
+      delivery: "follow_up",
+      content: [{ type: "text", text: longContext }],
+    })
+    expect(fake.state.events.map((event) => event.type)).toEqual(["turn.started", "input.accepted"])
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+    expect(fake.state.turns).toHaveLength(1)
+  })
+
+  it("replays the original fresh root before checking later Session state or active Turns", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    const service = new ObjectiveStartCommandService(fake.db)
+    const first = await service.start(objectiveStartCommand("objective_start_replay"))
+    fake.state.setSessionStatus("archived")
+    const readsBeforeReplay = fake.tx.agentTurn.findFirst.mock.calls.length
+    const replay = await service.start(objectiveStartCommand("objective_start_replay"))
+
+    expect(replay).toMatchObject({
+      disposition: "duplicate", originalDisposition: "started", inputId: first.inputId, turnId: first.turnId,
+    })
+    expect(fake.tx.agentTurn.findFirst).toHaveBeenCalledTimes(readsBeforeReplay)
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("rejects paused, closed, and active fresh admissions without writes", async () => {
+    for (const status of ["paused", "completed", "aborted", "archived"]) {
+      const fake = makeDb({ sessionStatus: status })
+      await expect(new ObjectiveStartCommandService(fake.db).start(objectiveStartCommand(`status_${status}`)))
+        .rejects.toMatchObject({ code: "objective_start_state_conflict", status: 409 })
+      expect(fake.state.turns).toHaveLength(0)
+      expect(fake.state.inputs).toHaveLength(0)
+      expect(fake.state.outbox).toHaveLength(0)
+    }
+
+    const active = makeDb({ sessionStatus: "running", activeSource: "user" })
+    await expect(new ObjectiveStartCommandService(active.db).start(objectiveStartCommand("active_root")))
+      .rejects.toMatchObject({ code: "retry_active_conflict", status: 409 })
+    expect(active.state.turns).toHaveLength(1)
+    expect(active.state.inputs).toHaveLength(0)
+    expect(active.state.outbox).toHaveLength(0)
+
+    const foreign = makeDb({ sessionStatus: "running", sessionOwnerId: "user_2" })
+    await expect(new ObjectiveStartCommandService(foreign.db).start(objectiveStartCommand("foreign_session")))
+      .rejects.toMatchObject({ code: "agent_session_not_found", status: 404 })
+    expect(foreign.state.turns).toHaveLength(0)
+    expect(foreign.state.inputs).toHaveLength(0)
+    expect(foreign.state.outbox).toHaveLength(0)
+  })
+
+  it("serializes concurrent same-key objective starts and rolls failed dispatch back", async () => {
+    const concurrent = makeDb({ sessionStatus: "running" })
+    const service = new ObjectiveStartCommandService(concurrent.db)
+    const command = objectiveStartCommand("objective_start_race")
+    const [first, second] = await Promise.all([service.start(command), service.start(command)])
+    expect(new Set([first.turnId, second.turnId])).toHaveLength(1)
+    expect([first.disposition, second.disposition].sort()).toEqual(["duplicate", "started"])
+    expect(concurrent.state.inputs).toHaveLength(1)
+    expect(concurrent.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+
+    const failing = makeDb({ sessionStatus: "running", failDispatchOutbox: true })
+    await expect(new ObjectiveStartCommandService(failing.db).start(objectiveStartCommand("objective_start_rollback")))
+      .rejects.toThrow("outbox unavailable")
+    expect(failing.state.rollbacks).toBe(1)
+    expect(failing.state.turns).toHaveLength(0)
+    expect(failing.state.inputs).toHaveLength(0)
+    expect(failing.state.events).toHaveLength(0)
+    expect(failing.state.outbox).toHaveLength(0)
+  })
+
   it("serializes concurrent starts to one active root Turn", async () => {
     const fake = makeDb()
     const service = new AgentCommandService(fake.db)
@@ -503,6 +648,41 @@ describe("AgentCommandService", () => {
       content: [...content],
     })).rejects.toMatchObject({ code: "automation_cannot_steer_user_turn", status: 409 })
     expect(fake.state.inputs).toHaveLength(1)
+  })
+
+  it("checks the accepted-steer cap after the Session lock and before every acceptance write", async () => {
+    const fake = makeDb({ activeSource: "user", steeringInputRows: acceptedSteeringRows(128) })
+    const service = new AgentCommandService(fake.db)
+
+    await expect(service.steer({ ...startCommand("client_at_capacity"), expectedTurnId: "turn_1", expectedRevision: 0 }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409, details: { capacity: 128, unresolvedCount: 128 } })
+
+    expect(fake.state.transactionCount).toBe(1)
+    expect(fake.state.rawQueries).toHaveLength(4)
+    const firstQuery = (fake.state.rawQueries[0] as { strings?: readonly string[] }).strings?.join(" ") ?? ""
+    expect(firstQuery).toContain("FOR UPDATE")
+    expect(fake.state.rawQueries.slice(1).every(query => !((query as { strings?: readonly string[] }).strings?.join(" ") ?? "").includes("FOR UPDATE"))).toBe(true)
+    expect(fake.tx.agentInput.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("returns an accepted duplicate at capacity before running the capacity reader", async () => {
+    const duplicateInput = { id: "already-accepted", sessionId: "session_1", targetTurnId: "turn_1", clientMessageId: "client_duplicate_at_capacity",
+      delivery: "steer", acceptedSequence: BigInt(7) }
+    const fake = makeDb({ activeSource: "user", steeringInputRows: acceptedSteeringRows(128), initialInputs: [duplicateInput] })
+    const result = await new AgentCommandService(fake.db).steer({ ...startCommand(duplicateInput.clientMessageId), expectedTurnId: "turn_1" })
+
+    expect(result).toMatchObject({ disposition: "duplicate", inputId: duplicateInput.id, turnId: "turn_1" })
+    expect(fake.state.rawQueries).toHaveLength(1)
+    expect(fake.state.rawQueries[0]).toBeDefined()
+    expect(fake.tx.agentInput.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
   })
 
   it("rolls back Turn, Item, Event, Input and Outbox on transaction failure", async () => {

@@ -166,7 +166,7 @@ function shouldReroute(
 ): boolean {
   if (index >= candidateCount - 1 || index >= maxReroutes) return false
   if (blocked) return false
-  return failure.retryable || failure.code === "unsupported_capability" || failure.code === "adapter_not_found" || failure.code === "cursor_lost"
+  return failure.retryable || failure.code === "unsupported_capability" || failure.code === "adapter_not_found" || failure.code === "cursor_lost" || failure.code === "context_estimate_exceeded"
 }
 
 function rerouteBlocked(options: ModelFallbackOptions): boolean {

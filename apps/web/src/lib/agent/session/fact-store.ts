@@ -110,8 +110,12 @@ function buildOutboxPayload(
   }
 }
 
-function safeEventPayload(input: Pick<AppendAgentEventInput, "type" | "payload">): Prisma.InputJsonValue {
-  return redactAgentEvent({ type: input.type, body: "", data: input.payload }).data as Prisma.InputJsonValue
+function safeEventPayload(input: AppendAgentEventInput): Prisma.InputJsonValue {
+  return redactAgentEvent({
+    type: input.type, body: "", data: input.payload,
+    routing: { sessionId: input.sessionId, turnId: input.turnId, itemId: input.itemId ?? null, taskId: input.taskId ?? null,
+      actor: input.actor, correlationId: input.correlationId, causationId: input.causationId ?? null, outboxTopic: input.outboxTopic },
+  }).data as Prisma.InputJsonValue
 }
 
 export async function appendAgentEventWithOutbox(

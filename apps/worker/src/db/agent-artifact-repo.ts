@@ -1,4 +1,4 @@
-import type { Pool } from "pg"
+import type { Pool, PoolClient } from "pg"
 import { randomUUID } from "node:crypto"
 import {
   AgentArtifactRepositoryError, artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive,
@@ -73,6 +73,22 @@ function assertReviewSourceBinding(input: AgentArtifactReviewWrite): void {
   }
 }
 
+export async function insertAgentArtifactBaseWithClient(client: Pick<PoolClient, "query">, input: AgentArtifactBaseInsert): Promise<AgentArtifactRow> {
+  const inserted = await client.query<Record<string, unknown>>(
+    `INSERT INTO "agent_artifact" (${columns}) VALUES ($1, $2, $3, $4, 'base', $1, $5, $6::jsonb, $7, $8, $9, $10, NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING RETURNING ${columns}`,
+    [input.id, input.userId, input.jobId, input.artifactType, input.hash, JSON.stringify(input.content), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs]],
+  )
+  if (inserted.rows[0]) return toAgentArtifactRow(inserted.rows[0])
+  const existing = await selectOne(client, input.userId, input.id)
+  const sameRefs = (left: readonly string[], right: readonly string[]) => left.length === right.length && left.every((value, index) => value === right[index])
+  if (!existing || existing.jobId !== input.jobId || existing.artifactType !== input.artifactType || existing.lifecycle !== "base"
+    || existing.baseId !== input.id || existing.baseHash !== input.hash || existing.hash !== input.hash || existing.constraintHash !== input.constraintHash
+    || !sameRefs(existing.provenanceRefs, input.provenanceRefs) || !sameRefs(existing.evidenceRefs, input.evidenceRefs)) {
+    throw new AgentArtifactRepositoryError("receipt_conflict", "An immutable artifact with this identity has different content or scope.")
+  }
+  return existing
+}
+
 export function createAgentArtifactRepository(pool: Pool) {
   return {
     async find(userId: string, artifactId: string): Promise<AgentArtifactRow | null> {
@@ -87,6 +103,8 @@ export function createAgentArtifactRepository(pool: Pool) {
       )
       return toAgentArtifactRow(result.rows[0] ?? {})
     },
+
+    insertBaseWithClient: insertAgentArtifactBaseWithClient,
 
     async saveDraft(input: AgentArtifactDraftWrite): Promise<AgentArtifactVersionRow> {
       return withArtifactTransaction(pool, input.userId, async client => {
