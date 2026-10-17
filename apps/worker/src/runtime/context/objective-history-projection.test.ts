@@ -2,7 +2,10 @@ import { createHash } from "node:crypto"
 import type pg from "pg"
 import { describe, expect, it, vi } from "vitest"
 import { rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin } from "./root-task-history-fence.js"
-import { updateRootObjectiveHistoryProjection, type RootObjectiveHistoryIdentity } from "./objective-history-projection.js"
+import {
+  OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, projectRootObjectiveHistoryForBackfill,
+  isValidRootObjectiveHistoryTerminalReceipt, updateRootObjectiveHistoryProjection, type RootObjectiveHistoryIdentity,
+} from "./objective-history-projection.js"
 
 const identity: RootObjectiveHistoryIdentity = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" }
 const goal = "Find senior platform roles"
@@ -63,14 +66,53 @@ describe("objective history projection", () => {
     expect(calls[1]?.sql).not.toContain("terminalEvent")
   })
 
-  it("leaves all objective keys unavailable for selected-job-scoped Turn input", async () => {
+  it("marks selected-job-scoped Turn input evaluated while leaving its objective keys unavailable", async () => {
     const input = { input: { goal, successCriteria: criteria, selectedJobPreparation: { selectedJobId: "job-1" } } }
     expect(rootTaskHistoryObjectiveDigest(input, { goal, successCriteria: criteria })).toBeDefined()
     const { client, calls } = clientWith({ rows: [turnRow(input)], rowCount: 1 }, { rowCount: 1 })
 
     await expect(updateRootObjectiveHistoryProjection(client, identity)).resolves.toBe(true)
 
-    expect(calls[1]?.values?.slice(0, 3)).toEqual([null, null, null])
+    expect(calls[1]?.values?.slice(0, 3)).toEqual([null, null, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
+  })
+
+  it("returns evaluated-unindexable for unsupported objectives and marks their semantics version", async () => {
+    const input = { goal, successCriteria: criteria }
+    const expected = { input, source: "user", goal: "A conflicting root goal", successCriteria: criteria }
+    const { client, calls } = clientWith({ rows: [turnRow(input, { goal: expected.goal })], rowCount: 1 }, { rowCount: 1 })
+
+    await expect(projectRootObjectiveHistoryForBackfill(client, identity, expected)).resolves.toEqual({
+      kind: "evaluated_unindexable", objectiveDigest: null, canonicalOriginDigest: null,
+      semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, reason: "unsupported_or_invalid_objective",
+    })
+
+    expect(calls[1]?.values?.slice(0, 3)).toEqual([null, null, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
+  })
+
+  it("returns retryable conflict when a persisted objective no longer matches the scanned snapshot", async () => {
+    const expected = { input: { goal }, source: "user", goal, successCriteria: criteria }
+    const { client, calls } = clientWith({ rowCount: 0 })
+
+    await expect(projectRootObjectiveHistoryForBackfill(client, identity, expected)).resolves.toEqual({
+      kind: "retryable_conflict", reason: "persisted_input_changed",
+    })
+
+    expect(calls[0]?.sql).toContain('turn."input" IS NOT DISTINCT FROM $5::jsonb')
+    expect(calls).toHaveLength(1)
+  })
+
+  it("reports an unlinked Root/Turn pair as ineligible and preserves the existing boolean writer API", async () => {
+    const { client, calls } = clientWith({ rowCount: 0 }, { rowCount: 0 }, { rowCount: 0 })
+
+    await expect(projectRootObjectiveHistoryForBackfill(client, identity, {
+      input: {}, source: "user", goal, successCriteria: criteria,
+    })).resolves.toEqual({ kind: "retryable_conflict", reason: "persisted_input_changed" })
+    await expect(projectRootObjectiveHistoryForBackfill(client, identity)).resolves.toEqual({
+      kind: "ineligible", reason: "unlinked_root_turn",
+    })
+    await expect(updateRootObjectiveHistoryProjection(client, identity)).resolves.toBe(false)
+
+    expect(calls).toHaveLength(3)
   })
 
   it("keeps the same-session key but leaves cross-session indexing unavailable for invalid verification requirements", async () => {
@@ -89,7 +131,7 @@ describe("objective history projection", () => {
 
     await expect(updateRootObjectiveHistoryProjection(client, identity)).resolves.toBe(true)
 
-    expect(calls[1]?.values?.slice(0, 3)).toEqual([null, null, null])
+    expect(calls[1]?.values?.slice(0, 3)).toEqual([null, null, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
   })
 
   it("stores the exact eligible Root-owned failed receipt sequence and time", async () => {
@@ -100,6 +142,13 @@ describe("objective history projection", () => {
 
     expect(calls[0]?.sql).toContain('event."taskId" = turn."rootTaskId"')
     expect(calls[1]?.values).toEqual(["99", at, identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId, "in_progress"])
+  })
+
+  it("validates an existing terminal receipt without rewriting its locator", async () => {
+    const { client, calls } = clientWith({ rows: [terminalRow()], rowCount: 1 })
+
+    await expect(isValidRootObjectiveHistoryTerminalReceipt(client, identity, "event-failed")).resolves.toBe(true)
+    expect(calls).toHaveLength(1)
   })
 
   it("validates a completed receipt against its persisted start and completed-step receipt", async () => {
