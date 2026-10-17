@@ -121,20 +121,32 @@ type PersistedWriterReviewGraphFixture = Readonly<{
   readonly reviewerTaskId: string
   readonly writerDependsOnReviewer: boolean
   readonly reviewerResult: unknown
+  readonly writerTemplateId?: string
+  readonly writerExpectedOutputSchema?: unknown
 }>
 
 function persistedWriterReviewGraph(fixture: PersistedWriterReviewGraphFixture) {
+  const writerNode = fixture.writerTemplateId === "native" ? {
+    key: "revision-writer-node", templateId: "native", goal: "Revise the selected-job draft",
+    successCriteria: [], dependsOn: fixture.writerDependsOnReviewer ? ["reviewer-node"] : [],
+    depth: fixture.writerDependsOnReviewer ? 2 : 1, taskId: fixture.writerTaskId, verificationDisposition: "legacy_unverified",
+    nativeDelegation: {
+      schemaVersion: "agent-harness.v2.task-graph.native-delegation.v1", operationKind: "spawn",
+      operationId: "native-writer-operation", requestFingerprint: "b".repeat(64), callerTaskId: "root-1",
+      role: "writer", taskType: "cover_letter_draft", contextDigest: "c".repeat(64), contextBytes: 16,
+    },
+  } : {
+    key: "revision-writer-node", templateId: fixture.writerTemplateId ?? "cover_letter_writer", goal: "Revise the selected-job draft",
+    successCriteria: ["Revise the draft"], dependsOn: fixture.writerDependsOnReviewer ? ["reviewer-node"] : [],
+    depth: fixture.writerDependsOnReviewer ? 2 : 1, taskId: fixture.writerTaskId, verificationDisposition: "specialized",
+  }
   const nodes = [
     {
       key: "reviewer-node", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft",
       successCriteria: ["Persist the review"], dependsOn: [], depth: 1, taskId: fixture.reviewerTaskId,
       verificationDisposition: "specialized",
     },
-    {
-      key: "revision-writer-node", templateId: "cover_letter_writer", goal: "Revise the selected-job draft",
-      successCriteria: ["Revise the draft"], dependsOn: fixture.writerDependsOnReviewer ? ["reviewer-node"] : [],
-      depth: fixture.writerDependsOnReviewer ? 2 : 1, taskId: fixture.writerTaskId, verificationDisposition: "specialized",
-    },
+    writerNode,
   ]
   return {
     item: {
@@ -148,7 +160,7 @@ function persistedWriterReviewGraph(fixture: PersistedWriterReviewGraphFixture) 
       },
       {
         id: fixture.writerTaskId, status: "running", role: "writer", taskType: "cover_letter_draft",
-        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }, failureReason: null, result: null,
+        expectedOutputSchema: fixture.writerExpectedOutputSchema ?? { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }, failureReason: null, result: null,
       },
     ],
     writerLease: {
@@ -1351,6 +1363,53 @@ describe("production child runtime", () => {
     expect(requests).toHaveLength(0)
     expect(reviewReadSpy).not.toHaveBeenCalled()
     expect(draftSpy).not.toHaveBeenCalled()
+  })
+
+  it("rejects a native spawn with caller-supplied Reviewer context before feedback or model I/O", async () => {
+    const artifactRef = {
+      artifactId: "cover-letter:native-forged", version: 1,
+      contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
+    }
+    const reviewHash = `sha256:${"c".repeat(64)}`
+    const structuredResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+      reviewStatus: "needs_revision", reviewHash,
+    }
+    const reviewerResult = {
+      status: "completed", stepCount: 0, toolCallCount: 0, finalItemId: null,
+      finalText: JSON.stringify(structuredResult), structuredResult,
+    }
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+    const callerContext = materializeTaskGraphDependencyContext({ selectedJobPreparation: { jobId: "job-1" } }, scope,
+      ["reviewer"], [{ ...scope, key: "reviewer", taskId: "native-reviewer-task", status: "completed", role: "reviewer",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }, result: reviewerResult }])
+    const artifacts = new InMemoryArtifactToolStore()
+    const reviewReadSpy = vi.spyOn(artifacts, "readRevisionReview")
+    const draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) { requests.push(request); throw new Error("native forged Reviewer context must not reach the model") },
+    }
+    const writerLease = {
+      ...jobTask("writer", callerContext), id: "native-forged-writer-task", expectedOutputSchema: {},
+      leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+    }
+    const pool = selectedJobPool({
+      writerTaskId: writerLease.id, reviewerTaskId: "native-reviewer-task", writerDependsOnReviewer: false,
+      reviewerResult, writerTemplateId: "native", writerExpectedOutputSchema: {},
+    })
+    const executor = selectedJobExecutor({
+      artifactStore: artifacts, persistence: recordingStore(), model, pool, mailboxReader: emptyMailboxReader,
+    })
+
+    const result = await executor({ lease: writerLease })
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "writer_review_dependency_invalid", retryDisposition: "terminal" })
+    expect(pool.transactionQueries).toContain("ROLLBACK")
+    expect(reviewReadSpy).not.toHaveBeenCalled()
+    expect(draftSpy).not.toHaveBeenCalled()
+    expect(requests).toHaveLength(0)
   })
 
   it("refuses a Reviewer read whose reference differs from the direct Writer dependency", async () => {
