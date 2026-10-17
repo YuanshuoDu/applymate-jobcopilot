@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
+import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { projectRootTaskHistory } from "./root-task-history.js"
 import type { TurnLease } from "../turns/lease.js"
 
@@ -114,6 +115,20 @@ const crossWrongOrigin: Source = { turnId: `root-history-cross-origin-${suffix}`
   sessionId: otherSessionId, userId, goal: objective, criteria,
   input: { goal: objective, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } }, startSequence: 9,
   terminalCreatedAt: new Date("2024-01-01T00:00:00.000Z") }
+const sameSessionUnrelated: Source[] = Array.from({ length: 65 }, (_, index): Source => {
+  const unrelatedObjective = `Unrelated indexed history objective ${index}`
+  return { turnId: `root-history-same-filler-${index}-${suffix}`, rootTaskId: `root-history-same-filler-root-${index}-${suffix}`,
+    childId: `root-history-same-filler-child-${index}-${suffix}`, finalItemId: `root-history-same-filler-final-${index}-${suffix}`,
+    sessionId, userId, goal: unrelatedObjective, criteria, input: { goal: unrelatedObjective, successCriteria: criteria },
+    startSequence: 200 + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, 1, 0, 0, index)) }
+})
+const crossSessionWrongOriginFillers: Source[] = Array.from({ length: 65 }, (_, index): Source => ({
+  turnId: `root-history-cross-filler-${index}-${suffix}`, rootTaskId: `root-history-cross-filler-root-${index}-${suffix}`,
+  childId: `root-history-cross-filler-child-${index}-${suffix}`, finalItemId: `root-history-cross-filler-final-${index}-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { goal: objective, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } },
+  startSequence: 200 + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, 1, 0, 0, index)),
+}))
 const archivedSource: Source = { turnId: `root-history-archived-${suffix}`, rootTaskId: `root-history-archived-root-${suffix}`,
   childId: `root-history-archived-child-${suffix}`, finalItemId: `root-history-archived-final-${suffix}`,
   sessionId: archivedSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
@@ -128,7 +143,7 @@ const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, ro
   failureChildren: [{ key: "foreign-user", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" }] }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
-  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 101,
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1101,
   terminalCreatedAt: new Date("2031-01-01T00:00:00.000Z") }
 const equalCutoff: Source = { turnId: `root-history-equal-cutoff-${suffix}`, rootTaskId: `root-history-equal-cutoff-root-${suffix}`,
   childId: `root-history-equal-cutoff-child-${suffix}`, finalItemId: `root-history-equal-cutoff-final-${suffix}`,
@@ -242,6 +257,44 @@ async function insertSource(source: Source): Promise<void> {
     JSON.stringify(terminalPayload), terminalCreatedAt])
 }
 
+async function projectSources(sources: readonly Source[]): Promise<void> {
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN")
+    for (const source of sources) {
+      const identity = { userId: source.userId, sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId }
+      const objectiveProjected = await updateRootObjectiveHistoryProjection(client, identity)
+      if (!objectiveProjected) throw new Error(`Objective-history projection failed for ${source.turnId}`)
+      const terminalProjected = await updateRootObjectiveHistoryProjection(client, identity,
+        { terminalEventId: `root-history-terminal-${source.turnId}` })
+      if (!terminalProjected) throw new Error(`Objective-history terminal projection failed for ${source.turnId}`)
+    }
+    await client.query("COMMIT")
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function setObjectiveHistoryIndexReady(ready: boolean): Promise<void> {
+  const result = await pool!.query(`UPDATE "agent_objective_history_index_readiness"
+    SET "isReady" = $1, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "indexName" = $2 AND "semanticsVersion" = $3`,
+  [ready, "agent_turns_objective_history", OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
+  if (result.rowCount !== 1) throw new Error("Objective-history readiness row is missing")
+}
+
+async function withObjectiveHistoryIndexReady<T>(run: () => Promise<T>): Promise<T> {
+  await setObjectiveHistoryIndexReady(true)
+  try {
+    return await run()
+  } finally {
+    await setObjectiveHistoryIndexReady(false)
+  }
+}
+
 describePg("direct Root-task history PostgreSQL source validation", () => {
   beforeAll(async () => {
     pool = new PgPool({ connectionString: databaseUrl!, max: 2 })
@@ -249,8 +302,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }
     await insertUser(userId)
     await insertUser(otherUserId)
-    await insertSession(sessionId, userId, 100)
-    await insertSession(otherSessionId, userId, 4)
+    await insertSession(sessionId, userId, 1200)
+    await insertSession(otherSessionId, userId, 500)
     await insertSession(foreignSessionId, otherUserId, 4)
     await insertSession(archivedSessionId, userId, 4)
     await pool.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
@@ -288,13 +341,15 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
     await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
-      VALUES ($1, $2, $3, NULL, $4, 100, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, $7)`,
+      VALUES ($1, $2, $3, NULL, $4, 1000, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, $7)`,
     [`root-history-current-start-${suffix}`, sessionId, currentTurnId, currentRootTaskId,
       `turn:${currentTurnId}:event:turn-started`, JSON.stringify({ goal: objective, taskId: currentRootTaskId, rootTaskId: currentRootTaskId }), currentStartCreatedAt])
+    await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future])
   })
 
   afterAll(async () => {
     if (pool) {
+      await setObjectiveHistoryIndexReady(false).catch(() => undefined)
       await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[userId, otherUserId]]).catch(() => undefined)
       await pool.end()
     }
@@ -395,5 +450,50 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       await blocker.query("ROLLBACK").catch(() => undefined)
       blocker.release()
     }
+  })
+
+  it("finds exact same-session objectives behind more than 64 newer unrelated indexed outcomes", async () => {
+    for (const source of sameSessionUnrelated) await insertSource(source)
+    await projectSources(sameSessionUnrelated)
+    await withObjectiveHistoryIndexReady(async () => {
+      const graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values) => {
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), objectiveHistoryIndexEnabled: true }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      expect(graphLoads).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      const fillerTurnIds = new Set(sameSessionUnrelated.map(source => source.turnId))
+      expect(graphLoads.filter(turnId => fillerTurnIds.has(turnId))).toEqual([])
+    })
+  })
+
+  it("filters more than 64 newer cross-session wrong-origin rows before loading graphs", async () => {
+    for (const source of crossSessionWrongOriginFillers) await insertSource(source)
+    await projectSources(crossSessionWrongOriginFillers)
+    await withObjectiveHistoryIndexReady(async () => {
+      const graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values) => {
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true,
+        objectiveHistoryIndexEnabled: true }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(history.map(item => item.sourceTurnId)).toEqual([
+        crossEqualTimeHigherTurnId.turnId, otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId,
+      ])
+      expect(history.map(item => item.terminalAt?.toISOString())).toEqual([
+        "2022-01-01T00:00:00.000Z", "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
+      ])
+      expect(graphLoads).toEqual(history.map(item => item.sourceTurnId))
+      const fillerTurnIds = new Set(crossSessionWrongOriginFillers.map(source => source.turnId))
+      expect(graphLoads.filter(turnId => fillerTurnIds.has(turnId))).toEqual([])
+      expect(history.some(item => [crossWrongOrigin.turnId, equalCutoff.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
+    })
   })
 })

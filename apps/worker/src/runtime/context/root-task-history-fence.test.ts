@@ -1,7 +1,8 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
-import { readRootTaskHistoryFence, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { readRootTaskHistoryFence, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { rootTaskObjectiveDigest } from "./root-task-objective.js"
 
 type Row = Record<string, unknown>
@@ -131,6 +132,34 @@ describe("root task history current fence", () => {
       .toBe(JSON.stringify(["user", "interactive_discovery_shortlist", 1]))
     expect(rootTaskHistoryOrigin("user", { intent: { kind: "unknown", version: 1 }, input: { goal: "x" } })).toBeUndefined()
     expect(rootTaskHistoryOrigin("user", { intent: supported, input: { goal: "x", intent: { kind: "unknown", version: 1 } } })).toBeUndefined()
+  })
+
+  it("derives projection lookup keys separately while preserving legacy objectiveDigest semantics", async () => {
+    const turnInput = {
+      goal: " Plan a role ", intent: { kind: "interactive_discovery_shortlist", version: 1 },
+      verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1",
+        requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }] },
+    }
+    const test = fixture({ turnInput })
+    const legacy = await readRootTaskHistoryFence(test.client, test.input)
+    const sameSession = await readRootTaskHistoryFence(test.client, { ...test.input, objectiveHistoryIndexEnabled: true })
+    const crossSession = await readRootTaskHistoryFence(test.client, {
+      ...test.input, crossSessionRootTaskHistoryEnabled: true, objectiveHistoryIndexEnabled: true,
+    })
+    const root = { goal: "Plan a role", successCriteria: ["Compare roles"] }
+    const baseDigest = rootTaskHistoryObjectiveDigest(turnInput, root)
+    const crossDigest = rootTaskHistoryObjectiveDigest(turnInput, root, true)
+    const canonicalOrigin = rootTaskHistoryOrigin("user", turnInput)
+    const expectedCanonicalDigest = createHash("sha256")
+      .update(JSON.stringify({ objectiveDigest: crossDigest, canonicalOrigin })).digest("hex")
+
+    expect(sameSession?.objectiveDigest).toBe(legacy?.objectiveDigest)
+    expect(sameSession?.objectiveHistoryIndexObjectiveDigest).toBe(baseDigest)
+    expect(sameSession?.objectiveHistoryIndexCanonicalOriginDigest).toBeUndefined()
+    expect(crossSession?.objectiveDigest).toBe(crossDigest)
+    expect(crossSession?.objectiveHistoryIndexObjectiveDigest).toBe(baseDigest)
+    expect(crossSession?.objectiveHistoryIndexCanonicalOriginDigest).toBe(expectedCanonicalDigest)
+    expect(rootTaskHistoryIndexKeys("user", turnInput, root, true)?.canonicalOriginDigest).toBe(expectedCanonicalDigest)
   })
 
   it("fails closed on invalid origin, malformed start time, or invalid typed requirements only in opt-in mode", async () => {

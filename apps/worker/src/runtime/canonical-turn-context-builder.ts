@@ -46,6 +46,7 @@ type Input = Readonly<{
   selectedJobHistoryReader?: SelectedJobHistoryReader
   rootTaskHistoryDirectReader?: DirectRootTaskHistoryReader
   crossSessionRootTaskHistoryEnabled?: boolean
+  objectiveHistoryIndexEnabled?: boolean
   currentRootBudgetReader?: (owner: ExecutionOwnerFence) => Promise<CurrentRootBudgetObservation>
 }>
 
@@ -101,7 +102,9 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
         snapshot, reader: rootTaskHistoryReader,
         request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date(),
           ...(input.crossSessionRootTaskHistoryEnabled === true && input.planningEnabled && !input.selectedJobMode
-            ? { crossSessionRootTaskHistoryEnabled: true } : {}) },
+            ? { crossSessionRootTaskHistoryEnabled: true } : {}),
+          ...(input.objectiveHistoryIndexEnabled === true && input.planningEnabled && !input.selectedJobMode
+            ? { objectiveHistoryIndexEnabled: true } : {}) },
       })
       if (input.planningEnabled) {
         const owner = executionOwnerFence({ kind: "turn", taskId: input.rootTaskId, lease: input.lease })
