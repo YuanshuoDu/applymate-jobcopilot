@@ -101,6 +101,9 @@ const submitToolMocks = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock("bullmq", () => ({
   Queue: vi.fn().mockImplementation(() => ({
     add: vi.fn(),
+    client: Promise.resolve({
+      get: vi.fn(async (key: string) => (await mocks.redisExists(key)) === 0 ? null : "lock-token"),
+    }),
     getJob: mocks.getJob,
     isPaused: vi.fn().mockResolvedValue(false),
     toKey: (suffix: string) => `bull:apply-tasks:${suffix}`,
@@ -595,7 +598,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     expect(mocks.withCloakContext).not.toHaveBeenCalled();
     expect(mocks.updateJobForSubmission).not.toHaveBeenCalled();
 
-    mocks.redisExists.mockResolvedValueOnce(1);
+    mocks.redisExists.mockResolvedValueOnce(0).mockResolvedValueOnce(1);
     await completed(terminalJob);
     expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledTimes(2);
     await expect(mocks.reconcileClaimedSubmissionUncertain.mock.results[1]?.value).resolves.toBe(false);
@@ -614,9 +617,9 @@ describe("apply-queue Phase 5 pipeline", () => {
 
     await completed(terminalEvent);
 
-    expect(mocks.getJob).toHaveBeenCalledWith("worker-task-pipeline-1");
-    expect(mocks.reconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce();
-    await expect(mocks.reconcileClaimedSubmissionUncertain.mock.results[0]?.value).resolves.toBe(false);
+    expect(mocks.redisExists).toHaveBeenCalledWith("bull:apply-tasks:worker-task-pipeline-1:lock");
+    expect(mocks.getJob).not.toHaveBeenCalled();
+    expect(mocks.reconcileClaimedSubmissionUncertain).not.toHaveBeenCalled();
     expect(mocks.withCloakContext).not.toHaveBeenCalled();
   });
 
