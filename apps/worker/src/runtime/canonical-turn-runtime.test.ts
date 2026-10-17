@@ -2598,6 +2598,15 @@ describe("createCanonicalTurnRuntime", () => {
     expect(budgetObservationReads).toBe(6)
     expect(budgetClientReleases).toBe(6)
     expect(openedRootSteps).toHaveLength(6)
+    expect(requests.map(request => request.metadata)).toEqual(openedRootSteps.map(stepId => ({
+      sessionId: lease.sessionId,
+      turnId: lease.turnId,
+      stepId,
+      taskId: "root-1",
+      userId: lease.userId,
+      featureId: "agent-harness.turn",
+      traceId: `${lease.turnId}:${stepId}`,
+    })))
     expect(contexts.map(context => context.taskGraphRevision)).toEqual([7, 7, 7, 7, 8, 8])
     expect(contexts.map(context => context.inputThroughSequence)).toEqual([3n, 3n, 3n, 3n, 3n, 3n])
     expect(contexts.map(context => context.consumedInputIds)).toEqual([[freshSteer.id], [], [], [], [], []])
@@ -2730,7 +2739,6 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).not.toMatch(/selected_job_context_unavailable|child_resume_unavailable|invalid_structured_result|PRIVATE_HISTORICAL|PRIVATE_HISTORICAL_(SETUP|RESUME|OUTPUT)_(TEXT|ERROR)/)
       expect(text).toContain(index < 4 ? '"knownCount":4' : '"knownCount":5')
       const request = requests[index]!
-      expect(request.metadata).toMatchObject({ sessionId: lease.sessionId, turnId: lease.turnId, taskId: "root-1", userId: lease.userId })
       expect(request.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []))
         .toEqual(expect.arrayContaining(["agent.list", "agent.plan"]))
       const systemText = request.messages.filter(message => message.role === "system")
