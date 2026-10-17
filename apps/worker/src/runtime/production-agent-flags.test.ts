@@ -13,6 +13,7 @@ describe("production agent flags", () => {
       turnBoundaryCompactionEnabled: false,
       nativeSemanticProgressMemoryEnabled: false,
       crossSessionRootTaskHistoryEnabled: false,
+      objectiveHistoryIndexEnabled: false,
     })
   })
 
@@ -99,6 +100,7 @@ describe("production agent flags", () => {
       turnBoundaryCompactionEnabled: false,
       nativeSemanticProgressMemoryEnabled: false,
       crossSessionRootTaskHistoryEnabled: false,
+      objectiveHistoryIndexEnabled: false,
     })
   })
 
@@ -114,6 +116,20 @@ describe("production agent flags", () => {
     expect(resolveProductionAgentFlags({ ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1" }).crossSessionRootTaskHistoryEnabled).toBe(true)
     for (const value of [undefined, "", "0", "false", "true", "01", " 1", "1 "]) {
       expect(resolveProductionAgentFlags({ ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: value }).crossSessionRootTaskHistoryEnabled).toBe(false)
+    }
+  })
+
+  it("enables indexed Root history only with its exact server flag, independently of cross-session history", () => {
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_OBJECTIVE_HISTORY_INDEX: "1" })).toMatchObject({
+      objectiveHistoryIndexEnabled: true,
+      crossSessionRootTaskHistoryEnabled: false,
+    })
+    expect(resolveProductionAgentFlags({ ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1" })).toMatchObject({
+      objectiveHistoryIndexEnabled: false,
+      crossSessionRootTaskHistoryEnabled: true,
+    })
+    for (const value of [undefined, "", "0", "false", "true", "01", " 1", "1 "]) {
+      expect(resolveProductionAgentFlags({ ENABLE_AGENT_OBJECTIVE_HISTORY_INDEX: value }).objectiveHistoryIndexEnabled).toBe(false)
     }
   })
 })

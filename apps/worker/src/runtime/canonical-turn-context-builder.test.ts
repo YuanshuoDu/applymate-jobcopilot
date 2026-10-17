@@ -198,22 +198,30 @@ describe("canonical Turn context builder", () => {
     expect(calls).toEqual([])
   })
 
-  it("passes opt-in history scope only through a planning ordinary-root builder", async () => {
+  it("passes trusted history gates only through a planning ordinary-root builder", async () => {
     const load = vi.fn(async () => [])
     const reader: DirectRootTaskHistoryReader = { load }
     const pool = { connect: async () => { throw new Error("injected readers avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">
-    const build = (planningEnabled: boolean, selectedJobMode: boolean) => createCanonicalTurnContextBuilder({
+    const build = (options: { planningEnabled: boolean; selectedJobMode: boolean; objectiveHistoryIndexEnabled?: boolean;
+      crossSessionRootTaskHistoryEnabled?: boolean; turnInput?: unknown }) => createCanonicalTurnContextBuilder({
       pool, store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
-      planningEnabled, selectedJobMode, crossSessionRootTaskHistoryEnabled: true, rootTaskHistoryDirectReader: reader,
+      ...options, rootTaskHistoryDirectReader: reader,
       currentRootBudgetReader: async () => unavailableBudget,
     }).build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-opt-in",
       snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, now })
 
-    await build(true, false)
-    expect(load).toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: true }))
+    await build({ planningEnabled: true, selectedJobMode: false, objectiveHistoryIndexEnabled: true,
+      turnInput: { objectiveHistoryIndexEnabled: false, crossSessionRootTaskHistoryEnabled: false } })
+    expect(load).toHaveBeenCalledWith(expect.objectContaining({ objectiveHistoryIndexEnabled: true }))
+    expect(load).not.toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: true }))
     load.mockClear()
-    await build(false, false)
-    await build(true, true)
+    await build({ planningEnabled: true, selectedJobMode: false, crossSessionRootTaskHistoryEnabled: true,
+      turnInput: { objectiveHistoryIndexEnabled: true } })
+    expect(load).toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: true }))
+    expect(load).not.toHaveBeenCalledWith(expect.objectContaining({ objectiveHistoryIndexEnabled: true }))
+    load.mockClear()
+    await build({ planningEnabled: false, selectedJobMode: false, objectiveHistoryIndexEnabled: true, crossSessionRootTaskHistoryEnabled: true })
+    await build({ planningEnabled: true, selectedJobMode: true, objectiveHistoryIndexEnabled: true, crossSessionRootTaskHistoryEnabled: true })
     expect(load).not.toHaveBeenCalled()
   })
 

@@ -1,7 +1,8 @@
 import type pg from "pg"
 import { describe, expect, it } from "vitest"
 import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.js"
-import { rootTaskHistoryObjectiveDigest, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
 
 type Row = Record<string, unknown>
 const DISCOVERY_GOAL = "Discover and shortlist relevant jobs from my saved job inventory, using target roles and locations when configured."
@@ -16,11 +17,15 @@ const input: RootTaskHistoryFenceInput = {
   rootTaskId: "current-root", rootAttemptCount: 1, stepId: "current-step", now: new Date(2_000),
   crossSessionRootTaskHistoryEnabled: true,
 }
+const indexKeys = rootTaskHistoryIndexKeys("user", { goal: "Find roles", successCriteria: ["Use saved filters"] },
+  { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)!
 const fence: RootTaskHistoryFence = {
   currentStartSequence: 2n, currentStartCreatedAt: currentTime,
   currentOrigin: JSON.stringify(["user", "none"]),
   objectiveDigest: rootTaskHistoryObjectiveDigest({ goal: "Find roles", successCriteria: ["Use saved filters"] },
     { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)!,
+  objectiveHistoryIndexObjectiveDigest: indexKeys.objectiveDigest,
+  objectiveHistoryIndexCanonicalOriginDigest: indexKeys.canonicalOriginDigest,
 }
 
 function row(overrides: Row = {}): Row {
@@ -61,6 +66,25 @@ function client(rows: readonly Row[], queries: Array<{ sql: string; values?: rea
   return { query: async (sql: string, values?: readonly unknown[]) => { queries.push({ sql, values }); return { rows } } }
 }
 
+function indexedClient(readiness: readonly Row[], rows: readonly Row[], queries: Array<{ sql: string; values?: readonly unknown[] }>) {
+  return { query: async (sql: string, values?: readonly unknown[]) => {
+    queries.push({ sql, values })
+    return { rows: sql.includes('FROM "agent_objective_history_index_readiness"') ? readiness : rows }
+  } }
+}
+
+function indexedRow(overrides: Row = {}): Row {
+  return row({
+    turnObjectiveDigest: indexKeys.objectiveDigest,
+    turnCanonicalOriginDigest: indexKeys.canonicalOriginDigest,
+    turnObjectiveIndexSemanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
+    indexedTerminalSequence: "200", indexedTerminalAt: sourceTime,
+    ...overrides,
+  })
+}
+
+const readyRow = { indexName: "agent_turns_objective_history", semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, isReady: true }
+
 describe("Root history source scan", () => {
   it("scans same-user sessions by strict DB time, then validates origin and source terminal receipts", async () => {
     const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
@@ -81,6 +105,7 @@ describe("Root history source scan", () => {
 
     expect(results).toHaveLength(1)
     expect(results[0]).toMatchObject({ sessionId: "source-session", turnId: "source-turn", terminalSequence: 200n, terminalAt: sourceTime })
+    expect(queries).toHaveLength(1)
     expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, 64])
     expect(queries[0]?.sql).toContain('source_session."userId" = $2')
     expect(queries[0]?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
@@ -88,6 +113,55 @@ describe("Root history source scan", () => {
     expect(queries[0]?.sql).toContain('event."createdAt" < $4::timestamptz')
     expect(queries[0]?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
     expect(queries[0]?.sql).not.toContain('event."sequence" < $4::bigint')
+  })
+
+  it("keeps the legacy bounded scan when readiness is missing, false, unknown, or version-mismatched", async () => {
+    const readinessRows: readonly (readonly Row[])[] = [
+      [],
+      [{ ...readyRow, isReady: false }],
+      [{ ...readyRow, indexName: "unknown_index" }],
+      [{ ...readyRow, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION + 1 }],
+      [{ ...readyRow, isReady: "true" }],
+    ]
+    for (const readiness of readinessRows) {
+      const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+      const results = await readRootTaskHistoryCandidates(
+        indexedClient(readiness, [row()], queries) as unknown as pg.PoolClient,
+        { ...input, objectiveHistoryIndexEnabled: true }, fence,
+      )
+      expect(results).toHaveLength(1)
+      expect(queries).toHaveLength(2)
+      expect(queries[0]?.sql).toContain('FROM "agent_objective_history_index_readiness"')
+      expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, 64])
+      expect(queries[1]?.sql).toContain('FROM "agent_events" AS event')
+      expect(queries[1]?.sql).not.toContain('FROM "agent_turns" AS turn\n')
+    }
+  })
+
+  it("applies full cross-session keys before LIMIT and re-derives indexed source keys", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const badOrigin = indexedRow({ turnCanonicalOriginDigest: "0".repeat(64) })
+    const staleProjection = indexedRow({ input: { goal: "Changed objective", successCriteria: ["Use saved filters"] } })
+    const results = await readRootTaskHistoryCandidates(
+      indexedClient([readyRow], [indexedRow(), badOrigin, staleProjection], queries) as unknown as pg.PoolClient,
+      { ...input, objectiveHistoryIndexEnabled: true }, fence,
+    )
+
+    expect(results).toHaveLength(1)
+    expect(queries).toHaveLength(2)
+    expect(queries[1]?.values).toEqual([
+      "current-session", "user-a", "current-turn", currentTime, indexKeys.objectiveDigest,
+      indexKeys.canonicalOriginDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, 64,
+    ])
+    const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
+    expect(terminalWindow).toContain('FROM "agent_turns" AS turn')
+    expect(terminalWindow).toContain('turn."objectiveDigest" = $5')
+    expect(terminalWindow).toContain('turn."canonicalOriginDigest" = $6')
+    expect(terminalWindow).toContain('turn."objectiveIndexSemanticsVersion" = $7')
+    expect(terminalWindow).toContain('turn."terminalEventAt" < $4::timestamptz')
+    expect(terminalWindow.indexOf('turn."canonicalOriginDigest" = $6')).toBeLessThan(terminalWindow.indexOf("LIMIT $8"))
+    expect(terminalWindow).toContain('ORDER BY turn."terminalEventAt" DESC, turn."id" DESC')
+    expect(queries[1]?.sql).toContain('terminal."createdAt" = roots."indexedTerminalAt"')
   })
 
   it("requires an existing source AgentSession row, so deleted sessions cannot supply history", async () => {
@@ -143,6 +217,36 @@ describe("Root history source scan", () => {
     expect(queries[0]?.sql).toContain('event."sessionId" = $1 AND event."sequence" < $4::bigint')
     expect(queries[0]?.sql).toContain('ORDER BY terminal."sequence" DESC, roots."turnId" DESC')
     expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", "300", 64])
+  })
+
+  it("uses base objective keys and sequence cutoff before LIMIT for indexed same-session recall", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const sameInput: RootTaskHistoryFenceInput = { ...input, crossSessionRootTaskHistoryEnabled: undefined, objectiveHistoryIndexEnabled: true }
+    const sameKeys = rootTaskHistoryIndexKeys("user", { goal: "Find roles", successCriteria: ["Use saved filters"] },
+      { goal: "Find roles", successCriteria: ["Use saved filters"] }, false)!
+    const sameFence: RootTaskHistoryFence = {
+      currentStartSequence: 300n,
+      objectiveDigest: rootTaskHistoryObjectiveDigest({ goal: "Find roles", successCriteria: ["Use saved filters"] },
+        { goal: "Find roles", successCriteria: ["Use saved filters"] })!,
+      objectiveHistoryIndexObjectiveDigest: sameKeys.objectiveDigest,
+    }
+    const sameRow = indexedRow({ sessionId: "current-session", terminalStepSessionId: "current-session",
+      terminalStepEventSessionId: "current-session", turnCanonicalOriginDigest: null })
+    const results = await readRootTaskHistoryCandidates(
+      indexedClient([readyRow], [sameRow], queries) as unknown as pg.PoolClient, sameInput, sameFence,
+    )
+
+    expect(results).toHaveLength(1)
+    expect(queries[1]?.values).toEqual([
+      "current-session", "user-a", "current-turn", "300", sameKeys.objectiveDigest,
+      OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, 64,
+    ])
+    const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
+    expect(terminalWindow).toContain('turn."sessionId" = $1 AND turn."userId" = $2')
+    expect(terminalWindow).toContain('turn."objectiveDigest" = $5')
+    expect(terminalWindow).toContain('turn."objectiveIndexSemanticsVersion" = $6')
+    expect(terminalWindow).toContain('turn."terminalEventSequence" < $4::bigint')
+    expect(terminalWindow.indexOf('turn."objectiveDigest" = $5')).toBeLessThan(terminalWindow.indexOf("LIMIT $7"))
   })
 
   it("normalizes flat and nested typed requirements into the exact objective digest", async () => {
