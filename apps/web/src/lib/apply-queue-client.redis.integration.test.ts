@@ -98,6 +98,7 @@ async function expectRemovalReceipt(
     version: 1,
     cancelOperationId: operationId,
     ...identity,
+    previousState,
   });
   expect(await redis.ttl(receiptKey)).toBe(-1);
   expect(await removedEventsFor(queue, redis, identity.workerTaskId)).toEqual([
@@ -443,6 +444,85 @@ describeWithRedis("apply queue recovery checks (real Redis/BullMQ)", () => {
       await redis!.del(reappearedLockKey);
     }
   }, 30_000);
+
+  it("replays the removed event and cleans an exact receipt-backed orphan Bull job", async () => {
+    const unique = randomUUID();
+    const workerTaskId = `apply-cancel-${unique}-partial`;
+    jobIds.push(workerTaskId);
+    const baseIdentity = createAttempt(`${unique}-partial`);
+    const identity = cancellationIdentity(baseIdentity, workerTaskId);
+    const jobKey = queue!.toKey(workerTaskId);
+    const logsKey = `${jobKey}:logs`;
+    const receiptKey = queue!.toKey(`cancel-receipt:${createCancelOperationId(identity)}`);
+    const receipt = {
+      operationName: "apply-submit-cancel",
+      version: 1,
+      cancelOperationId: createCancelOperationId(identity),
+      applicationTaskId: identity.applicationTaskId,
+      userId: identity.userId,
+      jobId: identity.jobId,
+      sessionId: identity.sessionId,
+      fillTurnId: identity.fillTurnId,
+      workerTaskId: identity.workerTaskId,
+      receiptId: identity.receiptId,
+      constraintHash: identity.constraintHash,
+      previousState: "wait",
+    };
+
+    await queue!.add("apply", payloadFor(baseIdentity), { jobId: workerTaskId });
+    await waitForState(queue!, workerTaskId, "waiting");
+    await redis!.set(receiptKey, JSON.stringify(receipt));
+    expect(await redis!.lrem(queue!.toKey("wait"), 1, workerTaskId)).toBe(1);
+    await redis!.rpush(logsKey, "partial-removal-fixture");
+    try {
+      const originalData = await redis!.hget(jobKey, "data");
+      expect(originalData).not.toBeNull();
+      await redis!.hset(jobKey, "data", JSON.stringify({ ...payloadFor(baseIdentity), applicationTaskId: "other-task" }));
+      await expect(removePendingSubmitJobWithReceipt(redis!, key => queue!.toKey(key), identity, { mode: "receipt-only" }))
+        .resolves.toBe(false);
+      await redis!.hset(jobKey, "data", originalData!);
+
+      const lockKey = `${jobKey}:lock`;
+      await redis!.set(lockKey, "partial-fixture-lock", "EX", 60);
+      try {
+        await expect(removePendingSubmitJobWithReceipt(redis!, key => queue!.toKey(key), identity, { mode: "receipt-only" }))
+          .resolves.toBe(false);
+      } finally {
+        await redis!.del(lockKey);
+      }
+
+      await redis!.rpush(queue!.toKey("wait"), workerTaskId);
+      await expect(removePendingSubmitJobWithReceipt(redis!, key => queue!.toKey(key), identity, { mode: "receipt-only" }))
+        .resolves.toBe(false);
+      await redis!.lrem(queue!.toKey("wait"), 0, workerTaskId);
+
+      await redis!.zadd(queue!.toKey("completed"), Date.now(), workerTaskId);
+      await expect(removePendingSubmitJobWithReceipt(redis!, key => queue!.toKey(key), identity, { mode: "receipt-only" }))
+        .resolves.toBe(false);
+      await redis!.zrem(queue!.toKey("completed"), workerTaskId);
+
+      const orphan = await queue!.getJob(workerTaskId);
+      expect(orphan).toBeDefined();
+      expect(await orphan!.getState()).toBe("unknown");
+      expect(await removedEventsFor(queue!, redis!, workerTaskId)).toHaveLength(0);
+
+      await expect(verifyAndCancelSubmissionJob({
+        workerTaskId,
+        expected: baseIdentity,
+        withExactAttemptFence: async checkReceipt => checkReceipt(),
+      })).resolves.toBe(true);
+
+      expect(await queue!.getJob(workerTaskId)).toBeUndefined();
+      expect(await redis!.exists(jobKey)).toBe(0);
+      expect(await redis!.exists(logsKey)).toBe(0);
+      await expectRemovalReceipt(queue!, redis!, identity, "wait");
+      expect(await removedEventsFor(queue!, redis!, workerTaskId)).toHaveLength(1);
+    } finally {
+      await redis!.lrem(queue!.toKey("wait"), 0, workerTaskId);
+      await redis!.zrem(queue!.toKey("completed"), workerTaskId);
+      await redis!.del(jobKey, logsKey, `${jobKey}:lock`, receiptKey);
+    }
+  }, 15_000);
 
   it("leaves malformed jobs and unsupported or ambiguous Redis shapes untouched", async () => {
     const unique = randomUUID();

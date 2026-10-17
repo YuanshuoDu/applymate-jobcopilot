@@ -181,8 +181,10 @@ export async function verifyAndCancelSubmissionJob(input: VerifySubmissionJobInp
   try {
     const queue = getApplyQueue();
     const found = await queue.getJob(workerTaskId);
-    if (!found) {
-      if (input.allowMissingTerminalProof === true && await hasNoExactLock(queue, workerTaskId)) return true;
+    if (!found && input.allowMissingTerminalProof === true && await hasNoExactLock(queue, workerTaskId)) return true;
+    if (found && (found.id !== workerTaskId || found.name !== "apply" || !hasExpectedIdentity(found.data, expected))) return false;
+    const state = found ? await found.getState() : "missing";
+    if (!found || state === "unknown") {
       const redis = _redis;
       if (!redis || !input.withExactAttemptFence) return false;
       let receiptCheckInvoked = false;
@@ -193,9 +195,7 @@ export async function verifyAndCancelSubmissionJob(input: VerifySubmissionJobInp
       });
       return receiptCheckInvoked && fencedResult === true;
     }
-    if (found.id !== workerTaskId || found.name !== "apply" || !hasExpectedIdentity(found.data, expected)) return false;
     const job = found;
-    const state = await job.getState();
     if (!await hasNoExactLock(queue, workerTaskId)) return false;
     if (state === "completed") return true;
     if (state === "failed" && job.attemptsMade >= (job.opts.attempts ?? 1)) return true;

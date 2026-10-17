@@ -61,9 +61,12 @@ describe("atomic pending submit removal receipt", () => {
     ]));
     expect(script).toContain('"event", "removed", "jobId", jobId, "prev", previous');
     expect(script).toContain('"MAXLEN", "~", maxEvents');
-    expect(script).toContain('"SET", receiptKey, ARGV[13], "NX"');
+    expect(script).toContain('"SET", receiptKey, receiptValue(previous), "NX"');
     expect(script).toContain('receiptSet.ok ~= "OK"');
     expect(script).toContain('"EXISTS", KEYS[2])');
+    expect(script).toContain('local function receiptPreviousState(value)');
+    expect(script).toContain('if not exactSubmitJob() then return 0 end');
+    expect(script).toContain('"prev", previous)');
     expect(script).toContain('if ARGV[14] == "receipt-only" then return 0 end');
 
     const receiptText = args.at(-2);

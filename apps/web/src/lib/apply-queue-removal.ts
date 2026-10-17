@@ -66,25 +66,51 @@ local function stateMembershipCount()
   if redis.call("SISMEMBER", KEYS[11], jobId) == 1 then count = count + 1 end
   return count
 end
+local function receiptValue(previous)
+  return string.sub(ARGV[13], 1, -2) .. ',"previousState":"' .. previous .. '"}'
+end
+local function receiptPreviousState(value)
+  for _, previous in ipairs({"wait", "paused", "delayed"}) do
+    if value == receiptValue(previous) then return previous end
+  end
+  return nil
+end
+local function maxEventCount()
+  local raw = redis.call("HGET", KEYS[13], "opts.maxLenEvents")
+  local value = tonumber(raw or "10000")
+  if not value or value < 1 or value > 2147483647 or value % 1 ~= 0 then return nil end
+  return value
+end
+local function exactSubmitJob()
+  if redis.call("EXISTS", KEYS[1]) ~= 1 or redis.call("EXISTS", KEYS[2]) ~= 0 then return false end
+  local jobName, payloadRaw, parentKey, parent, dedupId, repeatKey, legacyRepeatKey =
+    unpack(redis.call("HMGET", KEYS[1], "name", "data", "parentKey", "parent", "deid", "rjk", "repeatJobKey"))
+  if jobName ~= "apply" or not payloadRaw or parentKey or parent or dedupId or repeatKey or legacyRepeatKey then return false end
+  for i = 16, 19 do if redis.call("EXISTS", KEYS[i]) ~= 0 then return false end end
+  local decoded, payload = pcall(cjson.decode, payloadRaw)
+  return decoded and type(payload) == "table" and payload.operation == "submit"
+    and payload.applicationTaskId == ARGV[5] and payload.userId == ARGV[6] and payload.jobId == ARGV[7]
+    and payload.sessionId == ARGV[8] and payload.fillTurnId == ARGV[9]
+    and payload.receiptId == ARGV[11] and payload.constraintHash == ARGV[12]
+end
 if jobId ~= ARGV[10] or ARGV[2] ~= "apply-submit-cancel" or ARGV[3] ~= "1" or ARGV[4] == ""
     or (ARGV[14] ~= "remove-or-replay" and ARGV[14] ~= "receipt-only") then return 0 end
 if redis.call("EXISTS", receiptKey) == 1 then
-  if redis.call("GET", receiptKey) ~= ARGV[13] or redis.call("EXISTS", KEYS[1]) ~= 0
-      or redis.call("EXISTS", KEYS[2]) ~= 0 or stateMembershipCount() ~= 0 then return 0 end
+  local previous = receiptPreviousState(redis.call("GET", receiptKey))
+  if not previous or redis.call("EXISTS", KEYS[2]) ~= 0 or stateMembershipCount() ~= 0 then return 0 end
+  if redis.call("EXISTS", KEYS[1]) == 1 then
+    if not exactSubmitJob() then return 0 end
+    local maxEvents = maxEventCount()
+    if not maxEvents then return 0 end
+    redis.call("XADD", KEYS[12], "MAXLEN", "~", maxEvents, "*", "event", "removed", "jobId", jobId, "prev", previous)
+    redis.call("DEL", KEYS[1], KEYS[15])
+    return 2
+  end
   for i = 15, 19 do if redis.call("EXISTS", KEYS[i]) ~= 0 then return 0 end end
   return 2
 end
 if ARGV[14] == "receipt-only" then return 0 end
-if redis.call("EXISTS", KEYS[1]) ~= 1 or redis.call("EXISTS", KEYS[2]) ~= 0 then return 0 end
-local jobName, payloadRaw, parentKey, parent, dedupId, repeatKey, legacyRepeatKey =
-  unpack(redis.call("HMGET", KEYS[1], "name", "data", "parentKey", "parent", "deid", "rjk", "repeatJobKey"))
-if jobName ~= "apply" or not payloadRaw or parentKey or parent or dedupId or repeatKey or legacyRepeatKey then return 0 end
-for i = 16, 19 do if redis.call("EXISTS", KEYS[i]) ~= 0 then return 0 end end
-local decoded, payload = pcall(cjson.decode, payloadRaw)
-if not decoded or type(payload) ~= "table" or payload.operation ~= "submit"
-    or payload.applicationTaskId ~= ARGV[5] or payload.userId ~= ARGV[6] or payload.jobId ~= ARGV[7]
-    or payload.sessionId ~= ARGV[8] or payload.fillTurnId ~= ARGV[9]
-    or payload.receiptId ~= ARGV[11] or payload.constraintHash ~= ARGV[12] then return 0 end
+if not exactSubmitJob() then return 0 end
 local waitCount, pausedCount, delayedCount = listCount(KEYS[3], jobId), listCount(KEYS[4], jobId), redis.call("ZSCORE", KEYS[5], jobId) and 1 or 0
 local pendingCount = waitCount + pausedCount + delayedCount
 if pendingCount ~= 1 then return 0 end
@@ -94,10 +120,9 @@ for i = 6, 11 do
   if i > 6 and i < 11 and redis.call("ZSCORE", KEYS[i], jobId) then return 0 end
 end
 local previous = waitCount == 1 and "wait" or (pausedCount == 1 and "paused" or "delayed")
-local maxEventsRaw = redis.call("HGET", KEYS[13], "opts.maxLenEvents")
-local maxEvents = tonumber(maxEventsRaw or "10000")
-if not maxEvents or maxEvents < 1 or maxEvents > 2147483647 or maxEvents % 1 ~= 0 then return 0 end
-local receiptSet = redis.call("SET", receiptKey, ARGV[13], "NX")
+local maxEvents = maxEventCount()
+if not maxEvents then return 0 end
+local receiptSet = redis.call("SET", receiptKey, receiptValue(previous), "NX")
 if not receiptSet or receiptSet.ok ~= "OK" then return 0 end
 local removed = previous == "wait" and redis.call("LREM", KEYS[3], 1, jobId)
   or (previous == "paused" and redis.call("LREM", KEYS[4], 1, jobId)

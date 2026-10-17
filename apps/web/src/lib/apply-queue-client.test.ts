@@ -158,12 +158,36 @@ describe("apply queue submission recovery check", () => {
     expect(mocks.redis.del).not.toHaveBeenCalled();
   });
 
-  it.each(["active", "waiting-children", "prioritized", "unknown"])("rejects nonterminal %s jobs", async status => {
+  it.each(["active", "waiting-children", "prioritized"])("rejects nonterminal %s jobs", async status => {
     mocks.getJob.mockResolvedValue(createJob(status));
     const withFence = vi.fn(async (remove: () => Promise<boolean>) => remove());
 
     await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, withExactAttemptFence: withFence })).resolves.toBe(false);
     expect(withFence).not.toHaveBeenCalled();
+  });
+
+  it("replays an exact removal receipt for an unknown-state orphan inside the attempt fence", async () => {
+    const job = createJob("unknown");
+    mocks.getJob.mockResolvedValue(job);
+    mocks.redis.eval.mockResolvedValueOnce(2);
+    const withFence = vi.fn(async (checkReceipt: () => Promise<boolean>) => checkReceipt());
+
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, withExactAttemptFence: withFence })).resolves.toBe(true);
+    expect(withFence).toHaveBeenCalledOnce();
+    expect(mocks.redis.eval).toHaveBeenCalledOnce();
+    expect(mocks.redis.eval.mock.calls[0]?.at(-1)).toBe("receipt-only");
+    expect(mocks.redis.exists).not.toHaveBeenCalled();
+    expect(job.remove).not.toHaveBeenCalled();
+  });
+
+  it("does not fresh-remove an unknown-state orphan without an exact receipt", async () => {
+    mocks.getJob.mockResolvedValue(createJob("unknown"));
+    mocks.redis.eval.mockResolvedValueOnce(0);
+
+    await expect(verifyAndCancelSubmissionJob({
+      workerTaskId, expected, withExactAttemptFence: async checkReceipt => checkReceipt(),
+    })).resolves.toBe(false);
+    expect(mocks.redis.eval.mock.calls[0]?.at(-1)).toBe("receipt-only");
   });
 
   it.each(["waiting", "delayed"])("removes a matching %s job inside the exact fence with one receipt script", async status => {
