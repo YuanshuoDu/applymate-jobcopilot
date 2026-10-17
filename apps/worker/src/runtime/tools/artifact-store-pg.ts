@@ -1,7 +1,7 @@
 import type { Pool } from "pg"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
-import { createAgentArtifactRepository, AgentArtifactRepositoryError, type AgentArtifactRow, type AgentArtifactVersionRow, type AgentArtifactReviewRow, type AgentArtifactReviewWrite } from "../../db/agent-artifact-repo.js"
-import { ArtifactToolError, type ArtifactBaseInput, type ArtifactToolRecord, type ArtifactToolStore, type ArtifactToolDraftInput, type ArtifactToolScope, type ArtifactVersionRef } from "./artifact-tools.js"
+import { createAgentArtifactRepository, AgentArtifactRepositoryError, type AgentArtifactRevisionReviewRead, type AgentArtifactRow, type AgentArtifactVersionRow, type AgentArtifactReviewRow, type AgentArtifactReviewWrite, type AgentArtifactSourceDigestReader } from "../../db/agent-artifact-repo.js"
+import { ArtifactToolError, type ArtifactBaseInput, type ArtifactToolRecord, type ArtifactToolStore, type ArtifactToolDraftInput, type ArtifactToolRevisionContext, type ArtifactToolScope, type ArtifactVersionRef } from "./artifact-tools.js"
 
 function isUniqueViolation(error: unknown): boolean { return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "23505") }
 function mapError(error: unknown): never {
@@ -16,7 +16,9 @@ function toRecord(row: AgentArtifactRow): ArtifactToolRecord {
 
 export class PgArtifactToolStore implements ArtifactToolStore {
   private readonly repository
-  constructor(pool: Pool) { this.repository = createAgentArtifactRepository(pool) }
+  constructor(pool: Pool, private readonly readCurrentSourceDigest?: AgentArtifactSourceDigestReader) {
+    this.repository = createAgentArtifactRepository(pool)
+  }
 
   async read(userId: string, artifactId: string): Promise<ArtifactToolRecord | null> {
     const row = await this.repository.find(userId, artifactId)
@@ -45,12 +47,25 @@ export class PgArtifactToolStore implements ArtifactToolStore {
         provenanceRefs: [...scope.evidenceRefs], evidenceRefs: [...scope.evidenceRefs], baseId: base.id, baseHash: base.hash,
         previousHash: previous?.hash ?? null, sourceDigest: scope.sourceDigest, taskId: scope.taskId, toolCallId: scope.toolCallId,
         requestHash: input.requestHash, taskFence: scope.taskFence, expectedPreviousHash: input.expectedPreviousHash,
+        expectedPreviousVersion: input.expectedPreviousVersion,
       })
     } catch (error: unknown) { return mapError(error) }
   }
 
   async readVersion(scope: Pick<ArtifactToolScope, "userId" | "sessionId" | "jobId">, ref: ArtifactVersionRef): Promise<AgentArtifactVersionRow | null> {
     return this.repository.findVersion({ ...scope, artifactId: ref.artifactId, version: ref.version })
+  }
+
+  async readRevisionReview(scope: ArtifactToolScope, revision: ArtifactToolRevisionContext): Promise<AgentArtifactReviewRow | null> {
+    if (!this.readCurrentSourceDigest || revision.currentSourceDigest !== scope.sourceDigest
+      || revision.artifactRef.sourceDigest !== revision.currentSourceDigest) return null
+    const input: AgentArtifactRevisionReviewRead = {
+      ...scope, artifactId: revision.artifactRef.artifactId, version: revision.artifactRef.version,
+      contentHash: revision.artifactRef.contentHash, sourceDigest: revision.artifactRef.sourceDigest,
+      currentSourceDigest: revision.currentSourceDigest, dependencyTaskId: revision.dependencyTaskId,
+      reviewHash: revision.reviewHash, readCurrentSourceDigest: this.readCurrentSourceDigest,
+    }
+    try { return await this.repository.readRevisionReview(input) } catch (error: unknown) { return mapError(error) }
   }
 
   async saveReview(input: Omit<AgentArtifactReviewRow, "id" | "artifactVersionId" | "createdAt"> & { readonly taskFence: AgentArtifactReviewWrite["taskFence"] }): Promise<AgentArtifactReviewRow> {

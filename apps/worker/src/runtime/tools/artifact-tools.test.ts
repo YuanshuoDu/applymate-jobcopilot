@@ -69,6 +69,43 @@ describe("immutable selected-job artifact tools", () => {
     await expect(store.readVersion({ userId: "user-a", sessionId: "session-a", jobId: "job-a" }, first.artifactRef)).resolves.toMatchObject({ version: 1, content: "Dear Example" })
   })
 
+  it("checks both expected head fields and rejects a stale version even when its hash still matches", async () => {
+    const store = new InMemoryArtifactToolStore()
+    const baseRow = base(store)
+    const writer = tool(store, "cover_letter.draft")
+    const first = await writer.execute(context(), draftInput(baseRow.id, baseRow.hash, "Same content")) as { artifactRef: ArtifactVersionRef }
+    const second = await writer.execute(context({ taskId: "task-b", toolCallId: "call-b" }), {
+      ...draftInput(baseRow.id, baseRow.hash, "Same content"),
+      expectedPreviousVersion: first.artifactRef.version, expectedPreviousHash: first.artifactRef.contentHash,
+    }) as { artifactRef: ArtifactVersionRef }
+    expect(second.artifactRef).toMatchObject({ version: 2, contentHash: first.artifactRef.contentHash })
+
+    await expect(writer.execute(context({ taskId: "task-c", toolCallId: "call-c" }), {
+      ...draftInput(baseRow.id, baseRow.hash, "Stale version"),
+      expectedPreviousVersion: first.artifactRef.version, expectedPreviousHash: first.artifactRef.contentHash,
+    })).rejects.toMatchObject({ code: "precondition_failed" })
+    await expect(writer.execute(context({ taskId: "task-d", toolCallId: "call-d" }), {
+      ...draftInput(baseRow.id, baseRow.hash, "Stale hash"), expectedPreviousVersion: second.artifactRef.version,
+      expectedPreviousHash: `sha256:${"f".repeat(64)}`,
+    })).rejects.toMatchObject({ code: "precondition_failed" })
+  })
+
+  it("allows only one concurrent revision to advance from the same version and hash", async () => {
+    const store = new InMemoryArtifactToolStore()
+    const baseRow = base(store)
+    const writer = tool(store, "cover_letter.draft")
+    const first = await writer.execute(context(), draftInput(baseRow.id, baseRow.hash)) as { artifactRef: ArtifactVersionRef }
+    const revision = (taskId: string) => writer.execute(context({ taskId, toolCallId: `call-${taskId}` }), {
+      ...draftInput(baseRow.id, baseRow.hash, `Revision from ${taskId}`),
+      expectedPreviousVersion: first.artifactRef.version, expectedPreviousHash: first.artifactRef.contentHash,
+    })
+
+    const results = await Promise.allSettled([revision("task-b"), revision("task-c")])
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1)
+    expect(results.filter(result => result.status === "rejected")).toHaveLength(1)
+    await expect(store.listForUser("user-a", "job-a")).resolves.toHaveLength(2)
+  })
+
   it("lets Reviewer read an exact scoped version and persists a hash-bound review without returning findings", async () => {
     const store = new InMemoryArtifactToolStore()
     const baseRow = base(store)

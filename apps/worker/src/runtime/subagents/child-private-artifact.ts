@@ -6,6 +6,7 @@ import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineToolExecutor } from "../turns/turn-engine-types.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { SelectedJobPreparation } from "../tools/artifact-tools.js"
+import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 import type { RuntimeToolDefinition, ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { validSelectedJobContext } from "./selected-job-artifact-context.js"
 
@@ -175,6 +176,18 @@ function exactReference(value: unknown): ArtifactVersionReference | undefined {
   try { return parseArtifactReference(record(value).artifactRef) } catch { return undefined }
 }
 
+function sameReference(left: ArtifactVersionReference, right: ArtifactVersionReference): boolean {
+  return left.artifactId === right.artifactId && left.version === right.version
+    && left.contentHash === right.contentHash && left.sourceDigest === right.sourceDigest
+}
+
+function validWriterRevisionContext(value: ArtifactToolRevisionContext | undefined, preparation: SelectedJobPreparation): value is ArtifactToolRevisionContext {
+  if (!value || !value.dependencyTaskId.trim() || !/^sha256:[a-f0-9]{64}$/.test(value.reviewHash)
+    || value.currentSourceDigest !== preparation.sourceDigest || value.artifactRef.sourceDigest !== preparation.sourceDigest) return false
+  try { return sameReference(parseArtifactReference(value.artifactRef), value.artifactRef) }
+  catch { return false }
+}
+
 function privateContext(input: Parameters<TurnEngineToolExecutor>[0], selectedJobPreparation: SelectedJobPreparation, taskFence: AgentArtifactTaskFence, lease: SubagentLease): PrivateArtifactToolContext {
   return {
     scope: { ...input.scope, userId: lease.userId }, sessionId: lease.sessionId,
@@ -193,6 +206,7 @@ export function createChildPrivateArtifactDispatcher(options: {
   readonly selectedJobPreparation?: SelectedJobPreparation
   readonly taskFence?: AgentArtifactTaskFence
   readonly reviewerArtifactRef?: ArtifactVersionReference
+  readonly writerRevisionContext?: ArtifactToolRevisionContext
   readonly observedEvidence: ObservedEvidenceIndex
   readonly privateCallIds: Set<string>
 }): TurnEngineToolExecutor {
@@ -224,16 +238,36 @@ export function createChildPrivateArtifactDispatcher(options: {
     const toolContext = privateContext(input, options.selectedJobPreparation, fence, options.lease)
     if (request.toolName === "artifact.version.read") {
       const reference = exactReference(request.input)
-      if (options.lease.role !== "reviewer" || !reference || !options.reviewerArtifactRef
-        || JSON.stringify(reference) !== JSON.stringify(options.reviewerArtifactRef)) {
+      const expected = options.lease.role === "reviewer" ? options.reviewerArtifactRef
+        : options.lease.role === "writer" && validWriterRevisionContext(options.writerRevisionContext, options.selectedJobPreparation)
+          ? options.writerRevisionContext.artifactRef : undefined
+      if (!reference || !expected || !sameReference(reference, expected)) {
         return resultFor(request, "private_artifact_read_unavailable")
       }
-      try { return await options.executePrivateTool(toolContext, request) }
+      try {
+        const result = await options.executePrivateTool(toolContext, request)
+        if (result.status === "completed" && result.errorCode === null) {
+          const actual = exactReference(result.output)
+          if (!actual || !sameReference(actual, expected)) return resultFor(request, "private_artifact_read_unavailable")
+        }
+        return result
+      }
       catch { return resultFor(request, "private_artifact_read_failed") }
     }
     if (request.toolName === "cover_letter.draft") {
       if (options.lease.role !== "writer" || !options.selectedJobPreparation) return resultFor(request, "private_artifact_draft_unavailable")
-      try { return await options.executePrivateTool(toolContext, request) }
+      let boundRequest = request
+      if (options.writerRevisionContext) {
+        if (!validWriterRevisionContext(options.writerRevisionContext, options.selectedJobPreparation)) return resultFor(request, "writer_revision_context_unavailable")
+        const ref = options.writerRevisionContext.artifactRef
+        if (!options.observedEvidence.artifactReads.has(artifactReferenceKey(ref))) return resultFor(request, "writer_revision_exact_read_required")
+        const draftInput = record(request.input)
+        boundRequest = {
+          ...request,
+          input: { ...draftInput, expectedPreviousVersion: ref.version, expectedPreviousHash: ref.contentHash },
+        }
+      }
+      try { return await options.executePrivateTool(toolContext, boundRequest) }
       catch { return resultFor(request, "private_artifact_draft_failed") }
     }
 

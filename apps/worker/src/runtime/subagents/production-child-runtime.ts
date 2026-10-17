@@ -15,12 +15,15 @@ import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
 import { loadChildAttemptResume } from "./child-resume.js"
-import { loadSelectedJobArtifactContext, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
+import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
+import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext, type TaskGraphWriterReviewDependency, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import { createJobDiscoveryClient, type JobDiscoveryClient } from "../tools/job-discovery-client.js"
 import type { JobDiscoveryExecutionFence } from "../tools/job-discover-tool.js"
+import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
+import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -35,6 +38,22 @@ export type ProductionChildRuntimeOptions = {
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
+type WriterReviewRevision = Readonly<{
+  context: ArtifactToolRevisionContext
+  feedback: TaskGraphWriterReviewFeedbackFrame
+}>
+
+function artifactTaskFence(lease: SubagentLease): AgentArtifactTaskFence {
+  if (!lease.turnId || lease.status !== "running" || lease.interruptRequestedAt !== null
+    || !lease.ownerId.trim() || lease.leaseOwner !== lease.ownerId || !Number.isSafeInteger(lease.attemptCount) || lease.attemptCount < 1
+    || !(lease.leaseExpiresAt instanceof Date) || lease.leaseExpiresAt.getTime() <= Date.now()) {
+    throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+  }
+  return {
+    taskId: lease.id, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+    rootTaskId: lease.rootTaskId, parentTaskId: lease.parentTaskId, leaseOwner: lease.ownerId, attemptCount: lease.attemptCount,
+  }
+}
 
 const SUBAGENT_READ_RULE = {
   id: "canonical-subagent-read",
@@ -109,14 +128,45 @@ function withoutIdentity<T extends { identity: ExecutionOwnerFence }>(input: T):
 async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence, discoveryClient?: JobDiscoveryClient): Promise<ChildToolRuntime> {
   const executionOwner: ExecutionOwner = { kind: "task", lease }
   const selectedJobRole = task.role === "scout" || task.role === "analyst" || task.role === "writer" || task.role === "reviewer"
-  const selectedJob = selectedJobRole ? selectedJobId(task) : undefined
+  const selectedJob = selectedJobRole ? selectedJobId(lease) : undefined
+  let writerReviewDependency: TaskGraphWriterReviewDependency | null = null
+  if (task.role === "writer" && selectedJob) {
+    try { writerReviewDependency = writerReviewDependencyFromTaskContext(lease.context, selectedJob) }
+    catch (error: unknown) {
+      if (error instanceof TaskGraphWriterReviewFeedbackError) throw error
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
+    }
+    await assertPersistedWriterReviewDependency(pool, task, lease, writerReviewDependency)
+  }
   const selectedJobArtifactContext = selectedJob
     ? await loadSelectedJobArtifactContext(pool, task.userId, selectedJob)
     : undefined
   const selectedJobPreparation = selectedJobArtifactContext?.preparation
   const artifacts = selectedJobPreparation && (task.role === "writer" || task.role === "reviewer")
-    ? createArtifactToolStore(pool)
+    ? createArtifactToolStore(pool, readSelectedJobSourceDigestWithClient)
     : undefined
+  let writerReviewRevision: WriterReviewRevision | undefined
+  if (writerReviewDependency) {
+    if (!selectedJobPreparation || !artifacts || selectedJobPreparation.jobId !== selectedJob
+      || selectedJobPreparation.sourceDigest !== writerReviewDependency.artifactRef.sourceDigest) {
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+    }
+    const context: ArtifactToolRevisionContext = {
+      ...writerReviewDependency, currentSourceDigest: selectedJobPreparation.sourceDigest,
+    }
+    const scope = {
+      ...selectedJobPreparation, userId: lease.userId, sessionId: lease.sessionId, taskId: lease.id,
+      toolCallId: "writer-review-feedback", taskFence: artifactTaskFence(lease),
+    }
+    const review = await artifacts.readRevisionReview(scope, context)
+    if (!review) throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+    writerReviewRevision = {
+      context,
+      feedback: createTaskGraphWriterReviewFeedbackFrame(review, context, {
+        userId: lease.userId, sessionId: lease.sessionId, jobId: selectedJobPreparation.jobId,
+      }),
+    }
+  }
   const coverLetterBase = task.role === "writer" && selectedJobPreparation && artifacts
     ? await resolveCoverLetterBase(artifacts, task.userId, selectedJobPreparation.jobId)
     : undefined
@@ -143,9 +193,10 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     definitions: runtime.registry.list(), router: runtime.router,
     ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
     ...(serverContext ? { serverContext } : {}),
+    ...(writerReviewRevision ? { writerReviewRevision } : {}),
     ...(selectedJobPreparation ? {
       executePrivateTool: async (context, request) => {
-        const privateRead = task.role === "reviewer" && request.toolName === "artifact.version.read"
+        const privateRead = request.toolName === "artifact.version.read" && (task.role === "reviewer" || (task.role === "writer" && Boolean(writerReviewRevision)))
         const privateDraft = task.role === "writer" && request.toolName === "cover_letter.draft"
         const privateReview = task.role === "reviewer" && request.toolName === "artifact.review"
         if ((!privateRead && !privateDraft && !privateReview) || request.toolVersion !== "1" || context.actorRole !== "subagent") {

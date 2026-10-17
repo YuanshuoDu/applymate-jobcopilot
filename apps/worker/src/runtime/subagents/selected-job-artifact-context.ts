@@ -21,10 +21,10 @@ const SELECTED_JOB_PRIVATE_PLACEHOLDER = "[Private selected-job response withhel
 
 export function isSelectedJobReadTool(toolName: string): boolean { return SELECTED_JOB_READ_TOOLS.has(toolName) }
 
-export function selectedJobToolAllowed(role: string, toolName: string): boolean {
+export function selectedJobToolAllowed(role: string, toolName: string, writerRevision = false): boolean {
   if (role === "scout") return toolName === "jobs.get"
   if (role === "analyst") return SELECTED_JOB_READ_TOOLS.has(toolName)
-  if (role === "writer") return toolName === "cover_letter.draft"
+  if (role === "writer") return toolName === "cover_letter.draft" || (writerRevision && toolName === "artifact.version.read")
   return role === "reviewer" && (toolName === "artifact.version.read" || toolName === "artifact.review")
 }
 

@@ -3,13 +3,21 @@ import { randomUUID } from "node:crypto"
 import {
   AgentArtifactRepositoryError, artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive,
   findCurrentDraftHeadWithClient, findReviewReceiptWithClient, toAgentArtifactReviewRow, toAgentArtifactRow, toAgentArtifactVersionRow, withArtifactTransaction,
-  type AgentArtifactBaseInsert, type AgentArtifactDraftWrite, type AgentArtifactReviewRow, type AgentArtifactReviewWrite,
+  type AgentArtifactBaseInsert, type AgentArtifactDraftWrite as HelperAgentArtifactDraftWrite, type AgentArtifactReviewRow, type AgentArtifactReviewWrite,
   type AgentArtifactRow, type AgentArtifactTaskFence, type AgentArtifactVersionRow,
 } from "./agent-artifact-repo-helpers.js"
 
 export { AgentArtifactRepositoryError, findCurrentDraftHeadWithClient, findReviewReceiptWithClient } from "./agent-artifact-repo-helpers.js"
-export type { AgentArtifactBaseInsert, AgentArtifactDraftWrite, AgentArtifactLifecycle, AgentArtifactReviewRow,
+export type { AgentArtifactBaseInsert, AgentArtifactLifecycle, AgentArtifactReviewRow,
   AgentArtifactReviewWrite, AgentArtifactRow, AgentArtifactTaskFence, AgentArtifactVersionRow } from "./agent-artifact-repo-helpers.js"
+export type AgentArtifactDraftWrite = HelperAgentArtifactDraftWrite & { readonly expectedPreviousVersion?: number }
+export type AgentArtifactSourceDigestReader = (client: Pick<PoolClient, "query">, userId: string, jobId: string) => Promise<string | null>
+
+export type AgentArtifactRevisionReviewRead = Readonly<{
+  userId: string; sessionId: string; jobId: string; artifactId: string; version: number; contentHash: string
+  sourceDigest: string; currentSourceDigest: string; dependencyTaskId: string; reviewHash: string; taskFence: AgentArtifactTaskFence
+  readCurrentSourceDigest: AgentArtifactSourceDigestReader
+}>
 
 export type AgentArtifactDraftHead = Readonly<{
   artifactId: string
@@ -130,7 +138,10 @@ export function createAgentArtifactRepository(pool: Pool) {
         if (previous && (previous.jobId !== base.jobId || previous.baseId !== input.baseId || previous.artifactType !== input.artifactType)) {
           throw new AgentArtifactRepositoryError("precondition_failed", "Draft identity does not match its base artifact.")
         }
-        if (previous && input.expectedPreviousHash !== undefined && input.expectedPreviousHash !== previous.hash) {
+        if (input.expectedPreviousVersion !== undefined && (!previous || input.expectedPreviousVersion !== previous.version)) {
+          throw new AgentArtifactRepositoryError("precondition_failed", "Draft update has a stale previous version.")
+        }
+        if (input.expectedPreviousHash !== undefined && (previous ? input.expectedPreviousHash !== previous.hash : input.expectedPreviousHash !== null)) {
           throw new AgentArtifactRepositoryError("precondition_failed", "Draft update has a stale previous hash.")
         }
         const previousHash = previous?.hash ?? input.previousHash
@@ -177,6 +188,30 @@ export function createAgentArtifactRepository(pool: Pool) {
     /** Reads only the current draft reference and requires its head version to belong to this session. */
     async findCurrentDraftHead(scope: AgentArtifactDraftHeadScope): Promise<AgentArtifactDraftHead | null> {
       return withArtifactTransaction(pool, scope.userId, client => findCurrentDraftHeadWithClient(client, scope))
+    },
+
+    async readRevisionReview(input: AgentArtifactRevisionReviewRead): Promise<AgentArtifactReviewRow | null> {
+      return withArtifactTransaction(pool, input.userId, async client => {
+        if (input.taskFence.taskId === input.dependencyTaskId || input.version < 1 || !Number.isSafeInteger(input.version)
+          || input.sourceDigest !== input.currentSourceDigest) return null
+        if (!await artifactTaskFenceIsCurrent(client, input.taskFence, input.jobId)) return null
+        if (!await artifactTaskLeaseIsLive(client, input.taskFence)) return null
+        const currentSourceDigest = await input.readCurrentSourceDigest(client, input.userId, input.jobId)
+        if (currentSourceDigest !== input.sourceDigest || currentSourceDigest !== input.currentSourceDigest) return null
+        const reviewResult = await client.query<Record<string, unknown>>(
+          `SELECT ${reviewColumns} FROM "agent_artifact_review" WHERE "userId"=$1 AND "sessionId"=$2 AND "jobId"=$3 AND "artifactId"=$4 AND "version"=$5 AND "contentHash"=$6 AND "sourceDigest"=$7 AND "currentSourceDigest"=$8 AND "status"='needs_revision' AND "taskId"=$9 AND "reviewHash"=$10 LIMIT 2`,
+          [input.userId, input.sessionId, input.jobId, input.artifactId, input.version, input.contentHash, input.sourceDigest, input.currentSourceDigest, input.dependencyTaskId, input.reviewHash],
+        )
+        if (reviewResult.rows.length !== 1) return null
+        const review = toAgentArtifactReviewRow(reviewResult.rows[0] ?? {})
+        if (review.status !== "needs_revision" || review.taskId !== input.dependencyTaskId || review.reviewHash !== input.reviewHash
+          || review.userId !== input.userId || review.sessionId !== input.sessionId || review.jobId !== input.jobId
+          || review.artifactId !== input.artifactId || review.version !== input.version || review.contentHash !== input.contentHash
+          || review.sourceDigest !== input.sourceDigest || review.currentSourceDigest !== input.currentSourceDigest) return null
+        const head = await selectOne(client, input.userId, input.artifactId, true)
+        if (!head || head.lifecycle !== "draft" || head.jobId !== input.jobId || head.version !== input.version || head.hash !== input.contentHash) return null
+        return await artifactTaskLeaseIsLive(client, input.taskFence) ? review : null
+      })
     },
 
     async saveReview(input: AgentArtifactReviewWrite): Promise<AgentArtifactReviewRow> {

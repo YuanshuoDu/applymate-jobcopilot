@@ -1,14 +1,16 @@
 import { describe, expect, it } from "vitest"
 import type { Pool } from "pg"
+import type { AgentArtifactSourceDigestReader } from "../../db/agent-artifact-repo.js"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
-import { createArtifactTools, createSelectedJobPreparation, type ArtifactToolExecutionContext, type ArtifactToolScope } from "./artifact-tools.js"
+import { createArtifactTools, createSelectedJobPreparation, type ArtifactToolExecutionContext, type ArtifactToolRevisionContext, type ArtifactToolScope } from "./artifact-tools.js"
 
 const prep = createSelectedJobPreparation("job-a", [{ sourceRef: "resume:r-1", content: { skills: ["TypeScript"] } }])
 function scopeFor(taskId = "task-a", toolCallId = "call-a"): ArtifactToolScope {
   return { userId: "user-a", sessionId: "session-a", taskId, toolCallId, taskFence: { taskId, userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a", leaseOwner: "worker-a", attemptCount: 1 }, ...prep }
 }
 const scope = scopeFor()
+const readCurrentSourceDigest: AgentArtifactSourceDigestReader = async () => prep.sourceDigest
 
 function executionContext(taskId = "task-a", toolCallId = "call-a", leaseOwner = "worker-a", attemptCount = 1): ArtifactToolExecutionContext {
   const scoped = scopeFor(taskId, toolCallId)
@@ -42,6 +44,108 @@ describe("PgArtifactToolStore immutable persistence", () => {
     await expect(store.writeDraft(scope, input)).resolves.toEqual(first)
     await expect(store.writeDraft(scope, { ...input, content: "changed", requestHash: hashArtifactContent("changed") })).rejects.toMatchObject({ code: "receipt_conflict" })
     expect((await store.listForUser(scope.userId, scope.jobId)).find(row => row.lifecycle === "draft")).toMatchObject({ version: 1, hash: first.contentHash })
+  })
+
+  it("checks the expected version and hash under the locked current head", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const input = { baseArtifactId: base.id, baseHash: base.hash, content: "same body", constraints: {}, requestHash: hashArtifactContent("first") }
+    const first = await store.writeDraft(scope, input)
+    const second = await store.writeDraft(scopeFor("task-a", "call-second"), {
+      ...input, requestHash: hashArtifactContent("second"), expectedPreviousVersion: first.version, expectedPreviousHash: first.contentHash,
+    })
+    expect(second).toMatchObject({ version: 2, contentHash: first.contentHash })
+
+    await expect(store.writeDraft(scopeFor("task-a", "call-stale-version"), {
+      ...input, requestHash: hashArtifactContent("stale-version"), expectedPreviousVersion: first.version, expectedPreviousHash: first.contentHash,
+    })).rejects.toMatchObject({ code: "precondition_failed" })
+    await expect(store.writeDraft(scopeFor("task-a", "call-stale-hash"), {
+      ...input, requestHash: hashArtifactContent("stale-hash"), expectedPreviousVersion: second.version,
+      expectedPreviousHash: hashArtifactContent("another body"),
+    })).rejects.toMatchObject({ code: "precondition_failed" })
+    await expect(store.readVersion(scope, { artifactId: second.artifactId, version: 3, contentHash: second.contentHash, sourceDigest: second.sourceDigest })).resolves.toBeNull()
+  })
+
+  it("serializes concurrent revisions so only one writer advances a matching head", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const first = await store.writeDraft(scope, { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("first") })
+    const revision = (toolCallId: string) => store.writeDraft(scopeFor("task-a", toolCallId), {
+      baseArtifactId: base.id, baseHash: base.hash, content: `revision ${toolCallId}`, constraints: {}, requestHash: hashArtifactContent(toolCallId),
+      expectedPreviousVersion: first.version, expectedPreviousHash: first.contentHash,
+    })
+
+    const results = await Promise.allSettled([revision("race-a"), revision("race-b")])
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1)
+    expect(results.filter(result => result.status === "rejected")).toHaveLength(1)
+    await expect(store.readVersion(scope, { artifactId: first.artifactId, version: 2, contentHash: (results.find(result => result.status === "fulfilled") as PromiseFulfilledResult<Awaited<ReturnType<typeof store.writeDraft>>>).value.contentHash, sourceDigest: first.sourceDigest })).resolves.toMatchObject({ version: 2 })
+    await expect(store.readVersion(scope, { artifactId: first.artifactId, version: 3, contentHash: first.contentHash, sourceDigest: first.sourceDigest })).resolves.toBeNull()
+  })
+
+  it("returns only the exact needs-revision receipt for a live Writer fence and unchanged artifact head", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool, readCurrentSourceDigest)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const version = await store.writeDraft(scope, { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("draft") })
+    const reviewerScope = scopeFor("review-task", "review-call")
+    const review = await store.saveReview({
+      userId: scope.userId, sessionId: scope.sessionId, jobId: scope.jobId, artifactId: version.artifactId, version: version.version,
+      contentHash: version.contentHash, sourceDigest: version.sourceDigest, currentSourceDigest: prep.sourceDigest, status: "needs_revision",
+      findings: [{ id: "grammar", code: "grammar", severity: "warning", message: "Revise wording", artifactHash: version.contentHash, evidence: [] }],
+      evidenceRefs: [...scope.evidenceRefs], taskId: reviewerScope.taskId, toolCallId: reviewerScope.toolCallId,
+      requestHash: hashArtifactContent("review"), reviewHash: hashArtifactContent("review receipt"), taskFence: reviewerScope.taskFence,
+    })
+    const revision: ArtifactToolRevisionContext = {
+      dependencyTaskId: reviewerScope.taskId,
+      artifactRef: { artifactId: version.artifactId, version: version.version, contentHash: version.contentHash, sourceDigest: version.sourceDigest },
+      currentSourceDigest: prep.sourceDigest, reviewHash: review.reviewHash,
+    }
+
+    await expect(store.readRevisionReview(scope, revision)).resolves.toMatchObject({ id: review.id, status: "needs_revision", findings: [{ message: "Revise wording" }] })
+    await expect(new PgArtifactToolStore(pool as unknown as Pool).readRevisionReview(scope, revision)).resolves.toBeNull()
+    await expect(store.readRevisionReview(scope, { ...revision, dependencyTaskId: "other-reviewer" })).resolves.toBeNull()
+    await expect(store.readRevisionReview(scope, { ...revision, reviewHash: hashArtifactContent("wrong review") })).resolves.toBeNull()
+    await expect(store.readRevisionReview(scope, { ...revision, currentSourceDigest: hashArtifactContent("changed source") })).resolves.toBeNull()
+
+    pool.fence.interruptRequestedAt = new Date()
+    await expect(store.readRevisionReview(scope, revision)).resolves.toBeNull()
+  })
+
+  it("rejects ambiguous review receipts and a review whose artifact head has advanced", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool, readCurrentSourceDigest)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const version = await store.writeDraft(scope, { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("draft") })
+    const reviewer = scopeFor("review-task", "review-call")
+    const reviewWrite = {
+      userId: scope.userId, sessionId: scope.sessionId, jobId: scope.jobId, artifactId: version.artifactId, version: version.version,
+      contentHash: version.contentHash, sourceDigest: version.sourceDigest, currentSourceDigest: prep.sourceDigest, status: "needs_revision" as const,
+      findings: [], evidenceRefs: [...scope.evidenceRefs], taskId: reviewer.taskId, requestHash: hashArtifactContent("review"),
+      reviewHash: hashArtifactContent("review receipt"), taskFence: reviewer.taskFence,
+    }
+    await store.saveReview({ ...reviewWrite, toolCallId: "review-call-a" })
+    const revision: ArtifactToolRevisionContext = {
+      dependencyTaskId: reviewer.taskId,
+      artifactRef: { artifactId: version.artifactId, version: version.version, contentHash: version.contentHash, sourceDigest: version.sourceDigest },
+      currentSourceDigest: prep.sourceDigest, reviewHash: reviewWrite.reviewHash,
+    }
+    await store.saveReview({ ...reviewWrite, toolCallId: "review-call-b" })
+    await expect(store.readRevisionReview(scope, revision)).resolves.toBeNull()
+
+    const freshPool = new FakeArtifactPool()
+    const freshStore = new PgArtifactToolStore(freshPool as unknown as Pool, readCurrentSourceDigest)
+    const freshBase = await freshStore.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const oldVersion = await freshStore.writeDraft(scope, { baseArtifactId: freshBase.id, baseHash: freshBase.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("old") })
+    const oldReview = await freshStore.saveReview({ ...reviewWrite, artifactId: oldVersion.artifactId, version: oldVersion.version, contentHash: oldVersion.contentHash, sourceDigest: oldVersion.sourceDigest, currentSourceDigest: prep.sourceDigest, toolCallId: "old-review-call", taskFence: reviewer.taskFence })
+    await freshStore.writeDraft(scopeFor("task-a", "next-call"), {
+      baseArtifactId: freshBase.id, baseHash: freshBase.hash, content: "next", constraints: {}, requestHash: hashArtifactContent("next"),
+      expectedPreviousVersion: oldVersion.version, expectedPreviousHash: oldVersion.contentHash,
+    })
+    await expect(freshStore.readRevisionReview(scope, {
+      ...revision, artifactRef: { artifactId: oldVersion.artifactId, version: oldVersion.version, contentHash: oldVersion.contentHash, sourceDigest: oldVersion.sourceDigest }, reviewHash: oldReview.reviewHash,
+    })).resolves.toBeNull()
   })
 
   it("replays draft and review receipts through the PG store after a live lease reclaim", async () => {
@@ -182,13 +286,30 @@ class FakeArtifactPool {
   skipNextVersionReceiptRead = false
   conflictWinnerReads = 0
   private resolvingVersionConflict = false
+  private advisoryLockTail: Promise<void> = Promise.resolve()
   readonly fence = {
     leaseOwner: "worker-a", attemptCount: 1, status: "running", interruptRequestedAt: null as Date | null,
     leaseExpiresAt: new Date("2099-01-01T00:00:00Z"), sessionStatus: "active", turnStatus: "waiting",
     turnUserId: "user-a", turnRootTaskId: "root-a", rootStatus: "waiting", rootInterrupted: false,
     parentStatus: "waiting", parentInterrupted: false, selectedJobId: "job-a",
   }
-  async connect() { return { query: (sql: string, values?: unknown[]) => this.query(sql, values), release: () => undefined } }
+  async connect() {
+    let releaseLock: (() => void) | undefined
+    return {
+      query: async (sql: string, values?: unknown[]) => {
+        if (sql.includes("pg_advisory_xact_lock")) {
+          const predecessor = this.advisoryLockTail
+          this.advisoryLockTail = new Promise<void>(resolve => { releaseLock = resolve })
+          await predecessor
+          return this.empty()
+        }
+        const result = await this.query(sql, values)
+        if (sql === "COMMIT" || sql === "ROLLBACK") { releaseLock?.(); releaseLock = undefined }
+        return result
+      },
+      release: () => { releaseLock?.(); releaseLock = undefined },
+    }
+  }
   async query(sql: string, values: unknown[] = []): Promise<Result> {
     if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql) || sql.includes("set_config") || sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 0 }
     if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("selectedJobPreparation")) {
@@ -208,7 +329,7 @@ class FakeArtifactPool {
       return this.one(valid ? { id: values[0] } : undefined)
     }
     if (sql.includes('SELECT "leaseExpiresAt" > clock_timestamp() AS "live"')) {
-      const live = values[0] === "task-a" && values[1] === "session-a" && values[2] === this.fence.leaseOwner
+      const live = (values[0] === "task-a" || values[0] === "review-task") && values[1] === "session-a" && values[2] === this.fence.leaseOwner
         && values[3] === this.fence.attemptCount && this.fence.leaseExpiresAt.getTime() > Date.now()
       return this.one({ live })
     }
@@ -229,6 +350,14 @@ class FakeArtifactPool {
       const receipt = this.reviewReceipts.get(`${values[0]}:${values[1]}`)
       this.expireLeaseAfterReceiptQuery()
       return this.one(receipt)
+    }
+    if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact_review"') && sql.includes('"currentSourceDigest"=$8')) {
+      const matches = [...this.reviews.values()].filter(value => value.userId === values[0] && value.sessionId === values[1]
+        && value.jobId === values[2] && value.artifactId === values[3] && value.version === values[4]
+        && value.contentHash === values[5] && value.sourceDigest === values[6] && value.currentSourceDigest === values[7]
+        && value.status === "needs_revision" && value.taskId === values[8] && value.reviewHash === values[9]).slice(0, 2)
+      this.expireLeaseAfterReceiptQuery()
+      return { rows: matches, rowCount: matches.length }
     }
     if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact_version"')) {
       const row = [...this.versions.values()].find(value => value.userId === values[0] && value.sessionId === values[1] && value.jobId === values[2] && value.artifactId === values[3] && value.version === values[4] && (values[5] === undefined || value.contentHash === values[5]) && (values[6] === undefined || value.sourceDigest === values[6]))
