@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => {
       attemptsMade: number;
       opts: { attempts: number };
       getState: () => Promise<string>;
+      remove: () => Promise<void>;
     },
     getJob: vi.fn(),
     fakePage,
@@ -255,7 +256,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       isCurrentTerminalDelivery?: (client: unknown) => Promise<boolean>,
     ) => isCurrentTerminalDelivery ? isCurrentTerminalDelivery({
       query: async (sql: string) => sql.includes('FROM "application_tasks"')
-        ? { rows: [{ id: "application-task-1" }], rowCount: 1 }
+        ? { rows: [{ id: "application-task-1", status: "filling", checkpoint: "browser_active" }], rowCount: 1 }
         : sql.includes('FROM "application_task_events"')
           ? { rows: [], rowCount: 0 }
           : { rows: [], rowCount: 1 },
@@ -586,6 +587,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.currentSubmitJob = {
       ...terminalJob,
       getState: vi.fn().mockResolvedValue("completed"),
+      remove: vi.fn().mockResolvedValue(undefined),
     };
 
     await failed({ ...terminalJob, attemptsMade: 1 });
@@ -618,6 +620,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     mocks.currentSubmitJob = {
       ...terminalEvent,
       getState: vi.fn().mockResolvedValue("active"),
+      remove: vi.fn().mockResolvedValue(undefined),
     };
     mocks.redisExists.mockResolvedValue(1);
 
