@@ -1168,12 +1168,15 @@ async function reconcileTerminalSubmissionClaim(job: Job<ApplyTaskPayload> | und
     sessionId: submitPayload.sessionId, fillTurnId: submitPayload.fillTurnId,
     approvalId: submitPayload.receiptId, constraintHash: submitPayload.constraintHash,
   }, workerTaskId, async () => {
+    if (await applyQueue.isPaused()) return false;
     const currentJob = await applyQueue.getJob(workerTaskId);
-    if (!currentJob || currentJob.id !== workerTaskId || !matchesExactSubmitPayload(currentJob.data, submitPayload)) return false;
+    const lockKey = applyQueue.toKey(`${workerTaskId}:lock`);
+    // The terminal event supplies the exact identity when retention prunes its queue record.
+    if (!currentJob) return await redisConnection.exists(lockKey) === 0;
+    if (currentJob.id !== workerTaskId || !matchesExactSubmitPayload(currentJob.data, submitPayload)) return false;
     const state = await currentJob.getState();
     const terminal = state === "completed" || state === "failed" && currentJob.attemptsMade >= (currentJob.opts.attempts ?? 1);
     if (!terminal) return false;
-    const lockKey = applyQueue.toKey(`${workerTaskId}:lock`);
     return await redisConnection.exists(lockKey) === 0;
   });
 }

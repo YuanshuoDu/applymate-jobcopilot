@@ -67,6 +67,37 @@ describe("claimed submit terminal recovery", () => {
     expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId, expect.any(Function))
   })
 
+  it("recovers an exact claimed attempt when BullMQ has pruned its terminal job", async () => {
+    const { queue, redis } = makeQueue()
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
+
+    expect(queue.getJob).toHaveBeenCalledTimes(2)
+    expect(redis.get).toHaveBeenCalledTimes(2)
+    expect(mockReconcile).toHaveBeenCalledOnce()
+  })
+
+  it("defers if the exact lock appears after the absent-job preflight", async () => {
+    const { queue, redis } = makeQueue()
+    redis.get.mockImplementationOnce(async () => null).mockImplementationOnce(async () => "retry-lock")
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("deferred")
+
+    expect(mockReconcile).toHaveBeenCalledOnce()
+    expect(queue.getJob).toHaveBeenCalledOnce()
+    expect(redis.get).toHaveBeenCalledTimes(2)
+  })
+
+  it("defers if the queue pauses after the absent-job preflight", async () => {
+    const { queue } = makeQueue()
+    vi.spyOn(queue, "isPaused").mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("deferred")
+
+    expect(queue.isPaused).toHaveBeenCalledTimes(2)
+    expect(mockReconcile).toHaveBeenCalledOnce()
+  })
+
   it.each([
     { name: "active state", lock: null, expectSecondJobRead: true },
     { name: "active Redis lock", lock: "retry-lock", expectSecondJobRead: false },
@@ -103,9 +134,9 @@ describe("claimed submit terminal recovery", () => {
 
   it.each([
     { name: "a live Redis lock", options: { job: makeJob("failed"), lock: "token" } },
+    { name: "a missing job with its exact lock", options: { lock: "token" } },
     { name: "a paused queue", options: { job: makeJob("failed"), paused: true } },
     { name: "an active job", options: { job: makeJob("active") } },
-    { name: "a missing job", options: {} },
   ])("leaves a published claim alone with $name", async ({ options }) => {
     const { queue } = makeQueue(options)
 
@@ -119,6 +150,7 @@ describe("claimed submit terminal recovery", () => {
 
     expect(matchesSubmitJobPayload(job.data, intent)).toBe(false)
     await expect(inspectSubmitDelivery(queue, intent, false)).resolves.toBe("mismatch")
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("mismatch")
     expect(mockReconcile).not.toHaveBeenCalled()
   })
 

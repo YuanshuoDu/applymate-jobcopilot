@@ -217,9 +217,10 @@ describe("application submit outbox publisher", () => {
   it("never re-adds an intent once its exact Worker claim advanced the task", async () => {
     const fixture = makeFixture({ checkpoint: "browser_active", jobWorkflow: "submitting" })
     await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
+    expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce()
     expect(fixture.queue.add).not.toHaveBeenCalled()
     expect(fixture.state.outbox.publishedAt).toBeNull()
-    expect(fixture.state.outbox.lastError).toBe("terminal:claimed_delivery_missing")
+    expect(fixture.state.outbox.lastError).toBe("terminal:terminal_submit_reconciled")
   })
 
   it("re-adds an evicted published intent with the same stable ID while its exact attempt is still pre-claim", async () => {
@@ -411,15 +412,40 @@ describe("application submit outbox publisher", () => {
     expect(fixture.state.outbox.lastError).toBe("terminal:terminal_submit_reconciled")
   })
 
-  it("does not reconcile or requeue a claimed delivery whose job is missing", async () => {
+  it("recovers an exact claimed attempt after its job is pruned without republishing", async () => {
     const fixture = makeFixture({ checkpoint: "browser_active", jobWorkflow: "submitting" })
+    fixture.state.outbox.publishedAt = new Date("2026-10-16T12:00:00.000Z")
+    mockReconcileClaimedSubmissionUncertain.mockImplementationOnce(async (...args: unknown[]) => {
+      const validateDelivery = args[3] as (() => Promise<boolean>) | undefined
+      const safeToRecover = validateDelivery ? await validateDelivery() : false
+      if (safeToRecover) {
+        fixture.state.task.status = "waiting_for_user"
+        fixture.state.task.checkpoint = "submission_uncertain"
+      }
+      return safeToRecover
+    })
+
+    await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
+
+    expect(mockReconcileClaimedSubmissionUncertain).toHaveBeenCalledOnce()
+    expect(fixture.state.task).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain" })
+    expect(fixture.state.job).toEqual({ status: "saved", workflowState: "submitting" })
+    expect(fixture.queue.add).not.toHaveBeenCalled()
+    expect(fixture.state.outbox.publishedAt).toBeInstanceOf(Date)
+    expect(fixture.state.outbox.lastError).toBe("terminal:terminal_submit_reconciled")
+  })
+
+  it("defers a pruned claimed delivery while its exact Redis lock remains", async () => {
+    const fixture = makeFixture({ checkpoint: "browser_active", jobWorkflow: "submitting", lock: "live-lock" })
     fixture.state.outbox.publishedAt = new Date("2026-10-16T12:00:00.000Z")
 
     await expect(drainApplicationSubmitOutbox(fixture.pool, fixture.queue as never)).resolves.toBe(0)
 
     expect(mockReconcileClaimedSubmissionUncertain).not.toHaveBeenCalled()
+    expect(fixture.state.task).toMatchObject({ status: "filling", checkpoint: "browser_active" })
+    expect(fixture.state.job.workflowState).toBe("submitting")
     expect(fixture.queue.add).not.toHaveBeenCalled()
-    expect(fixture.state.outbox.lastError).toBe("terminal:claimed_delivery_missing")
+    expect(fixture.state.outbox.lastError).toBeNull()
   })
 
   it("keeps a claimed intent eligible after a retryable failed delivery", async () => {

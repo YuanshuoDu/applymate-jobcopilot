@@ -124,8 +124,9 @@ export async function resetExpiredSubmitAuthorization(client: PoolClient, intent
 export async function reconcileClaimedTerminalSubmit(
   pool: Pool, queue: SubmitOutboxQueue, intent: SubmitOutboxIntent,
 ): Promise<SubmitDeliveryState | "reconciled" | "unchanged"> {
-  const delivery = await inspectSubmitDelivery(queue, intent, false)
-  if (delivery !== "terminal") return delivery
+  // A durable exact claim may only recover as uncertain after a pruned job also has no exact lock.
+  const delivery = await inspectSubmitDelivery(queue, intent, true)
+  if (delivery !== "terminal" && delivery !== "absent") return delivery
   const identity: ApplicationSubmitIdentity = {
     applicationTaskId: intent.applicationTaskId, userId: intent.userId, jobId: intent.jobId,
     sessionId: intent.sessionId, fillTurnId: intent.fillTurnId,
@@ -133,9 +134,9 @@ export async function reconcileClaimedTerminalSubmit(
   }
   let fencedDelivery: SubmitDeliveryState | undefined
   const reconciled = await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async () => {
-    fencedDelivery = await inspectSubmitDelivery(queue, intent, false)
-    return fencedDelivery === "terminal"
+    fencedDelivery = await inspectSubmitDelivery(queue, intent, true)
+    return fencedDelivery === "terminal" || fencedDelivery === "absent"
   })
   if (reconciled) return "reconciled"
-  return fencedDelivery && fencedDelivery !== "terminal" ? fencedDelivery : "unchanged"
+  return fencedDelivery && fencedDelivery !== "terminal" && fencedDelivery !== "absent" ? fencedDelivery : "unchanged"
 }

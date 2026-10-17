@@ -141,12 +141,8 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
             row.idempotencyKey !== dispatchIds(currentIntent).idempotencyKey ? "outbox_identity_mismatch"
             : await validateCurrentSubmit(client, currentIntent)
           if (reason === "claimed_delivery_recovery") {
-            const delivery = await inspectSubmitDelivery(queue, currentIntent, false)
-            if (delivery === "terminal") { claimedRecovery = currentIntent; return "skipped" as const }
-            if (delivery === "missing") {
-              const terminalized = await markTerminal(client, row, "claimed_delivery_missing", queue, currentIntent.workerTaskId, published)
-              return terminalized ? "terminalized" as const : "skipped" as const
-            }
+            const delivery = await inspectSubmitDelivery(queue, currentIntent, true)
+            if (delivery === "terminal" || delivery === "absent") { claimedRecovery = currentIntent; return "skipped" as const }
             if (delivery === "mismatch") {
               const terminalized = await markTerminal(client, row, "queue_job_identity_mismatch", queue, currentIntent.workerTaskId, published)
               return terminalized ? "terminalized" as const : "skipped" as const

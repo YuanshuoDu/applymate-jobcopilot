@@ -611,6 +611,56 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
     }
   }, 30_000)
 
+  it.skipIf(!redisUrl)("recovers a durable claimed attempt after BullMQ prunes its terminal job", async () => {
+    const { identity, outboxId } = await prepareOutboxedSubmit("claimed-terminal-job-pruned")
+    const completed = deferred()
+    let workerRedis: Redis | undefined
+    let worker: Worker<ApplyTaskSubmitPayload, void> | undefined
+    try {
+      await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(1)
+      await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("claimed")
+
+      // Simulate Worker exit after its durable claim, before application-state finalization.
+      workerRedis = testRedis!.duplicate()
+      worker = new Worker<ApplyTaskSubmitPayload, void>("apply-tasks", async job => {
+        if (job.id !== identity.workerTaskId) throw new Error("Terminal test Worker received a different submit job")
+      }, { connection: workerRedis, concurrency: 1 })
+      worker.on("completed", job => { if (job?.id === identity.workerTaskId) completed.resolve() })
+      await worker.waitUntilReady()
+      await waitForSignal(completed.promise, "Claimed submit delivery did not complete before pruning")
+      await worker.close()
+      worker = undefined
+
+      const terminalJob = await submitQueue!.getJob(identity.workerTaskId)
+      expect(await terminalJob?.getState()).toBe("completed")
+      await terminalJob!.remove()
+      expect(await submitQueue!.getJob(identity.workerTaskId)).toBeUndefined()
+      const lockKey = submitQueue!.toKey(`${identity.workerTaskId}:lock`)
+      expect(await (await submitQueue!.client).get(lockKey)).toBeNull()
+
+      const addSpy = vi.spyOn(submitQueue!, "add")
+      try {
+        await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+        expect(addSpy).not.toHaveBeenCalled()
+        await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+        expect(addSpy).not.toHaveBeenCalled()
+      } finally { addSpy.mockRestore() }
+
+      const recovered = await submitRecoverySnapshot(identity)
+      expect(recovered.task).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain", workerTaskId: identity.workerTaskId })
+      expect(recovered.job).toMatchObject({ status: "saved", workflowState: "submitting", appliedAt: null })
+      expect(recovered.events.filter(event => event.type === "waiting_for_user")).toHaveLength(1)
+      const outbox = await pool.query<{ publishedAt: Date | null; lastError: string | null }>(
+        `SELECT "publishedAt", "lastError" FROM "${schema}"."agent_outbox" WHERE "id" = $1`, [outboxId],
+      )
+      expect(outbox.rows[0]).toMatchObject({ lastError: "terminal:terminal_submit_reconciled" })
+      expect(outbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
+    } finally {
+      if (worker) await worker.close().catch(() => undefined)
+      if (workerRedis && workerRedis.status !== "end") await workerRedis.quit().catch(() => workerRedis?.disconnect())
+    }
+  }, 20_000)
+
   it("surfaces a crashed pre-marker claim for review after terminal redelivery", async () => {
     const identity = await seedScenario("crashed-pre-marker-claim")
     await prepareSubmitClaim(identity)
