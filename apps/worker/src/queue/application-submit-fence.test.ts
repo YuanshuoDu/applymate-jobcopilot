@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from "vitest"
 import type { Pool, PoolClient } from "pg"
 
-import { appendFencedSubmitAudit, lockApplicationSubmitFence, recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js"
+import {
+  appendFencedSubmitAudit,
+  isValidApplicationSubmitTerminalObservation,
+  lockApplicationSubmitFence,
+  matchesExactApplicationSubmitTerminalProof,
+  recordSubmissionExecutionSettled,
+  type ApplicationSubmitIdentity,
+} from "./application-submit-fence.js"
 
 const identity: ApplicationSubmitIdentity = { sessionId: "session-a", fillTurnId: "turn-a", applicationTaskId: "application-a", userId: "user-a", jobId: "job-a", approvalId: "receipt-a", constraintHash: "c".repeat(64) }
 function client(fillTurnId = identity.fillTurnId, filler: "ready" | "active" | "missing" | "ambiguous" = "ready", jobExists = true) {
@@ -18,7 +25,45 @@ function client(fillTurnId = identity.fillTurnId, filler: "ready" | "active" | "
   return { client: { query } as unknown as PoolClient, calls, query }
 }
 
+const terminalProofIdentity = {
+  sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, applicationTaskId: identity.applicationTaskId,
+  userId: identity.userId, jobId: identity.jobId, workerTaskId: "bull-a", receiptId: identity.approvalId,
+  constraintHash: identity.constraintHash,
+}
+const terminalProof = {
+  ...terminalProofIdentity, approvalId: identity.approvalId, terminalState: "completed" as const, attemptsMade: 1, attempts: 3,
+}
+
 describe("application submit fence", () => {
+  it("matches exact terminal proof and requires failed attempts to be exhausted", () => {
+    expect(isValidApplicationSubmitTerminalObservation(terminalProof)).toBe(true)
+    expect(matchesExactApplicationSubmitTerminalProof(terminalProof, terminalProofIdentity)).toBe(true)
+    const failed = { ...terminalProof, terminalState: "failed" as const, attemptsMade: 3 }
+    expect(matchesExactApplicationSubmitTerminalProof(failed, terminalProofIdentity)).toBe(true)
+    expect(matchesExactApplicationSubmitTerminalProof(
+      { ...failed, attemptsMade: 2 }, terminalProofIdentity,
+    )).toBe(false)
+  })
+
+  it.each([
+    ["stale Turn", { fillTurnId: "turn-old" }],
+    ["different approval", { approvalId: "receipt-other", receiptId: "receipt-other" }],
+    ["different job", { jobId: "job-other" }],
+  ] as const)("rejects terminal proof for a %s", (_label, override) => {
+    expect(matchesExactApplicationSubmitTerminalProof(
+      { ...terminalProof, ...override }, terminalProofIdentity,
+    )).toBe(false)
+  })
+
+  it.each([
+    ["fractional attemptsMade", { attemptsMade: 1.5 }],
+    ["zero total attempts", { attempts: 0 }],
+    ["unknown terminal state", { terminalState: "active" }],
+  ] as const)("rejects terminal proof with %s", (_label, override) => {
+    expect(matchesExactApplicationSubmitTerminalProof(
+      { ...terminalProof, ...override }, terminalProofIdentity,
+    )).toBe(false)
+  })
   it("locks session, exact Turn, canonical filler, application task, then exact owned Job", async () => {
     const test = client()
     await expect(lockApplicationSubmitFence(test.client, identity)).resolves.toBe("current")

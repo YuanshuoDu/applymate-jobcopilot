@@ -2,7 +2,12 @@ import type { Queue } from "bullmq"
 import type { Pool, PoolClient } from "pg"
 import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload, type ApplyTaskSubmitIdentity, type ApplyTaskSubmitPayload } from "@jobcopilot/shared"
 import { reconcileClaimedSubmissionUncertain } from "../db/submission-guard.js"
-import type { ApplicationSubmitIdentity } from "./application-submit-fence.js"
+import {
+  isValidApplicationSubmitTerminalObservation,
+  matchesExactApplicationSubmitTerminalProof,
+  type ApplicationSubmitIdentity,
+  type ApplicationSubmitTerminalObservation,
+} from "./application-submit-fence.js"
 
 const ADD_OPTIONS = { attempts: 3, backoff: { type: "exponential" as const, delay: 60_000 }, removeOnComplete: false, removeOnFail: false }
 const RETRY_OPTIONS = { resetAttemptsMade: true, resetAttemptsStarted: true }
@@ -14,11 +19,7 @@ export type SubmitOutboxIntent = ApplyTaskSubmitIdentity & Readonly<{
 }>
 export type SubmitOutboxQueue = Pick<Queue<ApplyTaskPayload>, "add" | "getJob" | "isPaused" | "client" | "toKey">
 export type SubmitDeliveryState = "absent" | "terminal" | "deferred" | "missing" | "mismatch"
-export type SubmitTerminalObservation = Readonly<{
-  terminalState: "completed" | "failed"
-  attemptsMade: number
-  attempts: number
-}>
+export type SubmitTerminalObservation = ApplicationSubmitTerminalObservation
 
 export async function validateCurrentSubmit(
   client: PoolClient, intent: SubmitOutboxIntent,
@@ -126,40 +127,17 @@ export async function resetExpiredSubmitAuthorization(client: PoolClient, intent
   [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.receiptId, intent.workerTaskId])
 }
 
-function proofData(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
-}
-
-function validTerminalObservation(value: SubmitTerminalObservation): boolean {
-  return Number.isSafeInteger(value.attemptsMade) && value.attemptsMade >= 0
-    && Number.isSafeInteger(value.attempts) && value.attempts >= 1
-    && (value.terminalState === "completed" || (value.terminalState === "failed" && value.attemptsMade >= value.attempts))
-}
-
-function matchesTerminalProof(value: unknown, intent: SubmitOutboxIntent): boolean {
-  const data = proofData(value)
-  if (!data) return false
-  return data.applicationTaskId === intent.applicationTaskId && data.userId === intent.userId
-    && data.jobId === intent.jobId && data.sessionId === intent.sessionId && data.fillTurnId === intent.fillTurnId
-    && data.workerTaskId === intent.workerTaskId && data.approvalId === intent.receiptId
-    && data.receiptId === intent.receiptId && data.constraintHash === intent.constraintHash
-    && (data.terminalState === "completed" || data.terminalState === "failed")
-    && Number.isSafeInteger(data.attemptsMade) && Number(data.attemptsMade) >= 0
-    && Number.isSafeInteger(data.attempts) && Number(data.attempts) >= 1
-    && (data.terminalState !== "failed" || Number(data.attemptsMade) >= Number(data.attempts))
-}
-
 async function readTerminalProof(client: PoolClient, intent: SubmitOutboxIntent): Promise<{ present: boolean; valid: boolean }> {
   const rows = await client.query<{ data: unknown }>(`SELECT "data" FROM "application_task_events"
     WHERE "taskId" = $1 AND "type" = 'submission_terminal_observed' AND "actor" = 'worker'
       AND "data"->>'fillTurnId' = $2 FOR SHARE`, [intent.applicationTaskId, intent.fillTurnId])
-  return { present: rows.rows.length > 0, valid: rows.rows.length === 1 && matchesTerminalProof(rows.rows[0]?.data, intent) }
+  return { present: rows.rows.length > 0, valid: rows.rows.length === 1 && matchesExactApplicationSubmitTerminalProof(rows.rows[0]?.data, intent) }
 }
 
 async function persistTerminalProof(
   client: PoolClient, intent: SubmitOutboxIntent, observation: SubmitTerminalObservation,
 ): Promise<boolean> {
-  if (!validTerminalObservation(observation)) return false
+  if (!isValidApplicationSubmitTerminalObservation(observation)) return false
   const existing = await readTerminalProof(client, intent)
   if (existing.present) return existing.valid
   const data = {
