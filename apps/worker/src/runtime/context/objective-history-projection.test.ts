@@ -78,7 +78,8 @@ describe("objective history projection", () => {
 
   it("returns evaluated-unindexable for unsupported objectives and marks their semantics version", async () => {
     const input = { goal, successCriteria: criteria }
-    const expected = { input, source: "user", goal: "A conflicting root goal", successCriteria: criteria }
+    const expected = { inputJsonbText: JSON.stringify(input), source: "user", goal: "A conflicting root goal",
+      successCriteriaJsonbText: JSON.stringify(criteria) }
     const { client, calls } = clientWith({ rows: [turnRow(input, { goal: expected.goal })], rowCount: 1 }, { rowCount: 1 })
 
     await expect(projectRootObjectiveHistoryForBackfill(client, identity, expected)).resolves.toEqual({
@@ -90,7 +91,8 @@ describe("objective history projection", () => {
   })
 
   it("returns retryable conflict when a persisted objective no longer matches the scanned snapshot", async () => {
-    const expected = { input: { goal }, source: "user", goal, successCriteria: criteria }
+    const expected = { inputJsonbText: JSON.stringify({ goal }), source: "user", goal,
+      successCriteriaJsonbText: JSON.stringify(criteria) }
     const { client, calls } = clientWith({ rowCount: 0 })
 
     await expect(projectRootObjectiveHistoryForBackfill(client, identity, expected)).resolves.toEqual({
@@ -101,13 +103,13 @@ describe("objective history projection", () => {
     expect(calls).toHaveLength(1)
   })
 
-  it("binds expected JSONB snapshots as JSON text in comparison and guarded update queries", async () => {
-    const expected = {
-      input: { input: { goal, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } } },
-      source: "user", goal, successCriteria: criteria,
-    }
+  it("binds raw expected JSONB snapshot text without rounding large numbers", async () => {
+    const parsedInput = { input: { goal, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } } }
+    const inputJsonbText = '{"input":{"goal":"Find senior platform roles","successCriteria":["Use the saved EU locations"],"intent":{"kind":"interactive_discovery_shortlist","version":1},"ignoredNumeric":9007199254740993}}'
+    const successCriteriaJsonbText = '["Use the saved EU locations"]'
+    const expected = { inputJsonbText, source: "user", goal, successCriteriaJsonbText }
     const { client, calls } = clientWith(
-      { rows: [turnRow(expected.input, { goal: expected.goal, successCriteria: expected.successCriteria })], rowCount: 1 },
+      { rows: [turnRow(parsedInput)], rowCount: 1 },
       { rowCount: 1 },
     )
 
@@ -117,18 +119,31 @@ describe("objective history projection", () => {
 
     expect(calls[0]?.values).toEqual([
       identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId,
-      JSON.stringify(expected.input), expected.source, expected.goal, JSON.stringify(expected.successCriteria),
+      inputJsonbText, expected.source, expected.goal, successCriteriaJsonbText,
     ])
     expect(calls[1]?.values?.slice(7)).toEqual([
-      JSON.stringify(expected.input), expected.source, expected.goal, JSON.stringify(expected.successCriteria),
+      inputJsonbText, expected.source, expected.goal, successCriteriaJsonbText,
     ])
+  })
+
+  it("preserves SQL NULL and JSONB null as distinct snapshot binds", async () => {
+    const expected = { inputJsonbText: null, source: "user", goal, successCriteriaJsonbText: "null" }
+    const input = { input: { goal, successCriteria: criteria } }
+    const { client, calls } = clientWith({ rows: [turnRow(input)], rowCount: 1 }, { rowCount: 1 })
+
+    await projectRootObjectiveHistoryForBackfill(client, identity, expected)
+
+    expect(calls[0]?.values).toEqual([
+      identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId, null, "user", goal, "null",
+    ])
+    expect(calls[1]?.values?.slice(7)).toEqual([null, "user", goal, "null"])
   })
 
   it("reports an unlinked Root/Turn pair as ineligible and preserves the existing boolean writer API", async () => {
     const { client, calls } = clientWith({ rowCount: 0 }, { rowCount: 0 }, { rowCount: 0 })
 
     await expect(projectRootObjectiveHistoryForBackfill(client, identity, {
-      input: {}, source: "user", goal, successCriteria: criteria,
+      inputJsonbText: "{}", source: "user", goal, successCriteriaJsonbText: JSON.stringify(criteria),
     })).resolves.toEqual({ kind: "retryable_conflict", reason: "persisted_input_changed" })
     await expect(projectRootObjectiveHistoryForBackfill(client, identity)).resolves.toEqual({
       kind: "ineligible", reason: "unlinked_root_turn",

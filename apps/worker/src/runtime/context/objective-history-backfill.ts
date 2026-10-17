@@ -15,10 +15,10 @@ const VERIFY_DEADLINE_MS = 30_000
 const TERMINAL_TYPES = ["turn.completed", "turn.failed", "turn.interrupted"]
 type Client = pg.PoolClient
 type Candidate = RootObjectiveHistoryIdentity & Readonly<{
-  input: unknown
+  inputJsonbText: string | null
   source: unknown
   goal: unknown
-  successCriteria: unknown
+  successCriteriaJsonbText: string | null
 }>
 
 export type ObjectiveHistoryBackfillOptions = Readonly<{ batchSize?: number; maxBatches?: number }>
@@ -71,7 +71,8 @@ const ELIGIBLE_JOIN = `${ELIGIBLE_FROM}
 
 async function candidates(client: Client, cursor: string | null, batchSize: number): Promise<Candidate[]> {
   const result = await client.query<Candidate>(`SELECT turn."id" AS "turnId", turn."sessionId", turn."userId",
-      turn."rootTaskId", turn."input", turn."source", root."goal", root."successCriteria"
+      turn."rootTaskId", turn."input"::text AS "inputJsonbText", turn."source", root."goal",
+      root."successCriteria"::text AS "successCriteriaJsonbText"
     ${ELIGIBLE_JOIN} AND turn."objectiveIndexSemanticsVersion" IS DISTINCT FROM $1
       AND ($2::text IS NULL OR turn."id" > $2)
     ORDER BY turn."id" ASC LIMIT $3`, [OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, cursor, batchSize])

@@ -134,7 +134,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
       const indexed = new Map(fields.rows.map(row => [row.id, row]))
       expect(indexed.get(good.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: 1 })
       expect(indexed.get(invalid.turnId)).toMatchObject({ objectiveDigest: null, canonicalOriginDigest: null, objectiveIndexSemanticsVersion: 1 })
-      expect(indexed.get(failed.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: 1, terminalEventSequence: 11 })
+      expect(indexed.get(failed.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: 1, terminalEventSequence: "11" })
       expect(indexed.get(unlinked.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: null })
 
       const replay = await backfillObjectiveHistoryProjection(pool!)
@@ -143,6 +143,23 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
       await pool!.query(`UPDATE "agent_turns" SET "terminalEventSequence" = 98 WHERE "id" = $1`, [failed.turnId])
       const failedVerification = await backfillObjectiveHistoryProjection(pool!)
       expect(failedVerification).toMatchObject({ verificationFailed: true, ready: false })
+    } finally { await owner.cleanup() }
+  })
+
+  it("preserves exact large JSON numbers while projecting an ignored input field", async () => {
+    const owner = await createOwner()
+    try {
+      const identity = await seedTurn(owner, "large-json-number")
+      const rawInput = '{"input":{"goal":"Find senior platform roles","successCriteria":["Use the saved EU locations"],"intent":{"kind":"interactive_discovery_shortlist","version":1},"ignoredNumeric":9007199254740993}}'
+      await pool!.query(`UPDATE "agent_turns" SET "input" = $1::jsonb WHERE "id" = $2`, [rawInput, identity.turnId])
+
+      const report = await backfillObjectiveHistoryProjection(pool!)
+
+      expect(report).toMatchObject({ evaluated: 1, conflicts: 0, ready: true, verificationFailed: false })
+      const saved = await pool!.query(`SELECT "input"::text AS "inputText", "objectiveIndexSemanticsVersion"
+        FROM "agent_turns" WHERE "id" = $1`, [identity.turnId])
+      expect(saved.rows[0]?.inputText).toContain('"ignoredNumeric": 9007199254740993')
+      expect(saved.rows[0]?.objectiveIndexSemanticsVersion).toBe(1)
     } finally { await owner.cleanup() }
   })
 
@@ -165,7 +182,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
         const wrapper = racePool(async () => {
           if (race === "objective") await pool!.query(`UPDATE "agent_turns" SET "input" = $1::jsonb WHERE "id" = $2`,
             [JSON.stringify({ input: { goal: "Changed while scanned" } }), identity.turnId])
-          else await pool!.query(`UPDATE "sub_agent_tasks" SET "parentTaskId" = 'new-parent' WHERE "id" = $1`, [identity.rootTaskId])
+          else await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = NULL WHERE "id" = $1`, [identity.turnId])
         })
         const report = await backfillObjectiveHistoryProjection(wrapper)
         expect(report).toMatchObject({ conflicts: 1, evaluated: 0, ready: false })
@@ -194,7 +211,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
     try {
       const identity = await seedTurn(owner, "invalid-existing-terminal", { failedEvent: true })
       await expect(backfillObjectiveHistoryProjection(pool!)).resolves.toMatchObject({ ready: true })
-      await pool!.query(`UPDATE "agent_events" SET "actor" = 'worker' WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.failed'`,
+      await pool!.query(`UPDATE "agent_events" SET "actor" = 'system' WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.failed'`,
         [identity.sessionId, identity.turnId])
 
       const report = await backfillObjectiveHistoryProjection(pool!)

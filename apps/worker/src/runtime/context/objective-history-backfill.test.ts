@@ -5,6 +5,7 @@ import { isValidRootObjectiveHistoryTerminalReceipt } from "./objective-history-
 const mockState = vi.hoisted(() => ({
   pending: new Set<string>(),
   outcomes: new Map<string, { kind: string; reason?: string; objectiveDigest?: string; canonicalOriginDigest?: string | null; semanticsVersion?: number }>(),
+  snapshots: [] as unknown[],
   terminalSuccess: true,
   verificationErrorCode: null as string | null,
 }))
@@ -12,7 +13,8 @@ const mockState = vi.hoisted(() => ({
 vi.mock("./objective-history-projection.js", () => ({
   OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION: 1,
   isValidRootObjectiveHistoryTerminalReceipt: vi.fn(async () => mockState.terminalSuccess),
-  projectRootObjectiveHistoryForBackfill: vi.fn(async (_client: unknown, identity: { turnId: string }) => {
+  projectRootObjectiveHistoryForBackfill: vi.fn(async (_client: unknown, identity: { turnId: string }, expected?: unknown) => {
+    if (expected) mockState.snapshots.push(expected)
     const outcome = mockState.outcomes.get(identity.turnId) ?? {
       kind: "evaluated_indexable", objectiveDigest: "a".repeat(64), canonicalOriginDigest: null, semanticsVersion: 1,
     }
@@ -25,7 +27,7 @@ vi.mock("./objective-history-projection.js", () => ({
 
 import { backfillObjectiveHistoryProjection } from "./objective-history-backfill.js"
 
-type Candidate = { turnId: string; sessionId: string; userId: string; rootTaskId: string; input: unknown; source: string; goal: string; successCriteria: string[] }
+type Candidate = { turnId: string; sessionId: string; userId: string; rootTaskId: string; inputJsonbText: string | null; source: string; goal: string; successCriteriaJsonbText: string | null }
 type Response = { rows?: unknown[]; rowCount?: number }
 
 function harness(rows: Candidate[], consistent = true, hasTerminalEvent = false, existingLocatorCount = 0) {
@@ -65,12 +67,13 @@ function harness(rows: Candidate[], consistent = true, hasTerminalEvent = false,
 
 function candidate(turnId: string): Candidate {
   return { turnId, sessionId: "session-1", userId: "user-1", rootTaskId: "root-" + turnId,
-    input: { goal: "Find roles" }, source: "user", goal: "Find roles", successCriteria: ["Use EU filters"] }
+    inputJsonbText: '{"goal":"Find roles"}', source: "user", goal: "Find roles", successCriteriaJsonbText: '["Use EU filters"]' }
 }
 
 describe("objective history backfill bounds", () => {
   beforeEach(() => {
     mockState.pending.clear(); mockState.outcomes.clear(); mockState.terminalSuccess = true; mockState.verificationErrorCode = null
+    mockState.snapshots = []
     vi.mocked(isValidRootObjectiveHistoryTerminalReceipt).mockClear()
   })
 
@@ -82,6 +85,19 @@ describe("objective history backfill bounds", () => {
     expect(report).toMatchObject({ batches: 1, evaluated: 100, capped: true, ready: false, transactions: 2, workTransactions: 1, verificationBatches: 0 })
     expect(h.calls.find(call => call.sql.includes('SELECT turn."id" AS "turnId"'))?.values?.[2]).toBe(100)
     expect(h.calls.filter(call => call.sql === "BEGIN")).toHaveLength(2)
+  })
+
+  it("passes raw JSONB text snapshots unchanged to projection CAS", async () => {
+    const row = { ...candidate("raw-json"), inputJsonbText: '{"ignoredNumeric":9007199254740993}' }
+    const h = harness([row])
+
+    const report = await backfillObjectiveHistoryProjection(h.pool)
+
+    expect(report).toMatchObject({ conflicts: 0, evaluated: 1, ready: true })
+    expect(mockState.snapshots).toEqual([row])
+    const candidateQuery = h.calls.find(call => call.sql.includes('SELECT turn."id" AS "turnId"'))?.sql
+    expect(candidateQuery).toContain('turn."input"::text AS "inputJsonbText"')
+    expect(candidateQuery).toContain('root."successCriteria"::text AS "successCriteriaJsonbText"')
   })
 
   it("resumes after committed batches and reaches readiness only after consistency passes", async () => {
