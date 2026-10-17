@@ -640,6 +640,34 @@ async function routeCanonicalRootMutation(toolName: "agent.spawn" | "spawn_subag
 }
 
 describe("createCanonicalTurnRuntime", () => {
+  it("rejects malformed scheduled automation context before registering planner tools or creating children", async () => {
+    const roots = rootStore()
+    const toolRuntimeFactory = vi.fn(() => { throw new Error("tool_runtime_registered_before_validation") })
+    const modelRuntimeFactory = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: lease.ownerId,
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      stateLoader: async () => state({ source: "automation", automationRunMode: "scheduled", turnInput: { privateTurnInput: "PRIVATE_TURN_INPUT" } }),
+      taskGraphCommandPort: commandPort,
+      rootTaskStore: roots as never,
+      toolRuntimeFactory,
+      modelRuntimeFactory,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).rejects.toThrow("scheduled_automation_context_invalid")
+    expect(toolRuntimeFactory).not.toHaveBeenCalled()
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(commandPort.readCurrent).not.toHaveBeenCalled()
+    expect(roots.ensure).not.toHaveBeenCalled()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
   it("surfaces selected-job preparation as unavailable without planning gates, model calls, or task scheduling", async () => {
     const roots = rootStore()
     const modelRuntimeFactory = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))

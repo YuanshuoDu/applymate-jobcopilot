@@ -122,7 +122,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const durableWaitPort = createPgDurableWaitPort(pool)
     let state = await (options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes, durableWaitControlReader: durableWaitPort }))
     const { enabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobPreparation, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
-      enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
+      enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now, turnSource: state.source, automationRunMode: state.automationRunMode, turnInput: state.turnInput,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, applicationFillPreparationLoader: options.applicationFillPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
     if (!taskGraphPlanningEnabled && !signal.aborted) {
