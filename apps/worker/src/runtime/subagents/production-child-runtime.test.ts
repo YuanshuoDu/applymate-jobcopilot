@@ -16,6 +16,8 @@ import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient }
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { buildInteractiveDiscoveryShortlist, requireCurrentOwnerJobs } from "../interactive-discovery-persistence.js"
 import { restoreToolCallState } from "../turns/persisted-tool-call-state.js"
+import type { ChildMailboxReader } from "./child-context.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
 
@@ -114,7 +116,50 @@ function recordingStore() {
   return { engineStore, writes, itemSnapshots, events }
 }
 
-function selectedJobPool() {
+type PersistedWriterReviewGraphFixture = Readonly<{
+  readonly writerTaskId: string
+  readonly reviewerTaskId: string
+  readonly writerDependsOnReviewer: boolean
+  readonly reviewerResult: unknown
+}>
+
+function persistedWriterReviewGraph(fixture: PersistedWriterReviewGraphFixture) {
+  const nodes = [
+    {
+      key: "reviewer-node", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft",
+      successCriteria: ["Persist the review"], dependsOn: [], depth: 1, taskId: fixture.reviewerTaskId,
+      verificationDisposition: "specialized",
+    },
+    {
+      key: "revision-writer-node", templateId: "cover_letter_writer", goal: "Revise the selected-job draft",
+      successCriteria: ["Revise the draft"], dependsOn: fixture.writerDependsOnReviewer ? ["reviewer-node"] : [],
+      depth: fixture.writerDependsOnReviewer ? 2 : 1, taskId: fixture.writerTaskId, verificationDisposition: "specialized",
+    },
+  ]
+  return {
+    item: {
+      id: taskGraphItemId("root-1"), revision: 1,
+      content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }, createdAt: new Date("2026-09-09T12:00:00.000Z"),
+    },
+    tasks: [
+      {
+        id: fixture.reviewerTaskId, status: "completed", role: "reviewer", taskType: "cover_letter_review",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }, failureReason: null, result: fixture.reviewerResult,
+      },
+      {
+        id: fixture.writerTaskId, status: "running", role: "writer", taskType: "cover_letter_draft",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }, failureReason: null, result: null,
+      },
+    ],
+    writerLease: {
+      id: fixture.writerTaskId, sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      userId: "user-1", status: "running", role: "writer", leaseOwner: "worker-1", attemptCount: 1,
+      interruptRequestedAt: null,
+    },
+  }
+}
+
+function selectedJobPool(persistedWriterReview?: PersistedWriterReviewGraphFixture) {
   const job = {
     id: "job-1", company: "Example GmbH", role: "Engineer", location: "Berlin", status: "open", score: 8,
     url: "https://jobs.example/1", source: "greenhouse", salary: "EUR 80k", description: `${selectedJobSourceCanary} job description`, keywords: "TypeScript",
@@ -133,8 +178,43 @@ function selectedJobPool() {
     }] }
     throw new Error(`unexpected production child query: ${sql}`)
   })
-  return { query }
+  const graphQueries: string[] = []
+  const transactionQueries: string[] = []
+  const tenantScopeUserIds: unknown[] = []
+  const persistedGraph = persistedWriterReview ? persistedWriterReviewGraph(persistedWriterReview) : undefined
+  const client = persistedGraph ? {
+    query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+      graphQueries.push(sql)
+      if (/^BEGIN(?:\s|$)/.test(sql) || sql === "COMMIT" || sql === "ROLLBACK") {
+        transactionQueries.push(sql)
+        return { rows: [] }
+      }
+      if (sql.includes("set_config('app.user_id', $1, true)")) {
+        transactionQueries.push(sql)
+        tenantScopeUserIds.push(values[0])
+        return { rows: [] }
+      }
+      if (sql.includes('FROM "agent_items" AS item')) return { rows: [persistedGraph.item] }
+      if (sql.includes('clock_timestamp()') && sql.includes('FROM "sub_agent_tasks"')) return { rows: [persistedGraph.writerLease] }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: persistedGraph.tasks }
+      if (sql.includes('FROM "agent_events" AS event')) return { rows: [] }
+      throw new Error(`unexpected persisted TaskGraph query: ${sql}`)
+    }),
+    release: vi.fn(),
+  } : undefined
+  return {
+    query, graphQueries, transactionQueries, tenantScopeUserIds,
+    ...(client ? { connect: async () => client } : {}),
+  }
 }
+
+function initialWriterPool(writerTaskId: string) {
+  return selectedJobPool({
+    writerTaskId, reviewerTaskId: `${writerTaskId}-reviewer`, writerDependsOnReviewer: false, reviewerResult: null,
+  })
+}
+
+const emptyMailboxReader: ChildMailboxReader = { listPendingMessages: async () => [] }
 
 function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPreparation: { jobId: "job-1" } }): SubagentLease {
   return {
@@ -180,12 +260,14 @@ function selectedJobExecutor(input: {
   readonly persistence: ReturnType<typeof recordingStore>
   readonly model: ModelAdapter
   readonly pool?: ReturnType<typeof selectedJobPool>
+  readonly mailboxReader?: ChildMailboxReader
 }) {
   artifactStoreMock.current = input.artifactStore
   const pool = input.pool ?? selectedJobPool()
   const executor = createOptionalProductionChildExecutor({
     enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
     authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => input.model,
+    ...(input.mailboxReader ? { mailboxReader: input.mailboxReader } : {}),
   })
   if (!executor) throw new Error("production selected-job child executor was not created")
   return executor
@@ -823,10 +905,20 @@ describe("production child runtime", () => {
     const artifacts = new InMemoryArtifactToolStore()
     const draftSpy = vi.spyOn(artifacts, "writeDraft")
     const writerPersistence = recordingStore()
-    const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: writerPersistence, model: writerModel })
+    const writerPool = initialWriterPool("writer-task")
+    const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: writerPersistence, model: writerModel, pool: writerPool, mailboxReader: emptyMailboxReader })
     const writerLease = { ...jobTask("writer"), id: "writer-task" }
     const writer = await writerExecutor({ lease: writerLease })
     expect(writer, JSON.stringify({ writer, writes: writerPersistence.writes })).toMatchObject({ status: "completed" })
+    expect(writerPool.transactionQueries).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SELECT set_config('app.user_id', $1, true)",
+      "COMMIT",
+    ])
+    expect(writerPool.tenantScopeUserIds).toEqual(["user-1"])
+    expect(writerPool.graphQueries[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    expect(writerPool.graphQueries[1]).toContain("set_config('app.user_id', $1, true)")
+    expect(writerPool.graphQueries[2]).toContain('FROM "agent_items" AS item')
     expect(emittedTool(writerRequests[0]!, "cover_letter.draft")).toBe(true)
     expect(emittedTool(writerRequests[0]!, "artifact.version.read")).toBe(false)
     assertNoExternalTools(writerRequests[0]!)
@@ -938,6 +1030,7 @@ describe("production child runtime", () => {
     })
     const artifacts = new InMemoryArtifactToolStore()
     const draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const revisionReviewReadSpy = vi.spyOn(artifacts, "readRevisionReview")
     const writerRequests: HarnessModelRequest[] = []
     const writerModel: ModelAdapter = {
       id: "fixture-model", profile,
@@ -955,7 +1048,7 @@ describe("production child runtime", () => {
       },
     }
     const writerPersistence = recordingStore()
-    const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: writerPersistence, model: writerModel })
+    const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: writerPersistence, model: writerModel, pool: initialWriterPool("writer-task"), mailboxReader: emptyMailboxReader })
     const writerLease = { ...jobTask("writer"), id: "writer-task" }
     const writer = await writerExecutor({ lease: writerLease })
     expect(writer).toMatchObject({ status: "completed" })
@@ -1033,14 +1126,37 @@ describe("production child runtime", () => {
       },
     }
     const revisionPersistence = recordingStore()
-    const revisionExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: revisionPersistence, model: revisionModel })
     const revisionLease = {
       ...jobTask("writer", revisionContext), id: "writer-revision-task",
       leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
     }
+    const revisionPool = selectedJobPool({
+      writerTaskId: revisionLease.id, reviewerTaskId: reviewerLease.id,
+      writerDependsOnReviewer: true, reviewerResult: reviewer.result,
+    })
+    const revisionExecutor = selectedJobExecutor({
+      artifactStore: artifacts, persistence: revisionPersistence, model: revisionModel, pool: revisionPool,
+      mailboxReader: { listPendingMessages: async () => [] },
+    })
     const revised = await revisionExecutor({ lease: revisionLease })
 
     expect(revised).toMatchObject({ status: "completed", result: { structuredResult: { role: "writer", artifactRef: revisionRef } } })
+    expect(revisionPool.transactionQueries).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SELECT set_config('app.user_id', $1, true)",
+      "COMMIT",
+    ])
+    expect(revisionPool.tenantScopeUserIds).toEqual(["user-1"])
+    expect(revisionPool.graphQueries[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    expect(revisionPool.graphQueries[1]).toContain("set_config('app.user_id', $1, true)")
+    expect(revisionPool.graphQueries[2]).toContain('FROM "agent_items" AS item')
+    expect(revisionPool.graphQueries).toEqual(expect.arrayContaining([
+      expect.stringContaining('FROM "agent_items" AS item'),
+      expect.stringContaining('FROM "sub_agent_tasks"'),
+      expect.stringContaining('FROM "agent_events" AS event'),
+      expect.stringContaining("clock_timestamp()"),
+    ]))
+    expect(revisionReviewReadSpy).toHaveBeenCalledTimes(1)
     expect(artifactStoreMock.sourceDigestReader).toBe(readSelectedJobSourceDigestWithClient)
     expect(emittedTool(revisionRequests[0]!, "artifact.version.read")).toBe(true)
     expect(emittedTool(revisionRequests[0]!, "cover_letter.draft")).toBe(true)
@@ -1057,6 +1173,88 @@ describe("production child runtime", () => {
     expect(JSON.stringify(reviewerPersistence.writes)).not.toContain(finding.message)
     expect(JSON.stringify(revisionPersistence.writes)).not.toContain(finding.message)
     expect(JSON.stringify(revisionPersistence.writes)).not.toContain("The opening does not identify the strongest experience.")
+
+    expect(revisionContext).toMatchObject({
+      selectedJobPreparation: { jobId: "job-1" },
+      taskGraphDependencyResults: { items: [{ role: "reviewer", taskStatus: "completed", result: { reviewStatus: "needs_revision" } }] },
+    })
+    const forgedRequests: HarnessModelRequest[] = []
+    const forgedModel: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        forgedRequests.push(request)
+        throw new Error("Writer model must not run without a persisted direct Reviewer edge")
+      },
+    }
+    const forgedPersistence = recordingStore()
+    const forgedLease = {
+      ...jobTask("writer", revisionContext), id: "writer-forged-revision-task",
+      leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+    }
+    const forgedPool = selectedJobPool({
+      writerTaskId: forgedLease.id, reviewerTaskId: reviewerLease.id,
+      writerDependsOnReviewer: false, reviewerResult: reviewer.result,
+    })
+    draftSpy.mockClear()
+    revisionReviewReadSpy.mockClear()
+    const forgedExecutor = selectedJobExecutor({
+      artifactStore: artifacts, persistence: forgedPersistence, model: forgedModel, pool: forgedPool,
+      mailboxReader: { listPendingMessages: async () => [] },
+    })
+    const forged = await forgedExecutor({ lease: forgedLease })
+
+    expect(forged).toMatchObject({ status: "failed", failureReason: "writer_review_dependency_invalid", retryDisposition: "terminal" })
+    expect(forgedPool.graphQueries).toEqual(expect.arrayContaining([
+      expect.stringContaining('FROM "agent_items" AS item'),
+      expect.stringContaining('FROM "sub_agent_tasks"'),
+      expect.stringContaining('FROM "agent_events" AS event'),
+    ]))
+    expect(forgedRequests).toHaveLength(0)
+    expect(revisionReviewReadSpy).not.toHaveBeenCalled()
+    expect(draftSpy).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when an omitted dependency hides a persisted direct Reviewer edge", async () => {
+    const artifacts = new InMemoryArtifactToolStore()
+    const draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const reviewReadSpy = vi.spyOn(artifacts, "readRevisionReview")
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        throw new Error("Writer model must not run when persisted Reviewer evidence is omitted")
+      },
+    }
+    const persistence = recordingStore()
+    const pool = selectedJobPool({
+      writerTaskId: "writer-hidden-review", reviewerTaskId: "reviewer-task",
+      writerDependsOnReviewer: true, reviewerResult: null,
+    })
+    const executor = selectedJobExecutor({
+      artifactStore: artifacts, persistence, model, pool,
+      mailboxReader: { listPendingMessages: async () => [] },
+    })
+    const writerLease = {
+      ...jobTask("writer", { selectedJobPreparation: { jobId: "job-1" } }),
+      id: "writer-hidden-review", leaseExpiresAt: new Date("2099-01-01T00:00:00Z"),
+    }
+
+    const result = await executor({ lease: writerLease })
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "writer_review_dependency_invalid", retryDisposition: "terminal" })
+    expect(pool.transactionQueries).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SELECT set_config('app.user_id', $1, true)",
+      "ROLLBACK",
+    ])
+    expect(pool.tenantScopeUserIds).toEqual(["user-1"])
+    expect(pool.graphQueries[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    expect(pool.graphQueries[1]).toContain("set_config('app.user_id', $1, true)")
+    expect(pool.graphQueries[2]).toContain('FROM "agent_items" AS item')
+    expect(requests).toHaveLength(0)
+    expect(reviewReadSpy).not.toHaveBeenCalled()
+    expect(draftSpy).not.toHaveBeenCalled()
   })
 
   it("refuses a Reviewer read whose reference differs from the direct Writer dependency", async () => {
@@ -1083,7 +1281,7 @@ describe("production child runtime", () => {
       },
     }
     const artifacts = new InMemoryArtifactToolStore()
-    const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: recordingStore(), model: writerModel })
+    const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: recordingStore(), model: writerModel, pool: initialWriterPool("writer-task"), mailboxReader: emptyMailboxReader })
     const writerLease = { ...jobTask("writer"), id: "writer-task" }
     const writer = await writerExecutor({ lease: writerLease })
     expect(writer, JSON.stringify(writer)).toMatchObject({ status: "completed" })

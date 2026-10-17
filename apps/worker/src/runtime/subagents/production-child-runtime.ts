@@ -16,8 +16,7 @@ import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
 import { loadChildAttemptResume } from "./child-resume.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
-import { createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext } from "./task-graph-writer-review-feedback.js"
-import type { TaskGraphWriterReviewDependency, TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
+import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext, type TaskGraphWriterReviewDependency, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
@@ -137,6 +136,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
       if (error instanceof TaskGraphWriterReviewFeedbackError) throw error
       throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
     }
+    await assertPersistedWriterReviewDependency(pool, task, lease, writerReviewDependency)
   }
   const selectedJobArtifactContext = selectedJob
     ? await loadSelectedJobArtifactContext(pool, task.userId, selectedJob)

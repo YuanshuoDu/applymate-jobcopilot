@@ -1,8 +1,11 @@
 import { Buffer } from "node:buffer"
+import type pg from "pg"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import type { AgentArtifactReviewRow } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext, ArtifactVersionRef } from "../tools/artifact-tools.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
 import { parseArtifactReference, type ArtifactVersionReference } from "./role-results.js"
+import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
 export const TASK_GRAPH_WRITER_REVIEW_FEEDBACK_BYTE_LIMIT = 4 * 1024
 const DEPENDENCY_CONTEXT_KEY = "taskGraphDependencyResults"
@@ -44,6 +47,99 @@ export class TaskGraphWriterReviewFeedbackError extends Error {
   }
 }
 
+/** Bind optional context evidence to persisted Reviewer edges and reject omitted edges. */
+export async function assertPersistedWriterReviewDependency(
+  pool: pg.Pool, task: SubagentTaskRecord, lease: SubagentLease, dependency: TaskGraphWriterReviewDependency | null,
+): Promise<void> {
+  const turnId = typeof lease.turnId === "string" ? lease.turnId : ""
+  const parentTaskId = typeof lease.parentTaskId === "string" ? lease.parentTaskId : ""
+  if (task.id !== lease.id || task.userId !== lease.userId || task.sessionId !== lease.sessionId || task.turnId !== lease.turnId
+    || task.rootTaskId !== lease.rootTaskId || task.parentTaskId !== lease.parentTaskId || task.role !== "writer" || lease.role !== "writer"
+    || !turnId.trim() || !parentTaskId.trim()) {
+    throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+  }
+  const client = await pool.connect()
+  let transactionStarted = false
+  let committed = false
+  let releaseError: Error | undefined
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    transactionStarted = true
+    await client.query("SELECT set_config('app.user_id', $1, true)", [lease.userId])
+    const scope = {
+      userId: lease.userId, sessionId: lease.sessionId, turnId,
+      rootTaskId: lease.rootTaskId, parentTaskId,
+    }
+    const graph = await loadTaskGraph(client, scope, false)
+    const writerNode = graph.snapshot?.nodes.find(node => node.taskId === lease.id)
+    const writer = graph.tasks.get(lease.id)
+    if (graph.rootTaskId !== lease.rootTaskId || !writerNode || writerNode.templateId !== "cover_letter_writer"
+      || !writer || writer.role !== "writer") {
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
+    }
+    const directReviewers = graph.snapshot!.nodes.filter(node => node.templateId === "cover_letter_reviewer"
+      && writerNode.dependsOn.includes(node.key))
+    if (directReviewers.length > 1 || (dependency
+      ? directReviewers.length !== 1 || directReviewers[0]?.taskId !== dependency.dependencyTaskId
+      : directReviewers.length !== 0)) {
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
+    }
+    if (!dependency) {
+      if (writer.status !== "running" || task.status !== "running" || lease.status !== "running") {
+        throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+      }
+      await client.query("COMMIT")
+      committed = true
+      return
+    }
+    const reviewerNode = directReviewers[0]!
+    const reviewer = graph.tasks.get(reviewerNode.taskId)
+    if (!reviewer || reviewer.role !== "reviewer") throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
+    const dependentWriters = graph.snapshot!.nodes.filter(node => node.dependsOn.includes(reviewerNode.key)
+      && graph.tasks.get(node.taskId)?.role === "writer")
+    if (dependentWriters.length !== 1 || dependentWriters[0]?.taskId !== lease.id) {
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
+    }
+    if (writer.status !== "running" || reviewer.status !== "completed" || reviewer.failureReason !== null) {
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+    }
+    if (lease.status !== "running" || task.status !== "running" || task.leaseOwner !== lease.ownerId || task.attemptCount !== lease.attemptCount
+      || lease.leaseOwner !== lease.ownerId || !lease.turnId?.trim() || !lease.parentTaskId?.trim() || !lease.ownerId.trim()
+      || !Number.isSafeInteger(lease.attemptCount) || lease.attemptCount < 1 || lease.interruptRequestedAt !== null
+      || !(lease.leaseExpiresAt instanceof Date) || lease.leaseExpiresAt.getTime() <= Date.now()) {
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+    }
+    const current = await client.query(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId",
+        session."userId" AS "userId", task."status", task."role", task."leaseOwner", task."attemptCount", task."interruptRequestedAt"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+        AND task."parentTaskId" = $5 AND session."userId" = $6 AND task."role" = 'writer' AND task."status" = 'running'
+        AND task."leaseOwner" = $7 AND task."attemptCount" = $8 AND task."interruptRequestedAt" IS NULL
+        AND task."leaseExpiresAt" > clock_timestamp()`,
+    [lease.id, lease.sessionId, lease.turnId, lease.rootTaskId, lease.parentTaskId, lease.userId, lease.ownerId, lease.attemptCount])
+    const row = safeRecord(current.rows[0])
+    if (current.rows.length !== 1 || row.id !== lease.id || row.userId !== lease.userId || row.sessionId !== lease.sessionId
+      || row.turnId !== lease.turnId || row.rootTaskId !== lease.rootTaskId || row.parentTaskId !== lease.parentTaskId
+      || row.status !== "running" || row.role !== "writer" || row.leaseOwner !== lease.ownerId
+      || row.attemptCount !== lease.attemptCount || row.interruptRequestedAt !== null) {
+      throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+    }
+    await client.query("COMMIT")
+    committed = true
+  } catch (error: unknown) {
+    if (transactionStarted && !committed) {
+      try {
+        await client.query("ROLLBACK")
+      } catch (rollbackError: unknown) {
+        releaseError = rollbackError instanceof Error ? rollbackError : new Error("writer_review_rollback_failed")
+      }
+    }
+    if (error instanceof TaskGraphWriterReviewFeedbackError) throw error
+    throw new TaskGraphWriterReviewFeedbackError("writer_review_receipt_unavailable")
+  } finally {
+    client.release(releaseError)
+  }
+}
 /** Resolve only one direct, completed Reviewer receipt from server-materialized task context. */
 export function writerReviewDependencyFromTaskContext(value: unknown, expectedJobId: string): TaskGraphWriterReviewDependency | null {
   const context = plainRecord(value)
@@ -186,4 +282,8 @@ function plainRecord(value: unknown): Record<string, unknown> | null {
     return (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
       && Object.getOwnPropertySymbols(value).length === 0 ? value as Record<string, unknown> : null
   } catch { return null }
+}
+
+function safeRecord(value: unknown): Record<string, unknown> {
+  return plainRecord(value) ?? {}
 }
