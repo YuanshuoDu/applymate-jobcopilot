@@ -624,8 +624,8 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
     expect(unchanged.events.filter(event => event.type === "submission_terminal_observed")).toHaveLength(0)
   }, 20_000)
 
-  it.skipIf(!redisUrl)("recovers a durable claimed attempt after Worker terminal evidence survives pruning", async () => {
-    const { identity, outboxId, submitPayload } = await prepareOutboxedSubmit("claimed-terminal-job-pruned")
+  it.skipIf(!redisUrl)("retries failed terminal-proof persistence from retained delivery before pruning", async () => {
+    const { identity, outboxId } = await prepareOutboxedSubmit("claimed-terminal-proof-retry")
     const completed = deferred()
     let workerRedis: Redis | undefined
     let worker: Worker<ApplyTaskSubmitPayload, void> | undefined
@@ -646,29 +646,53 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
 
       const terminalJob = await submitQueue!.getJob(identity.workerTaskId)
       expect(await terminalJob?.getState()).toBe("completed")
-      await terminalJob!.remove()
-      expect(await submitQueue!.getJob(identity.workerTaskId)).toBeUndefined()
+      expect(terminalJob?.opts.removeOnComplete).toBe(false)
+      expect(terminalJob?.opts.removeOnFail).toBe(false)
       const lockKey = submitQueue!.toKey(`${identity.workerTaskId}:lock`)
       expect(await (await submitQueue!.client).get(lockKey)).toBeNull()
-      const observedIntent: SubmitOutboxIntent = {
-        applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
-        sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
-        constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId, submitPayload,
+
+      await pool.query(`CREATE FUNCTION "${schema}"."reject_terminal_proof"() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW."type" = 'submission_terminal_observed' THEN RAISE EXCEPTION 'injected terminal proof write failure'; END IF; RETURN NEW; END $$`)
+      await pool.query(`CREATE TRIGGER "reject_terminal_proof" BEFORE INSERT ON "${schema}"."application_task_events"
+        FOR EACH ROW EXECUTE FUNCTION "${schema}"."reject_terminal_proof"()`)
+      try {
+        await expect(reconcileTerminalSubmitJob(pool, submitQueue as unknown as SubmitOutboxQueue, terminalJob, "completed"))
+          .rejects.toThrow("injected terminal proof write failure")
+      } finally {
+        await pool.query(`DROP TRIGGER "reject_terminal_proof" ON "${schema}"."application_task_events"`)
+        await pool.query(`DROP FUNCTION "${schema}"."reject_terminal_proof"()`)
       }
-      await reconcileTerminalSubmitJob(pool, submitQueue as unknown as SubmitOutboxQueue, terminalJob, "completed")
-      const proof = await pool.query<{ data: Record<string, unknown> }>(
-        `SELECT "data" FROM "${schema}"."application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_terminal_observed'`,
-        [identity.applicationTaskId],
-      )
-      expect(proof.rows).toHaveLength(1)
-      expect(proof.rows[0]?.data).toMatchObject({ applicationTaskId: identity.applicationTaskId, userId: identity.userId,
-        jobId: identity.jobId, sessionId: identity.sessionId, fillTurnId: identity.fillTurnId,
-        workerTaskId: identity.workerTaskId, approvalId: identity.approvalId, receiptId: identity.approvalId,
-        constraintHash: identity.constraintHash, terminalState: "completed" })
-      await expect(reconcileClaimedTerminalSubmit(pool, submitQueue as unknown as SubmitOutboxQueue, observedIntent)).resolves.toBe("unchanged")
+      const retainedJob = await submitQueue!.getJob(identity.workerTaskId)
+      expect(retainedJob?.id).toBe(identity.workerTaskId)
+      expect(retainedJob?.data).toEqual(terminalJob?.data)
+      expect(await retainedJob?.getState()).toBe("completed")
+      expect(await (await submitQueue!.client).get(lockKey)).toBeNull()
+      expect((await submitRecoverySnapshot(identity)).task).toMatchObject({ status: "filling", checkpoint: "browser_active" })
+      expect((await submitRecoverySnapshot(identity)).events.filter(event => event.type === "submission_terminal_observed")).toHaveLength(0)
 
       const addSpy = vi.spyOn(submitQueue!, "add")
       try {
+        await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+        expect(addSpy).not.toHaveBeenCalled()
+        const proof = await pool.query<{ data: Record<string, unknown> }>(
+          `SELECT "data" FROM "${schema}"."application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_terminal_observed'`,
+          [identity.applicationTaskId],
+        )
+        expect(proof.rows).toHaveLength(1)
+        expect(proof.rows[0]?.data).toMatchObject({ applicationTaskId: identity.applicationTaskId, userId: identity.userId,
+          jobId: identity.jobId, sessionId: identity.sessionId, fillTurnId: identity.fillTurnId,
+          workerTaskId: identity.workerTaskId, approvalId: identity.approvalId, receiptId: identity.approvalId,
+          constraintHash: identity.constraintHash, terminalState: "completed" })
+        expect(await submitQueue!.getJob(identity.workerTaskId)).toBeUndefined()
+        const recoveredIntent: SubmitOutboxIntent = {
+          applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+          sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
+          constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId,
+          submitPayload: terminalJob!.data,
+        }
+        await expect(reconcileClaimedTerminalSubmit(pool, submitQueue as unknown as SubmitOutboxQueue, recoveredIntent))
+          .resolves.toBe("reconciled")
+        expect((await submitRecoverySnapshot(identity)).events.filter(event => event.type === "submission_terminal_observed")).toHaveLength(1)
         await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
         expect(addSpy).not.toHaveBeenCalled()
         await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
@@ -684,6 +708,7 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       )
       expect(outbox.rows[0]?.lastError).toMatch(/^terminal:/)
       expect(outbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      addSpy.mockRestore()
     } finally {
       if (worker) await worker.close().catch(() => undefined)
       if (workerRedis && workerRedis.status !== "end") await workerRedis.quit().catch(() => workerRedis?.disconnect())

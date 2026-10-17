@@ -4,7 +4,7 @@ import { matchesApplyTaskSubmitPayload, type ApplyTaskPayload, type ApplyTaskSub
 import { reconcileClaimedSubmissionUncertain } from "../db/submission-guard.js"
 import type { ApplicationSubmitIdentity } from "./application-submit-fence.js"
 
-const ADD_OPTIONS = { attempts: 3, backoff: { type: "exponential" as const, delay: 60_000 }, removeOnComplete: 100, removeOnFail: 200 }
+const ADD_OPTIONS = { attempts: 3, backoff: { type: "exponential" as const, delay: 60_000 }, removeOnComplete: false, removeOnFail: false }
 const RETRY_OPTIONS = { resetAttemptsMade: true, resetAttemptsStarted: true }
 const RUNNABLE_STATES = new Set(["waiting", "wait", "active", "delayed", "prioritized", "waiting-children"])
 
@@ -183,12 +183,30 @@ async function observedTerminalJob(queue: SubmitOutboxQueue, intent: SubmitOutbo
   return { terminalState: state, attemptsMade, attempts }
 }
 
-async function verifyClaimedAttempt(client: PoolClient, intent: SubmitOutboxIntent): Promise<boolean> {
-  const result = await client.query(`SELECT 1 FROM "application_tasks" WHERE "id" = $1 AND "userId" = $2
-    AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6
-    AND "status" = 'filling' AND "checkpoint" IN ('browser_active', 'submission_request_started') FOR UPDATE`,
-  [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.workerTaskId])
-  return result.rowCount === 1
+async function removeTerminalJobAfterProof(
+  queue: SubmitOutboxQueue, intent: SubmitOutboxIntent,
+): Promise<"removed" | "absent" | "deferred" | "mismatch"> {
+  const job = await queue.getJob(intent.workerTaskId)
+  if (!job) return "absent"
+  if (job.id !== intent.workerTaskId || !matchesSubmitJobPayload(job.data, intent)) return "mismatch"
+  const state = await job.getState()
+  if (state !== "completed" && (state !== "failed" || job.attemptsMade < (job.opts.attempts ?? 1))) return "deferred"
+  if (await (await queue.client).get(queue.toKey(`${intent.workerTaskId}:lock`)) !== null) return "deferred"
+  await job.remove()
+  return "removed"
+}
+
+async function terminalAttemptDisposition(client: PoolClient, intent: SubmitOutboxIntent): Promise<"claimed" | "uncertain" | "final" | "stale"> {
+  const task = (await client.query<{ status: string; checkpoint: string | null }>(`SELECT "status", "checkpoint" FROM "application_tasks"
+    WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6 FOR UPDATE`,
+  [intent.applicationTaskId, intent.userId, intent.jobId, intent.sessionId, intent.fillTurnId, intent.workerTaskId])).rows[0]
+  if (!task) return "stale"
+  if (task.status === "filling" && ["browser_active", "submission_request_started"].includes(task.checkpoint ?? "")) return "claimed"
+  if (task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain") return "uncertain"
+  if (["submitted", "failed"].includes(task.status) || task.status === "waiting_for_authorization" && task.checkpoint === "form_filled" ||
+    task.status === "waiting_for_user" && ["submission_blocked", "user_takeover"].includes(task.checkpoint ?? "") ||
+    task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit") return "final"
+  return "stale"
 }
 
 export async function reconcileClaimedTerminalSubmit(
@@ -203,17 +221,32 @@ export async function reconcileClaimedTerminalSubmit(
     approvalId: intent.receiptId, constraintHash: intent.constraintHash,
   }
   let fencedDelivery: SubmitDeliveryState | undefined
+  let terminalOutcomeDurable = false
   const reconciled = await reconcileClaimedSubmissionUncertain(pool, identity, intent.workerTaskId, async client => {
     fencedDelivery = await inspectSubmitDelivery(queue, intent, true)
     if (fencedDelivery !== "terminal" && fencedDelivery !== "absent") return false
-    if (!await verifyClaimedAttempt(client, intent)) return false
+    const disposition = await terminalAttemptDisposition(client, intent)
+    if (disposition === "final") { terminalOutcomeDurable = true; return false }
+    if (disposition === "stale") return false
     if (fencedDelivery === "absent") {
-      if (!observed) return (await readTerminalProof(client, intent)).valid
-      return await persistTerminalProof(client, intent, observed)
+      terminalOutcomeDurable = observed
+        ? await persistTerminalProof(client, intent, observed)
+        : (await readTerminalProof(client, intent)).valid
+      return terminalOutcomeDurable
     }
     const terminal = await observedTerminalJob(queue, intent)
-    return terminal ? persistTerminalProof(client, intent, terminal) : observed ? persistTerminalProof(client, intent, observed) : false
+    terminalOutcomeDurable = disposition === "uncertain" && !terminal && !observed
+      ? (await readTerminalProof(client, intent)).valid
+      : terminal ? await persistTerminalProof(client, intent, terminal)
+      : observed ? await persistTerminalProof(client, intent, observed) : false
+    return terminalOutcomeDurable
   })
+  if (terminalOutcomeDurable) {
+    const removal = await removeTerminalJobAfterProof(queue, intent)
+    if (removal === "mismatch") return "mismatch"
+    if (removal === "deferred") return "deferred"
+    return "reconciled"
+  }
   if (reconciled) return "reconciled"
   return fencedDelivery && fencedDelivery !== "terminal" && fencedDelivery !== "absent" ? fencedDelivery : "unchanged"
 }

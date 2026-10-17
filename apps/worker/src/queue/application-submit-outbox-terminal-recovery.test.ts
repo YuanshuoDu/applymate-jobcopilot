@@ -23,6 +23,8 @@ const intent: SubmitOutboxIntent = {
   submitPayload: { ...identity, operation: "submit", applyUrl: "https://jobs.example/apply", personaId: "server", resumePath: "" },
 }
 let terminalProofRows: Array<{ data: unknown }> = []
+let failTerminalProofInsert = false
+let taskState = { status: "filling", checkpoint: "browser_active" as string | null }
 
 function makeJob(state: string, options: { id?: string; data?: unknown; attemptsMade?: number; attempts?: number } = {}) {
   return {
@@ -31,15 +33,17 @@ function makeJob(state: string, options: { id?: string; data?: unknown; attempts
     attemptsMade: options.attemptsMade ?? 3,
     opts: { attempts: options.attempts ?? 3 },
     getState: vi.fn(async () => state),
+    remove: vi.fn(async () => undefined),
   }
 }
 
 function makeQueue(options: { job?: ReturnType<typeof makeJob>; lock?: string | null; paused?: boolean } = {}) {
   const redis = { get: vi.fn(async () => options.lock ?? null) }
+  let retainedJob = options.job
   let addedJob: ReturnType<typeof makeJob> | undefined
   const queue = {
     isPaused: vi.fn(async () => options.paused ?? false),
-    getJob: vi.fn(async () => options.job ?? addedJob),
+    getJob: vi.fn(async () => retainedJob ?? addedJob),
     add: vi.fn(async (_name: string, data: unknown, opts: { jobId: string }) => {
       addedJob = makeJob("waiting", { id: opts.jobId, data })
       return addedJob
@@ -47,16 +51,19 @@ function makeQueue(options: { job?: ReturnType<typeof makeJob>; lock?: string | 
     toKey: vi.fn((key: string) => `bull:apply:${key}`),
     client: Promise.resolve(redis),
   }
-  return { queue: queue as unknown as SubmitOutboxQueue, redis }
+  return { queue: queue as unknown as SubmitOutboxQueue, redis, prune: () => { retainedJob = undefined; addedJob = undefined } }
 }
 
 beforeEach(() => {
   terminalProofRows = []
+  failTerminalProofInsert = false
+  taskState = { status: "filling", checkpoint: "browser_active" }
   mockProofQuery.mockReset().mockImplementation(async (sql: unknown, values?: unknown[]) => {
     const query = String(sql)
-    if (query.includes('FROM "application_tasks"')) return { rows: [{ id: intent.applicationTaskId }], rowCount: 1 }
+    if (query.includes('FROM "application_tasks"')) return { rows: [{ id: intent.applicationTaskId, ...taskState }], rowCount: 1 }
     if (query.includes('FROM "application_task_events"')) return { rows: terminalProofRows, rowCount: terminalProofRows.length }
     if (query.includes('INSERT INTO "application_task_events"') && query.includes("submission_terminal_observed")) {
+      if (failTerminalProofInsert) { failTerminalProofInsert = false; throw new Error("injected terminal proof write failure") }
       terminalProofRows.push({ data: JSON.parse(String(values?.[1])) as unknown })
       return { rows: [], rowCount: 1 }
     }
@@ -77,9 +84,9 @@ describe("claimed submit terminal recovery", () => {
 
     await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
 
-    expect(redis.get).toHaveBeenCalledTimes(2)
+    expect(redis.get).toHaveBeenCalledTimes(3)
     expect(redis.get).toHaveBeenCalledWith(`bull:apply:${intent.workerTaskId}:lock`)
-    expect(queue.getJob).toHaveBeenCalledTimes(3)
+    expect(queue.getJob).toHaveBeenCalledTimes(4)
     expect(mockReconcile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ approvalId: identity.receiptId }), intent.workerTaskId, expect.any(Function))
     expect(terminalProofRows[0]?.data).toMatchObject({ ...identity, workerTaskId: intent.workerTaskId, terminalState: "completed" })
   })
@@ -123,6 +130,54 @@ describe("claimed submit terminal recovery", () => {
     expect(terminalProofRows).toHaveLength(1)
     expect(terminalProofRows[0]?.data).toMatchObject({ ...identity, workerTaskId: intent.workerTaskId,
       terminalState: "completed", attemptsMade: 3, attempts: 3 })
+  })
+
+  it("retains exact terminal evidence through a proof-write failure and removes it only after retry commits", async () => {
+    taskState = { status: "waiting_for_user", checkpoint: "submission_uncertain" }
+    const job = makeJob("completed")
+    const { queue, prune } = makeQueue({ job })
+    failTerminalProofInsert = true
+
+    await expect(reconcileTerminalSubmitJob({} as Pool, queue, job as never, "completed"))
+      .rejects.toThrow("injected terminal proof write failure")
+    expect(await queue.getJob(intent.workerTaskId)).toBe(job)
+    expect(job.remove).not.toHaveBeenCalled()
+    expect(terminalProofRows).toHaveLength(0)
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
+    expect(terminalProofRows).toHaveLength(1)
+    expect(job.remove).toHaveBeenCalledOnce()
+
+    prune()
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
+    expect(queue.add).not.toHaveBeenCalled()
+  })
+
+  it("defers cleanup when the exact lock appears after proof commits", async () => {
+    const job = makeJob("completed")
+    const { queue, redis } = makeQueue({ job })
+    redis.get.mockResolvedValueOnce(null).mockResolvedValueOnce(null).mockResolvedValueOnce("late-lock")
+
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("deferred")
+    expect(terminalProofRows).toHaveLength(1)
+    expect(job.remove).not.toHaveBeenCalled()
+
+    redis.get.mockResolvedValue(null)
+    await expect(reconcileClaimedTerminalSubmit({} as Pool, queue, intent)).resolves.toBe("reconciled")
+    expect(terminalProofRows).toHaveLength(1)
+    expect(job.remove).toHaveBeenCalledOnce()
+  })
+
+  it("cleans a matching terminal delivery after the exact task has a durable final outcome", async () => {
+    taskState = { status: "submitted", checkpoint: "submission_verified" }
+    const job = makeJob("completed")
+    const { queue } = makeQueue({ job })
+
+    await expect(reconcileTerminalSubmitJob({} as Pool, queue, job as never, "completed")).resolves.toBeUndefined()
+
+    expect(job.remove).toHaveBeenCalledOnce()
+    expect(terminalProofRows).toHaveLength(0)
+    expect(queue.add).not.toHaveBeenCalled()
   })
 
   it("persists only a final failed callback as terminal evidence", async () => {
@@ -244,7 +299,9 @@ describe("claimed submit terminal recovery", () => {
 
     await expect(ensureSubmitQueueJob(queue, intent)).resolves.toBe("ready")
 
-    expect(queue.add).toHaveBeenCalledWith("apply", intent.submitPayload, expect.objectContaining({ jobId: intent.workerTaskId }))
+    expect(queue.add).toHaveBeenCalledWith("apply", intent.submitPayload, expect.objectContaining({
+      jobId: intent.workerTaskId, removeOnComplete: false, removeOnFail: false,
+    }))
   })
 
   it("does not requeue a terminal delivery with a live lock", async () => {

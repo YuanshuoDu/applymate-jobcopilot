@@ -108,6 +108,8 @@ async function terminalizeClaimed(pool: Pool, queue: SubmitQueue, id: string, in
 async function processRow(pool: Pool, queue: SubmitQueue, id: string, published = false): Promise<ProcessOutcome> {
   let scanned: OutboxRow | undefined
   let claimedRecovery: Intent | undefined
+  let terminalCleanup: Intent | undefined
+  let terminalCleanupReason: string | undefined
   try {
     const outcome = await transaction(pool, async client => {
       const marker = published ? `"publishedAt" IS NOT NULL` : `"publishedAt" IS NULL`
@@ -156,11 +158,17 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
               return terminalized ? "terminalized" as const : "skipped" as const
             }
             if (delivery !== "absent" && delivery !== "terminal") return "skipped" as const
-            if (!await markTerminal(client, row, reason, queue, currentIntent.workerTaskId, published)) return "skipped" as const
             await resetExpiredSubmitAuthorization(client, currentIntent)
-            return "terminalized" as const
+            terminalCleanup = currentIntent
+            terminalCleanupReason = reason
+            return "skipped" as const
           }
           if (reason) {
+            if (reason === "attempt_already_claimed_or_terminal") {
+              terminalCleanup = currentIntent
+              terminalCleanupReason = reason
+              return "skipped" as const
+            }
             const terminalized = await markTerminal(client, row, reason, queue, currentIntent.workerTaskId, published)
             return terminalized ? "terminalized" as const : "skipped" as const
           }
@@ -191,6 +199,12 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
       if (recovery === "reconciled") return terminalizeClaimed(pool, queue, id, claimedRecovery, "terminal_submit_reconciled", published)
       if (recovery === "mismatch") return terminalizeClaimed(pool, queue, id, claimedRecovery, "queue_job_identity_mismatch", published)
       return "skipped"
+    }
+    if (terminalCleanup) {
+      const cleanup = await reconcileClaimedTerminalSubmit(pool, queue, terminalCleanup)
+      if (cleanup === "mismatch") return terminalizeClaimed(pool, queue, id, terminalCleanup, "queue_job_identity_mismatch", published)
+      if (cleanup !== "reconciled") return "skipped"
+      return terminalizeClaimed(pool, queue, id, terminalCleanup, terminalCleanupReason!, published)
     }
     return outcome
   } catch (error: unknown) {
