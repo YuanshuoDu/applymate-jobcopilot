@@ -87,6 +87,24 @@ jobs:
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify backfill script argument parser
+        working-directory: apps/worker
+        run: |
+          config="scripts/.backfill-script-vitest.config.mjs"
+          test ! -e "$config"
+          trap 'rm -f "$config"' EXIT
+          cat > "$config" <<'EOF'
+          import workerConfig from "../vitest.config.ts"
+
+          export default {
+            ...workerConfig,
+            test: {
+              ...workerConfig.test,
+              include: ["scripts/backfill-objective-history.test.ts"],
+            },
+          }
+          EOF
+          pnpm exec vitest run --config "$config" scripts/backfill-objective-history.test.ts
       - name: Verify submit outbox retry and duplicate-delivery fencing
         run: >-
           pnpm --filter @jobcopilot/worker exec vitest run
