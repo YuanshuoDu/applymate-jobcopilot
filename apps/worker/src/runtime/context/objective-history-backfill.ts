@@ -108,6 +108,7 @@ async function hasPendingCandidates(client: Client, cursor: string | null = null
 }
 
 type VerificationResult = Readonly<{ consistent: boolean; complete: boolean }>
+class TerminalIneligibleBatchError extends Error {}
 class VerificationDeadlineError extends Error {}
 class VerificationMismatchError extends Error {}
 
@@ -201,15 +202,29 @@ export async function backfillObjectiveHistoryProjection(
     if (!reset) throw new Error("The exact objective-history readiness row is missing")
     while (batches < maxBatches) {
       if (!await hasPendingCandidates(client, cursor)) break
-      const page = await transaction(client, async () => {
-        const rows = await candidates(client, cursor, batchSize)
-        for (const row of rows) {
-          const counts = await projectCandidate(client, row)
-          evaluated += counts.evaluated; unindexable += counts.unindexable
-          ineligible += counts.ineligible; conflicts += counts.conflicts; terminalIneligible += counts.terminalIneligible
-        }
-        return rows
-      })
+      let page: Candidate[]
+      const pageCounts = { evaluated: 0, unindexable: 0, ineligible: 0, conflicts: 0, terminalIneligible: 0 }
+      try {
+        page = await transaction(client, async () => {
+          const rows = await candidates(client, cursor, batchSize)
+          for (const row of rows) {
+            const counts = await projectCandidate(client, row)
+            pageCounts.evaluated += counts.evaluated; pageCounts.unindexable += counts.unindexable
+            pageCounts.ineligible += counts.ineligible; pageCounts.conflicts += counts.conflicts
+            pageCounts.terminalIneligible += counts.terminalIneligible
+            if (counts.terminalIneligible) throw new TerminalIneligibleBatchError()
+          }
+          return rows
+        })
+      } catch (error) {
+        if (!(error instanceof TerminalIneligibleBatchError)) throw error
+        batches += 1
+        terminalIneligible += pageCounts.terminalIneligible
+        break
+      }
+      evaluated += pageCounts.evaluated; unindexable += pageCounts.unindexable
+      ineligible += pageCounts.ineligible; conflicts += pageCounts.conflicts
+      terminalIneligible += pageCounts.terminalIneligible
       batches += 1
       if (!page.length) break
       cursor = page[page.length - 1]!.turnId

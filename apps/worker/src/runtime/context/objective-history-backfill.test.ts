@@ -167,7 +167,7 @@ describe("objective history backfill bounds", () => {
 
     const report = await backfillObjectiveHistoryProjection(h.pool)
 
-    expect(report).toMatchObject({ evaluated: 1, terminalIneligible: 1, verificationFailed: true, ready: false })
+    expect(report).toMatchObject({ evaluated: 0, terminalIneligible: 1, verificationFailed: true, ready: false })
     expect(h.calls.filter(call => call.sql.includes('"isReady" = $1')).map(call => call.values?.[0])).toEqual([false])
   })
 

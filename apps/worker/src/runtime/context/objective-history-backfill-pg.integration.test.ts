@@ -255,6 +255,37 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
     } finally { await owner.cleanup() }
   })
 
+  it("keeps an invalid terminal candidate pending until its receipt is repaired", async () => {
+    const owner = await createOwner()
+    try {
+      const identity = await seedTurn(owner, "terminal-repair", { failedEvent: true })
+      await pool!.query(`UPDATE "agent_events" SET "actor" = 'system' WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.failed'`,
+        [identity.sessionId, identity.turnId])
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const report = await backfillObjectiveHistoryProjection(pool!)
+        expect(report).toMatchObject({ batches: 1, evaluated: 0, terminalIneligible: 1, verificationFailed: true, ready: false })
+        const state = await pool!.query(`SELECT turn."objectiveIndexSemanticsVersion", turn."terminalEventSequence", turn."terminalEventAt", ready."isReady"
+          FROM "agent_turns" turn CROSS JOIN "agent_objective_history_index_readiness" ready
+          WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = 1`,
+        [identity.turnId])
+        expect(state.rows[0]).toEqual({ objectiveIndexSemanticsVersion: null, terminalEventSequence: null, terminalEventAt: null, isReady: false })
+      }
+
+      await pool!.query(`UPDATE "agent_events" SET "actor" = 'orchestrator' WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.failed'`,
+        [identity.sessionId, identity.turnId])
+      const repaired = await backfillObjectiveHistoryProjection(pool!)
+
+      expect(repaired).toMatchObject({ evaluated: 1, terminalIneligible: 0, verificationComplete: true, verificationFailed: false, ready: true })
+      const state = await pool!.query(`SELECT turn."objectiveIndexSemanticsVersion", turn."terminalEventSequence", turn."terminalEventAt", ready."isReady"
+        FROM "agent_turns" turn CROSS JOIN "agent_objective_history_index_readiness" ready
+        WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = 1`,
+      [identity.turnId])
+      expect(state.rows[0]).toMatchObject({ objectiveIndexSemanticsVersion: 1, terminalEventSequence: "11", isReady: true })
+      expect(state.rows[0]?.terminalEventAt).toBeInstanceOf(Date)
+    } finally { await owner.cleanup() }
+  })
+
   it("accepts a legitimate interrupted Turn with a null-task Stop receipt and no root terminal locator", async () => {
     const owner = await createOwner()
     try {
