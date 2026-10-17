@@ -14,6 +14,7 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "../selected-job-preparation.js"
 import type { TurnLease } from "../turns/lease.js"
 import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { INTERACTIVE_DISCOVERY_ROOT_TOOLS, rootTaskAllowedActions, rootToolSurface } from "../interactive-discovery-contract.js"
 import { isSelectedJobRootTool } from "../canonical-turn-task-graph-context.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
@@ -122,6 +123,25 @@ function fixture(): Fixture {
 }
 
 function selectedJobId(value: Fixture): string { return `p3-task-graph-selected-job-${value.sessionId}` }
+
+function completedReviewerResultEnvelope() {
+  const digest = `sha256:${"a".repeat(64)}`
+  return {
+    status: "completed",
+    stepCount: 1,
+    toolCallCount: 1,
+    finalItemId: null,
+    finalText: "Review passed",
+    structuredResult: {
+      schemaVersion: ROLE_RESULT_SCHEMA,
+      role: "reviewer",
+      status: "completed",
+      artifactRef: { artifactId: "fixture-cover-letter", version: 1, contentHash: digest, sourceDigest: digest },
+      reviewStatus: "passed",
+      reviewHash: digest,
+    },
+  }
+}
 
 function selectedJobRootAllowedActions(templates: TaskGraphScheduleInput["templates"]): string[] {
   const rootTools = rootToolSurface(
@@ -841,9 +861,9 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       })
       expect(initialReviewer).toMatchObject({ status: "accepted", revision: 1, nodes: [{ key: "reviewer", status: "queued" }] })
       const completedReviewer = await adminPool!.query(
-        `UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = '{}'::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+        `UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = $4::jsonb, "updatedAt" = CURRENT_TIMESTAMP
          WHERE "id" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "status" = 'queued'`,
-        [initialReviewer.nodes[0]!.taskId, value.sessionId, value.rootTaskId],
+        [initialReviewer.nodes[0]!.taskId, value.sessionId, value.rootTaskId, JSON.stringify(completedReviewerResultEnvelope())],
       )
       expect(completedReviewer.rowCount).toBe(1)
 
@@ -902,9 +922,9 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       })
       expect(freshReviewer).toMatchObject({ status: "accepted", revision: 3 })
       const completedFreshReviewer = await adminPool!.query(
-        `UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = '{}'::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+        `UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = $4::jsonb, "updatedAt" = CURRENT_TIMESTAMP
          WHERE "id" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "status" = 'queued'`,
-        [freshReviewer.nodes[0]!.taskId, value.sessionId, value.rootTaskId],
+        [freshReviewer.nodes[0]!.taskId, value.sessionId, value.rootTaskId, JSON.stringify(completedReviewerResultEnvelope())],
       )
       expect(completedFreshReviewer.rowCount).toBe(1)
       const freshWriter = await command.appendAndSchedule({
