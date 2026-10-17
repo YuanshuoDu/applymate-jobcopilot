@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EnqueueApplyInput, ApplyQueueSubmissionIdentity } from "./apply-queue-client";
 
 const mocks = vi.hoisted(() => ({
-  redis: { exists: vi.fn(), del: vi.fn() },
+  redis: { exists: vi.fn(), del: vi.fn(), eval: vi.fn() },
   getJob: vi.fn(),
   add: vi.fn(),
   close: vi.fn(),
@@ -13,6 +13,7 @@ vi.mock("ioredis", () => ({
   Redis: class MockRedis {
     exists = mocks.redis.exists;
     del = mocks.redis.del;
+    eval = mocks.redis.eval;
   },
 }));
 vi.mock("bullmq", () => ({
@@ -71,10 +72,11 @@ const identityMismatches: Array<[string, { id?: string; data?: Record<string, un
 
 function createJob(
   state: string,
-  overrides: { id?: string; data?: Record<string, unknown>; removeError?: Error; attemptsMade?: number; attempts?: number } = {},
+  overrides: { id?: string; name?: string; data?: Record<string, unknown>; removeError?: Error; attemptsMade?: number; attempts?: number } = {},
 ) {
   return {
     id: overrides.id ?? workerTaskId,
+    name: overrides.name ?? "apply",
     data: { ...expected, operation: "submit", ...overrides.data } as EnqueueApplyInput,
     attemptsMade: overrides.attemptsMade ?? 3,
     opts: { attempts: overrides.attempts ?? 3 },
@@ -88,7 +90,8 @@ function createJob(
 describe("apply queue submission recovery check", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.redis.exists.mockResolvedValue(0);
+    mocks.redis.exists.mockReset().mockResolvedValue(0);
+    mocks.redis.eval.mockReset().mockResolvedValue(0);
     mocks.getJob.mockResolvedValue(undefined);
     mocks.add.mockResolvedValue({ id: workerTaskId });
     mocks.close.mockResolvedValue(undefined);
@@ -106,6 +109,14 @@ describe("apply queue submission recovery check", () => {
     expect(job.remove).not.toHaveBeenCalled();
     expect(mocks.redis.exists).toHaveBeenCalledWith(`bull:apply-tasks:${workerTaskId}:lock`);
     expect(mocks.redis.del).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "failed"])("rejects terminal %s jobs with a mismatched queue job name", async state => {
+    mocks.getJob.mockResolvedValue(createJob(state, { name: "different-queue-job" }));
+
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected })).resolves.toBe(false);
+    expect(mocks.redis.del).not.toHaveBeenCalled();
+    expect(mocks.redis.eval).not.toHaveBeenCalled();
   });
 
   it("fails closed for missing IDs, missing jobs, and missing expected identity", async () => {
@@ -147,7 +158,7 @@ describe("apply queue submission recovery check", () => {
     expect(mocks.redis.del).not.toHaveBeenCalled();
   });
 
-  it.each(["active", "waiting-children", "paused", "prioritized", "unknown"])("rejects nonterminal %s jobs", async status => {
+  it.each(["active", "waiting-children", "prioritized", "unknown"])("rejects nonterminal %s jobs", async status => {
     mocks.getJob.mockResolvedValue(createJob(status));
     const withFence = vi.fn(async (remove: () => Promise<boolean>) => remove());
 
@@ -155,9 +166,9 @@ describe("apply queue submission recovery check", () => {
     expect(withFence).not.toHaveBeenCalled();
   });
 
-  it.each(["waiting", "delayed"])("removes a matching %s job inside the exact fence and rechecks absence", async status => {
+  it.each(["waiting", "delayed"])("removes a matching %s job inside the exact fence with one receipt script", async status => {
     const job = createJob(status);
-    mocks.getJob.mockResolvedValueOnce(job).mockResolvedValueOnce(job).mockResolvedValueOnce(undefined);
+    mocks.getJob.mockResolvedValueOnce(job);
     let fenceHeld = false;
     const withFence = vi.fn(async (remove: () => Promise<boolean>) => {
       fenceHeld = true;
@@ -167,16 +178,17 @@ describe("apply queue submission recovery check", () => {
         fenceHeld = false;
       }
     });
-    job.remove.mockImplementation(async () => {
+    mocks.redis.eval.mockImplementation(async () => {
       expect(fenceHeld).toBe(true);
-      return undefined;
+      return 1;
     });
 
     await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, withExactAttemptFence: withFence })).resolves.toBe(true);
     expect(withFence).toHaveBeenCalledTimes(1);
-    expect(job.remove).toHaveBeenCalledTimes(1);
-    expect(mocks.getJob).toHaveBeenCalledTimes(3);
-    expect(mocks.redis.exists).toHaveBeenCalledTimes(3);
+    expect(job.remove).not.toHaveBeenCalled();
+    expect(mocks.getJob).toHaveBeenCalledTimes(1);
+    expect(mocks.redis.exists).toHaveBeenCalledTimes(1);
+    expect(mocks.redis.eval).toHaveBeenCalledTimes(1);
     expect(mocks.redis.del).not.toHaveBeenCalled();
   });
 
@@ -190,29 +202,34 @@ describe("apply queue submission recovery check", () => {
     })).resolves.toBe(false);
   });
 
-  it("fails closed when the pending job disappears before removal", async () => {
+  it("fails closed when the pending job disappears before the atomic removal", async () => {
     const job = createJob("waiting");
-    mocks.getJob.mockResolvedValueOnce(job).mockResolvedValueOnce(undefined);
+    mocks.getJob.mockResolvedValueOnce(job);
     const withFence = vi.fn(async (remove: () => Promise<boolean>) => remove());
+    mocks.redis.eval.mockResolvedValueOnce(0);
 
     await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, withExactAttemptFence: withFence })).resolves.toBe(false);
     expect(job.remove).not.toHaveBeenCalled();
+    expect(mocks.redis.eval).toHaveBeenCalledTimes(1);
   });
 
-  it("rechecks the state and lock inside the caller's exact attempt fence", async () => {
+  it("uses the atomic Redis script to recheck state and lock inside the exact attempt fence", async () => {
     const job = createJob("waiting");
-    job.getState.mockResolvedValueOnce("waiting").mockResolvedValueOnce("active");
+    job.getState.mockResolvedValueOnce("waiting");
     mocks.getJob.mockResolvedValue(job);
     const withFence = vi.fn(async (remove: () => Promise<boolean>) => remove());
+    mocks.redis.eval.mockResolvedValueOnce(0);
 
     await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, withExactAttemptFence: withFence })).resolves.toBe(false);
-    expect(job.getState).toHaveBeenCalledTimes(2);
+    expect(job.getState).toHaveBeenCalledTimes(1);
     expect(job.remove).not.toHaveBeenCalled();
+    expect(mocks.redis.eval).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed when removal errors or the follow-up finds the job or a lock", async () => {
-    const removalErrorJob = createJob("waiting", { removeError: new Error("locked") });
+    const removalErrorJob = createJob("waiting");
     mocks.getJob.mockResolvedValue(removalErrorJob);
+    mocks.redis.eval.mockRejectedValueOnce(new Error("locked"));
     await expect(verifyAndCancelSubmissionJob({
       workerTaskId,
       expected,
@@ -221,7 +238,8 @@ describe("apply queue submission recovery check", () => {
 
     const removedJob = createJob("delayed");
     mocks.getJob.mockReset();
-    mocks.getJob.mockResolvedValueOnce(removedJob).mockResolvedValueOnce(removedJob).mockResolvedValueOnce(removedJob);
+    mocks.getJob.mockResolvedValueOnce(removedJob);
+    mocks.redis.eval.mockResolvedValueOnce(0);
     await expect(verifyAndCancelSubmissionJob({
       workerTaskId,
       expected,
@@ -230,14 +248,51 @@ describe("apply queue submission recovery check", () => {
 
     const lockJob = createJob("waiting");
     mocks.getJob.mockReset();
-    mocks.getJob.mockResolvedValueOnce(lockJob).mockResolvedValueOnce(lockJob).mockResolvedValueOnce(undefined);
+    mocks.getJob.mockResolvedValueOnce(lockJob);
     mocks.redis.exists.mockReset();
-    mocks.redis.exists.mockResolvedValueOnce(0).mockResolvedValueOnce(0).mockResolvedValueOnce(1);
+    mocks.redis.exists.mockResolvedValueOnce(0).mockResolvedValueOnce(0);
+    mocks.redis.eval.mockResolvedValueOnce(0);
     await expect(verifyAndCancelSubmissionJob({
       workerTaskId,
       expected,
       withExactAttemptFence: async (remove: () => Promise<boolean>) => remove(),
     })).resolves.toBe(false);
+  });
+
+  it("accepts a missing job only in receipt-only mode when a matching receipt exists", async () => {
+    mocks.getJob.mockResolvedValue(undefined);
+
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected })).resolves.toBe(false);
+    await expect(verifyAndCancelSubmissionJob({
+      workerTaskId,
+      expected,
+      withExactAttemptFence: async () => true,
+    })).resolves.toBe(false);
+    expect(mocks.redis.eval).not.toHaveBeenCalled();
+
+    mocks.redis.eval.mockResolvedValueOnce(2);
+
+    await expect(verifyAndCancelSubmissionJob({
+      workerTaskId,
+      expected,
+      withExactAttemptFence: async checkReceipt => checkReceipt(),
+    })).resolves.toBe(true);
+    expect(mocks.redis.eval).toHaveBeenCalledTimes(1);
+    expect(mocks.redis.eval.mock.calls[0]?.at(-1)).toBe("receipt-only");
+    expect(mocks.redis.exists).not.toHaveBeenCalled();
+  });
+
+  it("does not turn an initially missing job into a fresh removal if it appears before EVAL", async () => {
+    mocks.getJob.mockResolvedValueOnce(undefined);
+    const withFence = vi.fn(async (checkReceipt: () => Promise<boolean>) => checkReceipt());
+    mocks.redis.eval.mockImplementationOnce(async (...args: unknown[]) => {
+      expect(args.at(-1)).toBe("receipt-only");
+      return 0;
+    });
+
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected, withExactAttemptFence: withFence })).resolves.toBe(false);
+    expect(withFence).toHaveBeenCalledTimes(1);
+    expect(mocks.redis.eval).toHaveBeenCalledTimes(1);
   });
 
   it("returns false on Redis and BullMQ query errors", async () => {
@@ -251,6 +306,10 @@ describe("apply queue submission recovery check", () => {
     const stateError = createJob("completed");
     stateError.getState.mockRejectedValueOnce(new Error("state query failed"));
     mocks.getJob.mockResolvedValueOnce(stateError);
+    await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected })).resolves.toBe(false);
+
+    mocks.getJob.mockResolvedValueOnce(undefined);
+    mocks.redis.eval.mockRejectedValueOnce(new Error("redis script failed"));
     await expect(verifyAndCancelSubmissionJob({ workerTaskId, expected })).resolves.toBe(false);
   });
 
