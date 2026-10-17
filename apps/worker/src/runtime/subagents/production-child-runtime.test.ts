@@ -214,6 +214,21 @@ function initialWriterPool(writerTaskId: string) {
   })
 }
 
+function legacyInitialWriterPool() {
+  const base = selectedJobPool(), graphQueries: string[] = [], transactionQueries: string[] = [], tenantScopeUserIds: unknown[] = []
+  const client = {
+    query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+      graphQueries.push(sql)
+      if (/^BEGIN(?:\s|$)/.test(sql) || sql === "COMMIT" || sql === "ROLLBACK") { transactionQueries.push(sql); return { rows: [] } }
+      if (sql.includes("set_config('app.user_id', $1, true)")) { transactionQueries.push(sql); tenantScopeUserIds.push(values[0]); return { rows: [] } }
+      if (sql.includes('FROM "agent_items" AS item') || sql.includes('FROM "agent_events" AS event')) return { rows: [] }
+      throw new Error(`unexpected legacy Writer graph query: ${sql}`)
+    }),
+    release: vi.fn(),
+  }
+  return { ...base, connect: async () => client, graphQueries, transactionQueries, tenantScopeUserIds }
+}
+
 const emptyMailboxReader: ChildMailboxReader = { listPendingMessages: async () => [] }
 
 function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPreparation: { jobId: "job-1" } }): SubagentLease {
@@ -874,6 +889,80 @@ describe("production child runtime", () => {
     expect(queryCalls.filter(call => call.sql.includes("FROM persona_facts")).map(call => call.values)).toEqual([
       ["user-1", null, "cover_letter"], ["user-1", ["language"], "cover_letter"],
     ])
+  })
+
+  it("allows a legacy selected-job Writer without TaskGraph membership", async () => {
+    const body = "A short initial cover-letter draft from the legacy selected-job flow."
+    const preparation = (await selectedJobSourceDigest()).preparation
+    const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`
+    const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: "job-1" })
+    const artifactRef = {
+      artifactId: `cover-letter:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`,
+      version: 1, contentHash: hashArtifactContent(body), sourceDigest: preparation.sourceDigest,
+    }
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "legacy-draft", name: "cover_letter.draft", arguments: {
+            baseArtifactId, baseHash, content: body, constraints: { maxWords: 160 },
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore(), draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const persistence = recordingStore(), pool = legacyInitialWriterPool()
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence, model, pool, mailboxReader: emptyMailboxReader })
+    const result = await executor({ lease: { ...jobTask("writer"), id: "legacy-initial-writer" } })
+
+    expect(result).toMatchObject({ status: "completed", result: { structuredResult: { role: "writer", artifactRef } } })
+    expect(draftSpy).toHaveBeenCalledOnce()
+    expect(pool.transactionQueries).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SELECT set_config('app.user_id', $1, true)",
+      "COMMIT",
+    ])
+    expect(pool.graphQueries).toEqual(expect.arrayContaining([
+      expect.stringContaining('FROM "agent_items" AS item'),
+      expect.stringContaining('FROM "agent_events" AS event'),
+    ]))
+    expect(requests).toHaveLength(2)
+    expect(emittedTool(requests[0]!, "cover_letter.draft")).toBe(true)
+    expect(emittedTool(requests[0]!, "artifact.version.read")).toBe(false)
+    assertNoExternalTools(requests[0]!)
+  })
+
+  it("does not treat graph-derived non-Reviewer context as legacy when the graph item is absent", async () => {
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) { requests.push(request); throw new Error("legacy fallthrough must not invoke the Writer model") },
+    }
+    const pool = legacyInitialWriterPool()
+    const executor = selectedJobExecutor({
+      artifactStore: new InMemoryArtifactToolStore(), persistence: recordingStore(), model, pool,
+      mailboxReader: emptyMailboxReader,
+    })
+    const result = await executor({ lease: {
+      ...jobTask("writer", {
+        selectedJobPreparation: { jobId: "job-1" },
+        taskGraphDependencyResults: { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: [{ role: "analyst" }] },
+      }), id: "writer-graph-context-without-item",
+    } })
+
+    expect(result).toMatchObject({ status: "failed", failureReason: "writer_review_dependency_invalid", retryDisposition: "terminal" })
+    expect(pool.transactionQueries).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+      "SELECT set_config('app.user_id', $1, true)",
+      "ROLLBACK",
+    ])
+    expect(requests).toHaveLength(0)
   })
 
   it("composes the selected-job Writer and Reviewer tools with a private exact-reference read receipt", async () => {

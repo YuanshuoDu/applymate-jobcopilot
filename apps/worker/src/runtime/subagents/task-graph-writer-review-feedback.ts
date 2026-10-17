@@ -3,7 +3,7 @@ import type pg from "pg"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import type { AgentArtifactReviewRow } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext, ArtifactVersionRef } from "../tools/artifact-tools.js"
-import { loadTaskGraph } from "./task-graph-pg-state.js"
+import { hasPersistedTaskGraphMembership, loadTaskGraph } from "./task-graph-pg-state.js"
 import { parseArtifactReference, type ArtifactVersionReference } from "./role-results.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
@@ -71,6 +71,14 @@ export async function assertPersistedWriterReviewDependency(
       rootTaskId: lease.rootTaskId, parentTaskId,
     }
     const graph = await loadTaskGraph(client, scope, false)
+    const context = plainRecord(lease.context), hasTaskGraphDependencyContext = context !== null && Object.hasOwn(context, DEPENDENCY_CONTEXT_KEY)
+    if (!graph.snapshot) {
+      if (hasTaskGraphDependencyContext || await hasPersistedTaskGraphMembership(client, scope, lease.id)
+        || dependency || task.status !== "running" || lease.status !== "running") {
+        throw new TaskGraphWriterReviewFeedbackError("writer_review_dependency_invalid")
+      }
+      await client.query("COMMIT"); committed = true; return
+    }
     const writerNode = graph.snapshot?.nodes.find(node => node.taskId === lease.id)
     const writer = graph.tasks.get(lease.id)
     if (graph.rootTaskId !== lease.rootTaskId || !writerNode || writerNode.templateId !== "cover_letter_writer"
