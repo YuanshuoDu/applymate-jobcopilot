@@ -13,7 +13,7 @@ const MAX_ITEMS = 128
 const TASK_KINDS = new Set(["scout", "analyst", "writer", "reviewer", "other"])
 const STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const EXECUTION_FAILURE_CATEGORY_ORDER = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"] as const
-const HISTORICAL_CATEGORY_INTERPRETATION = "Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning. "
+const HISTORICAL_CATEGORY_INTERPRETATION = "Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, current evidence, and currently available inputs before planning. "
 const REASONS = new Set([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
   "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",

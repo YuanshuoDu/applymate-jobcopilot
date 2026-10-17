@@ -59,7 +59,7 @@ const lease = {
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
 }
 type TurnEngineStoreFactory = NonNullable<CanonicalTurnRuntimeOptions["turnEngineStoreFactory"]>
-const HISTORICAL_EXECUTION_CATEGORY_INTRO = "Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning."
+const HISTORICAL_EXECUTION_CATEGORY_INTRO = "Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, current evidence, and currently available inputs before planning."
 const HISTORICAL_EXECUTION_CATEGORY_GUIDANCE = [
   "For execution-setup cues, inspect the existing execution prerequisites for the child.",
   "For resume-state cues, inspect the current resume state and available evidence.",

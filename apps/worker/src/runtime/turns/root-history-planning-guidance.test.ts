@@ -114,7 +114,7 @@ describe("root history planning guidance", () => {
     ].join(" "))
     const withCategory = buildRootHistoryPlanningInstruction(context([historyBlock(categoryContent)]), [{ name: "agent.list" }, { name: "agent.plan" }])
     expect(withCategory).not.toBeNull()
-    expect(textOf(withCategory)).toBe(`${baseline} Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning. For resume-state cues, inspect the current resume state and available evidence.`)
+    expect(textOf(withCategory)).toBe(`${baseline} Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, current evidence, and currently available inputs before planning. For resume-state cues, inspect the current resume state and available evidence.`)
     expect(textOf(withCategory)).not.toContain("resume_state_unavailable")
 
     const categoryWithHiddenTools = textOf(buildRootHistoryPlanningInstruction(
@@ -165,7 +165,7 @@ describe("root history planning guidance", () => {
       "For resume-state cues, inspect the current resume state and available evidence.",
       "For structured-output cues, inspect the existing typed output contract and current available result evidence.",
     ]
-    const historical = `Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, evidence, and available inputs before planning. ${advice.join(" ")}`
+    const historical = `Historical execution-category cues are hypotheses about earlier prerequisites only; compare them with the current graph, current evidence, and currently available inputs before planning. ${advice.join(" ")}`
     expect(first).toBe(reordered)
     expect(first.endsWith(historical)).toBe(true)
     for (const categoryAdvice of advice) expect(first.split(categoryAdvice)).toHaveLength(2)
