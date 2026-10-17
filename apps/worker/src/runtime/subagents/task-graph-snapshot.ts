@@ -5,6 +5,7 @@ import type { SubagentTaskStatus } from "./types.js"
 import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { parseRegisteredScoutEnvelope, taskGraphNodeKeysMatch, type RegisteredScoutEnvelope } from "./task-graph-command-port.js"
 import { APPLICATION_FILLER_TEMPLATE_ID } from "./role-policy.js"
+import { readPinnedRootCriteria } from "./root-plan-criteria.js"
 
 export const TASK_GRAPH_ITEM_TYPE = "task_graph"
 export const TASK_GRAPH_SNAPSHOT_VERSION = "agent-harness.v2.task-graph"
@@ -20,18 +21,14 @@ export type StoredTaskGraphNode = TaskGraphNodeProposal & Readonly<{
 export type TaskGraphSnapshot = Readonly<{
   schemaVersion: typeof TASK_GRAPH_SNAPSHOT_VERSION
   nodes: readonly StoredTaskGraphNode[]
+  rootSuccessCriteria?: readonly string[]
 }>
 
-const MAX_NODES = TASK_GRAPH_LIMITS.maxNodes
-const MAX_SNAPSHOT_BYTES = TASK_GRAPH_LIMITS.maxSnapshotBytes
-const MAX_DEPTH = TASK_GRAPH_LIMITS.maxDepth
-const MAX_KEY_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
-const MAX_TEMPLATE_ID_LENGTH = TASK_GRAPH_LIMITS.maxTemplateIdLength
-const MAX_GOAL_LENGTH = TASK_GRAPH_LIMITS.maxGoalLength
-const MAX_CRITERIA = TASK_GRAPH_LIMITS.maxSuccessCriteria
-const MAX_CRITERION_LENGTH = TASK_GRAPH_LIMITS.maxCriterionLength
-const MAX_DEPENDENCIES = TASK_GRAPH_LIMITS.maxDependencies
-const MAX_TASK_ID_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
+const MAX_NODES = TASK_GRAPH_LIMITS.maxNodes, MAX_SNAPSHOT_BYTES = TASK_GRAPH_LIMITS.maxSnapshotBytes
+const MAX_DEPTH = TASK_GRAPH_LIMITS.maxDepth, MAX_KEY_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
+const MAX_TEMPLATE_ID_LENGTH = TASK_GRAPH_LIMITS.maxTemplateIdLength, MAX_GOAL_LENGTH = TASK_GRAPH_LIMITS.maxGoalLength
+const MAX_CRITERIA = TASK_GRAPH_LIMITS.maxSuccessCriteria, MAX_CRITERION_LENGTH = TASK_GRAPH_LIMITS.maxCriterionLength
+const MAX_DEPENDENCIES = TASK_GRAPH_LIMITS.maxDependencies, MAX_TASK_ID_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
 const LEGACY_NODE_KEYS = "dependsOn,depth,goal,key,successCriteria,taskId,templateId"
 const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
 const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
@@ -79,8 +76,11 @@ function parsedRepairOf(value: unknown): TaskGraphRepairOf | undefined {
 }
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
   const row = object(value)
-  if (!row || !exactKeys(row, "nodes,schemaVersion") || row.schemaVersion !== TASK_GRAPH_SNAPSHOT_VERSION
+  const pinnedShape = row !== null && exactKeys(row, "nodes,rootSuccessCriteria,schemaVersion")
+  if (!row || (!pinnedShape && !exactKeys(row, "nodes,schemaVersion")) || row.schemaVersion !== TASK_GRAPH_SNAPSHOT_VERSION
     || !Array.isArray(row.nodes) || row.nodes.length > MAX_NODES) throw new Error("task_graph_snapshot_invalid")
+  const rootSuccessCriteria = pinnedShape && row ? readPinnedRootCriteria(row) : undefined
+  if (pinnedShape && (!rootSuccessCriteria?.length)) throw new Error("task_graph_snapshot_root_criteria_invalid")
   const keys = new Set<string>()
   const ids = new Set<string>()
   const nodes: StoredTaskGraphNode[] = []
@@ -162,12 +162,12 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
     }
   }
   if (visited !== nodes.length) throw new Error("task_graph_snapshot_cycle_invalid")
-  const snapshot: TaskGraphSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }
+  const snapshot: TaskGraphSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes, ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}) }
   assertTaskGraphSnapshotSize(snapshot)
   return snapshot
 }
 
-export function taskGraphSnapshot(state: TaskGraphState, taskIds: ReadonlyMap<string, string>): TaskGraphSnapshot {
+export function taskGraphSnapshot(state: TaskGraphState & Readonly<{ rootSuccessCriteria?: readonly string[] }>, taskIds: ReadonlyMap<string, string>, rootSuccessCriteria = state.rootSuccessCriteria): TaskGraphSnapshot {
   const snapshot = {
     schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
     nodes: state.nodes.map(node => {
@@ -181,7 +181,7 @@ export function taskGraphSnapshot(state: TaskGraphState, taskIds: ReadonlyMap<st
       }
       const verificationDisposition = existingDisposition ?? (node.verification ? "typed" : role ? "legacy_unverified" : "specialized")
       return { ...stored, taskId, verificationDisposition }
-    }),
+    }), ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}),
   }
   return parseTaskGraphSnapshot(snapshot)
 }
@@ -210,7 +210,7 @@ export function taskGraphState(
   revision: number,
   statuses: ReadonlyMap<string, { status: SubagentTaskStatus; failureReason: string | null }>,
   events: readonly TaskGraphEvent[],
-): TaskGraphState {
+): TaskGraphState & Readonly<{ rootSuccessCriteria?: readonly string[] }> {
   if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("task_graph_revision_invalid")
   return {
     revision,
@@ -219,7 +219,7 @@ export function taskGraphState(
       if (!current || !TASK_STATUSES.has(current.status)) throw new Error("task_graph_task_missing")
       return { ...node, status: current.status, ...(current.failureReason ? { failureReason: current.failureReason } : {}) }
     }),
-    appliedEvents: events,
+    appliedEvents: events, ...(snapshot.rootSuccessCriteria ? { rootSuccessCriteria: snapshot.rootSuccessCriteria } : {}),
   }
 }
 

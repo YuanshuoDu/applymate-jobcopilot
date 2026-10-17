@@ -107,7 +107,7 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
         return options.failFence === "turn" ? empty : { rows: [{ id: input.scope.turnId }], rowCount: 1 }
       }
       if (sql.startsWith('SELECT task.*, session."userId" AS "userId"')) {
-        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, budgetSnapshot: {}, allowedActions: options.allowedActions ?? ["agent.plan"] }], rowCount: 1 }
+        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, budgetSnapshot: {}, allowedActions: options.allowedActions ?? ["agent.plan"], successCriteria: [] }], rowCount: 1 }
       }
       if (sql.startsWith('SELECT "id" FROM "agent_steps"')) {
         return { rows: [{ id: input.scope.stepId }], rowCount: 1 }
