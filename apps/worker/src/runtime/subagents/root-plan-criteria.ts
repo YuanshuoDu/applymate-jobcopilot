@@ -80,11 +80,18 @@ function readRootCriteriaProperty(
 }
 
 /** Pins the immutable server goal before model-authored additional requirements. */
-export function resolveRootPlanCriteria(goal: unknown, currentValue: unknown, additional: readonly string[]): RootPlanCriteriaResolution {
+export function resolveRootPlanCriteria(
+  goal: unknown, currentValue: unknown, additional: readonly string[], ownedCriteriaValue: unknown = [],
+): RootPlanCriteriaResolution {
   if (typeof goal !== "string" || !goal.trim() || goal.trim() !== goal
     || Buffer.byteLength(goal, "utf8") > MAX_ROOT_CRITERION_BYTES) return { status: "invalid" }
   const current = parsePersistedRootCriteria(currentValue)
-  if (!current) return { status: "invalid" }
+  const ownedCriteria = parsePersistedRootCriteria(ownedCriteriaValue)
+  if (!current || !ownedCriteria) return { status: "invalid" }
+  const pinnedAdditional = current.length ? current.slice(1) : additional
+  const verifierCriteria = [...new Set([goal, ...ownedCriteria, ...pinnedAdditional])]
+  if (verifierCriteria.length > MAX_ROOT_CRITERIA
+    || verifierCriteria.some(item => Buffer.byteLength(item, "utf8") > MAX_ROOT_CRITERION_BYTES)) return { status: "invalid" }
   const criteria = [...new Set([goal, ...additional])]
   if (criteria.length > MAX_ROOT_CRITERIA || criteria.some(item => Buffer.byteLength(item, "utf8") > MAX_ROOT_CRITERION_BYTES)) return { status: "invalid" }
   if (current.length === 0) return { status: "persist", criteria }

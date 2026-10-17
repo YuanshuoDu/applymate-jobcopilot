@@ -39,6 +39,9 @@ type FakePoolOptions = {
   graphContent?: unknown
   graphRevision?: number
   taskRows?: Array<Record<string, unknown>>
+  rootGoal?: string
+  rootCriteria?: readonly string[]
+  turnInput?: unknown
 }
 
 const empty: QueryResult = { rows: [], rowCount: 0 }
@@ -106,8 +109,12 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
       if (sql.startsWith('SELECT "id" FROM "agent_turns"')) {
         return options.failFence === "turn" ? empty : { rows: [{ id: input.scope.turnId }], rowCount: 1 }
       }
+      if (sql.startsWith('SELECT "input" FROM "agent_turns"')) {
+        return { rows: [{ input: options.turnInput }], rowCount: 1 }
+      }
       if (sql.startsWith('SELECT task.*, session."userId" AS "userId"')) {
-        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, budgetSnapshot: {}, allowedActions: options.allowedActions ?? ["agent.plan"], successCriteria: [] }], rowCount: 1 }
+        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, goal: options.rootGoal,
+          budgetSnapshot: {}, allowedActions: options.allowedActions ?? ["agent.plan"], successCriteria: options.rootCriteria ?? [] }], rowCount: 1 }
       }
       if (sql.startsWith('SELECT "id" FROM "agent_steps"')) {
         return { rows: [{ id: input.scope.stepId }], rowCount: 1 }
@@ -670,6 +677,50 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_items"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))).toBe(false)
+  })
+
+  it("rejects a pinned requirement that would exceed the 32-item owned verifier set before writes", async () => {
+    const goal = "Original goal"
+    const rootCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `root ${index}`)]
+    const turnCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `turn ${index}`)]
+    const input = { ...scheduleInput(1), rootSuccessCriteria: ["new requirement"] }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, rootGoal: goal, rootCriteria,
+      turnInput: { goal, content: goal, successCriteria: turnCriteria } })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "root_success_criteria_invalid",
+    })
+
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT "input" FROM "agent_turns"'))).toBe(true)
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+  })
+
+  it("accepts a pinned requirement already present in the 32-item owned verifier set", async () => {
+    const goal = "Original goal"
+    const rootCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `root ${index}`)]
+    const turnCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `turn ${index}`)]
+    const input = { ...scheduleInput(1), rootSuccessCriteria: ["root 14"] }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, rootGoal: goal, rootCriteria,
+      turnInput: { goal, content: goal, successCriteria: turnCriteria } })
+    reconciliationMocks.create.mockResolvedValueOnce({
+      state: { revision: 2, nodes: [] }, snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, created: [], readyTaskIds: [],
+    })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).resolves.toEqual({
+      status: "accepted", revision: 2, nodes: [], readyTaskIds: [],
+    })
+
+    expect(reconciliationMocks.create).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan.mock.calls[0]?.[1]).toMatchObject({
+      snapshot: { rootSuccessCriteria: [goal, "root 14"] },
+    })
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
   })
 
   it.each([0, 1])("refuses a new plan with only %i shared Turn step(s) remaining and rolls back before writes", async remaining => {

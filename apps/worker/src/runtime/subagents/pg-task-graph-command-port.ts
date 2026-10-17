@@ -19,6 +19,7 @@ import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { BudgetExceededError } from "../budget.js"
 import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 import { normalizeRootPlanCriteria, parsePersistedRootCriteria, resolveRootPlanCriteria } from "./root-plan-criteria.js"
+import { resolveRootTaskObjective } from "../context/root-task-objective.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -105,9 +106,11 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   }
   if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
-  let pinnedCriteria = loaded.snapshot?.rootSuccessCriteria
-  if (rootSuccessCriteria !== undefined || pinnedCriteria !== undefined) {
-    const resolved = resolveRootPlanCriteria(parent.goal, pinnedCriteria ?? [], rootSuccessCriteria ?? pinnedCriteria!.slice(1))
+  let pinnedCriteria = loaded.snapshot?.rootSuccessCriteria; if (rootSuccessCriteria !== undefined || pinnedCriteria !== undefined) {
+    const turn = await client.query(`SELECT "input" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4 AND "status" = 'in_progress' FOR UPDATE`,
+      [input.scope.turnId, input.scope.sessionId, input.scope.userId, input.scope.rootTaskId]), objective = resolveRootTaskObjective(turn.rows[0]?.input, parent)
+    if (!objective.goal || objective.turnGoalConflict || !objective.criteriaValid) throw new TaskGraphCommandError("root_success_criteria_invalid", "The owned Turn objective or criteria are invalid")
+    const resolved = resolveRootPlanCriteria(parent.goal, pinnedCriteria ?? [], rootSuccessCriteria ?? pinnedCriteria!.slice(1), objective.criteria)
     if (resolved.status === "invalid") throw new TaskGraphCommandError("root_success_criteria_invalid", "The owned root objective or criteria are invalid")
     if (resolved.status === "conflict") throw new TaskGraphCommandError("root_success_criteria_conflict", "The root acceptance criteria are already pinned")
     pinnedCriteria = resolved.criteria
