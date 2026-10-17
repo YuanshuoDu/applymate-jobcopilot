@@ -128,11 +128,7 @@ export type TaskGraphScheduleReceipt = Readonly<{
   readyTaskIds: readonly string[]
 }>
 
-export type TaskGraphScheduleInput = Readonly<{
-  scope: TaskGraphExecutionScope
-  proposal: TaskGraphProposal
-  templates: Readonly<Record<string, TaskGraphTaskTemplate>>
-}>
+export type TaskGraphScheduleInput = Readonly<{ scope: TaskGraphExecutionScope; proposal: TaskGraphProposal; templates: Readonly<Record<string, TaskGraphTaskTemplate>>; rootSuccessCriteria?: readonly string[] }>
 
 export type RegisteredScoutEnvelope = Readonly<{
   role: "scout"
@@ -195,6 +191,7 @@ export type TaskGraphCurrentNode = Readonly<{
 export type TaskGraphCurrentState = Readonly<{
   revision: number
   nodes: readonly TaskGraphCurrentNode[]
+  rootSuccessCriteria?: readonly string[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
 }>
 export class TaskGraphCommandError extends Error {

@@ -18,9 +18,12 @@ import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contra
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { BudgetExceededError } from "../budget.js"
 import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
+import { normalizeRootPlanCriteria, parsePersistedRootCriteria, resolveRootPlanCriteria } from "./root-plan-criteria.js"
+import { resolveRootTaskObjective } from "../context/root-task-objective.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
+type LoadedCurrentGraph = Awaited<ReturnType<typeof loadTaskGraph>> & Readonly<{ rootSuccessCriteria?: readonly string[] }>
 
 export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCommandPort {
   return {
@@ -57,10 +60,13 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
           throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
         }
         currentTaskGraph(loaded)
+        const preservingLoadedPin = loaded.snapshot?.rootSuccessCriteria && loaded.state
+          ? { ...loaded, state: { ...loaded.state, rootSuccessCriteria: loaded.snapshot.rootSuccessCriteria } }
+          : loaded
         if (command.request.kind === "followup" && "mode" in command.request && command.request.mode === "replace_unstarted") {
-          return replaceUnstartedNativeFollowup(client, input, command, parent, loaded)
+          return replaceUnstartedNativeFollowup(client, input, command, parent, preservingLoadedPin)
         }
-        return appendNativeGraphCommand(client, input, command, parent, loaded)
+        return appendNativeGraphCommand(client, input, command, parent, preservingLoadedPin)
       })
     },
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
@@ -81,12 +87,16 @@ function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: Steeri
 }
 
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
+  const rootSuccessCriteria = normalizeRootPlanCriteria(input.rootSuccessCriteria)
+  if (rootSuccessCriteria === null) throw new TaskGraphCommandError("root_success_criteria_invalid", "Additional root criteria are invalid")
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
   const loaded = await loadTaskGraph(client, input.scope)
   const current = loaded.state, revision = current?.revision ?? 0
   const key = taskGraphProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
-  const fingerprint = taskGraphFingerprint(input.proposal)
+  const fingerprint = rootSuccessCriteria === undefined
+    ? taskGraphFingerprint(input.proposal)
+    : taskGraphFingerprint({ proposal: input.proposal, rootSuccessCriteria })
   const replay = await findPlanReplay(client, input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId))
   if (replay) return replay
   const prepared = operation ? await prepareSteeringReconciliation(client, operation) : null
@@ -96,6 +106,15 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   }
   if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
+  let pinnedCriteria = loaded.snapshot?.rootSuccessCriteria; if (rootSuccessCriteria !== undefined || pinnedCriteria !== undefined) {
+    const turn = await client.query(`SELECT "input" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4 AND "status" = 'in_progress' FOR UPDATE`,
+      [input.scope.turnId, input.scope.sessionId, input.scope.userId, input.scope.rootTaskId]), objective = resolveRootTaskObjective(turn.rows[0]?.input, parent)
+    if (!objective.goal || objective.turnGoalConflict || !objective.criteriaValid) throw new TaskGraphCommandError("root_success_criteria_invalid", "The owned Turn objective or criteria are invalid")
+    const resolved = resolveRootPlanCriteria(parent.goal, pinnedCriteria ?? [], rootSuccessCriteria ?? pinnedCriteria!.slice(1), objective.criteria)
+    if (resolved.status === "invalid") throw new TaskGraphCommandError("root_success_criteria_invalid", "The owned root objective or criteria are invalid")
+    if (resolved.status === "conflict") throw new TaskGraphCommandError("root_success_criteria_conflict", "The root acceptance criteria are already pinned")
+    pinnedCriteria = resolved.criteria
+  }
   try {
     await enforceRootStepBudget(client, {
       kind: "turn", taskId: input.scope.rootTaskId, rootTaskId: input.scope.rootTaskId,
@@ -108,7 +127,8 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
     throw error
   }
   const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []))
-  const snapshot = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
+  const stamped = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
+  const snapshot = pinnedCriteria ? parseTaskGraphSnapshot({ ...stamped, rootSuccessCriteria: pinnedCriteria }) : stamped
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
   await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot, expectedRevision: revision,
     now: new Date(), idempotencyKey: key, fingerprint, receipt })
@@ -145,7 +165,7 @@ async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: T
   const loaded = await loadCurrentWithClient(client, scope)
   const current = currentTaskGraph(loaded)
   const planningFacts = buildTaskGraphPlanningFacts(loaded)
-  return planningFacts ? { ...current, planningFacts } : current
+  return { ...current, ...(loaded.rootSuccessCriteria ? { rootSuccessCriteria: loaded.rootSuccessCriteria } : {}), ...(planningFacts ? { planningFacts } : {}) }
 }
 
 async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, request: TaskGraphResultPageRequest) {
@@ -154,14 +174,22 @@ async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">
   return projectTaskGraphResultPage(loaded, request)
 }
 
-async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {
+async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<LoadedCurrentGraph> {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
-  await lockTaskGraphScope(client, scope)
+  const parent = await lockTaskGraphScope(client, scope)
   const loaded = await loadTaskGraph(client, scope, false)
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }
-  return loaded
+  currentTaskGraph(loaded)
+  const criteria = parsePersistedRootCriteria(parent.successCriteria)
+  if (!criteria) throw new TaskGraphCommandError("root_success_criteria_invalid", "Persisted root criteria are invalid")
+  const pinned = loaded.snapshot?.rootSuccessCriteria
+  if (pinned && (typeof parent.goal !== "string" || parent.goal.trim() !== pinned[0])) {
+    throw new TaskGraphCommandError("root_success_criteria_invalid", "Persisted root criteria do not match the owned objective")
+  }
+  if (pinned) return { ...loaded, rootSuccessCriteria: pinned }
+  return criteria.length ? { ...loaded, rootSuccessCriteria: criteria } : loaded
 }
 
 async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {

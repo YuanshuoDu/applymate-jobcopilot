@@ -10,6 +10,7 @@ import type {
   TaskGraphScheduleReceipt,
   TaskGraphTaskTemplate,
 } from "../subagents/task-graph-command-port.js"
+import { normalizeRootPlanCriteria } from "../subagents/root-plan-criteria.js"
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 import { createSteeringReconciliationTool, steeringReconciliationOperation, type ReconciliationFenceOptions } from "./steering-reconciliation.js"
@@ -88,6 +89,7 @@ function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?:
   return Type.Object({
     expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
     nodes: Type.Array(nodeSchema, { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
+    rootSuccessCriteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 4 })),
   }, { additionalProperties: false })
 }
 
@@ -95,7 +97,10 @@ export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ mi
 
 type ModelTaskGraphRepairOf = Omit<TaskGraphRepairOf, "graphRootTaskId"> & Readonly<{ graphRootTaskId?: string }>
 type ModelTaskGraphNodeProposal = Omit<TaskGraphNodeProposal, "repairOf"> & Readonly<{ repairOf?: ModelTaskGraphRepairOf }>
-export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{ nodes: readonly ModelTaskGraphNodeProposal[] }>
+export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{
+  nodes: readonly ModelTaskGraphNodeProposal[]
+  rootSuccessCriteria?: readonly string[]
+}>
 
 export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
@@ -159,6 +164,11 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
       throw new ToolExecutionError(code, "The Turn needs two remaining steps to supervise a TaskGraph plan", { code, requiredSteps: MIN_CONTINUATION_STEPS })
     }
     const input = value as TaskGraphProposalInput
+    const rootSuccessCriteria = normalizeRootPlanCriteria(input.rootSuccessCriteria)
+    if (rootSuccessCriteria === null) {
+      const code = "task_graph_root_criteria_invalid"
+      throw new ToolExecutionError(code, "Additional root acceptance criteria must be one to four bounded, non-empty statements", { code })
+    }
     const encoded = JSON.stringify(input)
     if (!encoded || Buffer.byteLength(encoded, "utf8") > MAX_PROPOSAL_BYTES) {
       throw new ToolExecutionError("task_graph_proposal_too_large", "TaskGraph proposal exceeds the bounded request size", { code: "task_graph_proposal_too_large", maxBytes: MAX_PROPOSAL_BYTES })
@@ -197,6 +207,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
       const receipt = await options.commandPort.appendAndScheduleWithReconciliation({
         scope,
         proposal,
+        ...(rootSuccessCriteria === undefined ? {} : { rootSuccessCriteria }),
         templates: options.templates,
       }, operation)
       return receipt
@@ -210,7 +221,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     schemaVersion,
     name: "agent.plan",
     version: "1",
-    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte. Use only checks allowed for that role. findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. findings_cover_scout_candidates_gte is Analyst-only; use it only when the plan explicitly declares a cohort percentage, with a direct Scout dependency and minimumPercent from 1 to 100. Omitting it preserves normal top-N selection; do not infer a percentage or require processing of every candidate. A repair uses repairOf={nodeKey,taskId,criterionIds} for a prior typed same-template node; omit graphRootTaskId because the server binds the active Root. A matching legacy graphRootTaskId is accepted, but a mismatch is rejected. Repeat exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness.${selectedJobWriterGuidance}\nTaskGraph maxNodes is an eight-node lifetime history cap, separate from active-child concurrency. When present, read the current owner-scoped task_graph_current.nodeCapacity: remaining is total space; ordinaryRemaining is the ordinary-addition budget while reserveActive is true. In a typed graph before its first accepted repair, preserve one global final slot for a valid failed-target criterion repair. A valid proposal containing that repair may use the reserve in any node order but must fit remaining and the hard eight-node cap; the server still validates the exact current failed target and unresolved criteria. An accepted repair relation consumes the reserve even while queued or if it later fails; it does not pass a criterion, make the target successful, or promise another retry. Refresh current state and use remaining honestly; do not spend the reserve with agent.spawn or agent.followup.\nIf agent.plan returns task_graph_repair_conflict, inspect or refresh the current owner-scoped graph. If an overlapping repair is active, wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits; if none is active, correct the rejected batch so each target/criterion has only one proposed attempt, then replan. An active repair is not evidence of success.\nWait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
+    description: `For non-trivial goals, call agent.plan before executing child work. Optional rootSuccessCriteria adds one to four bounded, untrusted acceptance requirements; the server prepends the complete original human objective as a mandatory criterion. Omitting the field preserves current behavior; it grants no proof, permission, or completion authority. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte. Use only checks allowed for that role. findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. findings_cover_scout_candidates_gte is Analyst-only; use it only when the plan explicitly declares a cohort percentage, with a direct Scout dependency and minimumPercent from 1 to 100. Omitting it preserves normal top-N selection; do not infer a percentage or require processing of every candidate. A repair uses repairOf={nodeKey,taskId,criterionIds} for a prior typed same-template node; omit graphRootTaskId because the server binds the active Root. A matching legacy graphRootTaskId is accepted, but a mismatch is rejected. Repeat exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. ${selectedJobWriterGuidance}\nTaskGraph maxNodes is an eight-node lifetime history cap, separate from active-child concurrency. When present, read the current owner-scoped task_graph_current.nodeCapacity: remaining is total space; ordinaryRemaining is the ordinary-addition budget while reserveActive is true. In a typed graph before its first accepted repair, preserve one global final slot for a valid failed-target criterion repair. A valid proposal containing that repair may use the reserve in any node order but must fit remaining and the hard eight-node cap; the server still validates the exact current failed target and unresolved criteria. An accepted repair relation consumes the reserve even while queued or if it later fails; it does not pass a criterion, make the target successful, or promise another retry. Refresh current state and use remaining honestly; do not spend the reserve with agent.spawn or agent.followup.\nIf agent.plan returns task_graph_repair_conflict, inspect or refresh the current owner-scoped graph. If an overlapping repair is active, wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits; if none is active, correct the rejected batch so each target/criterion has only one proposed attempt, then replan. An active repair is not evidence of success.\nWait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
     capabilities: ["coordination"],
     inputSchema: proposalInputSchema(templateIdSchema, templates),
     outputSchema: ReceiptSchema,

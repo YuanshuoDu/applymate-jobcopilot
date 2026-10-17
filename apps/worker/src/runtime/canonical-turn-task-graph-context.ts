@@ -2,14 +2,15 @@ import { Buffer } from "node:buffer"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
   TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
-  type TaskGraphAnalystProjectionItem, type TaskGraphArtifactProjectionReference, type TaskGraphCurrentNode,
-  type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphProjectionEvidenceKind, type TaskGraphProjectionSource,
-  type TaskGraphReadScope, type TaskGraphResultProjection, type TaskGraphScoutProjectionItem,
+  type TaskGraphAnalystProjectionItem, type TaskGraphArtifactProjectionReference, type TaskGraphCommandPort, type TaskGraphCurrentNode,
+  type TaskGraphCurrentState, type TaskGraphProjectionEvidenceKind, type TaskGraphProjectionSource, type TaskGraphReadScope,
+  type TaskGraphResultProjection, type TaskGraphScoutProjectionItem,
 } from "./subagents/task-graph-command-port.js"
 import { parseTaskGraphCurrentVerificationMetadata, taskGraphCurrentVerificationMetadataBytes, validateTaskGraphCurrentVerificationGraph } from "./canonical-turn-task-graph-verification-context.js"
 import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
+import { readRootPlanCriteriaObservation } from "./subagents/root-plan-criteria.js"
 import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
 import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
 import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
@@ -177,9 +178,7 @@ function projectionItems(value: TaskGraphResultProjection): number {
   return 1
 }
 
-function projectionBytes(value: TaskGraphResultProjection): number {
-  return Buffer.byteLength(JSON.stringify(value), "utf8")
-}
+function projectionBytes(value: TaskGraphResultProjection): number { return Buffer.byteLength(JSON.stringify(value), "utf8") }
 
 function node(value: unknown): TaskGraphCurrentNode {
   const row = record(value)
@@ -208,6 +207,7 @@ function node(value: unknown): TaskGraphCurrentNode {
 export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, value: TaskGraphCurrentState): StepContextSnapshot {
   const state = record(value)
   if (!state || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0 || !Array.isArray(state.nodes) || state.nodes.length > MAX_NODES) throw new Error("task_graph_current_state_invalid")
+  const rootSuccessCriteria = readRootPlanCriteriaObservation(state)
   let projectedBytes = 0
   let projectedItems = 0
   let verificationBytes = 0
@@ -229,7 +229,7 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   if (keys.size !== nodes.length || !validateTaskGraphCurrentVerificationGraph(nodes)) throw new Error("task_graph_current_state_invalid:dependencies")
   let planningFacts: unknown
   try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
-  const content = withTaskGraphCurrentPlanningObservation({ kind: "task_graph_current", revision: Number(state.revision), nodes }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
+  const content = withTaskGraphCurrentPlanningObservation({ kind: "task_graph_current", revision: Number(state.revision), ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), nodes }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
   return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)
