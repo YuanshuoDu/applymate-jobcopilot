@@ -604,8 +604,10 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         }
       })
     const mismatchedRoles = mismatchGroup("targetRoles", 800, 2)
-    const mismatchedLocations = mismatchGroup("targetLocations", 1060, 3)
-    const mismatchedMinScores = mismatchGroup("minScore", 1320, 4)
+    // Keep each four-event Turn range unique within this session. The earlier
+    // baseline fixture reserves sequences 1101–1104 for its future Turn.
+    const mismatchedLocations = mismatchGroup("targetLocations", 1120, 3)
+    const mismatchedMinScores = mismatchGroup("minScore", 1380, 4)
     const hugeExponentMalformed: Source = {
       turnId: `root-history-scheduled-huge-number-${suffix}`, rootTaskId: `root-history-scheduled-huge-number-root-${suffix}`,
       childId: `root-history-scheduled-huge-number-child-${suffix}`, finalItemId: `root-history-scheduled-huge-number-final-${suffix}`,
@@ -698,13 +700,13 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       childId: `root-history-manual-child-${suffix}`, finalItemId: `root-history-manual-final-${suffix}`,
       sessionId, userId, turnSource: "automation", goal: objective, criteria,
       input: { goal: objective, successCriteria: criteria, automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "invalid" } },
-      startSequence: 900, terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
+      startSequence: 1900, terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
     }
     const legacyAutomationSource: Source = {
       turnId: `root-history-legacy-automation-source-${suffix}`, rootTaskId: `root-history-legacy-automation-root-${suffix}`,
       childId: `root-history-legacy-automation-child-${suffix}`, finalItemId: `root-history-legacy-automation-final-${suffix}`,
       sessionId, userId, turnSource: "automation", goal: objective, criteria,
-      input: { goal: objective, successCriteria: criteria }, startSequence: 920,
+      input: { goal: objective, successCriteria: criteria }, startSequence: 1920,
       terminalCreatedAt: new Date("2022-01-02T00:00:00.000Z"),
     }
     await insertSource(manualSource)
