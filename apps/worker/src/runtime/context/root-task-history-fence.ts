@@ -4,6 +4,7 @@ import type pg from "pg"
 import type { TurnLease } from "../turns/lease.js"
 import { lockTaskGraphScope, type GraphScope } from "../subagents/task-graph-pg-state.js"
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
+import { isScheduledAutomationTurn, scheduledAutomationCriteria, type ScheduledAutomationCriteria } from "../subagents/scheduled-automation-snapshot.js"
 import { resolveRootTaskObjective, resolveRootTaskVerificationRequirements, rootTaskObjectiveDigest } from "./root-task-objective.js"
 
 type Client = pg.PoolClient
@@ -22,6 +23,7 @@ export type RootTaskHistoryFenceInput = Readonly<{
 export type RootTaskHistoryFence = Readonly<{
   currentStartSequence: bigint
   objectiveDigest: string
+  scheduledAutomationCriteria?: ScheduledAutomationCriteria
   objectiveHistoryIndexObjectiveDigest?: string
   objectiveHistoryIndexCanonicalOriginDigest?: string
   currentStartCreatedAt?: Date
@@ -189,6 +191,9 @@ export async function readRootTaskHistoryFence(
   const currentTurn = turn.rows[0]
   if (turn.rows.length !== 1 || !currentTurn) throw new Error("root_task_history_current_turn_fenced")
   if (hasSelectedJobPreparation(currentTurn.input)) return undefined
+  const scheduledTurn = isScheduledAutomationTurn(currentTurn.source, currentTurn.input)
+  const scheduledCriteria = scheduledTurn ? scheduledAutomationCriteria(currentTurn.input) : undefined
+  if (scheduledTurn && !scheduledCriteria) return undefined
   const currentOrigin = input.crossSessionRootTaskHistoryEnabled ? rootTaskHistoryOrigin(currentTurn.source, currentTurn.input) : undefined
   if (input.crossSessionRootTaskHistoryEnabled && !currentOrigin) return undefined
   const objectiveDigest = rootTaskHistoryObjectiveDigest(currentTurn.input, root, input.crossSessionRootTaskHistoryEnabled === true)
@@ -200,6 +205,7 @@ export async function readRootTaskHistoryFence(
   const start = await currentStart(client, input)
   return start === undefined ? undefined : {
     currentStartSequence: start.sequence, objectiveDigest,
+    ...(scheduledCriteria ? { scheduledAutomationCriteria: scheduledCriteria } : {}),
     ...(indexKeys ? { objectiveHistoryIndexObjectiveDigest: indexKeys.objectiveDigest,
       ...(indexKeys.canonicalOriginDigest ? { objectiveHistoryIndexCanonicalOriginDigest: indexKeys.canonicalOriginDigest } : {}) } : {}),
     ...(input.crossSessionRootTaskHistoryEnabled && start.createdAt ? { currentStartCreatedAt: start.createdAt } : {}),

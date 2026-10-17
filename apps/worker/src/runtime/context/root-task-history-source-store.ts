@@ -1,6 +1,7 @@
 import type pg from "pg"
 import { hasSelectedJobPreparation, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
+import { isScheduledAutomationTurn, sameScheduledAutomationCriteria, scheduledAutomationCriteria, scheduledAutomationHistoryCompatibilitySql } from "../subagents/scheduled-automation-snapshot.js"
 
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
@@ -79,12 +80,17 @@ function validTerminal(row: Row, turnId: string, rootTaskId: string, status: str
 function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHistoryFence, indexed = false): RootTaskHistoryCandidate | undefined {
   const turnId = row.turnId, rootTaskId = row.taskRootTaskId
   const crossSession = input.crossSessionRootTaskHistoryEnabled === true
+  const scheduledTurn = isScheduledAutomationTurn(row.turnSource, row.input)
+  const scheduledCriteria = scheduledTurn ? scheduledAutomationCriteria(row.input) : undefined
   if (!text(turnId) || !text(rootTaskId) || !text(row.sessionId) || turnId === input.lease.turnId
     || (!crossSession && row.sessionId !== input.lease.sessionId) || row.userId !== input.lease.userId
     || row.rootTaskId !== rootTaskId || row.taskId !== rootTaskId || row.taskTurnId !== turnId
     || row.parentTaskId !== null || row.taskRole !== "orchestrator" || row.taskType !== "root"
     || !["completed", "failed", "interrupted"].includes(String(row.turnStatus))
     || row.turnStatus !== row.taskStatus || hasSelectedJobPreparation(row.input)) return undefined
+  if (fence.scheduledAutomationCriteria
+    ? !scheduledTurn || !scheduledCriteria || !sameScheduledAutomationCriteria(scheduledCriteria, fence.scheduledAutomationCriteria)
+    : scheduledTurn) return undefined
   if (crossSession && (row.sourceSessionUserId !== input.lease.userId || ["aborted", "archived"].includes(String(row.sourceSessionStatus))
     || rootTaskHistoryOrigin(row.turnSource, row.input) !== fence.currentOrigin)) return undefined
   const start = validStart(row, turnId, rootTaskId)
@@ -129,18 +135,25 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
     && !!fence.objectiveHistoryIndexObjectiveDigest
     && (!crossSession || !!fence.objectiveHistoryIndexCanonicalOriginDigest)
   const indexed = canUseIndex && await objectiveHistoryIndexReady(client)
+  const compatibilityParameter = indexed ? crossSession ? "$8" : "$7" : "$5"
+  const compatibility = scheduledAutomationHistoryCompatibilitySql(compatibilityParameter)
   const legacyWindow = crossSession
     ? `SELECT event."sessionId", event."turnId", event."taskId", event."sequence", event."createdAt"
       FROM "agent_events" AS event
+      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
       JOIN "agent_sessions" AS current_session ON current_session."id" = $1 AND current_session."userId" = $2
         AND current_session."status" NOT IN ('aborted', 'archived')
       JOIN "agent_sessions" AS source_session ON source_session."id" = event."sessionId"
         AND source_session."userId" = $2 AND source_session."status" NOT IN ('aborted', 'archived')
       WHERE event."createdAt" < $4::timestamptz AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
+        AND ${compatibility}
       ORDER BY event."createdAt" DESC, event."turnId" DESC`
     : `SELECT event."sessionId", event."turnId", event."taskId", event."sequence"
-      FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."sequence" < $4::bigint
+      FROM "agent_events" AS event
+      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+      WHERE event."sessionId" = $1 AND event."sequence" < $4::bigint
         AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
+        AND ${compatibility}
       ORDER BY event."sequence" DESC`
   const indexedWindow = crossSession
     ? `SELECT turn."sessionId", turn."id" AS "turnId", turn."rootTaskId" AS "taskId",
@@ -153,6 +166,7 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
       WHERE turn."userId" = $2 AND turn."id" <> $3 AND turn."terminalEventAt" < $4::timestamptz
         AND turn."objectiveDigest" = $5 AND turn."canonicalOriginDigest" = $6
         AND turn."objectiveIndexSemanticsVersion" = $7
+        AND ${compatibility}
       ORDER BY turn."terminalEventAt" DESC, turn."id" DESC`
     : `SELECT turn."sessionId", turn."id" AS "turnId", turn."rootTaskId" AS "taskId",
         turn."terminalEventSequence" AS "sequence", turn."terminalEventAt" AS "createdAt"
@@ -160,24 +174,26 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
       WHERE turn."sessionId" = $1 AND turn."userId" = $2 AND turn."id" <> $3
         AND turn."terminalEventSequence" < $4::bigint AND turn."objectiveDigest" = $5
         AND turn."objectiveIndexSemanticsVersion" = $6
+        AND ${compatibility}
       ORDER BY turn."terminalEventSequence" DESC, turn."id" DESC`
   const window = indexed ? indexedWindow : legacyWindow
-  const limit = indexed ? crossSession ? "$8" : "$7" : "$5"
+  const limit = indexed ? crossSession ? "$9" : "$8" : "$6"
   const projectionColumns = indexed ? `, turn."objectiveDigest" AS "turnObjectiveDigest",
       turn."canonicalOriginDigest" AS "turnCanonicalOriginDigest",
       turn."objectiveIndexSemanticsVersion" AS "turnObjectiveIndexSemanticsVersion",
       turn."terminalEventSequence" AS "indexedTerminalSequence", turn."terminalEventAt" AS "indexedTerminalAt"` : ""
   const locatorGuard = indexed ? `AND terminal."sequence" = roots."indexedTerminalSequence"
       AND terminal."createdAt" = roots."indexedTerminalAt"` : ""
+  const scheduleCriteria = fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null
   const values = indexed
     ? crossSession
       ? [input.lease.sessionId, input.lease.userId, input.lease.turnId, fence.currentStartCreatedAt,
         fence.objectiveHistoryIndexObjectiveDigest, fence.objectiveHistoryIndexCanonicalOriginDigest,
-        OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, SCAN_LIMIT]
+        OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, scheduleCriteria, SCAN_LIMIT]
       : [input.lease.sessionId, input.lease.userId, input.lease.turnId, String(fence.currentStartSequence),
-        fence.objectiveHistoryIndexObjectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, SCAN_LIMIT]
+        fence.objectiveHistoryIndexObjectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, scheduleCriteria, SCAN_LIMIT]
     : [input.lease.sessionId, input.lease.userId, input.lease.turnId,
-      crossSession ? fence.currentStartCreatedAt : String(fence.currentStartSequence), SCAN_LIMIT]
+      crossSession ? fence.currentStartCreatedAt : String(fence.currentStartSequence), scheduleCriteria, SCAN_LIMIT]
   const result = await client.query<Row>(`WITH terminal_window AS MATERIALIZED (
       ${window}
       LIMIT ${limit}

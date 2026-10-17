@@ -11,6 +11,12 @@ const currentTime = new Date("2026-10-07T12:00:00.000Z")
 const verificationRequirements = { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
   { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } },
 ] }
+const scheduledSnapshot = (overrides: Record<string, unknown> = {}) => ({
+  schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+  targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70,
+  dailyCap: 10, requireApproval: true, autoApply: false, ...overrides,
+})
+const scheduledCriteria = { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 }
 const input: RootTaskHistoryFenceInput = {
   lease: { turnId: "current-turn", sessionId: "current-session", ownerId: "worker", userId: "user-a", leaseVersion: 1,
     leaseStartedAt: new Date(1), leaseExpiresAt: new Date(10_000) },
@@ -62,6 +68,10 @@ function discoveryTurnInput(targetRoles: readonly string[], targetLocations: rea
   return { goal, content: [{ type: "text" as const, text: goal }], intent: { kind: "interactive_discovery_shortlist", version: 1 } }
 }
 
+function scheduledTurnInput(snapshot = scheduledSnapshot()) {
+  return { goal: "Find roles", successCriteria: ["Use saved filters"], automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }
+}
+
 function client(rows: readonly Row[], queries: Array<{ sql: string; values?: readonly unknown[] }>) {
   return { query: async (sql: string, values?: readonly unknown[]) => { queries.push({ sql, values }); return { rows } } }
 }
@@ -106,13 +116,16 @@ describe("Root history source scan", () => {
     expect(results).toHaveLength(1)
     expect(results[0]).toMatchObject({ sessionId: "source-session", turnId: "source-turn", terminalSequence: 200n, terminalAt: sourceTime })
     expect(queries).toHaveLength(1)
-    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, 64])
+    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, null, 64])
     expect(queries[0]?.sql).toContain('source_session."userId" = $2')
     expect(queries[0]?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
     expect(queries[0]?.sql).toContain('current_session."id" = $1 AND current_session."userId" = $2')
     expect(queries[0]?.sql).toContain('event."createdAt" < $4::timestamptz')
     expect(queries[0]?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
     expect(queries[0]?.sql).not.toContain('event."sequence" < $4::bigint')
+    const terminalWindow = queries[0]!.sql.slice(queries[0]!.sql.indexOf("WITH terminal_window"), queries[0]!.sql.indexOf("), roots"))
+    expect(terminalWindow).toContain("CASE WHEN $5::jsonb IS NULL THEN NOT")
+    expect(terminalWindow.indexOf("CASE WHEN $5::jsonb IS NULL")).toBeLessThan(terminalWindow.indexOf("LIMIT $6"))
   })
 
   it("keeps the legacy bounded scan when readiness is missing, false, unknown, or version-mismatched", async () => {
@@ -134,9 +147,9 @@ describe("Root history source scan", () => {
       expect(queries[0]?.sql).toContain('FROM "agent_objective_history_index_readiness"')
       expect(queries[0]?.sql).toContain('"isReady" = TRUE')
       expect(queries[0]?.sql).toContain("FOR SHARE")
-      expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, 64])
+      expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, null, 64])
       expect(queries[1]?.sql).toContain('FROM "agent_events" AS event')
-      expect(queries[1]?.sql).not.toContain('FROM "agent_turns" AS turn\n')
+      expect(queries[1]?.sql).toContain('JOIN "agent_turns" AS turn')
     }
   })
 
@@ -153,7 +166,7 @@ describe("Root history source scan", () => {
     expect(queries).toHaveLength(2)
     expect(queries[1]?.values).toEqual([
       "current-session", "user-a", "current-turn", currentTime, indexKeys.objectiveDigest,
-      indexKeys.canonicalOriginDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, 64,
+      indexKeys.canonicalOriginDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, null, 64,
     ])
     const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
     expect(terminalWindow).toContain('FROM "agent_turns" AS turn')
@@ -161,7 +174,9 @@ describe("Root history source scan", () => {
     expect(terminalWindow).toContain('turn."canonicalOriginDigest" = $6')
     expect(terminalWindow).toContain('turn."objectiveIndexSemanticsVersion" = $7')
     expect(terminalWindow).toContain('turn."terminalEventAt" < $4::timestamptz')
-    expect(terminalWindow.indexOf('turn."canonicalOriginDigest" = $6')).toBeLessThan(terminalWindow.indexOf("LIMIT $8"))
+    expect(terminalWindow).toContain("CASE WHEN $8::jsonb IS NULL THEN NOT")
+    expect(terminalWindow.indexOf("CASE WHEN $8::jsonb IS NULL")).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
+    expect(terminalWindow.indexOf('turn."canonicalOriginDigest" = $6')).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
     expect(terminalWindow).toContain('ORDER BY turn."terminalEventAt" DESC, turn."id" DESC')
     expect(queries[1]?.sql).toContain('terminal."createdAt" = roots."indexedTerminalAt"')
   })
@@ -218,7 +233,115 @@ describe("Root history source scan", () => {
     expect(results).toHaveLength(1)
     expect(queries[0]?.sql).toContain('event."sessionId" = $1 AND event."sequence" < $4::bigint')
     expect(queries[0]?.sql).toContain('ORDER BY terminal."sequence" DESC, roots."turnId" DESC')
-    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", "300", 64])
+    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", "300", null, 64])
+    const terminalWindow = queries[0]!.sql.slice(queries[0]!.sql.indexOf("WITH terminal_window"), queries[0]!.sql.indexOf("), roots"))
+    expect(terminalWindow).toContain("CASE WHEN $5::jsonb IS NULL THEN NOT")
+    expect(terminalWindow.indexOf("CASE WHEN $5::jsonb IS NULL")).toBeLessThan(terminalWindow.indexOf("LIMIT $6"))
+  })
+
+  it("revalidates scheduled source snapshots and requires exact ordered search criteria", async () => {
+    const scheduledFence: RootTaskHistoryFence = {
+      ...fence, currentOrigin: JSON.stringify(["automation", "none"]), scheduledAutomationCriteria: scheduledCriteria,
+    }
+    const rows = [
+      row({ turnSource: "automation", input: scheduledTurnInput() }),
+      row({ turnSource: "automation", input: scheduledTurnInput(scheduledSnapshot({ targetRoles: ["AI Engineer", "Engineer"] })) }),
+      row({ turnSource: "automation", input: scheduledTurnInput(scheduledSnapshot({ dailyCap: 51 })) }),
+      row({ turnSource: "automation", input: { ...scheduledTurnInput(), automationRunMode: "manual" } }),
+      row(),
+    ]
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+
+    const results = await readRootTaskHistoryCandidates(client(rows, queries) as unknown as pg.PoolClient, input, scheduledFence)
+
+    expect(results).toHaveLength(1)
+    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, JSON.stringify(scheduledCriteria), 64])
+    const terminalWindow = queries[0]!.sql.slice(queries[0]!.sql.indexOf("WITH terminal_window"), queries[0]!.sql.indexOf("), roots"))
+    expect(terminalWindow).toContain("COALESCE((turn.\"source\" = 'automation' AND turn.\"input\"->>'automationRunMode' = 'scheduled'), FALSE)")
+    expect(terminalWindow).toContain("turn.\"source\" = 'automation'")
+    expect(terminalWindow).toContain("turn.\"input\"->>'automationRunMode' = 'scheduled'")
+    expect(terminalWindow.indexOf("scheduledAutomationSnapshot")).toBeLessThan(terminalWindow.indexOf("LIMIT $6"))
+  })
+
+  it("binds scheduled compatibility before LIMIT in all four candidate windows", async () => {
+    const scheduledInput = scheduledTurnInput()
+    const root = { goal: "Find roles", successCriteria: ["Use saved filters"] }
+    const crossKeys = rootTaskHistoryIndexKeys("automation", scheduledInput, root, true)!
+    const sameKeys = rootTaskHistoryIndexKeys("automation", scheduledInput, root, false)!
+    const crossFence: RootTaskHistoryFence = {
+      ...fence, currentOrigin: JSON.stringify(["automation", "none"]),
+      objectiveHistoryIndexObjectiveDigest: crossKeys.objectiveDigest,
+      objectiveHistoryIndexCanonicalOriginDigest: crossKeys.canonicalOriginDigest,
+      scheduledAutomationCriteria: scheduledCriteria,
+    }
+    const sameFence: RootTaskHistoryFence = {
+      currentStartSequence: 300n, objectiveDigest: sameKeys.objectiveDigest,
+      objectiveHistoryIndexObjectiveDigest: sameKeys.objectiveDigest, scheduledAutomationCriteria: scheduledCriteria,
+    }
+    const currentSessionRow = row({ turnSource: "automation", input: scheduledInput, sessionId: "current-session",
+      terminalStepSessionId: "current-session", terminalStepEventSessionId: "current-session" })
+    const crossIndexedRow = indexedRow({ turnSource: "automation", input: scheduledInput,
+      turnObjectiveDigest: crossKeys.objectiveDigest, turnCanonicalOriginDigest: crossKeys.canonicalOriginDigest })
+    const sameIndexedRow = indexedRow({ turnSource: "automation", input: scheduledInput, sessionId: "current-session",
+      terminalStepSessionId: "current-session", terminalStepEventSessionId: "current-session",
+      turnObjectiveDigest: sameKeys.objectiveDigest, turnCanonicalOriginDigest: null })
+    const serializedCriteria = JSON.stringify(scheduledCriteria)
+    const cases: Array<{ label: string; indexed: boolean; row: Row; queryIndex: number; readInput: RootTaskHistoryFenceInput;
+      readFence: RootTaskHistoryFence; values: readonly unknown[]; parameter: string; limit: string }> = [
+      { label: "legacy cross-session", indexed: false, row: row({ turnSource: "automation", input: scheduledInput }),
+        queryIndex: 0, readInput: input, readFence: crossFence,
+        values: ["current-session", "user-a", "current-turn", currentTime, serializedCriteria, 64], parameter: "$5", limit: "LIMIT $6" },
+      { label: "legacy same-session", indexed: false, row: currentSessionRow, queryIndex: 0,
+        readInput: { ...input, crossSessionRootTaskHistoryEnabled: undefined }, readFence: sameFence,
+        values: ["current-session", "user-a", "current-turn", "300", serializedCriteria, 64], parameter: "$5", limit: "LIMIT $6" },
+      { label: "indexed cross-session", indexed: true, row: crossIndexedRow, queryIndex: 1,
+        readInput: { ...input, objectiveHistoryIndexEnabled: true }, readFence: crossFence,
+        values: ["current-session", "user-a", "current-turn", currentTime, crossKeys.objectiveDigest,
+          crossKeys.canonicalOriginDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, serializedCriteria, 64], parameter: "$8", limit: "LIMIT $9" },
+      { label: "indexed same-session", indexed: true, row: sameIndexedRow, queryIndex: 1,
+        readInput: { ...input, crossSessionRootTaskHistoryEnabled: undefined, objectiveHistoryIndexEnabled: true }, readFence: sameFence,
+        values: ["current-session", "user-a", "current-turn", "300", sameKeys.objectiveDigest,
+          OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, serializedCriteria, 64], parameter: "$7", limit: "LIMIT $8" },
+    ]
+
+    for (const entry of cases) {
+      const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+      const source = entry.indexed ? indexedClient([readyRow], [entry.row], queries) : client([entry.row], queries)
+      const results = await readRootTaskHistoryCandidates(source as unknown as pg.PoolClient, entry.readInput, entry.readFence)
+
+      expect(results, entry.label).toHaveLength(1)
+      const query = queries[entry.queryIndex]!
+      expect(query.values, entry.label).toEqual(entry.values)
+      const terminalWindow = query.sql.slice(query.sql.indexOf("WITH terminal_window"), query.sql.indexOf("), roots"))
+      expect(terminalWindow, entry.label).toContain(`${entry.parameter}::jsonb IS NULL`)
+      expect(terminalWindow.indexOf("scheduledAutomationSnapshot"), entry.label).toBeLessThan(terminalWindow.indexOf(entry.limit))
+    }
+  })
+
+  it("preserves ordinary and manual history while excluding scheduled history", async () => {
+    const legacyInput: RootTaskHistoryFenceInput = { ...input, crossSessionRootTaskHistoryEnabled: undefined }
+    const ordinaryFence: RootTaskHistoryFence = {
+      currentStartSequence: 300n,
+      objectiveDigest: rootTaskHistoryObjectiveDigest({ goal: "Find roles", successCriteria: ["Use saved filters"] },
+        { goal: "Find roles", successCriteria: ["Use saved filters"] })!,
+    }
+    const ordinary = row({ sessionId: "current-session", terminalStepSessionId: "current-session", terminalStepEventSessionId: "current-session" })
+    const manual = row({ turnSource: "automation", input: { goal: "Find roles", successCriteria: ["Use saved filters"],
+      automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "invalid" } },
+      sessionId: "current-session", terminalStepSessionId: "current-session", terminalStepEventSessionId: "current-session" })
+    const legacyAutomation = row({ turnSource: "automation", input: { goal: "Find roles", successCriteria: ["Use saved filters"] },
+      sessionId: "current-session", terminalStepSessionId: "current-session", terminalStepEventSessionId: "current-session" })
+    const scheduled = row({ turnSource: "automation", input: scheduledTurnInput(), sessionId: "current-session",
+      terminalStepSessionId: "current-session", terminalStepEventSessionId: "current-session" })
+
+    const read = (candidate: Row) => readRootTaskHistoryCandidates(
+      client([candidate], []) as unknown as pg.PoolClient, legacyInput, ordinaryFence,
+    )
+
+    expect(await read(ordinary)).toHaveLength(1)
+    expect(await read(manual)).toHaveLength(1)
+    expect(await read(legacyAutomation)).toHaveLength(1)
+    expect(await read(scheduled)).toEqual([])
   })
 
   it("uses base objective keys and sequence cutoff before LIMIT for indexed same-session recall", async () => {
@@ -241,14 +364,15 @@ describe("Root history source scan", () => {
     expect(results).toHaveLength(1)
     expect(queries[1]?.values).toEqual([
       "current-session", "user-a", "current-turn", "300", sameKeys.objectiveDigest,
-      OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, 64,
+      OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, null, 64,
     ])
     const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
     expect(terminalWindow).toContain('turn."sessionId" = $1 AND turn."userId" = $2')
     expect(terminalWindow).toContain('turn."objectiveDigest" = $5')
     expect(terminalWindow).toContain('turn."objectiveIndexSemanticsVersion" = $6')
     expect(terminalWindow).toContain('turn."terminalEventSequence" < $4::bigint')
-    expect(terminalWindow.indexOf('turn."objectiveDigest" = $5')).toBeLessThan(terminalWindow.indexOf("LIMIT $7"))
+    expect(terminalWindow).toContain("CASE WHEN $7::jsonb IS NULL THEN NOT")
+    expect(terminalWindow.indexOf("CASE WHEN $7::jsonb IS NULL")).toBeLessThan(terminalWindow.indexOf("LIMIT $8"))
   })
 
   it("normalizes flat and nested typed requirements into the exact objective digest", async () => {
