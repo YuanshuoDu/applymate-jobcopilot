@@ -103,8 +103,13 @@ export function parseAndBindStructuredResultOutcome<T extends StructuredRole>(
   try { parsed = JSON.parse(value) as unknown } catch (error: unknown) {
     return error instanceof SyntaxError ? invalid("result_shape_invalid") : invalid()
   }
+  let validated: Extract<StructuredRoleResult, { role: T }>
   try {
-    const validated = validateRoleResult(parsed, role)
+    validated = validateRoleResult(parsed, role)
+  } catch (error: unknown) {
+    return invalid(validationFailureCategory(error))
+  }
+  try {
     const normalized = normalizeStructuredResult(validated, index)
     if (!normalized) return invalid("evidence_binding_invalid")
     const rebound = validateRoleResult(normalized, role)
@@ -113,6 +118,6 @@ export function parseAndBindStructuredResultOutcome<T extends StructuredRole>(
     if (Buffer.byteLength(serialized, "utf8") > MAX_EVIDENCE_BYTES) return invalid("result_too_large")
     return { kind: "valid", result: rebound }
   } catch (error: unknown) {
-    return invalid(validationFailureCategory(error))
+    return invalid(error instanceof RoleResultValidationError ? "evidence_binding_invalid" : undefined)
   }
 }

@@ -76,6 +76,15 @@ describe("single-pass structured result outcomes", () => {
       .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
   })
 
+  it("classifies known validation failures after evidence rebinding as binding failures", () => {
+    const index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "jobs.search", { jobs: [{ id: "job-1", source: "greenhouse" }] })
+    index.entries.set("job\u0000job-1", { id: "", kind: "job", ref: "job-1", source: "greenhouse" })
+
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(scoutWithEvidence()), "scout", index))
+      .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
+  })
+
   it("classifies the normalized serialized-size check separately from raw input size", () => {
     const refs = Array.from({ length: 15 }, (_, index) => `job-${index}-${"x".repeat(110)}`)
     const index = createObservedEvidenceIndex()
