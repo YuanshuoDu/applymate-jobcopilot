@@ -101,6 +101,29 @@ describe("objective history projection", () => {
     expect(calls).toHaveLength(1)
   })
 
+  it("binds expected JSONB snapshots as JSON text in comparison and guarded update queries", async () => {
+    const expected = {
+      input: { input: { goal, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } } },
+      source: "user", goal, successCriteria: criteria,
+    }
+    const { client, calls } = clientWith(
+      { rows: [turnRow(expected.input, { goal: expected.goal, successCriteria: expected.successCriteria })], rowCount: 1 },
+      { rowCount: 1 },
+    )
+
+    await expect(projectRootObjectiveHistoryForBackfill(client, identity, expected)).resolves.toMatchObject({
+      kind: "evaluated_indexable",
+    })
+
+    expect(calls[0]?.values).toEqual([
+      identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId,
+      JSON.stringify(expected.input), expected.source, expected.goal, JSON.stringify(expected.successCriteria),
+    ])
+    expect(calls[1]?.values?.slice(7)).toEqual([
+      JSON.stringify(expected.input), expected.source, expected.goal, JSON.stringify(expected.successCriteria),
+    ])
+  })
+
   it("reports an unlinked Root/Turn pair as ineligible and preserves the existing boolean writer API", async () => {
     const { client, calls } = clientWith({ rowCount: 0 }, { rowCount: 0 }, { rowCount: 0 })
 

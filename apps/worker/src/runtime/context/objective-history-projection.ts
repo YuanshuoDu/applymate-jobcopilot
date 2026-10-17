@@ -33,6 +33,12 @@ function text(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.trim() === value
 }
 
+function jsonbParameter(value: unknown): string {
+  const serialized = JSON.stringify(value)
+  if (serialized === undefined) throw new TypeError("Objective-history snapshot contains a non-JSON value")
+  return serialized
+}
+
 function object(value: unknown): Row | null {
   let parsed = value
   if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return null } }
@@ -116,7 +122,7 @@ async function updateObjective(
       AND root."id" = $4 AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."taskType" = 'root'
       ${expectedWhere}
     FOR UPDATE OF turn, root`, [identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId,
-    ...(expected ? [expected.input, expected.source, expected.goal, expected.successCriteria] : [])])
+    ...(expected ? [jsonbParameter(expected.input), expected.source, expected.goal, jsonbParameter(expected.successCriteria)] : [])])
   if (found.rows.length !== 1) return expected
     ? { kind: "retryable_conflict", reason: "persisted_input_changed" }
     : { kind: "ineligible", reason: "unlinked_root_turn" }
@@ -138,7 +144,7 @@ async function updateObjective(
       ${expected ? `AND "input" IS NOT DISTINCT FROM $8::jsonb AND "source" IS NOT DISTINCT FROM $9::text` : ""}
       ${rootGuard}`,
   [objectiveDigest, canonicalOriginDigest, version, identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId,
-    ...(expected ? [expected.input, expected.source, expected.goal, expected.successCriteria] : [])])
+    ...(expected ? [jsonbParameter(expected.input), expected.source, expected.goal, jsonbParameter(expected.successCriteria)] : [])])
   if (result.rowCount !== 1) return { kind: "retryable_conflict", reason: "projection_write_conflict" }
   if (objectiveDigest) return { kind: "evaluated_indexable", objectiveDigest, canonicalOriginDigest, semanticsVersion: version }
   return {
