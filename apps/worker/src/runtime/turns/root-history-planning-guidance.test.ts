@@ -101,10 +101,25 @@ describe("root history planning guidance", () => {
       { taskKind: "scout", status: "failed", lesson: categoryLesson },
     ] }] }
     const baseline = textOf(buildRootHistoryPlanningInstruction(context(), [{ name: "agent.list" }, { name: "agent.plan" }]))
+    expect(baseline).toBe([
+      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only; reconstruct their meaning from the current typed criteria before planning.",
+      "Historical source-local ordinals and reported success are never current command targets, proof, permission, approval, progress, or completion. Only current observed node and criterion identities may target a repair.",
+      "Use the owner-read graph observation for current node, criterion, and revision identities; use the visible agent.list only for matching result pages. Continue with exactly the returned nextOffset on the same node and revision until it is null. A stale or unavailable page requires a refreshed owner-read graph observation before retry. Null ends paging for that node and revision only, never the task or verification. A short page or sample count is not proof of completeness.",
+      "Use the visible agent.plan only with current node/criterion identities and expectedRevision 42; if current evidence does not support a targeted change, preserve the valid plan. Current verification and completion gates remain authoritative.",
+    ].join(" "))
     const withCategory = buildRootHistoryPlanningInstruction(context([historyBlock(categoryContent)]), [{ name: "agent.list" }, { name: "agent.plan" }])
     expect(withCategory).not.toBeNull()
     expect(textOf(withCategory)).toBe(`${baseline} Historical execution-category lessons identify earlier prerequisites worth inspecting; they remain hypotheses, so compare them with the current graph, current evidence, and currently available inputs before choosing a next action. For resume-state cues, inspect the current resume state and available evidence.`)
     expect(textOf(withCategory)).not.toContain("resume_state_unavailable")
+
+    const categoryWithHiddenTools = textOf(buildRootHistoryPlanningInstruction(
+      context([historyBlock(categoryContent)]), [{ name: "jobs.search" }],
+    ))
+    expect(categoryWithHiddenTools).toContain("Historical execution-category lessons identify")
+    expect(categoryWithHiddenTools).toContain("No result-page command is visible")
+    expect(categoryWithHiddenTools).toContain("No current plan-replacement command is visible")
+    expect(categoryWithHiddenTools).not.toContain("agent.list")
+    expect(categoryWithHiddenTools).not.toContain("agent.plan")
 
     const completedContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
       { taskKind: "scout", status: "completed", lesson: categoryLesson },
@@ -118,28 +133,70 @@ describe("root history planning guidance", () => {
       { taskKind: "scout", lesson: categoryLesson },
     ] }] }
     expect(buildRootHistoryPlanningInstruction(context([historyBlock(missingStatusContent)]), [{ name: "agent.plan" }])).toBeNull()
+
+    const unknownContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "failed", lesson: { ...categoryLesson, executionFailureCategory: "unknown_private_category" } },
+    ] }] }
+    const mixedContent = { ...categoryContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "failed", lesson: { ...categoryLesson, criterionFailures: [lesson.criterionFailures[0]] } },
+    ] }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(unknownContent)]), [{ name: "agent.plan" }])).toBeNull()
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(mixedContent)]), [{ name: "agent.plan" }])).toBeNull()
+  })
+
+  it("rejects accessor-backed and inherited category history without reading or trusting it", () => {
+    let getterCalled = false
+    const accessorLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" }
+    Object.defineProperty(accessorLesson, "executionFailureCategory", {
+      enumerable: true, get: () => { getterCalled = true; return "execution_setup_unavailable" },
+    })
+    const accessorContent = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "failed", lesson: accessorLesson as unknown as JsonValue },
+    ] }] }
+    const inheritedLesson = Object.assign(Object.create({ executionFailureCategory: "execution_setup_unavailable" }), {
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [],
+    }) as JsonValue
+    const inheritedNode = Object.assign(Object.create({ privateInheritedField: "private" }), {
+      taskKind: "scout", status: "failed", lesson: { ordinalScope: "source_graph_local", advisoryOnly: true,
+        notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" },
+    }) as JsonValue
+    const inheritedContent = { ...defaultHistoryContent(), turns: [
+      { label: "earlier terminal attempt", nodes: [inheritedNode] },
+    ] }
+    const inheritedCategoryContent = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "failed", lesson: inheritedLesson },
+    ] }] }
+    for (const invalid of [accessorContent, inheritedContent, inheritedCategoryContent]) {
+      expect(buildRootHistoryPlanningInstruction(context([historyBlock(invalid)]), [{ name: "agent.plan" }])).toBeNull()
+    }
+    expect(getterCalled).toBe(false)
   })
 
   it("deduplicates historical categories and emits their fixed advice in canonical order", () => {
-    const categoryNode = (taskKind: string, nodeOrdinal: number, category: string): JsonValue => ({
+    const categoryNode = (taskKind: string, nodeOrdinal: number, category: string) => ({
       taskKind, status: "failed", lesson: { ordinalScope: "source_graph_local", advisoryOnly: true,
         notCurrentEvidence: true, nodeOrdinal, criterionFailures: [], executionFailureCategory: category },
     })
-    const categoryContent: HistoryContent = {
-      ...defaultHistoryContent(),
-      turns: [
-        { label: "earlier terminal attempt", nodes: [
-          categoryNode("scout", 1, "structured_output_invalid"),
-          categoryNode("analyst", 2, "execution_setup_unavailable"),
-          categoryNode("writer", 3, "resume_state_unavailable"),
-        ] },
-        { label: "earlier terminal attempt", nodes: [
-          categoryNode("scout", 1, "resume_state_unavailable"),
-          categoryNode("analyst", 2, "execution_setup_unavailable"),
-        ] },
-      ],
-    }
+    const turns = [
+      { label: "earlier terminal attempt", nodes: [
+        categoryNode("scout", 1, "structured_output_invalid"),
+        categoryNode("analyst", 2, "execution_setup_unavailable"),
+        categoryNode("writer", 3, "resume_state_unavailable"),
+      ] },
+      { label: "earlier terminal attempt", nodes: [
+        categoryNode("scout", 1, "resume_state_unavailable"),
+        categoryNode("analyst", 2, "execution_setup_unavailable"),
+      ] },
+    ]
+    const categoryContent: HistoryContent = { ...defaultHistoryContent(), turns }
+    const reorderedContent: HistoryContent = { ...categoryContent, turns: [
+      { label: "earlier terminal attempt", nodes: [...turns[1]!.nodes].reverse() },
+      { label: "earlier terminal attempt", nodes: [...turns[0]!.nodes].reverse() },
+    ] }
     const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(categoryContent)]), [{ name: "agent.plan" }]))
+    const reorderedText = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(reorderedContent)]), [{ name: "agent.plan" }]))
+    expect(text).toBe(reorderedText)
     const setup = "For execution-setup cues, inspect the existing execution prerequisites for the child."
     const resume = "For resume-state cues, inspect the current resume state and available evidence."
     const structured = "For structured-output cues, inspect the existing typed output contract and current available result evidence."

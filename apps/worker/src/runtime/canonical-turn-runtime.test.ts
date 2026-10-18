@@ -3368,8 +3368,16 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).not.toContain('"minimum":1')
       expect(text).not.toMatch(/execution_setup_unavailable|resume_state_unavailable|structured_output_invalid/)
     }
-    const visibleTools = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
-    expect(visibleTools).toEqual(expect.arrayContaining(["agent.list", "agent.plan"]))
+    for (const [index, request] of requests.entries()) {
+      const stepId = openedRootSteps[index]
+      expect(stepId).toBeDefined()
+      expect(request.metadata).toEqual({
+        sessionId: lease.sessionId, turnId: lease.turnId, stepId, taskId: "root-1", userId: lease.userId,
+        featureId: "agent-harness.turn", traceId: `${lease.turnId}:${stepId}`,
+      })
+      const visibleTools = request.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : [])
+      expect(visibleTools).toEqual(expect.arrayContaining(["agent.list", "agent.plan"]))
+    }
     const finalRequest = requests.at(-1)
     for (const call of calls) {
       expect(finalRequest?.messages.some(message => message.content.some(part => part.type === "tool_result" && part.toolUseId === call.callId))).toBe(true)
