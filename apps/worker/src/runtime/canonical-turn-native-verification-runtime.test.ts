@@ -312,6 +312,38 @@ describe("canonical native verification runtime composition", () => {
     expect(result?.[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
   })
 
+  it("runs a scheduled review-only gate without selected-job mode and keeps its witness private", async () => {
+    const selectedJobCompletion = vi.fn(async () => ({ ok: true as const, witness: { revision: 3, nodes: [] } }))
+    const gate = createCanonicalRootCompletionGate({
+      enabled: true,
+      nativeVerification: { checkCompletion: async () => null, accepted: () => false },
+      onCandidateStart: vi.fn(),
+      checkChildren: async () => ({ ok: true as const }),
+      selectedJobMode: false,
+      selectedJobCompletion,
+    })
+
+    const result = await gate?.({ stepId: "step-scheduled", candidateText: "draft ready" } as never)
+
+    expect(selectedJobCompletion).toHaveBeenCalledOnce()
+    expect(result).toEqual({ ok: true })
+    expect(JSON.stringify(result)).not.toContain("witness")
+  })
+
+  it("preserves a scheduled review-only denial when selected-job mode is false", async () => {
+    const denial = { ok: false as const, blocker: "selected_job_draft_review_required", feedback: "Review required" }
+    const gate = createCanonicalRootCompletionGate({
+      enabled: true,
+      nativeVerification: { checkCompletion: async () => null, accepted: () => false },
+      onCandidateStart: vi.fn(),
+      checkChildren: async () => ({ ok: true as const }),
+      selectedJobMode: false,
+      selectedJobCompletion: async () => denial,
+    })
+
+    await expect(gate?.({ stepId: "step-scheduled", candidateText: "draft ready" } as never)).resolves.toEqual(denial)
+  })
+
   it("signals the third distinct strict root rejection while keeping its key private", async () => {
     const port: NativeVerificationPort = {
       ensureChildren: vi.fn(async () => ({ status: "passed" as const, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] })),

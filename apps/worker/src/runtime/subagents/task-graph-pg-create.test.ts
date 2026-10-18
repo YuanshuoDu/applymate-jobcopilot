@@ -8,6 +8,12 @@ import { parseTaskGraphSnapshot, taskGraphSnapshot } from "./task-graph-snapshot
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { selectVerifiedScheduledDraftCandidate } from "./scheduled-draft-candidate.js"
+
+vi.mock("./scheduled-draft-candidate.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-draft-candidate.js")>()
+  return { ...actual, selectVerifiedScheduledDraftCandidate: vi.fn() }
+})
 
 const analystVerification = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
@@ -838,6 +844,38 @@ describe("createGraphTasks", () => {
     const evidence = context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
     expect(evidence.items[0]).toMatchObject({ dependencyKey: "target", taskStatus: "completed", repairLineage: [{ criterionIds: ["finding-count"] }] })
     expect(evidence.items[0]?.result).toMatchObject({ role: "analyst", findingCount: 1, evidenceCount: 1 })
+  })
+
+  it("rejects a Writer that omits the server-selected 10-point source in favor of its 9-point dependency", async () => {
+    const query = vi.fn(async (_sql: string) => ({ rows: [], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const current: TaskGraphState = { revision: 2, appliedEvents: [], nodes: [10, 9].map(score => ({
+      key: `analyst-${score}`, templateId: "analyst", taskId: `task-${score}`, goal: `Analyze ${score}`,
+      successCriteria: ["Return findings"], dependsOn: [], depth: 1, status: "completed" as const,
+      verificationDisposition: "typed" as const, verification: analystVerification,
+    })) }
+    vi.mocked(selectVerifiedScheduledDraftCandidate).mockResolvedValueOnce({
+      candidate: { jobId: "job-high", score: 10 }, sourceAnalystKeys: ["analyst-10"], witness: {} as never,
+    })
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 2, nodes: [
+        { key: "new-analyst", templateId: "analyst", goal: "Analyze the new batch", successCriteria: ["Return findings"], dependsOn: [], verification: analystVerification },
+        writerReviewNode({ key: "writer", templateId: "cover_letter_writer", dependsOn: ["analyst-9"] }),
+        writerReviewNode({ key: "reviewer", templateId: "cover_letter_reviewer", dependsOn: ["writer"] }),
+      ] },
+      templates: {
+        analyst: { role: "analyst", taskType: "research", allowedActions: [] },
+        cover_letter_writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: [], context: { scheduledDraftMode: true } },
+        cover_letter_reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: [], context: { scheduledDraftMode: true } },
+      },
+    }
+    const parent = { budgetSnapshot: { subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }
+    const priorIds = new Map([["analyst-10", "task-10"], ["analyst-9", "task-9"]])
+    await expect(createGraphTasks(client, input, parent, current, priorIds)).rejects.toMatchObject({ code: "task_graph_scheduled_draft_candidate_dependency_missing" })
+    expect(vi.mocked(selectVerifiedScheduledDraftCandidate).mock.calls[0]?.[4]).toEqual(["analyst-10", "analyst-9"])
+    expect(vi.mocked(selectVerifiedScheduledDraftCandidate).mock.calls[0]?.[6]).toEqual(["new-analyst"])
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
   })
 })
 

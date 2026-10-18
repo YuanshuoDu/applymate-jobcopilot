@@ -121,10 +121,11 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
     const carryGraphSummary = (result: TurnEngineCompletionGateResult) => result.ok && children?.ok && children[TASK_GRAPH_FINAL_SUMMARY_BINDING]
       ? { ...result, [TASK_GRAPH_FINAL_SUMMARY_BINDING]: children[TASK_GRAPH_FINAL_SUMMARY_BINDING] } : result
     if (input.interactiveDiscovery) return carryGraphSummary(await input.interactiveDiscovery())
-    if (!input.selectedJobMode) return children ?? { ok: true }
-    return carryGraphSummary(input.selectedJobCompletion ? await input.selectedJobCompletion() : {
+    if (!input.selectedJobMode && !input.selectedJobCompletion) return children ?? { ok: true }
+    const selectedJob = input.selectedJobCompletion ? await input.selectedJobCompletion() : {
       ok: false, blocker: "selected_job_draft_review_required", feedback: "Selected-job completion verification is unavailable.",
-    })
+    }
+    return carryGraphSummary(selectedJob.ok ? { ok: true } : selectedJob)
   }
   if (input.nativeVerification.resetSemanticProgress) gate[RESET_NATIVE_SEMANTIC_PROGRESS] = input.nativeVerification.resetSemanticProgress
   if (input.readTaskGraphDenialCheckpoint) gate[READ_TASK_GRAPH_DENIAL_CHECKPOINT] = input.readTaskGraphDenialCheckpoint
