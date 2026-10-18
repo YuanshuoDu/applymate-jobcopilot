@@ -156,8 +156,8 @@ describePg("historical discovery result-page PostgreSQL store", () => {
       VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [taskGraphItemId(sourceRootId), sessionId, sourceTurnId, sourceRootId, JSON.stringify(graph)])
     await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
-      VALUES ($1, $2, $3, NULL, $4, 1, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, CURRENT_TIMESTAMP),
-        ($7, $2, $3, NULL, $4, 3, 'turn.failed', 'orchestrator', $3, $8, $9::jsonb, CURRENT_TIMESTAMP)`,
+      VALUES ($1, $2, $3, NULL, $4, 3, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, CURRENT_TIMESTAMP),
+        ($7, $2, $3, NULL, $4, 4, 'turn.failed', 'orchestrator', $3, $8, $9::jsonb, CURRENT_TIMESTAMP)`,
     [`history-page-start-${sourceTurnId}`, sessionId, sourceTurnId, sourceRootId, `turn:${sourceTurnId}:event:turn-started`,
       JSON.stringify({ goal: objective, taskId: sourceRootId, rootTaskId: sourceRootId }), `history-page-terminal-${sourceTurnId}`,
       `turn:${sourceTurnId}:event:turn-failed:task_failed`, JSON.stringify({ turnId: sourceTurnId, taskId: sourceRootId, errorCode: "task_failed", finalItemId: null })])
