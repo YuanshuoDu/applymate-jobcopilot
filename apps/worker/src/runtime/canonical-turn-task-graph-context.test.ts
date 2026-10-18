@@ -14,6 +14,7 @@ import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "./planning/task-graph-verification.js"
 import { taskGraphCurrentVerificationMetadataBytes } from "./canonical-turn-task-graph-verification-context.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./subagents/child-discovery-attempt.js"
 
 const state: TaskGraphCurrentState = {
   revision: 3,
@@ -219,6 +220,27 @@ describe("TaskGraph turn observation", () => {
         status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null,
       }, structuredOutputFailureCategory: category, failureReason: null, resultSummary: null })
     }
+  })
+
+  it("keeps validated discovery-attempt health separate from an unavailable failed result projection", () => {
+    const discoveryAttemptHealth = {
+      schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+      candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
+    }
+    const projected = projectedNode({ ...structuredOutputFailureNode("result_shape_invalid"),
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" }, discoveryAttemptHealth })
+    const malformed = projectedNode({ ...structuredOutputFailureNode("result_shape_invalid"), discoveryAttemptHealth: { ...discoveryAttemptHealth, privateProvider: "secret" } })
+    const untyped = projectedNode({ ...ordinaryFailedNode(), discoveryAttemptHealth })
+
+    expect(projected).toMatchObject({ status: "failed", discoveryAttemptHealth })
+    expect(projected.resultProjection).toEqual({
+      schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable",
+    })
+    expect(JSON.stringify(projected)).not.toContain("attemptCount")
+    expect(JSON.stringify(projected)).not.toContain("privateProvider")
+    expect(malformed).not.toHaveProperty("discoveryAttemptHealth")
+    expect(untyped).not.toHaveProperty("discoveryAttemptHealth")
   })
 
   it("omits unknown, malformed, inherited, accessor, and non-enumerable subtype values", () => {

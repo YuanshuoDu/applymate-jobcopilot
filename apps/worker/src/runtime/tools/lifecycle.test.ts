@@ -354,6 +354,52 @@ describe("ToolLifecycle", () => {
     expect(sink.events[0]?.payload.output).toEqual(result)
   })
 
+  it("publishes the raw validated discovery receipt after persistence even when the event uses a durable ref", async () => {
+    const put = vi.fn(async (_owner: ExecutionOwner, input: { stepId: string; toolCallId: string; value: unknown }) => ({
+      id: "tool-result-discovery-observed", userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: input.stepId,
+      taskId: "root-1", toolCallId: input.toolCallId, sanitizedJson: input.value as never, sha256: "c".repeat(64),
+      byteCount: 9_000, createdAt: new Date(), updatedAt: new Date(),
+    }))
+    const repository = { put, read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const sink = new InMemoryToolLifecycleSink()
+    const observed: Array<{ phase: string; output?: unknown; persistedEventCount: number }> = []
+    const lifecycle = new ToolLifecycle({
+      sink, durableResults: repository, resolveOwner: () => owner, maxEventBytes: 256,
+      onDiscoveryAttemptLifecycleEvent: event => observed.push({ phase: event.phase, ...(event.phase === "started" ? {} : { output: event.output }), persistedEventCount: sink.events.length }),
+    })
+    const callId = "call-discover-observed-ref"
+    const discoveryCall = { ...call, id: callId, toolName: "jobs.discover" }
+    await lifecycle.started(discoveryCall, { targetRoles: ["Engineer"], targetLocations: [] })
+    const rawOutput = {
+      jobs: [discoverJob("x".repeat(600))], evidence: [discoverEvidence()], nextCursor: null, usage: discoverUsage(callId),
+    }
+    const result = await lifecycle.completed(discoveryCall, rawOutput)
+
+    expect(result).toMatchObject({ $ref: "tool-result-discovery-observed" })
+    expect(observed.map(value => value.phase)).toEqual(["started", "completed"])
+    expect(observed.every(value => value.persistedEventCount > 0)).toBe(true)
+    expect(observed[1]?.output).toBe(rawOutput)
+    expect(sink.events.at(-1)?.payload.output).toEqual(result)
+    expect(JSON.stringify(sink.events)).not.toContain("ledger-discover")
+  })
+
+  it("captures only the safe failure detail and cannot let observer errors alter persistence", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const observed: unknown[] = []
+    const lifecycle = new ToolLifecycle({
+      sink,
+      onDiscoveryAttemptLifecycleEvent: event => {
+        observed.push(event)
+        if (event.phase !== "started") throw new Error("observer failure")
+      },
+    })
+    const failure = { usage: discoverUsage(call.id) }
+    await lifecycle.started({ ...call, toolName: "jobs.discover" }, {})
+    await expect(lifecycle.failed({ ...call, toolName: "jobs.discover" }, "failed", "job_discovery_failed", failure)).resolves.toBeDefined()
+    expect(observed).toHaveLength(2)
+    expect(sink.events.at(-1)?.phase).toBe("failed")
+  })
+
   it("uses the 6 KiB resume limit only for jobs.discover lifecycle output", async () => {
     const put = vi.fn(async (_owner: ExecutionOwner, input: { stepId: string; toolCallId: string; value: unknown }) => ({
       id: "tool-result-discover-boundary", userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: input.stepId,
