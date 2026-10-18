@@ -6,15 +6,52 @@ import type { ListSubagentsInput } from "./coordination-tools.js"
 import type { ToolExecutionContext } from "./types.js"
 import { activity } from "./coordination-executor-support.js"
 import { parseTaskGraphResultPage, parseTaskGraphResultPageRequest, type TaskGraphResultPage, type TaskGraphResultPageRequest } from "../subagents/task-graph-result-page-contract.js"
-import type { TaskGraphReadScope } from "../subagents/task-graph-command-port.js"
+import {
+  TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA,
+  parseTaskGraphHistoricalDiscoveryPage,
+  parseTaskGraphHistoricalDiscoveryPageRequest,
+  type TaskGraphHistoricalDiscoveryPage,
+  type TaskGraphHistoricalDiscoveryPageRequest,
+} from "../subagents/task-graph-historical-discovery-page-contract.js"
+import type { TaskGraphCommandPort, TaskGraphExecutionScope, TaskGraphReadScope } from "../subagents/task-graph-command-port.js"
+
+type HistoricalDiscoveryReader = {
+  readHistoricalDiscoveryPage?: (scope: TaskGraphExecutionScope, request: TaskGraphHistoricalDiscoveryPageRequest) => Promise<unknown>
+}
 
 /** Canonical agent.list dispatch keeps legacy input exact and never falls back from a malformed page. */
 export async function executeAgentList(context: ToolExecutionContext, input: unknown, options: CoordinationExecutorOptions): Promise<unknown> {
+  const historicalRequest = parseTaskGraphHistoricalDiscoveryPageRequest(input)
+  if (historicalRequest) return executeHistoricalDiscoveryPage(context, historicalRequest, options)
   const request = parseTaskGraphResultPageRequest(input)
   if (request) return executeTaskGraphResultPage(context, request, options)
   const legacy = parseLegacyListInput(input)
   if (legacy) return executeListSubagents(context, legacy, options)
   throw new CoordinationError("coordination_invalid_input", "Invalid agent.list input")
+}
+
+async function executeHistoricalDiscoveryPage(
+  context: ToolExecutionContext,
+  request: TaskGraphHistoricalDiscoveryPageRequest,
+  options: CoordinationExecutorOptions,
+): Promise<TaskGraphHistoricalDiscoveryPage> {
+  const native = options.nativeCoordination
+  const port = native?.commandPort as (TaskGraphCommandPort & HistoricalDiscoveryReader) | undefined
+  if (!native?.enabled || context.actorRole !== "orchestrator" || !nonempty(context.taskId)
+    || context.taskId !== context.rootTaskId || !port || typeof port.readHistoricalDiscoveryPage !== "function") unavailable()
+  const parentAttemptCount = readParentAttempt(native.parentAttemptCount)
+  const scope = historicalPageReadScope(context, native.turnLeaseOwner, native.turnLeaseVersion, native.parentLeaseOwner, parentAttemptCount)
+  const parsed = parseTaskGraphHistoricalDiscoveryPage(await port.readHistoricalDiscoveryPage(scope, request))
+  if (!parsed) throw new CoordinationError("coordination_task_graph_page_invalid", "Historical TaskGraph discovery page is invalid")
+  if (parsed.availability === "available" && parsed.offset !== request.offset) {
+    throw new CoordinationError("coordination_task_graph_page_invalid", "Historical TaskGraph discovery page is invalid")
+  }
+  const page = parsed.availability === "available" && request.sourceToken !== undefined && parsed.sourceToken !== request.sourceToken
+    ? historicalUnavailable("source_changed") : parsed
+  await activity(context, options, "agent.list_historical_discovery_page", null, {
+    count: page.availability === "available" ? page.items.length : 0, offset: request.offset,
+  })
+  return page
 }
 
 async function executeTaskGraphResultPage(context: ToolExecutionContext, request: TaskGraphResultPageRequest, options: CoordinationExecutorOptions): Promise<TaskGraphResultPage> {
@@ -64,7 +101,20 @@ function pageReadScope(context: ToolExecutionContext, turnLeaseOwner: string, tu
     rootTaskId: context.taskId!, parentTaskId: context.taskId!, turnLeaseOwner, turnLeaseVersion, parentLeaseOwner, parentAttemptCount }
 }
 
+function historicalPageReadScope(context: ToolExecutionContext, turnLeaseOwner: string, turnLeaseVersion: number,
+  parentLeaseOwner: string, parentAttemptCount: number): TaskGraphExecutionScope {
+  if (![context.scope.userId, context.sessionId, context.turnId, context.stepId, turnLeaseOwner, parentLeaseOwner].every(nonempty)
+    || !Number.isSafeInteger(turnLeaseVersion) || turnLeaseVersion < 1) return unavailable()
+  return { userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId,
+    rootTaskId: context.taskId!, parentTaskId: context.taskId!, turnLeaseOwner, turnLeaseVersion, parentLeaseOwner, parentAttemptCount }
+}
+
 function nonempty(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
 function unavailable(): never {
   throw new CoordinationError("coordination_task_graph_page_unavailable", "Current TaskGraph result pages are unavailable")
+}
+
+function historicalUnavailable(reason: "no_source" | "source_changed" | "offset_out_of_range"): TaskGraphHistoricalDiscoveryPage {
+  return { schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "unavailable",
+    observation: "historical_discovery", verificationStatus: "unverified", reason }
 }

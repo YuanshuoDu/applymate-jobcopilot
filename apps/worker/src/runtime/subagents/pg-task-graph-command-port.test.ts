@@ -440,6 +440,16 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(JSON.stringify(fake.calls.map(call => call.values))).not.toContain("PRIVATE_FINAL_TEXT")
   })
 
+  it("exposes historical discovery paging and rejects invalid requests before database access", async () => {
+    const input = scheduleInput()
+    const fake = fakePool(input, { includeReplay: false })
+    const port = createPgTaskGraphCommandPort(fake.pool)
+
+    expect(port.readHistoricalDiscoveryPage).toBeTypeOf("function")
+    await expect(port.readHistoricalDiscoveryPage!(input.scope, { offset: 1 })).rejects.toThrow("task_graph_historical_discovery_request_invalid")
+    expect(fake.calls).toEqual([])
+  })
+
   it("preserves the durable-receipt error when paging a missing current graph", async () => {
     const input = scheduleInput()
     const fake = fakePool(input, { missingGraph: true, persistedPlanReceipt: true })
