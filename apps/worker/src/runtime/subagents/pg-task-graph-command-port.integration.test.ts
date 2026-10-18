@@ -574,6 +574,9 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["agent.plan"]'::jsonb WHERE "id" = $1`, [value.rootTaskId])
 
   const originalSequence = await nextEventSequence(pool, value)
+  await seedReconciliationStep(pool, value, {
+    id: value.originStepId, ordinal: 0, status: "streaming", cursor: originalSequence, consumedInputIds: [value.originalInputId],
+  })
   await seedReconciliationInput(pool, value, {
     id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
     sequence: originalSequence, consumedByStepId: value.originStepId,
@@ -582,9 +585,6 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
     input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
   })])
-  await seedReconciliationStep(pool, value, {
-    id: value.originStepId, ordinal: 0, status: "streaming", cursor: originalSequence, consumedInputIds: [value.originalInputId],
-  })
   await seedReconciliationAgenda(pool, value, {
     id: value.originStepId, sequence: await nextEventSequence(pool, value), cursor: originalSequence, planRevision: 0,
     consumedInputIds: [value.originalInputId],
