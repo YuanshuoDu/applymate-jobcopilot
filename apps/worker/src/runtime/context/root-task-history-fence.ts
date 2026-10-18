@@ -1,8 +1,10 @@
 import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
 import type pg from "pg"
 import type { TurnLease } from "../turns/lease.js"
 import { lockTaskGraphScope, type GraphScope } from "../subagents/task-graph-pg-state.js"
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
+import { isScheduledAutomationTurn, scheduledAutomationCriteria, type ScheduledAutomationCriteria } from "../subagents/scheduled-automation-snapshot.js"
 import { resolveRootTaskObjective, resolveRootTaskVerificationRequirements, rootTaskObjectiveDigest } from "./root-task-objective.js"
 
 type Client = pg.PoolClient
@@ -15,11 +17,15 @@ export type RootTaskHistoryFenceInput = Readonly<{
   stepId: string
   now: Date
   crossSessionRootTaskHistoryEnabled?: boolean
+  objectiveHistoryIndexEnabled?: boolean
 }>
 
 export type RootTaskHistoryFence = Readonly<{
   currentStartSequence: bigint
   objectiveDigest: string
+  scheduledAutomationCriteria?: ScheduledAutomationCriteria
+  objectiveHistoryIndexObjectiveDigest?: string
+  objectiveHistoryIndexCanonicalOriginDigest?: string
   currentStartCreatedAt?: Date
   currentOrigin?: string
 }>
@@ -79,6 +85,7 @@ export function validateRootTaskHistoryFenceInput(input: RootTaskHistoryFenceInp
     || !Number.isSafeInteger(lease.leaseVersion) || lease.leaseVersion < 1 || !text(input.rootTaskId)
     || !Number.isSafeInteger(input.rootAttemptCount) || input.rootAttemptCount < 1 || !text(input.stepId)
     || (input.crossSessionRootTaskHistoryEnabled !== undefined && typeof input.crossSessionRootTaskHistoryEnabled !== "boolean")
+    || (input.objectiveHistoryIndexEnabled !== undefined && typeof input.objectiveHistoryIndexEnabled !== "boolean")
     || !(input.now instanceof Date) || !Number.isFinite(input.now.getTime())) {
     throw new Error("root_task_history_input_invalid")
   }
@@ -108,6 +115,27 @@ export function rootTaskHistoryObjectiveDigest(turnInput: unknown, root: Row, in
     verificationRequirements: requirements.status === "valid"
       ? requirements.requirements.map(({ id, kind, minimum }) => ({ id, kind, minimum })) : null,
   })
+}
+
+/** Derives projection lookup keys from persisted Turn and Root data; projection fields remain locators only. */
+export function rootTaskHistoryIndexKeys(
+  source: unknown,
+  turnInput: unknown,
+  root: Row,
+  includeCrossSession: boolean,
+): Readonly<{ objectiveDigest: string; canonicalOriginDigest?: string }> | undefined {
+  const objectiveDigest = rootTaskHistoryObjectiveDigest(turnInput, root)
+  if (!objectiveDigest) return undefined
+  if (!includeCrossSession) return { objectiveDigest }
+  const crossSessionDigest = rootTaskHistoryObjectiveDigest(turnInput, root, true)
+  const canonicalOrigin = rootTaskHistoryOrigin(source, turnInput)
+  if (!crossSessionDigest || !canonicalOrigin) return undefined
+  return {
+    objectiveDigest,
+    canonicalOriginDigest: createHash("sha256")
+      .update(JSON.stringify({ objectiveDigest: crossSessionDigest, canonicalOrigin }))
+      .digest("hex"),
+  }
 }
 
 async function currentStart(client: Queryable, input: RootTaskHistoryFenceInput): Promise<Readonly<{ sequence: bigint; createdAt?: Date }> | undefined> {
@@ -163,13 +191,23 @@ export async function readRootTaskHistoryFence(
   const currentTurn = turn.rows[0]
   if (turn.rows.length !== 1 || !currentTurn) throw new Error("root_task_history_current_turn_fenced")
   if (hasSelectedJobPreparation(currentTurn.input)) return undefined
+  const scheduledTurn = isScheduledAutomationTurn(currentTurn.source, currentTurn.input)
+  const scheduledCriteria = scheduledTurn ? scheduledAutomationCriteria(currentTurn.input) : undefined
+  if (scheduledTurn && !scheduledCriteria) return undefined
   const currentOrigin = input.crossSessionRootTaskHistoryEnabled ? rootTaskHistoryOrigin(currentTurn.source, currentTurn.input) : undefined
   if (input.crossSessionRootTaskHistoryEnabled && !currentOrigin) return undefined
   const objectiveDigest = rootTaskHistoryObjectiveDigest(currentTurn.input, root, input.crossSessionRootTaskHistoryEnabled === true)
   if (!objectiveDigest) return undefined
+  const indexKeys = input.objectiveHistoryIndexEnabled === true
+    ? rootTaskHistoryIndexKeys(currentTurn.source, currentTurn.input, root, input.crossSessionRootTaskHistoryEnabled === true)
+    : undefined
+  if (input.objectiveHistoryIndexEnabled === true && !indexKeys) return undefined
   const start = await currentStart(client, input)
   return start === undefined ? undefined : {
     currentStartSequence: start.sequence, objectiveDigest,
+    ...(scheduledCriteria ? { scheduledAutomationCriteria: scheduledCriteria } : {}),
+    ...(indexKeys ? { objectiveHistoryIndexObjectiveDigest: indexKeys.objectiveDigest,
+      ...(indexKeys.canonicalOriginDigest ? { objectiveHistoryIndexCanonicalOriginDigest: indexKeys.canonicalOriginDigest } : {}) } : {}),
     ...(input.crossSessionRootTaskHistoryEnabled && start.createdAt ? { currentStartCreatedAt: start.createdAt } : {}),
     ...(currentOrigin ? { currentOrigin } : {}),
   }

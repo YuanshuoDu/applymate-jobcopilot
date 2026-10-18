@@ -1,12 +1,14 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
-import { readRootTaskHistoryFence, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { readRootTaskHistoryFence, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { rootTaskObjectiveDigest } from "./root-task-objective.js"
 
 type Row = Record<string, unknown>
 type Options = Readonly<{
   turnInput?: unknown
+  turnSource?: string
   rootGoal?: string
   rootCriteria?: readonly string[]
   stepAttempt?: number
@@ -44,7 +46,7 @@ function fixture(options: Options = {}) {
       }] }
       if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "source", "input"')) return { rows: [{
         id: "turn-current", sessionId: "session-1", userId: "user-1", rootTaskId: "root-current", status: "in_progress",
-        source: "user",
+        source: options.turnSource ?? "user",
         input: options.turnInput ?? { goal: " Plan a role " },
       }] }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [start()] }
@@ -102,6 +104,49 @@ describe("root task history current fence", () => {
     }
   })
 
+  it("records validated scheduled criteria on the current fence", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "scheduled", scheduledAutomationSnapshot: {
+        schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+        targetRoles: [" Engineer "], targetLocations: ["Dublin"], minScore: 70,
+        dailyCap: 10, requireApproval: true, autoApply: false,
+      } },
+    })
+
+    await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toMatchObject({
+      scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 },
+    })
+  })
+
+  it("returns no history fence for a scheduled Turn with a malformed snapshot", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "scheduled", scheduledAutomationSnapshot: {
+        schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+        targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70,
+        dailyCap: 10, requireApproval: true, autoApply: "false",
+      } },
+    })
+
+    await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toBeUndefined()
+    expect(test.queries.some(sql => sql.includes("turn.started"))).toBe(false)
+  })
+
+  it("keeps manual automation history ordinary even if a scheduled snapshot is malformed", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "wrong" } },
+    })
+
+    const result = await readRootTaskHistoryFence(test.client, test.input)
+
+    expect(result?.scheduledAutomationCriteria).toBeUndefined()
+    expect(result?.objectiveDigest).toBe(rootTaskObjectiveDigest({
+      goal: "Plan a role", criteria: [{ criterionId: "criterion-1", requirement: "Compare roles" }],
+    }))
+  })
+
   it("requires one canonical current Root start receipt", async () => {
     for (const startRows of [[], [start(), { ...start("21"), startEventCount: 2 }], [{ ...start(), actor: "system" }]]) {
       const test = fixture({ startRows })
@@ -131,6 +176,34 @@ describe("root task history current fence", () => {
       .toBe(JSON.stringify(["user", "interactive_discovery_shortlist", 1]))
     expect(rootTaskHistoryOrigin("user", { intent: { kind: "unknown", version: 1 }, input: { goal: "x" } })).toBeUndefined()
     expect(rootTaskHistoryOrigin("user", { intent: supported, input: { goal: "x", intent: { kind: "unknown", version: 1 } } })).toBeUndefined()
+  })
+
+  it("derives projection lookup keys separately while preserving legacy objectiveDigest semantics", async () => {
+    const turnInput = {
+      goal: " Plan a role ", intent: { kind: "interactive_discovery_shortlist", version: 1 },
+      verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1",
+        requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }] },
+    }
+    const test = fixture({ turnInput })
+    const legacy = await readRootTaskHistoryFence(test.client, test.input)
+    const sameSession = await readRootTaskHistoryFence(test.client, { ...test.input, objectiveHistoryIndexEnabled: true })
+    const crossSession = await readRootTaskHistoryFence(test.client, {
+      ...test.input, crossSessionRootTaskHistoryEnabled: true, objectiveHistoryIndexEnabled: true,
+    })
+    const root = { goal: "Plan a role", successCriteria: ["Compare roles"] }
+    const baseDigest = rootTaskHistoryObjectiveDigest(turnInput, root)
+    const crossDigest = rootTaskHistoryObjectiveDigest(turnInput, root, true)
+    const canonicalOrigin = rootTaskHistoryOrigin("user", turnInput)
+    const expectedCanonicalDigest = createHash("sha256")
+      .update(JSON.stringify({ objectiveDigest: crossDigest, canonicalOrigin })).digest("hex")
+
+    expect(sameSession?.objectiveDigest).toBe(legacy?.objectiveDigest)
+    expect(sameSession?.objectiveHistoryIndexObjectiveDigest).toBe(baseDigest)
+    expect(sameSession?.objectiveHistoryIndexCanonicalOriginDigest).toBeUndefined()
+    expect(crossSession?.objectiveDigest).toBe(crossDigest)
+    expect(crossSession?.objectiveHistoryIndexObjectiveDigest).toBe(baseDigest)
+    expect(crossSession?.objectiveHistoryIndexCanonicalOriginDigest).toBe(expectedCanonicalDigest)
+    expect(rootTaskHistoryIndexKeys("user", turnInput, root, true)?.canonicalOriginDigest).toBe(expectedCanonicalDigest)
   })
 
   it("fails closed on invalid origin, malformed start time, or invalid typed requirements only in opt-in mode", async () => {

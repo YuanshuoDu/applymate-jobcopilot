@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool as PgPool } from "pg"
+import { Pool as PgPool, type PoolClient } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
-import { projectRootTaskHistory } from "./root-task-history.js"
+import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
+import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import type { TurnLease } from "../turns/lease.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -26,6 +27,14 @@ function gate() {
   let open!: () => void
   const promise = new Promise<void>(resolve => { open = resolve })
   return { open, promise }
+}
+
+function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error(message)), 10_000) }),
+  ]).finally(() => { if (timeout) clearTimeout(timeout) })
 }
 
 function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonly unknown[]) => Promise<void>): Pick<PgPool, "connect"> {
@@ -73,6 +82,15 @@ const currentStepId = `root-history-current-step-${suffix}`, workerId = `worker-
 const currentStartCreatedAt = new Date("2030-01-01T00:00:00.000Z")
 const objective = "Plan an engineering search"
 const criteria = ["Keep the search within the saved locations"]
+const scheduledSnapshot = (targetRoles: readonly string[], overrides: Record<string, unknown> = {}) => ({
+  schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+  targetRoles, targetLocations: ["Dublin"], minScore: 70,
+  dailyCap: 10, requireApproval: true, autoApply: false, ...overrides,
+})
+
+function scheduledTurnInput(snapshot: unknown) {
+  return { goal: objective, successCriteria: criteria, automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }
+}
 const matching: Source[] = [
   { turnId: `root-history-source-a-${suffix}`, rootTaskId: `root-history-root-a-${suffix}`, childId: `root-history-child-a-${suffix}`,
     finalItemId: `root-history-final-a-${suffix}`, sessionId, userId, goal: objective, criteria, input: { goal: ` ${objective} `, successCriteria: criteria }, startSequence: 1,
@@ -114,6 +132,20 @@ const crossWrongOrigin: Source = { turnId: `root-history-cross-origin-${suffix}`
   sessionId: otherSessionId, userId, goal: objective, criteria,
   input: { goal: objective, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } }, startSequence: 9,
   terminalCreatedAt: new Date("2024-01-01T00:00:00.000Z") }
+const sameSessionUnrelated: Source[] = Array.from({ length: 65 }, (_, index): Source => {
+  const unrelatedObjective = `Unrelated indexed history objective ${index}`
+  return { turnId: `root-history-same-filler-${index}-${suffix}`, rootTaskId: `root-history-same-filler-root-${index}-${suffix}`,
+    childId: `root-history-same-filler-child-${index}-${suffix}`, finalItemId: `root-history-same-filler-final-${index}-${suffix}`,
+    sessionId, userId, goal: unrelatedObjective, criteria, input: { goal: unrelatedObjective, successCriteria: criteria },
+    startSequence: 200 + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, 1, 0, 0, index)) }
+})
+const crossSessionWrongOriginFillers: Source[] = Array.from({ length: 65 }, (_, index): Source => ({
+  turnId: `root-history-cross-filler-${index}-${suffix}`, rootTaskId: `root-history-cross-filler-root-${index}-${suffix}`,
+  childId: `root-history-cross-filler-child-${index}-${suffix}`, finalItemId: `root-history-cross-filler-final-${index}-${suffix}`,
+  sessionId: otherSessionId, userId, goal: objective, criteria,
+  input: { goal: objective, successCriteria: criteria, intent: { kind: "interactive_discovery_shortlist", version: 1 } },
+  startSequence: 200 + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, 1, 0, 0, index)),
+}))
 const archivedSource: Source = { turnId: `root-history-archived-${suffix}`, rootTaskId: `root-history-archived-root-${suffix}`,
   childId: `root-history-archived-child-${suffix}`, finalItemId: `root-history-archived-final-${suffix}`,
   sessionId: archivedSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
@@ -128,7 +160,7 @@ const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, ro
   failureChildren: [{ key: "foreign-user", templateId: "analyst", role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable" }] }
 const future: Source = { turnId: `root-history-future-turn-${suffix}`, rootTaskId: `root-history-future-root-${suffix}`,
   childId: `root-history-future-child-${suffix}`, finalItemId: `root-history-future-final-${suffix}`,
-  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 101,
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 2101,
   terminalCreatedAt: new Date("2031-01-01T00:00:00.000Z") }
 const equalCutoff: Source = { turnId: `root-history-equal-cutoff-${suffix}`, rootTaskId: `root-history-equal-cutoff-root-${suffix}`,
   childId: `root-history-equal-cutoff-child-${suffix}`, finalItemId: `root-history-equal-cutoff-final-${suffix}`,
@@ -242,6 +274,53 @@ async function insertSource(source: Source): Promise<void> {
     JSON.stringify(terminalPayload), terminalCreatedAt])
 }
 
+async function projectSources(sources: readonly Source[]): Promise<void> {
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN")
+    for (const source of sources) {
+      const identity = { userId: source.userId, sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId }
+      const objectiveProjected = await updateRootObjectiveHistoryProjection(client, identity)
+      if (!objectiveProjected) throw new Error(`Objective-history projection failed for ${source.turnId}`)
+      const terminalProjected = await updateRootObjectiveHistoryProjection(client, identity,
+        { terminalEventId: `root-history-terminal-${source.turnId}` })
+      if (!terminalProjected) throw new Error(`Objective-history terminal projection failed for ${source.turnId}`)
+    }
+    await client.query("COMMIT")
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function setObjectiveHistoryIndexReady(ready: boolean): Promise<void> {
+  const result = await pool!.query(`UPDATE "agent_objective_history_index_readiness"
+    SET "isReady" = $1, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "indexName" = $2 AND "semanticsVersion" = $3`,
+  [ready, "agent_turns_objective_history", OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
+  if (result.rowCount !== 1) throw new Error("Objective-history readiness row is missing")
+}
+
+async function updateCurrentTurn(source: string, input: unknown): Promise<void> {
+  await pool!.query(`UPDATE "agent_turns" SET "source" = $2, "input" = $3::jsonb WHERE "id" = $1 AND "sessionId" = $4`,
+    [currentTurnId, source, JSON.stringify(input), sessionId])
+}
+
+async function updateTurnInputJson(turnId: string, inputJson: string): Promise<void> {
+  await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [turnId, inputJson])
+}
+
+async function withObjectiveHistoryIndexReady<T>(run: () => Promise<T>): Promise<T> {
+  await setObjectiveHistoryIndexReady(true)
+  try {
+    return await run()
+  } finally {
+    await setObjectiveHistoryIndexReady(false)
+  }
+}
+
 describePg("direct Root-task history PostgreSQL source validation", () => {
   beforeAll(async () => {
     pool = new PgPool({ connectionString: databaseUrl!, max: 2 })
@@ -249,8 +328,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }
     await insertUser(userId)
     await insertUser(otherUserId)
-    await insertSession(sessionId, userId, 100)
-    await insertSession(otherSessionId, userId, 4)
+    await insertSession(sessionId, userId, 2200)
+    await insertSession(otherSessionId, userId, 500)
     await insertSession(foreignSessionId, otherUserId, 4)
     await insertSession(archivedSessionId, userId, 4)
     await pool.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
@@ -288,13 +367,15 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
     await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
-      VALUES ($1, $2, $3, NULL, $4, 100, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, $7)`,
+      VALUES ($1, $2, $3, NULL, $4, 1000, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, $7)`,
     [`root-history-current-start-${suffix}`, sessionId, currentTurnId, currentRootTaskId,
       `turn:${currentTurnId}:event:turn-started`, JSON.stringify({ goal: objective, taskId: currentRootTaskId, rootTaskId: currentRootTaskId }), currentStartCreatedAt])
+    await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future])
   })
 
   afterAll(async () => {
     if (pool) {
+      await setObjectiveHistoryIndexReady(false).catch(() => undefined)
       await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[userId, otherUserId]]).catch(() => undefined)
       await pool.end()
     }
@@ -396,4 +477,262 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       blocker.release()
     }
   })
+
+  it("finds exact same-session objectives behind more than 64 newer unrelated indexed outcomes", async () => {
+    for (const source of sameSessionUnrelated) await insertSource(source)
+    await projectSources(sameSessionUnrelated)
+    await withObjectiveHistoryIndexReady(async () => {
+      const graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values) => {
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), objectiveHistoryIndexEnabled: true }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      expect(graphLoads).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      const fillerTurnIds = new Set(sameSessionUnrelated.map(source => source.turnId))
+      expect(graphLoads.filter(turnId => fillerTurnIds.has(turnId))).toEqual([])
+    })
+  })
+
+  it("holds readiness through indexed candidate selection while an explicit reset is attempted", async () => {
+    await withObjectiveHistoryIndexReady(async () => {
+      const readinessRead = gate(), continueCandidateSelection = gate()
+      let readinessPaused = false
+      let candidateSql: string | undefined
+      const observed = observeQueries(pool!, async sql => {
+        if (!readinessPaused && sql.includes('FROM "agent_objective_history_index_readiness"')) {
+          readinessPaused = true
+          readinessRead.open()
+          await continueCandidateSelection.promise
+        }
+        if (sql.includes("WITH terminal_window")) candidateSql = sql
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), objectiveHistoryIndexEnabled: true }
+      let reader: Promise<readonly ValidatedRootTaskHistoryOutcome[]> | undefined
+      let resetter: PoolClient | undefined
+      try {
+        reader = createPgDirectRootTaskHistoryStore(observed).load(input)
+        await withTimeout(readinessRead.promise, "readiness row was not read")
+
+        resetter = await pool!.connect()
+        await resetter.query("BEGIN")
+        await resetter.query("SET LOCAL lock_timeout = '1000ms'")
+        let resetError: unknown
+        let resetCommitted = false
+        try {
+          await resetter.query(`UPDATE "agent_objective_history_index_readiness"
+            SET "isReady" = FALSE, "updatedAt" = CURRENT_TIMESTAMP
+            WHERE "indexName" = $1 AND "semanticsVersion" = $2`,
+          ["agent_turns_objective_history", OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
+          await resetter.query("COMMIT")
+          resetCommitted = true
+        } catch (error: unknown) {
+          resetError = error
+          await resetter.query("ROLLBACK").catch(() => undefined)
+        }
+        expect(resetCommitted).toBe(false)
+        expect(errorCode(resetError)).toBe("55P03")
+
+        continueCandidateSelection.open()
+        const history = await withTimeout(reader, "indexed candidate selection did not finish")
+        expect(candidateSql).toContain('FROM "agent_turns" AS turn')
+        expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      } finally {
+        continueCandidateSelection.open()
+        if (resetter) {
+          await resetter.query("ROLLBACK").catch(() => undefined)
+          resetter.release()
+        }
+        if (reader) await reader.catch(() => undefined)
+      }
+    })
+  })
+
+  it("filters more than 64 newer cross-session wrong-origin rows before loading graphs", async () => {
+    for (const source of crossSessionWrongOriginFillers) await insertSource(source)
+    await projectSources(crossSessionWrongOriginFillers)
+    await withObjectiveHistoryIndexReady(async () => {
+      const graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values) => {
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true,
+        objectiveHistoryIndexEnabled: true }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(history.map(item => item.sourceTurnId)).toEqual([
+        crossEqualTimeHigherTurnId.turnId, otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId,
+      ])
+      expect(history.map(item => item.terminalAt?.toISOString())).toEqual([
+        "2022-01-01T00:00:00.000Z", "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
+      ])
+      expect(graphLoads).toEqual(history.map(item => item.sourceTurnId))
+      const fillerTurnIds = new Set(crossSessionWrongOriginFillers.map(source => source.turnId))
+      expect(graphLoads.filter(turnId => fillerTurnIds.has(turnId))).toEqual([])
+      expect(history.some(item => [crossWrongOrigin.turnId, equalCutoff.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
+    })
+  })
+
+  it("keeps matching scheduled history behind malformed and mismatched rows in indexed and legacy windows", async () => {
+    const targetRoles = ["Platform Engineer"]
+    const validSnapshot = scheduledSnapshot(targetRoles)
+    const malformedSameSession: Source[] = Array.from({ length: 65 }, (_, index): Source => ({
+      turnId: `root-history-scheduled-malformed-${index}-${suffix}`, rootTaskId: `root-history-scheduled-malformed-root-${index}-${suffix}`,
+      childId: `root-history-scheduled-malformed-child-${index}-${suffix}`, finalItemId: `root-history-scheduled-malformed-final-${index}-${suffix}`,
+      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      input: scheduledTurnInput(scheduledSnapshot(targetRoles, { autoApply: "false" })),
+      startSequence: 500 + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, 1, 0, 0, index)),
+    }))
+    const mismatchGroup = (dimension: "targetRoles" | "targetLocations" | "minScore", firstSequence: number, day: number): Source[] =>
+      Array.from({ length: 65 }, (_, index): Source => {
+        const roles = dimension === "targetRoles" ? ["Different role"] : targetRoles
+        const overrides = dimension === "targetLocations" ? { targetLocations: ["Berlin"] }
+          : dimension === "minScore" ? { minScore: 71 } : {}
+        return {
+          turnId: `root-history-scheduled-${dimension}-mismatch-${index}-${suffix}`,
+          rootTaskId: `root-history-scheduled-${dimension}-mismatch-root-${index}-${suffix}`,
+          childId: `root-history-scheduled-${dimension}-mismatch-child-${index}-${suffix}`,
+          finalItemId: `root-history-scheduled-${dimension}-mismatch-final-${index}-${suffix}`,
+          sessionId, userId, turnSource: "automation", goal: objective, criteria,
+          input: scheduledTurnInput(scheduledSnapshot(roles, overrides)),
+          startSequence: firstSequence + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, day, 0, 0, index)),
+        }
+      })
+    const mismatchedRoles = mismatchGroup("targetRoles", 800, 2)
+    // Keep each four-event Turn range unique within this session. The earlier
+    // baseline fixture reserves sequences 1101–1104 for its future Turn.
+    const mismatchedLocations = mismatchGroup("targetLocations", 1120, 3)
+    const mismatchedMinScores = mismatchGroup("minScore", 1380, 4)
+    const hugeExponentMalformed: Source = {
+      turnId: `root-history-scheduled-huge-number-${suffix}`, rootTaskId: `root-history-scheduled-huge-number-root-${suffix}`,
+      childId: `root-history-scheduled-huge-number-child-${suffix}`, finalItemId: `root-history-scheduled-huge-number-final-${suffix}`,
+      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      input: scheduledTurnInput(scheduledSnapshot(targetRoles)), startSequence: 760,
+      terminalCreatedAt: new Date("2025-01-01T00:00:01.000Z"),
+    }
+    const matchingSameSession: Source = {
+      turnId: `root-history-scheduled-match-same-${suffix}`, rootTaskId: `root-history-scheduled-match-same-root-${suffix}`,
+      childId: `root-history-scheduled-match-same-child-${suffix}`, finalItemId: `root-history-scheduled-match-same-final-${suffix}`,
+      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      input: scheduledTurnInput(validSnapshot), startSequence: 460, terminalCreatedAt: new Date("2021-01-01T00:00:00.000Z"),
+    }
+    const numericBoundarySnapshot = scheduledSnapshot(targetRoles, { minScore: 100 })
+    const numericBoundaryMatch: Source = {
+      turnId: `root-history-scheduled-number-match-${suffix}`, rootTaskId: `root-history-scheduled-number-match-root-${suffix}`,
+      childId: `root-history-scheduled-number-match-child-${suffix}`, finalItemId: `root-history-scheduled-number-match-final-${suffix}`,
+      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      input: scheduledTurnInput(numericBoundarySnapshot), startSequence: 470,
+      terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
+    }
+    const matchingCrossSession: Source = {
+      turnId: `root-history-scheduled-match-cross-${suffix}`, rootTaskId: `root-history-scheduled-match-cross-root-${suffix}`,
+      childId: `root-history-scheduled-match-cross-child-${suffix}`, finalItemId: `root-history-scheduled-match-cross-final-${suffix}`,
+      sessionId: otherSessionId, userId, turnSource: "automation", goal: objective, criteria,
+      input: scheduledTurnInput(validSnapshot), startSequence: 790, terminalCreatedAt: new Date("2020-01-01T00:00:00.000Z"),
+    }
+    const mismatchedCriteria = [...mismatchedRoles, ...mismatchedLocations, ...mismatchedMinScores]
+    const sources = [...malformedSameSession, ...mismatchedCriteria, hugeExponentMalformed,
+      matchingSameSession, numericBoundaryMatch, matchingCrossSession]
+    await pool!.query(`UPDATE "agent_events" SET "sequence" = 2000 WHERE "id" = $1`, [`root-history-current-start-${suffix}`])
+    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = 3000 WHERE "id" = $1`, [sessionId])
+    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = 2000 WHERE "id" = $1`, [otherSessionId])
+    for (const source of sources) await insertSource(source)
+    const hugeExponentInput = JSON.stringify(hugeExponentMalformed.input).replace('"minScore":70', '"minScore":1e10000')
+    const preciseBoundaryInput = JSON.stringify(numericBoundaryMatch.input)
+      .replace('"minScore":100', '"minScore":100.00000000000000000000000001')
+      .replace('"dailyCap":10', '"dailyCap":10.00000000000000000000000001')
+    await updateTurnInputJson(hugeExponentMalformed.turnId, hugeExponentInput)
+    await updateTurnInputJson(numericBoundaryMatch.turnId, preciseBoundaryInput)
+    await projectSources(sources)
+    await updateCurrentTurn("automation", scheduledTurnInput(validSnapshot))
+
+    try {
+      for (const crossSession of [false, true]) {
+        for (const indexed of [false, true]) {
+          const graphLoads: string[] = []
+          const observed = observeQueries(pool!, async (sql, values) => {
+            if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+          })
+          const input: DirectRootTaskHistoryLoadInput = {
+            lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+            ...(crossSession ? { crossSessionRootTaskHistoryEnabled: true } : {}),
+            ...(indexed ? { objectiveHistoryIndexEnabled: true } : { objectiveHistoryIndexEnabled: false }),
+          }
+          const run = () => createPgDirectRootTaskHistoryStore(observed).load(input)
+          const history = indexed ? await withObjectiveHistoryIndexReady(run) : await run()
+          const expected = crossSession ? [matchingSameSession.turnId, matchingCrossSession.turnId] : [matchingSameSession.turnId]
+          expect(new Set(history.map(item => item.sourceTurnId))).toEqual(new Set(expected))
+          expect(graphLoads).toEqual(history.map(item => item.sourceTurnId))
+          const rejectedIds = new Set([...malformedSameSession, ...mismatchedCriteria, hugeExponentMalformed].map(source => source.turnId))
+          expect(graphLoads.some(turnId => rejectedIds.has(turnId))).toBe(false)
+        }
+      }
+
+      await updateCurrentTurn("automation", scheduledTurnInput(numericBoundarySnapshot))
+      for (const crossSession of [false, true]) {
+        for (const indexed of [false, true]) {
+          const graphLoads: string[] = []
+          const observed = observeQueries(pool!, async (sql, values) => {
+            if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+          })
+          const input: DirectRootTaskHistoryLoadInput = {
+            lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+            ...(crossSession ? { crossSessionRootTaskHistoryEnabled: true } : {}),
+            ...(indexed ? { objectiveHistoryIndexEnabled: true } : { objectiveHistoryIndexEnabled: false }),
+          }
+          const run = () => createPgDirectRootTaskHistoryStore(observed).load(input)
+          const history = indexed ? await withObjectiveHistoryIndexReady(run) : await run()
+          expect(history.map(item => item.sourceTurnId)).toEqual([numericBoundaryMatch.turnId])
+          expect(graphLoads).toEqual([numericBoundaryMatch.turnId])
+        }
+      }
+    } finally {
+      await updateCurrentTurn("user", { goal: objective, successCriteria: criteria })
+    }
+
+    const manualSource: Source = {
+      turnId: `root-history-manual-source-${suffix}`, rootTaskId: `root-history-manual-root-${suffix}`,
+      childId: `root-history-manual-child-${suffix}`, finalItemId: `root-history-manual-final-${suffix}`,
+      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      input: { goal: objective, successCriteria: criteria, automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "invalid" } },
+      startSequence: 490, terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
+    }
+    const legacyAutomationSource: Source = {
+      turnId: `root-history-legacy-automation-source-${suffix}`, rootTaskId: `root-history-legacy-automation-root-${suffix}`,
+      childId: `root-history-legacy-automation-child-${suffix}`, finalItemId: `root-history-legacy-automation-final-${suffix}`,
+      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      input: { goal: objective, successCriteria: criteria }, startSequence: 495,
+      terminalCreatedAt: new Date("2022-01-02T00:00:00.000Z"),
+    }
+    await insertSource(manualSource)
+    await insertSource(legacyAutomationSource)
+    await projectSources([manualSource, legacyAutomationSource])
+    await updateCurrentTurn("automation", { goal: objective, successCriteria: criteria, automationRunMode: "manual" })
+    try {
+      const legacyHistory = await createPgDirectRootTaskHistoryStore(pool!).load({
+        lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+        objectiveHistoryIndexEnabled: false,
+      })
+      expect(legacyHistory.map(item => item.sourceTurnId)).toContain(manualSource.turnId)
+      expect(legacyHistory.map(item => item.sourceTurnId)).toContain(legacyAutomationSource.turnId)
+      const indexedHistory = await withObjectiveHistoryIndexReady(() => createPgDirectRootTaskHistoryStore(pool!).load({
+        lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+        objectiveHistoryIndexEnabled: true,
+      }))
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(manualSource.turnId)
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(legacyAutomationSource.turnId)
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(matching[0]!.turnId)
+      expect(indexedHistory.map(item => item.sourceTurnId)).toContain(matching[1]!.turnId)
+      const scheduledTurnIds = new Set([...malformedSameSession, ...mismatchedCriteria, hugeExponentMalformed,
+        matchingSameSession, numericBoundaryMatch, matchingCrossSession].map(source => source.turnId))
+      expect(indexedHistory.some(item => scheduledTurnIds.has(item.sourceTurnId))).toBe(false)
+    } finally {
+      await updateCurrentTurn("user", { goal: objective, successCriteria: criteria })
+    }
+  }, 30_000)
 })
