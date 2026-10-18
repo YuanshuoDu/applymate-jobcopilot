@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA, type TaskGraphResultPage } from "../subagents/task-graph-result-page-contract.js"
-import { isTaskGraphResultPageLike, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
+import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "../subagents/task-graph-historical-discovery-page-contract.js"
+import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 
 const numericUuid = "00000000-0000-4000-8000-000000000000"
 const page: TaskGraphResultPage = {
@@ -46,6 +47,23 @@ describe("TaskGraph result-page lifecycle redaction", () => {
 
   it("classifies malformed page markers for the fail-closed agent.list lifecycle path", () => {
     expect(isTaskGraphResultPageLike({ schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, email: "secret@example.com" })).toBe(true)
+    expect(isTaskGraphResultPageLike({ observation: "historical_discovery", sourceToken: "not-a-token" })).toBe(true)
     expect(isTaskGraphResultPageLike({ tasks: [] })).toBe(false)
+  })
+
+  it("validates historical input and restores only the closed page token and canonical job IDs", () => {
+    const sourceToken = "b".repeat(64)
+    const request = { mode: "historical_discovery", offset: 0 }
+    expect(prepareAgentListLifecycleInput(request, 1024).pageRequest).toBe(true)
+    expect(prepareAgentListLifecycleInput({ ...request, taskId: "forged" }, 1024).safeInput).toBe("[invalid agent.list input]")
+    const historical = {
+      schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+      observation: "historical_discovery", verificationStatus: "unverified", sourceToken,
+      sourceResultStatus: "completed", offset: 0, nextOffset: null, totalCount: 1, truncated: false,
+      items: [{ jobId: numericUuid }],
+    }
+    expect(prepareTaskGraphResultPageOutput(historical).safe).toEqual(historical)
+    expect(() => prepareTaskGraphResultPageOutput({ ...historical, evidence: [{ jobId: numericUuid }] })).toThrow()
+    expect(() => prepareTaskGraphResultPageOutput({ ...historical, sourceToken: "forged" })).toThrow()
   })
 })

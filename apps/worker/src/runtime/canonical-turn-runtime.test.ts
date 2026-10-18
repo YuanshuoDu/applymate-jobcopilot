@@ -29,6 +29,7 @@ import type { TreeBudgetReservationStore } from "./subagents/tree-budget-types.j
 import type { SubagentLease } from "./subagents/types.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphResultPageRequest } from "./subagents/task-graph-result-page-contract.js"
+import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./subagents/task-graph-historical-discovery-page-contract.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { priorConversation } from "./canonical-steering-markers.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
@@ -3189,6 +3190,156 @@ describe("createCanonicalTurnRuntime", () => {
     expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
     expect(readCurrentResultPage).toHaveBeenCalledTimes(5)
     expect(requests).toHaveLength(6)
+  })
+
+  it("keeps terminal Scout pages advisory across Root steps and requires a fresh ordinary Scout jobs.get read", async () => {
+    const historicalJobIds = [
+      "00000000-0000-4000-8000-000000000101", "00000000-0000-4000-8000-000000000102",
+      "00000000-0000-4000-8000-000000000103", "00000000-0000-4000-8000-000000000104",
+    ]
+    const sourceToken = "d".repeat(64)
+    const historicalPage = (offset: number): TaskGraphHistoricalDiscoveryPage => ({
+      schemaVersion: "agent-harness.v2.task-graph.historical-discovery-page.v1", trust: "untrusted", availability: "available",
+      observation: "historical_discovery", verificationStatus: "unverified", sourceToken, sourceResultStatus: "partial",
+      offset, nextOffset: offset === 0 ? 3 : null, totalCount: historicalJobIds.length, truncated: false,
+      items: historicalJobIds.slice(offset, offset + 3).map(jobId => ({ jobId })),
+    })
+    const historyReads: Array<{ scope: Parameters<NonNullable<TaskGraphCommandPort["readHistoricalDiscoveryPage"]>>[0]; request: TaskGraphHistoricalDiscoveryPageRequest }> = []
+    const activityClient = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT 1 FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      readHistoricalDiscoveryPage: vi.fn(async (scope, request) => {
+        historyReads.push({ scope, request })
+        return historicalPage(request.offset)
+      }),
+    }
+    const denialCheckpoint = { schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: "root-1", graphRevision: 0, verificationDigest: "e".repeat(64) }
+    const checkCompletion = vi.fn(async () => {
+      const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Current typed evidence is still required." }
+      Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: denialCheckpoint })
+      return denial
+    })
+    const roots = { ...rootStore(), checkCompletion }
+    const requests: HarnessModelRequest[] = []
+    const events: RuntimeEvent[] = []
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(activityPool as never), {
+      workerId: lease.ownerId,
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.get", "jobs.search"] } },
+      stateLoader: async () => ({ ...state(), budgetSnapshot: { limits: { maxSteps: 8 } }, toolPolicySnapshot: {} }),
+      rootTaskStore: roots as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      turnEngineStoreFactory: () => store(events),
+      contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          if (requests.length === 1) {
+            yield { type: "tool_call_completed", callId: "history-first-page", name: "agent.list", arguments: { mode: "historical_discovery", offset: 0 } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (requests.length === 2) {
+            const prior = request.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-first-page")
+            if (!prior || prior.type !== "tool_result") throw new Error("historical_first_page_lifecycle_result_missing")
+            const first = JSON.parse(prior.content) as { nextOffset?: unknown; sourceToken?: unknown }
+            if (first.nextOffset !== 3 || first.sourceToken !== sourceToken) throw new Error("historical_page_binding_missing")
+            yield { type: "tool_call_completed", callId: "history-next-page", name: "agent.list", arguments: {
+              mode: "historical_discovery", offset: first.nextOffset, sourceToken: first.sourceToken,
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "These historical IDs are unverified leads; the current TaskGraph still needs a fresh Scout read." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
+    expect(historyReads.map(read => read.request)).toEqual([
+      { mode: "historical_discovery", offset: 0 },
+      { mode: "historical_discovery", offset: 3, sourceToken },
+    ])
+    expect(new Set(historyReads.map(read => read.scope.stepId)).size).toBe(2)
+    expect(historyReads.every(read => read.scope.rootTaskId === "root-1" && read.scope.parentTaskId === "root-1"
+      && read.scope.userId === lease.userId && read.scope.sessionId === lease.sessionId && read.scope.turnId === lease.turnId)).toBe(true)
+    expect(requests[1]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-first-page"))
+      .toMatchObject({ type: "tool_result", content: expect.stringContaining(historicalJobIds[0]!) })
+    const pageResult = requests[1]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-first-page")
+    expect(pageResult && pageResult.type === "tool_result" ? JSON.parse(pageResult.content) : null).toMatchObject({
+      trust: "untrusted", observation: "historical_discovery", verificationStatus: "unverified",
+    })
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(checkCompletion).toHaveBeenCalled()
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed" }) }))
+    expect(roots.finish).not.toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
+
+    const freshScoutLease: SubagentLease = {
+      id: "subagent-12345678-1234-4234-9234-123456789012", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+      rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/scout-refresh", depth: 1, role: "scout", taskType: "job_discovery",
+      status: "running", goal: "Refresh one historical lead through the current job read", constraints: [], successCriteria: ["Return the current canonical job evidence"],
+      allowedActions: ["jobs.get"], context: {}, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+      modelProfileSnapshot: { provider: "fixture", model: "fixture" }, result: null, failureReason: null,
+      attemptCount: 1, maxAttempts: 1, leaseOwner: "child-worker", leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
+      interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId: "child-worker", signal: new AbortController().signal,
+    }
+    const refreshedJobId = historicalJobIds[0]!
+    const freshReadInputs: unknown[] = []
+    const freshScoutRequests: HarnessModelRequest[] = []
+    const freshResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId: refreshedJobId, source: "greenhouse", url: null, evidenceIds: [`read:job:${refreshedJobId}`] }],
+      evidence: [{ id: `read:job:${refreshedJobId}`, kind: "job", ref: refreshedJobId, source: "greenhouse" }],
+      summary: "Current jobs.get read completed.",
+    }
+    const getTool = {
+      schemaVersion, name: "jobs.get", version: "1", description: "Read one current job record",
+      capabilities: ["read"] as const, inputSchema: Type.Object({ jobId: Type.String() }),
+      outputSchema: Type.Object({ job: Type.Object({ id: Type.String(), source: Type.String() }) }),
+      risk: "read" as const, domain: "jobs" as const, idempotency: "read_only" as const,
+      timeoutMs: 1_000, requiredCapabilities: ["read"],
+    } satisfies ChildPublicDefinition
+    const childModel: ModelAdapter = {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        freshScoutRequests.push(request)
+        if (freshScoutRequests.length === 1) {
+          yield { type: "tool_call_completed", callId: "fresh-scout-jobs-get", name: "jobs.get", arguments: { jobId: refreshedJobId } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: JSON.stringify(freshResult) }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const executeFreshScout = createChildExecutor({
+      store: childExecutionStore(), treeBudget: childBudgetStore(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => childModel,
+      toolRuntimeFactory: () => ({ definitions: [getTool], validateArguments: () => true,
+        router: { execute: async (_context, request) => {
+          freshReadInputs.push(request.input)
+          return { ...request, status: "completed", output: { job: { id: refreshedJobId, source: "greenhouse" } }, errorCode: null }
+        } },
+      }),
+    })
+    const freshScoutOutcome = await executeFreshScout({ lease: freshScoutLease })
+    expect(freshReadInputs).toEqual([{ jobId: refreshedJobId }])
+    expect(freshScoutOutcome).toMatchObject({ status: "completed", result: { structuredResult: freshResult } })
   })
 
   it("fails page mode closed without an optional page port while keeping explicit legacy agent.list available", async () => {

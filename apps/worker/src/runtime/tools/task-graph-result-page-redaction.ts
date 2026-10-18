@@ -1,12 +1,15 @@
 import { types as nodeTypes } from "node:util"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { parseTaskGraphResultPage, parseTaskGraphResultPageRequest } from "../subagents/task-graph-result-page-contract.js"
+import { parseTaskGraphHistoricalDiscoveryPage, parseTaskGraphHistoricalDiscoveryPageRequest, type TaskGraphHistoricalDiscoveryPage } from "../subagents/task-graph-historical-discovery-page-contract.js"
 import { prepareLifecycleValue, prepareSafeValue, sanitizeLifecyclePreview, type PreparedLifecycleValue } from "./redaction.js"
 
-const PAGE_KEYS = new Set(["schemaVersion", "trust", "availability", "graphRevision", "reason", "role", "taskStatus", "resultStatus", "totalCount", "evidenceCount", "offset", "nextOffset", "items"])
+const PAGE_KEYS = new Set(["schemaVersion", "trust", "availability", "graphRevision", "reason", "role", "taskStatus", "resultStatus", "totalCount", "evidenceCount", "offset", "nextOffset", "items", "observation", "verificationStatus", "sourceToken", "sourceResultStatus", "truncated"])
 const INVALID_AGENT_LIST_INPUT = "[invalid agent.list input]"
 
 export function prepareAgentListLifecycleInput(value: unknown, maxBytes: number): { pageRequest: boolean; safeInput: unknown } {
+  const historicalRequest = parseTaskGraphHistoricalDiscoveryPageRequest(value)
+  if (historicalRequest) return { pageRequest: true, safeInput: sanitizeLifecyclePreview(historicalRequest, maxBytes) }
   const request = parseTaskGraphResultPageRequest(value)
   if (request) return { pageRequest: true, safeInput: sanitizeLifecyclePreview(request, maxBytes) }
   const legacy = safeLegacyListInput(value)
@@ -38,6 +41,8 @@ function safeLegacyListInput(value: unknown): { includeTerminal?: boolean } | nu
 
 /** Redacts the complete strict envelope, then restores only canonical item job IDs. */
 export function prepareTaskGraphResultPageOutput(value: unknown): PreparedLifecycleValue {
+  const historicalPage = parseTaskGraphHistoricalDiscoveryPage(value)
+  if (historicalPage) return prepareHistoricalDiscoveryPageOutput(historicalPage)
   const page = parseTaskGraphResultPage(value)
   if (!page) throw new Error("invalid_page")
   const redacted = prepareLifecycleValue(page)
@@ -54,6 +59,26 @@ export function prepareTaskGraphResultPageOutput(value: unknown): PreparedLifecy
   })
   const restored = prepareSafeValue({ ...safePage, items } as RepositoryJsonValue)
   if (!parseTaskGraphResultPage(restored.safe)) throw new Error("invalid_redaction")
+  return restored
+}
+
+function prepareHistoricalDiscoveryPageOutput(page: TaskGraphHistoricalDiscoveryPage): PreparedLifecycleValue {
+  const redacted = prepareLifecycleValue(page)
+  if (page.availability === "unavailable") {
+    if (!parseTaskGraphHistoricalDiscoveryPage(redacted.safe)) throw new Error("invalid_redaction")
+    return redacted
+  }
+  const safePage = plainRecord(redacted.safe)
+  const safeItems = safePage ? denseArray(safePage.items) : null
+  const rootKeys = "availability,items,nextOffset,observation,offset,schemaVersion,sourceResultStatus,sourceToken,totalCount,truncated,trust,verificationStatus"
+  if (!safePage || Object.keys(safePage).sort().join(",") !== rootKeys || !safeItems || safeItems.length !== page.items.length) throw new Error("invalid_redaction")
+  const items = safeItems.map((item, index) => {
+    const row = plainRecord(item)
+    if (!row || Object.keys(row).sort().join(",") !== "jobId") throw new Error("invalid_redaction")
+    return { jobId: page.items[index]!.jobId }
+  })
+  const restored = prepareSafeValue({ ...safePage, sourceToken: page.sourceToken, items } as RepositoryJsonValue)
+  if (!parseTaskGraphHistoricalDiscoveryPage(restored.safe)) throw new Error("invalid_redaction")
   return restored
 }
 

@@ -5,6 +5,7 @@ import { ToolRegistry } from "./registry.js"
 import { ToolSchemaValidator } from "./schema-validator.js"
 import { createCoordinationTools } from "./coordination-tools.js"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA } from "../subagents/task-graph-result-page-contract.js"
+import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "../subagents/task-graph-historical-discovery-page-contract.js"
 import type { CoordinationStore } from "./coordination-types.js"
 
 const options = {
@@ -145,6 +146,10 @@ describe("coordination tool definitions", () => {
     expect(listDescription).toContain("stale or unavailable, refresh current state")
     expect(listDescription).toContain("Never invent offsets, silently switch modes")
     expect(listDescription).toContain("verification proof")
+    expect(listDescription).toContain("historical_discovery")
+    expect(listDescription).toContain("fresh ordinary Scout must read each through jobs.get")
+    expect(listDescription).toContain("truncated=false does not establish historical search completeness")
+    expect(listDescription).toContain("Never supply old Turn/task/node IDs")
     const spawnDescription = registry.resolve("agent.spawn", "1").description
     const followupDescription = registry.resolve("agent.followup", "1").description
     expect(spawnDescription).toContain("eight-node lifetime cap separate from active-child concurrency")
@@ -176,6 +181,30 @@ describe("coordination tool definitions", () => {
       schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 2,
       role: "scout", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
       offset: 0, nextOffset: null, items: [{ jobId: "00000000-0000-4000-8000-000000000000", source: "other", evidenceKinds: ["job"] }],
+    }
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, page, "agent.list output")).not.toThrow()
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()
+  })
+
+  it("accepts only the source-bound historical discovery mode on agent.list", () => {
+    const definitions = createCoordinationTools(options)
+    const registry = new ToolRegistry(definitions)
+    const token = "a".repeat(64)
+    expect(registry.validateArguments("agent.list", { mode: "historical_discovery", offset: 0 })).toBe(true)
+    expect(registry.validateArguments("agent.list", { mode: "historical_discovery", offset: 0, sourceToken: token })).toBe(true)
+    expect(registry.validateArguments("agent.list", { mode: "historical_discovery", offset: 3, sourceToken: token })).toBe(true)
+    for (const invalid of [
+      { mode: "historical_discovery", offset: 3 }, { mode: "historical_discovery", offset: 0, sourceToken: "forged" },
+      { mode: "historical_discovery", offset: 0, sourceToken: token, turnId: "old-turn" },
+      { mode: "historical_discovery", offset: 0, sourceToken: token, taskId: "old-task" },
+      { mode: "historical_discovery", offset: 0, sourceToken: token, nodeKey: "old-node" },
+    ]) expect(registry.validateArguments("agent.list", invalid)).not.toBe(true)
+    expect(registry.validateArguments("list_subagents", { mode: "historical_discovery", offset: 0 })).not.toBe(true)
+    const page = {
+      schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+      observation: "historical_discovery", verificationStatus: "unverified", sourceToken: token,
+      sourceResultStatus: "completed", offset: 0, nextOffset: null, totalCount: 1, truncated: false,
+      items: [{ jobId: "00000000-0000-4000-8000-000000000000" }],
     }
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, page, "agent.list output")).not.toThrow()
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()

@@ -16,6 +16,7 @@ import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } fro
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
 import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
+import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-history-result-page-store.js"
 import { BudgetExceededError } from "../budget.js"
 import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 
@@ -23,6 +24,7 @@ const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
 
 export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCommandPort {
+  const historicalDiscovery = createPgRootTaskHistoryResultPageStore(pool)
   return {
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
       return transaction(pool, client => schedule(client, input))
@@ -69,6 +71,7 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async readCurrentResultPage(scope, request) {
       return transaction(pool, client => readCurrentResultPageWithClient(client, scope, request))
     },
+    readHistoricalDiscoveryPage(scope, request) { return historicalDiscovery.read(scope, request) },
     readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
   }
 }

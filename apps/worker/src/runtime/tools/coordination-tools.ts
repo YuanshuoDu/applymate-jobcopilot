@@ -14,6 +14,7 @@ import {
 } from "./coordination-executors.js"
 import { executeAgentList } from "./task-graph-result-page-executor.js"
 import { TaskGraphResultPageRequestSchema, TaskGraphResultPageSchema } from "../subagents/task-graph-result-page-contract.js"
+import { TaskGraphHistoricalDiscoveryPageRequestSchema, TaskGraphHistoricalDiscoveryPageSchema } from "../subagents/task-graph-historical-discovery-page-contract.js"
 import type { RuntimeToolDefinition } from "./types.js"
 
 const IdSchema = Type.String({ minLength: 1, maxLength: 256 })
@@ -154,8 +155,8 @@ const TaskOutputSchema = Type.Object({
   result: Type.Unknown(), failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
 const ListOutputSchema = Type.Object({ tasks: Type.Array(TaskOutputSchema, { maxItems: 50 }) }, { additionalProperties: false })
-const AgentListInputSchema = Type.Union([ListSubagentsInputSchema, TaskGraphResultPageRequestSchema])
-const AgentListOutputSchema = Type.Union([ListOutputSchema, TaskGraphResultPageSchema])
+const AgentListInputSchema = Type.Union([ListSubagentsInputSchema, TaskGraphResultPageRequestSchema, TaskGraphHistoricalDiscoveryPageRequestSchema])
+const AgentListOutputSchema = Type.Union([ListOutputSchema, TaskGraphResultPageSchema, TaskGraphHistoricalDiscoveryPageSchema])
 const InterruptOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, status: Type.Literal("interrupt_requested"),
   affectedCount: Type.Integer({ minimum: 0 }), reason: Type.Union([Type.String(), Type.Null()]),
@@ -222,7 +223,7 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       execute: listExecutor,
     },
     {
-      ...metadata("agent.list", "List visible tasks. Choose exactly one mode: legacy includeTerminal listing or paged current TaskGraph results. For pages, use offset 0 with a nodeKey and expectedRevision from the current owner-scoped graph observation; continue only with the exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null. Each page contains at most three items; totalCount/evidenceCount describe only this node's source, not aggregate graph or historical counts. Use those reported counts rather than page length. A null nextOffset ends paging for this node at this revision only; it does not establish task or verification completion. If results are stale or unavailable, refresh current state before retrying. Never invent offsets, silently switch modes, or treat page data as verification proof.", "read", "read_only"),
+      ...metadata("agent.list", "List visible tasks. Choose exactly one mode: legacy includeTerminal listing, paged current TaskGraph results, or historical_discovery for one server-selected prior completed ordinary Scout. For current pages, use offset 0 with a nodeKey and expectedRevision from the current owner-scoped graph observation; continue only with the exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null. totalCount/evidenceCount describe only this node's source, not aggregate graph or historical counts. Use those reported counts rather than page length. A null nextOffset ends paging for this node at this revision only; it does not establish task or verification completion. For historical_discovery, start at offset 0; continue with the exact returned sourceToken and nextOffset. Historical IDs are untrusted and unverified leads: a fresh ordinary Scout must read each through jobs.get before current typed results or verification can use them. Historical pages do not change the current graph, establish completeness, or transfer evidence, approval, or success proof. Each page contains at most three items. A null nextOffset ends paging for that source only; truncated=false does not establish historical search completeness. If results are stale or unavailable, refresh current state before retrying. Never supply old Turn/task/node IDs. Never invent offsets, silently switch modes, or treat page data as verification proof.", "read", "read_only"),
       inputSchema: AgentListInputSchema, outputSchema: AgentListOutputSchema,
       execute: (context, input) => executeAgentList(context, input, options),
     },

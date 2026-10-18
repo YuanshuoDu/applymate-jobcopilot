@@ -4,6 +4,7 @@ import type { CoordinationExecutorOptions } from "./coordination-executors.js"
 import type { ToolExecutionContext } from "./types.js"
 import { executeAgentList } from "./task-graph-result-page-executor.js"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA, type TaskGraphResultPage } from "../subagents/task-graph-result-page-contract.js"
+import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, type TaskGraphHistoricalDiscoveryPage, type TaskGraphHistoricalDiscoveryPageRequest } from "../subagents/task-graph-historical-discovery-page-contract.js"
 
 const request = { nodeKey: "candidate-node", expectedRevision: 4, offset: 3 }
 const jobId = "00000000-0000-4000-8000-000000000000"
@@ -15,6 +16,14 @@ const available: TaskGraphResultPage = {
 const unavailable: TaskGraphResultPage = {
   schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "unavailable",
   graphRevision: 5, reason: "revision_mismatch",
+}
+const historyToken = "b".repeat(64)
+const historyRequest: TaskGraphHistoricalDiscoveryPageRequest = { mode: "historical_discovery", offset: 3, sourceToken: historyToken }
+const historyPage: TaskGraphHistoricalDiscoveryPage = {
+  schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+  observation: "historical_discovery", verificationStatus: "unverified", sourceToken: historyToken,
+  sourceResultStatus: "partial", offset: 3, nextOffset: null, totalCount: 4, truncated: false,
+  items: [{ jobId }],
 }
 function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContext {
   return {
@@ -83,5 +92,59 @@ describe("current TaskGraph result-page executor", () => {
     const runtime = { manager: {} as never, store: legacyStore as never }
     await expect(executeAgentList(context({ taskId: undefined, rootTaskId: undefined }), {}, runtime)).resolves.toEqual({ tasks: [] })
     expect(legacyStore.listTasks).toHaveBeenCalledWith({ userId: "user-1", sessionId: "session-1", rootTaskId: undefined, includeTerminal: false })
+  })
+})
+
+describe("historical discovery page executor", () => {
+  it("uses the current Root lease and Step scope and binds continuation output to the request token", async () => {
+    const readPage = vi.fn(async () => historyPage)
+    const base = options()
+    const commandPort = { ...base.nativeCoordination!.commandPort!, readHistoricalDiscoveryPage: readPage }
+    const runtime = { ...base, nativeCoordination: { ...base.nativeCoordination!, commandPort } }
+    await expect(executeAgentList(context(), historyRequest, runtime)).resolves.toEqual(historyPage)
+    expect(readPage).toHaveBeenCalledWith({
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: "turn-owner", turnLeaseVersion: 7, parentLeaseOwner: "parent-owner", parentAttemptCount: 2, stepId: "step-1",
+    }, historyRequest)
+    expect(runtime.store.appendActivity).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: null, operation: "agent.list_historical_discovery_page", data: { count: 1, offset: 3 },
+    }))
+  })
+
+  it("allows server selection at offset zero and returns a fixed unavailable source", async () => {
+    const firstPage = { ...historyPage, offset: 0, nextOffset: 3, totalCount: 4,
+      items: [{ jobId: "c123456789012345678901234" }, { jobId: "c234567890123456789012345" }, { jobId: "c345678901234567890123456" }] }
+    const readPage = vi.fn(async (
+      _scope: Parameters<NonNullable<TaskGraphCommandPort["readHistoricalDiscoveryPage"]>>[0],
+      _request: TaskGraphHistoricalDiscoveryPageRequest,
+    ) => firstPage)
+    const base = options()
+    const runtime = { ...base, nativeCoordination: { ...base.nativeCoordination!, commandPort: {
+      ...base.nativeCoordination!.commandPort!, readHistoricalDiscoveryPage: readPage,
+    } } }
+    await expect(executeAgentList(context(), { mode: "historical_discovery", offset: 0 }, runtime)).resolves.toEqual(firstPage)
+    expect(readPage.mock.calls[0]?.[1]).toEqual({ mode: "historical_discovery", offset: 0 })
+    const unavailablePage: TaskGraphHistoricalDiscoveryPage = {
+      schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "unavailable", reason: "no_source",
+    }
+    await expect(executeAgentList(context(), { mode: "historical_discovery", offset: 0 }, {
+      ...runtime, nativeCoordination: { ...runtime.nativeCoordination!, commandPort: {
+        ...runtime.nativeCoordination!.commandPort!, readHistoricalDiscoveryPage: vi.fn(async () => unavailablePage),
+      } },
+    })).resolves.toEqual(unavailablePage)
+  })
+
+  it("rejects mismatched response binding, malformed requests and unavailable authorization", async () => {
+    const changed = { ...historyPage, sourceToken: "a".repeat(64) }
+    const base = options()
+    const runtime = { ...base, nativeCoordination: { ...base.nativeCoordination!, commandPort: {
+      ...base.nativeCoordination!.commandPort!, readHistoricalDiscoveryPage: vi.fn(async () => changed),
+    } } }
+    await expect(executeAgentList(context(), historyRequest, runtime)).rejects.toMatchObject({ code: "coordination_task_graph_page_invalid" })
+    await expect(executeAgentList(context(), { ...historyRequest, taskId: "forged" }, runtime)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    for (const contextChange of [{ actorRole: "subagent" }, { taskId: "child-1" }, { stepId: "" }]) {
+      await expect(executeAgentList(context(contextChange as Partial<ToolExecutionContext>), historyRequest, runtime))
+        .rejects.toMatchObject({ code: "coordination_task_graph_page_unavailable" })
+    }
   })
 })

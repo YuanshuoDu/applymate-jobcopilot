@@ -11,6 +11,7 @@ import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphN
 import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
 import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
@@ -218,4 +219,6 @@ export type TaskGraphCommandPort = Readonly<{
   readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads one bounded advisory page from the current owner-fenced graph. */
   readCurrentResultPage?(scope: TaskGraphReadScope, request: TaskGraphResultPageRequest): Promise<TaskGraphResultPage>
+  /** Reads one server-selected advisory page from a same-objective terminal Scout source. */
+  readHistoricalDiscoveryPage?(scope: TaskGraphReadScope & Readonly<{ stepId: string }>, request: TaskGraphHistoricalDiscoveryPageRequest): Promise<TaskGraphHistoricalDiscoveryPage>
 }>
