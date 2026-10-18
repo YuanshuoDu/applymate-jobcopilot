@@ -11,12 +11,12 @@ const mockState = vi.hoisted(() => ({
 }))
 
 vi.mock("./objective-history-projection.js", () => ({
-  OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION: 1,
+  OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION: 2,
   isValidRootObjectiveHistoryTerminalReceipt: vi.fn(async () => mockState.terminalSuccess),
   projectRootObjectiveHistoryForBackfill: vi.fn(async (_client: unknown, identity: { turnId: string }, expected?: unknown) => {
     if (expected) mockState.snapshots.push(expected)
     const outcome = mockState.outcomes.get(identity.turnId) ?? {
-      kind: "evaluated_indexable", objectiveDigest: "a".repeat(64), canonicalOriginDigest: null, semanticsVersion: 1,
+      kind: "evaluated_indexable", objectiveDigest: "a".repeat(64), canonicalOriginDigest: null, semanticsVersion: 2,
     }
     if (outcome.kind === "evaluated_indexable" || outcome.kind === "evaluated_unindexable") mockState.pending.delete(identity.turnId)
     return outcome
@@ -106,11 +106,16 @@ describe("objective history backfill bounds", () => {
     await expect(backfillObjectiveHistoryProjection(first.pool, { batchSize: 1, maxBatches: 2 })).resolves.toMatchObject({
       batches: 2, evaluated: 2, capped: true, ready: false,
     })
+    const firstReadinessWrite = first.calls.find(call => call.sql.includes('"agent_objective_history_index_readiness"'))
+    expect(firstReadinessWrite?.sql).toContain('INSERT INTO "agent_objective_history_index_readiness"')
+    expect(firstReadinessWrite?.sql).toContain('ON CONFLICT ("indexName", "semanticsVersion")')
+    expect(firstReadinessWrite?.values).toEqual([false, "agent_turns_objective_history", 2])
 
     const resumed = await backfillObjectiveHistoryProjection(first.pool, { batchSize: 1, maxBatches: 2 })
     expect(resumed).toMatchObject({ batches: 1, evaluated: 1, capped: false, verificationFailed: false, ready: true,
       transactions: 3, workTransactions: 2, verificationBatches: 1 })
-    expect(first.calls.filter(call => call.sql.includes('"isReady" = $1')).map(call => call.values?.[0])).toEqual([false, false, true])
+    const readinessWrites = first.calls.filter(call => call.sql.includes('"agent_objective_history_index_readiness"'))
+    expect(readinessWrites.map(call => call.values?.[0])).toEqual([false, false, true])
     const finalVerifierBegin = first.calls.map(call => call.sql).lastIndexOf("BEGIN")
     const isolation = first.calls.findIndex(call => call.sql === "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
     const statementTimeout = first.calls.findIndex(call => call.sql === "SET LOCAL statement_timeout = '20000ms'")

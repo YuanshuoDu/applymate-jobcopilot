@@ -295,12 +295,32 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   }
 }
 
+async function deleteSourceFixtures(sources: readonly Source[]): Promise<void> {
+  if (!sources.length) return
+  const client = await pool!.connect(), turnIds = sources.map(source => source.turnId)
+  try {
+    await client.query("BEGIN")
+    await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+      AND "parentTaskId" IS NOT NULL`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+      AND "parentTaskId" IS NULL`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query("COMMIT")
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
 async function setObjectiveHistoryIndexReady(ready: boolean): Promise<void> {
-  const result = await pool!.query(`UPDATE "agent_objective_history_index_readiness"
-    SET "isReady" = $1, "updatedAt" = CURRENT_TIMESTAMP
-    WHERE "indexName" = $2 AND "semanticsVersion" = $3`,
+  const result = await pool!.query(`INSERT INTO "agent_objective_history_index_readiness" ("indexName", "semanticsVersion", "isReady")
+    VALUES ($2, $3, $1) ON CONFLICT ("indexName", "semanticsVersion")
+    DO UPDATE SET "isReady" = $1, "updatedAt" = CURRENT_TIMESTAMP`,
   [ready, "agent_turns_objective_history", OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
-  if (result.rowCount !== 1) throw new Error("Objective-history readiness row is missing")
+  if (result.rowCount !== 1) throw new Error("Objective-history readiness row could not be written")
 }
 
 async function updateCurrentTurn(source: string, input: unknown): Promise<void> {
@@ -495,6 +515,46 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       const fillerTurnIds = new Set(sameSessionUnrelated.map(source => source.turnId))
       expect(graphLoads.filter(turnId => fillerTurnIds.has(turnId))).toEqual([])
     })
+  })
+
+  it("filters changed typed contracts before the indexed limit and keeps fallback recall bounded", async () => {
+    const requirements = (candidateMinimum: number, reverse = false) => {
+      const rows = [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: candidateMinimum } },
+        { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+      ]
+      return { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: reverse ? rows.reverse() : rows }
+    }
+    const currentInput = { goal: objective, successCriteria: criteria, verificationRequirements: requirements(2) }
+    const base = (suffix: string, startSequence: number, value: unknown): Source => ({
+      turnId: `root-history-contract-${suffix}-${suffix === "old" ? "old" : "current"}-${randomUUID()}`,
+      rootTaskId: `root-history-contract-root-${randomUUID()}`, childId: `root-history-contract-child-${randomUUID()}`,
+      finalItemId: `root-history-contract-final-${randomUUID()}`, sessionId, userId, goal: objective, criteria,
+      input: { goal: objective, successCriteria: criteria, verificationRequirements: value }, startSequence,
+    })
+    const exactOld = base("match", 600, requirements(2, true))
+    const exactRecent = base("match", 960, requirements(2))
+    const changed = Array.from({ length: 65 }, (_, index) => base(`changed-${index}`, 700 + index * 4, requirements(3)))
+    const sources = [exactOld, ...changed, exactRecent]
+    const originalInput = { goal: objective, successCriteria: criteria }
+
+    await updateCurrentTurn("user", currentInput)
+    try {
+      for (const source of sources) await insertSource(source)
+      await projectSources(sources)
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), objectiveHistoryIndexEnabled: true }
+
+      const indexed = await withObjectiveHistoryIndexReady(() => createPgDirectRootTaskHistoryStore(pool!).load(input))
+      expect(indexed.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId, exactOld.turnId])
+
+      const fallback = await createPgDirectRootTaskHistoryStore(pool!).load({ ...input, objectiveHistoryIndexEnabled: false })
+      expect(fallback.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId])
+      expect(fallback.some(item => changed.some(source => source.turnId === item.sourceTurnId))).toBe(false)
+    } finally {
+      try { await updateCurrentTurn("user", originalInput) }
+      finally { await deleteSourceFixtures(sources) }
+    }
   })
 
   it("holds readiness through indexed candidate selection while an explicit reset is attempted", async () => {

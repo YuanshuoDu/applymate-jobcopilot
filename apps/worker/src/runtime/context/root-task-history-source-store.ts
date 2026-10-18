@@ -2,6 +2,12 @@ import type pg from "pg"
 import { hasSelectedJobPreparation, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
 import { isScheduledAutomationTurn, sameScheduledAutomationCriteria, scheduledAutomationCriteria, scheduledAutomationHistoryCompatibilitySql } from "../subagents/scheduled-automation-snapshot.js"
+import {
+  isHistoryReceiptText as text,
+  parseHistoryReceiptSequence as sequence,
+  validateHistoryStartReceipt as validStart,
+  validateHistoryTerminalReceipt as validTerminal,
+} from "./root-task-history-terminal-receipts.js"
 
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
@@ -14,68 +20,6 @@ export type RootTaskHistoryCandidate = Readonly<{
   terminalSequence: bigint
   terminalAt?: Date
 }>
-
-function text(value: unknown): value is string {
-  return typeof value === "string" && !!value.trim() && value.trim() === value
-}
-
-function object(value: unknown): Row | null {
-  let parsed = value
-  if (typeof parsed === "string") {
-    try { parsed = JSON.parse(parsed) as unknown } catch { return null }
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
-  try {
-    const prototype = Object.getPrototypeOf(parsed)
-    return prototype === Object.prototype || prototype === null ? parsed as Row : null
-  } catch { return null }
-}
-
-function sequence(value: unknown): bigint | undefined {
-  if (typeof value !== "string" && typeof value !== "bigint") return undefined
-  try { const parsed = BigInt(value); return parsed > 0n ? parsed : undefined } catch { return undefined }
-}
-
-function validStart(row: Row, turnId: string, rootTaskId: string): bigint | undefined {
-  const payload = object(row.startPayload), value = sequence(row.startSequence)
-  return Number(row.startEventCount) === 1 && row.startTurnId === turnId && row.startTaskId === rootTaskId
-    && row.startItemId === null && row.startType === "turn.started" && row.startActor === "orchestrator"
-    && row.startCorrelationId === turnId && row.startIdempotencyKey === `turn:${turnId}:event:turn-started`
-    && payload?.taskId === rootTaskId && payload.rootTaskId === rootTaskId ? value : undefined
-}
-
-function validTerminal(row: Row, turnId: string, rootTaskId: string, status: string, startSequence: bigint): bigint | undefined {
-  const payload = object(row.terminalPayload), value = sequence(row.terminalSequence)
-  if (!payload || !value || Number(row.terminalEventCount) !== 1 || row.terminalTurnId !== turnId
-    || row.terminalTaskId !== rootTaskId || row.terminalActor !== "orchestrator"
-    || payload.turnId !== turnId || payload.taskId !== rootTaskId) return undefined
-  const prefix = `turn:${turnId}:event:`
-  if (status === "completed") {
-    const stepPayload = object(row.terminalStepEventPayload), stepSequence = sequence(row.terminalStepEventSequence)
-    const exactStepPayload = !!stepPayload && Object.keys(stepPayload).sort().join(",") === "status,stepId,taskId"
-    return row.terminalType === "turn.completed" && text(payload.finalItemId) && row.terminalItemId === payload.finalItemId
-      && text(row.terminalCorrelationId) && row.terminalStepId === row.terminalCorrelationId
-      && row.terminalStepSessionId === row.sessionId && row.terminalStepTurnId === turnId
-      && row.terminalStepTaskId === rootTaskId && row.terminalStepStatus === "completed"
-      && Number(row.terminalStepEventCount) === 1 && row.terminalStepEventSessionId === row.sessionId
-      && row.terminalStepEventTurnId === turnId && row.terminalStepEventTaskId === rootTaskId
-      && row.terminalStepEventItemId === null && row.terminalStepEventType === "step.completed"
-      && row.terminalStepEventActor === "orchestrator" && row.terminalStepEventCorrelationId === row.terminalStepId
-      && row.terminalStepEventIdempotencyKey === `${prefix}step-completed:${row.terminalStepId}`
-      && stepSequence !== undefined && stepSequence > startSequence && stepSequence < value
-      && exactStepPayload && stepPayload?.stepId === row.terminalStepId && stepPayload.status === "completed" && stepPayload.taskId === rootTaskId
-      && row.terminalIdempotencyKey === `${prefix}turn-completed` ? value : undefined
-  }
-  if (status === "failed") {
-    return row.terminalType === "turn.failed" && text(payload.errorCode)
-      && (payload.finalItemId === null || text(payload.finalItemId)) && row.terminalItemId === payload.finalItemId
-      && row.terminalCorrelationId === turnId
-      && row.terminalIdempotencyKey === `${prefix}turn-failed:${payload.errorCode}` ? value : undefined
-  }
-  return status === "interrupted" && row.terminalType === "turn.interrupted" && text(payload.errorCode)
-    && row.terminalItemId === null && row.terminalCorrelationId === turnId
-    && row.terminalIdempotencyKey === `${prefix}turn-interrupted` ? value : undefined
-}
 
 function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHistoryFence, indexed = false): RootTaskHistoryCandidate | undefined {
   const turnId = row.turnId, rootTaskId = row.taskRootTaskId
@@ -100,7 +44,7 @@ function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHi
     || (!crossSession && terminal >= fence.currentStartSequence)
     || (crossSession && (!fence.currentStartCreatedAt || !terminalAt
       || terminalAt.getTime() >= fence.currentStartCreatedAt.getTime()))
-    || rootTaskHistoryObjectiveDigest(row.input, { goal: row.goal, successCriteria: row.successCriteria }, crossSession) !== fence.objectiveDigest) return undefined
+    || rootTaskHistoryObjectiveDigest(row.input, { goal: row.goal, successCriteria: row.successCriteria }) !== fence.objectiveDigest) return undefined
   if (indexed) {
     const keys = rootTaskHistoryIndexKeys(row.turnSource, row.input, { goal: row.goal, successCriteria: row.successCriteria }, crossSession)
     if (!keys || row.turnObjectiveDigest !== keys.objectiveDigest

@@ -51,16 +51,16 @@ describe("objective history projection", () => {
       intent: { kind: "interactive_discovery_shortlist", version: 1 } } }
     const root = { goal, successCriteria: criteria }
     const origin = rootTaskHistoryOrigin("user", input)!
-    const crossSessionDigest = rootTaskHistoryObjectiveDigest(input, root, true)!
+    const objectiveDigest = rootTaskHistoryObjectiveDigest(input, root)!
     const expectedOriginDigest = createHash("sha256")
-      .update(JSON.stringify({ objectiveDigest: crossSessionDigest, canonicalOrigin: origin })).digest("hex")
+      .update(JSON.stringify({ objectiveDigest, canonicalOrigin: origin })).digest("hex")
     const { client, calls } = clientWith({ rows: [turnRow(input)], rowCount: 1 }, { rowCount: 1 })
 
     await expect(updateRootObjectiveHistoryProjection(client, identity)).resolves.toBe(true)
 
     expect(calls[0]?.sql).toContain("FOR UPDATE OF turn, root")
     expect(calls[1]?.values).toEqual([
-      rootTaskHistoryObjectiveDigest(input, root, false), expectedOriginDigest, 1,
+      objectiveDigest, expectedOriginDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
       identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId,
     ])
     expect(calls[1]?.sql).not.toContain("terminalEvent")
@@ -153,13 +153,13 @@ describe("objective history projection", () => {
     expect(calls).toHaveLength(3)
   })
 
-  it("keeps the same-session key but leaves cross-session indexing unavailable for invalid verification requirements", async () => {
+  it("leaves both same-session and cross-session indexing unavailable for invalid requirements", async () => {
     const input = { goal, successCriteria: criteria, verificationRequirements: { schemaVersion: "unknown", requirements: [] } }
     const { client, calls } = clientWith({ rows: [turnRow(input)], rowCount: 1 }, { rowCount: 1 })
 
     await expect(updateRootObjectiveHistoryProjection(client, identity)).resolves.toBe(true)
 
-    expect(calls[1]?.values).toEqual([rootTaskHistoryObjectiveDigest(input, { goal, successCriteria: criteria }), null, 1,
+    expect(calls[1]?.values).toEqual([null, null, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
       identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId])
   })
 

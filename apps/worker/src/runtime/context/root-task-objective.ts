@@ -158,8 +158,11 @@ function parseObjectiveRequirements(value: unknown): readonly RootTaskVerificati
 }
 
 function requirementsEqual(left: readonly RootTaskVerificationRequirement[], right: readonly RootTaskVerificationRequirement[]): boolean {
-  return left.length === right.length && left.every((requirement, index) => {
-    const other = right[index]
+  const byId = (a: RootTaskVerificationRequirement, b: RootTaskVerificationRequirement) =>
+    a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+  const canonicalLeft = [...left].sort(byId), canonicalRight = [...right].sort(byId)
+  return canonicalLeft.length === canonicalRight.length && canonicalLeft.every((requirement, index) => {
+    const other = canonicalRight[index]
     return requirement.id === other?.id && requirement.kind === other.kind && requirement.minimum === other.minimum
   })
 }
