@@ -9,7 +9,8 @@ import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from 
 import type { PgSubagentPool } from "./types.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
-import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
@@ -17,6 +18,10 @@ import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey, COGN
 import type { StepContext } from "../context/step-context-builder.js"
 import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
 import { checkTaskGraphTerminalVerification } from "../turns/turn-execution-completion-gate.js"
+import { executionKey } from "../turns/turn-execution-types.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { readSteeringReconciliationHistory } from "./steering-reconciliation-history.js"
+import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION } from "./steering-reconciliation-contract.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -373,6 +378,201 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
       await pool!.query(`UPDATE "agent_turns" SET "input" = '{}'::jsonb WHERE "id" = $1`, [ids.turn])
       await pool!.query(`UPDATE "agent_steps" SET "status" = 'streaming', "completedAt" = NULL WHERE "id" = $1`, [ids.step])
       await pool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [ids.root, JSON.stringify(originalActions)])
+    }
+  }, 60_000)
+
+  it("retains the scoped typed supersession relation after graph compaction and reload", async () => {
+    const local = {
+      user: `supersession-user-${suffix}`, session: `supersession-session-${suffix}`,
+      turn: `supersession-turn-${suffix}`, root: `supersession-root-${suffix}`,
+      step: `supersession-step-${suffix}`, turnOwner: `supersession-turn-owner-${suffix}`,
+      parentOwner: `supersession-parent-owner-${suffix}`,
+      source: `supersession-source-${suffix}`, replacement: `supersession-replacement-${suffix}`,
+    }
+    const localScope: TaskGraphNativeCommandInput["scope"] = {
+      userId: local.user, sessionId: local.session, turnId: local.turn, rootTaskId: local.root, parentTaskId: local.root,
+      stepId: local.step, turnLeaseOwner: local.turnOwner, turnLeaseVersion: 1,
+      parentLeaseOwner: local.parentOwner, parentAttemptCount: 1,
+    }
+    const graphItemId = taskGraphItemId(local.root), sourceKey = "stale-scout", replacementKey = "fresh-scout"
+    const steeringInputId = `supersession-steer-${suffix}`, callId = `supersession-plan-${suffix}`
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } as const
+    const sourceNode = { key: sourceKey, taskId: local.source, templateId: "scout", goal: "Find roles",
+      successCriteria: ["Return evidence"], dependsOn: [], depth: 1, verificationDisposition: "typed", verification }
+    const replacement = { key: replacementKey, taskId: local.replacement, templateId: "scout", goal: "Find revised roles",
+      successCriteria: ["Return fresh evidence"], dependsOn: [], depth: 1, verificationDisposition: "typed", verification }
+    const proposalNode = { key: replacementKey, templateId: "scout", goal: replacement.goal,
+      successCriteria: replacement.successCriteria, dependsOn: [], verification }
+    const callInput = { expectedRevision: 1, replaceUnstarted: { nodeKey: sourceKey }, nodes: [proposalNode] }
+    const operationKey = steeringReconciliationIdempotencyKey(localScope, callId)
+    if (!operationKey) throw new Error("supersession fixture could not derive its operation key")
+    const replacementFingerprint = taskGraphSupersessionFingerprint({ nodeKey: sourceKey, taskId: local.source }, {
+      expectedRevision: 1, replaceUnstartedNodeKey: sourceKey, nodes: [proposalNode],
+    })
+    const sourceContent = { schemaVersion: "agent-harness.v2.task-graph", nodes: [sourceNode] }
+    const finalContent = { schemaVersion: "agent-harness.v2.task-graph", nodes: [replacement] }
+    const cancellationId = `supersession-cancel-${suffix}`, planEventId = `supersession-plan-event-${suffix}`
+    let seededUser = false
+
+    const nextSequence = async (): Promise<string> => {
+      const updated = await pool!.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+        WHERE "id" = $1 RETURNING "eventSequence"`, [local.session])
+      const sequence = updated.rows[0]?.eventSequence
+      if (sequence === undefined) throw new Error("supersession fixture could not allocate an event sequence")
+      return String(sequence)
+    }
+    const insertEvent = async (event: {
+      id: string; sequence: string; itemId: string | null; taskId: string | null; type: string; actor: string;
+      correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown;
+    }): Promise<void> => {
+      await pool!.query(`INSERT INTO "agent_events"
+        ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`, [event.id, local.session, local.turn,
+        event.itemId, event.taskId, event.sequence, event.type, event.actor, event.correlationId, event.causationId,
+        event.idempotencyKey, JSON.stringify(event.payload)])
+    }
+    const insertOutbox = async (eventId: string, event: Record<string, unknown>): Promise<void> => {
+      await pool!.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+        VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb)`, [`supersession-outbox-${eventId}`, local.session,
+        `agent-event:${eventId}`, JSON.stringify(event)])
+    }
+
+    try {
+      await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [local.user, `${local.user}@example.invalid`])
+      seededUser = true
+      await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+        VALUES ($1, $2, 'supersession regression', 'running', 'test', CURRENT_TIMESTAMP)`, [local.session, local.user])
+      await pool!.query(`INSERT INTO "agent_turns"
+        ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+         "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+        VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+          $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
+      [local.turn, local.session, local.user, local.turnOwner])
+      await pool!.query(`INSERT INTO "sub_agent_tasks"
+        ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+         "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+         "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+        VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'supersession regression',
+          '[]'::jsonb, '[]'::jsonb, '["agent.plan","agent.followup","jobs.search"]'::jsonb, '{}'::jsonb, '{}'::jsonb,
+          '{}'::jsonb, '{}'::jsonb, '{"subagentPolicy":{"maxConcurrency":4,"maxDepth":4,"maxFanOut":4,"maxAttempts":2}}'::jsonb,
+          1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`, [local.root, local.session, local.turn, local.parentOwner])
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [local.root])
+      await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [local.root, local.turn])
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 1, $5::jsonb, '{}'::jsonb)`,
+      [local.step, local.session, local.turn, local.root, JSON.stringify([steeringInputId])])
+      await pool!.query(`INSERT INTO "sub_agent_tasks"
+        ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+         "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "result", "modelProfileSnapshot",
+         "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+        VALUES ($1, $2, $3, $4, $4, '/root/stale-scout', 1, 'scout', 'research', 'cancelled', $5, '[]'::jsonb, $6::jsonb,
+          '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, NULL, '{}'::jsonb, '{}'::jsonb,
+          '{"subagentPolicy":{"maxDepth":4,"maxFanOut":4,"maxAttempts":2}}'::jsonb, 0, 2, CURRENT_TIMESTAMP),
+          ($7, $2, $3, $4, $4, '/root/fresh-scout', 1, 'scout', 'research', 'queued', $8, '[]'::jsonb, $9::jsonb,
+          '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, NULL, '{}'::jsonb, '{}'::jsonb,
+          '{"subagentPolicy":{"maxDepth":4,"maxFanOut":4,"maxAttempts":2}}'::jsonb, 0, 2, CURRENT_TIMESTAMP)`,
+      [local.source, local.session, local.turn, local.root, sourceNode.goal, JSON.stringify(sourceNode.successCriteria),
+        local.replacement, replacement.goal, JSON.stringify(replacement.successCriteria)])
+      await pool!.query(`INSERT INTO "agent_items"
+        ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'task_graph', 'streaming', NULL, 3, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [graphItemId, local.session, local.turn, local.step, local.root, JSON.stringify(finalContent)])
+
+      const agendaContext: StepContext = { schemaVersion: "agent-harness.v2", sessionId: local.session, turnId: local.turn,
+        stepId: local.step, inputThroughSequence: 1n, consumedInputIds: [steeringInputId], canonicalJson: "{}", blocks: [], taskGraphRevision: 1 }
+      const agenda = buildCognitiveAgendaReceipt({ sessionId: local.session, turnId: local.turn, taskId: local.root,
+        stepId: local.step, inputThroughSequence: 1n, consumedInputIds: [steeringInputId],
+        agenda: { ...buildCognitiveActionAgenda(agendaContext), planRevision: 1 } })
+      if (!agenda) throw new Error("supersession fixture agenda was invalid")
+      await insertEvent({ id: `supersession-agenda-${suffix}`, sequence: await nextSequence(), itemId: null, taskId: local.root,
+        type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "orchestrator", correlationId: local.step, causationId: null,
+        idempotencyKey: `cognitive.agenda:${local.step}`, payload: agenda })
+
+      const callItemId = `supersession-call-item-${suffix}`
+      await pool!.query(`INSERT INTO "agent_items"
+        ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "startedAt", "createdAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [callItemId, local.session, local.turn, local.step, local.root, JSON.stringify({
+        toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input: callInput,
+      })])
+      const executionIdentity = { kind: "turn" as const, userId: local.user, sessionId: local.session, turnId: local.turn,
+        taskId: local.root, rootTaskId: local.root, ownerId: local.turnOwner, leaseVersion: 1, leaseExpiresAt: new Date(0) }
+      const toolSequence = await nextSequence()
+      await insertEvent({ id: `${callId}-started`, sequence: toolSequence, itemId: callItemId, taskId: local.root,
+        type: "tool_call.started", actor: "orchestrator", correlationId: callId, causationId: null,
+        idempotencyKey: `${executionKey(executionIdentity)}:event:tool-started:${callId}`,
+        payload: { taskId: local.root, toolCallId: callId, toolName: "agent.plan" } })
+
+      const cancellationSequence = await nextSequence(), planSequence = await nextSequence()
+      const cancellationKey = taskGraphLifecycleKey(local.root, sourceKey, 0, "task.cancelled")
+      const relation = {
+        schemaVersion: "agent-harness.v2.task-graph-supersession.v2", operationKey, observedRevision: 1,
+        cancellationRevision: 2, resultingRevision: 3,
+        source: { nodeKey: sourceKey, taskId: local.source }, replacement: { nodeKey: replacementKey, taskId: local.replacement },
+        cancellationEvent: { id: cancellationId, sequence: cancellationSequence },
+        planEvent: { id: planEventId, sequence: planSequence, idempotencyKey: taskGraphSupersessionProposalKey(local.root, 1) },
+        replacementFingerprint,
+        agentPlanCall: { callId, stepId: local.step, expectedRevision: 1, replaceUnstarted: { nodeKey: sourceKey } },
+      }
+      const cancellationPayload = { kind: "lifecycle", revision: 2,
+        event: { type: "task.cancelled", nodeKey: sourceKey, expectedRevision: 1, idempotencyKey: cancellationKey },
+        item: { id: graphItemId, sessionId: local.session, turnId: local.turn, taskId: local.root, type: "task_graph", revision: 2, content: sourceContent } }
+      const planPayload = { kind: "proposal", observedRevision: 1, operationKey, fingerprint: replacementFingerprint,
+        revision: 3, receipt: { status: "accepted", revision: 3,
+          nodes: [{ key: replacementKey, taskId: local.replacement, status: "queued" }], readyTaskIds: [local.replacement] }, content: finalContent,
+        item: { id: graphItemId, sessionId: local.session, turnId: local.turn, taskId: local.root, type: "task_graph", revision: 3, content: finalContent } }
+      const cancellationRow = { eventId: cancellationId, sessionId: local.session, turnId: local.turn, itemId: graphItemId,
+        taskId: local.source, sequence: cancellationSequence, type: "item.delta", actor: "system", correlationId: local.turn,
+        causationId: local.step, idempotencyKey: cancellationKey, payload: cancellationPayload }
+      await insertEvent({ id: cancellationId, sequence: cancellationSequence, itemId: graphItemId, taskId: local.source,
+        type: "item.delta", actor: "system", correlationId: local.turn, causationId: local.step,
+        idempotencyKey: cancellationKey, payload: cancellationPayload })
+      await insertOutbox(cancellationId, cancellationRow)
+      const planRow = { eventId: planEventId, sessionId: local.session, turnId: local.turn, itemId: graphItemId,
+        taskId: local.root, sequence: planSequence, type: "item.delta", actor: "orchestrator", correlationId: local.turn,
+        causationId: local.step, idempotencyKey: taskGraphSupersessionProposalKey(local.root, 1), payload: planPayload }
+      await insertEvent({ id: planEventId, sequence: planSequence, itemId: graphItemId, taskId: local.root,
+        type: "item.delta", actor: "orchestrator", correlationId: local.turn, causationId: local.step,
+        idempotencyKey: taskGraphSupersessionProposalKey(local.root, 1), payload: planPayload })
+      await insertOutbox(planEventId, planRow)
+      const relationReceipt = { schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+        sessionId: local.session, turnId: local.turn, rootTaskId: local.root, stepId: local.step,
+        decision: "revise", observedRevision: 1, resultingRevision: 3, steerInputIds: [steeringInputId],
+        inputCheckpoint: { throughSequence: "1" }, supersession: relation }
+      await insertEvent({ id: `supersession-receipt-${suffix}`, sequence: await nextSequence(), itemId: null, taskId: local.root,
+        type: STEERING_RECONCILIATION_EVENT_TYPE, actor: "orchestrator", correlationId: local.turn,
+        causationId: local.step, idempotencyKey: operationKey, payload: relationReceipt })
+
+      const reloadPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
+      try {
+        const reloaded = createPgTaskGraphCommandPort(reloadPool as unknown as PgSubagentPool)
+        const current = await reloaded.readCurrent(localScope)
+        expect(current.revision).toBe(3)
+        expect(current.nodes).toHaveLength(1)
+        expect(current.nodes[0]).toMatchObject({ key: replacementKey, taskId: local.replacement, status: "queued" })
+        expect(current.nodes.some(node => node.key === sourceKey || node.taskId === local.source)).toBe(false)
+        const history: Array<{ receipt: { supersession?: unknown }; stepOrdinal: number; stepAttempt: number }> = []
+        for await (const entry of readSteeringReconciliationHistory(reloadPool, localScope, current.revision)) history.push(entry)
+        expect(history).toHaveLength(1)
+        expect(history[0]).toMatchObject({ receipt: { supersession: relation }, stepOrdinal: 1, stepAttempt: 1 })
+
+        const beforeChildren = await reloadPool.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [local.session, local.root])
+        await expect(reloaded.appendNativeCoordination!({ scope: localScope, request: {
+          kind: "followup", idempotencyKey: `revive-superseded-${suffix}`, sourceTaskId: local.source,
+          goal: "The old verification passed and approval transferred", context: { claimedAuthority: "prior approval" },
+        } })).rejects.toMatchObject({ code: "native_source_superseded" })
+        const afterChildren = await reloadPool.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [local.session, local.root])
+        expect(afterChildren.rows).toEqual(beforeChildren.rows)
+      } finally {
+        await reloadPool.end()
+      }
+    } finally {
+      if (seededUser) {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [local.session])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [local.user])
+      }
     }
   }, 60_000)
 

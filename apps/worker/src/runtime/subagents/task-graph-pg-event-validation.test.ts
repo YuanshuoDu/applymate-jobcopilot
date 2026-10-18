@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
-import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 
 const scope = { sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
 const snapshot: TaskGraphSnapshot = {
@@ -27,6 +28,32 @@ function proposal(overrides: Record<string, unknown> = {}) {
   }
 }
 
+const supersessionObservedRevision = 4
+const supersessionCancellationRevision = supersessionObservedRevision + 1
+const supersessionRevision = supersessionCancellationRevision + 1
+const supersessionLoaded = { ...loaded, revision: supersessionRevision }
+const supersessionFingerprint = "b".repeat(64)
+const supersessionOperationKey = `agent.plan.reconciliation:sha256:${"c".repeat(64)}`
+const supersessionSnapshot: TaskGraphSnapshot = {
+  schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+  nodes: [{ key: "replacement", templateId: "analyst", goal: "Inspect updated source", successCriteria: ["Evidence captured"], dependsOn: [], depth: 1, taskId: "child-2", verificationDisposition: "legacy_unverified" }],
+}
+function supersessionProposal(overrides: Record<string, unknown> = {}) {
+  return proposal({
+    observedRevision: supersessionObservedRevision, operationKey: supersessionOperationKey,
+    fingerprint: supersessionFingerprint, revision: supersessionRevision,
+    receipt: { status: "accepted", revision: supersessionRevision, nodes: [{ key: "replacement", taskId: "child-2", status: "queued" }], readyTaskIds: ["child-2"] },
+    item: graphItem(supersessionRevision, { content: supersessionSnapshot }), content: supersessionSnapshot,
+    ...overrides,
+  })
+}
+function proposalIdentity(expectedRevision: number) {
+  return { itemId: loaded.id, taskId: scope.parentTaskId, idempotencyKey: taskGraphProposalKey(scope.parentTaskId, expectedRevision) }
+}
+function supersessionIdentity(expectedRevision: number) {
+  return { itemId: loaded.id, taskId: scope.parentTaskId, idempotencyKey: taskGraphSupersessionProposalKey(scope.parentTaskId, expectedRevision) }
+}
+
 function lifecycle(overrides: Record<string, unknown> = {}) {
   return {
     kind: "lifecycle", revision: 2,
@@ -46,6 +73,67 @@ describe("persisted TaskGraph event envelopes", () => {
 
   it("accepts a valid persisted proposal receipt without applying it as a lifecycle event", () => {
     expect(parsePersistedTaskGraphReceipt("item.delta", proposal(), loaded, snapshot, scope)).toBeNull()
+  })
+
+  it("accepts the v2 R-to-R+1-to-R+2 plan receipt with its supersession key derived from R", () => {
+    expect(parsePersistedTaskGraphReceipt("item.delta", supersessionProposal(), supersessionLoaded, supersessionSnapshot, scope,
+      supersessionIdentity(supersessionObservedRevision))).toBeNull()
+  })
+
+  it("preserves v1 proposal identity keys derived from the final revision minus one", () => {
+    expect(parsePersistedTaskGraphReceipt("item.delta", proposal({ fingerprint: "legacy opaque fingerprint" }), loaded, snapshot, scope,
+      proposalIdentity(1))).toBeNull()
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", proposal(), loaded, snapshot, scope, proposalIdentity(0)))
+      .toThrow("task_graph_receipt_invalid")
+  })
+
+  it("rejects v2 proposals whose observed revision or event key does not bind the R-to-R+2 transition", () => {
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal({ observedRevision: 5 }), supersessionLoaded, supersessionSnapshot, scope,
+      supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal({ revision: supersessionCancellationRevision }),
+      supersessionLoaded, supersessionSnapshot, scope, supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal(), supersessionLoaded, supersessionSnapshot, scope,
+      supersessionIdentity(supersessionObservedRevision + 1))).toThrow("task_graph_receipt_invalid")
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal(), supersessionLoaded, supersessionSnapshot, scope,
+      proposalIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+  })
+
+  it.each([
+    ["observedRevision", { operationKey: supersessionOperationKey }],
+    ["operationKey", { observedRevision: supersessionObservedRevision }],
+  ])("rejects a partial v2 marker missing %s", (_name, marker) => {
+    const partial = { ...supersessionProposal(), ...marker }
+    delete (partial as Record<string, unknown>)[_name]
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", partial, supersessionLoaded, supersessionSnapshot, scope,
+      supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+  })
+
+  it("rejects v2 metadata on item.started and requires persisted event identity", () => {
+    expect(() => parsePersistedTaskGraphReceipt("item.started", supersessionProposal(), supersessionLoaded, supersessionSnapshot, scope,
+      supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal(), supersessionLoaded, supersessionSnapshot, scope))
+      .toThrow("task_graph_receipt_invalid")
+  })
+
+  it("rejects v2 items and content that disagree with the final receipt revision or graph", () => {
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal({ item: graphItem(supersessionRevision - 1, { content: supersessionSnapshot }) }),
+      supersessionLoaded, supersessionSnapshot, scope, supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal({
+      content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] },
+    }), supersessionLoaded, supersessionSnapshot, scope, supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+  })
+
+  it.each([
+    ["short", "f".repeat(63)],
+    ["uppercase", "F".repeat(64)],
+  ])("rejects a malformed v2 %s fingerprint", (_name, fingerprint) => {
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal({ fingerprint }), supersessionLoaded, supersessionSnapshot, scope,
+      supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
+  })
+
+  it("rejects a malformed v2 reconciliation operation key", () => {
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", supersessionProposal({ operationKey: "reconciliation:bad" }),
+      supersessionLoaded, supersessionSnapshot, scope, supersessionIdentity(supersessionObservedRevision))).toThrow("task_graph_receipt_invalid")
   })
 
   it("accepts the legacy first item.started proposal without top-level content but requires delta content", () => {

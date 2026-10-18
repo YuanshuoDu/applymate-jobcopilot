@@ -2,9 +2,11 @@ import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
+import { parseTaskGraphSupersessionRelation, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 
 export const STEERING_RECONCILIATION_EVENT_TYPE = "agent.plan.reconciliation" as const
 export const STEERING_RECONCILIATION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v1" as const
+export const STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v2" as const
 export const STEERING_RECONCILIATION_BLOCKER = "steering_reconciliation_pending" as const
 export const STEERING_RECONCILIATION_FEEDBACK = "Accepted user steering must be reconciled against the current TaskGraph before completion. Review current input and plan, then use agent.reconcile to keep the current revision or agent.plan to revise it." as const
 export const STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS = 128
@@ -13,7 +15,7 @@ const MAX_SEQUENCE = 9_223_372_036_854_775_807n
 type Row = Record<string, unknown>
 
 export type SteeringReconciliationReceipt = Readonly<{
-  schemaVersion: typeof STEERING_RECONCILIATION_SCHEMA_VERSION
+  schemaVersion: typeof STEERING_RECONCILIATION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
   sessionId: string
   turnId: string
   rootTaskId: string
@@ -23,6 +25,7 @@ export type SteeringReconciliationReceipt = Readonly<{
   resultingRevision: number
   steerInputIds: readonly string[]
   inputCheckpoint: Readonly<{ throughSequence: string }>
+  supersession?: TaskGraphSupersessionRelation
 }>
 export type SteeringReconciliationScope = TaskGraphReadScope & Readonly<{ stepId?: string; rootInputId?: string | null }>
 export type SteeringReconciliationOperation = Readonly<{
@@ -31,6 +34,7 @@ export type SteeringReconciliationOperation = Readonly<{
   expectedRevision: number
   callId: string
   rootInputId?: string | null
+  replaceUnstartedNodeKey?: string
 }>
 export type SteeringReconciliationPendingInput = Readonly<{
   id: string
@@ -99,16 +103,19 @@ export function steeringReconciliationIdempotencyKey(scope: TaskGraphExecutionSc
   return `agent.plan.reconciliation:sha256:${createHash("sha256").update(identity, "utf8").digest("hex")}`
 }
 export function validSteeringReconciliationToolCall(event: Row, item: Row, scope: TaskGraphReadScope, stepId: string,
-  decision: "keep" | "revise", expectedRevision: number): boolean {
+  decision: "keep" | "revise", expectedRevision: number, replaceUnstartedNodeKey?: string): boolean {
   const call = record(event.payload), content = record(item.content), input = record(content?.input)
   const toolName = decision === "keep" ? "agent.reconcile" : "agent.plan"
   const callId = call?.toolCallId
-  const expectedInputKeys = decision === "keep" ? "decision,expectedRevision" : "expectedRevision,nodes"
+  const expectedInputKeys = decision === "keep" ? "decision,expectedRevision"
+    : replaceUnstartedNodeKey === undefined ? "expectedRevision,nodes" : "expectedRevision,nodes,replaceUnstarted"
+  const replacement = record(input?.replaceUnstarted)
   const scoped: TaskGraphExecutionScope = { ...scope, stepId }
   const executionIdentity = { kind: "turn" as const, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner,
     leaseVersion: scope.turnLeaseVersion, leaseExpiresAt: new Date(0) }
   return Boolean(steeringReconciliationId(callId) && validSteeringReconciliationScope(scoped)
+    && (decision === "revise" || replaceUnstartedNodeKey === undefined)
     && event.type === "tool_call.started" && event.actor === "orchestrator" && event.taskId === scope.rootTaskId
     && event.itemId === item.id && event.correlationId === callId
     && event.idempotencyKey === `${executionKey(executionIdentity)}:event:tool-started:${callId}`
@@ -117,26 +124,36 @@ export function validSteeringReconciliationToolCall(event: Row, item: Row, scope
     && item.stepId === stepId && item.taskId === scope.rootTaskId && item.type === "tool_call"
     && content?.toolCallId === callId && content.toolName === toolName && content.toolVersion === "1" && input
     && Object.keys(input).sort().join(",") === expectedInputKeys && input.expectedRevision === expectedRevision
-    && (decision === "keep" ? input.decision === "keep" : Array.isArray(input.nodes) && input.nodes.length > 0))
+    && (decision === "keep" ? input.decision === "keep" : Array.isArray(input.nodes)
+      && input.nodes.length > 0 && (replaceUnstartedNodeKey === undefined
+        || input.nodes.length === 1 && steeringReconciliationId(replaceUnstartedNodeKey)
+          && replacement !== null && exact(replacement, ["nodeKey"]) && replacement.nodeKey === replaceUnstartedNodeKey)))
 }
 export function parseSteeringReconciliationReceipt(value: unknown, expected?: SteeringReconciliationScope): SteeringReconciliationReceipt | null {
   try {
     const row = record(value)
-    if (!row || !exact(row, ["schemaVersion", "sessionId", "turnId", "rootTaskId", "stepId", "decision", "observedRevision", "resultingRevision", "steerInputIds", "inputCheckpoint"])
-      || row.schemaVersion !== STEERING_RECONCILIATION_SCHEMA_VERSION || !steeringReconciliationId(row.sessionId)
+    const baseKeys = ["schemaVersion", "sessionId", "turnId", "rootTaskId", "stepId", "decision", "observedRevision", "resultingRevision", "steerInputIds", "inputCheckpoint"]
+    if (!row || !steeringReconciliationId(row.sessionId)
       || !steeringReconciliationId(row.turnId) || !steeringReconciliationId(row.rootTaskId) || !steeringReconciliationId(row.stepId)
       || row.decision !== "keep" && row.decision !== "revise" || !steeringReconciliationRevision(row.observedRevision)
       || !steeringReconciliationRevision(row.resultingRevision)
-      || row.resultingRevision !== (row.decision === "keep" ? row.observedRevision : row.observedRevision + 1)
       || !Array.isArray(row.steerInputIds)) return null
+    const supersession = row.schemaVersion === STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
+      ? parseTaskGraphSupersessionRelation(row.supersession) : null
+    if (row.schemaVersion === STEERING_RECONCILIATION_SCHEMA_VERSION) {
+      if (!exact(row, baseKeys) || row.resultingRevision !== (row.decision === "keep" ? row.observedRevision : row.observedRevision + 1)) return null
+    } else if (row.schemaVersion !== STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION || !exact(row, [...baseKeys, "supersession"])
+      || row.decision !== "revise" || !supersession || supersession.observedRevision !== row.observedRevision
+      || supersession.resultingRevision !== row.resultingRevision || supersession.agentPlanCall.stepId !== row.stepId) return null
     const inputIds = row.steerInputIds as unknown[]
     if (inputIds.length === 0 || inputIds.length > STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS || !inputIds.every(steeringReconciliationId)
       || new Set(inputIds).size !== inputIds.length || inputIds.some((id, index) => index > 0 && String(inputIds[index - 1]) >= id)) return null
     const checkpoint = record(row.inputCheckpoint)
     if (!checkpoint || !exact(checkpoint, ["throughSequence"]) || steeringReconciliationSequence(checkpoint.throughSequence) === null) return null
     if (expected && (row.sessionId !== expected.sessionId || row.turnId !== expected.turnId || row.rootTaskId !== expected.rootTaskId
-      || expected.stepId !== undefined && row.stepId !== expected.stepId)) return null
-    const receipt = row as unknown as SteeringReconciliationReceipt
+      || expected.stepId !== undefined && row.stepId !== expected.stepId
+      || supersession && supersession.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, supersession.agentPlanCall.callId))) return null
+    const receipt = (supersession ? { ...row, supersession } : row) as unknown as SteeringReconciliationReceipt
     return Buffer.byteLength(JSON.stringify(receipt), "utf8") <= MAX_BYTES ? receipt : null
   } catch { return null }
 }

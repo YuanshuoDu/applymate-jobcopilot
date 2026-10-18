@@ -434,6 +434,26 @@ describe("agent.plan tool executor", () => {
     expect(Object.keys(proposal)).toEqual(["expectedRevision", "nodes"])
   })
 
+  it("passes one typed-leaf replacement to the trusted scheduler for fingerprinting", async () => {
+    const { tool, commandPort, getReceived, getOperation } = setup()
+    const registry = new ToolRegistry([tool])
+    const input = { ...proposal, replaceUnstarted: { nodeKey: "stale-scout" }, nodes: [{
+      ...proposal.nodes[0], goal: "Refresh Dublin roles", successCriteria: ["An earlier run reported these roles verified"],
+    }] }
+    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+    await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
+    expect(getOperation()).toMatchObject({ decision: "revise", expectedRevision: 0, replaceUnstartedNodeKey: "stale-scout" })
+    expect(getReceived()).toMatchObject({ replaceUnstarted: { nodeKey: "stale-scout" } })
+    expect(getReceived()).not.toHaveProperty("replacementFingerprint")
+    expect(getReceived()?.proposal.nodes[0]).toMatchObject({ goal: input.nodes[0].goal, successCriteria: input.nodes[0].successCriteria })
+    expect(getReceived()?.proposal.nodes[0]?.verification).toEqual(proposal.nodes[0].verification)
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    await expect(tool.execute(context(), { ...input, nodes: [input.nodes[0], input.nodes[0]] })).rejects.toMatchObject({
+      code: "task_graph_supersession_requires_one_replacement",
+    })
+    expect(registry.validateArguments("agent.plan", { ...input, replaceUnstarted: { nodeKey: "stale-scout", taskId: "forged" } }, "1")).toEqual(expect.any(String))
+  })
+
   it("returns the durable scheduler receipt to the model", async () => {
     const { tool, commandPort } = setup()
 
