@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool as PgPool } from "pg"
+import { Pool as PgPool, type PoolClient } from "pg"
 
 import { createAgentArtifactRepository } from "../../db/agent-artifact-repo.js"
 import { createCanonicalScheduledDraftRuntime } from "../scheduled-draft-runtime.js"
@@ -501,8 +501,19 @@ async function seedVerifiedScheduledDraftSources(pool: PgPool, value: Fixture, c
       verification: scheduledDraftAnalystVerification(source.hasFinding, source.scoutKey), dependsOn: [source.scoutKey] })
   }
   const input = scheduledDraftInput(value, 0, nodes)
+  const rootAllowedActions = selectedJobRootAllowedActions(input.templates)
+  const requiredActions = Object.values(input.templates).flatMap(template => template.allowedActions)
+  expect(requiredActions.every(action => rootAllowedActions.includes(action))).toBe(true)
+  const actionGrant = await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $5::jsonb
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1
+      AND "parentTaskId" IS NULL AND "leaseOwner" = $4 AND "attemptCount" = 1
+      AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`,
+  [value.rootTaskId, value.sessionId, value.turnId, value.parentLeaseOwner, JSON.stringify(rootAllowedActions)])
+  if (actionGrant.rowCount !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not seed the root permission snapshot")
+  await expect(scheduledDraftRootAllowedActions(pool, value)).resolves.toEqual(rootAllowedActions)
   const receipt = await command.appendAndSchedule(input)
   if (receipt.status !== "accepted" || receipt.revision !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not create its Scout and Analyst graph")
+  await expect(scheduledDraftRootAllowedActions(pool, value)).resolves.toEqual(rootAllowedActions)
   const row = await pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
     WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
   [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId])
@@ -518,7 +529,16 @@ async function seedVerifiedScheduledDraftSources(pool: PgPool, value: Fixture, c
       scheduledDraftRoleResult("analyst", source.jobId, source.hasFinding, source.score), scoutDependencies.projections, scoutDependencies.bindings)
     analysts.push(analyst)
   }
-  return { snapshot, analysts }
+  return { snapshot, analysts, rootAllowedActions }
+}
+
+async function scheduledDraftRootAllowedActions(pool: PgPool | PoolClient, value: Fixture): Promise<unknown> {
+  const result = await pool.query<{ allowedActions: unknown }>(`SELECT "allowedActions" FROM "sub_agent_tasks"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1
+      AND "parentTaskId" IS NULL AND "role" = 'orchestrator' AND "taskType" = 'root'`,
+  [value.rootTaskId, value.sessionId, value.turnId])
+  if (result.rows.length !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not read the root permission snapshot")
+  return result.rows[0]!.allowedActions
 }
 
 async function scheduledDraftDurableRows(pool: PgPool, value: Fixture): Promise<Record<string, unknown>> {
@@ -1744,6 +1764,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(accepted).toMatchObject({ status: "accepted", revision: 2, nodes: [
       { key: "writer", status: "queued" }, { key: "reviewer", status: "waiting" },
     ] })
+    await expect(scheduledDraftRootAllowedActions(adminPool!, value)).resolves.toEqual(sources.rootAllowedActions)
 
     const taskContexts = await adminPool!.query<{ role: string; context: unknown }>(`SELECT "role", "context" FROM "sub_agent_tasks"
       WHERE "sessionId" = $1 AND "parentTaskId" = $2 AND "role" IN ('writer', 'reviewer') ORDER BY "role"`,
@@ -1931,6 +1952,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       { key: "writer", templateId: "cover_letter_writer", goal: "Draft from the verified finding", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-finalize"] },
       { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
     ]))
+    await expect(scheduledDraftRootAllowedActions(adminPool!, value)).resolves.toEqual(sources.rootAllowedActions)
     const pair = await adminPool!.query<{ id: string; role: string }>(`SELECT "id", "role" FROM "sub_agent_tasks"
       WHERE "sessionId" = $1 AND "parentTaskId" = $2 AND "role" IN ('writer', 'reviewer') ORDER BY "role"`,
     [value.sessionId, value.rootTaskId])
@@ -1993,11 +2015,13 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       pool: adminPool!, commandPort: command, lease, root: { id: value.rootTaskId, attemptCount: 1 }, artifactRepository,
     })
     await expect(runtime.complete()).resolves.toEqual({ ok: true })
+    await expect(scheduledDraftRootAllowedActions(adminPool!, value)).resolves.toEqual(sources.rootAllowedActions)
 
     const positiveClient = await adminPool!.connect()
     try {
       await positiveClient.query("BEGIN")
       await expect(runtime.finalize(positiveClient)).resolves.toEqual({ ok: true })
+      await expect(scheduledDraftRootAllowedActions(positiveClient, value)).resolves.toEqual(sources.rootAllowedActions)
     } finally {
       await positiveClient.query("ROLLBACK").catch(() => undefined)
       positiveClient.release()
