@@ -49,8 +49,10 @@ export function canonicalTaskGraphReadObservations(items: readonly Row[], outcom
     if (totalBytes > MAX_TOTAL_BYTES || Buffer.byteLength(encoded, "utf8") > MAX_OBSERVATION_BYTES || truncated(output)) throw new Error("task_graph_verification_output_invalid")
     const source = (value: Row, fallback: string) => {
       const candidate = value.source
-      if (candidate === undefined || candidate === null || typeof candidate === "string" && candidate.trim().length === 0) return fallback
-      return text(candidate) && candidate.length <= 256 ? candidate : undefined
+      if (candidate === undefined || candidate === null) return fallback
+      if (typeof candidate !== "string") return undefined
+      if (candidate.trim().length === 0) return fallback
+      return candidate.length <= 256 ? candidate : undefined
     }
     const row = record(output)
     let projected: unknown

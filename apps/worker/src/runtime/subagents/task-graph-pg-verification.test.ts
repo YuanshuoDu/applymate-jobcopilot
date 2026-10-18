@@ -136,6 +136,25 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(result).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "result_invalid", evidenceDigest: null } })
   })
 
+  it("binds a padded canonical source from jobs.get only when Scout matches it exactly", async () => {
+    const source = " greenhouse "
+    const data = durableRows({ toolName: "jobs.get", output: { job: { id: "job-1", source } } })
+    const matchingResult = {
+      ...structuredResult,
+      candidates: [{ ...structuredResult.candidates[0], source }],
+      evidence: [{ ...structuredResult.evidence[0], source }],
+    }
+    const matching = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult: matchingResult })
+    const mismatchedResult = {
+      ...structuredResult,
+      candidates: [{ ...structuredResult.candidates[0], source: "greenhouse" }],
+    }
+    const mismatched = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult: mismatchedResult })
+
+    expect(matching).toMatchObject({ verified: true, projection: { candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }] } })
+    expect(mismatched).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "result_invalid", evidenceDigest: null } })
+  })
+
   it("allows only the generic jobs.read label when a current jobs.get receipt omits its source", async () => {
     const data = durableRows({ toolName: "jobs.get", output: { job: { id: "job-1" } } })
     const genericResult = {
