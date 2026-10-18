@@ -571,7 +571,9 @@ async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> 
 
 async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture) {
   await seed(pool, value)
-  await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["agent.plan"]'::jsonb WHERE "id" = $1`, [value.rootTaskId])
+  const analystTemplate = TASK_GRAPH_TEMPLATES.analyst
+  const rootActions = ["agent.plan", ...analystTemplate.allowedActions]
+  await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [value.rootTaskId, JSON.stringify(rootActions)])
 
   const originalSequence = await nextEventSequence(pool, value)
   await seedReconciliationStep(pool, value, {
@@ -590,7 +592,10 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     consumedInputIds: [value.originalInputId],
   })
 
-  const initialInput = scheduleInput(value, 1, true)
+  const scheduledInput = scheduleInput(value, 1, true)
+  const initialInput: TaskGraphScheduleInput = { ...scheduledInput, templates: {
+    ...scheduledInput.templates, analyst: analystTemplate,
+  } }
   const initialPlanInput: TaskGraphScheduleInput = { ...initialInput, scope: { ...initialInput.scope, stepId: value.originStepId } }
   const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
   const initial = await command.appendAndSchedule(initialPlanInput)
@@ -599,6 +604,14 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   const source = (await command.readCurrent(readScope(value))).nodes[0]
   const originalNode = initialInput.proposal.nodes[0]
   if (!source || !originalNode) throw new Error("TaskGraph supersession fixture lost its typed source")
+  const persistedSource = await pool.query<{ role: string; taskType: string; allowedActions: unknown; constraints: unknown; expectedOutputSchema: unknown }>(
+    `SELECT "role", "taskType", "allowedActions", "constraints", "expectedOutputSchema" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+    [source.taskId, value.sessionId],
+  )
+  expect(persistedSource.rows).toEqual([{
+    role: analystTemplate.role, taskType: analystTemplate.taskType, allowedActions: analystTemplate.allowedActions,
+    constraints: analystTemplate.constraints ?? [], expectedOutputSchema: analystTemplate.expectedOutputSchema ?? {},
+  }])
   const replacement = { ...originalNode, key: "replacement-1", goal: "Complete the revised graph task", successCriteria: ["Revised task completed"] }
   const replaceUnstarted = { nodeKey: source.key }
   const rawCallInput = { expectedRevision: 1, replaceUnstarted, nodes: [replacement] }
