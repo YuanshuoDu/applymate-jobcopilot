@@ -198,7 +198,7 @@ describe("canonical Turn verification requirements", () => {
     expect(resolveRootTaskVerificationRequirements(envelope)).toEqual({ status: "invalid" })
   })
 
-  it("compares duplicate requirements structurally while preserving list order", () => {
+  it("accepts reordered duplicate declarations while preserving the runtime contract order", () => {
     const persistedCopy = {
       requirements: [
         { check: { minimum: 3, kind: "candidate_count_gte" }, id: "candidate-count" },
@@ -218,7 +218,16 @@ describe("canonical Turn verification requirements", () => {
       verificationRequirements: objectiveRequirements(),
       input: { verificationRequirements: { ...persistedCopy, requirements: [...persistedCopy.requirements].reverse() } },
     }))
-      .toEqual({ status: "invalid" })
+      .toEqual({ status: "valid", requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", minimum: 3 },
+        { id: "finding_count", kind: "finding_count_gte", minimum: 1 },
+      ] })
+    expect(resolveRootTaskVerificationRequirements({
+      verificationRequirements: { ...persistedCopy, requirements: [...persistedCopy.requirements].reverse() },
+    })).toEqual({ status: "valid", requirements: [
+      { id: "finding_count", kind: "finding_count_gte", minimum: 1 },
+      { id: "candidate-count", kind: "candidate_count_gte", minimum: 3 },
+    ] })
   })
 
   it("keeps invalid typed intent separate from the existing prose objective", () => {

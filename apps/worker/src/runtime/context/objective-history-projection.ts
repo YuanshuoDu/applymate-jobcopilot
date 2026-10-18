@@ -4,7 +4,7 @@ import { hasSelectedJobPreparation, rootTaskHistoryObjectiveDigest, rootTaskHist
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
-export const OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION = 1
+export const OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION = 2
 const TERMINAL_TYPES = ["turn.completed", "turn.failed", "turn.interrupted"] as const
 
 export type RootObjectiveHistoryIdentity = Readonly<{
@@ -122,11 +122,10 @@ async function updateObjective(
     : { kind: "ineligible", reason: "unlinked_root_turn" }
   const row = found.rows[0]!
   const selectedJobScoped = hasSelectedJobPreparation(row.input)
-  const objectiveDigest = selectedJobScoped ? null : rootTaskHistoryObjectiveDigest(row.input, row, false) ?? null
-  const crossSessionDigest = selectedJobScoped ? undefined : rootTaskHistoryObjectiveDigest(row.input, row, true)
+  const objectiveDigest = selectedJobScoped ? null : rootTaskHistoryObjectiveDigest(row.input, row) ?? null
   const canonicalOrigin = selectedJobScoped ? undefined : rootTaskHistoryOrigin(row.source, row.input)
-  const canonicalOriginDigest = crossSessionDigest && canonicalOrigin
-    ? createHash("sha256").update(JSON.stringify({ objectiveDigest: crossSessionDigest, canonicalOrigin })).digest("hex")
+  const canonicalOriginDigest = objectiveDigest && canonicalOrigin
+    ? createHash("sha256").update(JSON.stringify({ objectiveDigest, canonicalOrigin })).digest("hex")
     : null
   const version = OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION
   const rootGuard = expected ? `AND EXISTS (SELECT 1 FROM "sub_agent_tasks" root

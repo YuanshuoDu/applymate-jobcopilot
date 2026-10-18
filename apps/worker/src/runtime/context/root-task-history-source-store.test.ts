@@ -29,7 +29,7 @@ const fence: RootTaskHistoryFence = {
   currentStartSequence: 2n, currentStartCreatedAt: currentTime,
   currentOrigin: JSON.stringify(["user", "none"]),
   objectiveDigest: rootTaskHistoryObjectiveDigest({ goal: "Find roles", successCriteria: ["Use saved filters"] },
-    { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)!,
+    { goal: "Find roles", successCriteria: ["Use saved filters"] })!,
   objectiveHistoryIndexObjectiveDigest: indexKeys.objectiveDigest,
   objectiveHistoryIndexCanonicalOriginDigest: indexKeys.canonicalOriginDigest,
 }
@@ -196,7 +196,7 @@ describe("Root history source scan", () => {
     const current = discoveryTurnInput(["Software Engineer"], ["Berlin"])
     const changedRole = discoveryTurnInput(["Data Scientist"], ["Berlin"])
     const changedLocation = discoveryTurnInput(["Software Engineer"], ["Amsterdam"])
-    const currentObjective = rootTaskHistoryObjectiveDigest(current, { goal: current.goal, successCriteria: ["Use saved filters"] }, true)!
+    const currentObjective = rootTaskHistoryObjectiveDigest(current, { goal: current.goal, successCriteria: ["Use saved filters"] })!
     const discoveryFence: RootTaskHistoryFence = {
       ...fence, currentOrigin: JSON.stringify(["user", "interactive_discovery_shortlist", 1]), objectiveDigest: currentObjective,
     }
@@ -344,7 +344,7 @@ describe("Root history source scan", () => {
     expect(await read(scheduled)).toEqual([])
   })
 
-  it("uses base objective keys and sequence cutoff before LIMIT for indexed same-session recall", async () => {
+  it("uses the complete objective identity and sequence cutoff before LIMIT for indexed same-session recall", async () => {
     const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
     const sameInput: RootTaskHistoryFenceInput = { ...input, crossSessionRootTaskHistoryEnabled: undefined, objectiveHistoryIndexEnabled: true }
     const sameKeys = rootTaskHistoryIndexKeys("user", { goal: "Find roles", successCriteria: ["Use saved filters"] },
@@ -380,9 +380,9 @@ describe("Root history source scan", () => {
     const nested = { input: { goal: "Find roles", successCriteria: ["Use saved filters"], verificationRequirements } }
     const both = { ...flat, input: { goal: "Find roles", successCriteria: ["Use saved filters"],
       verificationRequirements: structuredClone(verificationRequirements) } }
-    const flatDigest = rootTaskHistoryObjectiveDigest(flat, { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)
-    const nestedDigest = rootTaskHistoryObjectiveDigest(nested, { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)
-    const bothDigest = rootTaskHistoryObjectiveDigest(both, { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)
+    const flatDigest = rootTaskHistoryObjectiveDigest(flat, { goal: "Find roles", successCriteria: ["Use saved filters"] })
+    const nestedDigest = rootTaskHistoryObjectiveDigest(nested, { goal: "Find roles", successCriteria: ["Use saved filters"] })
+    const bothDigest = rootTaskHistoryObjectiveDigest(both, { goal: "Find roles", successCriteria: ["Use saved filters"] })
     const withRequirement = { ...fence, objectiveDigest: flatDigest! }
 
     expect(nestedDigest).toBe(flatDigest)
@@ -393,14 +393,14 @@ describe("Root history source scan", () => {
 
   it("keeps absent, invalid, or conflicting typed requirements out of exact-objective recall", async () => {
     const flat = { goal: "Find roles", successCriteria: ["Use saved filters"], verificationRequirements }
-    const validFence = { ...fence, objectiveDigest: rootTaskHistoryObjectiveDigest(flat, { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)! }
+    const validFence = { ...fence, objectiveDigest: rootTaskHistoryObjectiveDigest(flat, { goal: "Find roles", successCriteria: ["Use saved filters"] })! }
     const conflicting = { ...flat, input: { verificationRequirements: {
       ...verificationRequirements, requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 4 } }],
     } } }
     const invalid = { ...flat, verificationRequirements: { schemaVersion: "unsupported", requirements: [] } }
 
     expect(rootTaskHistoryObjectiveDigest({ goal: flat.goal, successCriteria: flat.successCriteria },
-      { goal: flat.goal, successCriteria: flat.successCriteria }, true)).not.toBe(validFence.objectiveDigest)
+      { goal: flat.goal, successCriteria: flat.successCriteria })).not.toBe(validFence.objectiveDigest)
     for (const value of [conflicting, invalid]) {
       await expect(readRootTaskHistoryCandidates(client([row({ input: value })], []) as unknown as pg.PoolClient, input, validFence)).resolves.toEqual([])
     }

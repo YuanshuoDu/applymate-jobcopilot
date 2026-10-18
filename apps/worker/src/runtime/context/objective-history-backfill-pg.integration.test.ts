@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
 import { backfillObjectiveHistoryProjection } from "./objective-history-backfill.js"
-import type { RootObjectiveHistoryIdentity } from "./objective-history-projection.js"
+import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, type RootObjectiveHistoryIdentity } from "./objective-history-projection.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -121,20 +121,29 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
       const first = await backfillObjectiveHistoryProjection(pool!, { batchSize: 2, maxBatches: 1 })
       expect(first).toMatchObject({ batches: 1, evaluated: 2, unindexable: 1, capped: true, ready: false,
         transactions: 2, workTransactions: 1 })
-      const partial = await pool!.query(`SELECT "isReady" FROM "agent_objective_history_index_readiness"
-        WHERE "indexName" = 'agent_turns_objective_history' AND "semanticsVersion" = 1`)
-      expect(partial.rows[0]).toEqual({ isReady: false })
+      const partial = await pool!.query(`SELECT "semanticsVersion", "isReady", "updatedAt" FROM "agent_objective_history_index_readiness"
+        WHERE "indexName" = 'agent_turns_objective_history' ORDER BY "semanticsVersion"`)
+      expect(partial.rows).toEqual([
+        { semanticsVersion: 1, isReady: false, updatedAt: expect.any(Date) },
+        { semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, isReady: false, updatedAt: expect.any(Date) },
+      ])
 
       const resumed = await backfillObjectiveHistoryProjection(pool!, { batchSize: 2, maxBatches: 2 })
       expect(resumed).toMatchObject({ batches: 1, evaluated: 1, capped: false, ready: true,
         transactions: 3, workTransactions: 2, verificationBatches: 1 })
+      const readyRows = await pool!.query(`SELECT "semanticsVersion", "isReady", "updatedAt" FROM "agent_objective_history_index_readiness"
+        WHERE "indexName" = 'agent_turns_objective_history' ORDER BY "semanticsVersion"`)
+      expect(readyRows.rows).toEqual([
+        { semanticsVersion: 1, isReady: false, updatedAt: expect.any(Date) },
+        { semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, isReady: true, updatedAt: expect.any(Date) },
+      ])
       const fields = await pool!.query(`SELECT "id", "objectiveDigest", "canonicalOriginDigest", "objectiveIndexSemanticsVersion",
         "terminalEventSequence", "terminalEventAt" FROM "agent_turns" WHERE "id" = ANY($1::text[])`,
       [[good.turnId, invalid.turnId, failed.turnId, unlinked.turnId]])
       const indexed = new Map(fields.rows.map(row => [row.id, row]))
-      expect(indexed.get(good.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: 1 })
-      expect(indexed.get(invalid.turnId)).toMatchObject({ objectiveDigest: null, canonicalOriginDigest: null, objectiveIndexSemanticsVersion: 1 })
-      expect(indexed.get(failed.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: 1, terminalEventSequence: "11" })
+      expect(indexed.get(good.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION })
+      expect(indexed.get(invalid.turnId)).toMatchObject({ objectiveDigest: null, canonicalOriginDigest: null, objectiveIndexSemanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION })
+      expect(indexed.get(failed.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, terminalEventSequence: "11" })
       expect(indexed.get(unlinked.turnId)).toMatchObject({ objectiveIndexSemanticsVersion: null })
 
       const replay = await backfillObjectiveHistoryProjection(pool!)
@@ -159,7 +168,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
       const saved = await pool!.query(`SELECT "input"::text AS "inputText", "objectiveIndexSemanticsVersion"
         FROM "agent_turns" WHERE "id" = $1`, [identity.turnId])
       expect(saved.rows[0]?.inputText).toContain('"ignoredNumeric": 9007199254740993')
-      expect(saved.rows[0]?.objectiveIndexSemanticsVersion).toBe(1)
+      expect(saved.rows[0]?.objectiveIndexSemanticsVersion).toBe(OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION)
     } finally { await owner.cleanup() }
   })
 
@@ -218,7 +227,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
 
       expect(report).toMatchObject({ verificationFailed: true, ready: false })
       const readiness = await pool!.query(`SELECT "isReady" FROM "agent_objective_history_index_readiness"
-        WHERE "indexName" = 'agent_turns_objective_history' AND "semanticsVersion" = 1`)
+        WHERE "indexName" = 'agent_turns_objective_history' AND "semanticsVersion" = ${OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION}`)
       expect(readiness.rows[0]).toEqual({ isReady: false })
     } finally { await owner.cleanup() }
   })
@@ -237,7 +246,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
       expect(locator.rows[0]?.terminalEventSequence).toBeNull()
       expect(locator.rows[0]?.terminalEventAt).toBeInstanceOf(Date)
       const readiness = await pool!.query(`SELECT "isReady" FROM "agent_objective_history_index_readiness"
-        WHERE "indexName" = 'agent_turns_objective_history' AND "semanticsVersion" = 1`)
+        WHERE "indexName" = 'agent_turns_objective_history' AND "semanticsVersion" = ${OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION}`)
       expect(readiness.rows[0]).toEqual({ isReady: false })
     } finally { await owner.cleanup() }
   })
@@ -267,7 +276,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
         expect(report).toMatchObject({ batches: 1, evaluated: 0, terminalIneligible: 1, verificationFailed: true, ready: false })
         const state = await pool!.query(`SELECT turn."objectiveIndexSemanticsVersion", turn."terminalEventSequence", turn."terminalEventAt", ready."isReady"
           FROM "agent_turns" turn CROSS JOIN "agent_objective_history_index_readiness" ready
-          WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = 1`,
+          WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = ${OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION}`,
         [identity.turnId])
         expect(state.rows[0]).toEqual({ objectiveIndexSemanticsVersion: null, terminalEventSequence: null, terminalEventAt: null, isReady: false })
       }
@@ -279,9 +288,9 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
       expect(repaired).toMatchObject({ evaluated: 1, terminalIneligible: 0, verificationComplete: true, verificationFailed: false, ready: true })
       const state = await pool!.query(`SELECT turn."objectiveIndexSemanticsVersion", turn."terminalEventSequence", turn."terminalEventAt", ready."isReady"
         FROM "agent_turns" turn CROSS JOIN "agent_objective_history_index_readiness" ready
-        WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = 1`,
+        WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = ${OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION}`,
       [identity.turnId])
-      expect(state.rows[0]).toMatchObject({ objectiveIndexSemanticsVersion: 1, terminalEventSequence: "11", isReady: true })
+      expect(state.rows[0]).toMatchObject({ objectiveIndexSemanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, terminalEventSequence: "11", isReady: true })
       expect(state.rows[0]?.terminalEventAt).toBeInstanceOf(Date)
     } finally { await owner.cleanup() }
   })
@@ -308,7 +317,7 @@ describePg("objective history backfill on disposable PostgreSQL", () => {
       await expect(backfillObjectiveHistoryProjection(wrapper)).rejects.toThrow("injected batch interruption")
       const row = await pool!.query(`SELECT turn."objectiveIndexSemanticsVersion", ready."isReady"
         FROM "agent_turns" turn CROSS JOIN "agent_objective_history_index_readiness" ready
-        WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = 1`,
+        WHERE turn."id" = $1 AND ready."indexName" = 'agent_turns_objective_history' AND ready."semanticsVersion" = ${OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION}`,
       [identity.turnId])
       expect(row.rows[0]).toEqual({ objectiveIndexSemanticsVersion: null, isReady: false })
     } finally { await owner.cleanup() }

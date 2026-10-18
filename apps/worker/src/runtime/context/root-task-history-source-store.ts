@@ -100,7 +100,7 @@ function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHi
     || (!crossSession && terminal >= fence.currentStartSequence)
     || (crossSession && (!fence.currentStartCreatedAt || !terminalAt
       || terminalAt.getTime() >= fence.currentStartCreatedAt.getTime()))
-    || rootTaskHistoryObjectiveDigest(row.input, { goal: row.goal, successCriteria: row.successCriteria }, crossSession) !== fence.objectiveDigest) return undefined
+    || rootTaskHistoryObjectiveDigest(row.input, { goal: row.goal, successCriteria: row.successCriteria }) !== fence.objectiveDigest) return undefined
   if (indexed) {
     const keys = rootTaskHistoryIndexKeys(row.turnSource, row.input, { goal: row.goal, successCriteria: row.successCriteria }, crossSession)
     if (!keys || row.turnObjectiveDigest !== keys.objectiveDigest
