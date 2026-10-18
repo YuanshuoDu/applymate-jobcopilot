@@ -29,12 +29,13 @@ import type { TreeBudgetReservationStore } from "./subagents/tree-budget-types.j
 import type { SubagentLease } from "./subagents/types.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphExecutionScope, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphResultPageRequest } from "./subagents/task-graph-result-page-contract.js"
+import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA } from "./subagents/task-graph-discovery-recovery-page-contract.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { priorConversation } from "./canonical-steering-markers.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
-import { createWorkerToolRuntime, InMemoryToolLifecycleSink, type CoordinationStore, type CoordinationTaskView, type DurableWaitPort } from "./tools/index.js"
+import { createCoordinationTools, createWorkerToolRuntime, InMemoryToolLifecycleSink, ToolLifecycle, ToolRegistry, ToolRouter, type CoordinationStore, type CoordinationTaskView, type DurableWaitPort } from "./tools/index.js"
 import { executeAgentList } from "./tools/task-graph-result-page-executor.js"
 import type { CoordinationExecutorOptions } from "./tools/coordination-executors.js"
 import type { RuntimeToolDefinition, ToolExecutionContext } from "./tools/types.js"
@@ -2752,6 +2753,48 @@ describe("createCanonicalTurnRuntime", () => {
     expect(historicalPage.items[0]?.jobId).toBe(candidateJobId)
     expect(appendAndSchedule).not.toHaveBeenCalled()
     expect(currentPageRead).toHaveBeenCalledOnce()
+  })
+
+  it("routes Root agent.list recovery through the owner-scoped page port as unverified IDs", async () => {
+    const recoveryRequest = { mode: "discovery_recovery", nodeKey: "scout-a", expectedRevision: 4, offset: 0 } as const
+    const recoveryPage = {
+      schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+      observation: "partial_discovery", verificationStatus: "unverified", graphRevision: 4, attemptCount: 2,
+      taskStatus: "failed", totalCount: 1, offset: 0, nextOffset: null, truncated: false,
+      items: [{ jobId: canonicalJobId }],
+    } as const
+    const readCurrentDiscoveryRecoveryPage = vi.fn(async () => recoveryPage)
+    const commandPort = { readCurrentDiscoveryRecoveryPage }
+    const store = { appendActivity: vi.fn(async () => undefined) } as unknown as CoordinationStore
+    const registry = new ToolRegistry(createCoordinationTools({
+      manager: {} as never, store,
+      nativeCoordination: {
+        enabled: true, commandPort: commandPort as never, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+        parentLeaseOwner: lease.ownerId, parentAttemptCount: () => 1,
+      },
+    }))
+    const sink = new InMemoryToolLifecycleSink()
+    const router = new ToolRouter(registry, new ToolLifecycle({ sink }))
+    const scope = {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+    }
+
+    const result = await router.execute({
+      scope: { userId: lease.userId }, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "root-step",
+      taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator", capabilities: ["read", "coordination", "canManageChildren"],
+      signal: new AbortController().signal,
+    }, { id: "recovery-page-call", toolName: "agent.list", toolVersion: "1", input: recoveryRequest })
+
+    expect(readCurrentDiscoveryRecoveryPage).toHaveBeenCalledWith(scope, recoveryRequest)
+    expect(result).toMatchObject({ status: "completed", output: recoveryPage })
+    expect(store.appendActivity).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "agent.list_discovery_recovery_page", status: "completed", data: { count: 1, revision: 4 },
+    }))
+    expect(sink.events.map(event => event.phase)).toEqual(["started", "progress", "completed"])
+    const persisted = sink.events.find(event => event.phase === "completed")
+    expect(persisted?.payload).toMatchObject({ toolName: "agent.list", output: recoveryPage })
+    expect(JSON.stringify(persisted)).not.toMatch(/evidence|score|provider|PRIVATE/)
   })
 
   it("pages current typed results through persisted lifecycle into successive model requests", async () => {

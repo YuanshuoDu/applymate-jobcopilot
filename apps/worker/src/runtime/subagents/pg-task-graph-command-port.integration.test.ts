@@ -21,6 +21,7 @@ import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-depe
 import { verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { readScheduledDraftCandidateBinding, validateScheduledDraftCandidateWitness } from "./scheduled-draft-candidate.js"
 import type { TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
+import { createChildDiscoveryObservers } from "./child-discovery-observers.js"
 import { INTERACTIVE_DISCOVERY_ROOT_TOOLS, rootTaskAllowedActions, rootToolSurface } from "../interactive-discovery-contract.js"
 import { isSelectedJobRootTool } from "../canonical-turn-task-graph-context.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
@@ -913,6 +914,32 @@ function restrictedTransactionPool(basePool: PgPool, roleName: string, userId: s
         },
       })
       return transactionScopedClient
+    },
+  }
+}
+
+function restrictedRolePool(basePool: PgPool, roleName: string): PgSubagentPool {
+  return {
+    async connect() {
+      const client = await basePool.connect()
+      const scopedClient = new Proxy(client, {
+        get(target, property) {
+          if (property === "query") {
+            return (...args: unknown[]) => {
+              const result: unknown = Reflect.apply(target.query, target, args)
+              const sql = typeof args[0] === "string" ? args[0].trim().toUpperCase() : ""
+              if (sql !== "BEGIN") return result
+              return Promise.resolve(result).then(async value => {
+                await Reflect.apply(target.query, target, [`SET LOCAL ROLE "${roleName}"`])
+                return value
+              })
+            }
+          }
+          const value: unknown = Reflect.get(target, property, target)
+          return typeof value === "function" ? value.bind(target) : value
+        },
+      })
+      return scopedClient
     },
   }
 }
@@ -2463,5 +2490,100 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       await client.query("ROLLBACK").catch(() => undefined)
       client.release()
     }
+  }, 60_000)
+
+  it("reads ordinary Scout provenance only for the current live lease and attempt", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const scoutActions = [...TASK_GRAPH_TEMPLATES.scout.allowedActions]
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb
+      WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "status" = 'running'
+        AND "leaseOwner" = $5 AND "attemptCount" = 1`, [
+      value.rootTaskId, JSON.stringify(["agent.plan", ...scoutActions]), value.sessionId, value.turnId, value.parentLeaseOwner,
+    ])
+    const agendaSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.stepId, sequence: agendaSequence, cursor: 0n, planRevision: 0, consumedInputIds: [],
+    })
+    const input: TaskGraphScheduleInput = {
+      scope: { ...readScope(value), stepId: value.stepId },
+      proposal: { expectedRevision: 0, nodes: [{
+        key: "ordinary-scout", templateId: "scout", goal: "Find matching jobs",
+        successCriteria: ["Return candidates supported by fresh job reads"],
+        verification: {
+          schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+          criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+        },
+        dependsOn: [],
+      }] },
+      templates: { scout: TASK_GRAPH_TEMPLATES.scout },
+    }
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const accepted = await command.appendAndSchedule(input)
+    expect(accepted.status).toBe("accepted")
+    const taskId = accepted.readyTaskIds[0]
+    expect(taskId).toBeTruthy()
+    const ownerId = `provenance-worker-${randomUUID()}`
+    const claimed = await new PgSubagentTaskStore(commandPool!).claim({
+      taskId: taskId!, sessionId: value.sessionId, ownerId,
+      policy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 }, now: new Date(),
+    })
+    expect(claimed).toMatchObject({ status: "running", role: "scout", taskType: "job_discovery", attemptCount: 1, leaseOwner: ownerId })
+    if (!claimed?.leaseExpiresAt) throw new Error("Scout provenance fixture did not receive a live lease")
+    const lease = { ...claimed, ownerId, leaseExpiresAt: claimed.leaseExpiresAt, signal: new AbortController().signal }
+    const scopedPool = restrictedRolePool(commandPool!, roleName)
+    const collectorFence = {
+      taskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+      turnId: lease.turnId!, attemptCount: lease.attemptCount,
+    }
+    const observeRecovery = async (candidate: typeof lease) => {
+      const observers = await createChildDiscoveryObservers(scopedPool as never, candidate, collectorFence)
+      const call = {
+        id: `pg-discovery-${randomUUID()}`, toolName: "jobs.discover", toolVersion: "1",
+        sessionId: candidate.sessionId, turnId: candidate.turnId!, stepId: value.stepId,
+        taskId: candidate.id, rootTaskId: candidate.rootTaskId,
+      }
+      const output = {
+        jobs: [{ id: "c123456789012345678901234", title: "Engineer", company: "Example", location: "Dublin",
+          url: "https://jobs.example/123", description: "Role", fullDescription: "Role", salary: null, logo: null,
+          source: "greenhouse", evidenceRefs: ["evidence-1"] }],
+        evidence: [{ evidenceId: "evidence-1", jobId: "c123456789012345678901234", kind: "source", source: "greenhouse",
+          url: "https://jobs.example/123", summary: "Discovered from the Greenhouse source" }],
+        nextCursor: null,
+        usage: { ledgerKey: "ledger-1", toolName: call.toolName, toolVersion: call.toolVersion, toolCallId: call.id,
+          sessionId: call.sessionId, turnId: call.turnId, stepId: call.stepId, requests: 1, jobsProcessed: 1,
+          jobsSucceeded: 1, jobsFailed: 0, providerFailures: 0, aiCalls: 0, providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1 },
+      }
+      observers.observeLifecycleEvent({ call, phase: "started" })
+      observers.observeLifecycleEvent({ call, phase: "completed", output })
+      return observers.discoveryRecoverySidecar()
+    }
+
+    await expect(observeRecovery(lease)).resolves.toMatchObject({ attemptCount: lease.attemptCount, jobIds: ["c123456789012345678901234"] })
+
+    const clearTurnLease = async (status: string) => adminPool!.query(`UPDATE "agent_turns" SET "status" = $2,
+        "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL
+      WHERE "id" = $1 AND "sessionId" = $3`, [value.turnId, status, value.sessionId])
+    for (const status of ["waiting_for_dependency", "queued"]) {
+      await clearTurnLease(status)
+      await expect(observeRecovery(lease)).resolves.toMatchObject({ attemptCount: lease.attemptCount, jobIds: ["c123456789012345678901234"] })
+    }
+    await clearTurnLease("completed")
+    await expect(observeRecovery(lease)).resolves.toBeUndefined()
+    await clearTurnLease("in_progress")
+
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4`, [
+      lease.id, lease.sessionId, ownerId, lease.attemptCount,
+    ])
+    await expect(observeRecovery(lease)).resolves.toBeUndefined()
+
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP + INTERVAL '1 minute',
+        "attemptCount" = "attemptCount" + 1
+      WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4`, [
+      lease.id, lease.sessionId, ownerId, lease.attemptCount,
+    ])
+    await expect(observeRecovery(lease)).resolves.toBeUndefined()
   }, 60_000)
 })

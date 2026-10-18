@@ -2,17 +2,26 @@ import { types as nodeTypes } from "node:util"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { parseTaskGraphResultPage, parseTaskGraphResultPageRequest } from "../subagents/task-graph-result-page-contract.js"
 import { parseTaskGraphHistoricalDiscoveryPage, parseTaskGraphHistoricalDiscoveryPageRequest } from "../subagents/task-graph-historical-discovery-page-contract.js"
+import { parseTaskGraphDiscoveryRecoveryPage, parseTaskGraphDiscoveryRecoveryPageRequest } from "../subagents/task-graph-discovery-recovery-page-contract.js"
 import { prepareLifecycleValue, prepareSafeValue, sanitizeLifecyclePreview, type PreparedLifecycleValue } from "./redaction.js"
 
-const PAGE_KEYS = new Set(["schemaVersion", "trust", "availability", "graphRevision", "reason", "role", "taskStatus", "resultStatus", "totalCount", "evidenceCount", "offset", "nextOffset", "items"])
+const PAGE_KEYS = new Set(["schemaVersion", "trust", "availability", "graphRevision", "reason", "role", "taskStatus", "resultStatus", "totalCount", "evidenceCount", "offset", "nextOffset", "items", "attemptCount", "observation", "verificationStatus", "truncated"])
 const INVALID_AGENT_LIST_INPUT = "[invalid agent.list input]"
 
 export function prepareAgentListLifecycleInput(value: unknown, maxBytes: number): { pageRequest: boolean; safeInput: unknown } {
-  const historical = parseTaskGraphHistoricalDiscoveryPageRequest(value)
-  if (historical) return { pageRequest: true, safeInput: sanitizeLifecyclePreview({ mode: "historical_discovery", ...historical }, maxBytes) }
+  if (hasModeProperty(value)) {
+    const mode = readMode(value)
+    if (mode === "historical_discovery") {
+      const historical = parseTaskGraphHistoricalDiscoveryPageRequest(value)
+      if (historical) return { pageRequest: true, safeInput: sanitizeLifecyclePreview({ mode, ...historical }, maxBytes) }
+    } else if (mode === "discovery_recovery") {
+      const recovery = parseTaskGraphDiscoveryRecoveryPageRequest(value)
+      if (recovery) return { pageRequest: true, safeInput: sanitizeLifecyclePreview(recovery, maxBytes) }
+    }
+    return { pageRequest: true, safeInput: sanitizeLifecyclePreview(INVALID_AGENT_LIST_INPUT, maxBytes) }
+  }
   const request = parseTaskGraphResultPageRequest(value)
   if (request) return { pageRequest: true, safeInput: sanitizeLifecyclePreview(request, maxBytes) }
-  if (hasHistoricalDiscoveryMode(value)) return { pageRequest: true, safeInput: sanitizeLifecyclePreview(INVALID_AGENT_LIST_INPUT, maxBytes) }
   const legacy = safeLegacyListInput(value)
   return { pageRequest: false, safeInput: sanitizeLifecyclePreview(legacy ?? INVALID_AGENT_LIST_INPUT, maxBytes) }
 }
@@ -21,7 +30,7 @@ export function isTaskGraphResultPageLike(value: unknown): boolean {
   if (!value || typeof value !== "object") return false
   if (nodeTypes.isProxy(value)) return true
   if (Array.isArray(value)) return false
-  try { return Reflect.ownKeys(value).some(key => typeof key === "string" && (PAGE_KEYS.has(key) || key === "sourceToken" || key === "sourceResultStatus" || key === "verificationStatus" || key === "observation")) }
+  try { return Reflect.ownKeys(value).some(key => typeof key === "string" && (PAGE_KEYS.has(key) || key === "sourceToken" || key === "sourceResultStatus")) }
   catch { return true }
 }
 
@@ -40,10 +49,12 @@ function safeLegacyListInput(value: unknown): { includeTerminal?: boolean } | nu
   } catch { return null }
 }
 
-/** Redacts the complete strict envelope, then restores only canonical item job IDs. */
+/** Redacts each strict envelope, then restores only canonical candidate IDs and the opaque history cursor. */
 export function prepareTaskGraphResultPageOutput(value: unknown): PreparedLifecycleValue {
   const historical = parseTaskGraphHistoricalDiscoveryPage(value)
   if (historical) return prepareHistoricalDiscoveryPageOutput(historical)
+  const recovery = parseTaskGraphDiscoveryRecoveryPage(value)
+  if (recovery) return prepareTaskGraphDiscoveryRecoveryPageOutput(recovery)
   const page = parseTaskGraphResultPage(value)
   if (!page) throw new Error("invalid_page")
   const redacted = prepareLifecycleValue(page)
@@ -63,32 +74,57 @@ export function prepareTaskGraphResultPageOutput(value: unknown): PreparedLifecy
   return restored
 }
 
-function prepareHistoricalDiscoveryPageOutput(value: NonNullable<ReturnType<typeof parseTaskGraphHistoricalDiscoveryPage>>): PreparedLifecycleValue {
-  const redacted = prepareLifecycleValue(value)
-  if (value.availability === "unavailable") {
+function prepareHistoricalDiscoveryPageOutput(page: NonNullable<ReturnType<typeof parseTaskGraphHistoricalDiscoveryPage>>): PreparedLifecycleValue {
+  const redacted = prepareLifecycleValue(page)
+  if (page.availability === "unavailable") {
     if (!parseTaskGraphHistoricalDiscoveryPage(redacted.safe)) throw new Error("invalid_redaction")
     return redacted
   }
   const safePage = plainRecord(redacted.safe)
   const safeItems = safePage ? denseArray(safePage.items) : null
   const rootKeys = "availability,items,nextOffset,observation,offset,schemaVersion,sourceResultStatus,sourceToken,totalCount,truncated,trust,verificationStatus"
-  if (!safePage || Object.keys(safePage).sort().join(",") !== rootKeys || !safeItems || safeItems.length !== value.items.length) throw new Error("invalid_redaction")
+  if (!safePage || Object.keys(safePage).sort().join(",") !== rootKeys || !safeItems || safeItems.length !== page.items.length) throw new Error("invalid_redaction")
   const items = safeItems.map((item, index) => {
     const row = plainRecord(item)
     if (!row || Object.keys(row).join(",") !== "jobId") throw new Error("invalid_redaction")
-    return { jobId: value.items[index]!.jobId }
+    return { jobId: page.items[index]!.jobId }
   })
-  const restored = prepareSafeValue({ ...safePage, sourceToken: value.sourceToken, items } as RepositoryJsonValue)
+  const restored = prepareSafeValue({ ...safePage, sourceToken: page.sourceToken, items } as RepositoryJsonValue)
   if (!parseTaskGraphHistoricalDiscoveryPage(restored.safe)) throw new Error("invalid_redaction")
   return restored
 }
 
-function hasHistoricalDiscoveryMode(value: unknown): boolean {
+function prepareTaskGraphDiscoveryRecoveryPageOutput(page: NonNullable<ReturnType<typeof parseTaskGraphDiscoveryRecoveryPage>>): PreparedLifecycleValue {
+  const redacted = prepareLifecycleValue(page)
+  if (page.availability === "unavailable") {
+    if (!parseTaskGraphDiscoveryRecoveryPage(redacted.safe)) throw new Error("invalid_redaction")
+    return redacted
+  }
+  const safePage = plainRecord(redacted.safe)
+  const safeItems = safePage ? denseArray(safePage.items) : null
+  const rootKeys = "attemptCount,availability,graphRevision,items,nextOffset,observation,offset,schemaVersion,taskStatus,totalCount,truncated,trust,verificationStatus"
+  if (!safePage || Object.keys(safePage).sort().join(",") !== rootKeys || !safeItems || safeItems.length !== page.items.length) throw new Error("invalid_redaction")
+  const items = safeItems.map((item, index) => {
+    const row = plainRecord(item)
+    if (!row || Object.keys(row).sort().join(",") !== "jobId") throw new Error("invalid_redaction")
+    return { jobId: page.items[index]!.jobId }
+  })
+  const restored = prepareSafeValue({ ...safePage, items } as RepositoryJsonValue)
+  if (!parseTaskGraphDiscoveryRecoveryPage(restored.safe)) throw new Error("invalid_redaction")
+  return restored
+}
+
+function hasModeProperty(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value) || nodeTypes.isProxy(value)) return false
+  try { return Reflect.ownKeys(value).includes("mode") } catch { return true }
+}
+
+function readMode(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value) || nodeTypes.isProxy(value)) return undefined
   try {
     const descriptor = Object.getOwnPropertyDescriptor(value, "mode")
-    return Boolean(descriptor && "value" in descriptor && descriptor.value === "historical_discovery")
-  } catch { return false }
+    return descriptor?.enumerable && "value" in descriptor ? descriptor.value : undefined
+  } catch { return undefined }
 }
 
 function plainRecord(value: unknown): Record<string, unknown> | null {

@@ -14,7 +14,7 @@ import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, re
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
 export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
-  const safeInputResult = stripTaskGraphMetadata(input.result)
+  const safeInputResult = stripTaskGraphMetadata(stripNonterminalDiscoveryRecovery(input.result, input.status, input.retry))
   const graphType = taskGraphEventType(input.status, input.retry)
   let graph = graphType ? await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: graphType, attemptCount: input.attemptCount, failureReason: input.failureReason }) : null
   if (!graph || "blocked" in graph) return { graph, status: input.status, failureReason: input.failureReason, result: safeInputResult }
@@ -66,6 +66,14 @@ function plainObject(value: unknown): Record<string, unknown> | null {
   let parsed = value; if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return null } }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null; const prototype = Object.getPrototypeOf(parsed)
   return prototype === Object.prototype || prototype === null ? parsed as Record<string, unknown> : null
+}
+function stripNonterminalDiscoveryRecovery(value: unknown, status: string, retry: boolean): unknown {
+  if (status === "failed" && !retry) return value
+  const source = plainObject(value)
+  if (!source || !Object.hasOwn(source, "discoveryRecovery")) return value
+  const result = { ...source }
+  delete result.discoveryRecovery
+  return result
 }
 function stripTaskGraphMetadata(value: unknown, active = new Set<object>(), depth = 0): unknown {
   if (depth > 32) return null

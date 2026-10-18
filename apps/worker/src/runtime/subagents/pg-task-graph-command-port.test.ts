@@ -7,6 +7,8 @@ import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
+import { DISCOVERY_RECOVERY_SCHEMA_VERSION } from "./task-graph-discovery-recovery-contract.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { steeringReconciliationIdempotencyKey } from "./steering-reconciliation-contract.js"
 import type { PgSubagentPool } from "./types.js"
@@ -734,6 +736,59 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(port.readHistoricalDiscoveryPage).toBeTypeOf("function")
     await expect(port.readHistoricalDiscoveryPage!(input.scope, { offset: 1 })).rejects.toThrow("task_graph_historical_discovery_request_invalid")
     expect(fake.calls).toEqual([])
+  })
+
+  it("reads a failed Scout recovery page from the same locked graph load without writes or extra queries", async () => {
+    const input = scheduleInput()
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
+    const registeredScoutEnvelope = {
+      role: "scout", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+      allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"],
+    }
+    const graphContent = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "scout-a", templateId: "scout",
+      goal: "Find jobs", successCriteria: ["Persist candidates"], dependsOn: [], depth: 1, taskId: "child-1",
+      verificationDisposition: "typed", verification, registeredScoutEnvelope }] }
+    const jobIds = Array.from({ length: 4 }, (_, index) => `c${String(index + 1).padStart(24, "0")}`)
+    const taskRows = [{ id: "child-1", status: "failed", role: "scout", taskType: "job_discovery", attemptCount: 3,
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+      allowedActions: [...registeredScoutEnvelope.allowedActions], contextIsObject: true, hasPrivateSelectionContext: false,
+      failureReason: "private provider error",
+      result: { status: "failed", finalItemId: "private-final", taskGraphVerificationReport: {
+        verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+        criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null,
+      }, discoveryRecovery: { schemaVersion: DISCOVERY_RECOVERY_SCHEMA_VERSION, attemptCount: 3, jobIds, truncated: false } },
+    }]
+    const fake = fakePool(input, { includeReplay: false, graphContent, graphRevision: 8, taskRows })
+    const { stepId: _stepId, ...scope } = input.scope
+    const port = createPgTaskGraphCommandPort(fake.pool)
+    const request = { mode: "discovery_recovery" as const, nodeKey: "scout-a", expectedRevision: 8, offset: 0, expectedAttemptCount: 3 }
+    await expect(port.readCurrentDiscoveryRecoveryPage!(scope, request)).resolves.toMatchObject({
+      availability: "available", observation: "partial_discovery", verificationStatus: "unverified",
+      graphRevision: 8, attemptCount: 3, taskStatus: "failed", totalCount: 4, nextOffset: 3,
+      items: [{ jobId: jobIds[0] }, { jobId: jobIds[1] }, { jobId: jobIds[2] }],
+    })
+    await expect(port.readCurrentDiscoveryRecoveryPage!(scope, { ...request, offset: 3, expectedAttemptCount: 3 }))
+      .resolves.toMatchObject({ availability: "available", offset: 3, nextOffset: null, items: [{ jobId: jobIds[3] }] })
+    const firstTransaction = fake.calls.slice(0, fake.calls.findIndex(call => call.sql === "COMMIT") + 1)
+    expect(firstTransaction[0]?.sql).toBe("BEGIN")
+    expect(firstTransaction.at(-1)?.sql).toBe("COMMIT")
+    expect(firstTransaction.filter(call => call.sql.startsWith('SELECT item."id"'))).toHaveLength(1)
+    expect(firstTransaction.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))).toHaveLength(1)
+    expect(firstTransaction.filter(call => call.sql.startsWith('SELECT event."type"'))).toHaveLength(1)
+    expect(firstTransaction.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+    expect(JSON.stringify(fake.calls.map(call => call.values))).not.toContain("private provider error")
+  })
+
+  it.each([
+    ["session", "task_graph_session_fenced"], ["turn", "task_graph_turn_fenced"], ["parent", "task_graph_parent_fenced"],
+  ] as const)("does not project recovery IDs after a %s owner-scope fence", async (fence, error) => {
+    const input = scheduleInput(), fake = fakePool(input, { includeReplay: false, failFence: fence })
+    const { stepId: _stepId, ...scope } = input.scope
+    await expect(createPgTaskGraphCommandPort(fake.pool).readCurrentDiscoveryRecoveryPage!(scope,
+      { mode: "discovery_recovery", nodeKey: "scout-a", expectedRevision: 2, offset: 0 })).rejects.toThrow(error)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT task."id", task."status"'))).toBe(false)
   })
 
   it("preserves the durable-receipt error when paging a missing current graph", async () => {

@@ -11,6 +11,7 @@ import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphN
 import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
 import type { TaskGraphResultProjection } from "./task-graph-result-projection-contract.js"
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import type { TaskGraphDiscoveryRecoveryPage, TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
@@ -225,4 +226,6 @@ export type TaskGraphCommandPort = Readonly<{
   readCurrentResultPage?(scope: TaskGraphReadScope, request: TaskGraphResultPageRequest): Promise<TaskGraphResultPage>
   /** Reads unverified Scout IDs only from a reselected same-session prior Root. */
   readHistoricalDiscoveryPage?(scope: TaskGraphExecutionScope, request: TaskGraphHistoricalDiscoveryPageRequest): Promise<TaskGraphHistoricalDiscoveryPage>
+  /** Reads bounded unverified canonical IDs from a failed ordinary Scout under the same owner fence. */
+  readCurrentDiscoveryRecoveryPage?(scope: TaskGraphReadScope, request: TaskGraphDiscoveryRecoveryPageRequest): Promise<TaskGraphDiscoveryRecoveryPage>
 }>
