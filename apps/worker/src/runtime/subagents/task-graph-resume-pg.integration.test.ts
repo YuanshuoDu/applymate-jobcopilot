@@ -11334,7 +11334,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             await waitForPersistedTaskWait(pool!, discoveryOwner.turnId, waitKey)
             const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
             const result = task.role === "scout"
-              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Found the fixture role" }
+              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: evidence.source, url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Found the fixture role" }
               : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId, score: 8.5, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Strong match" }
             const resultText = JSON.stringify(result)
             if (task.role === "scout" && discoveryScoutResultProjections.length < 4) {
@@ -12275,7 +12275,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               ? {
                 schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
                 candidates: selected.map((job, index) => ({
-                  jobId: String(job.id), source: "fixture", url: null, evidenceIds: [evidence[index]!.id],
+                  jobId: String(job.id), source: evidence[index]!.source, url: null, evidenceIds: [evidence[index]!.id],
                 })),
                 evidence, summary: "Returned canonical owner-job evidence",
               }
@@ -12637,7 +12637,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const evidence = selected.map(job => ({ id: `read:job:${job.id}`, kind: "job", ref: job.id, source: "greenhouse" }))
             const structuredResult = task.role === "scout"
               ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
-                candidates: selected.map((job, index) => ({ jobId: job.id as string, source: "fixture", url: null, evidenceIds: [evidence[index]!.id] })),
+                candidates: selected.map((job, index) => ({ jobId: job.id as string, source: evidence[index]!.source, url: null, evidenceIds: [evidence[index]!.id] })),
                 evidence, summary: "Four current Scout candidates" }
               : task.role === "analyst"
                 ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
@@ -13388,7 +13388,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (!jobs.some(job => job.id === jobId)) throw new Error("Lease recovery child could not observe its persisted fixture job")
             const evidence = { id: "read:job:" + jobId, kind: "job", ref: jobId, source: "greenhouse" }
             const structuredResult = task.role === "scout"
-              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Returned the persisted lease recovery candidate" }
+              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: evidence.source, url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Returned the persisted lease recovery candidate" }
               : task.role === "analyst"
                 ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId, score: 8.5, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Scored the persisted lease recovery candidate" }
                 : null
