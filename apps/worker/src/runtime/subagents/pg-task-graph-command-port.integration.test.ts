@@ -2,25 +2,32 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
 
+import { createAgentArtifactRepository } from "../../db/agent-artifact-repo.js"
+import { createCanonicalScheduledDraftRuntime } from "../scheduled-draft-runtime.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
-import { canonicalTaskGraphJson, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
 import { transaction } from "./pg-store-persistence.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "../selected-job-preparation.js"
 import type { TurnLease } from "../turns/lease.js"
-import { taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
+import { verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { readScheduledDraftCandidateBinding, validateScheduledDraftCandidateWitness } from "./scheduled-draft-candidate.js"
+import type { TaskGraphVerificationDependencyBinding } from "./task-graph-verification-report.js"
 import { INTERACTIVE_DISCOVERY_ROOT_TOOLS, rootTaskAllowedActions, rootToolSurface } from "../interactive-discovery-contract.js"
 import { isSelectedJobRootTool } from "../canonical-turn-task-graph-context.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_EVENT_TYPE } from "./steering-reconciliation-contract.js"
+import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const ANALYST_VERIFICATION = {
@@ -359,6 +366,174 @@ function readScope(value: Fixture): TaskGraphReadScope {
     turnLeaseOwner: value.turnLeaseOwner, turnLeaseVersion: 1,
     parentLeaseOwner: value.parentLeaseOwner, parentAttemptCount: 1,
   }
+}
+
+const SCHEDULED_DRAFT_SCOUT_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "scout",
+  criteria: [
+    { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+    { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+  ],
+} as const
+
+function scheduledDraftAnalystVerification(hasFinding: boolean, scoutKey: string): TaskGraphVerificationContract {
+  return {
+    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+    role: "analyst",
+    criteria: [
+      { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: scoutKey } },
+      hasFinding
+        ? { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }
+        : { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
+    ],
+  } as const
+}
+
+function scheduledDraftInput(
+  value: Fixture,
+  expectedRevision: number,
+  nodes: TaskGraphScheduleInput["proposal"]["nodes"],
+): TaskGraphScheduleInput {
+  const base = scheduleInput(value, 0, true)
+  return {
+    scope: base.scope,
+    proposal: { expectedRevision, nodes },
+    templates: {
+      ...TASK_GRAPH_TEMPLATES,
+      cover_letter_writer: {
+        role: "writer", taskType: "cover_letter_draft", allowedActions: ["artifact.version.read", "cover_letter.draft"],
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }, context: { scheduledDraftMode: true },
+      },
+      cover_letter_reviewer: {
+        role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.version.read", "artifact.review"],
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }, context: { scheduledDraftMode: true },
+      },
+    },
+  }
+}
+
+function scheduledDraftGraphScope(value: Fixture) {
+  return { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    rootTaskId: value.rootTaskId, parentTaskId: value.rootTaskId }
+}
+
+function scheduledDraftRoleResult(role: "scout" | "analyst", jobId: string, hasFinding = true, score = 8): unknown {
+  const evidence = [{ id: `model-job-${role}`, kind: "job", ref: jobId, source: "fixture" }]
+  if (role === "scout") return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed",
+    candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence[0]!.id] }], evidence, summary: "Fixture candidate",
+  }
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed",
+    findings: hasFinding ? [{ jobId, score, evidenceIds: [evidence[0]!.id] }] : [], evidence,
+    summary: hasFinding ? "Fixture finding" : "No fixture finding",
+  }
+}
+
+async function persistVerifiedScheduledDraftRole(pool: PgPool, value: Fixture, snapshot: ReturnType<typeof parseTaskGraphSnapshot>, node: StoredTaskGraphNode,
+  structuredResult: unknown, dependencies?: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>,
+  dependencyBindings?: readonly TaskGraphVerificationDependencyBinding[]) {
+  const attemptCount = 1, stepId = `scheduled-draft-step-${randomUUID()}`, callId = `scheduled-draft-call-${randomUUID()}`
+  const callItemId = `${callId}-item`, resultItemId = `${callId}-result`
+  const task = await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "attemptCount" = $4,
+      "leaseOwner" = $5, "leaseExpiresAt" = CURRENT_TIMESTAMP + INTERVAL '5 minutes',
+      "startedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "status" IN ('queued', 'waiting')`,
+  [node.taskId, value.sessionId, value.turnId, attemptCount, `scheduled-draft-owner-${callId}`])
+  if (task.rowCount !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not lease its typed task")
+  const ordinalResult = await pool.query<{ ordinal: number }>(`SELECT COALESCE(MAX("ordinal"), 0) + 1 AS "ordinal"
+    FROM "agent_steps" WHERE "turnId" = $1 AND "attempt" = $2`, [value.turnId, attemptCount])
+  const ordinal = Number(ordinalResult.rows[0]?.ordinal)
+  if (!Number.isSafeInteger(ordinal) || ordinal < 1) throw new Error("Scheduled-draft PostgreSQL fixture could not allocate a step ordinal")
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt", "completedAt")
+    VALUES ($1, $2, $3, $4, $5, $6, 'completed', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [stepId, value.sessionId, value.turnId, node.taskId, ordinal, attemptCount])
+  const job = (structuredResult as { evidence?: Array<{ ref?: string }> }).evidence?.[0]?.ref
+  if (typeof job !== "string") throw new Error("Scheduled-draft PostgreSQL fixture has no job evidence")
+  const output = { job: { id: job, source: "fixture" } }
+  const callContent = { toolCallId: callId, toolName: "jobs.get", toolVersion: "1", input: { jobId: job }, status: "completed", errorCode: null }
+  const resultContent = { toolCallId: callId, output, errorCode: null }
+  await pool.query(`INSERT INTO "agent_items"
+    ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "startedAt", "completedAt", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+      ($7, $2, $3, $4, $5, 'tool_result', 'completed', $8::jsonb, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [callItemId, value.sessionId, value.turnId, stepId, node.taskId, JSON.stringify(callContent), resultItemId, JSON.stringify(resultContent)])
+  await insertReconciliationEvent(pool, value, {
+    id: randomUUID(), sequence: await nextEventSequence(pool, value), type: "tool_call.started", actor: "subagent",
+    itemId: callItemId, taskId: node.taskId, correlationId: callId, idempotencyKey: `scheduled-draft:${callId}:started`,
+    payload: { taskId: node.taskId, toolCallId: callId, toolName: "jobs.get" },
+  })
+  await insertReconciliationEvent(pool, value, {
+    id: randomUUID(), sequence: await nextEventSequence(pool, value), type: "tool_call.completed", actor: "subagent",
+    itemId: callItemId, taskId: node.taskId, correlationId: callId, idempotencyKey: `scheduled-draft:${callId}:completed`,
+    payload: { taskId: node.taskId, toolCallId: callId, toolName: "jobs.get", toolVersion: "1", status: "completed", errorCode: null, output },
+  })
+  const verified = await verifyTaskGraphNodeEvidence(pool, {
+    scope: { ...scheduledDraftGraphScope(value), taskId: node.taskId, attemptCount }, snapshot, node, structuredResult,
+    ...(dependencies ? { dependencies } : {}),
+  })
+  if (!verified.verified || verified.structuredResult === undefined) throw new Error(`Scheduled-draft PostgreSQL fixture evidence did not verify: ${verified.evaluation.reasonCode}`)
+  const report = { ...verified.report, ...(dependencyBindings ? { dependencyBindings } : {}) }
+  const result = {
+    status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: null,
+    finalText: "Fixture result verified from PostgreSQL evidence", structuredResult: verified.structuredResult,
+    taskGraphVerificationReport: report,
+  }
+  const completed = await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'completed', "failureReason" = NULL,
+      "result" = $4::jsonb, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+      "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "status" = 'running' AND "attemptCount" = $5`,
+  [node.taskId, value.sessionId, value.turnId, JSON.stringify(result), attemptCount])
+  if (completed.rowCount !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not persist its verified task")
+  return verified
+}
+
+async function seedVerifiedScheduledDraftSources(pool: PgPool, value: Fixture, command: ReturnType<typeof createPgTaskGraphCommandPort>, sources: readonly {
+  readonly scoutKey: string; readonly analystKey: string; readonly jobId: string; readonly score: number; readonly hasFinding: boolean
+}[]) {
+  const nodes: TaskGraphScheduleInput["proposal"]["nodes"][number][] = []
+  for (const source of sources) {
+    nodes.push({ key: source.scoutKey, templateId: "scout", goal: `Find ${source.jobId}`, successCriteria: ["Return an evidenced job candidate"],
+      verification: SCHEDULED_DRAFT_SCOUT_VERIFICATION, dependsOn: [] })
+    nodes.push({ key: source.analystKey, templateId: "analyst", goal: `Verify ${source.jobId}`, successCriteria: ["Return a dependency-bound analysis"],
+      verification: scheduledDraftAnalystVerification(source.hasFinding, source.scoutKey), dependsOn: [source.scoutKey] })
+  }
+  const input = scheduledDraftInput(value, 0, nodes)
+  const receipt = await command.appendAndSchedule(input)
+  if (receipt.status !== "accepted" || receipt.revision !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not create its Scout and Analyst graph")
+  const row = await pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
+  [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId])
+  const snapshot = parseTaskGraphSnapshot(row.rows[0]?.content)
+  const analysts: StoredTaskGraphNode[] = []
+  for (const source of sources) {
+    const scout = snapshot.nodes.find(node => node.key === source.scoutKey), analyst = snapshot.nodes.find(node => node.key === source.analystKey)
+    if (!scout || !analyst) throw new Error("Scheduled-draft PostgreSQL fixture could not read its Scout and Analyst nodes")
+    await persistVerifiedScheduledDraftRole(pool, value, snapshot, scout, scheduledDraftRoleResult("scout", source.jobId))
+    const scoutDependencies = await verifyCompletedScoutDependencies(pool, scheduledDraftGraphScope(value), snapshot, analyst)
+    if (!scoutDependencies) throw new Error("Scheduled-draft PostgreSQL fixture could not reconstruct its completed Scout proof")
+    await persistVerifiedScheduledDraftRole(pool, value, snapshot, analyst,
+      scheduledDraftRoleResult("analyst", source.jobId, source.hasFinding, source.score), scoutDependencies.projections, scoutDependencies.bindings)
+    analysts.push(analyst)
+  }
+  return { snapshot, analysts }
+}
+
+async function scheduledDraftDurableRows(pool: PgPool, value: Fixture): Promise<Record<string, unknown>> {
+  const [tasks, graph, events, outbox, sequence] = await Promise.all([
+    pool.query(`SELECT "id", "status", "role", "context", "result" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [value.sessionId, value.rootTaskId]),
+    pool.query(`SELECT "id", "revision", "content" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "type" = 'task_graph'`, [taskGraphItemId(value.rootTaskId), value.sessionId]),
+    pool.query(`SELECT "id", "itemId", "taskId", "sequence", "type", "idempotencyKey", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence"`, [value.sessionId, value.turnId]),
+    pool.query(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox"
+      WHERE "aggregateId" = $1 ORDER BY "idempotencyKey"`, [value.sessionId]),
+    pool.query(`SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [value.sessionId]),
+  ])
+  return { tasks: tasks.rows, graph: graph.rows, events: events.rows, outbox: outbox.rows, sequence: sequence.rows }
 }
 
 async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> {
@@ -1544,6 +1719,302 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       expect(await graphRows(adminPool!, concurrentOwner)).toEqual(committed)
     } finally {
       await racingPool.end()
+    }
+  }, 60_000)
+
+  it("atomically binds the verified Analyst candidate to scheduled Writer and Reviewer contexts and reuses it after restart", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const highJobId = `scheduled-draft-job-high-${value.sessionId}`
+    const lowJobId = `scheduled-draft-job-low-${value.sessionId}`
+    const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
+      { scoutKey: "scout-high", analystKey: "analyst-high", jobId: highJobId, score: 9, hasFinding: true },
+      { scoutKey: "scout-low", analystKey: "analyst-low", jobId: lowJobId, score: 6, hasFinding: true },
+    ])
+    const scope = scheduledDraftGraphScope(value)
+    await expect(readScheduledDraftCandidateBinding(adminPool!, scope)).resolves.toEqual({ status: "absent" })
+
+    const writerReviewer = scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft for the verified Analyst job", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-high", "analyst-low"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ])
+    const accepted = await command.appendAndSchedule(writerReviewer)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 2, nodes: [
+      { key: "writer", status: "queued" }, { key: "reviewer", status: "waiting" },
+    ] })
+
+    const taskContexts = await adminPool!.query<{ role: string; context: unknown }>(`SELECT "role", "context" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND "parentTaskId" = $2 AND "role" IN ('writer', 'reviewer') ORDER BY "role"`,
+    [value.sessionId, value.rootTaskId])
+    expect(taskContexts.rows).toHaveLength(2)
+    const writerContext = taskContexts.rows.find(row => row.role === "writer")?.context as Record<string, unknown> | undefined
+    const reviewerContext = taskContexts.rows.find(row => row.role === "reviewer")?.context as Record<string, unknown> | undefined
+    expect(writerContext?.selectedJobPreparation).toEqual({ jobId: highJobId })
+    expect(reviewerContext?.selectedJobPreparation).toEqual({ jobId: highJobId })
+    expect(writerContext?.scheduledDraftCandidateWitness).toEqual(reviewerContext?.scheduledDraftCandidateWitness)
+    expect(writerContext?.scheduledDraftCandidateWitness).toMatchObject({
+      candidate: { jobId: highJobId, score: 9 }, sourceAnalystKeys: ["analyst-high"],
+      analysts: [{ nodeKey: "analyst-high" }, { nodeKey: "analyst-low" }],
+    })
+
+    const probe = await commandPool!.connect()
+    let persistedBinding: Awaited<ReturnType<typeof readScheduledDraftCandidateBinding>> | undefined
+    try {
+      await probe.query("BEGIN")
+      await probe.query(`SET LOCAL ROLE "${roleName}"`)
+      await probe.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+      persistedBinding = await readScheduledDraftCandidateBinding(probe, scope)
+      expect(await readScheduledDraftCandidateBinding(probe, { ...scope, turnId: value.foreignTurnId })).toEqual({ status: "absent" })
+      expect(await readScheduledDraftCandidateBinding(probe, {
+        ...scope, rootTaskId: value.foreignRootTaskId, parentTaskId: value.foreignRootTaskId,
+      })).toEqual({ status: "absent" })
+      expect(await readScheduledDraftCandidateBinding(probe, {
+        userId: value.foreignUserId, sessionId: value.foreignSessionId, turnId: value.foreignTurnId,
+        rootTaskId: value.foreignRootTaskId, parentTaskId: value.foreignRootTaskId,
+      })).toEqual({ status: "absent" })
+    } finally {
+      await probe.query("ROLLBACK").catch(() => undefined)
+      probe.release()
+    }
+    expect(persistedBinding).toMatchObject({
+      status: "bound", jobId: highJobId, graphRevision: 2,
+      witness: writerContext?.scheduledDraftCandidateWitness,
+    })
+    if (!persistedBinding || persistedBinding.status !== "bound") throw new Error("Scheduled-draft candidate binding was not persisted")
+
+    const restartedPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    try {
+      const restarted = createPgTaskGraphCommandPort(restrictedTransactionPool(restartedPool, roleName, value.userId))
+      await expect(restarted.appendAndSchedule(writerReviewer)).resolves.toEqual({ ...accepted, status: "duplicate" })
+    } finally {
+      await restartedPool.end()
+    }
+    await expect(readScheduledDraftCandidateBinding(adminPool!, scope)).resolves.toMatchObject({
+      status: "bound", jobId: persistedBinding.jobId, graphRevision: persistedBinding.graphRevision, witness: persistedBinding.witness,
+    })
+
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scope, persistedBinding.snapshot, persistedBinding.graphRevision,
+      persistedBinding.jobId, persistedBinding.witness)).resolves.toBe(true)
+    const sourceTask = sources.analysts.find(node => node.key === "analyst-high")?.taskId
+    if (!sourceTask) throw new Error("Scheduled-draft PostgreSQL fixture lost its highest-scoring Analyst")
+    const changedSource = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "result" = jsonb_set("result",
+      '{structuredResult,findings,0,score}', '7'::jsonb) WHERE "id" = $1 AND "sessionId" = $2`, [sourceTask, value.sessionId])
+    expect(changedSource.rowCount).toBe(1)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scope, persistedBinding.snapshot, persistedBinding.graphRevision,
+      persistedBinding.jobId, persistedBinding.witness)).resolves.toBe(false)
+  }, 60_000)
+
+  it("rejects scheduled drafting without a verified Analyst finding before any TaskGraph task, event, or outbox write", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
+      { scoutKey: "scout-no-finding", analystKey: "analyst-no-finding", jobId: `scheduled-draft-job-no-finding-${value.sessionId}`, score: 8, hasFinding: false },
+    ])
+    await expect(readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value))).resolves.toEqual({ status: "absent" })
+    const writerReviewer = scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft only from a verified Analyst finding", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-no-finding"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ])
+    const before = await scheduledDraftDurableRows(adminPool!, value)
+
+    await expect(command.appendAndSchedule(writerReviewer)).rejects.toMatchObject({ code: "task_graph_scheduled_draft_candidate_missing" })
+
+    expect(await scheduledDraftDurableRows(adminPool!, value)).toEqual(before)
+    expect(await readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value))).toEqual({ status: "absent" })
+  }, 60_000)
+
+  it("rejects a scheduled draft plan that omits the highest verified Analyst candidate before durable writes", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const highJobId = `scheduled-draft-job-high-${value.sessionId}`
+    await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
+      { scoutKey: "scout-high", analystKey: "analyst-high", jobId: highJobId, score: 9, hasFinding: true },
+      { scoutKey: "scout-low", analystKey: "analyst-low", jobId: `scheduled-draft-job-low-${value.sessionId}`, score: 6, hasFinding: true },
+    ])
+    const writerReviewer = scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft for the plan-selected Analyst job", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-low"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ])
+    const before = await scheduledDraftDurableRows(adminPool!, value)
+
+    await expect(command.appendAndSchedule(writerReviewer)).rejects.toMatchObject({ code: "task_graph_scheduled_draft_candidate_dependency_missing" })
+
+    expect(await scheduledDraftDurableRows(adminPool!, value)).toEqual(before)
+    expect(await readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value))).toEqual({ status: "absent" })
+  }, 60_000)
+
+  it("invalidates a persisted candidate witness when its source Analyst attempt changes", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const jobId = `scheduled-draft-job-attempt-${value.sessionId}`
+    const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
+      { scoutKey: "scout-attempt", analystKey: "analyst-attempt", jobId, score: 9, hasFinding: true },
+    ])
+    await command.appendAndSchedule(scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft from the verified finding", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-attempt"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ]))
+    const binding = await readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value))
+    if (binding.status !== "bound") throw new Error("Scheduled-draft attempt fixture did not persist its candidate binding")
+    const analystTaskId = sources.analysts[0]?.taskId
+    if (!analystTaskId) throw new Error("Scheduled-draft attempt fixture lost its Analyst task")
+
+    const bumped = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 2
+      WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = 1`, [analystTaskId, value.sessionId])
+    expect(bumped.rowCount).toBe(1)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
+      binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(false)
+
+    const restored = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1
+      WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = 2`, [analystTaskId, value.sessionId])
+    expect(restored.rowCount).toBe(1)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), binding.snapshot,
+      binding.graphRevision, binding.jobId, binding.witness)).resolves.toBe(true)
+  }, 60_000)
+
+  it("rejects validation of a persisted candidate witness after a structural graph append", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const jobId = `scheduled-draft-job-revision-${value.sessionId}`
+    await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
+      { scoutKey: "scout-revision", analystKey: "analyst-revision", jobId, score: 9, hasFinding: true },
+    ])
+    await command.appendAndSchedule(scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft from the verified finding", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-revision"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ]))
+    const binding = await readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value))
+    if (binding.status !== "bound") throw new Error("Scheduled-draft revision fixture did not persist its candidate binding")
+
+    await expect(command.appendAndSchedule(scheduledDraftInput(value, 2, [
+      { key: "analyst-after-binding", templateId: "analyst", goal: "Append an unrelated graph node", successCriteria: ["Persist the follow-up node"], dependsOn: [] },
+    ]))).resolves.toMatchObject({ status: "accepted", revision: 3 })
+    const graph = await adminPool!.query<{ revision: number; content: unknown }>(`SELECT "revision", "content" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
+    [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId])
+    const currentSnapshot = parseTaskGraphSnapshot(graph.rows[0]?.content)
+    expect(graph.rows[0]?.revision).toBe(3)
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scheduledDraftGraphScope(value), currentSnapshot,
+      3, binding.jobId, binding.witness)).resolves.toBe(false)
+    await expect(readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value)))
+      .rejects.toThrow("scheduled_draft_candidate_binding_invalid")
+  }, 60_000)
+
+  it("blocks terminal finalization when a persisted Analyst attempt changes after completion was accepted", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const jobId = `scheduled-draft-job-finalize-${value.sessionId}`
+    const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
+      { scoutKey: "scout-finalize", analystKey: "analyst-finalize", jobId, score: 9, hasFinding: true },
+    ])
+    await adminPool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+      VALUES ($1, $2, 'Fixture GmbH', 'Software Engineer', 'Berlin', 'saved', 'https://jobs.example.invalid/finalization',
+        'Original selected source for finalization', 'test', CURRENT_TIMESTAMP)`, [jobId, value.userId])
+    await adminPool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
+      VALUES ($1, $2, 'Finalization fixture base', $3::jsonb, 'base', 'manual', TRUE, CURRENT_TIMESTAMP)`, [
+      `scheduled-draft-resume-${value.sessionId}`, value.userId, JSON.stringify({ text: "Fixture base resume" }),
+    ])
+    const selectedJobContext = await loadSelectedJobArtifactContext(adminPool!, value.userId, jobId)
+    await command.appendAndSchedule(scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft from the verified finding", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-finalize"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ]))
+    const pair = await adminPool!.query<{ id: string; role: string }>(`SELECT "id", "role" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND "parentTaskId" = $2 AND "role" IN ('writer', 'reviewer') ORDER BY "role"`,
+    [value.sessionId, value.rootTaskId])
+    const writer = pair.rows.find(row => row.role === "writer"), reviewer = pair.rows.find(row => row.role === "reviewer")
+    if (!writer || !reviewer) throw new Error("Scheduled-draft finalization fixture did not create its Writer and Reviewer")
+    const sourceDigest = selectedJobContext.preparation.sourceDigest
+    const contentHash = `sha256:${"b".repeat(64)}`
+    const reviewHash = `sha256:${"c".repeat(64)}`
+    const constraintHash = `sha256:${"d".repeat(64)}`
+    const requestHash = `sha256:${"e".repeat(64)}`
+    const artifactRef = { artifactId: `scheduled-draft-artifact-${value.sessionId}`, version: 1, contentHash, sourceDigest }
+    const artifactVersionId = `scheduled-draft-version-${value.sessionId}`
+    const artifactContent = { text: "Fixture draft saved" }
+    await adminPool!.query(`INSERT INTO "agent_artifact"
+      ("id", "userId", "jobId", "artifactType", "lifecycle", "content", "hash", "constraintHash", "version", "updatedAt")
+      VALUES ($1, $2, $3, 'cover_letter', 'draft', $4::jsonb, $5, $6, 1, CURRENT_TIMESTAMP)`, [
+      artifactRef.artifactId, value.userId, jobId, JSON.stringify(artifactContent), contentHash, constraintHash,
+    ])
+    await adminPool!.query(`INSERT INTO "agent_artifact_version"
+      ("id", "artifactId", "version", "userId", "sessionId", "jobId", "artifactType", "content", "contentHash", "sourceDigest",
+       "constraintHash", "provenanceRefs", "evidenceRefs", "baseId", "baseHash", "previousHash", "taskId", "toolCallId", "requestHash")
+      VALUES ($1, $2, 1, $3, $4, $5, 'cover_letter', $6::jsonb, $7, $8, $9, ARRAY[]::text[], $10::text[], $11, $12, NULL, $13, $14, $15)`, [
+      artifactVersionId, artifactRef.artifactId, value.userId, value.sessionId, jobId, JSON.stringify(artifactContent), contentHash,
+      sourceDigest, constraintHash, [`job:${jobId}`], `scheduled-draft-base-${value.sessionId}`, `sha256:${"f".repeat(64)}`,
+      writer.id, `scheduled-draft-write-${value.sessionId}`, requestHash,
+    ])
+    await adminPool!.query(`INSERT INTO "agent_artifact_review"
+      ("id", "artifactVersionId", "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest",
+       "currentSourceDigest", "status", "findings", "evidenceRefs", "taskId", "toolCallId", "requestHash", "reviewHash")
+      VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $8, 'passed', '[]'::jsonb, $9::text[], $10, $11, $12, $13)`, [
+      `scheduled-draft-review-row-${value.sessionId}`, artifactVersionId, value.userId, value.sessionId, jobId, artifactRef.artifactId,
+      contentHash, sourceDigest, [`job:${jobId}`], reviewer.id, `scheduled-draft-review-${value.sessionId}`, requestHash, reviewHash,
+    ])
+    const writerResult = {
+      status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: null, finalText: "Fixture draft saved",
+      structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef },
+    }
+    const reviewerResult = {
+      status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: null, finalText: "Fixture review passed",
+      structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "passed", reviewHash },
+    }
+    for (const [taskId, result] of [[writer.id, writerResult], [reviewer.id, reviewerResult]] as const) {
+      const completed = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = $3::jsonb,
+        "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" IN ('queued', 'waiting')`,
+      [taskId, value.sessionId, JSON.stringify(result)])
+      expect(completed.rowCount).toBe(1)
+    }
+    const artifactRepository = createAgentArtifactRepository(adminPool!)
+    const lease: TurnLease = {
+      turnId: value.turnId, sessionId: value.sessionId, userId: value.userId, ownerId: value.turnLeaseOwner,
+      leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 60_000),
+    }
+    const alignedRootLease = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "leaseOwner" = $2,
+      "leaseExpiresAt" = CURRENT_TIMESTAMP + INTERVAL '5 minutes', "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "sessionId" = $3 AND "status" = 'running' AND "attemptCount" = 1`,
+    [value.rootTaskId, value.turnLeaseOwner, value.sessionId])
+    expect(alignedRootLease.rowCount).toBe(1)
+    const runtime = createCanonicalScheduledDraftRuntime({
+      pool: adminPool!, commandPort: command, lease, root: { id: value.rootTaskId, attemptCount: 1 }, artifactRepository,
+    })
+    await expect(runtime.complete()).resolves.toEqual({ ok: true })
+
+    const positiveClient = await adminPool!.connect()
+    try {
+      await positiveClient.query("BEGIN")
+      await expect(runtime.finalize(positiveClient)).resolves.toEqual({ ok: true })
+    } finally {
+      await positiveClient.query("ROLLBACK").catch(() => undefined)
+      positiveClient.release()
+    }
+
+    const analystTaskId = sources.analysts[0]?.taskId
+    if (!analystTaskId) throw new Error("Scheduled-draft finalization fixture lost its Analyst task")
+    const bumped = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 2
+      WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = 1`, [analystTaskId, value.sessionId])
+    expect(bumped.rowCount).toBe(1)
+    const client = await adminPool!.connect()
+    try {
+      await client.query("BEGIN")
+      await expect(runtime.finalize(client)).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
     }
   }, 60_000)
 })

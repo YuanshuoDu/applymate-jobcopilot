@@ -14,6 +14,7 @@ import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } fr
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
+import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 
@@ -68,6 +69,11 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
   assertWriterReviewPlan([...current.nodes, ...appended.addedNodes])
+  const scheduled = isScheduledDraftTemplate(input.templates)
+  const draftPair = scheduled ? scheduledDraftPair([...current.nodes, ...appended.addedNodes], new Set(current.nodes.map(node => node.key))) : undefined
+  if (scheduled && input.proposal.nodes.some(node => node.templateId === APPLICATION_FILLER_TEMPLATE_ID)) {
+    throw Object.assign(new Error("Scheduled draft Turns cannot create an application filler"), { code: "task_graph_scheduled_application_filler_rejected" })
+  }
   if (hasOverlappingTaskGraphRepair(current.nodes, appended.addedNodes)) throw Object.assign(new Error("Overlapping TaskGraph repair"), { code: "task_graph_repair_conflict" })
   const capacity = taskGraphNodeCapacity({
     nodeCount: current.nodes.length,
@@ -113,6 +119,16 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   })
   const readyDependencyKeys = [...new Set(input.proposal.nodes.flatMap(node => preflightStatuses.get(node.key) === "queued" ? node.dependsOn : []))]
   const completedDependencies = new Map((await loadTaskGraphDependencyResults(client, input.scope, readyDependencyKeys, snapshot.nodes)).map(item => [item.key, item] as const))
+  let scheduledBinding: ScheduledDraftCandidateBinding | undefined
+  if (draftPair) {
+    const statusByKey = preflightStatuses
+    const analystKeys = snapshot.nodes.filter(node => node.templateId === "analyst" && node.verificationDisposition === "typed" && statusByKey.get(node.key) === "completed").map(node => node.key)
+    const selected = await selectVerifiedScheduledDraftCandidate(client, input.scope, snapshot, appended.state.revision, analystKeys, statusByKey,
+      appended.addedNodes.filter(node => node.templateId !== "cover_letter_writer" && node.templateId !== "cover_letter_reviewer").map(node => node.key))
+    if (!selected) throw Object.assign(new Error("No currently verified Analyst finding can be drafted"), { code: "task_graph_scheduled_draft_candidate_missing" })
+    if (selected.sourceAnalystKeys.some(key => !draftPair.writer.dependsOn.includes(key))) throw Object.assign(new Error("Scheduled Writer omitted the source of the highest-scoring finding"), { code: "task_graph_scheduled_draft_candidate_dependency_missing" })
+    scheduledBinding = { candidate: selected.candidate, witness: selected.witness }
+  }
   const satisfiedDependencies = new Set<string>()
   for (const [key, dependency] of completedDependencies) {
     if (current.repairSatisfiedNodeKeys?.includes(key)) {
@@ -132,10 +148,12 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     const dependenciesDone = node.dependsOn.every(key => satisfiedDependencies.has(key))
     const status = dependenciesDone ? "queued" : "waiting"
     const childPolicy = inheritSubagentPolicy(policy, template.maxAttempts === undefined ? {} : { maxAttempts: template.maxAttempts })
+    const candidateContext = scheduled && (node.templateId === "cover_letter_writer" || node.templateId === "cover_letter_reviewer")
+      ? scheduledDraftTaskContext(template, scheduledBinding) : template.context ?? {}
     const context = status === "queued" && node.dependsOn.length > 0
-      ? materializeTaskGraphDependencyContext(template.context ?? {}, input.scope, node.dependsOn,
+      ? materializeTaskGraphDependencyContext(candidateContext, input.scope, node.dependsOn,
         node.dependsOn.map(key => completedDependencies.get(key)).filter((value): value is ScopedDependencyResult => value !== undefined))
-      : template.context ?? {}
+      : candidateContext
     const child = await createSubagentTask(client, {
       userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
       parentTaskId: input.scope.parentTaskId, role: template.role, taskType: template.taskType,
