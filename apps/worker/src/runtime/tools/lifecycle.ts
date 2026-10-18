@@ -12,6 +12,9 @@ import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
 import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
+export type DiscoveryAttemptLifecycleEvent =
+  | Readonly<{ call: LifecycleCall; phase: "started" }>
+  | Readonly<{ call: LifecycleCall; phase: "completed" | "failed" | "cancelled"; output: unknown }>
 export interface ToolLifecycleEvent {
   readonly phase: ToolLifecyclePhase
   readonly eventType: string
@@ -48,6 +51,8 @@ export interface ToolLifecycleOptions {
   readonly references?: ToolResultReferenceStore
   readonly durableResults?: ToolResultReferenceRepository
   readonly resolveOwner?: ToolLifecycleOwnerResolver
+  /** Server-only observer for the active generic Scout attempt; never awaited or allowed to alter a tool result. */
+  readonly onDiscoveryAttemptLifecycleEvent?: (event: DiscoveryAttemptLifecycleEvent) => void
   readonly maxEventBytes?: number
   readonly now?: () => string
 }
@@ -85,6 +90,7 @@ export class ToolLifecycle {
       input: safeInput,
     }
     await this.append({ phase: "started", eventType: "tool_call.started", item, payload: this.payload(call, "started", { input: safeInput }) })
+    this.observeDiscoveryAttempt({ call, phase: "started" })
   }
 
   async progress(call: LifecycleCall, progress: unknown): Promise<void> {
@@ -116,8 +122,9 @@ export class ToolLifecycle {
   private async result(call: LifecycleCall, phase: "completed" | "failed" | "cancelled", errorCode: string | null, output: unknown, signal?: AbortSignal): Promise<unknown> {
     const timestamp = this.now()
     const pageCall = this.pageCalls.delete(call.id)
+    const discoveryObservation = { output: output ?? null }
     const safeOutput = phase === "completed"
-      ? await this.persistCompletedOutput(call, output ?? null, pageCall)
+      ? await this.persistCompletedOutput(call, output ?? null, pageCall, discoveryObservation)
       : sanitizeLifecyclePreview(output ?? null, this.maxEventBytes)
     if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     const item: ToolResultItem = {
@@ -137,10 +144,11 @@ export class ToolLifecycle {
     if (phase === "completed" && signal?.aborted) throw new ToolExecutionError("cancelled", "Tool execution was interrupted")
     await this.append({ phase, eventType: phase === "completed" ? "tool_call.completed" : "tool_call.failed", item, payload: this.payload(call, phase, { output: safeOutput, errorCode }) })
     this.inputs.delete(call.id)
+    this.observeDiscoveryAttempt({ call, phase, output: phase === "completed" ? discoveryObservation.output : output ?? null })
     return safeOutput
   }
 
-  private async persistCompletedOutput(call: LifecycleCall, output: unknown, pageCall: boolean): Promise<unknown> {
+  private async persistCompletedOutput(call: LifecycleCall, output: unknown, pageCall: boolean, discoveryObservation: { output: unknown }): Promise<unknown> {
     let prepared: ReturnType<typeof prepareLifecycleValue>
     const nativeFollowup = call.toolName === "agent.followup" && hasNativeCoordinationEnvelope(output)
     if (call.toolName === "agent.list" && (pageCall || isTaskGraphResultPageLike(output))) {
@@ -182,6 +190,7 @@ export class ToolLifecycle {
     } else {
       prepared = prepareLifecycleValue(output)
     }
+    if (call.toolName === "jobs.discover") discoveryObservation.output = output
     if (prepared.sizeBytes > MAX_TOOL_RESULT_BYTES) {
       throw new ToolExecutionError("tool_result_too_large", "Tool result exceeds the 1 MiB limit")
     }
@@ -212,6 +221,11 @@ export class ToolLifecycle {
 
   private async append(event: ToolLifecycleEvent): Promise<void> {
     await this.options.sink.append(event)
+  }
+
+  private observeDiscoveryAttempt(event: DiscoveryAttemptLifecycleEvent): void {
+    if (event.call.toolName !== "jobs.discover") return
+    try { this.options.onDiscoveryAttemptLifecycleEvent?.(event) } catch { /* Observation cannot change a committed tool outcome. */ }
   }
 
   private payload(call: LifecycleCall, status: string, extra: Record<string, unknown>): ToolLifecyclePayload {

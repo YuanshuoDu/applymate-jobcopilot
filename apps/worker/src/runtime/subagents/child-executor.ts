@@ -19,6 +19,7 @@ import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobRe
 import { dispatchNativeVerificationTask } from "./native-verification-executor.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ChildResumeLoader } from "./child-resume.js"
+import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
@@ -37,6 +38,7 @@ export type ChildToolRuntime = {
   readonly selectedJobArtifactContext?: SelectedJobArtifactContextBundle
   readonly writerReviewRevision?: Readonly<{ context: ArtifactToolRevisionContext; feedback: TaskGraphWriterReviewFeedbackFrame }>
   readonly serverContext?: unknown
+  readonly discoveryAttemptSidecar?: () => DiscoveryAttemptSidecar | undefined
   /** Private scoped tools bypass normal lifecycle persistence; only their ref receipt is persisted. */
   readonly executePrivateTool?: (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
   readonly validateArguments?: (name: string, input: unknown, version?: string) => true | string
@@ -247,20 +249,23 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       toolCallCount: result.toolCallCount,
       finalItemId: result.finalItemId ?? null,
     }
+    const discoveryAttempt = lease.role === "scout" && lease.taskType === "job_discovery" && !selectedJob
+      && (result.status === "completed" || result.status === "failed") ? runtime.discoveryAttemptSidecar?.() : undefined
+    const discoveryAttemptField = discoveryAttempt ? { discoveryAttempt } : {}
     if (result.status === "completed" && structuredRole) {
       const finalText = result.finalText, outcome = parseAndBindStructuredResultOutcome(finalText, structuredRole, observedEvidence)
-      if (outcome.kind === "invalid") return { status: "failed", result: { ...childResult, status: "failed" as const, ...((structuredRole === "scout" || structuredRole === "analyst") && outcome.category ? { structuredOutputFailureCategory: outcome.category } : {}) }, failureReason: "invalid_structured_result" }
-      if (typeof finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }; const structuredResult = outcome.result
+      if (outcome.kind === "invalid") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, status: "failed" as const, ...((structuredRole === "scout" || structuredRole === "analyst") && outcome.category ? { structuredOutputFailureCategory: outcome.category } : {}) }, failureReason: "invalid_structured_result" }
+      if (typeof finalText !== "string") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, status: "failed" as const }, failureReason: "invalid_structured_result" }; const structuredResult = outcome.result
       const selectedEvidenceRole = Boolean(selectedJobPreparation && (structuredRole === "scout" || structuredRole === "analyst"))
       const safeStructuredResult = selectedEvidenceRole ? redactSelectedEvidenceResult(structuredResult, runtime.selectedJobArtifactContext!) : structuredResult
       const safeFinalText = selectedJobPreparation ? JSON.stringify(safeStructuredResult) : finalText
-      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, finalText: projectChildFinalText(safeFinalText), structuredResult: safeStructuredResult }, failureReason: result.errorCode }
+      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, ...discoveryAttemptField, finalText: projectChildFinalText(safeFinalText), structuredResult: safeStructuredResult }, failureReason: result.errorCode }
     }
     const status = resultStatus(result.status)
     return {
       status,
       ...(status === "completed" ? { mailboxMessageIds: contextBuilder.getMailboxMessageIds() } : {}),
-      result: { ...childResult, ...(result.status === "completed" && typeof result.finalText === "string" ? { finalText: projectChildFinalText(result.finalText) } : {}) },
+      result: { ...childResult, ...discoveryAttemptField, ...(result.status === "completed" && typeof result.finalText === "string" ? { finalText: projectChildFinalText(result.finalText) } : {}) },
       failureReason: result.errorCode,
     }
   }

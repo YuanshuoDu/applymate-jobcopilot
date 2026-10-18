@@ -58,6 +58,7 @@ import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } f
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionStore } from "./turns/turn-execution-types.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./subagents/child-discovery-attempt.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
 import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
 import { projectTaskGraphResultPage } from "./subagents/task-graph-result-page.js"
@@ -4178,6 +4179,11 @@ describe("createCanonicalTurnRuntime", () => {
   it("projects an asynchronously failed typed child into the next current-graph request before wait/list delivery", async () => {
     const rawRejectedOutput = '{"role":"scout","privateResult":"CURRENT_GRAPH_RAW_RESULT_SENTINEL"}'
     const goalText = "Find evidence-bound roles for the selected position GOAL_CANARY"
+    const discoveryAttemptHealth = {
+      schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+      candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
+    }
     const businessReference = { id: canonicalJobId, kind: "job" as const, ownerId: lease.userId, label: "BUSINESS_REFERENCE_CANARY" }
     const currentEvidence = {
       toolCallId: "current-evidence-call", toolName: "jobs.get", input: { jobId: canonicalJobId },
@@ -4215,14 +4221,16 @@ describe("createCanonicalTurnRuntime", () => {
       const snapshot = parseTaskGraphSnapshot({
         schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
         nodes: [{ key: "research", templateId: "scout", goal: "Find evidence-bound roles", successCriteria: ["Return sourced roles"],
-          dependsOn: [], depth: 1, taskId: actual.childLease.id, verificationDisposition: "typed", verification }],
+          dependsOn: [], depth: 1, taskId: actual.childLease.id, verificationDisposition: "typed", verification,
+          registeredScoutEnvelope: { role: "scout", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, allowedActions: ["jobs.search", "jobs.discover"] } }],
       })
       const statusMap = new Map([[actual.childLease.id, { status: "failed" as const, failureReason: "task_graph_verification_unverified" }]])
       const graphTask: GraphTaskRow = {
         id: actual.childLease.id, role: "scout", taskType: "job_discovery", status: "failed",
+        attemptCount: actual.childLease.attemptCount,
         expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
         failureReason: "task_graph_verification_unverified",
-        result: { ...(rawChildResult as Record<string, unknown>), taskGraphVerificationReport: verificationReport },
+        result: { ...(rawChildResult as Record<string, unknown>), discoveryAttempt: { attemptCount: actual.childLease.attemptCount, health: discoveryAttemptHealth }, taskGraphVerificationReport: verificationReport },
       }
       graphAfterScheduling = {
         rootTaskId: "root-1", snapshot, item: { id: "task-graph-root-1", revision: 1, content: snapshot, createdAt: new Date(0) },
@@ -4270,7 +4278,7 @@ describe("createCanonicalTurnRuntime", () => {
     let modelFactoryReceivedRawTurnInput = false
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: lease.ownerId, productionFlags: planningFlags, taskGraphCommandPort,
-      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.discover"] } },
       stateLoader: async () => ({
         ...state({ goal: goalText, turnInput: { input: { goal: goalText, successCriteria: ["TURN_CANONICAL_CRITERION", "SHARED_CANONICAL_CRITERION"], privateTurnId: "PRIVATE_TURN_ID" }, privateTurnField: "PRIVATE_TURN_FIELD" } }),
         snapshot: { system: [], profile: [], goal: { id: "root-goal", content: goalText }, steerHistory: [],
@@ -4333,13 +4341,15 @@ describe("createCanonicalTurnRuntime", () => {
     expect(buildCognitiveActionAgenda(initialContext)).toEqual(buildCognitiveActionAgenda(withoutCriteria))
     const currentBlock = contexts[1]?.blocks.find(block => block.id === "observation:task-graph-current")
     expect(currentBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
-    expect(currentBlock?.content).toMatchObject({ kind: "task_graph_current", revision: 1, nodes: [expect.objectContaining({
-      key: "research", status: "failed", verification, verificationCriterionIds: ["candidate-count"], verificationReport,
-      structuredOutputFailureCategory: "result_shape_invalid", resultSummary: null, failureReason: null,
-    })] })
+    expect(currentBlock?.content).toMatchObject({ kind: "task_graph_current", revision: 1 })
     const currentNode = (currentBlock?.content as { nodes: Array<Record<string, unknown>> } | undefined)?.nodes[0]
     expect(currentNode).toBeDefined()
-    for (const privateField of ["result", "structuredResult", "finalText", "finalItemId", "taskGraphVerificationReport", "repairReceipt", "nativeDelegation"]) {
+    expect(currentNode).toMatchObject({
+      key: "research", status: "failed", structuredOutputFailureCategory: "result_shape_invalid",
+      resultSummary: null, failureReason: null, discoveryAttemptHealth,
+      resultProjection: { availability: "unavailable" },
+    })
+    for (const privateField of ["result", "structuredResult", "finalText", "finalItemId", "taskGraphVerificationReport", "repairReceipt", "nativeDelegation", "discoveryAttempt", "attemptCount"]) {
       expect(currentNode).not.toHaveProperty(privateField)
     }
     const nextMessages = requests[1]?.messages ?? []
@@ -4352,6 +4362,11 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requestText).toContain("BUSINESS_REFERENCE_CANARY")
     expect(requestText).toContain("CURRENT_EVIDENCE_CANARY")
     expect(requestText).toContain("result_shape_invalid")
+    expect(requestText).toContain("discoveryAttemptHealth")
+    const graphObservation = nextMessages.flatMap(message => message.content)
+      .find(part => part.type === "text" && part.text.includes('"kind":"task_graph_current"'))
+    expect(graphObservation?.type === "text" ? graphObservation.text : "").toContain('"candidateCount":0')
+    expect(requestText).not.toContain("no matching jobs")
     expect(requestText).not.toContain("CURRENT_GRAPH_RAW_RESULT_SENTINEL")
     const actualResult = childOutcome?.result as Record<string, unknown> | undefined
     expect(typeof actualResult?.finalItemId).toBe("string")

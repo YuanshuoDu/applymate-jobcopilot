@@ -10,20 +10,16 @@ import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-cont
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { taskGraphNativeCurrentView } from "./task-graph-native-result.js"
 import { revalidateTaskGraphDependencyBindings } from "./task-graph-pg-dependency-binding-readback.js"
-import {
-  projectTaskGraphResult,
-  taskGraphResultProjectionBytes,
-  taskGraphResultProjectionItemCount,
-  TASK_GRAPH_RESULT_PROJECTION_ITEMS_TOTAL,
-  TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT,
-} from "./task-graph-result-projection.js"
+import { projectTaskGraphResult, taskGraphResultProjectionBytes, taskGraphResultProjectionItemCount,
+  TASK_GRAPH_RESULT_PROJECTION_ITEMS_TOTAL, TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT } from "./task-graph-result-projection.js"
 import type { SubagentTaskStatus } from "./types.js"
+import { projectTaskGraphDiscoveryAttemptHealth } from "./task-graph-discovery-attempt-health.js"
 export type GraphIdentityScope = Pick<TaskGraphReadScope, "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId">
 export type GraphEventScope = GraphIdentityScope & Readonly<{ stepId?: string }>
 export type GraphScope = TaskGraphReadScope & Readonly<{ stepId?: string }>
 export type GraphParent = Record<string, unknown>
 export type GraphItem = Readonly<{ id: string; revision: number; content: unknown; createdAt: unknown }>
-export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; failureReason: string | null; result: unknown }>
+export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; attemptCount?: number; failureReason: string | null; result: unknown }>
 export type LoadedGraph = Readonly<{
   rootTaskId: string
   snapshot: TaskGraphSnapshot | null
@@ -105,7 +101,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
   const revision = Number(stored.revision)
   if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("task_graph_revision_invalid")
   const ids = snapshot.nodes.map(node => node.taskId)
-  const taskRows = await client.query(`SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema", task."failureReason", task."result"
+  const taskRows = await client.query(`SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema", task."attemptCount", task."failureReason", task."result"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
       AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6`,
@@ -115,7 +111,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
     const row = raw as Record<string, unknown>
     return [String(row.id), {
       id: String(row.id), status: String(row.status) as SubagentTaskStatus, role: String(row.role),
-      taskType: String(row.taskType), expectedOutputSchema: row.expectedOutputSchema ?? {},
+      taskType: String(row.taskType), expectedOutputSchema: row.expectedOutputSchema ?? {}, attemptCount: Number(row.attemptCount),
       failureReason: nonEmpty(row.failureReason) ? String(row.failureReason) : null, result: row.result ?? null,
     }]
   }))
@@ -136,7 +132,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
   const state = { ...baseState, repairSatisfiedNodeKeys: repairs.satisfied, repairPendingNodeKeys: repairs.pending }
   return revalidateTaskGraphDependencyBindings(client, scope, { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks })
 }
-/** Uses the durable proposal receipt to distinguish graph children from legacy tasks sharing a root. */ export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
+export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
   const result = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload" FROM "agent_events" AS event
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
@@ -194,7 +190,7 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       || stored.verificationDisposition === "typed" && (task.status === "completed" || task.status === "failed") && !verificationReport
       || hasReceipt && !repairReceipt
       || stored.repairOf && task.status === "completed" && verificationReport?.status === "passed" && !repairReceipt) throw new Error("task_graph_verification_report_invalid")
-    const structuredOutputFailureCategory = classifyTaskGraphStructuredOutputFailure({ snapshotNode: stored, task, verificationReport, hasRepairReceipt: Boolean(repairReceipt) })
+    const structuredOutputFailureCategory = classifyTaskGraphStructuredOutputFailure({ snapshotNode: stored, task, verificationReport, hasRepairReceipt: Boolean(repairReceipt) }), discoveryAttemptHealth = projectTaskGraphDiscoveryAttemptHealth(stored, task, taskResult)
     const projectionSource = taskGraphProjectionSource(task.result, taskResult, Boolean(verificationReport), Boolean(repairReceipt))
     const proposedProjection = projectTaskGraphResult(task.role, task.status, projectionSource)
     const bytes = taskGraphResultProjectionBytes(proposedProjection)
@@ -210,7 +206,7 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
       dependsOn: node.dependsOn, taskId: stored.taskId,
       status: task.status, readiness: node.readiness, resultSummary: resultSummary(task.result),
-      resultProjection,
+      resultProjection, ...(discoveryAttemptHealth ? { discoveryAttemptHealth } : {}),
       ...(verification ? { verification } : {}), ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
       ...(verificationReport ? { verificationReport } : {}),
       ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}),
