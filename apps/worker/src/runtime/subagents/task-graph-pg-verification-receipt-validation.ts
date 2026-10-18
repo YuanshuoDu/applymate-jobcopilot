@@ -47,7 +47,13 @@ export function canonicalTaskGraphReadObservations(items: readonly Row[], outcom
     if (encoded === undefined) throw new Error("task_graph_verification_output_invalid")
     totalBytes += Buffer.byteLength(encoded, "utf8")
     if (totalBytes > MAX_TOTAL_BYTES || Buffer.byteLength(encoded, "utf8") > MAX_OBSERVATION_BYTES || truncated(output)) throw new Error("task_graph_verification_output_invalid")
-    const source = (value: Row, fallback: string) => value.source === undefined || value.source === null ? fallback : text(value.source) && value.source.length <= 256 ? value.source : undefined
+    const source = (value: Row, fallback: string) => {
+      const candidate = value.source
+      if (candidate === undefined || candidate === null) return fallback
+      if (typeof candidate !== "string") return undefined
+      if (candidate.trim().length === 0) return fallback
+      return candidate.length <= 256 ? candidate : undefined
+    }
     const row = record(output)
     let projected: unknown
     if (toolName === "jobs.search" && row && denseRecords(row.jobs, "id")) {
