@@ -30,16 +30,18 @@ const structuredResult = {
   evidence: [{ id: "model-job-ref", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Found one job",
 }
 
-function durableRows(overrides: { items?: Record<string, unknown>[]; events?: Record<string, unknown>[]; task?: Record<string, unknown>; replaySources?: Record<string, unknown>[]; replayEvents?: Record<string, unknown>[] } = {}) {
-  const callContent = { toolCallId: "call-1", toolName: "jobs.search", toolVersion: "1", input: {}, status: "completed", errorCode: null }
+function durableRows(overrides: { items?: Record<string, unknown>[]; events?: Record<string, unknown>[]; task?: Record<string, unknown>; replaySources?: Record<string, unknown>[]; replayEvents?: Record<string, unknown>[]; toolName?: string; output?: unknown } = {}) {
+  const toolName = overrides.toolName ?? "jobs.search"
+  const output = overrides.output ?? { jobs: [{ id: "job-1", source: "greenhouse" }] }
+  const callContent = { toolCallId: "call-1", toolName, toolVersion: "1", input: {}, status: "completed", errorCode: null }
   const items = overrides.items ?? [
     { id: "call-item", sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-1", joinedStepId: "step-1", rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, stepStatus: "completed", ordinal: 0, attempt: 1, type: "tool_call", status: "completed", revision: 2, content: callContent },
-    { id: "result-item", sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-1", joinedStepId: "step-1", rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, stepStatus: "completed", ordinal: 0, attempt: 1, type: "tool_result", status: "completed", revision: 1, content: { toolCallId: "call-1", output: { jobs: [{ id: "job-1", source: "greenhouse" }] }, errorCode: null } },
+    { id: "result-item", sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-1", joinedStepId: "step-1", rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, stepStatus: "completed", ordinal: 0, attempt: 1, type: "tool_result", status: "completed", revision: 1, content: { toolCallId: "call-1", output, errorCode: null } },
   ]
   const common = { itemId: "call-item", taskId: scope.taskId, correlationId: "call-1" }
   const events = overrides.events ?? [
-    { id: "started", ...common, type: "tool_call.started", sequence: 1, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName: "jobs.search" } },
-    { id: "completed", ...common, type: "tool_call.completed", sequence: 2, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName: "jobs.search", status: "completed", errorCode: null } },
+    { id: "started", ...common, type: "tool_call.started", sequence: 1, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName } },
+    { id: "completed", ...common, type: "tool_call.completed", sequence: 2, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName, status: "completed", errorCode: null } },
   ]
   const task = overrides.task ?? { id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 1, status: "running", role: "scout", userId: scope.userId }
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
@@ -112,6 +114,69 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(result.projection).toMatchObject({ evidenceIds: ["read:job:job-1"], candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }] })
     expect(JSON.stringify(result.report)).not.toContain("job-1")
     expect(data.query.mock.calls[0]?.[1]).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
+  })
+
+  it("verifies a Scout candidate from only a fresh current-attempt jobs.get receipt", async () => {
+    const data = durableRows({ toolName: "jobs.get", output: { job: { id: "job-1", source: "greenhouse" } } })
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult })
+
+    expect(result).toMatchObject({ verified: true, report: { status: "passed" } })
+    expect(result.projection).toMatchObject({ candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }] })
+    expect(data.items.filter(item => item.type === "tool_call").map(item => (item.content as Record<string, unknown>).toolName)).toEqual(["jobs.get"])
+  })
+
+  it("rejects Scout source attribution that differs from the fresh jobs.get receipt", async () => {
+    const data = durableRows({ toolName: "jobs.get", output: { job: { id: "job-1", source: "greenhouse" } } })
+    const mismatchedResult = {
+      ...structuredResult,
+      candidates: [{ ...structuredResult.candidates[0], source: "lever" }],
+    }
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult: mismatchedResult })
+
+    expect(result).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "result_invalid", evidenceDigest: null } })
+  })
+
+  it("allows only the generic jobs.read label when a current jobs.get receipt omits its source", async () => {
+    const data = durableRows({ toolName: "jobs.get", output: { job: { id: "job-1" } } })
+    const genericResult = {
+      ...structuredResult,
+      candidates: [{ ...structuredResult.candidates[0], source: "jobs.read" }],
+      evidence: [{ ...structuredResult.evidence[0], source: "jobs.read" }],
+    }
+    const generic = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult: genericResult })
+    const inventedResult = {
+      ...structuredResult,
+      candidates: [{ ...structuredResult.candidates[0], source: "greenhouse" }],
+      evidence: [{ ...structuredResult.evidence[0], source: "greenhouse" }],
+    }
+    const invented = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult: inventedResult })
+
+    expect(generic).toMatchObject({ verified: true, projection: { candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }] } })
+    expect(invented).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "result_invalid" } })
+  })
+
+  it("fails closed when current jobs.get receipts conflict on the same job source", async () => {
+    const data = durableRows({ toolName: "jobs.get", output: { job: { id: "job-1", source: "greenhouse" } } })
+    const firstCall = data.items[0]!
+    const firstResult = data.items[1]!
+    data.items.push(
+      { ...firstCall, id: "call-item-2", stepId: "step-2", joinedStepId: "step-2", ordinal: 1,
+        content: { ...(firstCall.content as Record<string, unknown>), toolCallId: "call-2" } },
+      { ...firstResult, id: "result-item-2", stepId: "step-2", joinedStepId: "step-2", ordinal: 1,
+        content: { toolCallId: "call-2", output: { job: { id: "job-1", source: "lever" } }, errorCode: null } },
+    )
+    const started = data.events[0]!
+    const completed = data.events[1]!
+    data.events.push(
+      { ...started, id: "started-2", itemId: "call-item-2", correlationId: "call-2", sequence: 3,
+        payload: { ...(started.payload as Record<string, unknown>), toolCallId: "call-2" } },
+      { ...completed, id: "completed-2", itemId: "call-item-2", correlationId: "call-2", sequence: 4,
+        payload: { ...(completed.payload as Record<string, unknown>), toolCallId: "call-2" } },
+    )
+
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult })
+
+    expect(result).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "canonical_evidence_ambiguous", evidenceDigest: null } })
   })
 
   it("verifies a replay only through its explicit prior source link and includes source IDs in the digest", async () => {
