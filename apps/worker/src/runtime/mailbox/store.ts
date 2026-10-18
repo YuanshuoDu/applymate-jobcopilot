@@ -49,13 +49,14 @@ export class PgCoordinationStore implements CoordinationStore {
       await requireSession(client, input)
       await requireTask(client, input.userId, input.sessionId, input.toTaskId, "Target task is unavailable")
       const result = await client.query(`SELECT message."id", message."sessionId", message."turnId", message."fromTaskId", message."toTaskId",
-        message."kind", message."payload", message."idempotencyKey", message."createdAt", message."deliveredAt", message."consumedAt"
+        message."kind", message."payload", message."idempotencyKey", message."targetAttemptCount", message."createdAt", message."deliveredAt", message."consumedAt"
         FROM "agent_mailbox_messages" AS message
         JOIN "agent_sessions" AS session ON session."id" = message."sessionId"
         JOIN "sub_agent_tasks" AS target ON target."id" = message."toTaskId" AND target."sessionId" = message."sessionId"
         WHERE message."sessionId" = $1 AND session."userId" = $2 AND message."toTaskId" = $3
           AND target."id" = $3 AND target."sessionId" = $1 AND message."turnId" = target."turnId"
           AND message."consumedAt" IS NULL
+          AND (message."targetAttemptCount" = target."attemptCount" OR (message."targetAttemptCount" IS NULL AND message."kind" <> 'human_follow_up'))
         ORDER BY message."createdAt" ASC, message."id" ASC LIMIT $4`,
       [input.sessionId, input.userId, input.toTaskId, limit])
       return result.rows.map(row => mailboxMessageRow(row as Record<string, unknown>))
@@ -83,6 +84,7 @@ export class PgCoordinationStore implements CoordinationStore {
               AND target."id" = $3 AND target."sessionId" = $1 AND target."status" = 'running'
               AND target."leaseOwner" = $5 AND target."attemptCount" = $6
               AND target."interruptRequestedAt" IS NULL AND target."leaseExpiresAt" > $7)
+          AND (message."targetAttemptCount" = $6 OR (message."targetAttemptCount" IS NULL AND message."kind" <> 'human_follow_up'))
         RETURNING message."id"`, [input.sessionId, input.userId, input.toTaskId, messageIds, owner.ownerId, owner.attemptCount, owner.now])
       const consumedIds = result.rows.map(row => String(row.id))
       return { messageIds: orderMessageIds(messageIds, consumedIds), count: consumedIds.length }
@@ -97,12 +99,13 @@ export class PgCoordinationStore implements CoordinationStore {
       await requireTurn(client, input)
       await requireTask(client, input.userId, input.sessionId, input.toTaskId, "Target task is unavailable", input.turnId)
       if (input.fromTaskId) await requireTask(client, input.userId, input.sessionId, input.fromTaskId, "Sender task is unavailable", input.turnId)
-      const existing = await client.query(`SELECT "id", "sessionId", "turnId", "fromTaskId", "toTaskId", "kind", "payload", "idempotencyKey", "createdAt"
+      if (input.kind === "human_follow_up") throw new CoordinationError("coordination_invalid_input", "Human follow-ups require a server-bound attempt")
+      const existing = await client.query(`SELECT "id", "sessionId", "turnId", "fromTaskId", "toTaskId", "kind", "payload", "idempotencyKey", "targetAttemptCount", "createdAt"
         FROM "agent_mailbox_messages" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [input.sessionId, input.idempotencyKey])
       if (existing.rows[0]) {
         const row = existing.rows[0] as Record<string, unknown>
         if (String(row.turnId) !== input.turnId || (row.fromTaskId == null ? null : String(row.fromTaskId)) !== input.fromTaskId
-          || String(row.toTaskId) !== input.toTaskId || String(row.kind) !== input.kind || stableJson(row.payload) !== stableJson(input.payload)) {
+          || String(row.toTaskId) !== input.toTaskId || String(row.kind) !== input.kind || row.targetAttemptCount != null || stableJson(row.payload) !== stableJson(input.payload)) {
           throw new CoordinationError("coordination_idempotency_conflict", "Mailbox idempotency key was reused with different content")
         }
         return { message: messageRow(row), duplicate: true }

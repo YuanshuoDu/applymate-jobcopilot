@@ -176,12 +176,12 @@ export interface TaskQueryRow extends CursorRow {
   status: string
   goal: string
   confidence: number | null
+  attemptCount?: number | null
   failureReason: string | null
   result: unknown | null
   createdAt: Date
   updatedAt: Date
 }
-
 export interface SafeArtifactRef {
   readonly artifactId: string
   readonly version: number
@@ -239,7 +239,7 @@ export function taskDto(row: TaskQueryRow) {
     taskType: row.taskType,
     status: legacy.status,
     goal: redactString(row.goal),
-    confidence: row.confidence,
+    confidence: row.confidence, attemptCount: Number.isSafeInteger(row.attemptCount) && Number(row.attemptCount) > 0 ? Number(row.attemptCount) : null,
     failureReason: row.failureReason ? redactString(row.failureReason) : null,
     hasResult: row.result !== null,
     ...(artifactRef ? { artifactRef } : {}),

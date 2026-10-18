@@ -5,6 +5,19 @@ import { itemDto, taskDto, turnDto } from "./query-dto"
 const date = new Date("2026-08-31T00:00:00Z")
 
 describe("agent query DTO redaction", () => {
+  it("projects a safe positive task attempt count without exposing lease metadata", () => {
+    const row = {
+      id: "child-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root/child",
+      role: "researcher", taskType: "research", status: "running", goal: "Research roles", confidence: null, attemptCount: 2,
+      failureReason: null, result: null, leaseOwner: "worker-secret", createdAt: date, updatedAt: date,
+    }
+    const dto = taskDto(row)
+    expect(dto).toMatchObject({ id: "child-1", attemptCount: 2 })
+    expect(dto).not.toHaveProperty("leaseOwner")
+    expect(JSON.stringify(dto)).not.toContain("worker-secret")
+    expect(taskDto({ ...row, attemptCount: 0 }).attemptCount).toBeNull()
+  })
+
   it("projects only referenced, redacted Scout evidence from an exact completed result envelope", () => {
     const result = {
       status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "final-item",

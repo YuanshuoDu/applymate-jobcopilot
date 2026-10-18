@@ -125,7 +125,7 @@ async function lockCheckpoints(client: Queryable, input: ChildMailboxHydrationIn
 
 async function readHydrated(client: Queryable, input: ChildMailboxHydrationInput): Promise<CoordinationMailboxMessage[]> {
   const result = await client.query(`SELECT message."id", message."sessionId", message."turnId", message."fromTaskId", message."toTaskId",
-      message."kind", message."payload", message."idempotencyKey", message."createdAt", message."deliveredAt", message."consumedAt"
+      message."kind", message."payload", message."idempotencyKey", message."targetAttemptCount", message."createdAt", message."deliveredAt", message."consumedAt"
     FROM "agent_mailbox_hydration_checkpoints" AS checkpoint
     JOIN "agent_mailbox_messages" AS message
       ON message."id" = checkpoint."messageId" AND message."sessionId" = checkpoint."sessionId"
@@ -138,6 +138,7 @@ async function readHydrated(client: Queryable, input: ChildMailboxHydrationInput
       AND message."sessionId" = $2 AND message."turnId" = $3 AND message."toTaskId" = $5
       AND target."sessionId" = $2 AND target."turnId" = $3 AND target."rootTaskId" = $4
       AND session."userId" = $1 AND message."consumedAt" IS NULL
+      AND (message."targetAttemptCount" = $6 OR (message."targetAttemptCount" IS NULL AND message."kind" <> 'human_follow_up'))
     ORDER BY message."createdAt" ASC, message."id" ASC
     LIMIT $7
     FOR UPDATE OF message`, values(input, input.limit))
@@ -146,7 +147,7 @@ async function readHydrated(client: Queryable, input: ChildMailboxHydrationInput
 
 async function readUncheckpointed(client: Queryable, input: ChildMailboxHydrationInput, limit: number): Promise<Row[]> {
   const result = await client.query(`SELECT message."id", message."sessionId", message."turnId", message."fromTaskId", message."toTaskId",
-      message."kind", message."payload", message."idempotencyKey", message."createdAt", message."deliveredAt", message."consumedAt"
+      message."kind", message."payload", message."idempotencyKey", message."targetAttemptCount", message."createdAt", message."deliveredAt", message."consumedAt"
     FROM "agent_mailbox_messages" AS message
     JOIN "agent_sessions" AS session ON session."id" = message."sessionId"
     JOIN "sub_agent_tasks" AS target
@@ -162,6 +163,7 @@ async function readUncheckpointed(client: Queryable, input: ChildMailboxHydratio
       AND target."attemptCount" = $7 AND target."interruptRequestedAt" IS NULL
       AND target."leaseExpiresAt" > CURRENT_TIMESTAMP
       AND message."consumedAt" IS NULL AND checkpoint."id" IS NULL
+      AND (message."targetAttemptCount" = $7 OR (message."targetAttemptCount" IS NULL AND message."kind" <> 'human_follow_up'))
     ORDER BY message."createdAt" ASC, message."id" ASC
     LIMIT $8
     FOR UPDATE OF message`, [input.userId, input.sessionId, input.turnId, input.rootTaskId, input.toTaskId, input.ownerId, input.attemptCount, limit])

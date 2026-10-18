@@ -12,10 +12,13 @@ const TERMINAL_STATUSES = ["completed", "failed", "interrupted", "cancelled", "c
 type PoolLike = Pick<pg.Pool, "connect">
 type Queryable = Pick<pg.PoolClient, "query">
 type OutboxRow = { id: string; aggregateId: string; payload: unknown }
-type MailboxPayload = { messageId: string; sessionId: string; turnId: string; toTaskId: string }
+type MailboxPayload = { messageId: string; sessionId: string; turnId: string; toTaskId: string; targetAttemptCount?: number }
 type MailboxLineage = {
   id: string
   deliveredAt: Date | string | null
+  kind: string
+  messageTargetAttemptCount: number | null
+  targetAttemptCount: number
   targetStatus: string
   targetSessionId: string
   targetTurnId: string | null
@@ -40,10 +43,12 @@ function nonEmptyString(value: unknown): value is string {
 function parseMailboxPayload(value: unknown): MailboxPayload | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
-  if (Object.keys(row).sort().join(",") !== "messageId,sessionId,toTaskId,turnId") return null
+  const keys = Object.keys(row).sort().join(",")
+  if (keys !== "messageId,sessionId,toTaskId,turnId" && keys !== "messageId,sessionId,targetAttemptCount,toTaskId,turnId") return null
   const { messageId, sessionId, turnId, toTaskId } = row
   if (!nonEmptyString(messageId) || !nonEmptyString(sessionId) || !nonEmptyString(turnId) || !nonEmptyString(toTaskId)) return null
-  return { messageId, sessionId, turnId, toTaskId }
+  if ("targetAttemptCount" in row && (!Number.isSafeInteger(row.targetAttemptCount) || Number(row.targetAttemptCount) < 1)) return null
+  return { messageId, sessionId, turnId, toTaskId, ...(typeof row.targetAttemptCount === "number" ? { targetAttemptCount: row.targetAttemptCount } : {}) }
 }
 
 function boundedBatchSize(value: number | undefined): number {
@@ -108,6 +113,7 @@ async function wakeWaitingTask(client: Queryable, payload: MailboxPayload, linea
     SET "status" = 'queued', "updatedAt" = CURRENT_TIMESTAMP
     WHERE target."id" = $1 AND target."sessionId" = $2 AND target."turnId" = $3
       AND target."rootTaskId" = $4 AND target."status" = 'waiting'
+      AND target."attemptCount" = $5
       AND target."leaseOwner" IS NULL AND target."leaseExpiresAt" IS NULL
       AND target."interruptRequestedAt" IS NULL
       AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
@@ -120,7 +126,7 @@ async function wakeWaitingTask(client: Queryable, payload: MailboxPayload, linea
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
           AND turn."id" = target."turnId" AND turn."sessionId" = target."sessionId"
           AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
-  [payload.toTaskId, payload.sessionId, payload.turnId, lineage.targetRootTaskId])
+  [payload.toTaskId, payload.sessionId, payload.turnId, lineage.targetRootTaskId, lineage.targetAttemptCount])
   if (queued.rowCount !== 1) return
   await client.query(`UPDATE "agent_outbox"
     SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
@@ -148,7 +154,8 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
     await markOutbox(client, row.id, "mailbox_outbox_aggregate_mismatch")
     return
   }
-  const message = await client.query<MailboxLineage>(`SELECT message."id", message."deliveredAt",
+  const message = await client.query<MailboxLineage>(`SELECT message."id", message."deliveredAt", message."kind",
+      message."targetAttemptCount" AS "messageTargetAttemptCount", target."attemptCount" AS "targetAttemptCount",
       target."status" AS "targetStatus", target."sessionId" AS "targetSessionId", target."turnId" AS "targetTurnId",
       target."rootTaskId" AS "targetRootTaskId", target."leaseOwner" AS "targetLeaseOwner",
       target."leaseExpiresAt" AS "targetLeaseExpiresAt", target."interruptRequestedAt" AS "targetInterruptRequestedAt",
@@ -171,6 +178,13 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
     return
   }
   const lineage = message.rows[0]
+  const attemptMatches = payload.targetAttemptCount === undefined
+    ? lineage.messageTargetAttemptCount === null && lineage.kind !== "human_follow_up"
+    : lineage.messageTargetAttemptCount === payload.targetAttemptCount && lineage.targetAttemptCount === payload.targetAttemptCount
+  if (!attemptMatches) {
+    await markOutbox(client, row.id, "mailbox_attempt_mismatch")
+    return
+  }
   // Session and lineage locks precede the task CAS; the dispatch reset is last.
   await wakeWaitingTask(client, payload, lineage)
   if (lineage.deliveredAt === null) {
