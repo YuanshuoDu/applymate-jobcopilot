@@ -10,6 +10,11 @@ import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } fro
 import type { PgSubagentPool } from "./types.js"
 import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 
+const historicalDiscoveryMocks = vi.hoisted(() => ({ create: vi.fn(), read: vi.fn() }))
+vi.mock("../context/root-task-history-result-page-store.js", () => ({
+  createPgRootTaskHistoryResultPageStore: historicalDiscoveryMocks.create,
+}))
+
 const reconciliationMocks = vi.hoisted(() => ({
   prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
 }))
@@ -173,7 +178,26 @@ function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template"
 }
 
 describe("createPgTaskGraphCommandPort", () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    historicalDiscoveryMocks.create.mockReturnValue({ read: historicalDiscoveryMocks.read })
+  })
+
+  it("delegates historical discovery page reads to the persisted store", async () => {
+    const fake = fakePool(scheduleInput())
+    const scope = scheduleInput().scope
+    const request = { mode: "historical_discovery" as const, offset: 0 as const }
+    const response = { schemaVersion: "agent-harness.v2.task-graph.historical-discovery-page.v1" as const,
+      trust: "untrusted" as const, availability: "unavailable" as const, reason: "no_source" as const }
+    historicalDiscoveryMocks.read.mockResolvedValue(response)
+
+    const port = createPgTaskGraphCommandPort(fake.pool)
+
+    await expect(port.readHistoricalDiscoveryPage!(scope, request)).resolves.toBe(response)
+    expect(historicalDiscoveryMocks.create).toHaveBeenCalledWith(fake.pool)
+    expect(historicalDiscoveryMocks.read).toHaveBeenCalledWith(scope, request)
+  })
+
   it("stamps the newly registered Scout envelope into the durable snapshot and preserves older declarations", async () => {
     const input = customScoutScheduleInput(1)
     const priorEnvelope = {
