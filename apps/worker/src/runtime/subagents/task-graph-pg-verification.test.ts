@@ -46,7 +46,11 @@ function durableRows(overrides: { items?: Record<string, unknown>[]; events?: Re
   const task = overrides.task ?? { id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 1, status: "running", role: "scout", userId: scope.userId }
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
     if (sql.includes('SELECT task."id"')) return { rows: [task], rowCount: 1 }
-    if (sql.includes('SELECT item."id"')) return { rows: items, rowCount: items.length }
+    if (sql.includes('SELECT item."id"')) {
+      const attempt = values?.[6]
+      const attemptItems = items.filter(item => item.attempt === attempt)
+      return { rows: attemptItems, rowCount: attemptItems.length }
+    }
     if (sql.includes('SELECT result."sessionId"')) return { rows: overrides.replaySources ?? [], rowCount: overrides.replaySources?.length ?? 0 }
     if (sql.includes('SELECT event."id"')) {
       if (sql.includes('event."taskId" = $5')) return { rows: overrides.replayEvents ?? [], rowCount: overrides.replayEvents?.length ?? 0 }
@@ -123,6 +127,41 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(result).toMatchObject({ verified: true, report: { status: "passed" } })
     expect(result.projection).toMatchObject({ candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }] })
     expect(data.items.filter(item => item.type === "tool_call").map(item => (item.content as Record<string, unknown>).toolName)).toEqual(["jobs.get"])
+  })
+
+  it("does not verify a Scout candidate from historical job receipts without current-attempt reads", async () => {
+    const attemptScope = { ...scope, attemptCount: 2 }
+    const priorAttempt = durableRows()
+    const currentStepId = "current-step"
+    const currentCall = {
+      ...priorAttempt.items[0]!, id: "current-call-item", stepId: currentStepId, joinedStepId: currentStepId, attempt: 2,
+      content: { toolCallId: "current-call", toolName: "application.outcomes_summary", toolVersion: "1", input: {}, status: "completed", errorCode: null },
+    }
+    const currentResult = {
+      ...priorAttempt.items[1]!, id: "current-result-item", stepId: currentStepId, joinedStepId: currentStepId, attempt: 2,
+      content: { toolCallId: "current-call", output: { jobCount: 1 }, errorCode: null },
+    }
+    const currentEvents = [
+      { id: "current-started", itemId: currentCall.id, taskId: scope.taskId, correlationId: "current-call", type: "tool_call.started", sequence: 3, payload: { taskId: scope.taskId, toolCallId: "current-call", toolName: "application.outcomes_summary" } },
+      { id: "current-completed", itemId: currentCall.id, taskId: scope.taskId, correlationId: "current-call", type: "tool_call.completed", sequence: 4, payload: { taskId: scope.taskId, toolCallId: "current-call", toolName: "application.outcomes_summary", status: "completed", errorCode: null } },
+    ]
+    const data = durableRows({
+      items: [...priorAttempt.items, currentCall, currentResult],
+      events: [...priorAttempt.events, ...currentEvents],
+      task: { id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 2, status: "running", role: "scout", userId: scope.userId },
+    })
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope: attemptScope, snapshot, node, structuredResult })
+    const itemQuery = data.query.mock.calls.find(([sql]) => sql.includes('SELECT item."id"'))
+
+    expect(priorAttempt.items).toHaveLength(2)
+    expect(priorAttempt.items.every(item => item.attempt === 1)).toBe(true)
+    expect(itemQuery?.[0]).toContain('AND step."attempt" = $7')
+    expect(itemQuery?.[1]).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId, 2])
+    expect(result).toMatchObject({
+      verified: false,
+      report: { status: "unverified", reasonCode: "canonical_evidence_missing", evidenceDigest: null, resultDigest: null },
+    })
+    expect(result.projection).toBeUndefined()
   })
 
   it("rejects Scout source attribution that differs from the fresh jobs.get receipt", async () => {
