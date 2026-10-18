@@ -1922,7 +1922,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     if (binding.status !== "bound") throw new Error("Scheduled-draft revision fixture did not persist its candidate binding")
 
     await expect(command.appendAndSchedule(scheduledDraftInput(value, 2, [
-      { key: "analyst-after-binding", templateId: "analyst", goal: "Append an unrelated graph node", successCriteria: ["Persist the follow-up node"], dependsOn: [] },
+      { key: "analyst-after-binding", templateId: "analyst", goal: "Append an unrelated graph node", successCriteria: ["Persist the follow-up node"],
+        verification: ANALYST_VERIFICATION, dependsOn: [] },
     ]))).resolves.toMatchObject({ status: "accepted", revision: 3 })
     const graph = await adminPool!.query<{ revision: number; content: unknown }>(`SELECT "revision", "content" FROM "agent_items"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
@@ -1967,7 +1968,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const reviewHash = `sha256:${"c".repeat(64)}`
     const constraintHash = `sha256:${"d".repeat(64)}`
     const requestHash = `sha256:${"e".repeat(64)}`
-    const artifactRef = { artifactId: `scheduled-draft-artifact-${value.sessionId}`, version: 1, contentHash, sourceDigest }
+    const artifactRef = { artifactId: `scheduled-draft-artifact-${value.rootTaskId.slice(-36)}`, version: 1, contentHash, sourceDigest }
     const artifactVersionId = `scheduled-draft-version-${value.sessionId}`
     const artifactContent = { text: "Fixture draft saved" }
     await adminPool!.query(`INSERT INTO "agent_artifact"
