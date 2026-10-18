@@ -131,8 +131,11 @@ describe('AgentComposerActiveTurn', () => {
 
       const form = findElement(changedTurnTree, props => props['data-testid'] === 'objective-replacement-form')
       expect(form).not.toBeNull()
+      const onSubmit = form?.props.onSubmit
+      if (typeof onSubmit !== 'function') throw new Error('Expected the objective replacement form to have a submit handler.')
+      const submit = onSubmit as React.FormEventHandler<HTMLFormElement>
       const preventDefault = vi.fn()
-      form?.props.onSubmit({ preventDefault } as unknown as React.FormEvent<HTMLFormElement>)
+      submit({ preventDefault } as unknown as React.FormEvent<HTMLFormElement>)
 
       expect(preventDefault).toHaveBeenCalledOnce()
       expect(replaceAgentObjective).toHaveBeenCalledWith({
