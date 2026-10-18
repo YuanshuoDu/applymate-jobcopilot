@@ -5,6 +5,7 @@ import type { ToolExecutionContext } from "./types.js"
 import { executeAgentList } from "./task-graph-result-page-executor.js"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA, type TaskGraphResultPage } from "../subagents/task-graph-result-page-contract.js"
 import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, type TaskGraphHistoricalDiscoveryPage } from "../subagents/task-graph-historical-discovery-page-contract.js"
+import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, type TaskGraphDiscoveryRecoveryPage } from "../subagents/task-graph-discovery-recovery-page-contract.js"
 
 const request = { nodeKey: "candidate-node", expectedRevision: 4, offset: 3 }
 const jobId = "00000000-0000-4000-8000-000000000000"
@@ -25,6 +26,17 @@ const historicalPage: TaskGraphHistoricalDiscoveryPage = {
   sourceResultStatus: "completed", offset: 0, nextOffset: null, totalCount: 1, truncated: false,
   items: [{ jobId }],
 }
+const recoveryRequest = { mode: "discovery_recovery" as const, nodeKey: "candidate-node", expectedRevision: 4, offset: 3, expectedAttemptCount: 2 }
+const recoveryAvailable: TaskGraphDiscoveryRecoveryPage = {
+  schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+  observation: "partial_discovery", verificationStatus: "unverified", graphRevision: 4, attemptCount: 2,
+  taskStatus: "failed", totalCount: 4, offset: 3, nextOffset: null, truncated: false,
+  items: [{ jobId }],
+}
+const recoveryUnavailable: TaskGraphDiscoveryRecoveryPage = {
+  schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "unavailable",
+  graphRevision: 5, reason: "attempt_mismatch",
+}
 function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContext {
   return {
     scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1",
@@ -33,10 +45,12 @@ function context(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionCo
   }
 }
 function options(readPage?: (scope: TaskGraphReadScope, input: typeof request) => Promise<unknown>, enabled = true,
-  readHistorical?: (scope: TaskGraphExecutionScope, input: { offset: number; sourceToken?: string }) => Promise<unknown>): CoordinationExecutorOptions {
+  readHistorical?: (scope: TaskGraphExecutionScope, input: { offset: number; sourceToken?: string }) => Promise<unknown>,
+  readRecoveryPage?: (scope: TaskGraphReadScope, input: typeof recoveryRequest) => Promise<unknown>): CoordinationExecutorOptions {
   const store = { appendActivity: vi.fn(async () => undefined), listTasks: vi.fn(async () => []) }
   const commandPort = { readCurrent: vi.fn(), ...(readPage ? { readCurrentResultPage: vi.fn(readPage) } : {}),
-    ...(readHistorical ? { readHistoricalDiscoveryPage: vi.fn(readHistorical) } : {}) }
+    ...(readHistorical ? { readHistoricalDiscoveryPage: vi.fn(readHistorical) } : {}),
+    ...(readRecoveryPage ? { readCurrentDiscoveryRecoveryPage: vi.fn(readRecoveryPage) } : {}) }
   return { manager: {} as never, store: store as never,
     nativeCoordination: { enabled, commandPort: commandPort as unknown as TaskGraphCommandPort,
       turnLeaseOwner: "turn-owner", turnLeaseVersion: 7, parentLeaseOwner: "parent-owner", parentAttemptCount: () => 2 } }
@@ -97,7 +111,7 @@ describe("current TaskGraph result-page executor", () => {
   })
 })
 
-describe("historical discovery page executor", () => {
+describe("historical and recovery discovery page executor", () => {
   it("reads with the live root execution scope including Step ID and restores the initial source token", async () => {
     const readHistorical = vi.fn(async () => historicalPage)
     const runtime = options(undefined, true, readHistorical)
@@ -153,5 +167,49 @@ describe("historical discovery page executor", () => {
   ])("rejects an invalid historical %s", async (_label, page) => {
     await expect(executeAgentList(context(), historicalRequest, options(undefined, true, async () => page)))
       .rejects.toMatchObject({ code: "coordination_task_graph_page_invalid" })
+  })
+
+  it("rejects malformed mode requests without falling back to current or legacy reads", async () => {
+    const runtime = options()
+    await expect(executeAgentList(context(), { mode: "historical_discovery", offset: 0, expectedAttemptCount: 2 }, runtime))
+      .rejects.toMatchObject({ code: "coordination_invalid_input" })
+    await expect(executeAgentList(context(), { ...recoveryRequest, sourceToken: historicalToken }, runtime))
+      .rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.store.listTasks).not.toHaveBeenCalled()
+  })
+
+  it("reads recovery IDs only through the Root lease scope and exact continuation attempt", async () => {
+    const readRecovery = vi.fn(async () => recoveryAvailable)
+    const runtime = options(undefined, true, undefined, readRecovery)
+    await expect(executeAgentList(context(), recoveryRequest, runtime)).resolves.toEqual(recoveryAvailable)
+    const command = runtime.nativeCoordination?.commandPort as TaskGraphCommandPort & { readCurrentDiscoveryRecoveryPage: ReturnType<typeof vi.fn> }
+    expect(command.readCurrentDiscoveryRecoveryPage).toHaveBeenCalledWith({
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: "turn-owner", turnLeaseVersion: 7, parentLeaseOwner: "parent-owner", parentAttemptCount: 2,
+    }, recoveryRequest)
+    expect(runtime.store.appendActivity).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: null, operation: "agent.list_discovery_recovery_page", data: { count: 1, revision: 4 },
+    }))
+  })
+
+  it("rejects recovery pages that do not match the requested revision, offset, or attempt", async () => {
+    const forgeries = [
+      { ...recoveryAvailable, graphRevision: 5 }, { ...recoveryAvailable, offset: 0 }, { ...recoveryAvailable, attemptCount: 3 },
+    ]
+    for (const page of forgeries) await expect(executeAgentList(context(), recoveryRequest, options(undefined, true, undefined, async () => page)))
+      .rejects.toMatchObject({ code: "coordination_task_graph_page_invalid" })
+    await expect(executeAgentList(context(), recoveryRequest, options(undefined, true, undefined, async () => recoveryUnavailable)))
+      .resolves.toEqual(recoveryUnavailable)
+  })
+
+  it("keeps recovery mode root-only, strict, and unavailable without its separate read port", async () => {
+    const runtime = options(undefined, true, undefined, async () => recoveryAvailable)
+    for (const actor of [context({ taskId: "child-1", actorRole: "subagent" }), context({ actorRole: "system" })]) {
+      await expect(executeAgentList(actor, recoveryRequest, runtime)).rejects.toMatchObject({ code: "coordination_task_graph_page_unavailable" })
+    }
+    const withoutRecovery = options()
+    await expect(executeAgentList(context(), recoveryRequest, withoutRecovery)).rejects.toMatchObject({ code: "coordination_task_graph_page_unavailable" })
+    await expect(executeAgentList(context(), { ...recoveryRequest, taskId: "forged" }, runtime)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(withoutRecovery.store.listTasks).not.toHaveBeenCalled()
   })
 })

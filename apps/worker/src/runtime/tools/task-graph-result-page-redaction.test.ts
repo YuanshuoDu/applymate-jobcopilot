@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA, type TaskGraphResultPage } from "../subagents/task-graph-result-page-contract.js"
 import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "../subagents/task-graph-historical-discovery-page-contract.js"
+import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA } from "../subagents/task-graph-discovery-recovery-page-contract.js"
 import { isTaskGraphResultPageLike, prepareAgentListLifecycleInput, prepareTaskGraphResultPageOutput } from "./task-graph-result-page-redaction.js"
 
 const numericUuid = "00000000-0000-4000-8000-000000000000"
@@ -14,6 +15,12 @@ const historicalPage = {
   schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
   observation: "historical_discovery", verificationStatus: "unverified", sourceToken: historicalToken,
   sourceResultStatus: "completed", offset: 0, nextOffset: null, totalCount: 1, truncated: false,
+  items: [{ jobId: numericUuid }],
+}
+const recoveryPage = {
+  schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+  observation: "partial_discovery", verificationStatus: "unverified", graphRevision: 5, attemptCount: 2,
+  taskStatus: "failed", totalCount: 1, offset: 0, nextOffset: null, truncated: false,
   items: [{ jobId: numericUuid }],
 }
 
@@ -78,5 +85,24 @@ describe("TaskGraph result-page lifecycle redaction", () => {
     expect(prepareTaskGraphResultPageOutput(unavailable).safe).toEqual(unavailable)
     expect(() => prepareTaskGraphResultPageOutput({ ...historicalPage, email: "secret@example.com" })).toThrow()
     expect(() => prepareTaskGraphResultPageOutput({ ...historicalPage, observation: "current" })).toThrow()
+  })
+
+  it("redacts recovery observations while restoring only their canonical job IDs", () => {
+    const prepared = prepareTaskGraphResultPageOutput(recoveryPage)
+    expect(prepared.safe).toEqual(recoveryPage)
+    expect(JSON.stringify(prepared.safe)).not.toContain("private")
+    expect(JSON.stringify(prepared.safe)).not.toContain("evidence")
+    expect(isTaskGraphResultPageLike({ observation: "partial_discovery", arbitrary: "private text" })).toBe(true)
+    expect(() => prepareTaskGraphResultPageOutput({ ...recoveryPage, score: 9 })).toThrow()
+  })
+
+  it("records only strict attempt-pinned recovery query fields in lifecycle input", () => {
+    const input = { mode: "discovery_recovery", nodeKey: "scout-a", expectedRevision: 5, offset: 3, expectedAttemptCount: 2 }
+    expect(prepareAgentListLifecycleInput(input, 1024)).toEqual({ pageRequest: true, safeInput: input })
+    expect(prepareAgentListLifecycleInput({ ...input, offset: 3, extra: "secret" }, 1024).safeInput).toBe("[invalid agent.list input]")
+    const unavailable = prepareTaskGraphResultPageOutput({ schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA,
+      trust: "untrusted", availability: "unavailable", graphRevision: 5, reason: "recovery_unavailable" })
+    expect(unavailable.safe).toEqual({ schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, trust: "untrusted",
+      availability: "unavailable", graphRevision: 5, reason: "recovery_unavailable" })
   })
 })

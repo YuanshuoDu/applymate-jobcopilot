@@ -16,6 +16,8 @@ import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } fro
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
 import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import type { TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
+import type { TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
+import { projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-recovery-page.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-history-result-page-store.js"
 import { BudgetExceededError } from "../budget.js"
@@ -74,6 +76,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     },
     async readHistoricalDiscoveryPage(scope: TaskGraphExecutionScope, request: TaskGraphHistoricalDiscoveryPageRequest) {
       return historicalDiscoveryPageStore.read(scope, request)
+    },
+    async readCurrentDiscoveryRecoveryPage(scope, request) {
+      return transaction(pool, client => readCurrentDiscoveryRecoveryPageWithClient(client, scope, request))
     },
     readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
   }
@@ -158,6 +163,16 @@ async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">
   const loaded = await loadCurrentWithClient(client, scope)
   currentTaskGraph(loaded)
   return projectTaskGraphResultPage(loaded, request)
+}
+
+async function readCurrentDiscoveryRecoveryPageWithClient(
+  client: Pick<PoolClient, "query">,
+  scope: TaskGraphReadScope,
+  request: TaskGraphDiscoveryRecoveryPageRequest,
+) {
+  const loaded = await loadCurrentWithClient(client, scope)
+  currentTaskGraph(loaded)
+  return projectTaskGraphDiscoveryRecoveryPage(loaded, request)
 }
 
 async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {

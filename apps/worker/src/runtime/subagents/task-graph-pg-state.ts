@@ -19,7 +19,7 @@ export type GraphEventScope = GraphIdentityScope & Readonly<{ stepId?: string }>
 export type GraphScope = TaskGraphReadScope & Readonly<{ stepId?: string }>
 export type GraphParent = Record<string, unknown>
 export type GraphItem = Readonly<{ id: string; revision: number; content: unknown; createdAt: unknown }>
-export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; attemptCount?: number; failureReason: string | null; result: unknown }>
+export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; taskType?: string; expectedOutputSchema?: unknown; allowedActions?: unknown; contextIsObject?: boolean; hasPrivateSelectionContext?: boolean; attemptCount?: number; failureReason: string | null; result: unknown }>
 export type LoadedGraph = Readonly<{
   rootTaskId: string
   snapshot: TaskGraphSnapshot | null
@@ -101,7 +101,10 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
   const revision = Number(stored.revision)
   if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("task_graph_revision_invalid")
   const ids = snapshot.nodes.map(node => node.taskId)
-  const taskRows = await client.query(`SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema", task."attemptCount", task."failureReason", task."result"
+  const taskRows = await client.query(`SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema", task."allowedActions",
+      COALESCE(jsonb_typeof(task."context") = 'object', false) AS "contextIsObject",
+      COALESCE(jsonb_typeof(task."context") = 'object' AND task."context" ?| ARRAY['selectedJobPreparation', 'coverLetterBase', 'writerReviewFeedback']::text[], false) AS "hasPrivateSelectionContext",
+      task."attemptCount", task."failureReason", task."result"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
       AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6`,
@@ -111,7 +114,11 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
     const row = raw as Record<string, unknown>
     return [String(row.id), {
       id: String(row.id), status: String(row.status) as SubagentTaskStatus, role: String(row.role),
-      taskType: String(row.taskType), expectedOutputSchema: row.expectedOutputSchema ?? {}, attemptCount: Number(row.attemptCount),
+      taskType: String(row.taskType), expectedOutputSchema: row.expectedOutputSchema ?? {},
+      allowedActions: row.allowedActions,
+      contextIsObject: typeof row.contextIsObject === "boolean" ? row.contextIsObject : undefined,
+      hasPrivateSelectionContext: typeof row.hasPrivateSelectionContext === "boolean" ? row.hasPrivateSelectionContext : undefined,
+      attemptCount: Number(row.attemptCount),
       failureReason: nonEmpty(row.failureReason) ? String(row.failureReason) : null, result: row.result ?? null,
     }]
   }))

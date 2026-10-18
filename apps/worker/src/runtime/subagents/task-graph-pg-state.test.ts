@@ -176,6 +176,25 @@ function fakeClient(options: ClientOptions = {}) {
 }
 
 describe("TaskGraph PostgreSQL state loading", () => {
+  it("loads persisted actions and only derived context flags with the existing task-row query", async () => {
+    const allowedActions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
+    const fake = fakeClient({ taskRows: [validTaskRow({ allowedActions, contextIsObject: true, hasPrivateSelectionContext: false })] })
+
+    const loaded = await loadTaskGraph(fake.client, identity)
+    expect(loaded.tasks.get("child-1")).toMatchObject({ allowedActions, contextIsObject: true, hasPrivateSelectionContext: false })
+    expect(loaded.tasks.get("child-1")).not.toHaveProperty("context")
+    const taskQueries = fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))
+    expect(taskQueries).toHaveLength(1)
+    expect(taskQueries[0]?.sql).toContain('task."allowedActions"')
+    expect(taskQueries[0]?.sql).toContain('AS "contextIsObject"')
+    expect(taskQueries[0]?.sql).toContain('AS "hasPrivateSelectionContext"')
+    expect(taskQueries[0]?.sql).toContain('task."context" ?| ARRAY[')
+    expect(taskQueries[0]?.sql).toContain("selectedJobPreparation")
+    expect(taskQueries[0]?.sql).toContain("coverLetterBase")
+    expect(taskQueries[0]?.sql).toContain("writerReviewFeedback")
+    expect(taskQueries[0]?.sql).not.toMatch(/task\."context",/)
+  })
+
   it("restores a typed contract from persisted canonical content across a Worker restart", async () => {
     const persisted = canonicalTaskGraphJson(typedSnapshot())
     const firstWorker = await loadTaskGraph(fakeClient({ itemContent: persisted }).client, identity)
