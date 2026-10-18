@@ -2194,9 +2194,10 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const outboxCopies = await adminPool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_outbox"
       WHERE "aggregateId" = $1 AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
       [value.sessionId, [`agent-event:${cancellation.id}`, `agent-event:${plan.id}`]])
-    expect(outboxCopies.rows).toEqual([
-      { idempotencyKey: `agent-event:${cancellation.id}` }, { idempotencyKey: `agent-event:${plan.id}` },
-    ])
+    expect(outboxCopies.rows).toHaveLength(2)
+    expect(outboxCopies.rows.map(row => row.idempotencyKey)).toEqual(expect.arrayContaining([
+      `agent-event:${cancellation.id}`, `agent-event:${plan.id}`,
+    ]))
 
     const laterInput: TaskGraphScheduleInput = {
       scope: prepared.input.scope,
