@@ -22,6 +22,8 @@ type MailboxRow = {
   sessionId: string
   turnId: string
   toTaskId: string
+  kind: string
+  targetAttemptCount: number | null
   deliveredAt: Date | null
   consumedAt: Date | null
 }
@@ -31,6 +33,7 @@ type TaskRow = {
   turnId: string
   rootTaskId: string | null
   status: string
+  attemptCount: number
   leaseOwner: string | null
   leaseExpiresAt: Date | string | null
   interruptRequestedAt: Date | string | null
@@ -49,12 +52,17 @@ type FakeOptions = {
   lineageValid?: boolean
   failOn?: string
   taskStatus?: string
+  taskAttemptCount?: number
+  messageKind?: string
+  messageTargetAttemptCount?: number | null
   rootStatus?: string
   turnStatus?: string
   taskRootTaskId?: string | null
   taskLeaseOwner?: string | null
   taskLeaseExpiresAt?: Date | string | null
+  taskHasLiveLease?: boolean
   taskInterruptRequestedAt?: Date | string | null
+  pendingInterrupt?: boolean
   dispatchMissing?: boolean
   dispatchPublishedAt?: Date | null
   dispatchAttemptCount?: number
@@ -74,6 +82,7 @@ type FakeOptions = {
 }
 
 const validPayload = { messageId: "message-1", sessionId: "session-1", turnId: "turn-1", toTaskId: "task-1" }
+const boundPayload = { ...validPayload, targetAttemptCount: 2 }
 const completedScoutStructuredResult = {
   schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
   candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["evidence-1"] }],
@@ -103,6 +112,7 @@ function makeOutbox(overrides: Partial<OutboxRow> = {}): OutboxRow {
 function makeMailbox(overrides: Partial<MailboxRow> = {}): MailboxRow {
   return {
     id: "message-1", sessionId: "session-1", turnId: "turn-1", toTaskId: "task-1",
+    kind: "result", targetAttemptCount: null,
     deliveredAt: null, consumedAt: null, ...overrides,
   }
 }
@@ -125,6 +135,7 @@ class FakeClient {
       id: "task-1", sessionId: "session-1", turnId: "turn-1",
       rootTaskId: this.options.taskRootTaskId === undefined ? "root-1" : this.options.taskRootTaskId,
       status: this.options.taskStatus ?? "running", leaseOwner: this.options.taskLeaseOwner ?? null,
+      attemptCount: this.options.taskAttemptCount ?? 2,
       leaseExpiresAt: this.options.taskLeaseExpiresAt ?? null, interruptRequestedAt: this.options.taskInterruptRequestedAt ?? null,
     }
     this.dispatch = this.options.dispatchMissing ? null : {
@@ -154,6 +165,10 @@ class FakeClient {
       this.rollbackState = null
       return { rows: [], rowCount: 0 }
     }
+    if (sql.includes('WITH RECURSIVE ancestors AS')) {
+      const rows = this.options.pendingInterrupt ? [{ id: "interrupt-intent" } as T] : []
+      return { rows, rowCount: rows.length }
+    }
     if (sql.includes('FROM "agent_outbox"') && sql.includes('"publishedAt" IS NULL')) {
       const limit = Number(values[1])
       const rows = this.outboxRows
@@ -165,6 +180,7 @@ class FakeClient {
     if (sql.startsWith('UPDATE "sub_agent_tasks"')) {
       const eligible = this.task.status === "waiting" && this.task.sessionId === String(values[1])
         && this.task.turnId === String(values[2]) && this.task.rootTaskId === values[3]
+        && (!sql.includes('target."attemptCount" = $5') || this.task.attemptCount === Number(values[4]))
         && this.task.leaseOwner === null && this.task.leaseExpiresAt === null && this.task.interruptRequestedAt === null
         && (this.options.sessionStatus ?? "running") !== "aborted" && (this.options.sessionStatus ?? "running") !== "archived"
         && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(this.options.rootStatus ?? "running")
@@ -296,9 +312,12 @@ class FakeClient {
       if (this.options.lineageValid === false) return { rows: [], rowCount: 0 }
       const row = this.mailboxRows[0]
       return row ? { rows: [{
-        id: row.id, deliveredAt: row.deliveredAt, targetStatus: this.task.status, targetSessionId: this.task.sessionId,
+        id: row.id, deliveredAt: row.deliveredAt, kind: this.options.messageKind ?? row.kind,
+        messageTargetAttemptCount: this.options.messageTargetAttemptCount === undefined ? row.targetAttemptCount : this.options.messageTargetAttemptCount,
+        targetAttemptCount: this.task.attemptCount, targetStatus: this.task.status, targetSessionId: this.task.sessionId,
         targetTurnId: this.task.turnId, targetRootTaskId: this.task.rootTaskId, targetLeaseOwner: this.task.leaseOwner,
-        targetLeaseExpiresAt: this.task.leaseExpiresAt, targetInterruptRequestedAt: this.task.interruptRequestedAt,
+        targetLeaseExpiresAt: this.task.leaseExpiresAt, targetHasLiveLease: this.options.taskHasLiveLease ?? false,
+        targetInterruptRequestedAt: this.task.interruptRequestedAt,
         rootId: this.task.rootTaskId ?? "root-1", rootSessionId: this.task.sessionId, rootTurnId: this.task.turnId,
         rootStatus: this.options.rootStatus ?? "running", turnId: this.task.turnId, turnSessionId: this.task.sessionId,
         turnStatus: this.options.turnStatus ?? "in_progress",
@@ -338,6 +357,10 @@ describe("subagent mailbox outbox consumer", () => {
     expect(scan?.values).toEqual(["agent.subagent.mailbox", 50])
     const message = fake.client.calls.find(call => call.sql.includes('FROM "agent_mailbox_messages"'))
     expect(message?.sql).toContain('message."sessionId" = $2 AND message."turnId" = $3')
+    expect(message?.sql).toContain('message."targetAttemptCount"')
+    expect(message?.sql).toContain('target."attemptCount" AS "targetAttemptCount"')
+    expect(message?.sql).toContain('COALESCE(target."leaseExpiresAt" > clock_timestamp(), false) AS "targetHasLiveLease"')
+    expect(message?.sql).toContain('message."kind"')
     expect(message?.sql).toContain('target."turnId" = $3')
     expect(message?.sql).toContain('root."id" = target."rootTaskId"')
     expect(message?.sql).toContain('root."turnId" = target."turnId"')
@@ -396,6 +419,97 @@ describe("subagent mailbox outbox consumer", () => {
     expect(fake.client.calls[taskUpdate]?.sql).toContain('target."leaseExpiresAt" IS NULL')
     expect(fake.client.calls[taskUpdate]?.sql).toContain('target."interruptRequestedAt" IS NULL')
     expect(fake.client.calls[dispatchReset]?.values).toEqual(["subagent-dispatch:task-1", "session-1"])
+  })
+
+  it("delivers a matching attempt-bound human message only during its active lease", async () => {
+    const fake = fakePool({
+      taskStatus: "running", taskAttemptCount: 2, taskLeaseOwner: "worker-current", taskHasLiveLease: true, payload: boundPayload,
+      messageKind: "human_follow_up", messageTargetAttemptCount: 2,
+    })
+    const beforeDispatch = fake.client.dispatch ? { ...fake.client.dispatch } : null
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+    expect(fake.client.task.status).toBe("running")
+    expect(fake.client.dispatch).toEqual(beforeDispatch)
+    expect(fake.client.mailboxRows[0]?.deliveredAt).not.toBeNull()
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: null })
+    fake.client.outboxRows[0]!.publishedAt = null
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+    expect(fake.client.task.status).toBe("running")
+    expect(fake.client.dispatch).toEqual(beforeDispatch)
+    expect(fake.client.calls.filter(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toHaveLength(0)
+  })
+
+  it("stales a bound message while a user-accepted interrupt for an ancestor is pending", async () => {
+    const fake = fakePool({ taskStatus: "running", taskAttemptCount: 2, taskLeaseOwner: "worker-current", taskHasLiveLease: true,
+      payload: boundPayload, messageKind: "human_follow_up", messageTargetAttemptCount: 2, pendingInterrupt: true })
+    const beforeDispatch = fake.client.dispatch ? { ...fake.client.dispatch } : null
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    const lookup = fake.client.calls.find(call => call.sql.includes("WITH RECURSIVE ancestors AS"))
+    expect(lookup?.sql).toContain('intent."payload"->>\'taskId\' IN (SELECT "id" FROM ancestors)')
+    expect(lookup?.values).toEqual(["task-1", "session-1", "turn-1", "root-1", "agent.subagent.task-interrupt"])
+    expect(fake.client.dispatch).toEqual(beforeDispatch)
+    expect(fake.client.mailboxRows[0]).toMatchObject({ deliveredAt: null, consumedAt: null })
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: "mailbox_attempt_stale" })
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "agent_mailbox_messages"'))).toBe(false)
+    expect(fake.client.calls.some(call => call.sql.includes('SET "publishedAt" = NULL'))).toBe(false)
+  })
+
+  it.each([
+    ["waiting task", { taskStatus: "waiting" }],
+    ["queued task", { taskStatus: "queued" }],
+    ["terminal task", { taskStatus: "failed" }],
+    ["terminal root", { taskStatus: "running", taskLeaseOwner: "worker-current", taskHasLiveLease: true, rootStatus: "completed" }],
+    ["terminal Turn", { taskStatus: "running", taskLeaseOwner: "worker-current", taskHasLiveLease: true, turnStatus: "interrupted" }],
+    ["missing lease", { taskStatus: "running", taskLeaseOwner: null }],
+    ["expired lease", { taskStatus: "running", taskLeaseOwner: "worker-old", taskHasLiveLease: false }],
+    ["interrupt request", { taskStatus: "running", taskLeaseOwner: "worker-current", taskHasLiveLease: true, taskInterruptRequestedAt: new Date("2026-09-14T10:00:00.000Z") }],
+  ] as const)("marks attempt-bound delivery stale for a %s", async (_label, options) => {
+    const fake = fakePool({
+      ...options, taskAttemptCount: 2, payload: boundPayload,
+      messageKind: "human_follow_up", messageTargetAttemptCount: 2,
+    })
+    const beforeDispatch = fake.client.dispatch ? { ...fake.client.dispatch } : null
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    expect(fake.client.task.status).toBe(options.taskStatus)
+    expect(fake.client.dispatch).toEqual(beforeDispatch)
+    expect(fake.client.mailboxRows[0]).toMatchObject({ deliveredAt: null, consumedAt: null })
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: "mailbox_attempt_stale" })
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.client.calls.some(call => call.sql.includes('SET "publishedAt" = NULL'))).toBe(false)
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "agent_mailbox_messages"'))).toBe(false)
+  })
+
+  it("rejects a payload attempt that differs from the persisted message attempt", async () => {
+    const fake = fakePool({
+      taskStatus: "waiting", taskAttemptCount: 2, payload: { ...validPayload, targetAttemptCount: 2 },
+      messageKind: "human_follow_up", messageTargetAttemptCount: 1,
+    })
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    expect(fake.client.task.status).toBe("waiting")
+    expect(fake.client.outboxRows[0]).toMatchObject({ lastError: "mailbox_attempt_mismatch" })
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.client.calls.some(call => call.sql.includes('SET "publishedAt" = NULL'))).toBe(false)
+  })
+
+  it("never treats an unbound human row as a legacy outbox message", async () => {
+    const fake = fakePool({
+      taskStatus: "waiting", payload: validPayload, messageKind: "human_follow_up", messageTargetAttemptCount: null,
+    })
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    expect(fake.client.task.status).toBe("waiting")
+    expect(fake.client.outboxRows[0]).toMatchObject({ lastError: "mailbox_attempt_mismatch" })
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.client.calls.some(call => call.sql.includes('SET "publishedAt" = NULL'))).toBe(false)
   })
 
   it("keeps a TaskGraph waiter out of dispatch recovery while a prerequisite is still running", async () => {

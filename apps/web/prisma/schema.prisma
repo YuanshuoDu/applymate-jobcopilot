@@ -2327,6 +2327,7 @@ model AgentMailboxMessage {
   fromTaskId     String?
   toTaskId       String?
   kind           String
+  targetAttemptCount Int?
   payload        Json
   idempotencyKey String
   deliveredAt    DateTime?

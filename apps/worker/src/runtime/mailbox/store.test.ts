@@ -6,7 +6,7 @@ import type { ChildMailboxHydrationInput } from "./hydration.js"
 import type { CoordinationMailboxMessage, CoordinationMailboxOwnerFence, CoordinationTaskView } from "../tools/coordination-types.js"
 
 type QueryRecord = { sql: string; values: readonly unknown[]; tenantContextActive?: boolean }
-type MailboxRow = { -readonly [Key in keyof CoordinationMailboxMessage]: CoordinationMailboxMessage[Key] }
+type MailboxRow = { -readonly [Key in keyof CoordinationMailboxMessage]: CoordinationMailboxMessage[Key] } & { targetAttemptCount: number | null }
 type OwnerTaskState = Pick<CoordinationTaskView, "status" | "attemptCount" | "leaseOwner" | "leaseExpiresAt" | "interruptRequestedAt">
 
 const ownerFence: CoordinationMailboxOwnerFence = {
@@ -30,7 +30,7 @@ function mailboxRow(overrides: Partial<MailboxRow> = {}): MailboxRow {
   return {
     id: "message-1", sessionId: "session-a", turnId: "turn-a", fromTaskId: "task-sender", toTaskId: "task-1",
     kind: "result", payload: { ok: true }, idempotencyKey: "message-key-1",
-    createdAt: new Date("2026-09-03T00:00:00.000Z"), deliveredAt: null, consumedAt: null, ...overrides,
+    targetAttemptCount: null, createdAt: new Date("2026-09-03T00:00:00.000Z"), deliveredAt: null, consumedAt: null, ...overrides,
   }
 }
 
@@ -105,7 +105,8 @@ class FakeClient {
       const now = values[6] instanceof Date ? values[6] : null
       const ownerValid = this.matchesOwner(sessionId === task.sessionId ? toTaskId : "", sessionId, userId, String(values[4]), Number(values[5]), now)
       const confirmed = ownerValid
-        ? this.mailboxRows.filter(row => row.sessionId === sessionId && row.toTaskId === toTaskId && row.consumedAt === null && requested.includes(row.id))
+        ? this.mailboxRows.filter(row => row.sessionId === sessionId && row.toTaskId === toTaskId && row.consumedAt === null
+          && requested.includes(row.id) && (row.targetAttemptCount === Number(values[5]) || (row.targetAttemptCount === null && row.kind !== "human_follow_up")))
         : []
       for (const row of confirmed) row.consumedAt = new Date("2026-09-03T00:02:00.000Z")
       return { rows: confirmed.map(row => ({ id: row.id })), rowCount: confirmed.length }
@@ -122,6 +123,7 @@ class FakeClient {
       const limit = Number(values[3])
       const pending = this.mailboxRows
         .filter(row => row.sessionId === sessionId && row.toTaskId === toTaskId && row.turnId === task.turnId && row.consumedAt === null)
+        .filter(row => row.targetAttemptCount === this.ownerTask.attemptCount || (row.targetAttemptCount === null && row.kind !== "human_follow_up"))
         .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id))
         .slice(0, limit)
       return { rows: pending.map(row => ({ ...row })), rowCount: pending.length }
@@ -257,9 +259,24 @@ describe("PgCoordinationStore", () => {
       ])
     const read = client.queries.find(query => query.sql.includes('FROM "agent_mailbox_messages"') && query.sql.includes("ORDER BY"))
     expect(read?.sql).toContain('message."consumedAt" IS NULL')
+    expect(read?.sql).toContain('message."targetAttemptCount"')
+    expect(read?.sql).toContain('message."targetAttemptCount" = target."attemptCount"')
     expect(read?.sql).toContain('message."turnId" = target."turnId"')
     expect(read?.sql).toContain('ORDER BY message."createdAt" ASC, message."id" ASC')
     expect(read?.values).toEqual(["session-a", "user-a", "task-1", 100])
+  })
+
+  it("lists only matching-attempt human messages while preserving NULL legacy model messages", async () => {
+    const client = new FakeClient("task", "running", [
+      mailboxRow({ id: "human-old", kind: "human_follow_up", targetAttemptCount: 1 }),
+      mailboxRow({ id: "human-current", kind: "human_follow_up", targetAttemptCount: 2 }),
+      mailboxRow({ id: "legacy-model", kind: "result", targetAttemptCount: null }),
+      mailboxRow({ id: "unbound-human", kind: "human_follow_up", targetAttemptCount: null }),
+    ])
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.listPendingMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1" }))
+      .resolves.toMatchObject([{ id: "human-current" }, { id: "legacy-model" }])
   })
 
   it("fails closed for foreign and closed mailbox read scopes", async () => {
@@ -294,7 +311,26 @@ describe("PgCoordinationStore", () => {
 
     const update = client.queries.find(query => query.sql.includes('UPDATE "agent_mailbox_messages"'))
     expect(update?.values).toEqual(["session-a", "user-a", "task-1", ["message-1"], ownerFence.ownerId, ownerFence.attemptCount, ownerFence.now])
+    expect(update?.sql).toContain('message."targetAttemptCount" = $6')
     expect(client.queries.map(query => query.sql)).toEqual(expect.arrayContaining(["BEGIN", "COMMIT"]))
+  })
+
+  it("does not consume attempt K human messages on K+1 and preserves NULL legacy replay", async () => {
+    const stale = mailboxRow({ id: "human-old", kind: "human_follow_up", targetAttemptCount: 1 })
+    const current = mailboxRow({ id: "human-current", kind: "human_follow_up", targetAttemptCount: 2 })
+    const legacy = mailboxRow({ id: "legacy-model", kind: "result", targetAttemptCount: null })
+    const unboundHuman = mailboxRow({ id: "unbound-human", kind: "human_follow_up", targetAttemptCount: null })
+    const client = new FakeClient("task", "running", [stale, current, legacy, unboundHuman])
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.consumeMessages({
+      userId: "user-a", sessionId: "session-a", toTaskId: "task-1",
+      messageIds: [stale.id, current.id, legacy.id, unboundHuman.id], owner: ownerFence,
+    })).resolves.toEqual({ messageIds: [current.id, legacy.id], count: 2 })
+    expect(client.mailboxRows.find(row => row.id === stale.id)?.consumedAt).toBeNull()
+    expect(client.mailboxRows.find(row => row.id === unboundHuman.id)?.consumedAt).toBeNull()
+    expect(client.mailboxRows.find(row => row.id === current.id)?.consumedAt).not.toBeNull()
+    expect(client.mailboxRows.find(row => row.id === legacy.id)?.consumedAt).not.toBeNull()
   })
 
   it.each([
@@ -376,6 +412,18 @@ describe("PgCoordinationStore", () => {
     expect(sessionGuard).toContain('"status" NOT IN (\'aborted\', \'archived\')')
     const taskGuard = client.queries.find(query => query.sql.includes('FROM "sub_agent_tasks" task') && query.sql.includes('task."turnId" = $4'))
     expect(taskGuard?.values).toEqual(["task-1", "session-a", "user-a", "turn-a"])
+  })
+
+  it("rejects generic writes of human follow-ups without a server-bound attempt", async () => {
+    const client = new FakeClient()
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.sendMessage({
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", fromTaskId: null,
+      toTaskId: "task-1", kind: "human_follow_up", payload: { text: "Please continue" }, idempotencyKey: "human-key",
+    })).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_mailbox_messages"'))).toBe(false)
+    expect(client.queries.some(query => query.sql.includes('agent.subagent.mailbox'))).toBe(false)
   })
 
   it("replays an exact mailbox message duplicate without writing a second row", async () => {
