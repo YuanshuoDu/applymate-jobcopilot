@@ -573,10 +573,29 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   await seed(pool, value)
   await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["agent.plan"]'::jsonb WHERE "id" = $1`, [value.rootTaskId])
 
+  const originalSequence = await nextEventSequence(pool, value)
+  await seedReconciliationInput(pool, value, {
+    id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
+    sequence: originalSequence, consumedByStepId: value.originStepId,
+    text: "Complete original user task reference", disposition: "submitted",
+  })
+  await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
+    input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
+  })])
+  await seedReconciliationStep(pool, value, {
+    id: value.originStepId, ordinal: 0, status: "streaming", cursor: originalSequence, consumedInputIds: [value.originalInputId],
+  })
+  await seedReconciliationAgenda(pool, value, {
+    id: value.originStepId, sequence: await nextEventSequence(pool, value), cursor: originalSequence, planRevision: 0,
+    consumedInputIds: [value.originalInputId],
+  })
+
   const initialInput = scheduleInput(value, 1, true)
+  const initialPlanInput: TaskGraphScheduleInput = { ...initialInput, scope: { ...initialInput.scope, stepId: value.originStepId } }
   const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
-  const initial = await command.appendAndSchedule(initialInput)
+  const initial = await command.appendAndSchedule(initialPlanInput)
   if (initial.revision !== 1) throw new Error("TaskGraph supersession fixture did not create revision one")
+  await pool.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [value.originStepId])
   const source = (await command.readCurrent(readScope(value))).nodes[0]
   const originalNode = initialInput.proposal.nodes[0]
   if (!source || !originalNode) throw new Error("TaskGraph supersession fixture lost its typed source")
@@ -593,18 +612,6 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     expectedRevision: 1, replaceUnstartedNodeKey: source.key, nodes: [replacement],
   })
 
-  const originalSequence = await nextEventSequence(pool, value)
-  await seedReconciliationStep(pool, value, {
-    id: value.originStepId, ordinal: 0, status: "completed", cursor: originalSequence, consumedInputIds: [value.originalInputId],
-  })
-  await seedReconciliationInput(pool, value, {
-    id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
-    sequence: originalSequence, consumedByStepId: value.originStepId,
-    text: "Complete original user task reference", disposition: "submitted",
-  })
-  await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
-    input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
-  })])
   const steerSequence = await nextEventSequence(pool, value)
   await pool.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`, [
     value.stepId, steerSequence.toString(), JSON.stringify([value.originalInputId, value.firstSteerInputId]),
