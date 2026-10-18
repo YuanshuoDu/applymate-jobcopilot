@@ -20,10 +20,9 @@ import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-history-result-page-store.js"
 import { BudgetExceededError } from "../budget.js"
 import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
-
+import { scheduleTaskGraphSupersession, stampCreatedScoutEnvelopes, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
-
 export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCommandPort {
   const historicalDiscoveryPageStore = createPgRootTaskHistoryResultPageStore(pool)
   return {
@@ -78,20 +77,21 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
   }
 }
-
 function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: SteeringReconciliationOperation["scope"]): boolean {
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
     && left.stepId === right.stepId && left.rootTaskId === right.rootTaskId && left.parentTaskId === right.parentTaskId
     && left.turnLeaseOwner === right.turnLeaseOwner && left.turnLeaseVersion === right.turnLeaseVersion
     && left.parentLeaseOwner === right.parentLeaseOwner && left.parentAttemptCount === right.parentAttemptCount
 }
-
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
   const loaded = await loadTaskGraph(client, input.scope)
   const current = loaded.state, revision = current?.revision ?? 0
-  const key = taskGraphProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
+  const key = input.replaceUnstarted ? taskGraphSupersessionProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
+    : taskGraphProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
+  if (input.replaceUnstarted) return scheduleTaskGraphSupersession(client, input, parent, loaded, operation, key,
+    (request, requestKey, digest, itemId, binding) => findPlanReplay(client, request, requestKey, digest, itemId, binding))
   const fingerprint = taskGraphFingerprint(input.proposal)
   const replay = await findPlanReplay(client, input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId))
   if (replay) return replay
@@ -121,45 +121,17 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   if (prepared) await writeSteeringReconciliationReceipt(client, prepared, created.state.revision)
   return receipt
 }
-
-function stampCreatedScoutEnvelopes(
-  snapshot: TaskGraphSnapshot, created: readonly { key: string }[], templates: Readonly<Record<string, TaskGraphTaskTemplate>>,
-): TaskGraphSnapshot {
-  const keys = new Set(created.map(node => node.key))
-  return parseTaskGraphSnapshot({ ...snapshot, nodes: snapshot.nodes.map(node => {
-    if (!keys.has(node.key) || node.templateId !== "scout" || node.verificationDisposition !== "typed") return node
-    const registeredScoutEnvelope = templates.scout && registeredScoutEnvelopeFor(templates.scout)
-    if (!registeredScoutEnvelope) throw new TaskGraphCommandError("task_graph_registered_scout_envelope_invalid", "Registered Scout template is invalid")
-    return { ...node, registeredScoutEnvelope }
-  }) })
-}
-
-function registeredScoutEnvelopeFor(template: TaskGraphTaskTemplate): RegisteredScoutEnvelope | undefined {
-  return parseRegisteredScoutEnvelope({ role: template.role, taskType: template.taskType,
-    expectedOutputSchema: parseScoutSchemaMarker(template.expectedOutputSchema), allowedActions: actionList(template.allowedActions) })
-}
-
-function parseScoutSchemaMarker(value: unknown): unknown {
-  if (typeof value !== "string") return value
-  try {
-    const parsed: unknown = JSON.parse(value) as unknown
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined
-  } catch { return undefined }
-}
-
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
   const loaded = await loadCurrentWithClient(client, scope)
   const current = currentTaskGraph(loaded)
   const planningFacts = buildTaskGraphPlanningFacts(loaded)
   return planningFacts ? { ...current, planningFacts } : current
 }
-
 async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, request: TaskGraphResultPageRequest) {
   const loaded = await loadCurrentWithClient(client, scope)
   currentTaskGraph(loaded)
   return projectTaskGraphResultPage(loaded, request)
 }
-
 async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   await lockTaskGraphScope(client, scope)
@@ -169,7 +141,6 @@ async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: T
   }
   return loaded
 }
-
 async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {
   const result = await client.query(`SELECT EXISTS (
     SELECT 1 FROM "agent_events" AS event
@@ -181,7 +152,6 @@ async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadSc
   ) AS "exists"`, [scope.sessionId, scope.turnId, taskGraphItemId(scope.parentTaskId), scope.userId])
   return (result.rows[0] as Row | undefined)?.exists === true
 }
-
 async function hasCurrentGraphItem(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {
   const result = await client.query(`SELECT EXISTS (
     SELECT 1 FROM "agent_items" AS item
@@ -192,8 +162,8 @@ async function hasCurrentGraphItem(client: Queryable, scope: TaskGraphReadScope)
   ) AS "exists"`, [taskGraphItemId(scope.parentTaskId), scope.sessionId, scope.turnId, scope.parentTaskId, scope.userId])
   return (result.rows[0] as Row | undefined)?.exists === true
 }
-
-async function findPlanReplay(client: Queryable, input: TaskGraphScheduleInput, key: string, fingerprint: string, itemId: string | null): Promise<TaskGraphScheduleReceipt | null> {
+async function findPlanReplay(client: Queryable, input: TaskGraphScheduleInput, key: string, fingerprint: string, itemId: string | null,
+  supersession?: Readonly<{ operationKey: string; observedRevision: number }>): Promise<TaskGraphScheduleReceipt | null> {
   if (!itemId) return null
   const result = await client.query(`SELECT event."payload" FROM "agent_events" AS event
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
@@ -203,17 +173,19 @@ async function findPlanReplay(client: Queryable, input: TaskGraphScheduleInput, 
   [input.scope.sessionId, input.scope.turnId, itemId, key, input.scope.userId])
   if (!result.rows[0]) return null
   const payload = object((result.rows[0] as Row).payload)
-  if (payload?.kind !== "proposal" || payload.fingerprint !== fingerprint) throw new TaskGraphCommandError("idempotency_conflict", "TaskGraph proposal key was already used", undefined)
+  if (payload?.kind !== "proposal" || payload.fingerprint !== fingerprint || supersession
+    && (payload.operationKey !== supersession.operationKey || payload.observedRevision !== supersession.observedRevision
+      || object(payload.receipt)?.revision !== supersession.observedRevision + 2 || payload.revision !== supersession.observedRevision + 2)) {
+    throw new TaskGraphCommandError("idempotency_conflict", "TaskGraph proposal key was already used", undefined)
+  }
   const receipt = parseReceipt(payload.receipt)
   if (!receipt) throw new Error("task_graph_receipt_invalid")
   return { ...receipt, status: "duplicate" }
 }
-
 function object(value: unknown): Row | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Row : null
 }
-
 function parseReceipt(value: unknown): Omit<TaskGraphScheduleReceipt, "status"> | null {
   const row = object(value)
   if (!row || !Number.isSafeInteger(row.revision) || Number(row.revision) < 1 || !Array.isArray(row.nodes) || !Array.isArray(row.readyTaskIds)) return null

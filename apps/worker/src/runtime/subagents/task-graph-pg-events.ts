@@ -4,11 +4,32 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import type { TaskGraphEvent } from "../planning/task-graph.js"
 import type { GraphEventScope } from "./task-graph-pg-state.js"
-import { TASK_GRAPH_ITEM_TYPE, taskGraphItemId, taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, TASK_GRAPH_ITEM_TYPE, taskGraphItemId, taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { TaskGraphState } from "../planning/task-graph.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type PlanReceipt = Readonly<{ status: "accepted" | "duplicate"; revision: number; nodes: readonly { key: string; taskId: string; status: "queued" | "waiting" }[]; readyTaskIds: readonly string[] }>
+export type TaskGraphPersistedEventIdentity = Readonly<{ id: string; sequence: string }>
+export function taskGraphSupersessionEnvelopeMatches(source: unknown, replacement: unknown): boolean {
+  const record = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+  const left = record(source), right = record(replacement), mutable = new Set(["key", "taskId", "goal", "successCriteria"])
+  if (!left || !right) return false
+  const envelope = (node: Record<string, unknown>) => Object.fromEntries(Object.entries(node).filter(([key]) => !mutable.has(key)))
+  return canonicalTaskGraphJson(envelope(left)) === canonicalTaskGraphJson(envelope(right))
+}
+export function taskGraphSupersessionProposalMatches(source: unknown, proposal: unknown, rootTaskId: string): boolean {
+  const left = source && typeof source === "object" && !Array.isArray(source) ? source as Record<string, unknown> : null
+  const right = proposal && typeof proposal === "object" && !Array.isArray(proposal) ? proposal as Record<string, unknown> : null
+  if (!left || !right) return false
+  const repairOf = (value: unknown): unknown => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value ?? null
+    const record = value as Record<string, unknown>
+    return { ...record, graphRootTaskId: record.graphRootTaskId ?? rootTaskId }
+  }
+  return ["templateId", "verification", "dependsOn", "nativeDelegation"]
+    .every(key => canonicalTaskGraphJson(left[key] ?? null) === canonicalTaskGraphJson(right[key] ?? null))
+    && canonicalTaskGraphJson(repairOf(left.repairOf)) === canonicalTaskGraphJson(repairOf(right.repairOf))
+}
 
 export async function writeTaskGraphSnapshot(client: Queryable, scope: GraphEventScope, snapshot: TaskGraphSnapshot, expectedRevision: number, now: Date): Promise<{ itemId: string; revision: number }> {
   const itemId = taskGraphItemId(scope.parentTaskId)
@@ -41,6 +62,21 @@ export async function appendTaskGraphReceipt(client: Queryable, input: {
   outbox?: boolean
   allowClosedSession?: boolean
 }): Promise<string> {
+  return (await appendTaskGraphReceiptWithIdentity(client, input)).id
+}
+
+export async function appendTaskGraphReceiptWithIdentity(client: Queryable, input: {
+  scope: GraphEventScope
+  itemId: string | null
+  type: string
+  idempotencyKey: string
+  payload: unknown
+  actor?: "orchestrator" | "system"
+  taskId?: string | null
+  causationId?: string | null
+  outbox?: boolean
+  allowClosedSession?: boolean
+}): Promise<TaskGraphPersistedEventIdentity> {
   const sequence = await nextSequence(client, input.scope, input.allowClosedSession ?? false)
   const id = randomUUID()
   const actor = input.actor ?? "orchestrator"
@@ -58,13 +94,22 @@ export async function appendTaskGraphReceipt(client: Queryable, input: {
     })])
     if (written.rowCount !== 1) throw new Error("task_graph_event_outbox_conflict")
   }
-  return id
+  return { id, sequence }
 }
 
 export async function writePlanReceipt(client: Queryable, input: {
   scope: GraphEventScope; state: TaskGraphState; snapshot: TaskGraphSnapshot; expectedRevision: number;
   now: Date; idempotencyKey: string; fingerprint: string; receipt: PlanReceipt;
+  operationKey?: string; observedRevision?: number
 }): Promise<void> {
+  await writePlanReceiptWithIdentity(client, input)
+}
+
+export async function writePlanReceiptWithIdentity(client: Queryable, input: {
+  scope: GraphEventScope; state: TaskGraphState; snapshot: TaskGraphSnapshot; expectedRevision: number;
+  now: Date; idempotencyKey: string; fingerprint: string; receipt: PlanReceipt;
+  operationKey?: string; observedRevision?: number
+}): Promise<TaskGraphPersistedEventIdentity> {
   const { scope, state, snapshot, expectedRevision, now, idempotencyKey, fingerprint, receipt } = input
   const stored = await writeTaskGraphSnapshot(client, scope, snapshot, expectedRevision, now)
   const item = {
@@ -73,8 +118,10 @@ export async function writePlanReceipt(client: Queryable, input: {
     status: "streaming", phase: null, revision: state.revision, content: snapshot,
     startedAt: now.toISOString(), completedAt: null, createdAt: now.toISOString(), updatedAt: now.toISOString(),
   }
-  const payload = { kind: "proposal", fingerprint, receipt, revision: state.revision, item }
-  await appendTaskGraphReceipt(client, {
+  const payload = { kind: "proposal", fingerprint, receipt, revision: state.revision, item,
+    ...(input.operationKey ? { operationKey: input.operationKey } : {}),
+    ...(input.observedRevision === undefined ? {} : { observedRevision: input.observedRevision }) }
+  return appendTaskGraphReceiptWithIdentity(client, {
     scope, itemId: stored.itemId, taskId: scope.parentTaskId,
     type: expectedRevision === 0 ? "item.started" : "item.delta", idempotencyKey, causationId: scope.stepId,
     payload: expectedRevision === 0 ? payload : { ...payload, content: snapshot }, outbox: true,
@@ -82,6 +129,10 @@ export async function writePlanReceipt(client: Queryable, input: {
 }
 
 export async function writeTaskLifecycleReceipt(client: Queryable, scope: GraphEventScope, itemId: string, taskId: string, event: TaskGraphEvent, expectedRevision: number, snapshot: TaskGraphSnapshot, now = new Date(), options: { stream?: boolean; allowClosedSession?: boolean } = {}): Promise<number> {
+  return (await writeTaskLifecycleReceiptWithIdentity(client, scope, itemId, taskId, event, expectedRevision, snapshot, now, options)).revision
+}
+
+export async function writeTaskLifecycleReceiptWithIdentity(client: Queryable, scope: GraphEventScope, itemId: string, taskId: string, event: TaskGraphEvent, expectedRevision: number, snapshot: TaskGraphSnapshot, now = new Date(), options: { stream?: boolean; allowClosedSession?: boolean } = {}): Promise<TaskGraphPersistedEventIdentity & Readonly<{ revision: number }>> {
   const safeEvent = sanitizeTaskGraphLifecycleEvent(event)
   const nextRevision = expectedRevision + 1
   const updated = await client.query(`UPDATE "agent_items" AS item SET "revision" = $6, "updatedAt" = $7
@@ -101,13 +152,13 @@ export async function writeTaskLifecycleReceipt(client: Queryable, scope: GraphE
     startedAt: timestamp(row.startedAt), completedAt: timestamp(row.completedAt),
     createdAt: timestamp(row.createdAt), updatedAt: now.toISOString(),
   }
-  await appendTaskGraphReceipt(client, {
+  const identity = await appendTaskGraphReceiptWithIdentity(client, {
     scope, itemId, taskId, type: "item.delta",
     idempotencyKey: safeEvent.idempotencyKey, actor: "system", causationId: scope.stepId ?? null,
     payload: { kind: "lifecycle", event: safeEvent, revision: nextRevision, item },
     outbox: options.stream ?? true, allowClosedSession: options.allowClosedSession ?? false,
   })
-  return nextRevision
+  return { ...identity, revision: nextRevision }
 }
 
 /** Keep raw worker errors in the restricted task row, never in the stream/event log. */

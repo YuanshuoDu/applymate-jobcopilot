@@ -135,6 +135,8 @@ export type TaskGraphScheduleInput = Readonly<{
   scope: TaskGraphExecutionScope
   proposal: TaskGraphProposal
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+  /** Present only for the atomic native Root typed-leaf supersession path. */
+  replaceUnstarted?: Readonly<{ nodeKey: string }>
   /** Server-resolved from the persisted Turn objective; never populated from model tool input. */
   verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>

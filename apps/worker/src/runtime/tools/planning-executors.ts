@@ -88,6 +88,9 @@ function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?:
   return Type.Object({
     expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
     nodes: Type.Array(nodeSchema, { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
+    replaceUnstarted: Type.Optional(Type.Object({
+      nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    }, { additionalProperties: false })),
   }, { additionalProperties: false })
 }
 
@@ -95,7 +98,10 @@ export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ mi
 
 type ModelTaskGraphRepairOf = Omit<TaskGraphRepairOf, "graphRootTaskId"> & Readonly<{ graphRootTaskId?: string }>
 type ModelTaskGraphNodeProposal = Omit<TaskGraphNodeProposal, "repairOf"> & Readonly<{ repairOf?: ModelTaskGraphRepairOf }>
-export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{ nodes: readonly ModelTaskGraphNodeProposal[] }>
+export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{
+  nodes: readonly ModelTaskGraphNodeProposal[]
+  replaceUnstarted?: Readonly<{ nodeKey: string }>
+}>
 
 export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
@@ -188,7 +194,13 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
-    const operation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
+    if (input.replaceUnstarted && input.nodes.length !== 1) {
+      throw new ToolExecutionError("task_graph_supersession_requires_one_replacement", "Supersession accepts exactly one replacement node")
+    }
+    const reconciliation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
+    const operation = input.replaceUnstarted
+      ? { ...reconciliation, replaceUnstartedNodeKey: input.replaceUnstarted.nodeKey }
+      : reconciliation
     const scope = operation.scope
     const proposal: TaskGraphProposal = {
       expectedRevision: input.expectedRevision,
@@ -214,6 +226,9 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
         proposal,
         templates: options.templates,
         verificationRequirements: options.verificationRequirements ?? { status: "absent" },
+        ...(input.replaceUnstarted ? {
+          replaceUnstarted: { nodeKey: input.replaceUnstarted.nodeKey },
+        } : {}),
       }, operation)
       return receipt
     } catch (error: unknown) {

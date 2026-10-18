@@ -7,7 +7,10 @@ import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
-import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_SCHEMA_VERSION, validSteeringReconciliationToolCall } from "./steering-reconciliation-contract.js"
+import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_SCHEMA_VERSION, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, validSteeringReconciliationToolCall } from "./steering-reconciliation-contract.js"
+import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { assertSteeringReconciliationCall, readSteeringReconciliationHistory, type SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
 
 const scope: TaskGraphExecutionScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -88,10 +91,89 @@ function fixture(change: Readonly<{ event?: Record<string, unknown>; tool?: Reco
   }) } as unknown as Pick<pg.PoolClient, "query">
   return { client, calls, storedEvent }
 }
-async function historyEntries(client: Pick<pg.PoolClient, "query">): Promise<SteeringReconciliationHistoryEntry[]> {
+async function historyEntries(client: Pick<pg.PoolClient, "query">, currentRevision = 1): Promise<SteeringReconciliationHistoryEntry[]> {
   const history: SteeringReconciliationHistoryEntry[] = []
-  for await (const entry of readSteeringReconciliationHistory(client, scope, 1)) history.push(entry)
+  for await (const entry of readSteeringReconciliationHistory(client, scope, currentRevision)) history.push(entry)
   return history
+}
+function normalizedCallNodes(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value)) return []
+  return value.map(candidate => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate
+    const node = candidate as Record<string, unknown>, repair = node.repairOf
+    if (!repair || typeof repair !== "object" || Array.isArray(repair)) return node
+    const relation = repair as Record<string, unknown>
+    return relation.graphRootTaskId === undefined
+      ? { ...node, repairOf: { ...relation, graphRootTaskId: scope.rootTaskId } }
+      : node
+  })
+}
+function supersessionFixture(change: Readonly<{ relation?: Record<string, unknown>; tool?: Record<string, unknown>; events?: Array<Record<string, unknown>>;
+  receipt?: Record<string, unknown>; receiptKey?: string; callInput?: Record<string, unknown>;
+  sourceNode?: Record<string, unknown>; replacementNode?: Record<string, unknown>; relatedNodes?: Array<Record<string, unknown>> }> = {}) {
+  const callScope = { ...scope, stepId: decisionStepId }
+  const callInput = change.callInput ?? { expectedRevision: 1, replaceUnstarted: { nodeKey: "stale-scout" }, nodes: [{ key: "fresh-scout",
+    templateId: "scout", goal: "new goal", successCriteria: ["new criterion"], dependsOn: [] }] }
+  const operationKey = steeringReconciliationIdempotencyKey(callScope, callId)!
+  const relation = change.relation ?? {
+    schemaVersion: "agent-harness.v2.task-graph-supersession.v2", operationKey,
+    observedRevision: 1, cancellationRevision: 2, resultingRevision: 3,
+    source: { nodeKey: "stale-scout", taskId: "source-task" }, replacement: { nodeKey: "fresh-scout", taskId: "replacement-task" },
+    cancellationEvent: { id: "cancel-event", sequence: "41" },
+    planEvent: { id: "plan-event", sequence: "42", idempotencyKey: taskGraphSupersessionProposalKey(scope.rootTaskId, 1) },
+    replacementFingerprint: taskGraphSupersessionFingerprint({ nodeKey: "stale-scout", taskId: "source-task" }, {
+      expectedRevision: 1, replaceUnstartedNodeKey: "stale-scout", nodes: normalizedCallNodes(callInput.nodes),
+    }),
+    agentPlanCall: { callId, stepId: decisionStepId, expectedRevision: 1, replaceUnstarted: { nodeKey: "stale-scout" } },
+  }
+  const receipt = change.receipt ?? { ...baseReceipt, schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+    decision: "revise", resultingRevision: 3, supersession: relation }
+  const graphItemId = taskGraphItemId(scope.rootTaskId), cancellationKey = taskGraphLifecycleKey(scope.rootTaskId, "stale-scout", 0, "task.cancelled")
+  const sourceNode = change.sourceNode ?? { key: "stale-scout", taskId: "source-task", templateId: "scout", goal: "old goal",
+    successCriteria: ["old criterion"], dependsOn: [], depth: 1 }
+  const replacementNode = change.replacementNode ?? { ...sourceNode, key: "fresh-scout", taskId: "replacement-task", goal: "new goal", successCriteria: ["new criterion"] }
+  const unrelatedNode = { key: "unrelated", taskId: "unrelated-task", templateId: "scout", goal: "unchanged goal",
+    successCriteria: ["unchanged criterion"], dependsOn: [], depth: 1 }
+  const relatedNodes = change.relatedNodes ?? []
+  const cancelledContent = { schemaVersion: "agent-harness.v2.task-graph", nodes: [...relatedNodes, sourceNode, unrelatedNode] }
+  const plannedContent = { schemaVersion: "agent-harness.v2.task-graph", nodes: [...relatedNodes, replacementNode, unrelatedNode] }
+  const events = change.events ?? [
+    { id: "cancel-event", itemId: graphItemId, taskId: "source-task", type: "item.delta", actor: "system", correlationId: scope.turnId, hasOutbox: true,
+      causationId: decisionStepId, sequence: "41", idempotencyKey: cancellationKey,
+      payload: { kind: "lifecycle", revision: 2, event: { type: "task.cancelled", nodeKey: "stale-scout", expectedRevision: 1, idempotencyKey: cancellationKey },
+        item: { id: graphItemId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, type: "task_graph", revision: 2,
+          content: cancelledContent } } },
+    { id: "plan-event", itemId: graphItemId, taskId: scope.rootTaskId, type: "item.delta", actor: "orchestrator", correlationId: scope.turnId, hasOutbox: true,
+      causationId: decisionStepId, sequence: "42", idempotencyKey: taskGraphSupersessionProposalKey(scope.rootTaskId, 1),
+      payload: { kind: "proposal", observedRevision: 1, operationKey, fingerprint: relation.replacementFingerprint, revision: 3,
+        receipt: { status: "accepted", revision: 3, nodes: [{ key: "fresh-scout", taskId: "replacement-task", status: "queued" }], readyTaskIds: ["replacement-task"] }, content: plannedContent,
+        item: { id: graphItemId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, type: "task_graph", revision: 3,
+          content: plannedContent } } },
+  ]
+  const storedEvent = { id: "receipt-event", itemId: null, taskId: scope.rootTaskId, type: "agent.plan.reconciliation", actor: "orchestrator",
+    correlationId: scope.turnId, causationId: decisionStepId, sequence: "43", idempotencyKey: change.receiptKey ?? operationKey,
+    payload: receipt, hasOutbox: false }
+  const toolEvent = { eventId: "tool-event", eventSequence: "40", type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId,
+    eventItemId: "call-item", correlationId: callId, idempotencyKey: toolStartKey(callId),
+    payload: { toolCallId: callId, toolName: "agent.plan", taskId: scope.rootTaskId }, callItemId: "call-item", stepId: decisionStepId,
+    itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input: callInput }, ...change.tool }
+  const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+    if (sql.includes('FROM "agent_events"') && sql.includes('"id" = ANY($3::text[])')) {
+      const ids = values?.[2] as string[], rows = events.filter(event => ids.includes(String(event.id)))
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('event."type" = $3')) {
+      const rows = values?.[3] == null ? [storedEvent] : []
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes("tool_call.started")) return { rows: values?.[4] == null ? [toolEvent] : [], rowCount: values?.[4] == null ? 1 : 0 }
+    if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: decisionStepId, taskId: scope.rootTaskId, ordinal: 1, attempt: 1,
+      status: "completed", inputThroughSequence: "10" }], rowCount: 1 }
+    if (sql.includes("cognitive.agenda")) return { rows: [{ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId,
+      correlationId: decisionStepId, payload: agenda() }], rowCount: 1 }
+    return { rows: [], rowCount: 0 }
+  }) } as unknown as Pick<pg.PoolClient, "query">
+  return { client, relation, receipt, storedEvent, events, callInput }
 }
 function longHistoryFixture(count: number, malformedIndex = -1) {
   const receipts: Array<Record<string, unknown>> = [], toolEvents: Array<Record<string, unknown>> = []
@@ -139,6 +221,173 @@ describe("durable steering reconciliation history", () => {
     const history = await historyEntries(f.client)
     expect(history).toEqual([{ receipt: baseReceipt, stepOrdinal: 1, stepAttempt: 1 }])
     expect(f.calls.some(sql => sql.includes('item."stepId" = ANY($4::text[])'))).toBe(true)
+  })
+
+  it("reconstructs a v2 supersession only when the persisted call and both ordered events match", async () => {
+    const f = supersessionFixture()
+    const history = await historyEntries(f.client, 3)
+    expect(history).toEqual([{ receipt: f.receipt, stepOrdinal: 1, stepAttempt: 1 }])
+  })
+
+  it.each([
+    ["multiple replacement nodes", (receipt: Record<string, unknown>) => ({ ...receipt, nodes: [...receipt.nodes as unknown[], ...receipt.nodes as unknown[]] })],
+    ["a foreign replacement identity", (receipt: Record<string, unknown>) => ({ ...receipt, nodes: [{ ...(receipt.nodes as Record<string, unknown>[])[0]!, taskId: "foreign-task" }] })],
+    ["extra replacement node fields", (receipt: Record<string, unknown>) => ({ ...receipt, nodes: [{ ...(receipt.nodes as Record<string, unknown>[])[0]!, extra: true }] })],
+    ["a missing queued readiness ID", (receipt: Record<string, unknown>) => ({ ...receipt, readyTaskIds: [] })],
+    ["foreign queued readiness IDs", (receipt: Record<string, unknown>) => ({ ...receipt, readyTaskIds: ["foreign-task"] })],
+    ["readiness attached to a waiting replacement", (receipt: Record<string, unknown>) => ({ ...receipt,
+      nodes: [{ ...(receipt.nodes as Record<string, unknown>[])[0]!, status: "waiting" }] })],
+  ] as const)("rejects a v2 plan receipt with %s", async (_name, mutate) => {
+    const original = supersessionFixture(), planPayload = original.events[1]!.payload as Record<string, unknown>
+    const events = original.events.map((event, index) => index === 1 ? { ...event,
+      payload: { ...planPayload, receipt: mutate(planPayload.receipt as Record<string, unknown>) } } : event)
+    const fixtureWithReceipt = supersessionFixture({ relation: original.relation as Record<string, unknown>, receipt: original.receipt as Record<string, unknown>, events })
+    await expect(historyEntries(fixtureWithReceipt.client, 3)).rejects.toThrow("steering_reconciliation_supersession_event_invalid")
+  })
+
+  it("accepts the createGraphTasks waiting result only with an empty ready list", async () => {
+    const original = supersessionFixture(), planPayload = original.events[1]!.payload as Record<string, unknown>
+    const receipt = planPayload.receipt as Record<string, unknown>, node = (receipt.nodes as Record<string, unknown>[])[0]!
+    const events = original.events.map((event, index) => index === 1 ? { ...event,
+      payload: { ...planPayload, receipt: { ...receipt, nodes: [{ ...node, status: "waiting" }], readyTaskIds: [] } } } : event)
+    const fixtureWithReceipt = supersessionFixture({ relation: original.relation as Record<string, unknown>, receipt: original.receipt as Record<string, unknown>, events })
+    await expect(historyEntries(fixtureWithReceipt.client, 3)).resolves.toEqual([{ receipt: fixtureWithReceipt.receipt, stepOrdinal: 1, stepAttempt: 1 }])
+  })
+
+  it("binds an omitted repair graph root to the stored source and replacement before fingerprinting", async () => {
+    const repair = { graphRootTaskId: scope.rootTaskId, nodeKey: "prior-scout", taskId: "prior-task", criterionIds: ["candidate-count"] }
+    const rawRepair = { nodeKey: repair.nodeKey, taskId: repair.taskId, criterionIds: repair.criterionIds }
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
+    const callInput = { expectedRevision: 1, replaceUnstarted: { nodeKey: "stale-scout" }, nodes: [{ key: "fresh-scout",
+      templateId: "scout", goal: "new goal", successCriteria: ["new criterion"], dependsOn: [], repairOf: rawRepair, verification }] }
+    const priorNode = { key: "prior-scout", taskId: "prior-task", templateId: "scout", goal: "prior goal",
+      successCriteria: ["prior criterion"], dependsOn: [], depth: 1, verificationDisposition: "typed", verification }
+    const sourceNode = { key: "stale-scout", taskId: "source-task", templateId: "scout", goal: "old goal",
+      successCriteria: ["old criterion"], dependsOn: [], depth: 1, verificationDisposition: "typed", verification, repairOf: repair }
+    const replacementNode = { ...sourceNode, key: "fresh-scout", taskId: "replacement-task", goal: "new goal",
+      successCriteria: ["new criterion"] }
+    const f = supersessionFixture({ callInput, sourceNode, replacementNode, relatedNodes: [priorNode] })
+    const history = await historyEntries(f.client, 3)
+    expect(history).toEqual([{ receipt: f.receipt, stepOrdinal: 1, stepAttempt: 1 }])
+    const cancellationNodes = (f.events[0]?.payload as { item: { content: { nodes: Array<Record<string, unknown>> } } }).item.content.nodes
+    const planNodes = (f.events[1]?.payload as { item: { content: { nodes: Array<Record<string, unknown>> } } }).item.content.nodes
+    expect(cancellationNodes.find(node => node.key === "stale-scout")?.repairOf).toEqual(repair)
+    expect(planNodes.find(node => node.key === "fresh-scout")?.repairOf).toEqual(repair)
+
+    const rawFingerprint = taskGraphSupersessionFingerprint({ nodeKey: "stale-scout", taskId: "source-task" }, {
+      expectedRevision: 1, replaceUnstartedNodeKey: "stale-scout", nodes: callInput.nodes,
+    })
+    const relation = { ...(f.relation as object), replacementFingerprint: rawFingerprint }
+    const receipt = { ...(f.receipt as object), supersession: relation }
+    const events = f.events.map((event, index) => index === 1 ? { ...event,
+      payload: { ...(event.payload as object), fingerprint: rawFingerprint } } : event)
+    const rawDigestFixture = supersessionFixture({ callInput, sourceNode, replacementNode, relatedNodes: [priorNode], relation, receipt, events })
+    await expect(historyEntries(rawDigestFixture.client, 3)).rejects.toThrow("steering_reconciliation_receipt_call_invalid")
+  })
+
+  it("rejects a v2 plan event that is sequenced after its reconciliation receipt", async () => {
+    const original = supersessionFixture(), relation = { ...(original.relation as object),
+      planEvent: { ...((original.relation as Record<string, unknown>).planEvent as object), sequence: "44" } }
+    const receipt = { ...(original.receipt as object), supersession: relation }
+    const events = original.events.map((event, index) => index === 1 ? { ...event, sequence: "44" } : event)
+    const f = supersessionFixture({ relation, receipt, events })
+    await expect(historyEntries(f.client, 3)).rejects.toThrow("steering_reconciliation_supersession_event_invalid")
+  })
+
+  it.each([
+    ["goal", (node: Record<string, unknown>) => ({ ...node, goal: "different goal" })],
+    ["successCriteria", (node: Record<string, unknown>) => ({ ...node, successCriteria: ["different criterion"] })],
+    ["key", (node: Record<string, unknown>) => ({ ...node, key: "different-node" })],
+    ["templateId", (node: Record<string, unknown>) => ({ ...node, templateId: "analyst" })],
+    ["dependsOn", (node: Record<string, unknown>) => ({ ...node, dependsOn: ["unrelated"] })],
+    ["unknown node fields", (node: Record<string, unknown>) => ({ ...node, unexpected: true })],
+  ] as const)("rejects a persisted proposal whose %s differs from the final replacement", async (_field, tamper) => {
+    const original = supersessionFixture().callInput as { expectedRevision: number; replaceUnstarted: { nodeKey: string }; nodes: Array<Record<string, unknown>> }
+    const callInput = { ...original, nodes: [tamper(original.nodes[0]!)] }
+    // The relation and plan receipt fingerprint both match this changed call; the node-to-node binding must still reject it.
+    const f = supersessionFixture({ callInput })
+    await expect(historyEntries(f.client, 3)).rejects.toThrow()
+  })
+
+  it.each([["cancellation", 0], ["plan", 1]] as const)("rejects a supersession %s event without its transactional outbox row", async (_event, index) => {
+    const f = supersessionFixture(), events = f.events.map((event, eventIndex) => eventIndex === index ? { ...event, hasOutbox: false } : event)
+    await expect(historyEntries(supersessionFixture({ relation: f.relation, receipt: f.receipt, events }).client, 3)).rejects.toThrow()
+  })
+
+  it.each([
+    ["a wrong source cancellation", () => {
+      const f = supersessionFixture(), events = f.events.map((event, index) => index === 0 ? { ...event, payload: {
+        ...(event.payload as object), event: { type: "task.cancelled", nodeKey: "other", expectedRevision: 1,
+          idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "stale-scout", 0, "task.cancelled") },
+      } } : event)
+      return supersessionFixture({ relation: f.relation, receipt: f.receipt, events })
+    }],
+    ["a changed persisted proposal", () => {
+      const f = supersessionFixture()
+      const input = { expectedRevision: 1, replaceUnstarted: { nodeKey: "stale-scout" }, nodes: [{ key: "other" }] }
+      return supersessionFixture({ relation: f.relation, receipt: f.receipt, tool: {
+        itemContent: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input },
+      } })
+    }],
+    ["a mismatched operation key", () => {
+      const f = supersessionFixture()
+      return supersessionFixture({ relation: { ...(f.relation as object), operationKey: `agent.plan.reconciliation:sha256:${"0".repeat(64)}` } })
+    }],
+    ["a cancellation after the plan event", () => {
+      const f = supersessionFixture(), relation = f.relation as Record<string, unknown>
+      return supersessionFixture({ relation: { ...relation, cancellationEvent: { id: "cancel-event", sequence: "43" } } })
+    }],
+    ["an R+1 resulting revision", () => {
+      const f = supersessionFixture(), relation = f.relation as Record<string, unknown>
+      return supersessionFixture({ relation: { ...relation, resultingRevision: 2 } })
+    }],
+    ["wrong cancellation source identity", () => {
+      const f = supersessionFixture(), events = f.events.map((event, index) => index === 0 ? { ...event, payload: {
+        ...(event.payload as object), event: { type: "task.cancelled", nodeKey: "other", expectedRevision: 1,
+          idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "stale-scout", 0, "task.cancelled") },
+      } } : event)
+      return supersessionFixture({ relation: f.relation, events })
+    }],
+    ["an event sequence claim that does not match storage", () => {
+      const f = supersessionFixture(), events = f.events.map((event, index) => index === 0 ? { ...event, sequence: "44" } : event)
+      return supersessionFixture({ relation: f.relation, events })
+    }],
+    ["a wrong plan event fingerprint", () => {
+      const f = supersessionFixture(), events = f.events.map((event, index) => index === 1 ? { ...event, payload: {
+        ...(event.payload as object), fingerprint: "b".repeat(64),
+      } } : event)
+      return supersessionFixture({ relation: f.relation, events })
+    }],
+    ["a wrong plan observed revision", () => {
+      const f = supersessionFixture(), events = f.events.map((event, index) => index === 1 ? { ...event, payload: {
+        ...(event.payload as object), observedRevision: 0,
+      } } : event)
+      return supersessionFixture({ relation: f.relation, receipt: f.receipt, events })
+    }],
+    ["an unrelated plan node changed after cancellation", () => {
+      const f = supersessionFixture(), events = f.events.map((event, index) => {
+        if (index !== 1) return event
+        const payload = event.payload as Record<string, unknown>, item = payload.item as Record<string, unknown>
+        const content = item.content as { schemaVersion: string; nodes: Array<Record<string, unknown>> }
+        const changed = { ...content, nodes: content.nodes.map(node => node.key === "unrelated" ? { ...node, goal: "changed goal" } : node) }
+        return { ...event, payload: { ...payload, content: changed, item: { ...item, content: changed } } }
+      })
+      return supersessionFixture({ relation: f.relation, receipt: f.receipt, events })
+    }],
+    ["the replacement immutable envelope changed", () => {
+      const f = supersessionFixture(), events = f.events.map((event, index) => {
+        if (index !== 1) return event
+        const payload = event.payload as Record<string, unknown>, item = payload.item as Record<string, unknown>
+        const content = item.content as { schemaVersion: string; nodes: Array<Record<string, unknown>> }
+        const changed = { ...content, nodes: content.nodes.map(node => node.key === "fresh-scout" ? { ...node, templateId: "researcher" } : node) }
+        return { ...event, payload: { ...payload, content: changed, item: { ...item, content: changed } } }
+      })
+      return supersessionFixture({ relation: f.relation, receipt: f.receipt, events })
+    }],
+    ["a receipt key not bound to the plan call", () => supersessionFixture({ receiptKey: `agent.plan.reconciliation:sha256:${"0".repeat(64)}` })],
+  ] as const)("rejects v2 history with %s", async (_name, create) => {
+    await expect(historyEntries(create().client, 3)).rejects.toThrow()
   })
 
   it("accepts the exact normal root payload emitted by executeToolWithItems and rejects child replay metadata", async () => {

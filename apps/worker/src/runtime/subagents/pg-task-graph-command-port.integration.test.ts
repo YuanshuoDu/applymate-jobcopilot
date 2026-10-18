@@ -7,7 +7,7 @@ import { createCanonicalScheduledDraftRuntime } from "../scheduled-draft-runtime
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
-import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
@@ -28,6 +28,7 @@ import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "../tur
 import type { StepContext } from "../context/step-context-builder.js"
 import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_EVENT_TYPE } from "./steering-reconciliation-contract.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
+import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const ANALYST_VERIFICATION = {
@@ -568,6 +569,157 @@ async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> 
   return BigInt(sequence)
 }
 
+async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture) {
+  await seed(pool, value)
+  const analystTemplate = TASK_GRAPH_TEMPLATES.analyst
+  const rootActions = ["agent.plan", ...analystTemplate.allowedActions]
+  await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [value.rootTaskId, JSON.stringify(rootActions)])
+
+  const originalSequence = await nextEventSequence(pool, value)
+  await seedReconciliationStep(pool, value, {
+    id: value.originStepId, ordinal: 0, status: "streaming", cursor: originalSequence, consumedInputIds: [value.originalInputId],
+  })
+  await seedReconciliationInput(pool, value, {
+    id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
+    sequence: originalSequence, consumedByStepId: value.originStepId,
+    text: "Complete original user task reference", disposition: "submitted",
+  })
+  await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
+    input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
+  })])
+  await seedReconciliationAgenda(pool, value, {
+    id: value.originStepId, sequence: await nextEventSequence(pool, value), cursor: originalSequence, planRevision: 0,
+    consumedInputIds: [value.originalInputId],
+  })
+
+  const scheduledInput = scheduleInput(value, 1, true)
+  const initialInput: TaskGraphScheduleInput = { ...scheduledInput, templates: {
+    ...scheduledInput.templates, analyst: analystTemplate,
+  } }
+  const initialPlanInput: TaskGraphScheduleInput = { ...initialInput, scope: { ...initialInput.scope, stepId: value.originStepId } }
+  const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
+  const initial = await command.appendAndSchedule(initialPlanInput)
+  if (initial.revision !== 1) throw new Error("TaskGraph supersession fixture did not create revision one")
+  await pool.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [value.originStepId])
+  const source = (await command.readCurrent(readScope(value))).nodes[0]
+  const originalNode = initialInput.proposal.nodes[0]
+  if (!source || !originalNode) throw new Error("TaskGraph supersession fixture lost its typed source")
+  const persistedSource = await pool.query<{ role: string; taskType: string; allowedActions: unknown; constraints: unknown; expectedOutputSchema: unknown }>(
+    `SELECT "role", "taskType", "allowedActions", "constraints", "expectedOutputSchema" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+    [source.taskId, value.sessionId],
+  )
+  expect(persistedSource.rows).toEqual([{
+    role: analystTemplate.role, taskType: analystTemplate.taskType, allowedActions: analystTemplate.allowedActions,
+    constraints: analystTemplate.constraints ?? [], expectedOutputSchema: analystTemplate.expectedOutputSchema ?? {},
+  }])
+  const replacement = { ...originalNode, key: "replacement-1", goal: "Complete the revised graph task", successCriteria: ["Revised task completed"] }
+  const replaceUnstarted = { nodeKey: source.key }
+  const rawCallInput = { expectedRevision: 1, replaceUnstarted, nodes: [replacement] }
+  const input: TaskGraphScheduleInput = {
+    scope: initialInput.scope,
+    proposal: { expectedRevision: 1, nodes: [replacement] },
+    templates: initialInput.templates,
+    replaceUnstarted,
+  }
+  const replacementFingerprint = taskGraphSupersessionFingerprint({ nodeKey: source.key, taskId: source.taskId }, {
+    expectedRevision: 1, replaceUnstartedNodeKey: source.key, nodes: [replacement],
+  })
+
+  const steerSequence = await nextEventSequence(pool, value)
+  await pool.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`, [
+    value.stepId, steerSequence.toString(), JSON.stringify([value.originalInputId, value.firstSteerInputId]),
+  ])
+  await seedReconciliationInput(pool, value, {
+    id: value.firstSteerInputId, clientMessageId: value.firstSteerClientMessageId, delivery: "steer",
+    sequence: steerSequence, consumedByStepId: value.stepId, text: "Replace the queued stale task", disposition: "steered",
+  })
+  const agendaSequence = await nextEventSequence(pool, value)
+  await seedReconciliationAgenda(pool, value, {
+    id: value.stepId, sequence: agendaSequence, cursor: steerSequence, planRevision: 1,
+    consumedInputIds: [value.originalInputId, value.firstSteerInputId],
+  })
+  const callSequence = await nextEventSequence(pool, value)
+  await seedReconciliationToolCall(pool, value, {
+    id: value.planCallId, stepId: value.stepId, toolName: "agent.plan", input: rawCallInput, sequence: callSequence,
+  })
+  const operation = {
+    scope: input.scope, decision: "revise" as const, expectedRevision: 1, callId: value.planCallId,
+    rootInputId: value.originalInputId, replaceUnstartedNodeKey: source.key,
+  }
+  return { command, input, operation, source, replacement, rawCallInput, replacementFingerprint }
+}
+
+async function supersessionDurableRows(pool: PgPool, value: Fixture): Promise<Record<string, unknown>> {
+  const [tasks, items, events, outbox, session, steps, inputs, waits] = await Promise.all([
+    pool.query(`SELECT * FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [value.sessionId, value.rootTaskId]),
+    pool.query(`SELECT * FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "id"`, [value.sessionId, value.turnId]),
+    pool.query(`SELECT * FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence", "id"`, [value.sessionId, value.turnId]),
+    pool.query(`SELECT * FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "idempotencyKey"`, [value.sessionId]),
+    pool.query(`SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [value.sessionId]),
+    pool.query(`SELECT * FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "id"`, [value.sessionId, value.turnId]),
+    pool.query(`SELECT * FROM "agent_inputs" WHERE "sessionId" = $1 AND "targetTurnId" = $2 ORDER BY "id"`, [value.sessionId, value.turnId]),
+    pool.query(`SELECT * FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "id"`, [value.sessionId, value.turnId]),
+  ])
+  return { tasks: tasks.rows, items: items.rows, events: events.rows, outbox: outbox.rows, session: session.rows, steps: steps.rows, inputs: inputs.rows, waits: waits.rows }
+}
+
+function pausingSessionLockPool(basePool: PgSubagentPool): {
+  pool: PgSubagentPool
+  acquired: Promise<void>
+  release: () => void
+} {
+  let acquired!: () => void
+  let release!: () => void
+  let paused = false
+  const acquiredPromise = new Promise<void>(resolve => { acquired = resolve })
+  const gate = new Promise<void>(resolve => { release = resolve })
+  return {
+    acquired: acquiredPromise,
+    release: () => release(),
+    pool: {
+      async connect() {
+        const client = await basePool.connect()
+        return new Proxy(client, {
+          get(target, property) {
+            if (property === "query") return (...args: unknown[]) => {
+              const sql = typeof args[0] === "string" ? args[0].toUpperCase() : ""
+              const result: unknown = Reflect.apply(target.query, target, args)
+              if (!paused && sql.includes("FROM \"AGENT_SESSIONS\"") && sql.includes("FOR UPDATE")) {
+                return Promise.resolve(result).then(async value => {
+                  paused = true
+                  acquired()
+                  await gate
+                  return value
+                })
+              }
+              return result
+            }
+            const result: unknown = Reflect.get(target, property, target)
+            return typeof result === "function" ? result.bind(target) : result
+          },
+        })
+      },
+    },
+  }
+}
+
+async function waitForLockWait(pool: PgPool, applicationName: string): Promise<void> {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ waitEventType: string | null }>(`SELECT "wait_event_type" AS "waitEventType"
+      FROM pg_stat_activity WHERE "application_name" = $1`, [applicationName])
+    if (result.rows.some(row => row.waitEventType === "Lock")) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error(`PostgreSQL worker race did not observe lock wait for ${applicationName}`)
+}
+
+async function waitForSignal(signal: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try { await Promise.race([signal, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("PostgreSQL race lock was not acquired")), 10_000) })]) }
+  finally { if (timer) clearTimeout(timer) }
+}
+
 async function insertReconciliationEvent(pool: PgPool, value: Fixture, event: {
   readonly id: string; readonly sequence: bigint; readonly type: string; readonly actor: string
   readonly itemId: string | null; readonly taskId: string | null; readonly correlationId: string
@@ -790,14 +942,18 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await installTaskGraphTenantRls(adminPool, policyPrefix, setup)
     await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO "${roleName}"`)
     await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_inputs" TO "${roleName}"`)
+    await adminPool.query(`GRANT SELECT ON "agent_tree_budget_reservations", "agent_native_semantic_rejections", "agent_mailbox_messages",
+      "agent_mailbox_hydration_checkpoints", "agent_tool_result_references", "agent_wait_conditions", "agent_transcript_events",
+      "agent_approvals", "agent_artifact_version", "agent_artifact_review", "application_tasks" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_turns" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_steps" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${roleName}"`)
     await adminPool.query(`GRANT INSERT ON "sub_agent_tasks" TO "${roleName}"`)
-    await adminPool.query(`GRANT UPDATE ("status", "updatedAt") ON "sub_agent_tasks" TO "${roleName}"`)
+    await adminPool.query(`GRANT UPDATE ("status", "nextAttemptAt", "completedAt", "updatedAt") ON "sub_agent_tasks" TO "${roleName}"`)
     await adminPool.query(`GRANT INSERT ON "agent_items" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("stepId", "revision", "content", "status", "completedAt", "updatedAt") ON "agent_items" TO "${roleName}"`)
     await adminPool.query(`GRANT INSERT ON "agent_events", "agent_outbox" TO "${roleName}"`)
+    await adminPool.query(`GRANT DELETE ON "agent_outbox" TO "${roleName}"`)
     await seed(adminPool, owner)
     commandPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
   })
@@ -1934,6 +2090,268 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       3, binding.jobId, binding.witness)).resolves.toBe(false)
     await expect(readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value)))
       .rejects.toThrow("scheduled_draft_candidate_binding_invalid")
+  }, 60_000)
+
+  it("replays a typed supersession after a later plan advances the graph beyond R+2", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value)
+    const rootBefore = await adminPool!.query<{ goal: string; successCriteria: unknown }>(`UPDATE "sub_agent_tasks"
+      SET "goal" = $2, "successCriteria" = $3::jsonb WHERE "id" = $1 RETURNING "goal", "successCriteria"`, [
+      value.rootTaskId, "Keep the original root objective", JSON.stringify(["Complete the original user request"]),
+    ])
+    expect(rootBefore.rows).toHaveLength(1)
+    const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 3, nodes: [{ key: "replacement-1", status: "queued" }] })
+    const rootAfter = await adminPool!.query<{ goal: string; successCriteria: unknown }>(`SELECT "goal", "successCriteria"
+      FROM "sub_agent_tasks" WHERE "id" = $1`, [value.rootTaskId])
+    expect(rootAfter.rows).toEqual(rootBefore.rows)
+
+    const operationKey = steeringReconciliationIdempotencyKey(prepared.input.scope, value.planCallId)
+    if (!operationKey) throw new Error("TaskGraph supersession fixture could not derive its operation key")
+    const receiptRows = await adminPool!.query<{ id: string; sequence: string | bigint; idempotencyKey: string; payload: unknown }>(
+      `SELECT "id", "sequence", "idempotencyKey", "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3 ORDER BY "sequence"`,
+      [value.sessionId, value.turnId, STEERING_RECONCILIATION_EVENT_TYPE],
+    )
+    expect(receiptRows.rows).toHaveLength(1)
+    const receiptRow = receiptRows.rows[0]!
+    const receiptPayload = receiptRow.payload as { supersession?: Record<string, unknown> }
+    const relation = receiptPayload.supersession
+    if (!relation) throw new Error("TaskGraph supersession receipt omitted its relation")
+    expect(receiptRow.idempotencyKey).toBe(operationKey)
+    expect(relation).toMatchObject({
+      schemaVersion: "agent-harness.v2.task-graph-supersession.v2", operationKey,
+      observedRevision: 1, cancellationRevision: 2, resultingRevision: 3,
+      source: { nodeKey: prepared.source.key, taskId: prepared.source.taskId },
+      replacement: { nodeKey: "replacement-1", taskId: accepted.nodes[0]?.taskId },
+      replacementFingerprint: prepared.replacementFingerprint,
+      agentPlanCall: { callId: value.planCallId, stepId: value.stepId, expectedRevision: 1, replaceUnstarted: { nodeKey: prepared.source.key } },
+    })
+
+    const cancellationIdentity = relation.cancellationEvent as { id: string; sequence: string }
+    const planIdentity = relation.planEvent as { id: string; sequence: string }
+    const eventRows = await adminPool!.query<{ id: string; sequence: string | bigint; itemId: string | null; taskId: string | null;
+      type: string; idempotencyKey: string; payload: unknown }>(
+      `SELECT "id", "sequence", "itemId", "taskId", "type", "idempotencyKey", "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "id" = ANY($3::text[]) ORDER BY "sequence"`,
+      [value.sessionId, value.turnId, [cancellationIdentity.id, planIdentity.id]],
+    )
+    expect(eventRows.rows).toHaveLength(2)
+    const cancellation = eventRows.rows.find(row => row.id === cancellationIdentity.id)!
+    const plan = eventRows.rows.find(row => row.id === planIdentity.id)!
+    expect(String(cancellation.sequence)).toBe(cancellationIdentity.sequence)
+    expect(String(plan.sequence)).toBe(planIdentity.sequence)
+    expect(BigInt(cancellation.sequence)).toBeLessThan(BigInt(plan.sequence))
+    expect(cancellation).toMatchObject({ itemId: taskGraphItemId(value.rootTaskId), taskId: prepared.source.taskId, type: "item.delta",
+      idempotencyKey: taskGraphLifecycleKey(value.rootTaskId, prepared.source.key, 0, "task.cancelled") })
+    expect(plan).toMatchObject({ itemId: taskGraphItemId(value.rootTaskId), taskId: value.rootTaskId, type: "item.delta",
+      idempotencyKey: taskGraphSupersessionProposalKey(value.rootTaskId, 1) })
+    const cancellationPayload = cancellation.payload as { kind: string; event: { type: string; expectedRevision: number };
+      revision: number; item: { revision: number; content: unknown } }
+    const planPayload = plan.payload as { kind: string; operationKey: string; observedRevision: number; fingerprint: string;
+      revision: number; receipt: { revision: number }; item: { revision: number; content: unknown }; content: unknown }
+    expect(cancellationPayload).toMatchObject({ kind: "lifecycle", event: { type: "task.cancelled", expectedRevision: 1 }, revision: 2, item: { revision: 2 } })
+    expect(parseTaskGraphSnapshot(cancellationPayload.item.content).nodes.some(node => node.key === prepared.source.key && node.taskId === prepared.source.taskId)).toBe(true)
+    expect(planPayload).toMatchObject({ kind: "proposal", operationKey, observedRevision: 1,
+      fingerprint: prepared.replacementFingerprint, revision: 3, receipt: { revision: 3 }, item: { revision: 3 } })
+    expect(canonicalTaskGraphJson(planPayload.content)).toBe(canonicalTaskGraphJson(planPayload.item.content))
+    const finalSnapshot = parseTaskGraphSnapshot(planPayload.item.content)
+    expect(finalSnapshot.nodes).toHaveLength(1)
+    expect(finalSnapshot.nodes[0]).toMatchObject({ key: "replacement-1", taskId: accepted.nodes[0]?.taskId,
+      templateId: prepared.source.templateId, verification: prepared.source.verification, dependsOn: prepared.source.dependsOn })
+    expect(finalSnapshot.nodes.some(node => node.key === prepared.source.key || node.taskId === prepared.source.taskId)).toBe(false)
+    const sourceTask = await adminPool!.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+      [prepared.source.taskId, value.sessionId])
+    expect(sourceTask.rows).toEqual([{ status: "cancelled" }])
+    const outboxCopies = await adminPool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_outbox"
+      WHERE "aggregateId" = $1 AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
+      [value.sessionId, [`agent-event:${cancellation.id}`, `agent-event:${plan.id}`]])
+    expect(outboxCopies.rows).toEqual([
+      { idempotencyKey: `agent-event:${cancellation.id}` }, { idempotencyKey: `agent-event:${plan.id}` },
+    ])
+
+    const laterInput: TaskGraphScheduleInput = {
+      scope: prepared.input.scope,
+      proposal: { expectedRevision: 3, nodes: [{ key: "later-plan", templateId: "analyst", goal: "Add a later task",
+        successCriteria: ["Complete the later task"], verification: ANALYST_VERIFICATION, dependsOn: [] }] },
+      templates: prepared.input.templates,
+    }
+    await expect(prepared.command.appendAndSchedule(laterInput)).resolves.toMatchObject({ status: "accepted", revision: 4 })
+    const advancedGraph = await adminPool!.query<{ revision: number }>(`SELECT "revision" FROM "agent_items"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
+    [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId])
+    expect(advancedGraph.rows).toEqual([{ revision: 4 }])
+
+    const committed = await supersessionDurableRows(adminPool!, value)
+    await commandPool!.end()
+    commandPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    const reopened = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
+    await expect(reopened.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(committed)
+  }, 60_000)
+
+  it("rejects changed supersession fingerprint, source, and revision without durable writes", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value)
+    const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 3 })
+
+    const assertRejectedWithoutWrites = async (input: TaskGraphScheduleInput, operation: typeof prepared.operation) => {
+      const before = await supersessionDurableRows(adminPool!, value)
+      await expect(prepared.command.appendAndScheduleWithReconciliation!(input, operation)).rejects.toThrow()
+      expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+    }
+    const changedReplacement = { ...prepared.replacement, goal: "Different replacement content" }
+    await assertRejectedWithoutWrites({ ...prepared.input, proposal: { ...prepared.input.proposal, nodes: [changedReplacement] } }, prepared.operation)
+
+    const foreignSourceCall = { ...prepared.rawCallInput, replaceUnstarted: { nodeKey: "foreign-source" } }
+    await assertRejectedWithoutWrites({ ...prepared.input, replaceUnstarted: foreignSourceCall.replaceUnstarted },
+    { ...prepared.operation, replaceUnstartedNodeKey: "foreign-source" })
+
+    await assertRejectedWithoutWrites({ ...prepared.input, proposal: { ...prepared.input.proposal, expectedRevision: 2 } },
+    { ...prepared.operation, expectedRevision: 2 })
+  }, 60_000)
+
+  it("rolls back cancellation, plan, receipt, outbox, cursor, and revision when v2 plan streaming fails", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value)
+    const before = await supersessionDurableRows(adminPool!, value)
+    const triggerName = `tg_fail_${randomUUID().replaceAll("-", "")}`
+    const functionName = `${triggerName}_fn`
+    await adminPool!.query(`CREATE FUNCTION public."${functionName}"() RETURNS trigger
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $task_graph_test$
+      BEGIN
+        IF NEW."topic" = 'agent.session.event'
+          AND NEW."aggregateId" = current_setting('applymate.task_graph_fail_session', true)
+          AND NEW."payload"->'payload'->>'kind' = 'proposal' THEN
+          RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'injected supersession plan-outbox failure';
+        END IF;
+        RETURN NEW;
+      END
+      $task_graph_test$`)
+    await adminPool!.query(`CREATE TRIGGER "${triggerName}" BEFORE INSERT ON public."agent_outbox"
+      FOR EACH ROW EXECUTE FUNCTION public."${functionName}"()`)
+    const failingPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    try {
+      const failing = createPgTaskGraphCommandPort(restrictedTransactionPool(failingPool, roleName, value.userId, value.sessionId))
+      await expect(failing.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+        .rejects.toThrow("injected supersession plan-outbox failure")
+      expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+    } finally {
+      await failingPool.end()
+      await adminPool!.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."agent_outbox"`)
+      await adminPool!.query(`DROP FUNCTION IF EXISTS public."${functionName}"()`)
+    }
+  }, 60_000)
+
+  it("rejects supersession when the queued source has attempt evidence before any writes", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value)
+    const changed = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1
+      WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'queued' AND "attemptCount" = 0`, [prepared.source.taskId, value.sessionId])
+    expect(changed.rowCount).toBe(1)
+    const before = await supersessionDurableRows(adminPool!, value)
+    await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .rejects.toMatchObject({ code: "task_graph_supersession_not_eligible" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+  }, 60_000)
+
+  it("rejects supersession when a Root-owned durable wait targets the queued source", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value)
+    const now = new Date()
+    await adminPool!.query(`INSERT INTO "agent_wait_conditions"
+      ("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey",
+       "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'any', 'waiting', $9, '[]'::jsonb, $10, $10)`, [
+      `p3-task-graph-wait-${randomUUID()}`, value.userId, value.sessionId, value.turnId,
+      value.rootTaskId, value.stepId, `supersession-target-${randomUUID()}`,
+      JSON.stringify([prepared.source.taskId]), new Date(now.getTime() + 60_000), now,
+    ])
+    const before = await supersessionDurableRows(adminPool!, value)
+    await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .rejects.toMatchObject({ code: "task_graph_supersession_not_eligible" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+  }, 60_000)
+
+  it("serializes typed supersession against the real Worker claim path in both lock orders", async () => {
+    const policy = { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 }
+    const claimedDuringSupersession = fixture()
+    additionalFixtures.push(claimedDuringSupersession)
+    const commandWins = await prepareTypedSupersession(adminPool!, commandPool!, roleName, claimedDuringSupersession)
+    const commandHolder = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    const claimLoser = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    const commandApp = `tg-command-${randomUUID()}`
+    const claimApp = `tg-claim-${randomUUID()}`
+    await commandHolder.query("SELECT set_config('application_name', $1, false)", [commandApp])
+    await claimLoser.query("SELECT set_config('application_name', $1, false)", [claimApp])
+    const commandBarrier = pausingSessionLockPool(restrictedTransactionPool(commandHolder, roleName, claimedDuringSupersession.userId))
+    const commandWinnerPort = createPgTaskGraphCommandPort(commandBarrier.pool)
+    try {
+      const commandPromise = commandWinnerPort.appendAndScheduleWithReconciliation!(commandWins.input, commandWins.operation)
+        .then(value => ({ value }), error => ({ error }))
+      await waitForSignal(commandBarrier.acquired)
+      const claimPromise = new PgSubagentTaskStore(claimLoser).claim({ taskId: commandWins.source.taskId,
+        sessionId: claimedDuringSupersession.sessionId, ownerId: "worker-after-cancel", policy, now: new Date() })
+        .then(value => ({ value }), error => ({ error }))
+      await waitForLockWait(adminPool!, claimApp)
+      commandBarrier.release()
+      const [commandOutcome, claimOutcome] = await Promise.all([commandPromise, claimPromise])
+      if (!("value" in commandOutcome)) throw commandOutcome.error
+      expect(commandOutcome.value).toMatchObject({ status: "accepted", revision: 3 })
+      expect("value" in claimOutcome ? claimOutcome.value : undefined).toBeNull()
+    } finally {
+      commandBarrier.release()
+      await Promise.all([commandHolder.end(), claimLoser.end()])
+    }
+    const cancelledSource = await adminPool!.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [commandWins.source.taskId])
+    expect(cancelledSource.rows).toEqual([{ status: "cancelled" }])
+
+    const claimedFirst = fixture()
+    additionalFixtures.push(claimedFirst)
+    const commandLoses = await prepareTypedSupersession(adminPool!, commandPool!, roleName, claimedFirst)
+    const claimHolder = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    const commandLoser = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    const workerApp = `tg-worker-${randomUUID()}`
+    const losingCommandApp = `tg-plan-${randomUUID()}`
+    await claimHolder.query("SELECT set_config('application_name', $1, false)", [workerApp])
+    await commandLoser.query("SELECT set_config('application_name', $1, false)", [losingCommandApp])
+    const claimBarrier = pausingSessionLockPool(claimHolder)
+    let claimedTask: Awaited<ReturnType<PgSubagentTaskStore["claim"]>> = null
+    try {
+      const claimPromise = new PgSubagentTaskStore(claimBarrier.pool).claim({ taskId: commandLoses.source.taskId,
+        sessionId: claimedFirst.sessionId, ownerId: "worker-before-plan", policy, now: new Date() })
+        .then(value => ({ value }), error => ({ error }))
+      await waitForSignal(claimBarrier.acquired)
+      const commandLosingPort = createPgTaskGraphCommandPort(restrictedTransactionPool(commandLoser, roleName, claimedFirst.userId))
+      const commandPromise = commandLosingPort.appendAndScheduleWithReconciliation!(commandLoses.input, commandLoses.operation)
+        .then(value => ({ value }), error => ({ error }))
+      await waitForLockWait(adminPool!, losingCommandApp)
+      claimBarrier.release()
+      const [claimOutcome, commandOutcome] = await Promise.all([claimPromise, commandPromise])
+      if (!("value" in claimOutcome)) throw claimOutcome.error
+      expect(claimOutcome.value).toMatchObject({ status: "running", attemptCount: 1, leaseOwner: "worker-before-plan" })
+      expect("error" in commandOutcome).toBe(true)
+      claimedTask = claimOutcome.value
+    } finally {
+      claimBarrier.release()
+      await Promise.all([claimHolder.end(), commandLoser.end()])
+    }
+    expect(claimedTask).toMatchObject({ status: "running", attemptCount: 1, leaseOwner: "worker-before-plan" })
+    const graphAfterClaim = await commandLoses.command.readCurrent(readScope(claimedFirst))
+    expect(graphAfterClaim.revision).toBe(2)
+    expect(graphAfterClaim.nodes).toMatchObject([{ key: commandLoses.source.key, taskId: commandLoses.source.taskId, status: "running" }])
+    const replacementRows = await adminPool!.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 AND "id" <> $3`,
+      [claimedFirst.sessionId, claimedFirst.rootTaskId, commandLoses.source.taskId])
+    expect(replacementRows.rows).toEqual([])
+    expect((await adminPool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "type" = $2`,
+      [claimedFirst.sessionId, STEERING_RECONCILIATION_EVENT_TYPE])).rows).toEqual([])
   }, 60_000)
 
   it("blocks terminal finalization when a persisted Analyst attempt changes after completion was accepted", async () => {
