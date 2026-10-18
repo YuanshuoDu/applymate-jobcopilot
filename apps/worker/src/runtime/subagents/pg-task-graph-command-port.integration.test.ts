@@ -130,6 +130,7 @@ function fixture(): Fixture {
 }
 
 function selectedJobId(value: Fixture): string { return `p3-task-graph-selected-job-${value.sessionId}` }
+function scheduledDraftJobId(value: Fixture, label: string): string { return `draft-${label}-${value.rootTaskId.slice(-36)}` }
 
 function completedReviewerResultEnvelope() {
   const digest = `sha256:${"a".repeat(64)}`
@@ -1750,8 +1751,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     additionalFixtures.push(value)
     await seed(adminPool!, value)
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
-    const highJobId = `scheduled-draft-job-high-${value.sessionId}`
-    const lowJobId = `scheduled-draft-job-low-${value.sessionId}`
+    const highJobId = scheduledDraftJobId(value, "high")
+    const lowJobId = scheduledDraftJobId(value, "low")
     const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
       { scoutKey: "scout-high", analystKey: "analyst-high", jobId: highJobId, score: 9, hasFinding: true },
       { scoutKey: "scout-low", analystKey: "analyst-low", jobId: lowJobId, score: 6, hasFinding: true },
@@ -1836,7 +1837,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await seed(adminPool!, value)
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
     await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
-      { scoutKey: "scout-no-finding", analystKey: "analyst-no-finding", jobId: `scheduled-draft-job-no-finding-${value.sessionId}`, score: 8, hasFinding: false },
+      { scoutKey: "scout-no-finding", analystKey: "analyst-no-finding", jobId: scheduledDraftJobId(value, "no-finding"), score: 8, hasFinding: false },
     ])
     await expect(readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value))).resolves.toEqual({ status: "absent" })
     const writerReviewer = scheduledDraftInput(value, 1, [
@@ -1856,10 +1857,10 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     additionalFixtures.push(value)
     await seed(adminPool!, value)
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
-    const highJobId = `scheduled-draft-job-high-${value.sessionId}`
+    const highJobId = scheduledDraftJobId(value, "high")
     await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
       { scoutKey: "scout-high", analystKey: "analyst-high", jobId: highJobId, score: 9, hasFinding: true },
-      { scoutKey: "scout-low", analystKey: "analyst-low", jobId: `scheduled-draft-job-low-${value.sessionId}`, score: 6, hasFinding: true },
+      { scoutKey: "scout-low", analystKey: "analyst-low", jobId: scheduledDraftJobId(value, "low"), score: 6, hasFinding: true },
     ])
     const writerReviewer = scheduledDraftInput(value, 1, [
       { key: "writer", templateId: "cover_letter_writer", goal: "Draft for the plan-selected Analyst job", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-low"] },
@@ -1878,7 +1879,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     additionalFixtures.push(value)
     await seed(adminPool!, value)
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
-    const jobId = `scheduled-draft-job-attempt-${value.sessionId}`
+    const jobId = scheduledDraftJobId(value, "attempt")
     const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
       { scoutKey: "scout-attempt", analystKey: "analyst-attempt", jobId, score: 9, hasFinding: true },
     ])
@@ -1909,7 +1910,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     additionalFixtures.push(value)
     await seed(adminPool!, value)
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
-    const jobId = `scheduled-draft-job-revision-${value.sessionId}`
+    const jobId = scheduledDraftJobId(value, "revision")
     await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
       { scoutKey: "scout-revision", analystKey: "analyst-revision", jobId, score: 9, hasFinding: true },
     ])
@@ -1939,7 +1940,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     additionalFixtures.push(value)
     await seed(adminPool!, value)
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
-    const jobId = `scheduled-draft-job-finalize-${value.sessionId}`
+    const jobId = scheduledDraftJobId(value, "finalize")
     const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [
       { scoutKey: "scout-finalize", analystKey: "analyst-finalize", jobId, score: 9, hasFinding: true },
     ])
