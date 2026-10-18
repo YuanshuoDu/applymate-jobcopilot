@@ -57,8 +57,7 @@ async function transaction<T>(client: Client, work: () => Promise<T>): Promise<T
 
 async function setReadiness(client: Client, ready: boolean): Promise<boolean> {
   const result = await client.query(`INSERT INTO "agent_objective_history_index_readiness" ("indexName", "semanticsVersion", "isReady")
-    VALUES ($2, $3, $1) ON CONFLICT ("indexName", "semanticsVersion")
-    DO UPDATE SET "isReady" = $1, "updatedAt" = CURRENT_TIMESTAMP`,
+    VALUES ($2, $3, $1) ON CONFLICT ("indexName", "semanticsVersion") DO UPDATE SET "isReady" = $1, "updatedAt" = CURRENT_TIMESTAMP`,
   [ready, INDEX_NAME, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION])
   return result.rowCount === 1
 }
