@@ -202,7 +202,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : left.id.localeCompare(right.id)
       })
     const recoveredQuestions = await recoverAnsweredQuestionContext(client, { lease, rootTaskId, steps: stepsResult.rows,
-      toolItems: itemsResult.rows, existingHistory: snapshot.steerHistory, maxQuestions: 64 })
+      toolItems: itemsResult.rows, existingHistory: snapshot.steerHistory, includeExistingPairs: true, maxQuestions: 64 })
     snapshot = mergeCanonicalTurnQuestionContext({ snapshot, priorHistory: history, recovered: recoveredQuestions })
     snapshot = {
       ...snapshot,

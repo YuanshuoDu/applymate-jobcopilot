@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { sha256Hex } from "./context/context-compaction-canonical.js"
@@ -12,6 +12,12 @@ import { StepContextBuilder } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import { collectContextSnapshot } from "./context/context-snapshot-collector.js"
+import { readTurnQuestionPlanningHistory } from "./turns/turn-question-planning-history.js"
+import { planningClarificationContext } from "./context/planning-clarification-context.js"
+
+vi.mock("./turns/turn-question-planning-history.js", () => ({ readTurnQuestionPlanningHistory: vi.fn() }))
+
+beforeEach(() => vi.mocked(readTurnQuestionPlanningHistory).mockResolvedValue([]))
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -210,47 +216,92 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot).not.toHaveProperty("planningClarificationHistoryPair")
   })
 
-  it("resumes a current Turn from the canonical snapshot's lexical answer-first Q/A order", async () => {
-    const question = { id: "agent-question:question-item:question", content: {
-      role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }],
+  it("resumes restored Q/A pairs in answer-event order without duplicating ordinary history", async () => {
+    const questionA = { id: "agent-question:question-item-a:question", content: {
+      role: "assistant", type: "question", question: "Continue A?", options: [{ label: "Yes", value: "yes" }],
     } }
-    const answer = { id: "agent-question:question-item:answer", content: {
-      role: "user", type: "answer", questionId: "question-1", text: "yes",
+    const answerA = { id: "agent-question:question-item-a:answer", content: {
+      role: "user", type: "answer", questionId: "question-a", text: "yes-a",
     } }
+    const questionB = { id: "agent-question:question-item-b:question", content: {
+      role: "assistant", type: "question", question: "Continue B?", options: [{ label: "Yes", value: "yes" }],
+    } }
+    const answerB = { id: "agent-question:question-item-b:answer", content: {
+      role: "user", type: "answer", questionId: "question-b", text: "yes-b",
+    } }
+    const ordinaryBetween = { id: "agent-question:question-item-az:note", content: { role: "assistant", text: "Unmatched ordinary history" } }
+    const ordinaryDuplicate = { id: "history:user:ordinary-input", content: { role: "user", text: "Prior ordinary input" } }
+    const summary = { observedPlanRevision: 2, graphRevisionAtAsk: 3, pendingSteerCount: 2, unconsumedSteerCount: 1, inputThroughSequence: "9" }
     const collected = await collectContextSnapshot({
       scope: { userId: "user-1" }, sessionId: "session-1", throughSequence: 7n,
       source: { goal: "Find jobs", userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [],
         artifacts: [], facts: [], failedAttempts: [], references: [], tokenUsage: [],
-        context: { system: [], profile: [], steerHistory: [question, answer], toolObservations: [] } },
+        context: { system: [], profile: [], steerHistory: [questionA, answerA, ordinaryBetween, questionB, answerB, ordinaryDuplicate], toolObservations: [] } },
       references: { verify: async reference => ({ ...reference, verified: true as const }) },
     })
-    expect(collected.content.context.steerHistory.map(entry => entry.id)).toEqual([answer.id, question.id])
-    const questionItem = { id: "question-item", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
-      stepId: null, status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: "question-call-1",
-        question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
-    const questionEvents = [
-      { id: "started", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
-        type: "item.started", actor: "orchestrator", sequence: "10", correlationId: "question-item", causationId: "question-1",
-        payload: { itemId: "question-item", waitKind: "question", toolCallId: "question-call-1" } },
-      { id: "answered", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
-        type: "question.answered", actor: "user", sequence: "11", correlationId: "question-1", causationId: "question-item",
-        payload: { waitKind: "question", waitId: "question-1", itemId: "question-item", turnId: "turn-1", toolCallId: "question-call-1", status: "answered" } },
-    ]
+    expect(collected.content.context.steerHistory.map(entry => entry.id)).toEqual([
+      answerA.id, questionA.id, ordinaryBetween.id, answerB.id, questionB.id, ordinaryDuplicate.id,
+    ])
+    const questionItem = (suffix: "a" | "b") => ({
+      id: `question-item-${suffix}`, type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+      stepId: null, status: "completed", content: { waitKind: "question", questionId: `question-${suffix}`, toolCallId: `question-call-${suffix}`,
+        question: `Continue ${suffix.toUpperCase()}?`, options: [{ label: "Yes", value: "yes" }], answer: `yes-${suffix}`, answerAvailable: true },
+    })
+    const questionEventsFor = (suffix: "a" | "b", started: string, answered: string) => {
+      const itemId = `question-item-${suffix}`, questionId = `question-${suffix}`, toolCallId = `question-call-${suffix}`
+      return [
+        { id: `started-${suffix}`, userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId,
+          type: "item.started", actor: "orchestrator", sequence: started, correlationId: itemId, causationId: questionId,
+          payload: { itemId, waitKind: "question", toolCallId } },
+        { id: `answered-${suffix}`, userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId,
+          type: "question.answered", actor: "user", sequence: answered, correlationId: questionId, causationId: itemId,
+          payload: { waitKind: "question", waitId: questionId, itemId, turnId: "turn-1", toolCallId, status: "answered" } },
+      ]
+    }
+    const questionEvents = [...questionEventsFor("a", "10", "30"), ...questionEventsFor("b", "11", "20")]
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
-      steps: [{ id: "step-1", taskId: "root-1", ordinal: 0, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
-      items: [{ id: "tool-call-item", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1", type: "tool_call", status: "completed", revision: 1,
-        content: { toolCallId: "question-call-1", toolName: "jobs.search", input: { query: "engineer" }, status: "completed" } }],
-      questionItems: [questionItem], questionEvents,
+      steps: [
+        { id: "step-a", taskId: "root-1", ordinal: 0, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+        { id: "step-b", taskId: "root-1", ordinal: 1, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      ],
+      items: ["a", "b"].map(suffix => ({ id: `tool-call-item-${suffix}`, sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: `step-${suffix}`,
+        type: "tool_call", status: "completed", revision: 1,
+        content: { toolCallId: `question-call-${suffix}`, toolName: "jobs.search", input: { query: "engineer" }, status: "completed" } })),
+      questionItems: [questionItem("a"), questionItem("b")], questionEvents,
+      inputs: [{ id: "ordinary-input", targetTurnId: "prior-turn", delivery: "immediate", status: "accepted", consumedByStepId: null, consumedAt: null,
+        cancelledAt: null, content: { text: "Prior ordinary input" }, acceptedSequence: "8" }],
       snapshots: [{ id: "snapshot-1", throughSequence: "7", version: 1, content: collected.content }],
     })
+    vi.mocked(readTurnQuestionPlanningHistory).mockResolvedValueOnce([summary])
 
     const resumed = await loadCanonicalTurnState(fake, lease)
-    expect(resumed.resume).toMatchObject({ nextOrdinal: 1, stepCount: 1 })
+    expect(resumed.resume).toMatchObject({ nextOrdinal: 2, stepCount: 2 })
     expect(resumed.snapshot.steerHistory).toEqual([
-      question,
-      answer,
+      { id: questionB.id, content: questionB.content },
+      { id: answerB.id, content: answerB.content },
+      ordinaryBetween,
+      { id: questionA.id, content: questionA.content },
+      { id: answerA.id, content: answerA.content },
+      ordinaryDuplicate,
     ])
+    expect(resumed.snapshot.steerHistory.filter(entry => entry.id === ordinaryDuplicate.id)).toHaveLength(1)
+    expect(resumed.snapshot.planningClarifications).toEqual([summary])
+    expect(resumed.snapshot.planningClarificationHistoryPair).toEqual({ questionEntryId: questionB.id, answerEntryId: answerB.id })
+    expect(planningClarificationContext(resumed.snapshot.planningClarifications, resumed.snapshot.steerHistory,
+      resumed.snapshot.planningClarificationHistoryPair).afterAnswerEntryId).toBe(answerB.id)
+    const claimStore: InputClaimStore = {
+      scope: { userId: "user-1" },
+      async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+        return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+          claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
+      },
+    }
+    const context = await new StepContextBuilder(claimStore).build({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-next", snapshot: resumed.snapshot, now: new Date(0),
+    })
+    const answerBlock = context.blocks.findIndex(block => block.id === `history:${answerB.id}`)
+    expect(context.blocks[answerBlock + 1]).toMatchObject({ id: "planning-clarification:latest-answered-question", content: summary })
   })
 
   it("restores a complete earlier root answer after compaction as untrusted model history without replacing the current goal", async () => {

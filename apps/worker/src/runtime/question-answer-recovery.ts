@@ -41,7 +41,9 @@ export async function recoverAnsweredQuestionContext(
 ): Promise<AnsweredQuestionContext> {
   const lineage = await recoverAnsweredQuestionLineage(client, input)
   const current = lineage.flatMap(item => item.entries)
-  const prior = await recoverPriorRootQuestionHistory(client, { ...input, existingHistory: [...input.existingHistory, ...current] })
+  const currentIds = new Set(current.map(entry => entry.id))
+  const priorExistingHistory = [...input.existingHistory.filter(entry => !currentIds.has(entry.id)), ...current]
+  const prior = await recoverPriorRootQuestionHistory(client, { ...input, existingHistory: priorExistingHistory, includeExistingPairs: false })
   const latest = latestQuestionByDurableOrder(lineage, input)
   let planningClarifications: readonly TurnQuestionPlanningSummary[] = []
   let planningClarificationHistoryPair: PlanningClarificationHistoryPair | undefined

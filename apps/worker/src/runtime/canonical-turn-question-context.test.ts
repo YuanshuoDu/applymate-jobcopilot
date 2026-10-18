@@ -28,6 +28,47 @@ describe("mergeCanonicalTurnQuestionContext", () => {
     expect(JSON.stringify(result.planningClarifications)).not.toContain("Germany")
   })
 
+  it("orders restored snapshot pairs by durable answer order and retains the selected planning pair", () => {
+    const questionA = { id: "agent-question:item-a:question", content: { role: "assistant", type: "question", question: "Where A?" } }
+    const answerA = { id: "agent-question:item-a:answer", content: { role: "user", type: "answer", questionId: "wait-a", text: "Dublin" } }
+    const questionB = { id: "agent-question:item-b:question", content: { role: "assistant", type: "question", question: "Where B?" } }
+    const answerB = { id: "agent-question:item-b:answer", content: { role: "user", type: "answer", questionId: "wait-b", text: "Berlin" } }
+    const ordinary = { id: "history:ordinary", content: { role: "user", text: "Keep this history" } }
+    const unmatched = { id: "agent-question:legacy:narrative", content: { role: "assistant", text: "Unmatched history stays put" } }
+    const selectedPair = { questionEntryId: questionB.id, answerEntryId: answerB.id }
+    const snapshot = { system: [], profile: [], steerHistory: [answerA, questionA, ordinary, answerB, questionB, unmatched], businessRefs: [], toolObservations: [] }
+
+    const result = mergeCanonicalTurnQuestionContext({
+      snapshot,
+      priorHistory: [],
+      recovered: { history: [questionB, answerB, questionA, answerA], planningClarifications: [], planningClarificationHistoryPair: selectedPair },
+    })
+
+    expect(result.steerHistory).toEqual([questionB, answerB, ordinary, questionA, answerA, unmatched])
+    expect(result.planningClarificationHistoryPair).toBe(selectedPair)
+    const selectedQuestionIndex = result.steerHistory.findIndex(entry => entry.id === selectedPair.questionEntryId)
+    expect(result.steerHistory[selectedQuestionIndex + 1]?.id).toBe(selectedPair.answerEntryId)
+    expect(result.steerHistory[2]).toEqual(ordinary)
+    expect(result.steerHistory[5]).toEqual(unmatched)
+  })
+
+  it("completes a snapshot pair with only its question while keeping the pair adjacent", () => {
+    const questionA = { id: "agent-question:item-a:question", content: { role: "assistant", type: "question", question: "Where A?" } }
+    const answerA = { id: "agent-question:item-a:answer", content: { role: "user", type: "answer", questionId: "wait-a", text: "Dublin" } }
+    const questionB = { id: "agent-question:item-b:question", content: { role: "assistant", type: "question", question: "Where B?" } }
+    const answerB = { id: "agent-question:item-b:answer", content: { role: "user", type: "answer", questionId: "wait-b", text: "Berlin" } }
+    const ordinary = { id: "history:ordinary", content: { role: "user", text: "Keep this history" } }
+    const snapshot = { system: [], profile: [], steerHistory: [questionA, ordinary, answerB, questionB], businessRefs: [], toolObservations: [] }
+
+    const result = mergeCanonicalTurnQuestionContext({
+      snapshot,
+      priorHistory: [],
+      recovered: { history: [questionB, answerB, questionA, answerA], planningClarifications: [] },
+    })
+
+    expect(result.steerHistory).toEqual([questionB, answerB, ordinary, questionA, answerA])
+  })
+
   it("discards saved pair anchors when live recovery has no current validated pair", () => {
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
       planningClarificationHistoryPair: { questionEntryId: "saved-question", answerEntryId: "saved-answer" } }

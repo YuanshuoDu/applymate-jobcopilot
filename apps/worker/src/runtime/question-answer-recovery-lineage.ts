@@ -11,6 +11,7 @@ export type RecoveryInput = {
   readonly steps: readonly Row[]
   readonly toolItems: readonly Row[]
   readonly existingHistory: readonly ContextHistoryEntry[]
+  readonly includeExistingPairs?: boolean // Canonical resume needs validated existing pairs to restore their durable order.
   readonly maxQuestions?: number
   readonly rootOnly?: boolean
 }
@@ -102,7 +103,7 @@ function historyPair(item: Row, content: Row): ContextHistoryEntry[] {
   ]
 }
 
-function appendIfNew(entries: readonly ContextHistoryEntry[], existing: readonly ContextHistoryEntry[]): ContextHistoryEntry[] {
+function appendIfNew(entries: readonly ContextHistoryEntry[], existing: readonly ContextHistoryEntry[], includeExistingPair: boolean): ContextHistoryEntry[] {
   for (const entry of entries) {
     if (existing.filter(candidate => candidate.id === entry.id).length > 1) {
       throw new Error("question_recovery_history_duplicate")
@@ -115,6 +116,7 @@ function appendIfNew(entries: readonly ContextHistoryEntry[], existing: readonly
   const questionIndex = existing.findIndex(entry => entry.id === entries[0].id)
   const answerIndex = existing.findIndex(entry => entry.id === entries[1].id)
   if (known.has(entries[1].id) && !known.has(entries[0].id)) throw new Error("question_recovery_history_pair_incomplete")
+  if (includeExistingPair && questionIndex >= 0) return [...entries]
   if (questionIndex >= 0 && answerIndex >= 0 && questionIndex > answerIndex) return [...entries]
   return entries.filter(entry => !known.has(entry.id))
 }
@@ -241,7 +243,8 @@ export async function recoverAnsweredQuestionLineage(
     const answeredAt = validateAnswer(answers[0], item, questionId, callId, lease)
     if (answeredAt <= startedAt) throw new Error("question_recovery_sequence_invalid")
     const entries = historyPair(item, content)
-    result.push({ order: answeredAt, lineage: { item, content, startedEvent: starts[0], answeredEvent: answers[0], stepId, questionId, toolCallId: callId, entries: appendIfNew(entries, input.existingHistory) } })
+    result.push({ order: answeredAt, lineage: { item, content, startedEvent: starts[0], answeredEvent: answers[0], stepId, questionId, toolCallId: callId,
+      entries: appendIfNew(entries, input.existingHistory, input.includeExistingPairs === true) } })
   }
   return result.sort((left, right) => left.order < right.order ? -1 : left.order > right.order ? 1 : 0).map(row => row.lineage)
 }

@@ -89,6 +89,29 @@ describe("durable question answer lineage", () => {
     expect(await recoverAnsweredQuestionHistory(client(rows, eventRows), supplied)).toEqual(lineage.flatMap(row => row.entries))
   })
 
+  it("can return already-present pairs after validation for canonical ordering without changing legacy dedupe", async () => {
+    const question = { id: "agent-question:question-item:question", content: {
+      role: "assistant", type: "question", question: "Where should I focus?", options: [{ label: "Dublin", value: "dublin" }],
+    } }
+    const answer = { id: "agent-question:question-item:answer", content: {
+      role: "user", type: "answer", questionId: "wait-1", text: "dublin",
+    } }
+    const snapshotOrder = [question, answer]
+    const legacy = await recoverAnsweredQuestionLineage(client(), input({ existingHistory: snapshotOrder }))
+    const canonical = await recoverAnsweredQuestionLineage(client(), input({ existingHistory: snapshotOrder, includeExistingPairs: true }))
+    const partial = await recoverAnsweredQuestionLineage(client(), input({ existingHistory: [question], includeExistingPairs: true }))
+
+    expect(legacy[0]?.entries).toEqual([])
+    expect(canonical[0]?.entries).toEqual([question, answer])
+    expect(partial[0]?.entries).toEqual([question, answer])
+    await expect(recoverAnsweredQuestionLineage(client(), input({ existingHistory: [answer], includeExistingPairs: true })))
+      .rejects.toThrow("question_recovery_history_pair_incomplete")
+    await expect(recoverAnsweredQuestionLineage(client(), input({ existingHistory: [question, question, answer], includeExistingPairs: true })))
+      .rejects.toThrow("question_recovery_history_duplicate")
+    await expect(recoverAnsweredQuestionLineage(client(), input({ existingHistory: [{ ...question, content: "changed" }, answer], includeExistingPairs: true })))
+      .rejects.toThrow("question_recovery_history_collision")
+  })
+
   it("accepts the broker's null-task answer for a turn-scoped question only with the matching root tool call", async () => {
     const question = item()
     const result = await recoverAnsweredQuestionLineage(client([question]), input())
