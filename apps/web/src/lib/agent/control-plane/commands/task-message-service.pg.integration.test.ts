@@ -111,7 +111,7 @@ describePg("TaskMessageService PostgreSQL durability and rollback", () => {
     expect(event).toMatchObject({ type: "input.accepted", actor: "user", itemId: accepted.itemId })
     expect(event?.payload).toMatchObject({ item: {
       id: accepted.itemId, taskId: value.taskId,
-      content: { parts: [{ type: "text", text: command.text }] },
+      content: "[REDACTED]",
     } })
 
     await prisma!.$executeRaw`UPDATE "sub_agent_tasks" SET "status" = 'completed', "attemptCount" = 3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL WHERE "id" = ${value.taskId}`
@@ -140,10 +140,13 @@ describePg("TaskMessageService PostgreSQL durability and rollback", () => {
 
   it("rolls back the mailbox and visible item when accepted-event outbox persistence fails", async () => {
     const value = await seedScenario()
-    await prisma!.$executeRawUnsafe(`ALTER TABLE "agent_outbox" ADD CONSTRAINT "block_session_event" CHECK ("topic" <> 'agent.session.event')`)
+    const clientMessageId = "rollback"
+    const acceptedEventIdempotencyKey = `agent-task-follow-up-accepted:${value.sessionId}:${clientMessageId}`
+    await prisma!.$executeRawUnsafe(`ALTER TABLE "agent_outbox" ADD CONSTRAINT "block_session_event" CHECK (
+      "topic" <> 'agent.session.event' OR ("payload"->>'idempotencyKey') <> '${acceptedEventIdempotencyKey}')`)
     try {
       const service = new TaskMessageService(prisma!)
-      await expect(service.send({ ...value, userId: value.userId, clientMessageId: "rollback", text: "Rollback this" }))
+      await expect(service.send({ ...value, userId: value.userId, clientMessageId, text: "Rollback this" }))
         .rejects.toThrow()
       expect(await prisma!.agentMailboxMessage.count({ where: { sessionId: value.sessionId } })).toBe(0)
       expect(await prisma!.agentOutbox.count({ where: { aggregateId: value.sessionId } })).toBe(0)
