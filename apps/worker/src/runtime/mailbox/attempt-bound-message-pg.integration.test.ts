@@ -29,11 +29,11 @@ const fixture = {
   rootTaskId: `mailbox-attempt-root-${suffix}`,
   taskId: `mailbox-attempt-child-${suffix}`,
   stepId: `mailbox-attempt-step-${suffix}`,
+  nextStepId: `mailbox-attempt-next-step-${suffix}`,
   oldMessageId: `mailbox-attempt-old-${suffix}`,
   currentMessageId: `mailbox-attempt-current-${suffix}`,
   legacyMessageId: `mailbox-attempt-legacy-${suffix}`,
   staleOutboxId: `mailbox-attempt-stale-outbox-${suffix}`,
-  currentOutboxId: `mailbox-attempt-current-outbox-${suffix}`,
   oldKey: `mailbox-attempt-old-key-${suffix}`,
   currentKey: `mailbox-attempt-current-key-${suffix}`,
   legacyKey: `mailbox-attempt-legacy-key-${suffix}`,
@@ -86,31 +86,29 @@ describeWithPostgres("attempt-bound mailbox messages in PostgreSQL", () => {
     expect(hydrated.map(message => message.id)).toEqual([fixture.currentMessageId, fixture.legacyMessageId])
   })
 
-  it("rejects stale outbox wake and applies a matching wake once across duplicate delivery", async () => {
+  it("stales a waiting follow-up and excludes it from the next attempt hydration", async () => {
     await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'waiting', "leaseOwner" = NULL, "leaseExpiresAt" = NULL WHERE "id" = $1`, [fixture.taskId])
-    await insertMailboxOutbox(pool, fixture.staleOutboxId, fixture.oldMessageId, fixture.oldKey, 1)
+    await insertMailboxOutbox(pool, fixture.staleOutboxId, fixture.currentMessageId, fixture.currentKey, 2)
 
     await expect(drainSubagentMailboxOutbox(pool)).resolves.toBe(1)
     await expect(pool.query(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [fixture.taskId]))
       .resolves.toMatchObject({ rows: [{ status: "waiting" }] })
+    await expect(pool.query(`SELECT "publishedAt", "attemptCount", "lastError" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [`agent.subagent.mailbox:${fixture.currentKey}`]))
+      .resolves.toMatchObject({ rows: [{ publishedAt: expect.any(Date), attemptCount: 1, lastError: "mailbox_attempt_stale" }] })
     await expect(pool.query(`SELECT "publishedAt", "attemptCount", "lastError" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [`subagent-dispatch:${fixture.taskId}`]))
       .resolves.toMatchObject({ rows: [{ publishedAt: expect.any(Date), attemptCount: 4, lastError: "prior_failure" }] })
-    await expect(pool.query(`SELECT "deliveredAt" FROM "agent_mailbox_messages" WHERE "id" = $1`, [fixture.oldMessageId]))
+    await expect(pool.query(`SELECT "deliveredAt" FROM "agent_mailbox_messages" WHERE "id" = $1`, [fixture.currentMessageId]))
       .resolves.toMatchObject({ rows: [{ deliveredAt: null }] })
 
-    await insertMailboxOutbox(pool, fixture.currentOutboxId, fixture.currentMessageId, fixture.currentKey, 2)
-    await expect(drainSubagentMailboxOutbox(pool)).resolves.toBe(1)
-    await expect(pool.query(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [fixture.taskId]))
-      .resolves.toMatchObject({ rows: [{ status: "queued" }] })
-    await expect(pool.query(`SELECT "publishedAt", "attemptCount", "lastError" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [`subagent-dispatch:${fixture.taskId}`]))
-      .resolves.toMatchObject({ rows: [{ publishedAt: null, attemptCount: 5, lastError: null }] })
-
-    await pool.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL WHERE "id" = $1`, [fixture.currentOutboxId])
-    await expect(drainSubagentMailboxOutbox(pool)).resolves.toBe(1)
-    await expect(pool.query(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [fixture.taskId]))
-      .resolves.toMatchObject({ rows: [{ status: "queued" }] })
-    await expect(pool.query(`SELECT "publishedAt", "attemptCount" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [`subagent-dispatch:${fixture.taskId}`]))
-      .resolves.toMatchObject({ rows: [{ publishedAt: null, attemptCount: 5 }] })
+    await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "attemptCount" = 3, "leaseOwner" = 'worker-next', "leaseExpiresAt" = CURRENT_TIMESTAMP + INTERVAL '5 minutes' WHERE "id" = $1`, [fixture.taskId])
+    await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+      VALUES ($1, $2, $3, $4, 2, 3, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [fixture.nextStepId, fixture.sessionId, fixture.turnId, fixture.taskId])
+    const nextAttemptMailbox = await hydrateChildMailbox(pool, {
+      userId: fixture.userId, sessionId: fixture.sessionId, turnId: fixture.turnId, rootTaskId: fixture.rootTaskId,
+      toTaskId: fixture.taskId, ownerId: "worker-next", attemptCount: 3, stepId: fixture.nextStepId, limit: 20,
+    })
+    expect(nextAttemptMailbox.map(message => message.id)).toEqual([fixture.legacyMessageId])
+    expect(nextAttemptMailbox.map(message => message.id)).not.toContain(fixture.currentMessageId)
   })
 })
 

@@ -25,6 +25,7 @@ type MailboxLineage = {
   targetRootTaskId: string | null
   targetLeaseOwner: string | null
   targetLeaseExpiresAt: Date | string | null
+  targetHasLiveLease: boolean
   targetInterruptRequestedAt: Date | string | null
   rootId: string
   rootSessionId: string
@@ -159,6 +160,7 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
       target."status" AS "targetStatus", target."sessionId" AS "targetSessionId", target."turnId" AS "targetTurnId",
       target."rootTaskId" AS "targetRootTaskId", target."leaseOwner" AS "targetLeaseOwner",
       target."leaseExpiresAt" AS "targetLeaseExpiresAt", target."interruptRequestedAt" AS "targetInterruptRequestedAt",
+      COALESCE(target."leaseExpiresAt" > clock_timestamp(), false) AS "targetHasLiveLease",
       root."id" AS "rootId", root."sessionId" AS "rootSessionId", root."turnId" AS "rootTurnId", root."status" AS "rootStatus",
       turn."id" AS "turnId", turn."sessionId" AS "turnSessionId", turn."status" AS "turnStatus"
     FROM "agent_mailbox_messages" AS message
@@ -183,6 +185,11 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
     : lineage.messageTargetAttemptCount === payload.targetAttemptCount && lineage.targetAttemptCount === payload.targetAttemptCount
   if (!attemptMatches) {
     await markOutbox(client, row.id, "mailbox_attempt_mismatch")
+    return
+  }
+  if (payload.targetAttemptCount !== undefined && (lineage.targetStatus !== "running"
+    || !lineage.targetLeaseOwner || !lineage.targetHasLiveLease || lineage.targetInterruptRequestedAt !== null)) {
+    await markOutbox(client, row.id, "mailbox_attempt_stale")
     return
   }
   // Session and lineage locks precede the task CAS; the dispatch reset is last.

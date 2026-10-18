@@ -60,6 +60,7 @@ type FakeOptions = {
   taskRootTaskId?: string | null
   taskLeaseOwner?: string | null
   taskLeaseExpiresAt?: Date | string | null
+  taskHasLiveLease?: boolean
   taskInterruptRequestedAt?: Date | string | null
   dispatchMissing?: boolean
   dispatchPublishedAt?: Date | null
@@ -310,7 +311,8 @@ class FakeClient {
         messageTargetAttemptCount: this.options.messageTargetAttemptCount === undefined ? row.targetAttemptCount : this.options.messageTargetAttemptCount,
         targetAttemptCount: this.task.attemptCount, targetStatus: this.task.status, targetSessionId: this.task.sessionId,
         targetTurnId: this.task.turnId, targetRootTaskId: this.task.rootTaskId, targetLeaseOwner: this.task.leaseOwner,
-        targetLeaseExpiresAt: this.task.leaseExpiresAt, targetInterruptRequestedAt: this.task.interruptRequestedAt,
+        targetLeaseExpiresAt: this.task.leaseExpiresAt, targetHasLiveLease: this.options.taskHasLiveLease ?? false,
+        targetInterruptRequestedAt: this.task.interruptRequestedAt,
         rootId: this.task.rootTaskId ?? "root-1", rootSessionId: this.task.sessionId, rootTurnId: this.task.turnId,
         rootStatus: this.options.rootStatus ?? "running", turnId: this.task.turnId, turnSessionId: this.task.sessionId,
         turnStatus: this.options.turnStatus ?? "in_progress",
@@ -352,6 +354,7 @@ describe("subagent mailbox outbox consumer", () => {
     expect(message?.sql).toContain('message."sessionId" = $2 AND message."turnId" = $3')
     expect(message?.sql).toContain('message."targetAttemptCount"')
     expect(message?.sql).toContain('target."attemptCount" AS "targetAttemptCount"')
+    expect(message?.sql).toContain('COALESCE(target."leaseExpiresAt" > clock_timestamp(), false) AS "targetHasLiveLease"')
     expect(message?.sql).toContain('message."kind"')
     expect(message?.sql).toContain('target."turnId" = $3')
     expect(message?.sql).toContain('root."id" = target."rootTaskId"')
@@ -413,37 +416,46 @@ describe("subagent mailbox outbox consumer", () => {
     expect(fake.client.calls[dispatchReset]?.values).toEqual(["subagent-dispatch:task-1", "session-1"])
   })
 
-  it("wakes a matching attempt-bound human message and treats redelivery as idempotent", async () => {
+  it("delivers a matching attempt-bound human message only during its active lease", async () => {
     const fake = fakePool({
-      taskStatus: "waiting", taskAttemptCount: 2, payload: boundPayload,
+      taskStatus: "running", taskAttemptCount: 2, taskLeaseOwner: "worker-current", taskHasLiveLease: true, payload: boundPayload,
       messageKind: "human_follow_up", messageTargetAttemptCount: 2,
     })
+    const beforeDispatch = fake.client.dispatch ? { ...fake.client.dispatch } : null
 
     await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
-    expect(fake.client.task.status).toBe("queued")
-    expect(fake.client.dispatch).toMatchObject({ publishedAt: null, attemptCount: 3 })
+    expect(fake.client.task.status).toBe("running")
+    expect(fake.client.dispatch).toEqual(beforeDispatch)
+    expect(fake.client.mailboxRows[0]?.deliveredAt).not.toBeNull()
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: null })
     fake.client.outboxRows[0]!.publishedAt = null
 
     await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
-    expect(fake.client.task.status).toBe("queued")
-    expect(fake.client.dispatch).toMatchObject({ publishedAt: null, attemptCount: 3 })
-    expect(fake.client.calls.filter(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toHaveLength(1)
+    expect(fake.client.task.status).toBe("running")
+    expect(fake.client.dispatch).toEqual(beforeDispatch)
+    expect(fake.client.calls.filter(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toHaveLength(0)
   })
 
-  it("records stale attempt-bound delivery without waking, delivering, or resetting dispatch", async () => {
+  it.each([
+    ["waiting task", { taskStatus: "waiting" }],
+    ["queued task", { taskStatus: "queued" }],
+    ["terminal task", { taskStatus: "failed" }],
+    ["missing lease", { taskStatus: "running", taskLeaseOwner: null }],
+    ["expired lease", { taskStatus: "running", taskLeaseOwner: "worker-old", taskHasLiveLease: false }],
+    ["interrupt request", { taskStatus: "running", taskLeaseOwner: "worker-current", taskHasLiveLease: true, taskInterruptRequestedAt: new Date("2026-09-14T10:00:00.000Z") }],
+  ] as const)("marks attempt-bound delivery stale for a %s", async (_label, options) => {
     const fake = fakePool({
-      taskStatus: "waiting", taskAttemptCount: 2,
-      payload: { ...validPayload, targetAttemptCount: 1 },
-      messageKind: "human_follow_up", messageTargetAttemptCount: 1,
+      ...options, taskAttemptCount: 2, payload: boundPayload,
+      messageKind: "human_follow_up", messageTargetAttemptCount: 2,
     })
     const beforeDispatch = fake.client.dispatch ? { ...fake.client.dispatch } : null
 
     await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
 
-    expect(fake.client.task.status).toBe("waiting")
+    expect(fake.client.task.status).toBe(options.taskStatus)
     expect(fake.client.dispatch).toEqual(beforeDispatch)
     expect(fake.client.mailboxRows[0]).toMatchObject({ deliveredAt: null, consumedAt: null })
-    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: "mailbox_attempt_mismatch" })
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: "mailbox_attempt_stale" })
     expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.client.calls.some(call => call.sql.includes('SET "publishedAt" = NULL'))).toBe(false)
     expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "agent_mailbox_messages"'))).toBe(false)
