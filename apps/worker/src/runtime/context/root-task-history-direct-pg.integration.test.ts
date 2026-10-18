@@ -295,6 +295,26 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
   }
 }
 
+async function deleteSourceFixtures(sources: readonly Source[]): Promise<void> {
+  if (!sources.length) return
+  const client = await pool!.connect(), turnIds = sources.map(source => source.turnId)
+  try {
+    await client.query("BEGIN")
+    await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+      AND "parentTaskId" IS NOT NULL`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])
+      AND "parentTaskId" IS NULL`, [sessionId, turnIds])
+    await client.query(`DELETE FROM "agent_turns" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [sessionId, turnIds])
+    await client.query("COMMIT")
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
 async function setObjectiveHistoryIndexReady(ready: boolean): Promise<void> {
   const result = await pool!.query(`INSERT INTO "agent_objective_history_index_readiness" ("indexName", "semanticsVersion", "isReady")
     VALUES ($2, $3, $1) ON CONFLICT ("indexName", "semanticsVersion")
@@ -532,7 +552,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       expect(fallback.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId])
       expect(fallback.some(item => changed.some(source => source.turnId === item.sourceTurnId))).toBe(false)
     } finally {
-      await updateCurrentTurn("user", originalInput)
+      try { await updateCurrentTurn("user", originalInput) }
+      finally { await deleteSourceFixtures(sources) }
     }
   })
 
