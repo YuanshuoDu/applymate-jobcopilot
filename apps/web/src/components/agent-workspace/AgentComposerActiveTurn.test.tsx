@@ -6,6 +6,7 @@ import {
   acquireObjectiveReplacementRequest,
   AgentComposerActiveTurn,
   canSubmitObjectiveReplacement,
+  objectiveReplacementTargetChanged,
   objectiveReplacementFormReducer,
   type ObjectiveReplacementFormState,
 } from './AgentComposerActiveTurn'
@@ -47,6 +48,18 @@ describe('AgentComposerActiveTurn', () => {
     }
     expect(renderToString(<AgentComposerActiveTurn controller={controller} />)).not.toContain('open-objective-replacement')
     expect(renderToString(<AgentComposerActiveTurn controller={{ ...controller, sessionStatus: 'running', activeTurn: null }} />)).not.toContain('open-objective-replacement')
+  })
+
+  it('detects a stale replacement target when the Turn, revision, or Session status changes', () => {
+    const state: ObjectiveReplacementFormState = {
+      open: true, target: { turnId: 'turn_1', revision: 2 }, draft: 'New goal',
+      clientMessageId: 'request_1', pending: false, error: null,
+    }
+
+    expect(objectiveReplacementTargetChanged(state, { id: 'turn_1', status: 'in_progress', revision: 2 }, 'running')).toBe(false)
+    expect(objectiveReplacementTargetChanged(state, { id: 'turn_2', status: 'in_progress', revision: 2 }, 'running')).toBe(true)
+    expect(objectiveReplacementTargetChanged(state, { id: 'turn_1', status: 'in_progress', revision: 3 }, 'running')).toBe(true)
+    expect(objectiveReplacementTargetChanged(state, { id: 'turn_1', status: 'in_progress', revision: 2 }, 'paused')).toBe(true)
   })
 
   it('keeps the captured target and request identity through conflict and uncertain retry', () => {

@@ -57,6 +57,18 @@ export function acquireObjectiveReplacementRequest(lock: { current: boolean }, s
   return true
 }
 
+export function objectiveReplacementTargetChanged(
+  state: ObjectiveReplacementFormState,
+  activeTurn: TurnComposerController['activeTurn'],
+  sessionStatus: TurnComposerController['sessionStatus'],
+): boolean {
+  return state.target !== null && (
+    sessionStatus !== 'running'
+    || activeTurn?.id !== state.target.turnId
+    || activeTurn?.revision !== state.target.revision
+  )
+}
+
 export function AgentComposerActiveTurn({ controller }: { controller: TurnComposerController }) {
   return <ActiveTurnSession key={controller.sessionId} controller={controller} />
 }
@@ -65,11 +77,7 @@ function ActiveTurnSession({ controller }: { controller: TurnComposerController 
   const [replacement, dispatch] = useReducer(objectiveReplacementFormReducer, initialReplacementState)
   const pendingRef = useRef(false)
   const canOpenReplacement = controller.sessionStatus === 'running' && controller.activeTurn !== null
-  const targetChanged = replacement.target !== null && (
-    controller.sessionStatus !== 'running'
-    || controller.activeTurn?.id !== replacement.target.turnId
-    || controller.activeTurn?.revision !== replacement.target.revision
-  )
+  const targetChanged = objectiveReplacementTargetChanged(replacement, controller.activeTurn, controller.sessionStatus)
 
   const openReplacement = () => {
     if (!canOpenReplacement || !controller.activeTurn) return
