@@ -15,6 +15,7 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-category.js"
 import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-structured-failure-category.js"
+import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -181,6 +182,7 @@ export type TaskGraphCurrentNode = Readonly<{
   readiness: TaskGraphReadiness
   resultSummary: string | null
   resultProjection?: TaskGraphResultProjection
+  discoveryAttemptHealth?: DiscoveryAttemptHealth
   verificationCriterionIds?: readonly string[]
   verification?: TaskGraphVerificationContract
   verificationReport?: TaskGraphVerificationReport

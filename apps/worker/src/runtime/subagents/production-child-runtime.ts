@@ -24,6 +24,7 @@ import { createJobDiscoveryClient, type JobDiscoveryClient } from "../tools/job-
 import type { JobDiscoveryExecutionFence } from "../tools/job-discover-tool.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
+import { createChildDiscoveryAttemptCollector } from "./child-discovery-attempt.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -184,13 +185,16 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId as string, taskId: lease.id, rootTaskId: lease.rootTaskId,
     role: "scout", leaseOwner: lease.leaseOwner as string, attemptCount: lease.attemptCount,
   } : undefined
+  const discoveryAttempt = discoveryFence ? createChildDiscoveryAttemptCollector(discoveryFence) : undefined
   const runtime = createWorkerToolRuntime(pool, {
     sink: durableLifecycleSink(store, owner),
     resolveOwner: () => executionOwner,
+    ...(discoveryAttempt ? { onDiscoveryAttemptLifecycleEvent: discoveryAttempt.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
   discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined)
   return {
     definitions: runtime.registry.list(), router: runtime.router,
+    ...(discoveryAttempt ? { discoveryAttemptSidecar: () => discoveryAttempt.sidecar() } : {}),
     ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
     ...(serverContext ? { serverContext } : {}),
     ...(writerReviewRevision ? { writerReviewRevision } : {}),
@@ -258,7 +262,6 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
 }
 
 export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean { return value === "1" }
-
 function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReader"] | undefined {
   // Keep lightweight construction fixtures usable; a real pg.Pool exposes
   // both methods and therefore gets the server-owned reader.
@@ -266,13 +269,11 @@ function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReade
   if (typeof candidate.connect !== "function" || typeof candidate.query !== "function") return undefined
   return new PgCoordinationStore(pool)
 }
-
 function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"] | undefined {
   const candidate = pool as unknown as { readonly connect?: unknown }
   if (typeof candidate.connect !== "function") return undefined
   return lease => loadChildAttemptResume(pool, lease)
 }
-
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   let genericExecutor: SubagentExecutor | undefined
@@ -294,7 +295,6 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
     return genericExecutor({ lease })
   }
 }
-
 export function createOptionalProductionChildExecutor(options: ProductionChildRuntimeOptions & { readonly enabled?: boolean }): SubagentExecutor | undefined {
   return (options.enabled ?? childExecutionEnabled()) ? createProductionChildExecutor(options) : undefined
 }

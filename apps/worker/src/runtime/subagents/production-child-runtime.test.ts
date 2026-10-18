@@ -576,6 +576,15 @@ describe("production child runtime", () => {
     const scoutExecution = await scoutExecutor({ lease: scoutLease })
     expect(scoutExecution).toMatchObject({ status: "completed" })
     const scoutChildResult = completedResult(scoutExecution.result)
+    expect(scoutChildResult).toMatchObject({ discoveryAttempt: {
+      attemptCount: scoutLease.attemptCount,
+      health: {
+        schemaVersion: "agent-harness.v2.task-graph.discovery-attempt-health.v1",
+        attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+        candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false,
+      },
+    } })
+    expect(JSON.stringify(scoutChildResult.discoveryAttempt)).not.toMatch(/provider-private|ledgerKey|toolCallId|sessionId|turnId|stepId|estimatedCost/i)
     const scoutResult = completedResult(scoutChildResult.structuredResult)
     const savedScoutJob = [...savedJobs.values()].find(row => row.userId === ownerUserId && row.url === providerUrl)
     if (!savedScoutJob) throw new Error("the production discovery route did not materialize the owner job")

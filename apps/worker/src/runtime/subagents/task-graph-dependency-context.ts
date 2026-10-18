@@ -3,6 +3,7 @@ import { parseArtifactReference, ROLE_RESULT_SCHEMA, validateRoleResult, type Ar
 import { projectValidatedRoleResult } from "./task-graph-result-projection.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
+import { parseDiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { TaskGraphRepairReceipt, TaskGraphVerificationReport } from "./task-graph-command-port.js"
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope, GraphTaskRow } from "./task-graph-pg-state.js"
@@ -191,8 +192,12 @@ function parseCompletedResultEnvelope(dependency: ScopedDependencyResult): {
     || typeof parsed.finalText !== "string" || !Object.hasOwn(parsed, "structuredResult")) {
     throw new Error("task_graph_dependency_result_envelope_invalid")
   }
+  const hasDiscoveryAttempt = Object.hasOwn(parsed, "discoveryAttempt")
+  if (hasDiscoveryAttempt && !validDiscoveryAttemptSidecar(parsed.discoveryAttempt, dependency)) {
+    throw new Error("task_graph_dependency_result_envelope_invalid")
+  }
   if (dependency.repairComposite === true) {
-    if (keys !== base || dependency.verificationDisposition !== "typed" || !dependency.verification || dependency.repairOf) {
+    if (hasDiscoveryAttempt || keys !== base || dependency.verificationDisposition !== "typed" || !dependency.verification || dependency.repairOf) {
       throw new Error("task_graph_dependency_result_envelope_invalid")
     }
     const report = parseTaskGraphVerificationReport(dependency.verificationReport, dependency.verification.criteria.map(item => item.id))
@@ -214,7 +219,8 @@ function parseCompletedResultEnvelope(dependency: ScopedDependencyResult): {
       parsed.taskGraphVerificationReport, dependency.verification.criteria.map(item => item.id),
     )
     const hasReceipt = Object.hasOwn(parsed, "taskGraphRepairReceipt")
-    const expected = [...base.split(","), "taskGraphVerificationReport", ...(hasReceipt ? ["taskGraphRepairReceipt"] : [])].sort().join(",")
+    const expected = [...base.split(","), "taskGraphVerificationReport", ...(hasReceipt ? ["taskGraphRepairReceipt"] : []),
+      ...(hasDiscoveryAttempt ? ["discoveryAttempt"] : [])].sort().join(",")
     const receipt = hasReceipt && dependency.repairOf && report ? parseTaskGraphRepairReceipt(parsed.taskGraphRepairReceipt, {
       repairOf: dependency.repairOf, repairNodeKey: dependency.key, repairTaskId: dependency.taskId, report,
     }) : undefined
@@ -223,9 +229,19 @@ function parseCompletedResultEnvelope(dependency: ScopedDependencyResult): {
       throw new Error("task_graph_dependency_result_envelope_invalid")
     }
     return { structuredResult: parsed.structuredResult, verificationReport: report, repairLineage: dependency.repairLineage }
-  } else if (keys !== base || dependency.repairOf || Object.hasOwn(parsed, "taskGraphVerificationReport")
+  } else if (keys !== [...base.split(","), ...(hasDiscoveryAttempt ? ["discoveryAttempt"] : [])].sort().join(",")
+    || dependency.repairOf || Object.hasOwn(parsed, "taskGraphVerificationReport")
     || Object.hasOwn(parsed, "taskGraphRepairReceipt")) throw new Error("task_graph_dependency_result_envelope_invalid")
   return { structuredResult: parsed.structuredResult }
+}
+
+function validDiscoveryAttemptSidecar(value: unknown, dependency: ScopedDependencyResult): boolean {
+  if (dependency.role !== "scout" || dependency.repairComposite === true || dependency.repairOf
+    || !expectedSchema(dependency.expectedOutputSchema, "scout") || !isPlainRecord(value)) return false
+  const attemptCount = Object.getOwnPropertyDescriptor(value, "attemptCount")
+  return !!attemptCount && "value" in attemptCount && typeof attemptCount.value === "number"
+    && Number.isSafeInteger(attemptCount.value) && attemptCount.value > 0
+    && parseDiscoveryAttemptSidecar(value, attemptCount.value) !== null
 }
 
 function encodedBytes(value: unknown): number {
