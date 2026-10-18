@@ -49,13 +49,31 @@ function graph(candidate: RootTaskHistoryCandidate, jobIds: readonly string[]): 
     item: { id: `item-${candidate.rootTaskId}`, revision: 1, content: snapshot, createdAt: new Date(0) } }
 }
 
-function harness(graphs: ReadonlyMap<string, LoadedGraph>, candidates: readonly RootTaskHistoryCandidate[]) {
+function harness(
+  graphs: ReadonlyMap<string, LoadedGraph>,
+  candidates: readonly RootTaskHistoryCandidate[],
+  rollbackError?: Error,
+) {
   const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+  const timeline: Array<{ kind: "query"; sql: string } | { kind: "load" }> = []
+  const transactionAtPreflight: boolean[] = [], transactionAtGraphLoad: boolean[] = []
+  const releaseErrors: Array<Error | boolean | undefined> = []
+  let transactionOpen = false
+  let connectionCount = 0, releaseCount = 0
   const client = {
     async query(sql: string, values?: readonly unknown[]) {
       queries.push({ sql, values })
-      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      timeline.push({ kind: "query", sql })
+      if (sql.startsWith("BEGIN")) { transactionOpen = true; return { rows: [], rowCount: 1 } }
+      if (sql === "COMMIT") { transactionOpen = false; return { rows: [], rowCount: 1 } }
+      if (sql === "ROLLBACK") {
+        if (rollbackError) throw rollbackError
+        transactionOpen = false
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
       if (sql.includes("SELECT NOT EXISTS")) {
+        transactionAtPreflight.push(transactionOpen)
         const loaded = [...graphs.values()].find(item => item.rootTaskId === values?.[2])
         const withinLimit = [...(loaded?.tasks.values() ?? [])].every(task => task.result === null
           || JSON.stringify(task.result).length <= TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT)
@@ -71,13 +89,20 @@ function harness(graphs: ReadonlyMap<string, LoadedGraph>, candidates: readonly 
       }
       throw new Error(`unexpected query: ${sql}`)
     },
-    release() { /* test client */ },
+    release(error?: Error | boolean) { releaseCount += 1; releaseErrors.push(error) },
   }
-  const pool = { connect: async () => client } as unknown as Pick<import("pg").Pool, "connect">
+  const pool = { connect: async () => { connectionCount += 1; return client } } as unknown as Pick<import("pg").Pool, "connect">
   doubles.readFence.mockResolvedValue({ objectiveDigest: "d".repeat(64) })
   doubles.readCandidates.mockResolvedValue(candidates)
-  doubles.loadTaskGraph.mockImplementation(async (_client: unknown, graphScope: { turnId: string }) => graphs.get(graphScope.turnId)!)
-  return { store: createPgRootTaskHistoryResultPageStore(pool), queries }
+  doubles.loadTaskGraph.mockImplementation(async (_client: unknown, graphScope: { turnId: string }) => {
+    timeline.push({ kind: "load" })
+    transactionAtGraphLoad.push(transactionOpen)
+    return graphs.get(graphScope.turnId)!
+  })
+  return {
+    store: createPgRootTaskHistoryResultPageStore(pool), queries, timeline, transactionAtPreflight, transactionAtGraphLoad,
+    releaseErrors, get connectionCount() { return connectionCount }, get releaseCount() { return releaseCount },
+  }
 }
 
 describe("historical Root Scout page store", () => {
@@ -139,5 +164,96 @@ describe("historical Root Scout page store", () => {
     expect(doubles.loadTaskGraph.mock.calls.map(call => call[1])).toEqual([
       { userId: scope.userId, sessionId: older.sessionId, turnId: older.turnId, rootTaskId: older.rootTaskId, parentTaskId: older.rootTaskId },
     ])
+  })
+
+  it("keeps the result-size preflight and graph load inside one repeatable-read snapshot", async () => {
+    const candidate = source(1), test = harness(new Map([[candidate.turnId, graph(candidate, [id(1)])]]), [candidate])
+
+    await expect(test.store.read(scope, { mode: "historical_discovery", offset: 0 }))
+      .resolves.toMatchObject({ availability: "available" })
+
+    const begin = test.timeline.findIndex(call => call.kind === "query" && call.sql === "BEGIN ISOLATION LEVEL REPEATABLE READ")
+    const setUser = test.timeline.findIndex(call => call.kind === "query" && call.sql.includes("set_config"))
+    const preflight = test.timeline.findIndex(call => call.kind === "query" && call.sql.includes("SELECT NOT EXISTS"))
+    const load = test.timeline.findIndex(call => call.kind === "load")
+    const resultRead = test.timeline.findIndex(call => call.kind === "query" && call.sql.includes('SELECT task."id", task."attemptCount"'))
+    const commit = test.timeline.findIndex(call => call.kind === "query" && call.sql === "COMMIT")
+    expect(begin).toBe(0)
+    expect(setUser).toBeGreaterThan(begin)
+    expect(preflight).toBeGreaterThan(setUser)
+    expect(load).toBeGreaterThan(preflight)
+    expect(resultRead).toBeGreaterThan(load)
+    expect(commit).toBeGreaterThan(resultRead)
+    expect(test.transactionAtPreflight).toEqual([true])
+    expect(test.transactionAtGraphLoad).toEqual([true])
+  })
+
+  it("retries SQLSTATE 40001 in a fresh transaction and repeats the fence read", async () => {
+    const candidate = source(1), test = harness(new Map([[candidate.turnId, graph(candidate, [id(1)])]]), [candidate])
+    const serializationFailure = Object.assign(new Error("serialization failure"), { code: "40001" })
+    doubles.readFence.mockRejectedValueOnce(serializationFailure)
+
+    await expect(test.store.read(scope, { mode: "historical_discovery", offset: 0 }))
+      .resolves.toMatchObject({ availability: "available" })
+
+    expect(doubles.readFence).toHaveBeenCalledTimes(2)
+    expect(test.connectionCount).toBe(2)
+    expect(test.releaseCount).toBe(2)
+    expect(test.queries.filter(query => query.sql.startsWith("BEGIN"))).toHaveLength(2)
+    expect(test.queries.filter(query => query.sql === "ROLLBACK")).toHaveLength(1)
+    expect(test.queries.filter(query => query.sql === "COMMIT")).toHaveLength(1)
+  })
+
+  it("revalidates the lease scope before retrying a serialization failure", async () => {
+    const candidate = source(1), test = harness(new Map([[candidate.turnId, graph(candidate, [id(1)])]]), [candidate])
+    const mutableScope = { ...scope, parentLeaseOwner: scope.parentLeaseOwner as string }
+    const serializationFailure = Object.assign(new Error("serialization failure"), { code: "40001" })
+    doubles.readFence.mockImplementationOnce(async () => {
+      mutableScope.parentLeaseOwner = "changed-owner"
+      throw serializationFailure
+    })
+
+    await expect(test.store.read(mutableScope, { mode: "historical_discovery", offset: 0 }))
+      .resolves.toMatchObject({ availability: "unavailable", reason: "no_source" })
+
+    expect(doubles.readFence).toHaveBeenCalledTimes(1)
+    expect(test.connectionCount).toBe(1)
+    expect(test.releaseCount).toBe(1)
+    expect(test.queries.filter(query => query.sql === "ROLLBACK")).toHaveLength(1)
+  })
+
+  it("does not retry non-serialization errors and caps serialization retries", async () => {
+    const candidate = source(1), test = harness(new Map([[candidate.turnId, graph(candidate, [id(1)])]]), [candidate])
+    const uniqueViolation = Object.assign(new Error("unique violation"), { code: "23505" })
+    doubles.readFence.mockRejectedValueOnce(uniqueViolation)
+    await expect(test.store.read(scope, { mode: "historical_discovery", offset: 0 })).rejects.toBe(uniqueViolation)
+    expect(test.connectionCount).toBe(1)
+    expect(test.releaseCount).toBe(1)
+    expect(doubles.readFence).toHaveBeenCalledTimes(1)
+    expect(test.queries.filter(query => query.sql === "ROLLBACK")).toHaveLength(1)
+
+    const bounded = harness(new Map([[candidate.turnId, graph(candidate, [id(1)])]]), [candidate])
+    const serializationFailure = Object.assign(new Error("serialization failure"), { code: "40001" })
+    doubles.readFence.mockClear().mockRejectedValue(serializationFailure)
+    await expect(bounded.store.read(scope, { mode: "historical_discovery", offset: 0 })).rejects.toBe(serializationFailure)
+    expect(doubles.readFence).toHaveBeenCalledTimes(3)
+    expect(bounded.connectionCount).toBe(3)
+    expect(bounded.releaseCount).toBe(3)
+    expect(bounded.queries.filter(query => query.sql === "ROLLBACK")).toHaveLength(3)
+  })
+
+  it("does not retry or reuse a client when rollback fails", async () => {
+    const candidate = source(1), rollbackFailure = new Error("rollback failed")
+    const test = harness(new Map([[candidate.turnId, graph(candidate, [id(1)])]]), [candidate], rollbackFailure)
+    const serializationFailure = Object.assign(new Error("serialization failure"), { code: "40001" })
+    doubles.readFence.mockRejectedValueOnce(serializationFailure)
+
+    await expect(test.store.read(scope, { mode: "historical_discovery", offset: 0 })).rejects.toBe(serializationFailure)
+
+    expect(doubles.readFence).toHaveBeenCalledTimes(1)
+    expect(test.connectionCount).toBe(1)
+    expect(test.releaseCount).toBe(1)
+    expect(test.releaseErrors).toEqual([rollbackFailure])
+    expect(test.queries.filter(query => query.sql.startsWith("BEGIN"))).toHaveLength(1)
   })
 })

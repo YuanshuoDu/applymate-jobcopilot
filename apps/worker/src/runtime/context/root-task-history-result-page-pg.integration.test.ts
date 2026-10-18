@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT } from "../subagents/task-graph-result-page-contract.js"
@@ -162,6 +162,115 @@ describePg("historical Scout page PostgreSQL read", () => {
       totalCount: 5, items: jobIds.slice(3).map(jobId => ({ jobId })) })
     expect(JSON.stringify(first)).not.toMatch(/historical-scout-valid-root|historical-scout-valid-turn|private|greenhouse|https:/)
   })
+
+  it("keeps a concurrent oversized Scout update outside the in-flight result snapshot", async () => {
+    const scope: TaskGraphReadScope & Readonly<{ stepId: string }> = { userId, sessionId, turnId: currentTurnId,
+      rootTaskId: currentRootId, parentTaskId: currentRootId, stepId: currentStepId, turnLeaseOwner: workerId,
+      turnLeaseVersion: 1, parentLeaseOwner: workerId, parentAttemptCount: 2 }
+    let signalPreflight!: () => void, resumeRead!: () => void, intercepted = false
+    const preflightReached = new Promise<void>(resolve => { signalPreflight = resolve })
+    const resumeGate = new Promise<void>(resolve => { resumeRead = resolve })
+    let gateTimeout: ReturnType<typeof setTimeout> | undefined
+    const gateTimedOut = new Promise<never>((_resolve, reject) => {
+      gateTimeout = setTimeout(() => reject(new Error("historical_result_gate_timeout")), 10_000)
+    })
+    let writerClient: PoolClient | undefined, writerReleased = false
+    let readerClient: PoolClient | undefined
+    let cleanupStarted = false, writerPromise: Promise<void> | undefined
+    const releaseWriter = (error?: Error | boolean) => {
+      if (!writerClient || writerReleased) return
+      writerReleased = true
+      writerClient.release(error)
+    }
+    const gatedPool = {
+      async connect() {
+        const client = await pool!.connect()
+        let readerReleased = false
+        const reader = new Proxy(client, {
+          get(target, property) {
+            if (property === "query") return async (sql: string, values?: unknown[]) => {
+              const result = await Reflect.apply(target.query, target, [sql, values])
+              if (!intercepted && sql.includes("SELECT NOT EXISTS") && values?.[2] === sourceB.rootId) {
+                intercepted = true
+                signalPreflight()
+                await Promise.race([resumeGate, gateTimedOut])
+              }
+              return result
+            }
+            if (property === "release") return (error?: Error | boolean) => {
+              if (readerReleased) return
+              readerReleased = true
+              target.release(error)
+            }
+            const value = Reflect.get(target, property, target)
+            return typeof value === "function" ? value.bind(target) : value
+          },
+        })
+        readerClient = reader
+        return reader
+      },
+    } as unknown as Pick<Pool, "connect">
+    const store = createPgRootTaskHistoryResultPageStore(gatedPool)
+    const originalResult = scoutResultEnvelope(sourceB.turnId, jobIds)
+    const oversizedResult = { ...originalResult, finalText: "x".repeat(TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT + 1) }
+    let pendingRead: ReturnType<typeof store.read> | undefined
+
+    try {
+      pendingRead = store.read(scope, { mode: "historical_discovery", offset: 0 })
+      const reachedPreflight = await Promise.race([
+        preflightReached.then(() => "preflight" as const),
+        pendingRead.then(() => "completed" as const),
+        gateTimedOut.then(() => "timeout" as const),
+      ])
+      if (reachedPreflight !== "preflight") throw new Error(`historical_result_${reachedPreflight}`)
+      const updateWithSecondConnection = async () => {
+        const writer = await pool!.connect()
+        writerClient = writer
+        writerReleased = false
+        if (cleanupStarted) { releaseWriter(true); return }
+        try {
+          await writer.query("BEGIN")
+          await writer.query(`UPDATE "sub_agent_tasks" SET "result" = $2::jsonb WHERE "id" = $1`,
+            [sourceB.childId, JSON.stringify(oversizedResult)])
+          await writer.query("COMMIT")
+        } catch (error: unknown) {
+          await writer.query("ROLLBACK").catch(() => undefined)
+          throw error
+        } finally { releaseWriter() }
+      }
+      writerPromise = updateWithSecondConnection()
+      void writerPromise.catch(() => undefined)
+      await Promise.race([writerPromise, gateTimedOut])
+
+      resumeRead()
+      await expect(pendingRead).resolves.toMatchObject({ availability: "available", sourceResultStatus: "completed",
+        totalCount: jobIds.length, items: jobIds.slice(0, 3).map(jobId => ({ jobId })) })
+    } finally {
+      cleanupStarted = true
+      resumeRead()
+      if (gateTimeout) clearTimeout(gateTimeout)
+      if (writerClient && !writerReleased) releaseWriter(true)
+      if (writerPromise) {
+        let writerDrainTimeout: ReturnType<typeof setTimeout> | undefined
+        await Promise.race([
+          writerPromise.then(() => undefined, () => undefined),
+          new Promise<void>(resolve => { writerDrainTimeout = setTimeout(resolve, 2_000) }),
+        ])
+        if (writerDrainTimeout) clearTimeout(writerDrainTimeout)
+      }
+      if (pendingRead) {
+        let drainTimeout: ReturnType<typeof setTimeout> | undefined
+        const readerDrained = await Promise.race([
+          pendingRead.then(() => true, () => true),
+          new Promise<boolean>(resolve => { drainTimeout = setTimeout(() => resolve(false), 2_000) }),
+        ])
+        if (drainTimeout) clearTimeout(drainTimeout)
+        if (!readerDrained) readerClient?.release(true)
+      }
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "result" = $2::jsonb WHERE "id" = $1`,
+        [sourceB.childId, JSON.stringify(originalResult)])
+    }
+  }, 30_000)
 
   it("rejects changed candidate IDs and out-of-range offsets without exposing old source identity", async () => {
     const store = createPgRootTaskHistoryResultPageStore(pool!)

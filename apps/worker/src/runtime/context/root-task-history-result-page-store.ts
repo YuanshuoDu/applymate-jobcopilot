@@ -9,7 +9,7 @@ import {
 import { historicalScoutTaskIds, projectHistoricalDiscoveryPage, selectHistoricalScoutSource } from "./root-task-history-result-page-selection.js"
 import { readRootTaskHistoryCandidates, type RootTaskHistoryCandidate } from "./root-task-history-source-store.js"
 import {
-  readRootTaskHistoryFence, validateRootTaskHistoryFenceInput, withRootTaskHistoryTransaction,
+  readRootTaskHistoryFence, validateRootTaskHistoryFenceInput,
   type RootTaskHistoryFenceInput,
 } from "./root-task-history-fence.js"
 
@@ -17,17 +17,63 @@ type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
 type HistoricalReadScope = TaskGraphReadScope & Readonly<{ stepId: string }>
 const GRAPH_LOAD_LIMIT = 8
+const MAX_READ_ATTEMPTS = 3
+
+class ConfirmedSerializationFailure extends Error {
+  constructor(readonly original: unknown) { super("root_task_history_serialization_retry") }
+}
 
 export function createPgRootTaskHistoryResultPageStore(pool: Pool) {
   return {
     async read(scope: HistoricalReadScope, request: TaskGraphHistoricalDiscoveryPageRequest): Promise<TaskGraphHistoricalDiscoveryPage> {
       const parsedRequest = parseTaskGraphHistoricalDiscoveryPageRequest(request)
-      if (!parsedRequest || scope.parentLeaseOwner !== scope.turnLeaseOwner) return unavailable("no_source")
-      const input = fenceInput(scope)
-      validateRootTaskHistoryFenceInput(input)
-      return withRootTaskHistoryTransaction(pool, scope.userId, client => readWithClient(client, input, scope, parsedRequest))
+      if (!parsedRequest) return unavailable("no_source")
+      for (let attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt += 1) {
+        if (scope.parentLeaseOwner !== scope.turnLeaseOwner) return unavailable("no_source")
+        const input = fenceInput(scope)
+        validateRootTaskHistoryFenceInput(input)
+        try {
+          return await withRootTaskHistorySnapshotTransaction(pool, scope.userId,
+            client => readWithClient(client, input, scope, parsedRequest))
+        } catch (error: unknown) {
+          if (!(error instanceof ConfirmedSerializationFailure)) throw error
+          if (attempt + 1 >= MAX_READ_ATTEMPTS) throw error.original
+        }
+      }
+      throw new Error("root_task_history_read_retry_exhausted")
     },
   }
+}
+
+async function withRootTaskHistorySnapshotTransaction<T>(
+  pool: Pool,
+  userId: string,
+  work: (client: Client) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect()
+  let committed = false, released = false
+  try {
+    // The size preflight and graph loader must observe the same result snapshot.
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", userId])
+    const result = await work(client)
+    await client.query("COMMIT")
+    committed = true
+    return result
+  } catch (error: unknown) {
+    let rollbackConfirmed = false
+    if (!committed) {
+      try {
+        await client.query("ROLLBACK")
+        rollbackConfirmed = true
+      } catch (rollbackError: unknown) {
+        released = true
+        client.release(rollbackError instanceof Error ? rollbackError : true)
+      }
+    }
+    if (rollbackConfirmed && serializationFailure(error)) throw new ConfirmedSerializationFailure(error)
+    throw error
+  } finally { if (!released) client.release() }
 }
 
 async function readWithClient(
@@ -125,8 +171,12 @@ function binding(scope: HistoricalReadScope, objectiveDigest: string) {
   }
 }
 
-function databaseError(value: unknown): boolean {
+function databaseError(value: unknown): value is { code: string } {
   return !!value && typeof value === "object" && "code" in value && typeof value.code === "string" && /^[0-9A-Z]{5}$/.test(value.code)
+}
+
+function serializationFailure(value: unknown): boolean {
+  return databaseError(value) && value.code === "40001"
 }
 
 function historyGraphEvidenceError(value: unknown): boolean {
