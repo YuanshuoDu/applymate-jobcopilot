@@ -222,6 +222,43 @@ describe("TaskGraph turn observation", () => {
     }
   })
 
+  it("requires the exact own enumerable data failure reason for raw structured subtype exposure", () => {
+    const reason = "task_graph_verification_unverified"
+    const valid = structuredOutputFailureNode("result_shape_invalid")
+    expect(projectedNode(valid).structuredOutputFailureCategory).toBe("result_shape_invalid")
+
+    let getterCalls = 0
+    const inherited = Object.create({ failureReason: reason }) as Record<string, unknown>
+    for (const [key, value] of Object.entries(valid)) {
+      if (key !== "failureReason") Object.defineProperty(inherited, key, { value, enumerable: true, configurable: true, writable: true })
+    }
+    const accessor = { ...valid }
+    Object.defineProperty(accessor, "failureReason", {
+      enumerable: true, configurable: true, get: () => { getterCalls += 1; return reason },
+    })
+    const hidden = { ...valid }
+    Object.defineProperty(hidden, "failureReason", { value: reason, enumerable: false, configurable: true })
+
+    const invalidCases: Array<[string, Record<string, unknown>]> = [
+      ["null", { ...valid, failureReason: null }],
+      ["wrong reason", { ...valid, failureReason: "task_graph_verification_failed" }],
+      ["inherited reason", inherited],
+      ["accessor reason", accessor],
+      ["non-enumerable reason", hidden],
+    ]
+    for (const [label, row] of invalidCases) {
+      const projected = projectedNode(row)
+      expect(projected, label).not.toHaveProperty("structuredOutputFailureCategory")
+
+      const descriptors = Object.getOwnPropertyDescriptors(row)
+      delete descriptors.structuredOutputFailureCategory
+      const withoutSubtype = Object.create(Object.getPrototypeOf(row)) as Record<string, unknown>
+      Object.defineProperties(withoutSubtype, descriptors)
+      expect(JSON.stringify(projected), label).toBe(JSON.stringify(projectedNode(withoutSubtype)))
+    }
+    expect(getterCalls).toBe(0)
+  })
+
   it("keeps validated discovery-attempt health separate from an unavailable failed result projection", () => {
     const discoveryAttemptHealth = {
       schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
@@ -329,7 +366,8 @@ describe("TaskGraph turn observation", () => {
       const ids = criteria.map(criterion => criterion.id)
       return {
         key: `typed-${index}`, taskId: `task-${index}`, templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"],
-        dependsOn: [], status: "failed", readiness: "terminal", resultSummary: null, failureReason: null,
+        dependsOn: [], status: "failed", readiness: "terminal", resultSummary: null,
+        failureReason: includeCategory ? "task_graph_verification_unverified" : null,
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria } as TaskGraphVerificationContract,
         verificationCriterionIds: ids,
         verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
