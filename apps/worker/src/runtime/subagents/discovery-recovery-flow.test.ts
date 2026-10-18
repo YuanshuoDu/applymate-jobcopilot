@@ -16,6 +16,7 @@ import { projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-re
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { DISCOVERY_RECOVERY_SCHEMA_VERSION } from "./task-graph-discovery-recovery-contract.js"
 import { InMemoryToolLifecycleSink, ToolLifecycle, type DiscoveryAttemptLifecycleEvent } from "../tools/lifecycle.js"
+import type { ToolResultReferenceRecord, ToolResultReferenceRepository } from "../tools/tool-result-reference-types.js"
 import { ToolRegistry } from "../tools/registry.js"
 import { ToolRouter } from "../tools/router.js"
 import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tools.js"
@@ -73,7 +74,7 @@ function provenanceClient(task: SubagentLease) {
 function discoveryOutput(request: JobDiscoveryRequest): JobDiscoveryOutput {
   const job = {
     id: recoveredJobId, title: "Software Engineer", company: "Example", location: "Dublin",
-    url: `https://jobs.example/${recoveredJobId}`, description: "Role", fullDescription: "Role",
+    url: `https://jobs.example/${recoveredJobId}`, description: "Role", fullDescription: "x".repeat(7 * 1024),
     salary: null, logo: null, source: "greenhouse", evidenceRefs: ["evidence-1"],
   }
   return {
@@ -201,7 +202,17 @@ describe("failed Scout discovery recovery flow", () => {
 
     const sink = new InMemoryToolLifecycleSink()
     const observedEvents: DiscoveryAttemptLifecycleEvent[] = []
-    const lifecycle = new ToolLifecycle({ sink, onDiscoveryAttemptLifecycleEvent: event => {
+    const durableReferenceId = "tool-result-00000000-0000-4000-8000-000000000009"
+    const durableResults: ToolResultReferenceRepository = {
+      put: vi.fn(async (_owner, input): Promise<ToolResultReferenceRecord> => ({
+        id: durableReferenceId, userId: failedLease.userId, sessionId: failedLease.sessionId,
+        turnId: failedLease.turnId!, stepId: input.stepId, taskId: failedLease.id, toolCallId: input.toolCallId,
+        sanitizedJson: input.value as ToolResultReferenceRecord["sanitizedJson"], sha256: "a".repeat(64),
+        byteCount: Buffer.byteLength(JSON.stringify(input.value), "utf8"), createdAt: new Date(), updatedAt: new Date(),
+      })),
+      read: vi.fn(async () => null),
+    }
+    const lifecycle = new ToolLifecycle({ sink, durableResults, resolveOwner: () => ({ kind: "task", lease: failedLease }), onDiscoveryAttemptLifecycleEvent: event => {
       observedEvents.push(event)
       observer.observeLifecycleEvent(event)
     } })
@@ -230,6 +241,20 @@ describe("failed Scout discovery recovery flow", () => {
     expect(observedEvents.map(event => event.phase)).toEqual(["started", "completed"])
     expect(observedEvents[0]?.call).toMatchObject({ taskId: failedLease.id, rootTaskId: failedLease.rootTaskId,
       sessionId: failedLease.sessionId, turnId: failedLease.turnId, toolName: "jobs.discover", toolVersion: "1" })
+    expect(durableResults.put).toHaveBeenCalledOnce()
+    expect(durableResults.put).toHaveBeenCalledWith({ kind: "task", lease: failedLease }, expect.objectContaining({
+      stepId: observedEvents[0]?.call.stepId, toolCallId: observedEvents[0]?.call.id,
+      value: expect.objectContaining({ jobs: [expect.objectContaining({ id: recoveredJobId, fullDescription: "x".repeat(7 * 1024) })] }),
+    }))
+    expect(sink.events[1]?.item).toMatchObject({ output: {
+      $ref: durableReferenceId, sizeBytes: expect.any(Number), sha256: "a".repeat(64),
+    } })
+    const persistedSize = (sink.events[1]?.item as { output?: { sizeBytes?: number } } | undefined)?.output?.sizeBytes
+    expect(persistedSize).toBeGreaterThan(6 * 1024)
+    expect(persistedSize).toBeLessThan(1024 * 1024)
+    expect(observedEvents[1]).toMatchObject({ phase: "completed", output: {
+      jobs: [expect.objectContaining({ id: recoveredJobId, fullDescription: "x".repeat(7 * 1024) })],
+    } })
     expect(observer.discoveryRecoverySidecar()).toMatchObject({ attemptCount: failedLease.attemptCount, jobIds: [recoveredJobId] })
     expect(failed).toMatchObject({ status: "failed", failureReason: "invalid_structured_result",
       result: { status: "failed", discoveryRecovery: {
