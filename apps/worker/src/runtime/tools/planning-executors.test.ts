@@ -58,28 +58,51 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
 }
 
 describe("agent.plan tool executor", () => {
-  it("gates scheduling on server-resolved coverage and ignores model-provided requirements", async () => {
+  it("passes server-resolved requirements to the locked scheduler and ignores model-provided requirements", async () => {
     const resolution = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
       schemaVersion: "agent-harness.v2.objective-requirements.v1",
       requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
     } } })
     const { tool, commandPort } = setup(undefined, resolution)
     const hostile = { ...proposal, verificationRequirements: { status: "absent" }, context: { verificationRequirements: [] } }
-    await expect(tool.execute(context(), hostile)).rejects.toMatchObject({
+    await expect(tool.execute(context(), hostile)).resolves.toEqual(receipt)
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    expect(commandPort.appendAndSchedule).toHaveBeenCalledWith(expect.objectContaining({ verificationRequirements: resolution }))
+  })
+
+  it("returns only canonical typed diagnostics from a locked coverage refusal", async () => {
+    const resolution = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+    } } })
+    const { tool, commandPort } = setup(undefined, resolution)
+    vi.mocked(commandPort.appendAndScheduleWithReconciliation!).mockRejectedValueOnce(Object.assign(
+      new Error("TaskGraph plan does not cover the canonical objective requirements"), {
+        code: "task_graph_objective_coverage_incomplete",
+        requirements: [{ id: "candidate-total", kind: "candidate_count_gte", role: "scout", minimum: 2 }],
+      },
+    ))
+
+    await expect(tool.execute(context(), proposal)).rejects.toMatchObject({
       code: "task_graph_objective_coverage_incomplete",
       safeOutput: { code: "task_graph_objective_coverage_incomplete", requirements: [
         { id: "candidate-total", kind: "candidate_count_gte", role: "scout", minimum: 2 },
       ] },
     })
-    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
-    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
-    expect(commandPort.reconcileSteering).not.toHaveBeenCalled()
+  })
 
-    const stronger = { ...proposal, nodes: [{ ...proposal.nodes[0], verification: {
-      ...proposal.nodes[0].verification, criteria: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 3 } }],
-    } }] }
-    await expect(tool.execute(context(), stronger)).resolves.toEqual(receipt)
-    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+  it("drops malformed coverage diagnostics instead of exposing untyped fields", async () => {
+    const { tool, commandPort } = setup()
+    vi.mocked(commandPort.appendAndScheduleWithReconciliation!).mockRejectedValueOnce(Object.assign(
+      new Error("TaskGraph plan does not cover the canonical objective requirements"), {
+        code: "task_graph_objective_coverage_incomplete",
+        requirements: [{ id: "private-value", kind: "unknown", role: "analyst", minimum: 2, raw: "must not escape" }],
+      },
+    ))
+
+    await expect(tool.execute(context(), proposal)).rejects.toMatchObject({
+      code: "task_graph_objective_coverage_incomplete", safeOutput: { code: "task_graph_objective_coverage_incomplete" },
+    })
   })
 
   it("keeps invalid optional requirements distinct while allowing prose-only planning", async () => {

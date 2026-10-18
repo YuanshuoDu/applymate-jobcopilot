@@ -588,7 +588,13 @@ describe("createPgTaskGraphCommandPort", () => {
   })
 
   it("returns the original receipt as a duplicate for an idempotent proposal replay", async () => {
-    const input = scheduleInput()
+    const input: TaskGraphScheduleInput = {
+      ...scheduleInput(),
+      // This proposal does not meet the server requirement; persisted replay still wins after revision advance.
+      verificationRequirements: { status: "valid", requirements: [
+        { id: "canonical-candidates", kind: "candidate_count_gte", minimum: 4 },
+      ] },
+    }
     const fake = fakePool(input, { budgetSnapshot: { maxSteps: 2 }, usedSteps: 2 })
     const port = createPgTaskGraphCommandPort(fake.pool)
 

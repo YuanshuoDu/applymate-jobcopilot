@@ -13,6 +13,7 @@ import type { TaskGraphResultProjection } from "./task-graph-result-projection-c
 import type { TaskGraphResultPage, TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
+import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-category.js"
 import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-structured-failure-category.js"
 export type {
@@ -132,6 +133,8 @@ export type TaskGraphScheduleInput = Readonly<{
   scope: TaskGraphExecutionScope
   proposal: TaskGraphProposal
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+  /** Server-resolved from the persisted Turn objective; never populated from model tool input. */
+  verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>
 
 export type RegisteredScoutEnvelope = Readonly<{
