@@ -314,7 +314,7 @@ function isExpectedSourceProjection(value, jobId = "fixture-job-restart") {
   return projection?.schemaVersion === "agent-harness.v2.task-graph.result-projection" && projection.trust === "untrusted"
     && projection.availability === "available" && projection.role === "scout" && projection.status === "completed"
     && projection.candidateCount === 1 && projection.evidenceCount === 1 && candidates.length === 1
-    && candidate?.jobId === jobId && candidate.source === "other"
+    && candidate?.jobId === jobId && candidate.source === "greenhouse"
     && Array.isArray(candidate.evidenceKinds) && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
 }
 const SOURCE_PROJECTION_AVAILABILITY = new Set(["available", "unavailable"])
@@ -482,7 +482,7 @@ function sourceProjectionDiagnostic(value) {
   if (!candidate || !Array.isArray(candidate.evidenceKinds) || !candidate.evidenceKinds.every(kind => typeof kind === "string")) {
     return { ...details, invalidField: "candidate_shape" }
   }
-  const candidateMatches = candidate.jobId === "fixture-job-restart" && candidate.source === "other"
+  const candidateMatches = candidate.jobId === "fixture-job-restart" && candidate.source === "greenhouse"
     && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
   return { ...details, category: candidateMatches ? "valid" : "candidate_identity_mismatch", candidateIdentity: candidateMatches ? "match" : "mismatch" }
 }
@@ -490,7 +490,7 @@ function assertSourceProjectionDiagnostic() {
   const valid = {
     schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
     role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
-    candidates: [{ jobId: "fixture-job-restart", source: "other", evidenceKinds: ["job"] }],
+    candidates: [{ jobId: "fixture-job-restart", source: "greenhouse", evidenceKinds: ["job"] }],
   }
   const cases = [
     [null, "absent"],
