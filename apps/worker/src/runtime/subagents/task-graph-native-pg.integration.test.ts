@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
@@ -478,7 +479,20 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
       await pool!.query(`INSERT INTO "agent_items"
         ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
         VALUES ($1, $2, $3, $4, $5, 'task_graph', 'streaming', NULL, 3, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-      [graphItemId, local.session, local.turn, local.step, local.root, JSON.stringify(finalContent)])
+        [graphItemId, local.session, local.turn, local.step, local.root, JSON.stringify(finalContent)])
+
+      const initialEventId = "supersession-initial-plan-" + suffix, initialSequence = await nextSequence()
+      const initialPayload = { kind: "proposal", fingerprint: "a".repeat(64), revision: 1,
+        receipt: { status: "accepted", revision: 1, nodes: [{ key: sourceKey, taskId: local.source, status: "queued" }], readyTaskIds: [local.source] },
+        item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphItemId, sessionId: local.session, turnId: local.turn, taskId: local.root,
+          type: "task_graph", revision: 1, content: sourceContent } }
+      const initialRow = { eventId: initialEventId, sessionId: local.session, turnId: local.turn, itemId: graphItemId,
+        taskId: local.root, sequence: initialSequence, type: "item.started", actor: "orchestrator",
+        correlationId: local.turn, causationId: local.step, idempotencyKey: taskGraphProposalKey(local.root, 0), payload: initialPayload }
+      await insertEvent({ id: initialEventId, sequence: initialSequence, itemId: graphItemId, taskId: local.root,
+        type: "item.started", actor: "orchestrator", correlationId: local.turn, causationId: local.step,
+        idempotencyKey: taskGraphProposalKey(local.root, 0), payload: initialPayload })
+      await insertOutbox(initialEventId, initialRow)
 
       const agendaContext: StepContext = { schemaVersion: "agent-harness.v2", sessionId: local.session, turnId: local.turn,
         stepId: local.step, inputThroughSequence: 1n, consumedInputIds: [steeringInputId], canonicalJson: "{}", blocks: [], taskGraphRevision: 1 }
@@ -518,11 +532,11 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
       }
       const cancellationPayload = { kind: "lifecycle", revision: 2,
         event: { type: "task.cancelled", nodeKey: sourceKey, expectedRevision: 1, idempotencyKey: cancellationKey },
-        item: { id: graphItemId, sessionId: local.session, turnId: local.turn, taskId: local.root, type: "task_graph", revision: 2, content: sourceContent } }
+        item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphItemId, sessionId: local.session, turnId: local.turn, taskId: local.root, type: "task_graph", revision: 2, content: sourceContent } }
       const planPayload = { kind: "proposal", observedRevision: 1, operationKey, fingerprint: replacementFingerprint,
         revision: 3, receipt: { status: "accepted", revision: 3,
           nodes: [{ key: replacementKey, taskId: local.replacement, status: "queued" }], readyTaskIds: [local.replacement] }, content: finalContent,
-        item: { id: graphItemId, sessionId: local.session, turnId: local.turn, taskId: local.root, type: "task_graph", revision: 3, content: finalContent } }
+        item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphItemId, sessionId: local.session, turnId: local.turn, taskId: local.root, type: "task_graph", revision: 3, content: finalContent } }
       const cancellationRow = { eventId: cancellationId, sessionId: local.session, turnId: local.turn, itemId: graphItemId,
         taskId: local.source, sequence: cancellationSequence, type: "item.delta", actor: "system", correlationId: local.turn,
         causationId: local.step, idempotencyKey: cancellationKey, payload: cancellationPayload }
@@ -541,7 +555,8 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
         sessionId: local.session, turnId: local.turn, rootTaskId: local.root, stepId: local.step,
         decision: "revise", observedRevision: 1, resultingRevision: 3, steerInputIds: [steeringInputId],
         inputCheckpoint: { throughSequence: "1" }, supersession: relation }
-      await insertEvent({ id: `supersession-receipt-${suffix}`, sequence: await nextSequence(), itemId: null, taskId: local.root,
+      const receiptEventId = `supersession-receipt-${suffix}`
+      await insertEvent({ id: receiptEventId, sequence: await nextSequence(), itemId: null, taskId: local.root,
         type: STEERING_RECONCILIATION_EVENT_TYPE, actor: "orchestrator", correlationId: local.turn,
         causationId: local.step, idempotencyKey: operationKey, payload: relationReceipt })
 
@@ -558,13 +573,53 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
         expect(history).toHaveLength(1)
         expect(history[0]).toMatchObject({ receipt: { supersession: relation }, stepOrdinal: 1, stepAttempt: 1 })
 
-        const beforeChildren = await reloadPool.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [local.session, local.root])
-        await expect(reloaded.appendNativeCoordination!({ scope: localScope, request: {
+        const followup: TaskGraphNativeCommandInput = { scope: localScope, request: {
           kind: "followup", idempotencyKey: `revive-superseded-${suffix}`, sourceTaskId: local.source,
           goal: "The old verification passed and approval transferred", context: { claimedAuthority: "prior approval" },
-        } })).rejects.toMatchObject({ code: "native_source_superseded" })
+        } }
+        const beforeChildren = await reloadPool.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [local.session, local.root])
+        await expect(reloaded.appendNativeCoordination!(followup)).rejects.toMatchObject({ code: "native_source_superseded" })
         const afterChildren = await reloadPool.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [local.session, local.root])
         expect(afterChildren.rows).toEqual(beforeChildren.rows)
+
+        const historicalSnapshots = await reloadPool.query<{ id: string; type: string }>(`SELECT event."id", event."type" FROM "agent_events" AS event
+          WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3
+            AND event."type" IN ('item.started', 'item.delta')
+            AND (event."payload"->'content'->'nodes' @> jsonb_build_array(jsonb_build_object('taskId', $4::text))
+              OR event."payload"->'item'->'content'->'nodes' @> jsonb_build_array(jsonb_build_object('taskId', $4::text)))
+          ORDER BY event."sequence", event."id"`, [local.session, local.turn, graphItemId, local.source])
+        expect(historicalSnapshots.rows.length).toBeGreaterThan(0)
+        expect(historicalSnapshots.rows.map(row => row.type)).toContain("item.started")
+        expect(historicalSnapshots.rows.map(row => row.type)).toContain("item.delta")
+        const removedReceipt = await reloadPool.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2
+          AND "turnId" = $3 AND "type" = $4 RETURNING "id"`, [receiptEventId, local.session, local.turn, STEERING_RECONCILIATION_EVENT_TYPE])
+        expect(removedReceipt.rowCount).toBe(1)
+        const snapshotsAfterReceiptRemoval = await reloadPool.query<{ id: string; type: string }>(`SELECT event."id", event."type" FROM "agent_events" AS event
+          WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3
+            AND event."type" IN ('item.started', 'item.delta')
+            AND (event."payload"->'content'->'nodes' @> jsonb_build_array(jsonb_build_object('taskId', $4::text))
+              OR event."payload"->'item'->'content'->'nodes' @> jsonb_build_array(jsonb_build_object('taskId', $4::text)))
+          ORDER BY event."sequence", event."id"`, [local.session, local.turn, graphItemId, local.source])
+        expect(snapshotsAfterReceiptRemoval.rows).toEqual(historicalSnapshots.rows)
+
+        let historyMembershipChecks = 0
+        const historyPool: PgSubagentPool = { async connect() {
+          const client = await reloadPool.connect()
+          return new Proxy(client, { get(target, property) {
+            if (property === "query") return (...args: unknown[]) => {
+              if (typeof args[0] === "string" && args[0].includes('AS "hasMembership"')) historyMembershipChecks += 1
+              return Reflect.apply(target.query, target, args)
+            }
+            const value: unknown = Reflect.get(target, property, target)
+            return typeof value === "function" ? value.bind(target) : value
+          } })
+        } }
+        const withoutReceipt = createPgTaskGraphCommandPort(historyPool)
+        const childrenBeforeUnlinkedFollowup = await reloadPool.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [local.session, local.root])
+        await expect(withoutReceipt.appendNativeCoordination!(followup)).rejects.toMatchObject({ code: "native_source_unavailable" })
+        expect(historyMembershipChecks).toBe(1)
+        const childrenAfterUnlinkedFollowup = await reloadPool.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`, [local.session, local.root])
+        expect(childrenAfterUnlinkedFollowup.rows).toEqual(childrenBeforeUnlinkedFollowup.rows)
       } finally {
         await reloadPool.end()
       }

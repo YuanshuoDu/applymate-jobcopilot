@@ -572,9 +572,6 @@ async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> 
 async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture) {
   await seed(pool, value)
   await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["agent.plan"]'::jsonb WHERE "id" = $1`, [value.rootTaskId])
-  await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
-    input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
-  })])
 
   const initialInput = scheduleInput(value, 1, true)
   const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
@@ -605,6 +602,9 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     sequence: originalSequence, consumedByStepId: value.originStepId,
     text: "Complete original user task reference", disposition: "submitted",
   })
+  await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
+    input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
+  })])
   const steerSequence = await nextEventSequence(pool, value)
   await pool.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`, [
     value.stepId, steerSequence.toString(), JSON.stringify([value.originalInputId, value.firstSteerInputId]),
