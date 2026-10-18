@@ -15,6 +15,9 @@ import type { GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
 import { projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-recovery-page.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { DISCOVERY_RECOVERY_SCHEMA_VERSION } from "./task-graph-discovery-recovery-contract.js"
+import * as taskGraphLifecycle from "./task-graph-pg-lifecycle.js"
+import * as taskGraphVerification from "./task-graph-pg-verification.js"
+import { prepareTaskGraphFinish } from "./pg-store-lifecycle.js"
 import { InMemoryToolLifecycleSink, ToolLifecycle, type DiscoveryAttemptLifecycleEvent } from "../tools/lifecycle.js"
 import type { ToolResultReferenceRecord, ToolResultReferenceRepository } from "../tools/tool-result-reference-types.js"
 import { ToolRegistry } from "../tools/registry.js"
@@ -186,6 +189,97 @@ function failedGraph(task: SubagentLease, result: unknown): LoadedGraph {
 }
 
 describe("failed Scout discovery recovery flow", () => {
+  it("retains only the closed recovery sidecar when server verification rejects a bound Scout result", async () => {
+    const lease = { ...childLease("scout-verifier-failure"), maxAttempts: 2 }
+    const provenance = provenanceClient(lease)
+    const observer = await createChildDiscoveryObservers(provenance.pool as never, lease, {
+      taskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+      turnId: lease.turnId!, attemptCount: lease.attemptCount,
+    })
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink, resolveOwner: () => ({ kind: "task", lease }),
+      onDiscoveryAttemptLifecycleEvent: observer.observeLifecycleEvent })
+    const discoveryFence: JobDiscoveryExecutionFence = {
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, taskId: lease.id,
+      rootTaskId: lease.rootTaskId, role: "scout", leaseOwner: lease.ownerId, attemptCount: lease.attemptCount,
+    }
+    const discoveryClient: JobDiscoveryClient = {
+      discover: async request => {
+        const output = discoveryOutput(request)
+        return { ...output, jobs: output.jobs.map(job => ({ ...job, fullDescription: "Role" })) }
+      },
+    }
+    const discovery = createJobsDiscoverTool({ client: discoveryClient, fence: discoveryFence }) as RuntimeToolDefinition
+    const getJob = vi.fn(async (_userId: string, jobId: string) => ({
+      id: jobId, company: "Example", role: "Software Engineer", location: "Dublin", status: "saved", score: 8,
+      url: `https://jobs.example/${jobId}`, source: "greenhouse", salary: null, description: "Role", keywords: null,
+    }))
+    const readDefinitions = createReadOnlyTools(readSource(getJob))
+    const definitions = [discovery, ...readDefinitions] as RuntimeToolDefinition[]
+    const policy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: [
+      { id: "flow-test-discovery", roles: ["subagent"], tools: ["jobs.discover"], toolVersions: ["1"],
+        risks: ["internal_write"], domains: ["jobs"], requiredCapabilities: ["read"], outcome: "allow",
+        reasonCode: "test_discovery_allowed", reason: "Flow fixture allows scoped discovery" },
+      { id: "flow-test-job-read", roles: ["subagent"], tools: ["jobs.get"], toolVersions: ["1"],
+        risks: ["read"], domains: ["jobs"], requiredCapabilities: ["read"], outcome: "allow",
+        reasonCode: "test_job_read_allowed", reason: "Flow fixture allows a fresh job read" },
+    ] } })
+    const router = new ToolRouter(new ToolRegistry(definitions), lifecycle, policy)
+    const stores = workerStores()
+    const completed = await createChildExecutor({
+      store: stores.store, treeBudget: stores.budget,
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => scriptedModel(["jobs.discover", "jobs.get"], typedScoutResult(recoveredJobId)),
+      toolRuntimeFactory: () => ({
+        definitions, router,
+        discoveryAttemptSidecar: observer.discoveryAttemptSidecar,
+        discoveryRecoverySidecar: observer.discoveryRecoverySidecar,
+        validateArguments: () => true,
+      }),
+    })({ lease })
+    expect(completed.status).toBe("completed")
+    expect(completed.result).toHaveProperty("structuredResult.candidates.0.jobId", recoveredJobId)
+    expect(getJob).toHaveBeenCalledWith(lease.userId, recoveredJobId)
+    expect(observer.discoveryRecoverySidecar()).toMatchObject({ jobIds: [recoveredJobId], attemptCount: lease.attemptCount })
+
+    const graph = {
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId, parentTaskId: lease.rootTaskId },
+      snapshot: ordinarySnapshot(lease.id), expectedRevision: 4,
+    }
+    const report = {
+      verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "failed", reasonCode: "criteria_not_met",
+      criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "candidate_count_below_minimum" }],
+      evidenceDigest: null, resultDigest: null,
+    }
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValue(graph as never)
+    const verify = vi.spyOn(taskGraphVerification, "verifyTaskGraphNodeEvidence").mockResolvedValue({
+      verified: false, report,
+    } as never)
+    try {
+      const finalized = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: lease.id, sessionId: lease.sessionId, attemptCount: lease.attemptCount,
+        status: completed.status, retry: false, result: completed.result,
+      })
+      expect(verify).toHaveBeenCalledOnce()
+      expect(finalized.status).toBe("failed")
+      expect(finalized.failureReason).toBe("task_graph_verification_failed")
+      expect(finalized.result).toMatchObject({ discoveryAttempt: observer.discoveryAttemptSidecar(), taskGraphVerificationReport: report })
+      const result = finalized.result as Record<string, unknown>
+      expect(result.discoveryRecovery).toEqual({
+        schemaVersion: DISCOVERY_RECOVERY_SCHEMA_VERSION, attemptCount: lease.attemptCount,
+        jobIds: [recoveredJobId], truncated: false,
+      })
+      expect(Object.keys(result.discoveryRecovery as Record<string, unknown>).sort())
+        .toEqual(["attemptCount", "jobIds", "schemaVersion", "truncated"])
+      expect(result).not.toHaveProperty("structuredResult")
+      expect(result).not.toHaveProperty("jobs")
+      expect(result).not.toHaveProperty("evidence")
+    } finally {
+      prepare.mockRestore()
+      verify.mockRestore()
+    }
+  })
+
   it("keeps a persisted partial discovery unverified and requires fresh jobs.get evidence", async () => {
     const failedLease = { ...childLease(), maxAttempts: 2 }
     const provenance = provenanceClient(failedLease)

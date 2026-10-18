@@ -170,6 +170,79 @@ describe("coordination executor support", () => {
     expect(waitTaskOutput(legacyTask).result).toEqual(legacyResult)
   })
 
+  it("omits the private discovery recovery sidecar from legacy list and current wait results", () => {
+    const recoveryJobId = "c123456789012345678901234"
+    const storedResult = {
+      status: "failed", stepCount: 4, toolCallCount: 3, structuredOutputFailureCategory: "result_shape_invalid",
+      discoveryRecovery: {
+        schemaVersion: "agent-harness.v2.task-graph.discovery-recovery.v1",
+        attemptCount: 3, jobIds: [recoveryJobId], truncated: false,
+      },
+    }
+    const failedTask: CoordinationTaskView = { ...task, status: "failed", result: storedResult }
+
+    expect(taskOutput(failedTask).result).toEqual({
+      status: "failed", stepCount: 4, toolCallCount: 3, structuredOutputFailureCategory: "result_shape_invalid",
+    })
+    expect(waitTaskOutput(failedTask).result).toEqual({
+      status: "failed", stepCount: 4, toolCallCount: 3, structuredOutputFailureCategory: "result_shape_invalid",
+    })
+    expect(JSON.stringify({ listed: taskOutput(failedTask), waited: waitTaskOutput(failedTask) })).not.toContain(recoveryJobId)
+    expect(failedTask.result).toEqual(storedResult)
+
+    const serializedTask = { ...failedTask, result: JSON.stringify(storedResult) }
+    const safeSerializedResult = JSON.stringify({
+      status: "failed", stepCount: 4, toolCallCount: 3, structuredOutputFailureCategory: "result_shape_invalid",
+    })
+    expect(taskOutput(serializedTask).result).toBe(safeSerializedResult)
+    expect(waitTaskOutput(serializedTask).result).toBe(safeSerializedResult)
+    expect(JSON.stringify({ listed: taskOutput(serializedTask), waited: waitTaskOutput(serializedTask) })).not.toContain(recoveryJobId)
+    expect(serializedTask.result).toBe(JSON.stringify(storedResult))
+  })
+
+  it("recursively omits discovery recovery from nested, array, and serialized results", () => {
+    const recoveryJobId = "c223456789012345678901234"
+    const recovery = { attemptCount: 9, jobIds: [recoveryJobId] }
+    const storedResult = {
+      status: "failed",
+      details: { keep: "nested-safe", deeper: { keep: "deep-safe", discoveryRecovery: recovery } },
+      rows: [{ keep: "array-safe", discoveryRecovery: recovery }],
+      serialized: JSON.stringify({ envelope: { keep: "serialized-safe", discoveryRecovery: recovery } }),
+    }
+    const failedTask: CoordinationTaskView = { ...task, status: "failed", result: storedResult }
+    const expectedResult = {
+      status: "failed",
+      details: { keep: "nested-safe", deeper: { keep: "deep-safe" } },
+      rows: [{ keep: "array-safe" }],
+      serialized: JSON.stringify({ envelope: { keep: "serialized-safe" } }),
+    }
+
+    const listed = taskOutput(failedTask)
+    const waited = waitTaskOutput(failedTask)
+    expect(listed.result).toEqual(expectedResult)
+    expect(waited.result).toEqual(expectedResult)
+    expect(JSON.stringify({ listed, waited })).not.toContain(recoveryJobId)
+    expect(JSON.stringify({ listed, waited })).not.toContain('"attemptCount":9')
+    expect(failedTask.result).toEqual(storedResult)
+  })
+
+  it("fails closed for malformed serialized recovery markers, including escaped keys", () => {
+    const recoveryJobId = "c323456789012345678901234"
+    const malformedResults = [
+      `prefix: {"discoveryRecovery":{"attemptCount":9,"jobIds":["${recoveryJobId}"]}`,
+      String.raw`prefix: {"discovery\u0052ecovery":{"attemptCount":9,"jobIds":["${recoveryJobId}"]}`,
+    ]
+
+    for (const rawResult of malformedResults) {
+      const failedTask: CoordinationTaskView = { ...task, status: "failed", result: rawResult }
+      expect(waitResult(rawResult)).toBeNull()
+      expect(taskOutput(failedTask).result).toBeNull()
+      expect(waitTaskOutput(failedTask).result).toBeNull()
+      expect(failedTask.result).toBe(rawResult)
+    }
+    expect(waitResult("ordinary text without recovery metadata")).toBe("ordinary text without recovery metadata")
+  })
+
   it("omits malformed serialized private TaskGraph results from terminal list and wait output", () => {
     const rawResult = String.raw`  {"taskGraph\u0056erificationReport":{"dependency\u0042indings":[{"taskId":"private-source","digest":"${"c".repeat(64)}"}]}`
     const rawDigest = digestNativeVerificationValue(rawResult)

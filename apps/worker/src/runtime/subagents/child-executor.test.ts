@@ -964,7 +964,7 @@ describe("child executor composition", () => {
     })
     const completedScout = await successfulExecutor({ lease: ordinaryScout })
     expect(completedScout.status).toBe("completed")
-    expect(completedScout.result).not.toHaveProperty("discoveryRecovery")
+    expect(completedScout.result).toHaveProperty("discoveryRecovery", recovery)
   })
 
   it("fails closed before parsing oversized structured output", async () => {

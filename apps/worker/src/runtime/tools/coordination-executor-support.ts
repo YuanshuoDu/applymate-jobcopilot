@@ -11,7 +11,7 @@ export type CoordinationExecutorOptions = CoordinationRuntimeOptions
 
 const WAIT_RESULT_MAX_BYTES = 2 * 1024
 const WAIT_FAILURE_MAX_BYTES = 500
-const FOREIGN_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
+const OMITTED_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget", "discoveryRecovery"])
 
 export function currentTurnTask(context: ToolExecutionContext, task: CoordinationTaskView): CoordinationTaskView {
   if (task.turnId !== context.turnId) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
@@ -104,9 +104,31 @@ function projectTaskGraphVerificationResult(value: unknown): unknown {
 }
 
 function stripForeignResultKeys(value: ReturnType<typeof sanitizeLifecyclePreview>): ReturnType<typeof sanitizeLifecyclePreview> {
-  if (Array.isArray(value)) return value.map(stripForeignResultKeys)
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([key]) => !FOREIGN_RESULT_KEYS.has(key)).map(([key, child]) => [key, stripForeignResultKeys(child)]))
+  if (typeof value === "string") {
+    try { const parsed = JSON.parse(value) as ReturnType<typeof sanitizeLifecyclePreview>, stripped = stripForeignResultKeys(parsed); return stripped === parsed ? value : JSON.stringify(stripped) ?? value }
+    catch { return containsDiscoveryRecoveryMarker(value) ? null : value }
+  }
+  if (Array.isArray(value)) {
+    const stripped = value.map(stripForeignResultKeys)
+    return stripped.some((child, index) => child !== value[index]) ? stripped : value
+  }
+  if (value && typeof value === "object") {
+    let changed = false
+    const entries: [string, ReturnType<typeof sanitizeLifecyclePreview>][] = []
+    for (const [key, child] of Object.entries(value)) {
+      if (OMITTED_RESULT_KEYS.has(key)) { changed = true; continue }
+      const stripped = stripForeignResultKeys(child)
+      if (stripped !== child) changed = true
+      entries.push([key, stripped])
+    }
+    return changed ? Object.fromEntries(entries) : value
+  }
   return value
+}
+
+function containsDiscoveryRecoveryMarker(value: string): boolean {
+  const decoded = value.replace(/\\u([0-9a-fA-F]{4})/g, (_match, code: string) => String.fromCharCode(Number.parseInt(code, 16)))
+  return decoded.includes("discoveryRecovery")
 }
 
 export function boundedFailureReason(value: string | null | undefined): string | null {

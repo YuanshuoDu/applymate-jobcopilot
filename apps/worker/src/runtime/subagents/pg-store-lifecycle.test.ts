@@ -223,11 +223,23 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       expect(retryDecision.result).not.toHaveProperty("discoveryRecovery")
       expect(retryDecision.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
 
+      for (const status of ["cancelled", "interrupted", "completed", "running"]) {
+        const nonFailed = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+          taskId: "child-1", sessionId: "session-1", attemptCount: 1, status, retry: false,
+          result: { status: "failed", discoveryRecovery, discoveryAttempt },
+        })
+        expect(nonFailed.status).toBe(status)
+        expect(nonFailed.result).not.toHaveProperty("discoveryRecovery")
+        expect(nonFailed.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
+      }
+
       const terminal = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
         taskId: "child-1", sessionId: "session-1", attemptCount: 3, status: "failed", retry: false,
         result: { status: "failed", discoveryRecovery, discoveryAttempt },
       })
       expect(terminal.result).toHaveProperty("discoveryRecovery", discoveryRecovery)
+      expect(Object.keys((terminal.result as Record<string, unknown>).discoveryRecovery as object).sort())
+        .toEqual(["attemptCount", "jobIds", "schemaVersion", "truncated"])
       expect(terminal.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
     } finally { prepare.mockRestore() }
   })

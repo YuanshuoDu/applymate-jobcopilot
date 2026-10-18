@@ -14,20 +14,21 @@ import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, re
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
 export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
-  const safeInputResult = stripTaskGraphMetadata(stripNonterminalDiscoveryRecovery(input.result, input.status, input.retry))
+  const safeInputResult = stripTaskGraphMetadata(input.result)
+  const finalizedResult = (value: unknown, status: string): unknown => stripNonterminalDiscoveryRecovery(value, status, input.retry)
   const graphType = taskGraphEventType(input.status, input.retry)
   let graph = graphType ? await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: graphType, attemptCount: input.attemptCount, failureReason: input.failureReason }) : null
-  if (!graph || "blocked" in graph) return { graph, status: input.status, failureReason: input.failureReason, result: safeInputResult }
+  if (!graph || "blocked" in graph) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
   const node = graph.snapshot.nodes.find(candidate => candidate.taskId === input.taskId)
-  if (!node || (node.templateId !== "scout" && node.templateId !== "analyst")) return { graph, status: input.status, failureReason: input.failureReason, result: safeInputResult }
+  if (!node || (node.templateId !== "scout" && node.templateId !== "analyst")) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
   if (input.status !== "completed") {
     if (input.status === "failed") {
       const report = unverifiedFailureReport(node)
       const failureReason = "task_graph_verification_unverified"
       graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.failed", attemptCount: input.attemptCount, failureReason })
-      return { graph, status: input.status, failureReason, result: taskGraphVerificationResult(safeInputResult, report, undefined, null) }
+      return { graph, status: input.status, failureReason, result: finalizedResult(taskGraphVerificationResult(safeInputResult, report, undefined, null), input.status) }
     }
-    return { graph, status: input.status, failureReason: input.failureReason, result: safeInputResult }
+    return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
   }
   const envelope = plainObject(safeInputResult)
   const structuredResult = envelope?.structuredResult
@@ -52,10 +53,10 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   const reportWithDependencies = typedPass && !repairRejected && dependencyKeys.length && dependencyProof
     ? { ...report, dependencyBindings: dependencyProof.bindings } : report
   const safeResult = taskGraphVerificationResult(safeInputResult, reportWithDependencies, boundResult, repairReceipt)
-  if (typedPass && !repairRejected) return { graph, status: input.status, failureReason: input.failureReason, result: safeResult, reconcileDependents: true }
+  if (typedPass && !repairRejected) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeResult, input.status), reconcileDependents: true }
   const failureReason = repairRejected ? "task_graph_repair_target_unresolved" : evidence.report.status === "failed" ? "task_graph_verification_failed" : "task_graph_verification_unverified"
   graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.failed", attemptCount: input.attemptCount, failureReason })
-  return { graph, status: "failed", failureReason, result: safeResult }
+  return { graph, status: "failed", failureReason, result: finalizedResult(safeResult, "failed") }
 }
 const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1" as const; const RESERVED_RESULT_KEYS = new Set(["taskGraphVerificationReport", "verificationReport", "taskGraphRepairReceipt"])
 function unverifiedFailureReport(node: StoredTaskGraphNode): TaskGraphVerificationReport {

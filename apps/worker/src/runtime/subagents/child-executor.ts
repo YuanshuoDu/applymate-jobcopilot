@@ -271,7 +271,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       const selectedEvidenceRole = Boolean(selectedJobPreparation && (structuredRole === "scout" || structuredRole === "analyst"))
       const safeStructuredResult = selectedEvidenceRole ? redactSelectedEvidenceResult(structuredResult, runtime.selectedJobArtifactContext!) : structuredResult
       const safeFinalText = selectedJobPreparation ? JSON.stringify(safeStructuredResult) : finalText
-      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, ...discoveryAttemptField, finalText: projectChildFinalText(safeFinalText), structuredResult: safeStructuredResult }, failureReason: result.errorCode }
+      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), finalText: projectChildFinalText(safeFinalText), structuredResult: safeStructuredResult }, failureReason: result.errorCode }
     }
     const status = resultStatus(result.status)
     return {
