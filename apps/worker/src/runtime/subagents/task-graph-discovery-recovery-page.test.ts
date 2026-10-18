@@ -87,6 +87,26 @@ describe("failed Scout discovery-recovery observation pages", () => {
     expect(JSON.stringify(first)).not.toContain("score")
   })
 
+  it("projects only capped server recovery IDs when model text and structured output remain persisted", () => {
+    const modelText = JSON.stringify({ jobIds: [id(99)], summary: "MODEL_AUTHORED_TEXT_SECRET" })
+    const modelPayload = { jobIds: [id(98)], summary: "MODEL_AUTHORED_STRUCTURED_SECRET", privateNotes: "PRIVATE_MODEL_DATA" }
+    const graph = loaded({ result: {
+      status: "completed", finalText: modelText, structuredResult: modelPayload, discoveryRecovery: sidecar(3, 24),
+    } })
+
+    const page = projectTaskGraphDiscoveryRecoveryPage(graph, request)
+    expect(page).toEqual({ schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+      observation: "partial_discovery", verificationStatus: "unverified", graphRevision: 8, attemptCount: 3, taskStatus: "failed",
+      totalCount: 24, offset: 0, nextOffset: 3, truncated: true,
+      items: [{ jobId: id(1) }, { jobId: id(2) }, { jobId: id(3) }] })
+    const serialized = JSON.stringify(page)
+    expect(serialized).not.toContain(modelText)
+    expect(serialized).not.toContain("MODEL_AUTHORED")
+    expect(serialized).not.toContain("PRIVATE_MODEL_DATA")
+    expect(serialized).not.toContain(id(98))
+    expect(serialized).not.toContain(id(99))
+  })
+
   it("requires the current failed ordinary generic Scout and its exact current-attempt sidecar", () => {
     const selectedEnvelope = { ...expectedEnvelope, allowedActions: ["jobs.get"] }
     const invalidGraphs = [
@@ -102,10 +122,8 @@ describe("failed Scout discovery-recovery observation pages", () => {
       loaded({ context: { selectedJobPreparation: undefined } }), loaded({ context: { coverLetterBase: null } }),
       loaded({ context: { writerReviewFeedback: false } }), loaded({ context: null }), loaded({ context: undefined }),
       loaded({ repair: true }), loaded({ native: true }), loaded({ stateRevision: 7 }),
-      loaded({ result: { status: "failed", structuredResult: { candidates: [{ jobId: id(9) }] }, discoveryRecovery: sidecar() } }),
-      loaded({ result: { status: "failed", finalText: JSON.stringify({ jobIds: [id(9)] }), discoveryRecovery: sidecar() } }),
       loaded({ result: { status: "failed", taskGraphRepairReceipt: { taskId: "private-repair" }, discoveryRecovery: sidecar() } }),
-      loaded({ result: { status: "completed", discoveryRecovery: sidecar() } }),
+      loaded({ result: { status: "pending", discoveryRecovery: sidecar() } }),
       loaded({ sidecar: { ...sidecar(), secret: "provider error" } }),
     ]
     for (const graph of invalidGraphs) {

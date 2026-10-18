@@ -191,6 +191,7 @@ function failedGraph(task: SubagentLease, result: unknown): LoadedGraph {
 describe("failed Scout discovery recovery flow", () => {
   it("retains only the closed recovery sidecar when server verification rejects a bound Scout result", async () => {
     const lease = { ...childLease("scout-verifier-failure"), maxAttempts: 2 }
+    const modelFinalText = typedScoutResult(recoveredJobId).replace("Found a matching role", "MODEL_AUTHORED_TEXT_SECRET")
     const provenance = provenanceClient(lease)
     const observer = await createChildDiscoveryObservers(provenance.pool as never, lease, {
       taskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
@@ -229,7 +230,7 @@ describe("failed Scout discovery recovery flow", () => {
     const completed = await createChildExecutor({
       store: stores.store, treeBudget: stores.budget,
       authorizeUsage: async () => ({ settle: async () => undefined }),
-      modelRuntimeFactory: () => scriptedModel(["jobs.discover", "jobs.get"], typedScoutResult(recoveredJobId)),
+      modelRuntimeFactory: () => scriptedModel(["jobs.discover", "jobs.get"], modelFinalText),
       toolRuntimeFactory: () => ({
         definitions, router,
         discoveryAttemptSidecar: observer.discoveryAttemptSidecar,
@@ -274,6 +275,18 @@ describe("failed Scout discovery recovery flow", () => {
       expect(result).not.toHaveProperty("structuredResult")
       expect(result).not.toHaveProperty("jobs")
       expect(result).not.toHaveProperty("evidence")
+      expect(result.status).toBe("completed")
+      expect(result.finalText).toBe(modelFinalText)
+      const page = projectTaskGraphDiscoveryRecoveryPage(failedGraph(lease, finalized.result), {
+        mode: "discovery_recovery", nodeKey: "scout-a", expectedRevision: 4, offset: 0,
+        expectedAttemptCount: lease.attemptCount,
+      })
+      expect(page).toEqual({ schemaVersion: "agent-harness.v2.task-graph.discovery-recovery-page.v1", trust: "untrusted",
+        availability: "available", observation: "partial_discovery", verificationStatus: "unverified", graphRevision: 4,
+        attemptCount: lease.attemptCount, taskStatus: "failed", totalCount: 1, offset: 0, nextOffset: null, truncated: false,
+        items: [{ jobId: recoveredJobId }] })
+      expect(JSON.stringify(page)).not.toContain("MODEL_AUTHORED_TEXT_SECRET")
+      expect(JSON.stringify(page)).not.toContain(modelFinalText)
     } finally {
       prepare.mockRestore()
       verify.mockRestore()

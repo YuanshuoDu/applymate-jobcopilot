@@ -35,8 +35,7 @@ export function projectTaskGraphDiscoveryRecoveryPage(
   if (task.status !== "failed") return unavailable(revision, "node_unavailable")
   const result = persistedFailureEnvelope(task.result)
   const recovery = result ? parseDiscoveryRecovery(result.discoveryRecovery) : undefined
-  if (!recovery || result?.status !== "failed" || Object.hasOwn(result, "structuredResult") || Object.hasOwn(result, "finalText")
-    || Object.hasOwn(result, "taskGraphRepairReceipt")
+  if (!recovery || (result?.status !== "failed" && result?.status !== "completed") || Object.hasOwn(result, "taskGraphRepairReceipt")
     || !validAttempt(task.attemptCount) || recovery.attemptCount !== task.attemptCount) {
     return unavailable(revision, "recovery_unavailable")
   }
