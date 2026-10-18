@@ -62,7 +62,7 @@ import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
 import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
 import { projectTaskGraphResultPage } from "./subagents/task-graph-result-page.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
+import { evaluateTaskGraphVerification, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract, type TaskGraphVerificationEvidenceProjection } from "./planning/task-graph-verification.js"
 import { evaluateTaskGraphObjectiveCoverage } from "./planning/task-graph-objective-coverage.js"
 
 const lease = {
@@ -3192,7 +3192,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requests).toHaveLength(6)
   })
 
-  it("keeps terminal Scout pages advisory across Root steps and requires a fresh ordinary Scout jobs.get read", async () => {
+  it("keeps historical Scout pages advisory and requires a fresh ordinary Scout read for typed completion", async () => {
     const historicalJobIds = [
       "00000000-0000-4000-8000-000000000101", "00000000-0000-4000-8000-000000000102",
       "00000000-0000-4000-8000-000000000103", "00000000-0000-4000-8000-000000000104",
@@ -3204,6 +3204,16 @@ describe("createCanonicalTurnRuntime", () => {
       offset, nextOffset: offset === 0 ? 3 : null, totalCount: historicalJobIds.length, truncated: false,
       items: historicalJobIds.slice(offset, offset + 3).map(jobId => ({ jobId })),
     })
+    const verification: TaskGraphVerificationContract = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+        { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
+      ],
+    }
+    let currentTypedProjection: unknown = historicalPage(3)
+    const completionEvaluations: Array<{ status: string; reasonCode: string }> = []
     const historyReads: Array<{ scope: Parameters<NonNullable<TaskGraphCommandPort["readHistoricalDiscoveryPage"]>>[0]; request: TaskGraphHistoricalDiscoveryPageRequest }> = []
     const activityClient = {
       query: vi.fn(async (sql: string) => {
@@ -3214,16 +3224,43 @@ describe("createCanonicalTurnRuntime", () => {
       release: vi.fn(),
     }
     const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
+    const scheduledScoutTaskId = "subagent-00000000-0000-4000-8000-000000000201"
+    const scoutTemplate: TaskGraphTaskTemplate = { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.get"] }
+    let scheduledScoutNode: TaskGraphScheduleInput["proposal"]["nodes"][number] | undefined
+    let currentGraph: TaskGraphCurrentState = { revision: 0, nodes: [] }
+    let dispatchedJobId: string | undefined
+    let freshScoutOutcome: Awaited<ReturnType<ReturnType<typeof createChildExecutor>>> | undefined
+    const appendAndScheduleWithReconciliation = vi.fn(async (input: TaskGraphScheduleInput) => {
+      scheduledScoutNode = input.proposal.nodes[0]
+      currentGraph = {
+        revision: 1,
+        nodes: input.proposal.nodes.map(node => ({
+          key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
+          dependsOn: node.dependsOn, taskId: scheduledScoutTaskId, status: "queued" as const, readiness: "ready" as const,
+          resultSummary: null, failureReason: null, verification: node.verification,
+          verificationCriterionIds: node.verification?.criteria.map(criterion => criterion.id),
+        })),
+      }
+      return {
+        status: "accepted" as const, revision: 1,
+        nodes: input.proposal.nodes.map(node => ({ key: node.key, taskId: scheduledScoutTaskId, status: "queued" as const })),
+        readyTaskIds: [scheduledScoutTaskId],
+      }
+    })
     const taskGraphCommandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
-      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      appendAndScheduleWithReconciliation,
+      readCurrent: vi.fn(async () => currentGraph),
       readHistoricalDiscoveryPage: vi.fn(async (scope, request) => {
         historyReads.push({ scope, request })
         return historicalPage(request.offset)
       }),
     }
-    const denialCheckpoint = { schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: "root-1", graphRevision: 0, verificationDigest: "e".repeat(64) }
+    const denialCheckpoint = { schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: "root-1", graphRevision: 1, verificationDigest: "e".repeat(64) }
     const checkCompletion = vi.fn(async () => {
+      const evaluation = evaluateTaskGraphVerification(verification, currentTypedProjection as TaskGraphVerificationEvidenceProjection)
+      completionEvaluations.push({ status: evaluation.status, reasonCode: evaluation.reasonCode })
+      if (evaluation.status === "passed") return { ok: true as const }
       const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "Current typed evidence is still required." }
       Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: denialCheckpoint })
       return denial
@@ -3231,13 +3268,72 @@ describe("createCanonicalTurnRuntime", () => {
     const roots = { ...rootStore(), checkCompletion }
     const requests: HarnessModelRequest[] = []
     const events: RuntimeEvent[] = []
+    const freshReadInputs: unknown[] = []
+    const freshScoutRequests: HarnessModelRequest[] = []
+    const getTool = {
+      schemaVersion, name: "jobs.get", version: "1", description: "Read one current job record",
+      capabilities: ["read"] as const, inputSchema: Type.Object({ jobId: Type.String() }),
+      outputSchema: Type.Object({ job: Type.Object({ id: Type.String(), source: Type.String() }) }),
+      risk: "read" as const, domain: "jobs" as const, idempotency: "read_only" as const,
+      timeoutMs: 1_000, requiredCapabilities: ["read"],
+    } satisfies ChildPublicDefinition
+    const childModel: ModelAdapter = {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        freshScoutRequests.push(request)
+        if (freshScoutRequests.length === 1) {
+          if (!dispatchedJobId) throw new Error("historical_page_job_id_not_dispatched")
+          yield { type: "tool_call_completed", callId: "fresh-scout-jobs-get", name: "jobs.get", arguments: { jobId: dispatchedJobId } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        const read = request.messages.flatMap(message => message.content)
+          .find(part => part.type === "tool_result" && part.toolUseId === "fresh-scout-jobs-get")
+        if (!read || read.type !== "tool_result") throw new Error("fresh_scout_jobs_get_result_missing")
+        const readOutput = JSON.parse(read.content) as { job?: { id?: unknown; source?: unknown } }
+        if (typeof readOutput.job?.id !== "string" || typeof readOutput.job.source !== "string") throw new Error("fresh_scout_current_job_missing")
+        const evidenceId = "fresh-job-evidence"
+        const freshResult = {
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+          candidates: [{ jobId: readOutput.job.id, source: readOutput.job.source, url: null, evidenceIds: [evidenceId] }],
+          evidence: [{ id: evidenceId, kind: "job", ref: readOutput.job.id, source: readOutput.job.source }],
+          summary: "Current jobs.get read completed.",
+        }
+        yield { type: "text_delta", text: JSON.stringify(freshResult) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const executeFreshScout = createChildExecutor({
+      store: childExecutionStore(), treeBudget: childBudgetStore(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => childModel,
+      toolRuntimeFactory: () => ({
+        definitions: [getTool], validateArguments: () => true,
+        router: { execute: async (_context, request) => {
+          freshReadInputs.push(request.input)
+          const input = request.input as { jobId: string }
+          return { ...request, status: "completed", output: { job: { id: input.jobId, source: "greenhouse" } }, errorCode: null }
+        } },
+      }),
+    })
+    const buildFreshScoutLease = (): SubagentLease => {
+      if (!dispatchedJobId || !scheduledScoutNode) throw new Error("fresh_scout_schedule_missing")
+      return {
+        id: scheduledScoutTaskId, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+        rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/fresh-scout-from-history", depth: 1, role: "scout", taskType: "job_discovery",
+        status: "running", goal: scheduledScoutNode.goal, constraints: [], successCriteria: [...scheduledScoutNode.successCriteria],
+        allowedActions: [...scoutTemplate.allowedActions], context: {}, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+        modelProfileSnapshot: { provider: "fixture", model: "fixture" }, result: null, failureReason: null,
+        attemptCount: 1, maxAttempts: 1, leaseOwner: "child-worker", leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
+        interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId: "child-worker", signal: new AbortController().signal,
+      }
+    }
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(activityPool as never), {
       workerId: lease.ownerId,
       productionFlags: resolveProductionAgentFlags({
         ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
       }),
       taskGraphCommandPort,
-      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.get", "jobs.search"] } },
+      taskGraphTemplates: { scout: scoutTemplate },
       stateLoader: async () => ({ ...state(), budgetSnapshot: { limits: { maxSteps: 8 } }, toolPolicySnapshot: {} }),
       rootTaskStore: roots as never,
       nativeVerificationFactory: () => nativeVerificationRuntime(),
@@ -3263,14 +3359,45 @@ describe("createCanonicalTurnRuntime", () => {
             yield { type: "completed", finishReason: "tool_calls" }
             return
           }
-          yield { type: "text_delta", text: "These historical IDs are unverified leads; the current TaskGraph still needs a fresh Scout read." }
-          yield { type: "completed", finishReason: "stop" }
+          if (requests.length === 3) {
+            const prior = request.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-next-page")
+            if (!prior || prior.type !== "tool_result") throw new Error("historical_second_page_lifecycle_result_missing")
+            const page = JSON.parse(prior.content) as TaskGraphHistoricalDiscoveryPage
+            if (page.availability !== "available" || page.offset !== 3 || page.sourceToken !== sourceToken || page.verificationStatus !== "unverified") {
+              throw new Error("historical_page_binding_missing")
+            }
+            dispatchedJobId = page.items[0]?.jobId
+            if (!dispatchedJobId) throw new Error("historical_page_job_id_missing")
+            yield { type: "tool_call_completed", callId: "fresh-scout-plan", name: "agent.plan", arguments: {
+              expectedRevision: 0,
+              nodes: [{
+                key: "fresh-scout-from-history", templateId: "scout", goal: "Read historical lead " + dispatchedJobId + " with current jobs.get",
+                successCriteria: ["Read current job details and return typed evidence"], dependsOn: [],
+                verification,
+              }],
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (requests.length === 4) {
+            const planResult = request.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "fresh-scout-plan")
+            if (!planResult || planResult.type !== "tool_result") throw new Error("fresh_scout_plan_lifecycle_result_missing")
+            const receipt = JSON.parse(planResult.content) as { nodes?: Array<{ taskId?: string }> }
+            if (receipt.nodes?.[0]?.taskId !== scheduledScoutTaskId) throw new Error("fresh_scout_plan_receipt_missing")
+          }
+          if (requests.length >= 4) {
+            yield { type: "text_delta", text: "Historical leads remain unverified until the fresh Scout records current jobs.get evidence." }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          throw new Error("unexpected_root_model_request")
         },
       }, registry: {} as never, candidates: [] }),
       authorizeUsage: async () => ({ settle: async () => undefined }),
     })
 
-    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
+    const rootExecution = await runtime.execute({ lease, signal: new AbortController().signal })
+    expect(rootExecution).toMatchObject({ status: "failed" })
     expect(historyReads.map(read => read.request)).toEqual([
       { mode: "historical_discovery", offset: 0 },
       { mode: "historical_discovery", offset: 3, sourceToken },
@@ -3278,68 +3405,59 @@ describe("createCanonicalTurnRuntime", () => {
     expect(new Set(historyReads.map(read => read.scope.stepId)).size).toBe(2)
     expect(historyReads.every(read => read.scope.rootTaskId === "root-1" && read.scope.parentTaskId === "root-1"
       && read.scope.userId === lease.userId && read.scope.sessionId === lease.sessionId && read.scope.turnId === lease.turnId)).toBe(true)
-    expect(requests[1]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-first-page"))
-      .toMatchObject({ type: "tool_result", content: expect.stringContaining(historicalJobIds[0]!) })
-    const pageResult = requests[1]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-first-page")
-    expect(pageResult && pageResult.type === "tool_result" ? JSON.parse(pageResult.content) : null).toMatchObject({
+    const firstPageResult = requests[1]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-first-page")
+    expect(firstPageResult && firstPageResult.type === "tool_result" ? JSON.parse(firstPageResult.content) : null).toMatchObject({
       trust: "untrusted", observation: "historical_discovery", verificationStatus: "unverified",
+      nextOffset: 3, sourceToken,
     })
-    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
-    expect(checkCompletion).toHaveBeenCalled()
+    const secondPageResult = requests[2]?.messages.flatMap(message => message.content).find(part => part.type === "tool_result" && part.toolUseId === "history-next-page")
+    const dispatchedPage = secondPageResult && secondPageResult.type === "tool_result"
+      ? JSON.parse(secondPageResult.content) as TaskGraphHistoricalDiscoveryPage : null
+    expect(dispatchedPage).toMatchObject({
+      trust: "untrusted", observation: "historical_discovery", verificationStatus: "unverified",
+      offset: 3, sourceToken, items: [{ jobId: historicalJobIds[3] }],
+    })
+    const availableDispatchedPage = dispatchedPage?.availability === "available" ? dispatchedPage : null
+    expect(dispatchedJobId).toBe(availableDispatchedPage?.items[0]?.jobId)
+    expect(appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+    const scheduled = appendAndScheduleWithReconciliation.mock.calls[0]?.[0]
+    expect(scheduled?.proposal.nodes[0]).toMatchObject({
+      key: "fresh-scout-from-history", templateId: "scout", goal: expect.stringContaining(historicalJobIds[3]!),
+      verification,
+    })
+    expect(scheduledScoutNode?.templateId).toBe("scout")
+    expect(scoutTemplate.allowedActions).toEqual(["jobs.get"])
     expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed" }) }))
     expect(roots.finish).not.toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
+    const historyOnlyCompletion = await checkCompletion()
+    expect(historyOnlyCompletion).toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    expect(completionEvaluations.length).toBeGreaterThan(0)
+    expect(completionEvaluations.every(evaluation => evaluation.status !== "passed")).toBe(true)
 
-    const freshScoutLease: SubagentLease = {
-      id: "subagent-12345678-1234-4234-9234-123456789012", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
-      rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/scout-refresh", depth: 1, role: "scout", taskType: "job_discovery",
-      status: "running", goal: "Refresh one historical lead through the current job read", constraints: [], successCriteria: ["Return the current canonical job evidence"],
-      allowedActions: ["jobs.get"], context: {}, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
-      modelProfileSnapshot: { provider: "fixture", model: "fixture" }, result: null, failureReason: null,
-      attemptCount: 1, maxAttempts: 1, leaseOwner: "child-worker", leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
-      interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId: "child-worker", signal: new AbortController().signal,
-    }
-    const refreshedJobId = historicalJobIds[0]!
-    const freshReadInputs: unknown[] = []
-    const freshScoutRequests: HarnessModelRequest[] = []
-    const freshResult = {
-      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
-      candidates: [{ jobId: refreshedJobId, source: "greenhouse", url: null, evidenceIds: [`read:job:${refreshedJobId}`] }],
-      evidence: [{ id: `read:job:${refreshedJobId}`, kind: "job", ref: refreshedJobId, source: "greenhouse" }],
-      summary: "Current jobs.get read completed.",
-    }
-    const getTool = {
-      schemaVersion, name: "jobs.get", version: "1", description: "Read one current job record",
-      capabilities: ["read"] as const, inputSchema: Type.Object({ jobId: Type.String() }),
-      outputSchema: Type.Object({ job: Type.Object({ id: Type.String(), source: Type.String() }) }),
-      risk: "read" as const, domain: "jobs" as const, idempotency: "read_only" as const,
-      timeoutMs: 1_000, requiredCapabilities: ["read"],
-    } satisfies ChildPublicDefinition
-    const childModel: ModelAdapter = {
-      ...model(() => []),
-      async *stream(request: HarnessModelRequest) {
-        freshScoutRequests.push(request)
-        if (freshScoutRequests.length === 1) {
-          yield { type: "tool_call_completed", callId: "fresh-scout-jobs-get", name: "jobs.get", arguments: { jobId: refreshedJobId } }
-          yield { type: "completed", finishReason: "tool_calls" }
-        } else {
-          yield { type: "text_delta", text: JSON.stringify(freshResult) }
-          yield { type: "completed", finishReason: "stop" }
-        }
-      },
-    }
-    const executeFreshScout = createChildExecutor({
-      store: childExecutionStore(), treeBudget: childBudgetStore(), authorizeUsage: async () => ({ settle: async () => undefined }),
-      modelRuntimeFactory: () => childModel,
-      toolRuntimeFactory: () => ({ definitions: [getTool], validateArguments: () => true,
-        router: { execute: async (_context, request) => {
-          freshReadInputs.push(request.input)
-          return { ...request, status: "completed", output: { job: { id: refreshedJobId, source: "greenhouse" } }, errorCode: null }
-        } },
-      }),
+    freshScoutOutcome = await executeFreshScout({ lease: buildFreshScoutLease() })
+    expect(freshScoutOutcome.status).toBe("completed")
+    const structuredResult = (freshScoutOutcome as unknown as { result?: { structuredResult?: {
+      candidates: readonly { jobId: string; evidenceIds: readonly string[] }[]
+      evidence: readonly { id: string }[]
+    } } }).result?.structuredResult
+    if (!structuredResult) throw new Error("fresh_scout_structured_result_missing")
+    currentTypedProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+      candidates: structuredResult.candidates.map(candidate => ({ jobId: candidate.jobId, evidenceIds: [...candidate.evidenceIds] })),
+      evidenceIds: structuredResult.evidence.map(evidence => evidence.id),
+    } satisfies TaskGraphVerificationEvidenceProjection
+    await expect(checkCompletion()).resolves.toEqual({ ok: true })
+    expect(freshReadInputs).toEqual([{ jobId: historicalJobIds[3] }])
+    expect(freshScoutOutcome).toMatchObject({
+      status: "completed", result: { structuredResult: { role: "scout", status: "completed", candidates: [{ jobId: historicalJobIds[3] }] } },
     })
-    const freshScoutOutcome = await executeFreshScout({ lease: freshScoutLease })
-    expect(freshReadInputs).toEqual([{ jobId: refreshedJobId }])
-    expect(freshScoutOutcome).toMatchObject({ status: "completed", result: { structuredResult: freshResult } })
+    expect(completionEvaluations.at(-1)).toEqual({ status: "passed", reasonCode: "criteria_met" })
+    expect(checkCompletion).toHaveBeenCalled()
+    expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed" }) }))
+    expect(roots.finish).not.toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
+    expect(requests.length).toBeGreaterThanOrEqual(4)
+    expect(freshScoutRequests).toHaveLength(2)
   })
 
   it("fails page mode closed without an optional page port while keeping explicit legacy agent.list available", async () => {
