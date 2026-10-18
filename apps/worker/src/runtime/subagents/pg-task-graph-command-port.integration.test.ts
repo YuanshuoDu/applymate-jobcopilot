@@ -511,6 +511,9 @@ async function seedVerifiedScheduledDraftSources(pool: PgPool, value: Fixture, c
   [value.rootTaskId, value.sessionId, value.turnId, value.parentLeaseOwner, JSON.stringify(rootAllowedActions)])
   if (actionGrant.rowCount !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not seed the root permission snapshot")
   await expect(scheduledDraftRootAllowedActions(pool, value)).resolves.toEqual(rootAllowedActions)
+  await seedReconciliationAgenda(pool, value, {
+    id: value.stepId, sequence: await nextEventSequence(pool, value), cursor: 0n, planRevision: 0, consumedInputIds: [],
+  })
   const receipt = await command.appendAndSchedule(input)
   if (receipt.status !== "accepted" || receipt.revision !== 1) throw new Error("Scheduled-draft PostgreSQL fixture could not create its Scout and Analyst graph")
   await expect(scheduledDraftRootAllowedActions(pool, value)).resolves.toEqual(rootAllowedActions)
