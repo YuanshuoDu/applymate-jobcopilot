@@ -4,9 +4,9 @@ import { Prisma, type PrismaClient } from "@prisma/client"
 import { AGENT_STREAM_SCHEMA_VERSION, type AgentItemRecord } from "@jobcopilot/agent-protocol"
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import type { CommandTransaction } from "./transaction"
+import { TASK_INTERRUPT_OUTBOX_TOPIC } from "./task-interrupt-intent"
 
-const MAILBOX_TOPIC = "agent.subagent.mailbox"
-const MAX_TEXT_LENGTH = 20_000
+const MAILBOX_TOPIC = "agent.subagent.mailbox", MAX_TEXT_LENGTH = 20_000
 
 export class TaskMessageError extends Error {
   constructor(readonly code: string, readonly status: 404 | 409 | 422, message: string) {
@@ -77,7 +77,7 @@ async function resolveCurrentAttempt(
   command: TaskMessageCommand,
   now: Date,
   requireActive: boolean,
-): Promise<{ turnId: string; attempt: number }> {
+): Promise<{ turnId: string; attempt: number; lineageTaskIds: string[] }> {
   const rows = await tx.$queryRaw<TaskIdentity[]>(Prisma.sql`
     SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", task."path", task."depth",
       task."status", task."attemptCount", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
@@ -132,7 +132,7 @@ async function resolveCurrentAttempt(
     || identity.interruptRequestedAt !== null || identity.rootInterruptRequestedAt !== null
     || typeof identity.leaseOwner !== "string" || !identity.leaseOwner.trim()
     || !(identity.leaseExpiresAt instanceof Date) || identity.leaseExpiresAt <= now)) throw unavailable()
-  return { turnId: identity.turnId, attempt: identity.attemptCount }
+  return { turnId: identity.turnId, attempt: identity.attemptCount, lineageTaskIds: ordered.map(row => row.id) }
 }
 
 async function replayExisting(
@@ -197,11 +197,18 @@ export class TaskMessageService {
       }
       if (sessionStatus !== "running") throw notFound()
       const now = command.now ?? new Date()
-      const { turnId, attempt } = await resolveCurrentAttempt(tx, normalized, now, true)
+      const { turnId, attempt, lineageTaskIds } = await resolveCurrentAttempt(tx, normalized, now, true)
       if (command.expectedAttemptCount !== undefined && command.expectedAttemptCount !== attempt) {
         throw new TaskMessageError("task_follow_up_attempt_changed", 409, "The selected task attempt has changed")
       }
-
+      const pendingInterrupt = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT intent."id" FROM "agent_outbox" intent
+        JOIN "agent_events" accepted ON accepted."sessionId" = intent."aggregateId" AND accepted."taskId" = intent."payload"->>'taskId' AND accepted."turnId" = ${turnId}
+          AND accepted."type" = 'task.interrupt.accepted' AND accepted."actor" = 'user'
+          AND accepted."payload"->>'status' = 'accepted' AND accepted."payload"->>'intentId' = intent."payload"->>'intentId'
+        WHERE intent."aggregateId" = ${command.sessionId} AND intent."topic" = ${TASK_INTERRUPT_OUTBOX_TOPIC} AND intent."publishedAt" IS NULL
+          AND intent."payload"->>'sessionId' = ${command.sessionId} AND intent."payload"->>'turnId' = ${turnId}
+          AND intent."payload"->>'taskId' IN (${Prisma.join(lineageTaskIds)}) LIMIT 1`)
+      if (pendingInterrupt.length > 0) throw unavailable()
       const messageId = randomUUID(), itemId = randomUUID()
       await tx.agentMailboxMessage.create({ data: {
         id: messageId, sessionId: command.sessionId, turnId, fromTaskId: null, toTaskId: command.taskId,

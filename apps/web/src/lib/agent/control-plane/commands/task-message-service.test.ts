@@ -23,12 +23,13 @@ const chain = [
 const command = { sessionId: "session-1", taskId: "task-child", userId: "user-1", clientMessageId: "client-1",
   text: "Please check the result", expectedAttemptCount: 3, now }
 
-function harness(options: { session?: Array<{ id: string; status: string }>; identity?: Record<string, unknown>; chain?: Array<Record<string, unknown>>; existing?: unknown } = {}) {
+function harness(options: { session?: Array<{ id: string; status: string }>; identity?: Record<string, unknown>; chain?: Array<Record<string, unknown>>; existing?: unknown; pendingInterrupt?: boolean } = {}) {
   const tx = {
     $queryRaw: vi.fn()
       .mockResolvedValueOnce(options.session ?? [{ id: "session-1", status: "running" }])
       .mockResolvedValueOnce([options.identity ?? identity])
-      .mockResolvedValueOnce(options.chain ?? chain),
+      .mockResolvedValueOnce(options.chain ?? chain)
+      .mockResolvedValueOnce(options.pendingInterrupt ? [{ id: "interrupt-intent" }] : []),
     agentMailboxMessage: { findFirst: vi.fn().mockResolvedValue(options.existing ?? null), create: vi.fn().mockResolvedValue({}) },
     agentOutbox: {
       create: vi.fn().mockResolvedValue({}),
@@ -60,7 +61,7 @@ describe("TaskMessageService", () => {
       targetAttemptCount: 3, disposition: "accepted", sequence: "10",
     })
     expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), { isolationLevel: "Serializable" })
-    expect(tx.$queryRaw).toHaveBeenCalledTimes(3)
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(4)
     expect(tx.agentMailboxMessage.create).toHaveBeenCalledWith({ data: expect.objectContaining({
       sessionId: "session-1", turnId: "turn-1", toTaskId: "task-child", kind: "human_follow_up",
       targetAttemptCount: 3, payload: { text: command.text }, idempotencyKey: "human-follow-up:client-1",
@@ -116,6 +117,24 @@ describe("TaskMessageService", () => {
     await expect(malformed.service.send(command)).rejects.toMatchObject({ code: "task_follow_up_target_unavailable", status: 409 })
     expect(stale.tx.agentMailboxMessage.create).not.toHaveBeenCalled()
     expect(malformed.tx.agentMailboxMessage.create).not.toHaveBeenCalled()
+    expect(mocks.append).not.toHaveBeenCalled()
+  })
+
+  it("rejects a new follow-up while an accepted ancestor interrupt intent is pending", async () => {
+    const ancestor = { id: "task-parent", sessionId: "session-1", turnId: "turn-1", rootTaskId: "task-root", parentTaskId: "task-root",
+      path: "/task-root/task-parent", depth: 1, status: "running", interruptRequestedAt: null }
+    const descendant = { ...chain[1]!, parentTaskId: "task-parent", path: "/task-root/task-parent/task-child", depth: 2 }
+    const { tx, service } = harness({
+      identity: { ...identity, parentTaskId: "task-parent", path: descendant.path, depth: 2 },
+      chain: [chain[0]!, ancestor, descendant], pendingInterrupt: true,
+    })
+    await expect(service.send(command)).rejects.toMatchObject({ code: "task_follow_up_target_unavailable", status: 409 })
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(4)
+    expect((tx.$queryRaw.mock.calls[3]?.[0] as { values: unknown[] }).values)
+      .toEqual(expect.arrayContaining(["task-root", "task-parent", "task-child"]))
+    expect(tx.agentMailboxMessage.create).not.toHaveBeenCalled()
+    expect(tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(tx.agentItem.create).not.toHaveBeenCalled()
     expect(mocks.append).not.toHaveBeenCalled()
   })
 

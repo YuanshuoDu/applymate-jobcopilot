@@ -4,6 +4,7 @@ import { getPool } from "../../db/apply-results.js"
 import { prepareGraphTransition, reconcileGraphDependents } from "../subagents/task-graph-pg-lifecycle.js"
 
 export const SUBAGENT_MAILBOX_OUTBOX_TOPIC = "agent.subagent.mailbox"
+const TASK_INTERRUPT_OUTBOX_TOPIC = "agent.subagent.task-interrupt"
 const DEFAULT_BATCH_SIZE = 10
 const MAX_BATCH_SIZE = 50
 const DEFAULT_POLL_MS = 1_000
@@ -188,9 +189,35 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
     return
   }
   if (payload.targetAttemptCount !== undefined && (lineage.targetStatus !== "running"
-    || !lineage.targetLeaseOwner || !lineage.targetHasLiveLease || lineage.targetInterruptRequestedAt !== null)) {
+    || !lineage.targetLeaseOwner || !lineage.targetHasLiveLease || lineage.targetInterruptRequestedAt !== null
+    || isTerminal(lineage.rootStatus) || isTerminal(lineage.turnStatus))) {
     await markOutbox(client, row.id, "mailbox_attempt_stale")
     return
+  }
+  if (payload.targetAttemptCount !== undefined) {
+    const pendingInterrupt = await client.query<{ id: string }>(`WITH RECURSIVE ancestors AS (
+        SELECT task."id", task."parentTaskId", ARRAY[task."id"]::text[] AS "visited"
+        FROM "sub_agent_tasks" AS task
+        WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+        UNION ALL
+        SELECT parent."id", parent."parentTaskId", child."visited" || parent."id"
+        FROM "sub_agent_tasks" AS parent JOIN ancestors AS child ON child."parentTaskId" = parent."id"
+        WHERE parent."sessionId" = $2 AND parent."turnId" = $3 AND parent."rootTaskId" = $4
+          AND NOT parent."id" = ANY(child."visited") AND cardinality(child."visited") < 11
+      ) SELECT intent."id" FROM "agent_outbox" AS intent
+        JOIN "agent_events" AS accepted ON accepted."sessionId" = intent."aggregateId"
+          AND accepted."taskId" = intent."payload"->>'taskId' AND accepted."turnId" = $3
+          AND accepted."type" = 'task.interrupt.accepted' AND accepted."actor" = 'user'
+          AND accepted."payload"->>'status' = 'accepted'
+          AND accepted."payload"->>'intentId' = intent."payload"->>'intentId'
+        WHERE intent."aggregateId" = $2 AND intent."topic" = $5 AND intent."publishedAt" IS NULL
+          AND intent."payload"->>'sessionId' = $2 AND intent."payload"->>'turnId' = $3
+          AND intent."payload"->>'taskId' IN (SELECT "id" FROM ancestors) LIMIT 1`,
+    [payload.toTaskId, payload.sessionId, payload.turnId, lineage.targetRootTaskId, TASK_INTERRUPT_OUTBOX_TOPIC])
+    if (pendingInterrupt.rows.length > 0) {
+      await markOutbox(client, row.id, "mailbox_attempt_stale")
+      return
+    }
   }
   // Session and lineage locks precede the task CAS; the dispatch reset is last.
   await wakeWaitingTask(client, payload, lineage)

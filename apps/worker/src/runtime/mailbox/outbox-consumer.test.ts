@@ -62,6 +62,7 @@ type FakeOptions = {
   taskLeaseExpiresAt?: Date | string | null
   taskHasLiveLease?: boolean
   taskInterruptRequestedAt?: Date | string | null
+  pendingInterrupt?: boolean
   dispatchMissing?: boolean
   dispatchPublishedAt?: Date | null
   dispatchAttemptCount?: number
@@ -163,6 +164,10 @@ class FakeClient {
       }
       this.rollbackState = null
       return { rows: [], rowCount: 0 }
+    }
+    if (sql.includes('WITH RECURSIVE ancestors AS')) {
+      const rows = this.options.pendingInterrupt ? [{ id: "interrupt-intent" } as T] : []
+      return { rows, rowCount: rows.length }
     }
     if (sql.includes('FROM "agent_outbox"') && sql.includes('"publishedAt" IS NULL')) {
       const limit = Number(values[1])
@@ -436,10 +441,29 @@ describe("subagent mailbox outbox consumer", () => {
     expect(fake.client.calls.filter(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toHaveLength(0)
   })
 
+  it("stales a bound message while a user-accepted interrupt for an ancestor is pending", async () => {
+    const fake = fakePool({ taskStatus: "running", taskAttemptCount: 2, taskLeaseOwner: "worker-current", taskHasLiveLease: true,
+      payload: boundPayload, messageKind: "human_follow_up", messageTargetAttemptCount: 2, pendingInterrupt: true })
+    const beforeDispatch = fake.client.dispatch ? { ...fake.client.dispatch } : null
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    const lookup = fake.client.calls.find(call => call.sql.includes("WITH RECURSIVE ancestors AS"))
+    expect(lookup?.sql).toContain('intent."payload"->>\'taskId\' IN (SELECT "id" FROM ancestors)')
+    expect(lookup?.values).toEqual(["task-1", "session-1", "turn-1", "root-1", "agent.subagent.task-interrupt"])
+    expect(fake.client.dispatch).toEqual(beforeDispatch)
+    expect(fake.client.mailboxRows[0]).toMatchObject({ deliveredAt: null, consumedAt: null })
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: "mailbox_attempt_stale" })
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "agent_mailbox_messages"'))).toBe(false)
+    expect(fake.client.calls.some(call => call.sql.includes('SET "publishedAt" = NULL'))).toBe(false)
+  })
+
   it.each([
     ["waiting task", { taskStatus: "waiting" }],
     ["queued task", { taskStatus: "queued" }],
     ["terminal task", { taskStatus: "failed" }],
+    ["terminal root", { taskStatus: "running", taskLeaseOwner: "worker-current", taskHasLiveLease: true, rootStatus: "completed" }],
+    ["terminal Turn", { taskStatus: "running", taskLeaseOwner: "worker-current", taskHasLiveLease: true, turnStatus: "interrupted" }],
     ["missing lease", { taskStatus: "running", taskLeaseOwner: null }],
     ["expired lease", { taskStatus: "running", taskLeaseOwner: "worker-old", taskHasLiveLease: false }],
     ["interrupt request", { taskStatus: "running", taskLeaseOwner: "worker-current", taskHasLiveLease: true, taskInterruptRequestedAt: new Date("2026-09-14T10:00:00.000Z") }],

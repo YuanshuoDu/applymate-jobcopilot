@@ -4,6 +4,8 @@ import { PrismaClient } from "@prisma/client"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 
 import { TaskMessageError, TaskMessageService } from "./task-message-service"
+import { TaskInterruptService } from "./task-interrupt-service"
+import { TASK_INTERRUPT_OUTBOX_TOPIC } from "./task-interrupt-intent"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -136,6 +138,26 @@ describePg("TaskMessageService PostgreSQL durability and rollback", () => {
     expect(await prisma!.agentOutbox.count({ where: { aggregateId: value.sessionId } })).toBe(0)
     expect(await prisma!.agentItem.count({ where: { sessionId: value.sessionId } })).toBe(0)
     expect(await prisma!.agentEvent.count({ where: { sessionId: value.sessionId } })).toBe(0)
+  })
+
+  it("rejects a new follow-up after user interrupt acceptance while its intent is still pending", async () => {
+    const value = await seedScenario()
+    const interrupt = new TaskInterruptService(prisma!)
+    const accepted = await interrupt.interrupt({ ...value, userId: value.userId, clientMessageId: "interrupt-before-follow-up" })
+    expect(accepted.disposition).toBe("accepted")
+    const intent = await prisma!.agentOutbox.findFirst({
+      where: { aggregateId: value.sessionId, topic: TASK_INTERRUPT_OUTBOX_TOPIC, publishedAt: null },
+      select: { payload: true, publishedAt: true },
+    })
+    expect(intent).toMatchObject({ payload: { intentId: accepted.intentId, taskId: value.taskId, turnId: value.turnId }, publishedAt: null })
+
+    const service = new TaskMessageService(prisma!)
+    await expect(service.send({ ...value, userId: value.userId, clientMessageId: "follow-up-after-interrupt", text: "Check the result", expectedAttemptCount: 2 }))
+      .rejects.toMatchObject({ code: "task_follow_up_target_unavailable", status: 409 })
+    expect(await prisma!.agentMailboxMessage.count({ where: { sessionId: value.sessionId } })).toBe(0)
+    expect(await prisma!.agentItem.count({ where: { sessionId: value.sessionId } })).toBe(0)
+    expect(await prisma!.agentEvent.count({ where: { sessionId: value.sessionId, type: "input.accepted" } })).toBe(0)
+    expect(await prisma!.agentOutbox.count({ where: { aggregateId: value.sessionId, topic: "agent.subagent.mailbox" } })).toBe(0)
   })
 
   it("rolls back the mailbox and visible item when accepted-event outbox persistence fails", async () => {
