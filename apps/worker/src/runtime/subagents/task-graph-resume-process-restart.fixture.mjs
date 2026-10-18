@@ -1731,7 +1731,7 @@ async function runSecondWorker() {
         const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: job.source ?? "greenhouse" }]
         const summary = task.goal === sourceGoal ? resultMarker : task.goal === dependentGoal ? dependentGoal : followUpGoal
         const result = task.role === "scout"
-          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
+          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: evidence[0].source, url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
           : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: ids.jobId, score: 8, evidenceIds: [evidence[0].id] }], evidence, summary }
         if (task.goal === followUpGoal) await waitForCommand("complete-follow-up-child")
         yield { type: "text_delta", text: JSON.stringify(result) }
@@ -1878,7 +1878,7 @@ async function runDiscoverySecondWorker() {
         if (task.role !== "scout" && task.role !== "analyst") throw new Error("p3_unexpected_discovery_child_role")
         const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: "greenhouse" }]
         const result = task.role === "scout"
-          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary: "Found the persisted fixture role" }
+          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: evidence[0].source, url: null, evidenceIds: [evidence[0].id] }], evidence, summary: "Found the persisted fixture role" }
           : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: ids.jobId, score: 8.5, evidenceIds: [evidence[0].id] }], evidence, summary: "Scored the persisted fixture role" }
         yield { type: "text_delta", text: JSON.stringify(result) }
         yield { type: "completed", finishReason: "stop" }
