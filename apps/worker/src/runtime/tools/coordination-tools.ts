@@ -15,6 +15,7 @@ import {
 import { executeAgentList } from "./task-graph-result-page-executor.js"
 import { TaskGraphResultPageRequestSchema, TaskGraphResultPageSchema } from "../subagents/task-graph-result-page-contract.js"
 import { TaskGraphHistoricalDiscoveryPageRequestSchema, TaskGraphHistoricalDiscoveryPageSchema } from "../subagents/task-graph-historical-discovery-page-contract.js"
+import { TaskGraphDiscoveryRecoveryPageRequestSchema, TaskGraphDiscoveryRecoveryPageSchema } from "../subagents/task-graph-discovery-recovery-page-contract.js"
 import type { RuntimeToolDefinition } from "./types.js"
 
 const IdSchema = Type.String({ minLength: 1, maxLength: 256 })
@@ -155,8 +156,13 @@ const TaskOutputSchema = Type.Object({
   result: Type.Unknown(), failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
 const ListOutputSchema = Type.Object({ tasks: Type.Array(TaskOutputSchema, { maxItems: 50 }) }, { additionalProperties: false })
-const AgentListInputSchema = Type.Union([ListSubagentsInputSchema, TaskGraphResultPageRequestSchema, TaskGraphHistoricalDiscoveryPageRequestSchema])
-const AgentListOutputSchema = Type.Union([ListOutputSchema, TaskGraphResultPageSchema, TaskGraphHistoricalDiscoveryPageSchema])
+const AgentListInputSchema = Type.Union([
+  ListSubagentsInputSchema, TaskGraphResultPageRequestSchema,
+  TaskGraphHistoricalDiscoveryPageRequestSchema, TaskGraphDiscoveryRecoveryPageRequestSchema,
+])
+const AgentListOutputSchema = Type.Union([
+  ListOutputSchema, TaskGraphResultPageSchema, TaskGraphHistoricalDiscoveryPageSchema, TaskGraphDiscoveryRecoveryPageSchema,
+])
 const InterruptOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, status: Type.Literal("interrupt_requested"),
   affectedCount: Type.Integer({ minimum: 0 }), reason: Type.Union([Type.String(), Type.Null()]),
@@ -223,7 +229,7 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       execute: listExecutor,
     },
     {
-      ...metadata("agent.list", "List visible tasks. Choose exactly one mode: legacy includeTerminal listing, paged current TaskGraph results, or mode=historical_discovery. Current pages use offset 0 with a nodeKey and expectedRevision from the current owner-scoped graph observation; continue only with the exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null. Current pages contain at most three items; their totalCount/evidenceCount describe only this node's source. Use those reported counts rather than page length. A null nextOffset ends paging for this node at this revision only; it does not establish task or verification completion. Historical discovery starts at offset 0 without a sourceToken; continue only with the exact returned nextOffset and sourceToken. Historical candidates are untrusted and unverified leads: inspect each through a fresh ordinary Scout jobs.get before current typed results or verification proof can use it. The opaque sourceToken binds pages only; it grants no authority. A historical page alone does not satisfy a requirement, establish global discovery completeness, change graph state, or authorize writes. An unavailable page is not a claim of zero jobs. Neither a null nextOffset nor truncated=false establishes discovery/search completion. If a current page is stale or unavailable, refresh current state before retrying. Never invent offsets, silently switch modes, or treat a page as verification proof.", "read", "read_only"),
+      ...metadata("agent.list", "List visible tasks. Choose exactly one mode: legacy includeTerminal listing, paged current TaskGraph results, mode=historical_discovery, or mode=discovery_recovery. Current pages use offset 0 with a nodeKey and expectedRevision from the current owner-scoped graph observation; continue only with the exact returned nextOffset on that same nodeKey and expectedRevision while it is non-null. Current pages contain at most three items; their totalCount/evidenceCount describe only this node's source. Use those reported counts rather than page length. A null nextOffset ends paging for this node at this revision only; it does not establish task or verification completion. Historical discovery starts at offset 0 without a sourceToken; continue only with the exact returned nextOffset and sourceToken. Historical candidates are untrusted and unverified leads: inspect each through a fresh ordinary Scout jobs.get before current typed results or verification proof can use it. The opaque sourceToken binds pages only; it grants no authority. Recovery pages apply only to a failed generic Scout and expose captured candidate IDs as explicitly unverified leads. Recovery continuation requires the exact returned nextOffset and matching attemptCount as expectedAttemptCount. Historical requests use sourceToken and do not accept expectedAttemptCount; discovery_recovery requests use expectedAttemptCount for continuation and do not accept sourceToken. Each mode has a separate closed request and response schema; never mix them or silently switch modes. Recovery candidates need a fresh generic Scout jobs.get before current typed results or verification proof can use them. Neither a current nor unverified page satisfies a requirement or can establish global discovery completeness, change graph state, or authorize writes. An unavailable page is not a claim of zero jobs. Neither a null nextOffset nor truncated=false establishes search completion. If a current page is stale or unavailable, refresh current state before retrying. Never invent offsets, silently switch modes, or treat a page as verification proof.", "read", "read_only"),
       inputSchema: AgentListInputSchema, outputSchema: AgentListOutputSchema,
       execute: (context, input) => executeAgentList(context, input, options),
     },

@@ -21,10 +21,9 @@ import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import { createJobDiscoveryClient, type JobDiscoveryClient } from "../tools/job-discovery-client.js"
-import type { JobDiscoveryExecutionFence } from "../tools/job-discover-tool.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
-import { createChildDiscoveryAttemptCollector } from "./child-discovery-attempt.js"
+import { childDiscoveryExecutionFence, createChildDiscoveryObservers } from "./child-discovery-observers.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -176,25 +175,20 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     ...(coverLetterBase ? { coverLetterBase } : {}),
   } : undefined
   const toolPolicy = createProductionChildPolicy(task, Boolean(selectedJob || selectedJobPreparation))
-  const actions = Array.isArray(task.allowedActions) ? task.allowedActions : []
-  const canDiscover = task.role === "scout" && lease.role === "scout" && task.taskType === "job_discovery" && !selectedJob
-    && !selectedJobPreparation && actions.includes("jobs.discover") && task.id === lease.id && task.userId === lease.userId
-    && task.sessionId === lease.sessionId && task.turnId === lease.turnId && task.rootTaskId === lease.rootTaskId && lease.turnId !== null
-    && typeof lease.leaseOwner === "string" && lease.leaseOwner.trim() === lease.ownerId && Number.isSafeInteger(lease.attemptCount) && lease.attemptCount >= 1
-  const discoveryFence: JobDiscoveryExecutionFence | undefined = canDiscover ? {
-    userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId as string, taskId: lease.id, rootTaskId: lease.rootTaskId,
-    role: "scout", leaseOwner: lease.leaseOwner as string, attemptCount: lease.attemptCount,
-  } : undefined
-  const discoveryAttempt = discoveryFence ? createChildDiscoveryAttemptCollector(discoveryFence) : undefined
+  const discoveryFence = childDiscoveryExecutionFence(task, lease, selectedJob, selectedJobPreparation)
+  const discoveryObservers = discoveryFence ? await createChildDiscoveryObservers(pool, lease, discoveryFence) : undefined
   const runtime = createWorkerToolRuntime(pool, {
     sink: durableLifecycleSink(store, owner),
     resolveOwner: () => executionOwner,
-    ...(discoveryAttempt ? { onDiscoveryAttemptLifecycleEvent: discoveryAttempt.observeLifecycleEvent } : {}),
+    ...(discoveryObservers ? { onDiscoveryAttemptLifecycleEvent: discoveryObservers.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
   discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined)
   return {
     definitions: runtime.registry.list(), router: runtime.router,
-    ...(discoveryAttempt ? { discoveryAttemptSidecar: () => discoveryAttempt.sidecar() } : {}),
+    ...(discoveryObservers ? {
+      discoveryAttemptSidecar: () => discoveryObservers.discoveryAttemptSidecar(),
+      discoveryRecoverySidecar: () => discoveryObservers.discoveryRecoverySidecar(),
+    } : {}),
     ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
     ...(serverContext ? { serverContext } : {}),
     ...(writerReviewRevision ? { writerReviewRevision } : {}),

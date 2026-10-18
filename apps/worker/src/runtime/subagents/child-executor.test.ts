@@ -903,6 +903,12 @@ describe("child executor composition", () => {
       candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
     } as const
     const sidecar = { attemptCount: 2, health }
+    const recovery = {
+      schemaVersion: "agent-harness.v2.task-graph.discovery-recovery.v1",
+      attemptCount: 2,
+      jobIds: ["c123456789012345678901234"],
+      truncated: false,
+    } as const
     const discoverTool = {
       ...tool("jobs.discover", "jobs"), risk: "internal_write" as const,
       capabilities: ["read", "write"] as const, requiredCapabilities: ["read"] as const,
@@ -926,21 +932,39 @@ describe("child executor composition", () => {
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => readSequenceModel("not-json", ["jobs.discover"]),
-      toolRuntimeFactory: () => ({ ...runtime, discoveryAttemptSidecar: () => sidecar }),
+      toolRuntimeFactory: () => ({ ...runtime, discoveryAttemptSidecar: () => sidecar, discoveryRecoverySidecar: () => recovery }),
     })
 
     const failedScout = await executor({ lease: ordinaryScout })
     expect(failedScout).toMatchObject({
       status: "failed", failureReason: "invalid_structured_result",
-      result: { status: "failed", discoveryAttempt: sidecar, structuredOutputFailureCategory: "result_shape_invalid" },
+      result: { status: "failed", discoveryAttempt: sidecar, discoveryRecovery: recovery, structuredOutputFailureCategory: "result_shape_invalid" },
     })
     expect(failedScout.result).not.toHaveProperty("structuredResult")
     expect(failedScout.result).not.toHaveProperty("discoveryAttemptHealth")
 
     const genericScout = await executor({ lease: { ...ordinaryScout, taskType: "research" } })
     expect(genericScout.result).not.toHaveProperty("discoveryAttempt")
+    expect(genericScout.result).not.toHaveProperty("discoveryRecovery")
     const analyst = await executor({ lease: { ...ordinaryScout, role: "analyst", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" } } })
     expect(analyst.result).not.toHaveProperty("discoveryAttempt")
+    expect(analyst.result).not.toHaveProperty("discoveryRecovery")
+    const selectedScout = await executor({ lease: { ...ordinaryScout, context: { selectedJobPreparation: {} } } })
+    expect(selectedScout.result).not.toHaveProperty("discoveryRecovery")
+
+    const completedText = JSON.stringify({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId: discoveredJob.id, source: "greenhouse", url: discoveredJob.url, evidenceIds: ["evidence-1"] }],
+      evidence: [{ id: "evidence-1", kind: "job", ref: discoveredJob.id, source: "greenhouse" }], summary: "One observed role",
+    })
+    const successfulExecutor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => readSequenceModel(completedText, ["jobs.discover"]),
+      toolRuntimeFactory: () => ({ ...runtime, discoveryAttemptSidecar: () => sidecar, discoveryRecoverySidecar: () => recovery }),
+    })
+    const completedScout = await successfulExecutor({ lease: ordinaryScout })
+    expect(completedScout.status).toBe("completed")
+    expect(completedScout.result).toHaveProperty("discoveryRecovery", recovery)
   })
 
   it("fails closed before parsing oversized structured output", async () => {
