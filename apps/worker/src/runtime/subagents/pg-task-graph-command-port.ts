@@ -1,5 +1,5 @@
 import type { PoolClient } from "pg"
-import { parseRegisteredScoutEnvelope, type RegisteredScoutEnvelope, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
+import { parseRegisteredScoutEnvelope, type RegisteredScoutEnvelope, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphExecutionScope, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { TaskGraphCommandError } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { actionList, transaction, type Queryable } from "./pg-store-persistence.js"
@@ -15,7 +15,9 @@ import { assertPlanningRootHasNoUnresolvedSteering } from "./pg-store-create.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
 import type { TaskGraphResultPageRequest } from "./task-graph-result-page-contract.js"
+import type { TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
+import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-history-result-page-store.js"
 import { BudgetExceededError } from "../budget.js"
 import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 
@@ -23,6 +25,7 @@ const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
 
 export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCommandPort {
+  const historicalDiscoveryPageStore = createPgRootTaskHistoryResultPageStore(pool)
   return {
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
       return transaction(pool, client => schedule(client, input))
@@ -68,6 +71,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     },
     async readCurrentResultPage(scope, request) {
       return transaction(pool, client => readCurrentResultPageWithClient(client, scope, request))
+    },
+    async readHistoricalDiscoveryPage(scope: TaskGraphExecutionScope, request: TaskGraphHistoricalDiscoveryPageRequest) {
+      return historicalDiscoveryPageStore.read(scope, request)
     },
     readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
   }

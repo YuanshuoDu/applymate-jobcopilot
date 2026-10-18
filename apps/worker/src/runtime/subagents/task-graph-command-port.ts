@@ -17,6 +17,7 @@ import type { RootTaskVerificationRequirementsResolution } from "../context/root
 import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-category.js"
 import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-structured-failure-category.js"
 import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
+import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -220,4 +221,6 @@ export type TaskGraphCommandPort = Readonly<{
   readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads one bounded advisory page from the current owner-fenced graph. */
   readCurrentResultPage?(scope: TaskGraphReadScope, request: TaskGraphResultPageRequest): Promise<TaskGraphResultPage>
+  /** Reads unverified Scout IDs only from a reselected same-session prior Root. */
+  readHistoricalDiscoveryPage?(scope: TaskGraphExecutionScope, request: TaskGraphHistoricalDiscoveryPageRequest): Promise<TaskGraphHistoricalDiscoveryPage>
 }>
