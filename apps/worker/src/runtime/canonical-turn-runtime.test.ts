@@ -62,6 +62,7 @@ import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagen
 import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
 import { projectTaskGraphResultPage } from "./subagents/task-graph-result-page.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
+import { evaluateTaskGraphObjectiveCoverage } from "./planning/task-graph-objective-coverage.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -512,7 +513,7 @@ async function taskGraphRootSurface(
   }))
   const taskGraphCommandPort = {
     appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
-    appendAndScheduleWithReconciliation: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    appendAndScheduleWithReconciliation: vi.fn(async (_input: TaskGraphScheduleInput) => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
     readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
   }
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
@@ -2495,6 +2496,18 @@ describe("createCanonicalTurnRuntime", () => {
       const plan = surface.registeredTools.find(tool => tool.name === "agent.plan")
       if (planningEnabled) {
         expect(plan).toBeDefined()
+        // This fake models the locked port's refusal only; transactional ordering/no-write proof lives in the PG create tests.
+        surface.taskGraphCommandPort.appendAndScheduleWithReconciliation.mockImplementationOnce(async input => {
+          const coverage = evaluateTaskGraphObjectiveCoverage(
+            input.verificationRequirements ?? { status: "absent" }, input.proposal.nodes, input.templates, input.scope.rootTaskId,
+          )
+          if (coverage.status === "incomplete") {
+            throw Object.assign(new Error("TaskGraph plan does not cover the canonical objective requirements"), {
+              code: "task_graph_objective_coverage_incomplete", requirements: coverage.requirements,
+            })
+          }
+          return { status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }
+        })
         await expect(plan!.execute(planContext, {
           ...undercoveredProposal,
           verificationRequirements: { status: "absent" },
@@ -2505,7 +2518,10 @@ describe("createCanonicalTurnRuntime", () => {
             { id: "candidate-total", kind: "candidate_count_gte", role: "scout", minimum: 2 },
           ] },
         })
-        expect(surface.taskGraphCommandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+        expect(surface.taskGraphCommandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+        expect(surface.taskGraphCommandPort.appendAndScheduleWithReconciliation.mock.calls[0]?.[0]?.verificationRequirements).toEqual({
+          status: "valid", requirements: [{ id: "candidate-total", kind: "candidate_count_gte", minimum: 2 }],
+        })
         expect(surface.taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
       } else {
         expect(plan).toBeUndefined()

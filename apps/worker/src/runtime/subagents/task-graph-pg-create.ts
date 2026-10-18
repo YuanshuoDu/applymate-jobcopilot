@@ -13,6 +13,7 @@ import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGr
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
+import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 
@@ -106,6 +107,10 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
   await validateRepairTargets(client, input, current, priorTaskIds)
+  const coverage = evaluateTaskGraphObjectiveCoverage(input.verificationRequirements ?? { status: "absent" }, appended.state.nodes, input.templates, input.scope.rootTaskId)
+  if (coverage.status === "incomplete") throw Object.assign(new Error("TaskGraph plan does not cover the canonical objective requirements"), {
+    code: "task_graph_objective_coverage_incomplete", requirements: coverage.requirements,
+  })
   const readyDependencyKeys = [...new Set(input.proposal.nodes.flatMap(node => preflightStatuses.get(node.key) === "queued" ? node.dependsOn : []))]
   const completedDependencies = new Map((await loadTaskGraphDependencyResults(client, input.scope, readyDependencyKeys, snapshot.nodes)).map(item => [item.key, item] as const))
   const satisfiedDependencies = new Set<string>()

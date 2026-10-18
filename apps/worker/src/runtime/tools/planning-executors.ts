@@ -3,7 +3,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
-import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
+import type { TaskGraphObjectiveCoverageRejection } from "../planning/task-graph-objective-coverage.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import type {
   TaskGraphCommandPort,
@@ -130,7 +130,29 @@ function scheduleErrorCode(error: unknown): string {
   return "task_graph_schedule_failed"
 }
 
-function safeScheduleError(error: unknown, code: string): Readonly<{ code: string; currentRevision?: number }> {
+function safeCoverageRequirements(value: unknown): readonly TaskGraphObjectiveCoverageRejection[] | undefined {
+  if (!Array.isArray(value) || value.length < 1 || value.length > TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria) return undefined
+  const safe: TaskGraphObjectiveCoverageRejection[] = []
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return undefined
+    const row = item as Record<string, unknown>
+    const kind = row.kind
+    const role = kind === "candidate_count_gte" ? "scout" : kind === "finding_count_gte" ? "analyst" : undefined
+    if (!role || Object.keys(row).sort().join(",") !== "id,kind,minimum,role" || typeof row.id !== "string"
+      || !/^[a-z][a-z0-9._-]{0,63}$/.test(row.id) || row.role !== role
+      || !Number.isSafeInteger(row.minimum) || typeof row.minimum !== "number" || row.minimum < 1
+      || row.minimum > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return undefined
+    safe.push({ id: row.id, kind: kind as TaskGraphObjectiveCoverageRejection["kind"], role, minimum: row.minimum })
+  }
+  return safe
+}
+
+function safeScheduleError(error: unknown, code: string): Readonly<{ code: string; currentRevision?: number; requirements?: readonly TaskGraphObjectiveCoverageRejection[] }> {
+  if (code === "task_graph_objective_coverage_incomplete") {
+    const requirements = error && typeof error === "object" && "requirements" in error
+      ? safeCoverageRequirements(error.requirements) : undefined
+    return requirements ? { code, requirements } : { code }
+  }
   if (code !== "revision_mismatch" && code !== "task_graph_revision_mismatch") return { code }
   if (!error || typeof error !== "object" || !("currentRevision" in error)) return { code }
   const currentRevision = error.currentRevision
@@ -183,13 +205,6 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
         }
       }),
     }
-    const coverage = evaluateTaskGraphObjectiveCoverage(options.verificationRequirements ?? { status: "absent" }, proposal, options.templates)
-    if (coverage.status === "incomplete") {
-      const code = "task_graph_objective_coverage_incomplete"
-      throw new ToolExecutionError(code, "TaskGraph plan does not cover the canonical objective requirements", {
-        code, requirements: coverage.requirements,
-      })
-    }
     try {
       if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {
         throw new ToolExecutionError("steering_reconciliation_unavailable", "TaskGraph revision requires an atomic reconciliation-capable port")
@@ -198,6 +213,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
         scope,
         proposal,
         templates: options.templates,
+        verificationRequirements: options.verificationRequirements ?? { status: "absent" },
       }, operation)
       return receipt
     } catch (error: unknown) {
