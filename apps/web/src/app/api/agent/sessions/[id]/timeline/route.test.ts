@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
+const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -10,7 +10,7 @@ vi.mock("@/lib/api-helpers", () => ({
 
 vi.mock("@/lib/db", () => ({ db: {
   agentSession: { findFirst: mocks.sessionFindFirst },
-  agentItem: { findMany: mocks.itemFindMany },
+  agentItem: { findFirst: mocks.itemFindFirst, findMany: mocks.itemFindMany },
   agentEvent: { findMany: mocks.agendaFindMany },
 } }))
 
@@ -93,10 +93,12 @@ describe("agent timeline query API", () => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.sessionFindFirst.mockReset()
+    mocks.itemFindFirst.mockReset()
     mocks.itemFindMany.mockReset()
     mocks.agendaFindMany.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
+    mocks.itemFindFirst.mockResolvedValue(null)
     mocks.itemFindMany.mockResolvedValue([])
     mocks.agendaFindMany.mockResolvedValue([])
   })
@@ -141,6 +143,70 @@ describe("agent timeline query API", () => {
     const body = await response.json()
     expect(body.items[0].content).toEqual({ title: "Resume", data: { accessToken: "[REDACTED]", resumeContent: "[REDACTED]" } })
     expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
+  })
+
+  it("returns one owner-scoped safe final DTO without paging or tail scans", async () => {
+    const final = {
+      ...item("turn:turn_1:item:final:step_1", 1), phase: "final_answer",
+      content: { text: "Answer text unchanged", final: { summary: "Two verified points.", evidence: "PRIVATE_EVIDENCE", usage: { tokens: 42 } } },
+    }
+    mocks.itemFindFirst.mockResolvedValueOnce(final)
+    const { GET } = await import("./route")
+
+    const response = await GET(request(`?itemId=${encodeURIComponent(final.id)}`) as never, params)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body).toEqual({ items: [{
+      schemaVersion: "agent-harness.v2", id: final.id, sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 0,
+      content: { text: "Answer text unchanged", summary: "Two verified points." },
+      startedAt: null, completedAt: final.completedAt.toISOString(), createdAt: final.createdAt.toISOString(), updatedAt: final.updatedAt.toISOString(),
+    }], page: { hasMore: false, nextCursor: null } })
+    expect(JSON.stringify(body)).not.toContain("PRIVATE_EVIDENCE")
+    expect(JSON.stringify(body)).not.toContain('"tokens"')
+    expect(mocks.sessionFindFirst).toHaveBeenCalledBefore(mocks.itemFindFirst)
+    expect(mocks.itemFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: final.id, sessionId: "session_1" },
+      select: expect.objectContaining({ id: true, sessionId: true, turnId: true, type: true, content: true }),
+    }))
+    expect(mocks.itemFindMany).not.toHaveBeenCalled()
+    expect(mocks.agendaFindMany).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["empty", "?itemId="],
+    ["duplicate", "?itemId=first&itemId=second"],
+    ["cursor mixed in", "?itemId=first&cursor=eyJ4IjoxfQ"],
+    ["limit mixed in", "?itemId=first&limit=1"],
+    ["unrelated query key", "?itemId=first&extra=1"],
+    ["control character", "?itemId=%00"],
+  ])("rejects an %s direct item target after the owner check", async (_name, path) => {
+    const { GET } = await import("./route")
+    const response = await GET(request(path) as never, params)
+
+    expect(response.status).toBe(400)
+    expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
+    expect(mocks.itemFindFirst).not.toHaveBeenCalled()
+    expect(mocks.itemFindMany).not.toHaveBeenCalled()
+    expect(mocks.agendaFindMany).not.toHaveBeenCalled()
+  })
+
+  it("keeps foreign session and missing or cross-session items indistinguishable as not found", async () => {
+    const { GET } = await import("./route")
+    mocks.sessionFindFirst.mockResolvedValueOnce(null)
+    const foreignSession = await GET(request("?itemId=item_1") as never, params)
+    expect(foreignSession.status).toBe(404)
+    expect(mocks.itemFindFirst).not.toHaveBeenCalled()
+
+    mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
+    mocks.itemFindFirst.mockResolvedValueOnce(null)
+    const missingItem = await GET(request("?itemId=item_1") as never, params)
+    expect(missingItem.status).toBe(404)
+    expect(await missingItem.json()).toMatchObject({ error: { code: "timeline_item_not_found" } })
+    expect(mocks.itemFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { id: "item_1", sessionId: "session_1" } }))
+    expect(mocks.itemFindMany).not.toHaveBeenCalled()
+    expect(mocks.agendaFindMany).not.toHaveBeenCalled()
   })
 
   it("omits private reconciliation receipt rows from timeline projections", async () => {
@@ -282,5 +348,14 @@ describe("agent timeline query API", () => {
     const response = await GET(request() as never, params)
     expect(response.status).toBe(401)
     expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
+  })
+
+  it("does not query target items when authentication fails", async () => {
+    mocks.requireAuth.mockResolvedValueOnce(Response.json({ error: "Unauthorized" }, { status: 401 }))
+    const { GET } = await import("./route")
+    const response = await GET(request("?itemId=item_1") as never, params)
+    expect(response.status).toBe(401)
+    expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
+    expect(mocks.itemFindFirst).not.toHaveBeenCalled()
   })
 })

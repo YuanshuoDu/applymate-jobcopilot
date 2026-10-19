@@ -43,11 +43,29 @@ const AGENDA_SELECT = {
 } as const
 
 const APPROVAL_LEDGER_QUERY_LIMIT = APPROVAL_LEDGER_MAX_EVENTS * 4
+const ITEM_QUERY_SELECT = {
+  id: true, sessionId: true, turnId: true, stepId: true, taskId: true, type: true, status: true,
+  phase: true, revision: true, content: true, startedAt: true, completedAt: true, createdAt: true, updatedAt: true,
+} as const
 
 export async function GET(request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(request)
   if (isErrorResponse(auth)) return auth
   const { id: sessionId } = await context.params
+  const query = new URL(request.url).searchParams
+  const itemIds = query.getAll("itemId")
+  if (itemIds.length > 0) {
+    const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
+    if (!session) return sessionNotFound()
+    const itemId = itemIds[0]
+    const directKeys = [...query.keys()]
+    if (itemIds.length !== 1 || directKeys.length !== 1 || directKeys[0] !== "itemId" || !safeTimelineId(itemId)) {
+      return Response.json({ error: { code: "invalid_item_id", message: "itemId must be the only query parameter and a single safe timeline item", details: {} } }, { status: 400 })
+    }
+    const row = await db.agentItem.findFirst({ where: { id: itemId, sessionId }, select: ITEM_QUERY_SELECT })
+    if (!row) return Response.json({ error: { code: "timeline_item_not_found", message: "Timeline item not found", details: {} } }, { status: 404 })
+    return ok({ items: [itemDto(row as ItemQueryRow)], page: { hasMore: false, nextCursor: null } })
+  }
   const page = parsePageRequest(request, "timeline", sessionId)
   if (page instanceof Response) return page
 
@@ -58,10 +76,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
     where: { sessionId, ...afterCursor(page.cursor) },
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     take: page.limit + 1,
-    select: {
-      id: true, sessionId: true, turnId: true, stepId: true, taskId: true, type: true, status: true,
-      phase: true, revision: true, content: true, startedAt: true, completedAt: true, createdAt: true, updatedAt: true,
-    },
+    select: ITEM_QUERY_SELECT,
   })
   const result = pageResult(rows as ItemQueryRow[], page, "timeline", sessionId)
   const agendas = page.cursor === null ? await recentAgendas(sessionId) : []
@@ -170,4 +185,8 @@ function agendaEnvelope(row: AgendaQueryRow, sessionId: string) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function safeTimelineId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)
 }
