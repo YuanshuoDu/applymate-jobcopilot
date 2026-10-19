@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   handler: undefined as undefined | ((job: { data: unknown; id?: string; attemptsMade?: number; opts?: { attempts?: number } }) => Promise<unknown>),
   canonical: vi.fn(),
+  pinMode: vi.fn(),
   producer: { enqueue: vi.fn(), close: vi.fn() },
   createProducer: vi.fn(),
   workerClose: vi.fn(),
@@ -37,6 +38,7 @@ vi.mock("bullmq", () => ({
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }));
 vi.mock("./agent-run-turn-executor.js", () => ({ runCanonicalAgentTurn: mocks.canonical }));
 vi.mock("./agent-run-canonical-dispatch.js", () => ({ createAgentRunCanonicalProducer: mocks.createProducer }));
+vi.mock("./agent-run-mode.js", () => ({ pinAgentRunMode: mocks.pinMode }));
 vi.mock("./agent-execution-dispatch-recovery.js", () => ({
   AGENT_EXECUTION_DISPATCH_POLL_MS: 1_000,
   dispatchPendingAgentExecutionOutbox: mocks.dispatchPending,
@@ -60,6 +62,8 @@ describe("agent-run queue", () => {
     vi.resetModules();
     mocks.handler = undefined;
     mocks.canonical.mockReset();
+    mocks.pinMode.mockReset().mockImplementation(async (_pool, _identity, canonicalEnabled: boolean) =>
+      canonicalEnabled ? "canonical_task_graph" : "legacy_pipeline_adapter");
     mocks.producer.enqueue.mockReset();
     mocks.producer.close.mockReset();
     mocks.createProducer.mockReset().mockReturnValue(mocks.producer);
@@ -82,6 +86,7 @@ describe("agent-run queue", () => {
     await import("./agent-run-queue.js");
     await mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1" } });
 
+    expect(mocks.pinMode).not.toHaveBeenCalled();
     expect(fetch).toHaveBeenCalledWith("https://app.applymate.test/api/internal/agent-run", expect.objectContaining({
       method: "POST",
       headers: expect.objectContaining({ "x-agent-worker-secret": "worker-secret" }),
@@ -300,7 +305,7 @@ describe("agent-run queue", () => {
     expect(values[5]).toBe(3);
   });
 
-  it("uses the existing pipeline adapter as an explicit gate-off rollback", async () => {
+  it("pins and uses the legacy pipeline adapter when the first-turn gate is off", async () => {
     mocks.canonical.mockResolvedValue({ status: "completed", summary: "pipeline complete" });
     await import("./agent-run-queue.js");
 
@@ -310,6 +315,9 @@ describe("agent-run queue", () => {
       expect.objectContaining({ data: expect.objectContaining({ turnId: "turn_1", executionId: "execution_1" }) }),
       expect.anything(),
     );
+    expect(mocks.pinMode).toHaveBeenCalledWith(expect.anything(), {
+      userId: "user_1", sessionId: "session_1", turnId: "turn_1",
+    }, false);
     expect(mocks.producer.enqueue).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -323,6 +331,9 @@ describe("agent-run queue", () => {
     expect(mocks.producer.enqueue).toHaveBeenCalledTimes(1);
     expect(mocks.producer.enqueue).toHaveBeenCalledWith({ sessionId: "session_1", turnId: "turn_1" });
     expect(mocks.producer.enqueue.mock.calls[0]?.[0]).not.toHaveProperty("executionId");
+    expect(mocks.pinMode).toHaveBeenCalledWith(expect.anything(), {
+      userId: "user_1", sessionId: "session_1", turnId: "turn_1",
+    }, true);
     expect(mocks.canonical).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -401,6 +412,29 @@ describe("agent-run queue", () => {
       .rejects.toThrow("outbox unavailable");
     expect(mocks.canonical).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps a canonical pin after the global flag flips off", async () => {
+    vi.stubEnv("ENABLE_AGENT_CANONICAL_AUTOMATION", "0");
+    mocks.pinMode.mockResolvedValueOnce("canonical_task_graph");
+    await import("./agent-run-queue.js");
+
+    await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1", turnId: "turn_1" } }))
+      .resolves.toEqual({ status: "routed", queue: "agent-turns", turnId: "turn_1" });
+    expect(mocks.producer.enqueue).toHaveBeenCalledOnce();
+    expect(mocks.canonical).not.toHaveBeenCalled();
+  });
+
+  it("keeps a legacy pin after the global flag flips on", async () => {
+    vi.stubEnv("ENABLE_AGENT_CANONICAL_AUTOMATION", "1");
+    mocks.pinMode.mockResolvedValueOnce("legacy_pipeline_adapter");
+    mocks.canonical.mockResolvedValueOnce({ status: "completed" });
+    await import("./agent-run-queue.js");
+
+    await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1", turnId: "turn_1" } }))
+      .resolves.toEqual({ status: "completed" });
+    expect(mocks.canonical).toHaveBeenCalledOnce();
+    expect(mocks.producer.enqueue).not.toHaveBeenCalled();
   });
 
   it("closes the canonical producer and legacy resources during shutdown", async () => {

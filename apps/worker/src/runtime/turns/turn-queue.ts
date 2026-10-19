@@ -68,6 +68,8 @@ export interface TurnQueueLike extends TurnDispatchQueue {
 export interface RunTurnJobOptions {
   pool: LeasePool
   execute: TurnExecutor
+  /** Enforce the canonical runner fence for jobs read from agent-turns. */
+  requireCanonicalAutomationMode?: boolean
   active?: TurnExecutionRegistry
   /** Optional process-local root shared with TurnCancelService. */
   interrupts?: RootAbortControllerRegistry
@@ -111,6 +113,7 @@ export async function runTurnJob(
     await recordTurnDlq(options.pool, job.data, job.attemptsMade + 1, "schema_invalid_payload", error)
     return { status: "dead_lettered", reasonCode: "schema_invalid_payload" }
   }
+  if (options.requireCanonicalAutomationMode) await assertCanonicalAutomationMode(options.pool, payload)
   const pollIntervalMs = interruptPollInterval(options.interruptPollMs)
 
   let lease: TurnLease
@@ -202,6 +205,29 @@ export async function runTurnJob(
   }
 }
 
+async function assertCanonicalAutomationMode(pool: LeasePool, payload: TurnJobPayload): Promise<void> {
+  const client = await pool.connect()
+  try {
+    const result = await client.query<{ source: string; executionMode: string | null }>(
+      `SELECT turn."source", turn."executionMode"
+       FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session
+         ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2`,
+      [payload.turnId, payload.sessionId],
+    )
+    const row = result.rows[0]
+    if (row?.source === "automation" && row.executionMode !== "canonical_task_graph") {
+      const error = new Error("Canonical Turn queue rejected an automation Turn without a canonical execution pin")
+      error.name = "AgentRunModeQueueError"
+      Object.assign(error, { code: "automation_mode_not_canonical" })
+      throw error
+    }
+  } finally {
+    client.release()
+  }
+}
+
 export async function enqueueTurn(
   pool: LeasePool,
   queue: TurnDispatchQueue,
@@ -231,6 +257,7 @@ export function createTurnQueue(options: {
     (job) => runTurnJob(job, {
       pool: options.pool,
       execute: options.execute,
+      requireCanonicalAutomationMode: true,
       waitHandoff: options.waitHandoff,
       active,
       interrupts: options.interrupts,
