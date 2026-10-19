@@ -74,7 +74,10 @@ describeWithPostgres("AgentRun mode pin on disposable PostgreSQL", () => {
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "type" text NOT NULL, "content" jsonb NOT NULL
       )`,
     ]
-    for (const statement of ddl) await admin!.query(statement)
+    const ddlClient = await testPool.connect()
+    try {
+      for (const statement of ddl) await ddlClient.query(statement)
+    } finally { ddlClient.release() }
     await testPool.connect().then(async client => {
       try {
         await client.query(`INSERT INTO "agent_sessions" ("id", "userId") VALUES ('session-1', 'user-1')`)
