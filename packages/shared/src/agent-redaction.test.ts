@@ -334,6 +334,42 @@ describe("agent event redaction", () => {
       expect(unrelated.messageId).toBe("[REDACTED]")
     }
 
+    const phoneShapedTaskId = "00004912-9422-5000-8000-000000000002"
+    const fullEnvelopePayload = { ...payload, item: { ...payload.item, taskId: phoneShapedTaskId } }
+    const fullEnvelope = {
+      schemaVersion: "agent-harness.v2",
+      id: "00004912-9422-5000-8000-000000000003",
+      sessionId,
+      turnId,
+      itemId,
+      taskId: phoneShapedTaskId,
+      type: "input.accepted",
+      actor: "user",
+      correlationId: turnId,
+      causationId: null,
+      idempotencyKey: "input.accepted:client-once",
+      sequence: 1,
+      payload: fullEnvelopePayload,
+      createdAt: "2026-10-06T17:30:00.000Z",
+    }
+    const fullEnvelopeResult = redactAgentEvent({ type: "input.accepted", body: "Call 4912-9422.", data: fullEnvelope })
+    const safeFullEnvelope = fullEnvelopeResult.data as {
+      taskId: string
+      payload: { messageId: string; item: { taskId: string; content: unknown } }
+    }
+    expect(fullEnvelopeResult.body).toBe("Call [REDACTED_PHONE].")
+    expect(safeFullEnvelope.taskId).toBe(phoneShapedTaskId)
+    expect(safeFullEnvelope.payload.messageId).toBe(messageId)
+    expect(safeFullEnvelope.payload.item.content).toBe("[REDACTED]")
+    expect(safeFullEnvelope.payload.item.taskId).toBe(phoneShapedTaskId)
+
+    const invalidFullEnvelope = redactAgentEvent({
+      type: "input.accepted",
+      body: "",
+      data: { ...fullEnvelope, payload: { ...fullEnvelopePayload, delivery: "other" } },
+    }).data as { payload: { item: { taskId: string } } }
+    expect(JSON.stringify(invalidFullEnvelope)).not.toContain(phoneShapedTaskId)
+
     const unboundStepId = redactAgentEvent({ type: "task.updated", body: "", data: { stepId: itemId } }).data as { stepId: string }
     expect(unboundStepId.stepId).toBe("[REDACTED]")
   })
