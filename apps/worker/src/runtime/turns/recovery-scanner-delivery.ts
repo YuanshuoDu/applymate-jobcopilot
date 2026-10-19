@@ -29,6 +29,19 @@ export async function dispatchPendingTurnOutbox(
          ON session."id" = dispatch."aggregateId"
         AND ${RUNNABLE_SESSION}
        WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM "agent_turns" AS heldTurn
+           JOIN "agent_sessions" AS heldSession
+             ON heldSession."id" = heldTurn."sessionId"
+            AND heldSession."userId" = heldTurn."userId"
+           WHERE heldTurn."id" = dispatch."payload"->>'turnId'
+             AND heldTurn."sessionId" = dispatch."payload"->>'sessionId'
+             AND heldSession."id" = dispatch."aggregateId"
+             AND heldTurn."source" = 'automation'
+             AND (heldTurn."executionMode" IS NULL
+               OR heldTurn."executionMode" = 'legacy_pipeline_adapter')
+         )
        ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
        LIMIT $2 FOR UPDATE OF dispatch, session SKIP LOCKED`,
       [TURN_DISPATCH_TOPIC, limit],
@@ -73,8 +86,8 @@ export async function dispatchPendingTurnOutbox(
           await quarantineTurnDispatch(client, row.id)
           return "poisoned"
         }
-        const lineage = await client.query<{ id: string }>(
-          `SELECT turn."id"
+        const lineage = await client.query<{ id: string; source: string; executionMode: string | null }>(
+          `SELECT turn."id", turn."source", turn."executionMode"
            FROM "agent_turns" AS turn
            JOIN "agent_sessions" AS turnSession
              ON turnSession."id" = turn."sessionId"
@@ -87,6 +100,8 @@ export async function dispatchPendingTurnOutbox(
           await quarantineTurnDispatch(client, row.id)
           return "poisoned"
         }
+        if (lineage.rows[0].source === "automation"
+          && lineage.rows[0].executionMode !== "canonical_task_graph") return "skipped"
         queueAddStarted = true
         try {
           await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })

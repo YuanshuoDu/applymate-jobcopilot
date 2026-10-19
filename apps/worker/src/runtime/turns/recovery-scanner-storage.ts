@@ -26,6 +26,7 @@ export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: num
           AND ${RUNNABLE_SESSION}
          WHERE turn."status" = 'in_progress'
            AND (turn."leaseExpiresAt" IS NULL OR turn."leaseExpiresAt" <= $1)
+           AND (turn."source" <> 'automation' OR turn."executionMode" = 'canonical_task_graph')
          ORDER BY turn."updatedAt" ASC, turn."id" ASC
          LIMIT $2 FOR UPDATE OF turn, session SKIP LOCKED
        )
@@ -35,6 +36,7 @@ export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: num
            "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = $1
        FROM stale
        WHERE turn."id" = stale."id"
+         AND (turn."source" <> 'automation' OR turn."executionMode" = 'canonical_task_graph')
          AND EXISTS (
            SELECT 1 FROM "agent_sessions" AS session
            WHERE session."id" = turn."sessionId"

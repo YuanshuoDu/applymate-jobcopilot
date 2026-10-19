@@ -1977,6 +1977,7 @@ model AgentTurn {
   budgetSnapshot       Json
   revision             Int       @default(0)
   nativeSemanticProgressMode String? @map("native_semantic_progress_mode")
+  executionMode        String?
   inputTokens          Int       @default(0)
   outputTokens         Int       @default(0)
   estimatedCostUsd     Decimal   @default(0) @db.Decimal(12, 8)

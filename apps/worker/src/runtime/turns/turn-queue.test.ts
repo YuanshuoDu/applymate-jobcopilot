@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-const bullMqMocks = vi.hoisted(() => ({ queueConstructor: vi.fn(), workerConstructor: vi.fn() }))
+const bullMqMocks = vi.hoisted(() => ({ queueConstructor: vi.fn(), workerConstructor: vi.fn(), processor: undefined as undefined | ((job: { data: unknown; attemptsMade: number }) => Promise<unknown>) }))
 vi.mock("bullmq", async importOriginal => {
   const actual = await importOriginal<typeof import("bullmq")>()
   return { ...actual, Queue: bullMqMocks.queueConstructor, Worker: bullMqMocks.workerConstructor }
@@ -49,11 +49,11 @@ describe("Turn queue worker polling", () => {
   })
 })
 
-function pool() {
+function pool(mode: { source?: string; executionMode?: string | null } = {}) {
   const calls: string[] = []
   const queries: Array<[string, unknown[] | undefined]> = []
   const client = {
-    query: vi.fn(async (sql: string, params?: unknown[]) => { calls.push(sql); queries.push([sql, params]); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 } }),
+    query: vi.fn(async (sql: string, params?: unknown[]) => { calls.push(sql); queries.push([sql, params]); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId, source: mode.source ?? "user", executionMode: mode.executionMode ?? null }], rowCount: 1 } }),
     release: vi.fn(),
   }
   return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls, queries }
@@ -128,6 +128,63 @@ describe("Turn queue processor", () => {
     })
     await expect(runTurnJob({ data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_2" }, attemptsMade: 0 }, { pool: fake.pool, execute })).resolves.toEqual({ status: "skipped", reasonCode: "lease_not_available" })
     expect(execute).not.toHaveBeenCalled()
+  })
+
+  it.each([null, "legacy_pipeline_adapter", "malformed"] as const)(
+    "rejects canonical queue intake for an automation Turn pinned %s before lease work",
+    async executionMode => {
+      const fake = pool({ source: "automation", executionMode })
+      const execute = vi.fn()
+
+      await expect(runTurnJob(
+        { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+        { pool: fake.pool as never, execute, requireCanonicalAutomationMode: true },
+      )).rejects.toMatchObject({ code: "automation_mode_not_canonical" })
+
+      expect(fake.calls).toHaveLength(1)
+      expect(fake.calls[0]).toContain('SELECT turn."source", turn."executionMode"')
+      expect(execute).not.toHaveBeenCalled()
+    },
+  )
+
+  it("allows canonical-pinned automation at queue intake and keeps direct legacy adapter leases compatible", async () => {
+    const canonical = pool({ source: "automation", executionMode: "canonical_task_graph" })
+    const executeCanonical = vi.fn().mockResolvedValue({ status: "completed" as const })
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: canonical.pool as never, execute: executeCanonical, requireCanonicalAutomationMode: true },
+    )).resolves.toEqual({ status: "completed" })
+    expect(executeCanonical).toHaveBeenCalledOnce()
+
+    const legacyAdapter = pool({ source: "automation", executionMode: "legacy_pipeline_adapter" })
+    const executeLegacy = vi.fn().mockResolvedValue({ status: "completed" as const })
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: legacyAdapter.pool as never, execute: executeLegacy },
+    )).resolves.toEqual({ status: "completed" })
+    expect(legacyAdapter.calls.some(sql => sql.includes('SELECT turn."source", turn."executionMode"'))).toBe(false)
+    expect(executeLegacy).toHaveBeenCalledOnce()
+  })
+
+  it("wires canonical automation mode fencing into the agent-turns worker", async () => {
+    const fake = pool({ source: "automation", executionMode: null })
+    const execute = vi.fn()
+    let processor: typeof bullMqMocks.processor
+    bullMqMocks.queueConstructor.mockImplementation(() => ({ add: vi.fn(), getJob: vi.fn().mockResolvedValue(undefined), close: vi.fn() }))
+    bullMqMocks.workerConstructor.mockImplementation((_name, handler) => {
+      processor = handler
+      return { close: vi.fn().mockResolvedValue(undefined) }
+    })
+    try {
+      const queue = createTurnQueue({ pool: fake.pool as never, execute })
+      await expect(processor?.({ data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 }))
+        .rejects.toMatchObject({ code: "automation_mode_not_canonical" })
+      expect(fake.calls).toHaveLength(1)
+      await queue.close()
+    } finally {
+      bullMqMocks.queueConstructor.mockReset()
+      bullMqMocks.workerConstructor.mockReset()
+    }
   })
 
   it("executes only after ownership and releases the lease on a terminal result", async () => {

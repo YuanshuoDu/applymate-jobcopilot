@@ -79,6 +79,7 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
       )`)
       await client.query(`CREATE TABLE "agent_turns" (
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "userId" text NOT NULL,
+        "source" text NOT NULL, "executionMode" text,
         "status" text NOT NULL DEFAULT 'queued', "leaseOwnerId" text,
         "leaseStartedAt" timestamptz, "leaseExpiresAt" timestamptz,
         "leaseVersion" integer NOT NULL DEFAULT 0, "revision" integer NOT NULL DEFAULT 0,
@@ -162,7 +163,7 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
       const payload: TurnJobPayload = { turnId, sessionId, ownerId: `owner-${index}` }
       const app = `${appPrefix}_${index}`
       await pool.query(`INSERT INTO "${schema}"."agent_sessions" ("id", "userId", "status") VALUES ($1, $2, 'running')`, [sessionId, userId])
-      await pool.query(`INSERT INTO "${schema}"."agent_turns" ("id", "sessionId", "userId") VALUES ($1, $2, $3)`, [turnId, sessionId, userId])
+      await pool.query(`INSERT INTO "${schema}"."agent_turns" ("id", "sessionId", "userId", "source", "executionMode") VALUES ($1, $2, $3, 'user', NULL)`, [turnId, sessionId, userId])
 
       const locked = deferred()
       const release = deferred()
@@ -213,7 +214,7 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
     const repairApp = `${appPrefix}_repair`
     const dispatchApp = `${appPrefix}_persist`
     await pool.query(`INSERT INTO "${schema}"."agent_sessions" ("id", "userId", "status") VALUES ($1, $2, 'running')`, [sessionId, userId])
-    await pool.query(`INSERT INTO "${schema}"."agent_turns" ("id", "sessionId", "userId", "status") VALUES ($1, $2, $3, 'queued')`, [turnId, sessionId, userId])
+    await pool.query(`INSERT INTO "${schema}"."agent_turns" ("id", "sessionId", "userId", "source", "executionMode", "status") VALUES ($1, $2, $3, 'user', NULL, 'queued')`, [turnId, sessionId, userId])
     await pool.query(
       `INSERT INTO "${schema}"."agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload", "publishedAt", "attemptCount")
        VALUES ($1, $2, $3, $4, $5::jsonb, now(), 3)`,
