@@ -23,17 +23,18 @@ const UUID_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const HASH_ID = /^[0-9a-f]{32,64}$/i
 const PREFIXED_ID = /^[a-z][a-z0-9._:-]{0,63}[_:.-][a-z0-9][a-z0-9._:-]{0,191}$/i
 const CUID_ID = /^c[a-z0-9]{23,31}$/i
+const PHONE_SHAPED_UNDERSCORE_ID_COMPONENT = /_(\+?[\d\s().-]*\d)(?=$|[_:.-])/g
 const SECRET_ID = /^(?:bearer\b|sk[-_]|xox[baprs]-|gh[pousr]_|github_pat_|ghs_|glpat-|AIza|ya29\.|secret[_:-]|password[_:-]|api[_-]?key[_:-]|token[_:-])|(?:password|secret|token|api[_-]?key)=/i
 const STABLE_ID_COMPONENT = /(^|[:._-])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32,64})(?=$|[:._-])/gi
 
 type RoutingTuple = AgentEventRoutingContext
 type JsonRecord = Record<string, unknown>
-function record(value: unknown): JsonRecord | null {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return null
-  const prototype = Object.getPrototypeOf(value); return prototype === Object.prototype || prototype === null ? value as JsonRecord : null
+function hasPhoneShapedUnderscoreIdComponent(value: string): boolean {
+  return Array.from(value.replace(STABLE_ID_COMPONENT, "$1opaque").matchAll(PHONE_SHAPED_UNDERSCORE_ID_COMPONENT)).some(([, component]) => !!component && component.replace(/\D/g, "").length >= 10)
 }
+function record(value: unknown): JsonRecord | null { if (value === null || typeof value !== "object" || Array.isArray(value)) return null; const prototype = Object.getPrototypeOf(value); return prototype === Object.prototype || prototype === null ? value as JsonRecord : null }
 function opaqueId(value: unknown): value is string {
-  if (typeof value !== "string" || value.length > 256 || value.trim() !== value || SECRET_ID.test(value)) return false
+  if (typeof value !== "string" || value.length > 256 || value.trim() !== value || SECRET_ID.test(value) || hasPhoneShapedUnderscoreIdComponent(value)) return false
   const stable = UUID_ID.test(value) || HASH_ID.test(value) || CUID_ID.test(value)
     || /(?:^|[:._-])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)
     || /(?:^|[:._-])[0-9a-f]{32,64}$/i.test(value)
@@ -45,7 +46,7 @@ function nullableId(value: unknown): value is string | null { return value === n
 function validIdempotencyKey(value: unknown): boolean { return value === null || typeof value === "string" && value.length > 0 && value.length <= 256 }
 function safeMetadataId(value: string): boolean {
   const scrubbed = value.replace(STABLE_ID_COMPONENT, "$1opaque")
-  return value.length <= 256 && value.trim() === value && !SECRET_ID.test(scrubbed)
+  return value.length <= 256 && value.trim() === value && !SECRET_ID.test(scrubbed) && !hasPhoneShapedUnderscoreIdComponent(value)
     && (UUID_ID.test(value) || HASH_ID.test(value) || CUID_ID.test(value) || PREFIXED_ID.test(value)) && redactSensitiveText(scrubbed) === scrubbed
 }
 function safeWaitIdempotencyKey(type: string, value: unknown, route: RoutingTuple): value is string {
@@ -235,6 +236,11 @@ function preserveEnvelope(type: string, raw: JsonRecord, safe: RepositoryJsonVal
   return envelope
 }
 
+function isLegacyApprovalReference(value: unknown, key: string): boolean {
+  const row = record(value); return key === "approval" && !!row && exactPayloadKeys(row, ["id", "receiptNonce", "scopeHash"]) && opaqueId(row.id) && opaqueId(row.receiptNonce)
+    && typeof row.scopeHash === "string" && row.scopeHash.length > 0 && row.scopeHash.length <= 256
+}
+
 export function redactSensitiveText(value: string): string {
   return value
     .replace(SENSITIVE_TOKEN, "Bearer [REDACTED]")
@@ -259,7 +265,7 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
   const route = input.routing && validRouting(input.routing) ? input.routing : envelope?.routing
   const hasEventEnvelopeShape = containsAgentEventEnvelopeShape(input.data, 0, undefined, route)
   const preserveFollowUpMessageId = route !== undefined && validFollowUpPayload(input.type, input.data, route)
-  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, false, !hasEventEnvelopeShape, route, false, preserveFollowUpMessageId)
+  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, false, !hasEventEnvelopeShape, route, false, preserveFollowUpMessageId, !input.routing && !hasEventEnvelopeShape)
   const data = route && input.data !== undefined ? input.routing ? redactWaitRouting(input.type, input.data, safe, route)
     : envelope ? preserveEnvelope(input.type, envelope.row, safe, route) : safe : safe
   return {
@@ -268,11 +274,11 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
   }
 }
 /** Keep user-facing event structure while removing credentials, answers, resumes, and contact data. */
-function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true, allowNestedAgentItems = true, route?: RoutingTuple, preserveItemStepId = false, preserveFollowUpMessageId = false): RepositoryJsonValue {
+function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true, allowNestedAgentItems = true, route?: RoutingTuple, preserveItemStepId = false, preserveFollowUpMessageId = false, preserveLegacyApprovalIds = false): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
   const normalizedKey = key?.toLowerCase()
   const structuralIdKey = normalizedKey !== undefined && (STRUCTURAL_ID_KEY.has(normalizedKey) || normalizedKey === "stepid")
-  const structuralId = typeof value === "string" && (allowStructuralIds && structuralIdKey
+  const structuralId = typeof value === "string" && (structuralIdKey && (allowStructuralIds || preserveLegacyApprovalIds && normalizedKey === "approvalid")
     && (normalizedKey === "questionid" ? stableOpaqueId(value) : normalizedKey === "stepid" ? preserveItemStepId && opaqueId(value) : opaqueId(value))
     || key === "messageId" && preserveFollowUpMessageId && opaqueId(value))
   if (structuralIdKey && value !== null && !structuralId) return "[REDACTED]"
@@ -283,16 +289,16 @@ function redactEventValue(value: unknown, key: string | null = null, depth = 0, 
   if (value === null || typeof value === "boolean") return value
   if (typeof value === "number") return Number.isFinite(value) ? value : "[REDACTED]"
   if (depth >= maxDepth) return "[REDACTED]"
-  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer, allowStructuralIds, allowNestedAgentItems, route, preserveItemStepId, preserveFollowUpMessageId))
+  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer, allowStructuralIds, allowNestedAgentItems, route, preserveItemStepId, preserveFollowUpMessageId, preserveLegacyApprovalIds))
   if (typeof value !== "object" || value === undefined) return "[REDACTED]"
   const entries: Array<[string, RepositoryJsonValue]> = []
   for (const [entryKey, entryValue] of Object.entries(value)) {
     // Omit absent fields so reconnect clients rotate receipts instead of seeing a false redaction marker.
     if (entryValue === undefined) continue
-    const preserveItemIds = allowNestedAgentItems && isNestedAgentItem(entryValue, entryKey, route)
+    const preserveItemIds = allowNestedAgentItems && isNestedAgentItem(entryValue, entryKey, route) || preserveLegacyApprovalIds && isLegacyApprovalReference(entryValue, entryKey)
     const preserveStepId = preserveItemIds || preserveItemStepId && entryKey === "stepId"
     entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer, allowStructuralIds || preserveItemIds,
-      allowNestedAgentItems, route, preserveStepId, preserveFollowUpMessageId && entryKey === "messageId")])
+      allowNestedAgentItems, route, preserveStepId, preserveFollowUpMessageId && entryKey === "messageId", preserveLegacyApprovalIds)])
   }
   return Object.fromEntries(entries)
 }

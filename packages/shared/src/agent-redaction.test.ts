@@ -65,6 +65,26 @@ describe("agent event redaction", () => {
     expect(safe.data).toEqual({ draft: { name: "Berlin SWE automation", minScore: 85, autoApply: false } })
   })
 
+  it("preserves only validated approval IDs in legacy payloads", () => {
+    const approvalId = "approval_4912-9422"
+    const requested = redactAgentEvent({
+      type: "approval.requested",
+      body: "",
+      data: { approvalId, action: "submit_application", scopeHash: "hash_1", revision: 1, email: "candidate@example.com" },
+    })
+    expect(requested.data).toEqual({ approvalId, action: "submit_application", scopeHash: "hash_1", revision: 1, email: "[REDACTED]" })
+
+    const automation = redactAgentEvent({
+      type: "automation_draft",
+      body: "",
+      data: { approval: { id: "approval_1", receiptNonce: "nonce_1", scopeHash: "hash_1" } },
+    })
+    expect(automation.data).toEqual({ approval: { id: "approval_1", receiptNonce: "nonce_1", scopeHash: "hash_1" } })
+
+    const invalid = redactAgentEvent({ type: "approval.requested", body: "", data: { approvalId: "sk_private_secret" } })
+    expect(invalid.data).toEqual({ approvalId: "[REDACTED]" })
+  })
+
   it("redacts structural IDs outside validated payloads and phone-like text", () => {
     const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
     const durableQuestionId = "0123456789abcdef".repeat(4)
@@ -88,20 +108,31 @@ describe("agent event redaction", () => {
   })
 
   it("rejects underscore-prefixed phone-shaped IDs while redacting phone text", () => {
-    const phoneLikeId = "task_4155550123"
-    const routing: AgentEventRoutingContext = {
-      sessionId, turnId: phoneLikeId, itemId: null, taskId: null, actor: "user",
-      correlationId: phoneLikeId, causationId: null, outboxTopic: "agent.session.event",
-    }
-    const safe = redactAgentEvent({
-      type: "session.pause_requested",
-      body: `Call ${phoneLikeId} about this task.`,
-      data: { turnId: phoneLikeId, expectedRevision: 1, requestedAt: "2026-10-06T17:30:00.000Z" },
-      routing,
-    })
+    for (const phoneLikeId of ["task_4155550123", "task_415-555-0123"]) {
+      const routing: AgentEventRoutingContext = {
+        sessionId, turnId: phoneLikeId, itemId: null, taskId: null, actor: "user",
+        correlationId: phoneLikeId, causationId: null, outboxTopic: "agent.session.event",
+      }
+      const safe = redactAgentEvent({
+        type: "session.pause_requested",
+        body: `Call ${phoneLikeId} or 4155550123 about this task.`,
+        data: { turnId: phoneLikeId, expectedRevision: 1, requestedAt: "2026-10-06T17:30:00.000Z" },
+        routing,
+      })
 
-    expect(safe.body).toBe("Call task_[REDACTED_PHONE] about this task.")
-    expect(safe.data).toEqual({ turnId: "[REDACTED]", expectedRevision: 1, requestedAt: "2026-10-06T17:30:00.000Z" })
+      expect(safe.body).toBe("Call task_[REDACTED_PHONE] or [REDACTED_PHONE] about this task.")
+      expect(safe.data).toEqual({ turnId: "[REDACTED]", expectedRevision: 1, requestedAt: "2026-10-06T17:30:00.000Z" })
+    }
+
+    const approvalId = "approval_4912-9422"
+    const validatedApproval = redactAgentEvent({
+      type: "approval.requested",
+      body: "",
+      data: { approvalId, action: "submit_application", scopeHash: `sha256:${"a".repeat(64)}`, revision: 2 },
+      routing: { sessionId, turnId, itemId: null, taskId: null, actor: "orchestrator", correlationId: approvalId,
+        causationId: null, outboxTopic: "agent.session.event" },
+    }).data as { approvalId: string }
+    expect(validatedApproval.approvalId).toBe(approvalId)
   })
 
   it("does not exempt invalid or secret-like values in structural ID fields", () => {
