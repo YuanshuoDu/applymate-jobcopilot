@@ -27,6 +27,35 @@ describe("ObjectiveStartCommandService validation", () => {
     expect(transaction).toHaveBeenCalledOnce()
   })
 
+  it("preserves whitespace-only background through Root and accepted-input persistence", async () => {
+    const text = " \t\r\n "
+    const content = [{ type: "text" as const, text }]
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1", status: "running" }]),
+      agentInput: { findFirst: vi.fn().mockResolvedValue(null) },
+      agentTurn: { findFirst: vi.fn().mockResolvedValue(null) },
+    }
+    const db = {
+      $transaction: (work: (value: unknown) => Promise<unknown>) => work(tx),
+    } as unknown as PrismaClient
+    const createRootTurn = vi.spyOn(transaction, "createRootTurn").mockResolvedValue({
+      id: "turn_1", source: "user", status: "queued", revision: 0,
+    })
+    const acceptInputFacts = vi.spyOn(transaction, "acceptInputFacts").mockResolvedValue({
+      inputId: "input_1", turnId: "turn_1", sequence: "1",
+    })
+    const service = new ObjectiveStartCommandService(db)
+
+    try {
+      await service.start({ ...command("Find Dublin roles"), content })
+      expect(createRootTurn.mock.calls[0]?.[2]).toEqual(content)
+      expect(acceptInputFacts.mock.calls[0]?.[2]).toEqual(content)
+    } finally {
+      createRootTurn.mockRestore()
+      acceptInputFacts.mockRestore()
+    }
+  })
+
   it("rejects malformed or oversized direct-service values before transaction", async () => {
     const transaction = vi.fn(async () => { throw new Error("transaction must not run") })
     const service = new ObjectiveStartCommandService({ $transaction: transaction } as unknown as PrismaClient)
@@ -36,6 +65,7 @@ describe("ObjectiveStartCommandService validation", () => {
     await expect(service.start(unsafeCommand({ objective: undefined }))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
     await expect(service.start(unsafeCommand({ objective: 42 }))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
     await expect(service.start(unsafeCommand({ content: [] }))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    await expect(service.start(unsafeCommand({ content: [{ type: "text", text: "" }] }))).rejects.toMatchObject({ code: "invalid_command", status: 422 })
     await expect(service.start(unsafeCommand({ content: [{ type: "text", text: "x".repeat(20_001) }] })))
       .rejects.toMatchObject({ code: "invalid_command", status: 422 })
     await expect(service.start(unsafeCommand({ content: Array.from({ length: 33 }, () => ({ type: "text", text: "ok" })) })))

@@ -1,8 +1,9 @@
 'use client'
 
-import React, { type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
+import React, { useCallback, useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 import { useToast } from '@/components/ui'
 import { useI18n } from '@/lib/i18n'
+import { AgentObjectiveContextForm, canStartOrdinaryChat, isOrdinaryComposerInputLocked, shouldReleaseInputAfterSessionSelection } from './AgentObjectiveContextForm'
 import { AgentComposer, type ComposerAttachment, type ComposerJob, type ComposerResume } from './AgentComposer'
 import { attachmentComposerContext, jobComposerContext, resumeComposerContext } from './AgentUnifiedStream.helpers'
 import { sendAgentTurnMessage, useAgentTurnComposerContext } from './agent-turn-commands'
@@ -45,14 +46,74 @@ export function AgentUnifiedStreamComposer({
   const { t } = useI18n()
   const toast = useToast()
   const turnComposer = useAgentTurnComposerContext()
+  const sessionStartLockRef = useRef(false)
+  const objectiveDraftPendingRef = useRef(false)
+  const objectiveStartInFlightRef = useRef(false)
+  const objectiveSessionSwitchPendingRef = useRef(false)
+  const objectiveSessionSwitchFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const objectiveContextEntryAvailable = !turnComposer && liveBlocks.length === 0 && !waitingForAnswer
+  const previousObjectiveContextEntryAvailableRef = useRef(objectiveContextEntryAvailable)
 
+  const syncOrdinaryComposerInputLock = useCallback(() => {
+    if (!inputRef.current) return
+    inputRef.current.disabled = isOrdinaryComposerInputLocked(
+      objectiveStartInFlightRef.current,
+      objectiveSessionSwitchPendingRef.current,
+    )
+  }, [inputRef])
+
+  const releaseOrdinaryComposerInputLock = useCallback(() => {
+    objectiveSessionSwitchPendingRef.current = false
+    if (objectiveSessionSwitchFallbackRef.current !== null) {
+      clearTimeout(objectiveSessionSwitchFallbackRef.current)
+      objectiveSessionSwitchFallbackRef.current = null
+    }
+    syncOrdinaryComposerInputLock()
+  }, [syncOrdinaryComposerInputLock])
+
+  function setObjectiveStartBusy(busy: boolean) {
+    objectiveStartInFlightRef.current = busy
+    setChatLoading(busy)
+    syncOrdinaryComposerInputLock()
+  }
+
+  function waitForObjectiveSessionSwitch() {
+    objectiveSessionSwitchPendingRef.current = true
+    syncOrdinaryComposerInputLock()
+    if (objectiveSessionSwitchFallbackRef.current !== null) clearTimeout(objectiveSessionSwitchFallbackRef.current)
+    objectiveSessionSwitchFallbackRef.current = setTimeout(releaseOrdinaryComposerInputLock, 5_000)
+  }
+
+  useEffect(() => {
+    const shouldReleaseAfterCommit = shouldReleaseInputAfterSessionSelection(
+      previousObjectiveContextEntryAvailableRef.current,
+      objectiveContextEntryAvailable,
+      objectiveSessionSwitchPendingRef.current,
+    )
+    previousObjectiveContextEntryAvailableRef.current = objectiveContextEntryAvailable
+    if (!shouldReleaseAfterCommit) return
+    const frameId = window.requestAnimationFrame(releaseOrdinaryComposerInputLock)
+    return () => window.cancelAnimationFrame(frameId)
+  }, [objectiveContextEntryAvailable, releaseOrdinaryComposerInputLock])
+
+  useEffect(() => () => {
+    if (objectiveSessionSwitchFallbackRef.current !== null) clearTimeout(objectiveSessionSwitchFallbackRef.current)
+  }, [])
   function appendComposerContext(text: string) {
+    if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) {
+      toast.info('Task is starting', 'Wait for the current task start to finish before adding context.')
+      return
+    }
     setChatInput(current => current.trim() ? `${current.trim()}\n\n${text}` : text)
     setAddMenuOpen(false)
     setTimeout(() => inputRef.current?.focus(), 0)
   }
 
   function addSelectedFiles(files: FileList | null) {
+    if (sessionStartLockRef.current) {
+      toast.info('Task is starting', 'Wait for the current task start to finish before adding files.')
+      return
+    }
     const next = Array.from(files ?? []).map(file => ({
       id: `${file.name}-${file.size}-${file.lastModified}`,
       name: file.name,
@@ -77,6 +138,12 @@ export function AgentUnifiedStreamComposer({
       setAttachedFiles([])
       return
     }
+    if (objectiveContextEntryAvailable && !canStartOrdinaryChat(objectiveDraftPendingRef.current)) {
+      toast.info('Finish the objective draft first', 'Discard or start that draft before sending ordinary chat. Your regular draft and attachments will stay here.')
+      return
+    }
+    if (sessionStartLockRef.current) return
+    sessionStartLockRef.current = true
     setChatInput('')
     setAttachedFiles([])
     setChatLoading(true)
@@ -117,6 +184,7 @@ export function AgentUnifiedStreamComposer({
       setAttachedFiles(current => current.length > 0 ? current : draftFiles)
       toast.error(t('agent.chatFailed'), message)
     } finally {
+      sessionStartLockRef.current = false
       if (requestVersion === chatRequestVersionRef.current) {
         chatRequestRef.current = null
         setChatLoading(false)
@@ -138,25 +206,44 @@ export function AgentUnifiedStreamComposer({
   ]
 
   return (
-    <AgentComposer
-      waitingForAnswer={waitingForAnswer}
-      chips={chips}
-      chatInput={chatInput}
-      chatLoading={chatLoading}
-      addMenuOpen={addMenuOpen}
-      attachedFiles={attachedFiles}
-      composerJobs={composerJobs}
-      composerResumes={composerResumes}
-      inputRef={inputRef}
-      fileInputRef={fileInputRef}
-      onChatInputChange={setChatInput}
-      onAddMenuOpenChange={setAddMenuOpen}
-      onSendChat={sendChat}
-      onRemoveAttachedFile={id => setAttachedFiles(current => current.filter(file => file.id !== id))}
-      onAddSelectedFiles={addSelectedFiles}
-      onAddJobContext={job => appendComposerContext(jobComposerContext(job))}
-      onAddResumeContext={resume => appendComposerContext(resumeComposerContext(resume))}
-      onAppendComposerContext={appendComposerContext}
-    />
+    <>
+      <AgentObjectiveContextForm
+        available={objectiveContextEntryAvailable}
+        startLockRef={sessionStartLockRef}
+        onDraftPendingChange={pending => { objectiveDraftPendingRef.current = pending }}
+        attachedFileCount={attachedFiles.length}
+        ordinaryComposerDraftPresent={Boolean(chatInput.trim())}
+        disabled={chatLoading}
+        onBusyChange={setObjectiveStartBusy}
+        onAccepted={(sessionId, objective) => {
+          shouldFollowScrollRef.current = true
+          waitForObjectiveSessionSwitch()
+          onSessionRecorded(sessionId, objective, 'Task · Running')
+        }}
+      />
+      <AgentComposer
+        waitingForAnswer={waitingForAnswer}
+        chips={chips}
+        chatInput={chatInput}
+        chatLoading={chatLoading}
+        addMenuOpen={addMenuOpen}
+        attachedFiles={attachedFiles}
+        composerJobs={composerJobs}
+        composerResumes={composerResumes}
+        inputRef={inputRef}
+        fileInputRef={fileInputRef}
+        onChatInputChange={value => {
+          if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) return
+          setChatInput(value)
+        }}
+        onAddMenuOpenChange={setAddMenuOpen}
+        onSendChat={sendChat}
+        onRemoveAttachedFile={id => setAttachedFiles(current => current.filter(file => file.id !== id))}
+        onAddSelectedFiles={addSelectedFiles}
+        onAddJobContext={job => appendComposerContext(jobComposerContext(job))}
+        onAddResumeContext={resume => appendComposerContext(resumeComposerContext(resume))}
+        onAppendComposerContext={appendComposerContext}
+      />
+    </>
   )
 }

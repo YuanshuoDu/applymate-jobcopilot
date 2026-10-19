@@ -42,6 +42,12 @@ describe("parseObjectiveStartBody", () => {
       .toMatchObject({ status: 422 })
   })
 
+  it("accepts and preserves whitespace-only background text byte-for-byte", () => {
+    const text = " \t\r\n "
+    const parsed = parseObjectiveStartBody({ ...baseBody, content: [{ type: "text", text }] }, request(), sessionId)
+    expect(parsed).toMatchObject({ content: [{ type: "text", text }] })
+  })
+
   it("accepts and preserves the existing 20,000-character context limit", () => {
     const text = "reference ".repeat(2_000)
     const parsed = parseObjectiveStartBody({ ...baseBody, content: [{ type: "text", text }] }, request(), sessionId)
@@ -69,7 +75,7 @@ describe("parseObjectiveStartBody", () => {
       { ...baseBody, userId: "user_1" },
       { ...baseBody, criteria: ["must pass"] },
       { ...baseBody, schemaVersion: "unsupported" },
-      { ...baseBody, content: [{ type: "text", text: "   " }] },
+      { ...baseBody, content: [{ type: "text", text: "" }] },
       { ...baseBody, content: [{ type: "text", text: "x".repeat(20_001) }] },
       { ...baseBody, content: [{ type: "text", text: "ok", extra: true }] },
       { ...baseBody, content: [] },

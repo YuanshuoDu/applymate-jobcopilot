@@ -44,7 +44,7 @@ function hasBoundedContent(value: unknown): value is ObjectiveStartCommand["cont
       if (!part || typeof part !== "object" || Array.isArray(part)) return false
       const record = part as Record<string, unknown>
       if (record.type === "text") {
-        if (typeof record.text !== "string" || !record.text.trim() || record.text.length > MAX_TEXT_PART_LENGTH) return false
+        if (typeof record.text !== "string" || record.text.length === 0 || record.text.length > MAX_TEXT_PART_LENGTH) return false
       } else {
         for (const field of ["attachmentId", "mediaType", "filename"] as const) {
           const item = record[field]
