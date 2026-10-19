@@ -12,7 +12,7 @@ WHERE EXISTS (
     AND dispatch."aggregateId" = turn."sessionId"
     AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
     AND dispatch."payload"->>'turnId' = turn."id"
-    AND dispatch."payload"->>'sessionId' = turn."sessionId'
+    AND dispatch."payload"->>'sessionId' = turn."sessionId"
 )
 AND NOT EXISTS (
   SELECT 1
