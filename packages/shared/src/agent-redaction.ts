@@ -15,6 +15,7 @@ const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid",
 const ROUTED_AGENT_EVENT_TYPE = new Set(["approval.resolved", "item.started", "question.answered", "task.interrupt.accepted", "turn.wakeup"])
 const AGENT_EVENT_ENVELOPE_ANCHORS = ["actor", "causationId", "correlationId", "createdAt", "id", "idempotencyKey", "itemId", "sequence", "sessionId", "taskId", "turnId", "type"]
 const AGENT_EVENT_ENVELOPE_CORE_IDENTITY = ["id", "sessionId", "turnId", "type"]
+const EVENT_REDACTION_MAX_DEPTH = 8
 const UUID_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const HASH_ID = /^[0-9a-f]{32,64}$/i
 const PREFIXED_ID = /^[a-z][a-z0-9._:-]{0,63}[_:.-][a-z0-9][a-z0-9._:-]{0,191}$/i
@@ -36,7 +37,8 @@ function opaqueId(value: unknown): value is string {
   const stable = UUID_ID.test(value) || HASH_ID.test(value) || CUID_ID.test(value)
     || /(?:^|[:._-])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)
     || /(?:^|[:._-])[0-9a-f]{32,64}$/i.test(value)
-  return (stable || PREFIXED_ID.test(value)) && (stable || redactSensitiveText(value) === value)
+  const withoutStableId = value.replace(STABLE_ID_COMPONENT, "$1opaque")
+  return (stable || PREFIXED_ID.test(value)) && redactSensitiveText(withoutStableId) === withoutStableId
 }
 
 function stableOpaqueId(value: unknown): value is string {
@@ -93,11 +95,14 @@ function validRouting(value: unknown): value is RoutingTuple {
     && (row.outboxTopic === "agent.session.event" || row.outboxTopic === "agent.turn.wakeup")
 }
 
-function hasAgentEventEnvelopeShape(value: unknown): boolean {
-  const row = record(value)
-  return !!row && (Object.hasOwn(row, "schemaVersion")
-    || Object.hasOwn(row, "payload") && AGENT_EVENT_ENVELOPE_ANCHORS.some(key => Object.hasOwn(row, key))
-    || AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => Object.hasOwn(row, key)))
+function containsAgentEventEnvelopeShape(value: unknown, depth = 0): boolean {
+  if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
+  const entries = Object.entries(value)
+  const keys = new Set(entries.map(([key]) => key.toLowerCase()))
+  const envelopeShape = keys.has("schemaversion")
+    || keys.has("payload") && AGENT_EVENT_ENVELOPE_ANCHORS.some(key => keys.has(key.toLowerCase()))
+    || AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
+  return envelopeShape || entries.some(([, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1))
 }
 
 function fullEnvelope(type: string, value: unknown): { row: JsonRecord; routing: RoutingTuple } | null {
@@ -178,8 +183,8 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
   const envelope = input.routing ? null : fullEnvelope(input.type, input.data)
   const route = input.routing && validRouting(input.routing) ? input.routing : envelope?.routing
   const allowStructuralIds = input.routing === undefined && !ROUTED_AGENT_EVENT_TYPE.has(input.type)
-    && !hasAgentEventEnvelopeShape(input.data)
-  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, 8, false, allowStructuralIds)
+    && !containsAgentEventEnvelopeShape(input.data)
+  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, allowStructuralIds)
   const data = route && input.data !== undefined
     ? input.routing
       ? redactWaitRouting(input.type, input.data, safe, route)
@@ -197,7 +202,7 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
  * and direct contact data. Lifecycle/tool payloads use the stricter generic
  * redactor above because they are not rendered back into the user transcript.
  */
-function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = 8, insideResume = false, allowStructuralIds = true): RepositoryJsonValue {
+function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
   const normalizedKey = key?.toLowerCase()
   const structuralId = allowStructuralIds && typeof value === "string" && normalizedKey !== undefined

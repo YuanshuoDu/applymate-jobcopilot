@@ -97,6 +97,21 @@ describe("agent event redaction", () => {
     }
   })
 
+  it("redacts PII prefixes before stable UUID or hash suffixes in structural IDs", () => {
+    const candidates = [
+      { value: "candidate@example.com-child-0be414dd-f9ec-4912-9422-a3db3100ea4f", pii: "candidate@example.com" },
+      { value: "+1 (415) 555-0198-0123456789abcdef0123456789abcdef", pii: "+1 (415) 555-0198" },
+    ]
+
+    for (const candidate of candidates) {
+      const safe = redactAgentEvent({ type: "task.updated", body: "", data: { item: { taskId: candidate.value } } })
+      const item = (safe.data as { item: { taskId: string } }).item
+
+      expect(item.taskId).not.toBe(candidate.value)
+      expect(item.taskId).not.toContain(candidate.pii)
+    }
+  })
+
   it("requires validated routing before preserving IDs from routed payloads or event envelopes", () => {
     const candidateTaskId = "task-70463535-1444-4bba-ae3b-b80578d2dd0a"
     const intentId = "70463535-1444-4bba-ae3b-b80578d2dd0e"
@@ -140,6 +155,33 @@ describe("agent event redaction", () => {
     }
     const safeWithoutPayload = redactAgentEvent({ type: "future.agent.event", body: "", data: partialWithoutPayload }).data as Record<string, unknown>
     expect(safeWithoutPayload.taskId).not.toBe(numericUuidTaskId)
+  })
+
+  it("does not restore generic ID exemptions for wrapped malformed or unsupported envelopes", () => {
+    const candidateTaskId = "task-70463535-1444-4bba-ae3b-b80578d2dd0a"
+    const envelopeId = "70463535-1444-4bba-ae3b-b80578d2dd0f"
+    const envelopes: Array<Record<string, unknown>> = [
+      {
+        schemaVersion: "agent-harness.v3", id: envelopeId, sessionId, turnId, type: "future.agent.event",
+        taskId: candidateTaskId, payload: { taskId: candidateTaskId },
+      },
+      {
+        id: envelopeId, sessionId, turnId, type: "future.agent.event",
+        taskId: candidateTaskId, payload: { taskId: candidateTaskId },
+      },
+      {
+        SchemaVersion: "agent-harness.v2", Id: envelopeId, SessionId: sessionId, TurnId: turnId, Type: "future.agent.event",
+        TaskId: candidateTaskId, Payload: { TaskId: candidateTaskId },
+      },
+    ]
+
+    for (const envelope of envelopes) {
+      const safe = redactAgentEvent({ type: "future.agent.event", body: "", data: { metadata: envelope } }).data as {
+        metadata: { taskId?: string; TaskId?: string; payload?: { taskId?: string }; Payload?: { TaskId?: string } }
+      }
+      const metadata = safe.metadata
+      expect(JSON.stringify(metadata)).not.toContain(candidateTaskId)
+    }
   })
 
   it("keeps opaque approval references and omits absent optional values", () => {
