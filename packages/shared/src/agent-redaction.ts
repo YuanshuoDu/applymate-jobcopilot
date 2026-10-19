@@ -157,9 +157,9 @@ function validatedPayloadFields(type: string, payload: JsonRecord, route: Routin
     && route.causationId !== null) return ["waitId", "itemId", "toolCallId"]
   return null
 }
-function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: string, route?: RoutingTuple): boolean {
+function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: string, route?: RoutingTuple, legacyApprovalReceipt?: unknown): boolean {
   if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
-  if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1, parentKey, route))
+  if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1, parentKey, route, legacyApprovalReceipt))
   const row = record(value)
   if (!row) return false
   const entries = Object.entries(row)
@@ -176,10 +176,9 @@ function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: 
   const malformedVersionedEnvelope = !nestedAgentItem && hasSchemaVersion && schemaVersions.some(version => typeof version !== "string")
     && (hasEventAnchor || eventType)
   const unversionedPartialEnvelope = !hasSchemaVersion && keys.has("payload") && hasEnvelopeAnchor
-  const envelopeShape = versionedAgentEnvelope || malformedVersionedEnvelope || unversionedPartialEnvelope
-    || ambiguousSchemaVersion
-    || !hasSchemaVersion && AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
-  return envelopeShape || entries.some(([key, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1, key, route))
+  const envelopeShape = value !== legacyApprovalReceipt && (versionedAgentEnvelope || malformedVersionedEnvelope || unversionedPartialEnvelope
+    || ambiguousSchemaVersion || !hasSchemaVersion && AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase())))
+  return envelopeShape || entries.some(([key, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1, key, route, legacyApprovalReceipt))
 }
 function containsDuplicateSchemaVersion(value: unknown, depth = 0): boolean {
   if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
@@ -239,13 +238,17 @@ function preserveEnvelope(type: string, raw: JsonRecord, safe: RepositoryJsonVal
   return envelope
 }
 function isLegacyApprovalReference(value: unknown, key: string): boolean {
-  const row = record(value); return key === "approval" && !!row && exactPayloadKeys(row, ["id", "receiptNonce", "scopeHash"]) && opaqueId(row.id) && opaqueId(row.receiptNonce)
-    && typeof row.scopeHash === "string" && row.scopeHash.length > 0 && row.scopeHash.length <= 256
+  const row = record(value); return key === "approval" && !!row && exactPayloadKeys(row, ["id", "receiptNonce", "scopeHash"]) && opaqueId(row.id) && opaqueId(row.receiptNonce) && typeof row.scopeHash === "string" && row.scopeHash.length > 0 && row.scopeHash.length <= 256
 }
-
+function legacyApprovalClientReceipt(value: unknown): JsonRecord | null {
+  const approval = record(record(value)?.approval)
+  return approval && exactPayloadKeys(approval, ["id", "type", "title", "body", "impact", "payload", "status", "receiptNonce", "scopeHash"])
+    && opaqueId(approval.id) && opaqueId(approval.receiptNonce) && ["type", "title", "body", "status"].every(key => typeof approval[key] === "string")
+    && jsonValue(approval) && typeof approval.scopeHash === "string" && approval.scopeHash.length > 0 && approval.scopeHash.length <= 256 ? approval : null
+}
+function preserveLegacyApprovalId(safe: unknown, receipt: JsonRecord): RepositoryJsonValue { const output = record(safe), approval = record(output?.approval); return output && approval ? { ...output, approval: preserveFields(approval, receipt, ["id"]) } : safe as RepositoryJsonValue }
 export function redactSensitiveText(value: string): string {
-  return value.replace(SENSITIVE_TOKEN, "Bearer [REDACTED]").replace(SENSITIVE_KEY_TOKEN, "[REDACTED]")
-    .replace(SENSITIVE_EMAIL, "[REDACTED_EMAIL]").replace(SENSITIVE_PHONE, "[REDACTED_PHONE]").replace(SENSITIVE_ASSIGNMENT, "$1=[REDACTED]")
+  return value.replace(SENSITIVE_TOKEN, "Bearer [REDACTED]").replace(SENSITIVE_KEY_TOKEN, "[REDACTED]").replace(SENSITIVE_EMAIL, "[REDACTED_EMAIL]").replace(SENSITIVE_PHONE, "[REDACTED_PHONE]").replace(SENSITIVE_ASSIGNMENT, "$1=[REDACTED]")
 }
 export function redactSensitiveValue(value: unknown, key: string | null = null, depth = 0, maxDepth = 8): RepositoryJsonValue {
   if (key && SENSITIVE_KEY.test(key)) return "[REDACTED]"
@@ -257,16 +260,14 @@ export function redactSensitiveValue(value: unknown, key: string | null = null, 
   if (typeof value !== "object" || value === undefined) return "[REDACTED]"
   return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [entryKey, redactSensitiveValue(entryValue, entryKey, depth + 1, maxDepth)]))
 }
-
 export function redactAgentEvent(input: { type: string; body: string; data?: unknown; routing?: AgentEventRoutingContext }): { body: string; data: RepositoryJsonValue | null } {
   const envelope = input.routing ? null : fullEnvelope(input.type, input.data)
   const route = input.routing && validRouting(input.routing) ? input.routing : envelope?.routing
-  const hasEventEnvelopeShape = containsAgentEventEnvelopeShape(input.data, 0, undefined, route)
+  const legacyApprovalReceipt = !input.routing && input.type === "approval_request" ? legacyApprovalClientReceipt(input.data) : null; const hasEventEnvelopeShape = containsAgentEventEnvelopeShape(input.data, 0, undefined, route, legacyApprovalReceipt)
   const preserveFollowUpMessageId = route !== undefined && validFollowUpPayload(input.type, input.data, route)
-  const legacyApprovalPayload = !input.routing && !hasEventEnvelopeShape && (validLegacyApprovalRequested(input.type, input.data)
-    || validStoredApprovalRequested(input.type, input.data) || validLegacyApprovalResponse(input.type, input.data))
+  const legacyApprovalPayload = !input.routing && !hasEventEnvelopeShape && (validLegacyApprovalRequested(input.type, input.data) || validStoredApprovalRequested(input.type, input.data) || validLegacyApprovalResponse(input.type, input.data))
   const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, false, !hasEventEnvelopeShape, route, false, preserveFollowUpMessageId, !input.routing && !hasEventEnvelopeShape && input.type === "automation_draft")
-  let data = route && input.data !== undefined ? input.routing ? redactWaitRouting(input.type, input.data, safe, route) : envelope ? preserveEnvelope(input.type, envelope.row, safe, route) : safe : safe
+  let data = route && input.data !== undefined ? input.routing ? redactWaitRouting(input.type, input.data, safe, route) : envelope ? preserveEnvelope(input.type, envelope.row, safe, route) : safe : safe; if (legacyApprovalReceipt && !hasEventEnvelopeShape) data = preserveLegacyApprovalId(data, legacyApprovalReceipt)
   if (legacyApprovalPayload) data = preserveFields(data, input.data as JsonRecord, ["approvalId"])
   return { body: redactSensitiveText(input.body), data }
 }

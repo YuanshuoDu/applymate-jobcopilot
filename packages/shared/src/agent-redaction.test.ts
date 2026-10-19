@@ -126,6 +126,38 @@ describe("agent event redaction", () => {
     }
   })
 
+  it("preserves strict structural IDs in legacy approval_request client receipts", () => {
+    const receiptId = "approval-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const receipt = { id: receiptId, type: "submit_application", title: "Review application", body: "Confirm before sending.",
+      impact: { externalSubmission: true }, payload: { jobId: "job_123" }, status: "pending", receiptNonce: "nonce_0123456789abcdef", scopeHash: "hash_1" }
+    const valid = redactAgentEvent({ type: "approval_request", body: "Review this approval.", data: { approval: receipt } }).data as { approval: { id: string } }
+    expect(valid.approval.id).toBe(receiptId)
+
+    const ordinary = redactAgentEvent({ type: "task.updated", body: "", data: { note: { id: receiptId } } }).data as { note: { id: string } }
+    expect(ordinary.note.id).toBe("[REDACTED]")
+
+    const phoneShapedId = "approval-353871234567"
+    const invalid = redactAgentEvent({ type: "approval_request", body: `Receipt ${phoneShapedId}`, data: { approval: { ...receipt, id: phoneShapedId } } })
+    expect((invalid.data as { approval: { id: string } }).approval.id).toBe("[REDACTED]")
+    expect(invalid.body).toBe("Receipt approval-[REDACTED_PHONE]")
+
+    const nearMiss = redactAgentEvent({ type: "approval_request", body: "", data: { approval: { ...receipt, extra: true } } })
+    expect((nearMiss.data as { approval: { id: string } }).approval.id).toBe("[REDACTED]")
+
+    const malformedEnvelope = redactAgentEvent({ type: "approval.requested", body: "", data: {
+      schemaVersion: "agent-harness.v2", id: "event_1", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: null,
+      type: "approval.requested", actor: "orchestrator", correlationId: receiptId, causationId: null, idempotencyKey: null,
+      sequence: 1, createdAt: "2026-10-19T12:00:00.000Z", payload: { approvalId: receiptId, action: "submit_application", scopeHash: "hash_1", revision: 0, extra: true },
+    } })
+    expect((malformedEnvelope.data as { payload: { approvalId: string } }).payload.approvalId).toBe("[REDACTED]")
+
+    const nestedEnvelope = redactAgentEvent({ type: "approval_request", body: "", data: { approval: { ...receipt, payload: {
+      schemaVersion: "agent-harness.v2", id: "nested_event", sessionId: "session_1", turnId: "turn_1", type: "approval.requested",
+      payload: { approvalId: receiptId, action: "submit_application", scopeHash: "hash_1", revision: 0, extra: true },
+    } } } })
+    expect((nestedEnvelope.data as { approval: { id: string } }).approval.id).toBe("[REDACTED]")
+  })
+
   it("redacts structural IDs outside validated payloads and phone-like text", () => {
     const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
     const durableQuestionId = "0123456789abcdef".repeat(4)
