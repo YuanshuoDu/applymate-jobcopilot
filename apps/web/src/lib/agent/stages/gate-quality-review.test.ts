@@ -47,7 +47,7 @@ function context(): Pick<PipelineCtx, 'roleConfigs' | 'aiConfig'> {
   }
 }
 
-beforeEach(() => mocks.modelChat.mockReset())
+beforeEach(() => { mocks.modelChat.mockReset() })
 
 describe('reviewApplicationQuality', () => {
   it('marks absent cover letter and job description as not applicable without calling a provider', async () => {
