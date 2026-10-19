@@ -4834,7 +4834,13 @@ type LeaseRecoveryFixtureDiagnostics = {
   adapterStage: LeaseRecoveryAdapterStage
   repairPlanResult: LeaseRecoveryModelResult
   repairWaitResult: LeaseRecoveryModelResult
+  finalRequestGraphFound: boolean
+  finalRequestGraphRoles: LeaseRecoveryGraphRole[]
 }
+
+type LeaseRecoveryGraphRole = "scout" | "dependent" | "scout-repair" | "other"
+
+const LEASE_RECOVERY_WAIT_OUTCOMES = new Set(["ready", "timed_out", "failed", "other"])
 
 const LEASE_RECOVERY_MODEL_RESULT_STATUSES = new Set(["completed", "failed", "missing", "other"])
 const LEASE_RECOVERY_MODEL_OUTPUT_STATUSES = new Set([
@@ -4892,6 +4898,147 @@ function leaseRecoveryModelResultProjection(value: unknown): LeaseRecoveryModelR
     isError: typeof source?.isError === "boolean" ? source.isError : null,
     outputStatus: diagnosticEnum(source?.outputStatus, LEASE_RECOVERY_MODEL_OUTPUT_STATUSES) as LeaseRecoveryModelResult["outputStatus"] | null ?? "other",
     errorCategory: diagnosticEnum(source?.errorCategory, LEASE_RECOVERY_MODEL_ERROR_CATEGORIES) as LeaseRecoveryModelResult["errorCategory"] | null ?? "other",
+  }
+}
+
+function leaseRecoveryGraphRoleOrder(value: unknown): LeaseRecoveryGraphRole[] {
+  const graph = record(value)
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : []
+  return nodes.slice(0, 16).map(value => {
+    const key = record(value)?.key
+    if (key === "scout") return "scout"
+    if (key === "analyst" || key === "dependent") return "dependent"
+    return key === "scout-repair" ? "scout-repair" : "other"
+  })
+}
+
+function leaseRecoveryWaitDiagnosticProjection(value: unknown): RecordValue {
+  const source = record(value)
+  const waitFound = source?.durableWaitFound === true
+  const turnFound = source?.durableTurnFound === true
+  return {
+    available: source?.available !== false,
+    latestPollOrdinal: boundedRepairWaitDiagnosticCount(source?.latestPollOrdinal),
+    latestOutcome: diagnosticEnum(source?.latestOutcome, LEASE_RECOVERY_WAIT_OUTCOMES) ?? "other",
+    durableWaitStatus: waitFound
+      ? diagnosticEnum(source?.durableWaitStatus, WAIT_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+    durableTurnStatus: turnFound
+      ? diagnosticEnum(source?.durableTurnStatus, TURN_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+    targetCount: diagnosticBoundedCount(source?.targetCount),
+    matchedCount: diagnosticBoundedCount(source?.matchedCount),
+  }
+}
+
+function leaseRecoveryModelCategoryProjection(value: unknown): RecordValue {
+  const result = leaseRecoveryModelResultProjection(value)
+  return { outputStatus: result.outputStatus, errorCategory: result.errorCategory }
+}
+
+function leaseRecoveryGraphDiagnosticProjection(value: unknown): RecordValue {
+  const source = record(value)
+  const found = source?.graphFound === true
+  return {
+    graphFound: found,
+    orderedRoles: found ? leaseRecoveryGraphRoleOrder(source?.graph) : [],
+  }
+}
+
+async function leaseRecoveryRepairWaitDiagnostic(
+  pool: Pool,
+  owner: Fixture,
+  pollOrdinal: number,
+  pollKey?: string,
+  observedOutcome?: unknown,
+): Promise<RecordValue> {
+  try {
+    const [turn, wait, result] = await Promise.all([
+      pool.query<{ status: string }>(
+        `SELECT turn."status" FROM "agent_turns" AS turn
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 LIMIT 1`,
+        [owner.turnId, owner.sessionId, owner.userId],
+      ),
+      pollKey ? pool.query<{ status: string; targetCount: number | null; matchedCount: number | null }>(
+        `SELECT wait."status",
+           CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN jsonb_array_length(wait."targetTaskIds") END AS "targetCount",
+           CASE WHEN jsonb_typeof(wait."matchedTaskIds") = 'array' THEN jsonb_array_length(wait."matchedTaskIds") END AS "matchedCount"
+         FROM "agent_wait_conditions" AS wait
+         JOIN "agent_turns" AS turn ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+         WHERE wait."turnId" = $1 AND wait."sessionId" = $2 AND wait."userId" = $3
+           AND turn."userId" = $3 AND wait."parentTaskId" = turn."rootTaskId" AND wait."idempotencyKey" = $4
+         LIMIT 1`,
+        [owner.turnId, owner.sessionId, owner.userId, pollKey],
+      ) : Promise.resolve({ rows: [] as Array<{ status: string; targetCount: number | null; matchedCount: number | null }> }),
+      pollKey ? pool.query<{ itemStatus: string; outputStatus: string | null }>(
+        `SELECT item."status" AS "itemStatus", item."content"->'output'->>'status' AS "outputStatus"
+         FROM "agent_items" AS item
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+         WHERE item."turnId" = $1 AND item."sessionId" = $2 AND item."taskId" = turn."rootTaskId"
+           AND item."type" = 'tool_result' AND item."content"->>'toolCallId' = $3
+           AND turn."userId" = $4 AND session."userId" = $4
+         ORDER BY item."createdAt" DESC LIMIT 1`,
+        [owner.turnId, owner.sessionId, pollKey, owner.userId],
+      ) : Promise.resolve({ rows: [] as Array<{ itemStatus: string; outputStatus: string | null }> }),
+    ])
+    return leaseRecoveryWaitDiagnosticProjection({
+      available: true,
+      latestPollOrdinal: pollOrdinal,
+      latestOutcome: observedOutcome ?? (result.rows[0]?.itemStatus === "failed"
+        ? "failed" : result.rows[0]?.outputStatus),
+      durableWaitFound: wait.rows.length > 0,
+      durableWaitStatus: wait.rows[0]?.status,
+      durableTurnFound: turn.rows.length > 0,
+      durableTurnStatus: turn.rows[0]?.status,
+      targetCount: wait.rows[0]?.targetCount,
+      matchedCount: wait.rows[0]?.matchedCount,
+    })
+  } catch {
+    return leaseRecoveryWaitDiagnosticProjection({ available: false, latestPollOrdinal: pollOrdinal })
+  }
+}
+
+async function leaseRecoveryPersistedGraphDiagnostic(pool: Pool, owner: Fixture): Promise<RecordValue> {
+  try {
+    const result = await pool.query<{ content: unknown }>(
+      `SELECT item."content" FROM "agent_items" AS item
+       JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" = 'task_graph'
+         AND item."taskId" = turn."rootTaskId" AND turn."userId" = $3 AND session."userId" = $3
+       ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`,
+      [owner.sessionId, owner.turnId, owner.userId],
+    )
+    const graph = diagnosticJsonRecord(result.rows[0]?.content)
+    return leaseRecoveryGraphDiagnosticProjection({ graphFound: graph !== null, graph })
+  } catch {
+    return { available: false, graphFound: false, orderedRoles: [] }
+  }
+}
+
+function leaseRecoveryFailureKind(error: unknown): string {
+  const name = error instanceof Error ? error.name : ""
+  if (name === "AssertionError") return "assertion"
+  if (name === "TimeoutError") return "timeout"
+  if (error instanceof Error) return "error"
+  return "other"
+}
+
+async function leaseRecoveryFailureDiagnostic(
+  pool: Pool,
+  owner: Fixture,
+  fixture: LeaseRecoveryFixtureDiagnostics,
+): Promise<RecordValue> {
+  const persistedSnapshot = await leaseRecoveryPersistedGraphDiagnostic(pool, owner)
+  return {
+    finalRequestGraph: leaseRecoveryGraphDiagnosticProjection({
+      graphFound: fixture.finalRequestGraphFound,
+      graph: { nodes: fixture.finalRequestGraphRoles.map(key => ({ key })) },
+    }),
+    persistedSnapshot,
+    repairPlanCategory: leaseRecoveryModelCategoryProjection(fixture.repairPlanResult),
+    repairWaitCategory: leaseRecoveryModelCategoryProjection(fixture.repairWaitResult),
   }
 }
 
@@ -5076,6 +5223,63 @@ async function restartFollowUpWaitDiagnostics(
 }
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("projects same-turn repair wait diagnostics to closed statuses and bounded counts", () => {
+    const secret = "private-turn-and-task-identifiers"
+    const projected = leaseRecoveryWaitDiagnosticProjection({
+      latestPollOrdinal: 4, latestOutcome: "timed_out",
+      durableWaitFound: true, durableWaitStatus: "timed_out",
+      durableTurnFound: true, durableTurnStatus: "waiting_for_dependency",
+      targetCount: 7, matchedCount: 3, taskId: secret, goal: secret,
+    })
+    const unknown = leaseRecoveryWaitDiagnosticProjection({
+      latestPollOrdinal: 999, latestOutcome: secret,
+      durableWaitFound: true, durableWaitStatus: secret,
+      durableTurnFound: true, durableTurnStatus: secret,
+      targetCount: "private-count", matchedCount: 10_001,
+    })
+    const failed = leaseRecoveryWaitDiagnosticProjection({ latestPollOrdinal: 2, latestOutcome: "failed" })
+    const missing = leaseRecoveryWaitDiagnosticProjection({ available: false, latestPollOrdinal: -1 })
+
+    expect(projected).toEqual({
+      available: true, latestPollOrdinal: 4, latestOutcome: "timed_out",
+      durableWaitStatus: "timed_out", durableTurnStatus: "waiting_for_dependency",
+      targetCount: 7, matchedCount: 3,
+    })
+    expect(unknown).toEqual({
+      available: true, latestPollOrdinal: 8, latestOutcome: "other",
+      durableWaitStatus: "other", durableTurnStatus: "other", targetCount: null, matchedCount: null,
+    })
+    expect(failed.latestOutcome).toBe("failed")
+    expect(missing).toEqual({
+      available: false, latestPollOrdinal: 0, latestOutcome: "other",
+      durableWaitStatus: "missing", durableTurnStatus: "missing", targetCount: null, matchedCount: null,
+    })
+    expect(JSON.stringify([projected, unknown, failed, missing])).not.toContain(secret)
+  })
+
+  it("projects final-request and persisted graph roles without arbitrary node data", () => {
+    const secret = "private-node-key-goal-and-id"
+    const projected = leaseRecoveryGraphDiagnosticProjection({ graphFound: true, graph: { nodes: [
+      { key: "scout", taskId: secret, goal: secret },
+      { key: "analyst", taskId: secret },
+      { key: "scout-repair", goal: secret },
+      { key: secret, id: secret },
+    ] } })
+    const missing = leaseRecoveryGraphDiagnosticProjection({ graphFound: false, graph: { nodes: [{ key: secret }] } })
+    const categories = {
+      plan: leaseRecoveryModelCategoryProjection({ outputStatus: secret, errorCategory: secret, body: secret }),
+      wait: leaseRecoveryModelCategoryProjection({ outputStatus: "ready", errorCategory: "task_graph", goal: secret }),
+    }
+
+    expect(projected).toEqual({ graphFound: true, orderedRoles: ["scout", "dependent", "scout-repair", "other"] })
+    expect(missing).toEqual({ graphFound: false, orderedRoles: [] })
+    expect(categories).toEqual({
+      plan: { outputStatus: "other", errorCategory: "other" },
+      wait: { outputStatus: "ready", errorCategory: "task_graph" },
+    })
+    expect(JSON.stringify([projected, missing, categories])).not.toContain(secret)
+  })
+
   it("projects restart child markers through the safe diagnostic allowlists", () => {
     const outcome = latestProcessFixtureJsonDiagnostic([
       `P3_CHILD_OUTCOME ${JSON.stringify({ role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing", hasResult: false, hasStructuredResult: false, prompt: "private" })}`,
@@ -11733,10 +11937,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     } catch (error) {
       let progress = JSON.stringify({ available: false })
       let waitResults: RecordValue = { available: false }
+      let repairWaitState: RecordValue = leaseRecoveryWaitDiagnosticProjection({ available: false })
       let rootFailure: RecordValue = { available: false }
       let verification: RecordValue = { available: false }
       let scoutResultDiagnostic: RecordValue = { available: false }
       try {
+        repairWaitState = await leaseRecoveryRepairWaitDiagnostic(
+          pool!, value, repairWaitCallIds.length, repairWaitCallIds.at(-1),
+          repairWaitStatuses.length === repairWaitCallIds.length ? repairWaitStatuses.at(-1) : undefined,
+        )
         const [initialWait, repairWait] = await Promise.all([
           scopedWaitToolResultDiagnostic(pool!, value, initialWaitCallId),
           scopedWaitToolResultDiagnostic(pool!, value, repairWaitCallIds.at(-1) ?? repairWaitCallId),
@@ -11784,6 +11993,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { label: "repairWaitResolutionReturned", value: "", safeValue: String(repairWaitResolutionReturned) },
         { label: "repairWaitResolvedOutcomeObserved", value: "", safeValue: String(repairWaitResolvedOutcomeObserved) },
         { label: "repairWaitReferenceObserved", value: "", safeValue: String(repairWaitReferenceObserved) },
+        { label: "repairWaitLatestPoll", value: "", safeValue: JSON.stringify(repairWaitState) },
         { label: "waitToolResults", value: "", safeValue: JSON.stringify(waitResults) },
         { label: "rootFailureEvidence", value: "", safeValue: JSON.stringify(rootFailure) },
         { label: "taskGraphVerdictEvidence", value: "", safeValue: JSON.stringify(verification) },
@@ -12290,7 +12500,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       runtimeExecuteInvocations: 0, runtimeExecuteFailureClass: "none", startupStage: "not_started",
       adapterExecutionOrdinal: 0, adapterRoundOrdinal: 0, adapterBranch: "not_started", adapterStage: "not_started",
       repairPlanResult: missingLeaseRecoveryModelResult(), repairWaitResult: missingLeaseRecoveryModelResult(),
+      finalRequestGraphFound: false, finalRequestGraphRoles: [],
     }
+    try {
     let initialWaitReportSeen = false
     let originalDependentTaskId = ""
     let repairTaskId = ""
@@ -12347,6 +12559,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             fixtureInvocationCounters.adapterRoundOrdinal = Math.min(round, 7)
             fixtureInvocationCounters.adapterBranch = "unexpected"
             fixtureInvocationCounters.adapterStage = "stream_entered"
+            if (execution >= 3) {
+              const finalGraph = currentGraphFromRequest(request)
+              fixtureInvocationCounters.finalRequestGraphFound = finalGraph !== null
+              fixtureInvocationCounters.finalRequestGraphRoles = leaseRecoveryGraphRoleOrder(finalGraph)
+            }
             if (execution === 1 && round === 1) {
               fixtureInvocationCounters.adapterBranch = "initial_plan"
               fixtureInvocationCounters.adapterStage = "branch_entered"
@@ -12757,6 +12974,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       criterionIds: ["candidate-count"], repairNodeKey: "scout-repair", repairTaskId,
     })
     expect(rootCompletedAfterRepair).toBe(true)
+    } catch (error: unknown) {
+      const diagnostic = await leaseRecoveryFailureDiagnostic(pool!, value, fixtureInvocationCounters)
+      throw new Error(
+        `Lease recovery failure (${leaseRecoveryFailureKind(error)}); diagnostic=${boundedDiagnostic(JSON.stringify(diagnostic), 1_200)}`,
+      )
+    }
   }, 90_000)
 
   it("stops an exact TaskGraph Turn, projects interrupted receipts, and removes every unpublished graph dispatch", async () => {
