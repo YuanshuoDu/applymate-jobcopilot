@@ -51,10 +51,78 @@ beforeEach(() => {
 })
 
 describe('runGate', () => {
+  it('keeps an unavailable quality review pending and explains the human-review fallback', async () => {
+    const ctx = context()
+    const base = packageFor(75)
+    const pkg = {
+      ...base,
+      coverLetter: 'A draft cover letter.',
+      job: { ...base.job, description: 'Incident response role.' },
+    }
+    mocks.modelChat.mockRejectedValue(new Error('provider-secret-detail'))
+
+    const result = await runGate([pkg], ctx)
+
+    expect(result.data?.approved).toHaveLength(0)
+    expect(result.data?.pending).toHaveLength(1)
+    expect(result.data?.skipped).toHaveLength(0)
+    expect(mocks.skipApplicationForGate).not.toHaveBeenCalled()
+    expect(ctx.emit).toHaveBeenCalledWith('agent_observation', {
+      role: 'reviewer',
+      observation: 'AI quality review did not complete; no quality result was produced. Normal match-threshold and material checks still apply; only eligible packages continue to human review.',
+    })
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_observation', expect.objectContaining({
+      observation: expect.stringContaining('provider-secret-detail'),
+    }))
+    expect(ctx.emit).toHaveBeenCalledWith('agent_question', expect.objectContaining({
+      questionId: 'application_review_job_1',
+    }))
+  })
+
+  it('applies the existing below-threshold skip after an unavailable quality review', async () => {
+    const ctx = context()
+    const base = packageFor(49)
+    const pkg = {
+      ...base,
+      coverLetter: 'A draft cover letter.',
+      job: { ...base.job, description: 'Incident response role.' },
+    }
+    mocks.modelChat.mockRejectedValue(new Error('provider-secret-detail'))
+
+    const result = await runGate([pkg], ctx)
+
+    expect(result.data?.pending).toHaveLength(0)
+    expect(result.data?.skipped).toHaveLength(1)
+    expect(mocks.skipApplicationForGate).toHaveBeenCalledWith(expect.objectContaining({
+      checkpoint: 'below_match_threshold',
+    }))
+    expect(ctx.emit).toHaveBeenCalledWith('agent_observation', {
+      role: 'reviewer',
+      observation: 'AI quality review did not complete; no quality result was produced. Normal match-threshold and material checks still apply; only eligible packages continue to human review.',
+    })
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_observation', expect.objectContaining({
+      observation: expect.stringContaining('pending'),
+    }))
+  })
+
   it('keeps a threshold-matching tailored resume in review even when autopilot is configured', async () => {
     const result = await runGate([packageFor(75, 'tailored_1')], context())
     expect(result.data?.approved).toHaveLength(0)
     expect(result.data?.pending).toHaveLength(1)
+  })
+
+  it('keeps the low-score clarification for a valid quality result', async () => {
+    const ctx = context()
+    ctx.askUser = vi.fn().mockResolvedValue('review')
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({
+      clScore: 4, fitGap: 'missing evidence', recommendation: 'add evidence', readyToApply: false,
+    }) })
+
+    const result = await runGate([{ ...packageFor(75), coverLetter: 'A draft cover letter.' }], ctx)
+
+    expect(ctx.askUser).toHaveBeenCalledWith('reviewer', expect.stringContaining('quality is low(4/10)'), expect.any(Array))
+    expect(result.data?.pending).toHaveLength(1)
+    expect(result.data?.skipped).toHaveLength(0)
   })
 
   it('marks a below-threshold package as skipped by default', async () => {

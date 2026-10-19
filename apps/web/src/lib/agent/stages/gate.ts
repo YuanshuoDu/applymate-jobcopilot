@@ -13,73 +13,24 @@
  *     pending  — queued for human review
  *     skipped  — below minMatchScore
  */
-import { modelChat } from '@/lib/model-router'
-import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ApplicationPackage, GateOutput, StageResult,
 } from '../types'
 import { stageOk } from '../types'
 import { skipApplicationForGate } from '../application-control'
 import { AgentExecutionCancelledError } from '../execution-control'
-import { roleAiConfig } from '../role-config'
 import { requireLegacyPolicy } from '../policy/legacy'
 import { hashArtifactConstraints } from '../artifacts/hash'
 import { preflightArtifact, reviewArtifact } from '../artifacts/review'
 import { artifactItemData } from '../artifacts/item'
 import { tailoringConstraints } from './prepare'
 import { createGateReviewReceipt } from './gate-review-receipt'
-
-// ── AI Quality Review ─────────────────────────────────────────────────────────
-
-interface QualityResult {
-  clScore:       number   // 0-10, how specific/relevant the cover letter is
-  fitGap:        string   // key missing skills / gaps
-  recommendation: string  // one-line suggestion
-  readyToApply:  boolean  // overall assessment
-}
+import { reviewApplicationQuality } from './gate-quality-review'
 
 function gateWriteOwner(ctx: PipelineCtx) {
   if (!ctx.sessionId) return undefined
   if (!ctx.turnId || !ctx.executionAttempt) throw new AgentExecutionCancelledError()
   return { turnId: ctx.turnId, executionAttempt: ctx.executionAttempt, signal: ctx.signal }
-}
-
-async function reviewApplicationQuality(
-  pkg: ApplicationPackage,
-  ctx: PipelineCtx,
-): Promise<QualityResult | null> {
-  // Only review if there's a cover letter to assess
-  if (!pkg.coverLetter && !pkg.job.description) return null
-
-  const reviewerCfg = ctx.roleConfigs.reviewer
-  const aiConfig: AiConfig = roleAiConfig('reviewer', reviewerCfg, ctx.aiConfig)
-
-  const prompt = `You are a hiring quality reviewer. Assess this application package.
-
-JOB: ${pkg.job.role} at ${pkg.job.company}${pkg.job.location ? ` (${pkg.job.location})` : ''}
-${pkg.job.description ? `JD: ${pkg.job.description.slice(0, 600)}` : ''}
-
-MATCH SCORE: ${pkg.score}%
-MATCHED KEYWORDS: ${pkg.matchedKeywords.slice(0, 5).join(', ')}
-MISSING KEYWORDS: ${pkg.missingKeywords.slice(0, 4).join(', ')}
-
-${pkg.coverLetter ? `COVER LETTER:\n${pkg.coverLetter.slice(0, 800)}` : 'NO COVER LETTER'}
-
-Return ONLY valid JSON:
-{
-  "clScore": <0-10, how specific/personalized the cover letter is to THIS job. 0=generic, 10=highly tailored>,
-  "fitGap": "<key missing skill or concern in one sentence>",
-  "recommendation": "<one actionable improvement for this specific application>",
-  "readyToApply": <true if score≥7 and materials look solid, false otherwise>
-}`
-
-  try {
-    const result = await modelChat([{ role: 'user', content: prompt }], aiConfig, 300)
-    const text = result.text.replace(/```json|```/g, '').trim()
-    return JSON.parse(text) as QualityResult
-  } catch {
-    return null
-  }
 }
 
 export async function runGate(
@@ -122,8 +73,14 @@ export async function runGate(
     })
 
     // ── Phase A: AI quality review ──────────────────────────────────────────
-    const quality = await reviewApplicationQuality(pkg, ctx)
-    if (quality) {
+    const qualityReview = await reviewApplicationQuality(pkg, ctx)
+    if (qualityReview.kind === 'unavailable') {
+      emit('agent_observation', {
+        role: 'reviewer',
+        observation: 'AI quality review did not complete; no quality result was produced. Normal match-threshold and material checks still apply; only eligible packages continue to human review.',
+      })
+    } else if (qualityReview.kind === 'valid') {
+      const quality = qualityReview.result
       const clTag  = quality.clScore >= 8 ? '✦ excellent' : quality.clScore >= 6 ? '◆ qualified' : '◇ Weak'
       const readyTag = quality.readyToApply ? '' : ' ⚠ Suggest improvements before submitting'
       emit('agent_observation', {
