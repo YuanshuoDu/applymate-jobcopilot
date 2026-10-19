@@ -127,13 +127,16 @@ function expectVerifiedDependencyProjectionItems(
   actual: unknown,
   expected: typeof SOURCE_DEPENDENCY_PROJECTION_ITEM | typeof SUMMARY_DEPENDENCY_PROJECTION_ITEM,
   criterionId: "candidate-count" | "finding-count",
+  sourceIntent?: Readonly<{ goal: string; successCriteria: readonly string[] }>,
 ): void {
   expect(Array.isArray(actual)).toBe(true)
   const items = Array.isArray(actual) ? actual : []
   expect(items).toHaveLength(1)
   const item = record(items[0])
   expect(item).not.toBeNull()
-  expect(Object.keys(item ?? {}).sort()).toEqual(["dependencyKey", "result", "role", "taskStatus", "verification"])
+  expect(Object.keys(item ?? {}).sort()).toEqual([
+    "dependencyKey", "result", "role", "taskStatus", "verification", ...(sourceIntent ? ["sourceIntent"] : []),
+  ].sort())
   expect(item).toMatchObject({
     dependencyKey: expected.dependencyKey, role: expected.role, taskStatus: expected.taskStatus,
   })
@@ -152,6 +155,30 @@ function expectVerifiedDependencyProjectionItems(
   expect(verification?.criteria).toEqual([{ criterionId, status: "passed", reasonCode: "criteria_met" }])
   expect(verification?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
   expect(verification?.resultDigest).toMatch(/^[a-f0-9]{64}$/)
+  if (sourceIntent) expectBoundedSourceIntent(item?.sourceIntent, sourceIntent)
+}
+
+function expectBoundedSourceIntent(value: unknown, expected: Readonly<{ goal: string; successCriteria: readonly string[] }>): void {
+  const intent = record(value)
+  expect(Object.keys(intent ?? {}).sort()).toEqual(["goal", "inputRelation", "successCriteria"])
+  expect(intent).toMatchObject(expected)
+  expect(["predates_current_inputs", "covers_current_inputs", "unknown"]).toContain(intent?.inputRelation)
+  expect(typeof intent?.goal).toBe("string")
+  expect((intent?.goal as string).length).toBeLessThanOrEqual(1200)
+  expect(Array.isArray(intent?.successCriteria)).toBe(true)
+  const criteria = intent?.successCriteria as unknown[]
+  expect(criteria.length).toBeLessThanOrEqual(8)
+  expect(criteria.every(item => typeof item === "string" && item.length <= 320)).toBe(true)
+  expect(JSON.stringify(intent)).not.toMatch(/stepId|inputId|inputThroughSequence|consumedInputIds|cursor/)
+}
+
+function dependencyEvidenceWithoutSourceIntent(value: unknown): unknown {
+  const context = record(value)
+  const items = Array.isArray(context?.items) ? context.items : []
+  return { ...context, items: items.map(item => {
+    const row = record(item)
+    return row ? Object.fromEntries(Object.entries(row).filter(([key]) => key !== "sourceIntent")) : item
+  }) }
 }
 
 const planLedgerTraceArtifactPath = process.env.AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH
@@ -8168,6 +8195,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(graph?.kind).toBe("task_graph_current")
               if (modelRounds === 1) {
+                const sourceIntents = Array.isArray(graph?.sourceIntent) ? graph.sourceIntent.map(record) : []
+                expect(sourceIntents.map(item => item?.nodeKey)).toEqual(["source", "summary", "large-source"])
+                expect(sourceIntents.map(item => [item?.goal, item?.successCriteria])).toEqual([
+                  ["Read the fixture source", ["Capture source evidence"]],
+                  ["Summarize the fixture source", ["Write a source summary"]],
+                  [OVERSIZED_SOURCE_GOAL, ["Return structured source evidence"]],
+                ])
+                for (const item of sourceIntents) {
+                  expect(Object.keys(item ?? {}).sort()).toEqual(["goal", "inputRelation", "nodeKey", "successCriteria"])
+                  expectBoundedSourceIntent(item && { goal: item.goal, successCriteria: item.successCriteria, inputRelation: item.inputRelation }, {
+                    goal: String(item?.goal ?? ""), successCriteria: Array.isArray(item?.successCriteria) ? item.successCriteria as string[] : [],
+                  })
+                }
+                expect(JSON.stringify(graph)).not.toMatch(/sourceStepId|inputThroughSequence|consumedInputIds|cursor/)
                 rootModelFailureStage = "resumed_graph_keys"
                 expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source"])
                 rootModelFailureStage = "resumed_graph_statuses"
@@ -8452,7 +8493,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               stage = "source_dependency_schema"
               expect(dependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
               stage = "source_dependency_items"
-              expectVerifiedDependencyProjectionItems(items, SOURCE_DEPENDENCY_PROJECTION_ITEM, "candidate-count")
+              expectVerifiedDependencyProjectionItems(items, SOURCE_DEPENDENCY_PROJECTION_ITEM, "candidate-count", {
+                goal: "Read the fixture source", successCriteria: ["Capture source evidence"],
+              })
               const childSnapshot = childContextSnapshot(lease)
               stage = "source_child_context_build"
               const childContext = await createChildContextBuilder(lease).build({
@@ -8468,11 +8511,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               stage = "source_profile_schema"
               expect(profileDependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
               stage = "source_profile_items"
-              expectVerifiedDependencyProjectionItems(profileDependencyContext?.items, SOURCE_DEPENDENCY_PROJECTION_ITEM, "candidate-count")
+              expectVerifiedDependencyProjectionItems(profileDependencyContext?.items, SOURCE_DEPENDENCY_PROJECTION_ITEM, "candidate-count", {
+                goal: "Read the fixture source", successCriteria: ["Capture source evidence"],
+              })
               const profileDependencyJson = JSON.stringify(profileDependencyContext)
+              const profileEvidenceJson = JSON.stringify(dependencyEvidenceWithoutSourceIntent(profileDependencyContext))
               stage = "source_profile_redaction"
               expect(profileDependencyJson).not.toContain("fixture-job-evidence")
-              expect(profileDependencyJson).not.toContain("Read the fixture source")
+              expect(profileEvidenceJson).not.toContain("Read the fixture source")
               expect(profileDependencyJson).not.toContain("fixture-final-item")
               stage = "source_system_boundary"
               expect(childContext.blocks.find(block => block.layer === "system")?.content)
@@ -8483,11 +8529,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               stage = "follow_up_dependency_schema"
               expect(dependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
               stage = "follow_up_dependency_items"
-              expectVerifiedDependencyProjectionItems(dependencyContext?.items, SUMMARY_DEPENDENCY_PROJECTION_ITEM, "finding-count")
+              expectVerifiedDependencyProjectionItems(dependencyContext?.items, SUMMARY_DEPENDENCY_PROJECTION_ITEM, "finding-count", {
+                goal: "Summarize the fixture source", successCriteria: ["Write a source summary"],
+              })
               const dependencyJson = JSON.stringify(dependencyContext)
+              const dependencyEvidenceJson = JSON.stringify(dependencyEvidenceWithoutSourceIntent(dependencyContext))
               stage = "follow_up_dependency_redaction"
               expect(dependencyJson).not.toContain("fixture-job-evidence")
-              expect(dependencyJson).not.toContain("Summarize the fixture source")
+              expect(dependencyEvidenceJson).not.toContain("Summarize the fixture source")
               expect(dependencyJson).not.toContain("fixture-final-item")
             }
             if (lease.role === "scout" || lease.role === "analyst") {
@@ -8611,18 +8660,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expectUnverifiedVerificationReport(oversizedStoredResult?.taskGraphVerificationReport, "candidate-count")
     const summarizeDependencyContext = record(childByGoal.get("Summarize the fixture source")?.context.taskGraphDependencyResults)
     expect(summarizeDependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
-    expectVerifiedDependencyProjectionItems(summarizeDependencyContext?.items, SOURCE_DEPENDENCY_PROJECTION_ITEM, "candidate-count")
+    expectVerifiedDependencyProjectionItems(summarizeDependencyContext?.items, SOURCE_DEPENDENCY_PROJECTION_ITEM, "candidate-count", {
+      goal: "Read the fixture source", successCriteria: ["Capture source evidence"],
+    })
     const summarizeDependencyJson = JSON.stringify(summarizeDependencyContext)
+    const summarizeEvidenceJson = JSON.stringify(dependencyEvidenceWithoutSourceIntent(summarizeDependencyContext))
     expect(summarizeDependencyJson).not.toContain("fixture-job-evidence")
-    expect(summarizeDependencyJson).not.toContain("Read the fixture source")
+    expect(summarizeEvidenceJson).not.toContain("Read the fixture source")
     expect(summarizeDependencyJson).not.toContain("fixture-final-item")
 
     const followUpDependencyContext = record(childByGoal.get(FOLLOW_UP_GOAL)?.context.taskGraphDependencyResults)
     expect(followUpDependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
-    expectVerifiedDependencyProjectionItems(followUpDependencyContext?.items, SUMMARY_DEPENDENCY_PROJECTION_ITEM, "finding-count")
+    expectVerifiedDependencyProjectionItems(followUpDependencyContext?.items, SUMMARY_DEPENDENCY_PROJECTION_ITEM, "finding-count", {
+      goal: "Summarize the fixture source", successCriteria: ["Write a source summary"],
+    })
     const followUpDependencyJson = JSON.stringify(followUpDependencyContext)
+    const followUpEvidenceJson = JSON.stringify(dependencyEvidenceWithoutSourceIntent(followUpDependencyContext))
     expect(followUpDependencyJson).not.toContain("fixture-job-evidence")
-    expect(followUpDependencyJson).not.toContain("Summarize the fixture source")
+    expect(followUpEvidenceJson).not.toContain("Summarize the fixture source")
     expect(followUpDependencyJson).not.toContain("fixture-final-item")
     const childDispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null; payload: RecordValue }>(
       `SELECT "idempotencyKey", "publishedAt", "payload" FROM "agent_outbox"

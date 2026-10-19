@@ -231,6 +231,18 @@ describe("StepContextBuilder", () => {
     expect(invalid.taskGraphRevision).toBeUndefined()
   })
 
+  it("keeps bounded source intent as untrusted graph evidence without checkpoint fields", async () => {
+    const sourceIntent = [{ nodeKey: "scout", goal: "Find roles in Dublin", successCriteria: ["Include direct apply URLs"], inputRelation: "unknown" }]
+    const observation = { id: "task-graph-current", content: { kind: "task_graph_current", revision: 7, nodes: [], sourceIntent } }
+    const store = new FakeInputClaimStore([])
+    const context = await new StepContextBuilder(store).build(request(store, { ...emptySnapshot, toolObservations: [observation] }))
+    const projected = context.blocks.find(item => item.id === "observation:task-graph-current")
+
+    expect(projected).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", content: observation.content })
+    expect(context.canonicalJson).toContain('"inputRelation":"unknown"')
+    expect(JSON.stringify(projected?.content)).not.toMatch(/sourceStepId|inputThroughSequence|consumedInputIds|cursor/)
+  })
+
   it("rehydrates an active marker input without adding the prior step ID to the new checkpoint", async () => {
     const store = new FakeInputClaimStore([input("steer-1", 2n, [{ type: "text", text: "Dublin" }], { status: "consumed", consumedByStepId: "old-step", consumedAt: now })])
     const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", { steeringMarkerState: { active: [activeMarker()] } }))

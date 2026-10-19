@@ -45,6 +45,7 @@ type FakePoolOptions = {
   graphContent?: unknown
   graphRevision?: number
   taskRows?: Array<Record<string, unknown>>
+  sourceStepRows?: Array<Record<string, unknown>>
   replayPayload?: unknown
   sourceEvidence?: Record<string, unknown>
   sourceUpdateCount?: number
@@ -160,6 +161,10 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
       }
       if (sql.startsWith("WITH wall_clock AS MATERIALIZED")) {
         return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
+      }
+      if (sql.startsWith("WITH current_candidates AS MATERIALIZED")) {
+        const rows = options.sourceStepRows ?? []
+        return { rows, rowCount: rows.length }
       }
       if (sql.startsWith('SELECT item."id"')) return options.missingGraph
         ? empty
@@ -602,6 +607,29 @@ describe("createPgTaskGraphCommandPort", () => {
 
     await expect(createPgTaskGraphCommandPort(fake.pool).readCurrent(scope)).resolves.toEqual({ revision: 0, nodes: [] })
     expect(fake.calls.some(call => call.sql.startsWith("SELECT EXISTS ("))).toBe(true)
+  })
+
+  it("keeps generic reads provenance-free and exposes safe source intent only through the planning read", async () => {
+    const input = scheduleInput()
+    const sourceStep = { id: "root-step", userId: input.scope.userId, turnUserId: input.scope.userId,
+      sessionId: input.scope.sessionId, turnId: input.scope.turnId, rootTaskId: input.scope.rootTaskId,
+      taskId: input.scope.rootTaskId, status: "streaming", attempt: 1, inputThroughSequence: "7", consumedInputIds: [],
+      sessionEventSequence: "7", checkpointInputsValid: true, hasPendingAcceptedInputs: false, isDiscoveredCurrent: true,
+      isExplicitCurrent: false, activeCount: 1 }
+    const fake = fakePool(input, { includeReplay: false, sourceStepRows: [sourceStep] })
+    const port = createPgTaskGraphCommandPort(fake.pool)
+    const { stepId: _stepId, ...scope } = input.scope
+
+    const ordinary = await port.readCurrent(scope)
+    expect(ordinary).not.toHaveProperty("sourceIntent")
+    expect(fake.calls.some(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toBe(false)
+
+    const planning = await port.readCurrentForPlanning!(scope)
+    expect(planning.current.sourceIntent).toEqual([{ nodeKey: "planned", goal: "Inspect the source",
+      successCriteria: ["Evidence captured"], inputRelation: "unknown" }])
+    expect(planning.currentInputCheckpoint).toEqual({ inputThroughSequence: 7n })
+    expect(JSON.stringify(planning.current)).not.toMatch(/currentInputCheckpoint|inputThroughSequence|source-step|root-step/)
+    expect(fake.calls.filter(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toHaveLength(1)
   })
 
   it("reloads graph state through the caller-owned client without opening another transaction", async () => {

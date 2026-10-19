@@ -1,5 +1,5 @@
 import type { PoolClient } from "pg"
-import { parseRegisteredScoutEnvelope, type RegisteredScoutEnvelope, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphExecutionScope, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
+import { parseRegisteredScoutEnvelope, type RegisteredScoutEnvelope, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphExecutionScope, type TaskGraphCurrentState, type TaskGraphPlanningCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { TaskGraphCommandError } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { actionList, transaction, type Queryable } from "./pg-store-persistence.js"
@@ -70,6 +70,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
       return transaction(pool, client => readCurrentWithClient(client, scope))
     },
+    async readCurrentForPlanning(scope: TaskGraphReadScope): Promise<TaskGraphPlanningCurrentState> {
+      return transaction(pool, client => readCurrentForPlanningWithClient(client, scope))
+    },
     async readCurrentResultPage(scope, request) {
       return transaction(pool, client => readCurrentResultPageWithClient(client, scope, request))
     },
@@ -80,6 +83,7 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
       return transaction(pool, client => readCurrentDiscoveryRecoveryPageWithClient(client, scope, request))
     },
     readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
+    readCurrentForPlanningWithClient(client, scope) { return readCurrentForPlanningWithClient(client, scope) },
   }
 }
 function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: SteeringReconciliationOperation["scope"]): boolean {
@@ -91,7 +95,12 @@ function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: Steeri
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
-  const loaded = await loadTaskGraph(client, input.scope)
+  const loaded = await loadTaskGraph(client, input.scope, true, {
+    includeSourceProvenance: !input.replaceUnstarted, currentStepId: input.scope.stepId,
+    // TaskGraph is root-only, and TurnEngine records root Step attempts as 1.
+    // parentAttemptCount belongs to the leased root task, not this Step.
+    currentStepAttempt: 1,
+  })
   const current = loaded.state, revision = current?.revision ?? 0
   const key = input.replaceUnstarted ? taskGraphSupersessionProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
     : taskGraphProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
@@ -118,7 +127,8 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
     }
     throw error
   }
-  const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []))
+  const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] },
+    new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []), loaded)
   const snapshot = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
   await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot, expectedRevision: revision,
@@ -131,6 +141,18 @@ async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: T
   const current = currentTaskGraph(loaded)
   const planningFacts = buildTaskGraphPlanningFacts(loaded)
   return planningFacts ? { ...current, planningFacts } : current
+}
+async function readCurrentForPlanningWithClient(
+  client: Pick<PoolClient, "query">, scope: TaskGraphReadScope,
+): Promise<TaskGraphPlanningCurrentState> {
+  const loaded = await loadCurrentWithClient(client, scope, true)
+  const current = currentTaskGraph(loaded), planningFacts = buildTaskGraphPlanningFacts(loaded)
+  const sourceIntent = current.nodes.map(node => ({ nodeKey: node.key, goal: node.goal, successCriteria: node.successCriteria,
+    inputRelation: loaded.sourceInputRelationByNodeKey?.get(node.key) ?? "unknown" as const }))
+  return {
+    current: { ...current, ...(planningFacts ? { planningFacts } : {}), sourceIntent },
+    currentInputCheckpoint: loaded.currentInputCheckpoint ?? null,
+  }
 }
 async function readCurrentResultPageWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, request: TaskGraphResultPageRequest) {
   const loaded = await loadCurrentWithClient(client, scope)
@@ -148,10 +170,11 @@ async function readCurrentDiscoveryRecoveryPageWithClient(
   return projectTaskGraphDiscoveryRecoveryPage(loaded, request)
 }
 
-async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope) {
+async function loadCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope, includeSourceProvenance = false) {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   await lockTaskGraphScope(client, scope)
-  const loaded = await loadTaskGraph(client, scope, false)
+  const loaded = await loadTaskGraph(client, scope, false, includeSourceProvenance
+    ? { includeSourceProvenance: true, discoverCurrentStep: true } : {})
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }

@@ -8,13 +8,14 @@ import { json, type Queryable } from "./pg-store-persistence.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import type { TaskGraphScheduleInput, TaskGraphTaskTemplate } from "./task-graph-command-port.js"
-import type { GraphParent } from "./task-graph-pg-state.js"
+import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
 import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
+import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 
@@ -51,7 +52,10 @@ function assertWriterReviewPlan(nodes: readonly TaskGraphNodeProposal[]): void {
   }
 }
 
-export async function createGraphTasks(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>): Promise<CreatedGraphTasks> {
+export async function createGraphTasks(
+  client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState,
+  priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
+): Promise<CreatedGraphTasks> {
   const parentTask = { budgetSnapshot: parent.budgetSnapshot } as Pick<SubagentTaskRecord, "budgetSnapshot">
   const policy = policyFromTask(parentTask)
   safeProposalSize(input.proposal)
@@ -118,7 +122,14 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     code: "task_graph_objective_coverage_incomplete", requirements: coverage.requirements,
   })
   const readyDependencyKeys = [...new Set(input.proposal.nodes.flatMap(node => preflightStatuses.get(node.key) === "queued" ? node.dependsOn : []))]
-  const completedDependencies = new Map((await loadTaskGraphDependencyResults(client, input.scope, readyDependencyKeys, snapshot.nodes)).map(item => [item.key, item] as const))
+  const dependencyResults = await loadTaskGraphDependencyResults(client, input.scope, readyDependencyKeys, snapshot.nodes)
+  const sourceNodes = new Map(current.nodes.map(node => [node.key, node] as const))
+  const completedDependencies = new Map(dependencyResults.map(item => {
+    const sourceNode = sourceNodes.get(item.key)
+    const sourceIntent = provenance && sourceNode ? sourceIntentForTaskGraphNode(sourceNode,
+      provenance?.sourceInputCheckpointByNodeKey?.get(item.key), provenance?.currentInputCheckpoint) : undefined
+    return [item.key, sourceIntent ? { ...item, sourceIntent } : item] as const
+  }))
   let scheduledBinding: ScheduledDraftCandidateBinding | undefined
   if (draftPair) {
     const statusByKey = preflightStatuses
@@ -150,9 +161,12 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     const childPolicy = inheritSubagentPolicy(policy, template.maxAttempts === undefined ? {} : { maxAttempts: template.maxAttempts })
     const candidateContext = scheduled && (node.templateId === "cover_letter_writer" || node.templateId === "cover_letter_reviewer")
       ? scheduledDraftTaskContext(template, scheduledBinding) : template.context ?? {}
+    const dependencyResults = node.dependsOn.map(key => completedDependencies.get(key))
+      .filter((value): value is ScopedDependencyResult => value !== undefined)
+    const contextDependencies = template.role === "analyst" ? dependencyResults
+      : dependencyResults.map(({ sourceIntent: _sourceIntent, ...dependency }) => dependency)
     const context = status === "queued" && node.dependsOn.length > 0
-      ? materializeTaskGraphDependencyContext(candidateContext, input.scope, node.dependsOn,
-        node.dependsOn.map(key => completedDependencies.get(key)).filter((value): value is ScopedDependencyResult => value !== undefined))
+      ? materializeTaskGraphDependencyContext(candidateContext, input.scope, node.dependsOn, contextDependencies)
       : candidateContext
     const child = await createSubagentTask(client, {
       userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,

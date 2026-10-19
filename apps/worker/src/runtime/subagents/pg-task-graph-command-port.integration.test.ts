@@ -1201,6 +1201,75 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(beforeReplay.item).toEqual([{ id: taskGraphItemId(owner.rootTaskId), revision: 1 }])
   }, 60_000)
 
+  it("reconstructs source freshness from the persisted proposal Step after a Worker restart", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const analyst = TASK_GRAPH_TEMPLATES.analyst
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [
+      value.rootTaskId, JSON.stringify(["agent.plan", ...analyst.allowedActions]),
+    ])
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.stepId, sequence: await nextEventSequence(adminPool!, value), cursor: 0n, planRevision: 0,
+      consumedInputIds: [],
+    })
+    const firstWorker = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const input = scheduleInput(value, 1, true)
+    const accepted = await firstWorker.appendAndSchedule(input)
+    expect(accepted.revision).toBe(1)
+
+    await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [value.stepId])
+    const priorFollowUpInputId = `p3-task-graph-follow-up-${value.turnId}`
+    const priorFollowUpStepId = `${value.originStepId}-prior`
+    const priorFollowUpSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationStep(adminPool!, value, {
+      id: priorFollowUpStepId, ordinal: 2, status: "completed", cursor: priorFollowUpSequence,
+      consumedInputIds: [priorFollowUpInputId],
+    })
+    await seedReconciliationInput(adminPool!, value, {
+      id: priorFollowUpInputId, clientMessageId: `${priorFollowUpInputId}-client`, delivery: "follow_up",
+      sequence: priorFollowUpSequence, consumedByStepId: priorFollowUpStepId, text: "Keep the original user direction", disposition: "submitted",
+    })
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: priorFollowUpStepId, sequence: await nextEventSequence(adminPool!, value), cursor: priorFollowUpSequence,
+      planRevision: 1, consumedInputIds: [priorFollowUpInputId],
+    })
+    const currentSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationStep(adminPool!, value, {
+      id: value.originStepId, ordinal: 3, status: "streaming", cursor: currentSequence,
+      consumedInputIds: [priorFollowUpInputId, value.firstSteerInputId],
+    })
+    await seedReconciliationInput(adminPool!, value, {
+      id: value.firstSteerInputId, clientMessageId: value.firstSteerClientMessageId, delivery: "steer",
+      sequence: currentSequence, consumedByStepId: value.originStepId, text: "Use the newer accepted direction", disposition: "steered",
+    })
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.originStepId, sequence: await nextEventSequence(adminPool!, value), cursor: currentSequence,
+      planRevision: 1, consumedInputIds: [priorFollowUpInputId, value.firstSteerInputId],
+    })
+
+    // A new command-port instance models reconstruction by a restarted Worker.
+    const restartedWorker = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const planning = await restartedWorker.readCurrentForPlanning!(readScope(value))
+    expect(planning.current.sourceIntent).toEqual([{
+      nodeKey: "task-1", goal: "Complete graph task 1", successCriteria: ["Task 1 completed"],
+      inputRelation: "predates_current_inputs",
+    }])
+    expect(planning.currentInputCheckpoint).toEqual({ inputThroughSequence: currentSequence })
+    expect(JSON.stringify(planning.current)).not.toMatch(/inputThroughSequence|consumedInputIds|firstSteer|originStepId/)
+    expect(await restartedWorker.readCurrent(readScope(value))).not.toHaveProperty("sourceIntent")
+
+    const malformedCheckpoint = await adminPool!.query(`UPDATE "agent_steps" SET "consumedInputIds" = '[]'::jsonb
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "status" = 'completed'`,
+    [priorFollowUpStepId, value.sessionId, value.turnId, value.rootTaskId])
+    expect(malformedCheckpoint.rowCount).toBe(1)
+    const malformedPlanning = await restartedWorker.readCurrentForPlanning!(readScope(value))
+    expect(malformedPlanning.currentInputCheckpoint).toBeNull()
+    expect(malformedPlanning.current.sourceIntent).toEqual([{
+      nodeKey: "task-1", goal: "Complete graph task 1", successCriteria: ["Task 1 completed"], inputRelation: "unknown",
+    }])
+  }, 60_000)
+
   it("serializes competing Writers for one completed Reviewer and leaves rejected reuse without durable writes", async () => {
     const value = fixture()
     additionalFixtures.push(value)

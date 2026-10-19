@@ -419,6 +419,25 @@ describe("TaskGraph turn observation", () => {
     expect(result.system.map(seed => seed.id)).toEqual(["completion-recovery:task-graph:5", "policy:task-graph"])
   })
 
+  it("projects only bounded source intent for current Root nodes and hides checkpoint identities", () => {
+    const result = mergeTaskGraphCurrentObservation(snapshot(), {
+      ...state,
+      sourceIntent: [
+        { nodeKey: "research", goal: "Find roles in Dublin.", successCriteria: ["Return current jobs."], inputRelation: "predates_current_inputs" },
+        { nodeKey: "foreign-node", goal: "Foreign.", successCriteria: ["Ignore."], inputRelation: "covers_current_inputs" },
+        { nodeKey: "research", goal: "Duplicate.", successCriteria: ["Ignore."], inputRelation: "unknown" },
+        { nodeKey: "research", goal: "Leaked.", successCriteria: [], inputRelation: "unknown", sourceStepId: "private-step", inputThroughSequence: "9" },
+      ],
+    } as TaskGraphCurrentState & { sourceIntent: unknown })
+    const content = result.toolObservations.find(item => item.id === "task-graph-current")?.content as Record<string, unknown>
+
+    expect(content.sourceIntent).toEqual([{
+      nodeKey: "research", goal: "Find roles in Dublin.", successCriteria: ["Return current jobs."], inputRelation: "predates_current_inputs",
+    }])
+    expect(JSON.stringify(content)).not.toMatch(/sourceStepId|inputId|cursor|inputThroughSequence|private-step/)
+    expect(content.nodes).toEqual((mergeTaskGraphCurrentObservation(snapshot(), state).toolObservations.at(-1)?.content as { nodes: unknown[] }).nodes)
+  })
+
   it("preserves safe native operation and structural result receipts in the current graph", () => {
     const native = { operationKind: "spawn" as const, operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: "c".repeat(64) }
     const nativeResult = { schemaVersion: "agent-harness.v2.task-graph.native-result.v1" as const, role: "scout", taskStatus: "completed" as const, disposition: "opaque" as const, resultDigest: "d".repeat(64) }
