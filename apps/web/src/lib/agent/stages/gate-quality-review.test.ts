@@ -18,6 +18,8 @@ const invalidResponses: Array<[string, string]> = [
   ['malformed JSON', '{not-json'],
   ['incomplete JSON', JSON.stringify({ clScore: 8, fitGap: 'gap', readyToApply: true })],
   ['extra fields', JSON.stringify({ ...validResult, unexpected: 'value' })],
+  ['duplicate fields', '{"clScore":2,"clScore":8,"fitGap":"gap","recommendation":"fix","readyToApply":true}'],
+  ['duplicate escaped field names', '{"clScore":2,"cl\\u0053core":8,"fitGap":"gap","recommendation":"fix","readyToApply":true}'],
   ['score with the wrong type', JSON.stringify({ ...validResult, clScore: '8' })],
   ['score below range', JSON.stringify({ ...validResult, clScore: -0.1 })],
   ['score above range', JSON.stringify({ ...validResult, clScore: 10.1 })],
