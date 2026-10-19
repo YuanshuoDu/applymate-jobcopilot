@@ -79,7 +79,7 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
         && values[0] === SESSION_CONTROL_RECOVERY_MAX_BATCH
       ) return none
       if (sql.includes("WITH candidates AS") || sql.includes("WITH stale AS")) return none
-      if (sql.includes('SELECT turn."source", turn."executionMode"') && sql.includes('FROM "agent_turns" AS turn')) {
+      if (sql.includes('SELECT turn."id", turn."source", turn."executionMode"') && sql.includes('FROM "agent_turns" AS turn')) {
         return state.turn.id === values[0] && state.turn.sessionId === values[1]
           ? { rows: [{ id: state.turn.id, source: state.turn.source, executionMode: state.turn.executionMode }], rowCount: 1 }
           : none
