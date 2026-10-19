@@ -16,7 +16,12 @@ const ROUTED_AGENT_EVENT_TYPE = new Set(["approval.resolved", "item.started", "q
 const AGENT_EVENT_SCHEMA_VERSION = "agent-harness.v2"
 const AGENT_EVENT_SCHEMA_NAMESPACE = "agent-harness."
 const AGENT_EVENT_ENVELOPE_ANCHORS = ["actor", "causationId", "correlationId", "createdAt", "id", "idempotencyKey", "itemId", "sequence", "sessionId", "taskId", "turnId", "type"]
+const AGENT_EVENT_DISTINCTIVE_ANCHORS = ["actor", "causationId", "correlationId", "idempotencyKey", "itemId", "payload", "sequence"]
+const AGENT_ITEM_TYPES = new Set(["agent_message", "tool_call", "tool_result", "user_message", "plan", "reasoning_summary", "subagent_activity", "approval_request", "approval_response", "question", "artifact", "context_compaction", "error"])
+const AGENT_ITEM_STATUSES = new Set(["started", "streaming", "completed", "failed", "interrupted"])
+const AGENT_ITEM_RECORD_KEYS = new Set(["schemaVersion", "id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "createdAt", "updatedAt"])
 const AGENT_EVENT_ENVELOPE_CORE_IDENTITY = ["id", "sessionId", "turnId", "type"]
+const AGENT_EVENT_TYPE = /^[a-z][a-z0-9_-]*\.[a-z0-9._-]+$/i
 const EVENT_REDACTION_MAX_DEPTH = 8
 const UUID_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const HASH_ID = /^[0-9a-f]{32,64}$/i
@@ -89,6 +94,17 @@ function validTimestamp(value: unknown): value is string {
   return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
 }
 
+function nullableTimestamp(value: unknown): boolean { return value === null || validTimestamp(value) }
+
+function jsonValue(value: unknown, depth = 0): value is RepositoryJsonValue {
+  if (depth > EVENT_REDACTION_MAX_DEPTH) return false
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true
+  if (typeof value === "number") return Number.isFinite(value)
+  if (Array.isArray(value)) return value.every(entry => jsonValue(entry, depth + 1))
+  const row = record(value)
+  return !!row && Object.values(row).every(entry => jsonValue(entry, depth + 1))
+}
+
 function validRouting(value: unknown): value is RoutingTuple {
   const row = record(value)
   return !!row && opaqueId(row.sessionId) && opaqueId(row.turnId) && nullableId(row.itemId) && nullableId(row.taskId)
@@ -97,26 +113,43 @@ function validRouting(value: unknown): value is RoutingTuple {
     && (row.outboxTopic === "agent.session.event" || row.outboxTopic === "agent.turn.wakeup")
 }
 
-function containsAgentEventEnvelopeShape(value: unknown, depth = 0): boolean {
+function isNestedAgentItem(row: JsonRecord, parentKey: string | undefined, schemaVersions: unknown[], hasEventAnchor: boolean, eventType: boolean): boolean {
+  const keys = Object.keys(row)
+  return parentKey === "item" && keys.length === AGENT_ITEM_RECORD_KEYS.size && keys.every(key => AGENT_ITEM_RECORD_KEYS.has(key))
+    && schemaVersions.length === 1 && schemaVersions[0] === AGENT_EVENT_SCHEMA_VERSION
+    && !hasEventAnchor && !eventType && opaqueId(row.id) && opaqueId(row.sessionId) && opaqueId(row.turnId)
+    && nullableId(row.stepId) && nullableId(row.taskId)
+    && typeof row.type === "string" && AGENT_ITEM_TYPES.has(row.type)
+    && typeof row.status === "string" && AGENT_ITEM_STATUSES.has(row.status)
+    && (row.phase === null || row.phase === "commentary" || row.phase === "final_answer")
+    && Number.isSafeInteger(row.revision) && (row.revision as number) >= 0 && jsonValue(row.content)
+    && nullableTimestamp(row.startedAt) && nullableTimestamp(row.completedAt)
+    && validTimestamp(row.createdAt) && validTimestamp(row.updatedAt)
+}
+
+function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: string): boolean {
   if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
-  if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1))
+  if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1, parentKey))
   const row = record(value)
   if (!row) return false
   const entries = Object.entries(row)
   const keys = new Set(entries.map(([key]) => key.toLowerCase()))
   const hasEnvelopeAnchor = AGENT_EVENT_ENVELOPE_ANCHORS.some(key => keys.has(key.toLowerCase()))
+  const hasEventAnchor = AGENT_EVENT_DISTINCTIVE_ANCHORS.some(key => keys.has(key.toLowerCase()))
+  const eventType = typeof row.type === "string" && AGENT_EVENT_TYPE.test(row.type)
   const schemaVersions = entries.filter(([key]) => key.toLowerCase() === "schemaversion").map(([, version]) => version)
   const hasSchemaVersion = schemaVersions.length > 0
-  const ambiguousSchemaVersion = schemaVersions.length > 1 && (keys.has("payload") || hasEnvelopeAnchor)
-  const versionedAgentEnvelope = schemaVersions.some(version => typeof version === "string"
+  const nestedAgentItem = isNestedAgentItem(row, parentKey, schemaVersions, hasEventAnchor, eventType)
+  const ambiguousSchemaVersion = !nestedAgentItem && schemaVersions.length > 1 && (hasEventAnchor || eventType)
+  const versionedAgentEnvelope = !nestedAgentItem && schemaVersions.some(version => typeof version === "string"
     && version.toLowerCase().startsWith(AGENT_EVENT_SCHEMA_NAMESPACE))
-  const malformedVersionedEnvelope = hasSchemaVersion && schemaVersions.some(version => typeof version !== "string")
-    && (keys.has("payload") || hasEnvelopeAnchor)
+  const malformedVersionedEnvelope = !nestedAgentItem && hasSchemaVersion && schemaVersions.some(version => typeof version !== "string")
+    && (hasEventAnchor || eventType)
   const unversionedPartialEnvelope = !hasSchemaVersion && keys.has("payload") && hasEnvelopeAnchor
   const envelopeShape = versionedAgentEnvelope || malformedVersionedEnvelope || unversionedPartialEnvelope
     || ambiguousSchemaVersion
     || !hasSchemaVersion && AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
-  return envelopeShape || entries.some(([, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1))
+  return envelopeShape || entries.some(([key, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1, key.toLowerCase()))
 }
 
 function containsDuplicateSchemaVersion(value: unknown, depth = 0): boolean {
