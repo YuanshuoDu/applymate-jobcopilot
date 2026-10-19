@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { Type } from "@sinclair/typebox"
 
@@ -15,6 +15,7 @@ beforeEach(() => {
   selectedJobDirectHistory.load.mockReset().mockImplementation(async () => [])
   rootTaskHistory.load.mockReset().mockImplementation(async () => [])
 })
+afterEach(() => vi.unstubAllEnvs())
 
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
@@ -22,6 +23,9 @@ import type pg from "pg"
 import { StepContextBuilder, type ContextBlock, type ContextOwnerFence, type StepContext } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StoredAgentInput } from "./context/input-claim-store.js"
 import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
+import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./subagents/scheduled-automation-snapshot.js"
+import { TASK_GRAPH_TEMPLATES } from "./subagents/task-graph-templates.js"
+import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./subagents/scheduled-automation-pipeline-bridge.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime as createCanonicalTurnRuntimeImpl, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { createChildExecutor, type ChildPublicDefinition } from "./subagents/child-executor.js"
@@ -453,6 +457,45 @@ function setup(overrides: Record<string, unknown> = {}) {
     authorizeUsage: async () => ({ settle: vi.fn(async () => undefined) }), ...overrides,
   })
   return { runtime, roots, tool, getModelCalls: () => calls }
+}
+
+function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntimeOptions> = {}) {
+  const roots = rootStore(), executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+  const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+  const bridge = vi.fn(async (owner: ScheduledAutomationPipelineBridgeScope) => ({ status: "ready" as const, attestation: scheduledPipelineAttestation(owner) }))
+  const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ status: "completed", report: scheduledPipelineReport }), { status: 200 }))
+  const commandPort: TaskGraphCommandPort = {
+    appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+  }
+  const runtime = createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+    workerId: lease.ownerId,
+    productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }),
+    stateLoader: async () => state({ source: "automation", automationRunMode: "scheduled", turnInput: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {
+      schemaVersion: SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION, targetRoles: ["Software Engineer"], targetLocations: ["Dublin"],
+      minScore: 70, dailyCap: 10, requireApproval: false, autoApply: false,
+    } } }),
+    taskGraphCommandPort: commandPort, taskGraphTemplates: TASK_GRAPH_TEMPLATES,
+    selectedJobPreparationLoader: async () => undefined, applicationFillPreparationLoader: async () => undefined,
+    rootTaskStore: roots as never, nativeVerificationFactory: () => nativeVerificationRuntime(),
+    turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+    modelRuntimeFactory: async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }),
+    authorizeUsage: async () => ({ settle: async () => undefined }), executionProjection, sessionProjection,
+    scheduledPipelineBridge: bridge, scheduledPipelineFetch: fetcher as typeof fetch,
+    ...overrides,
+  })
+  return { runtime, roots, executionProjection, sessionProjection, bridge, fetcher }
+}
+
+const scheduledPipelineReport = { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 12 }
+function scheduledPipelineAttestation(owner: ScheduledAutomationPipelineBridgeScope): ScheduledAutomationPipelineAttestation {
+  const digest = `sha256:${"a".repeat(64)}`
+  return { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner, snapshotDigest: digest, graphRevision: 1,
+    scout: { taskId: "scout-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: digest,
+      candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete", taskId: "scout-1", attemptCount: 1, completedCalls: 1, candidateCount: 1,
+        providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: digest } },
+    analyst: { taskId: "analyst-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: digest,
+      dependsOnTaskIds: ["scout-1"], jobIds: ["job-1"] }, evidenceDigest: digest }
 }
 
 async function rootToolNames(
@@ -4591,6 +4634,131 @@ describe("createCanonicalTurnRuntime", () => {
     const completedToolNames = events.filter(event => event.type === "tool_call.completed")
       .map(event => (event.payload as { toolName?: string }).toolName)
     expect(new Set(completedToolNames)).toEqual(new Set(["agent.plan"]))
+  })
+
+  it("hands a completed scheduled TaskGraph to Web with the fenced attestation and avoids double-finalizing execution", async () => {
+    vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
+    vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret-canary")
+    const run = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({ status: "completed", stepCount: 1, toolCallCount: 0 })
+    try {
+      const fixture = scheduledPipelineRuntimeFixture()
+      const result = await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+      expect(result).toMatchObject({ status: "completed" })
+      expect(fixture.bridge).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+        rootTaskId: "root-1", rootAttemptCount: 1, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion })
+      const [url, init] = fixture.fetcher.mock.calls[0]!
+      expect(url).toBe("https://applymate.example/api/internal/agent-runtime/scheduled-pipeline")
+      expect(new Headers(init?.headers).get("x-agent-worker-secret")).toBe("worker-secret-canary")
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      expect(body.owner).toEqual(expect.objectContaining({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
+        rootTaskId: "root-1", rootAttemptCount: 1, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }))
+      expect(String(init?.body)).not.toContain("worker-secret-canary")
+      expect(fixture.executionProjection.finish).not.toHaveBeenCalled()
+      expect(fixture.roots.finish.mock.invocationCallOrder[0]).toBeLessThan(fixture.sessionProjection.finish.mock.invocationCallOrder[0]!)
+      expect(fixture.sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
+    } finally { run.mockRestore() }
+  })
+
+  it("fails a scheduled canonical Turn with a typed prerequisite blocker when TaskGraph is disabled", async () => {
+    const run = vi.spyOn(TurnEngine.prototype, "run")
+    try {
+      const fixture = scheduledPipelineRuntimeFixture({ productionFlags: resolveProductionAgentFlags() })
+      const result = await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+      expect(result).toEqual({ status: "failed", summary: "scheduled_task_graph_unavailable" })
+      expect(run).not.toHaveBeenCalled()
+      expect(fixture.bridge).not.toHaveBeenCalled()
+      expect(fixture.fetcher).not.toHaveBeenCalled()
+      expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({
+        result: expect.objectContaining({ status: "failed", errorCode: "scheduled_task_graph_unavailable" }),
+      }))
+    } finally { run.mockRestore() }
+  })
+
+  it("fails a scheduled canonical Turn when its durable wait consumer is unavailable", async () => {
+    const run = vi.spyOn(TurnEngine.prototype, "run")
+    try {
+      const enabled = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+      const fixture = scheduledPipelineRuntimeFixture({ productionFlags: { ...enabled, consumeWaitOutcomes: false } })
+      const result = await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+      expect(result).toEqual({ status: "failed", summary: "scheduled_task_graph_unavailable" })
+      expect(run).not.toHaveBeenCalled()
+      expect(fixture.bridge).not.toHaveBeenCalled()
+      expect(fixture.fetcher).not.toHaveBeenCalled()
+    } finally { run.mockRestore() }
+  })
+
+  it("does not hand off manual or ordinary Turns", async () => {
+    const run = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({ status: "completed", stepCount: 1, toolCallCount: 0 })
+    try {
+      const fixture = scheduledPipelineRuntimeFixture({ stateLoader: async () => state({ source: "automation", automationRunMode: "manual", turnInput: { automationRunMode: "manual" } }) })
+      await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+      expect(fixture.bridge).not.toHaveBeenCalled()
+      expect(fixture.fetcher).not.toHaveBeenCalled()
+    } finally { run.mockRestore() }
+  })
+
+  it("turns bridge and pre-claim Web blocks into failed Turns", async () => {
+    vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
+    vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret-canary")
+    const run = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({ status: "completed", stepCount: 1, toolCallCount: 0 })
+    try {
+      const blocked = scheduledPipelineRuntimeFixture({ scheduledPipelineBridge: async () => ({ status: "blocked", reasonCode: "canonical_evidence_unavailable" }) })
+      await expect((await blocked.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "scheduled_pipeline_canonical_evidence_unavailable" })
+      expect(blocked.fetcher).not.toHaveBeenCalled()
+      expect(blocked.executionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed" }) }))
+
+      const denied = scheduledPipelineRuntimeFixture({ scheduledPipelineFetch: vi.fn<typeof fetch>(async () => new Response(
+        JSON.stringify({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" }), { status: 403 })) })
+      await expect((await denied.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "scheduled_pipeline_entitlement_required" })
+      expect(denied.executionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed" }) }))
+    } finally { run.mockRestore() }
+  })
+
+  it("leaves transient handoff failures unfinished so a later retry can complete", async () => {
+    vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
+    vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret-canary")
+    const run = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({ status: "completed", stepCount: 1, toolCallCount: 0 })
+    try {
+      const fixture = scheduledPipelineRuntimeFixture()
+      fixture.fetcher.mockImplementationOnce(async () => new Response(JSON.stringify({ status: "blocked", errorCode: "scheduled_pipeline_execution_failed" }), { status: 503 }))
+      const runtime = await fixture.runtime
+      await expect(runtime.execute({ lease, signal: new AbortController().signal })).rejects.toThrow("scheduled_pipeline_handoff_retryable")
+      expect(fixture.roots.finish).not.toHaveBeenCalled()
+      expect(fixture.executionProjection.finish).not.toHaveBeenCalled()
+      await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+      expect(fixture.fetcher).toHaveBeenCalledTimes(2)
+      expect(fixture.roots.finish).toHaveBeenCalledOnce()
+    } finally { run.mockRestore() }
+  })
+
+  it("does not invoke the scheduled bridge when the canonical engine is waiting", async () => {
+    const run = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({ status: "waiting_for_dependency", stepCount: 1, toolCallCount: 0, waitId: "wait-1" })
+    try {
+      const fixture = scheduledPipelineRuntimeFixture()
+      await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "waiting_for_dependency", waitId: "wait-1" })
+      expect(fixture.bridge).not.toHaveBeenCalled()
+      expect(fixture.fetcher).not.toHaveBeenCalled()
+      expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "waiting_for_dependency" }) }))
+    } finally { run.mockRestore() }
+  })
+
+  it("persists a Web-reported wait on the root and session without re-finalizing execution", async () => {
+    vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
+    vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret-canary")
+    const run = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({ status: "completed", stepCount: 1, toolCallCount: 0 })
+    try {
+      const fixture = scheduledPipelineRuntimeFixture({ scheduledPipelineFetch: vi.fn<typeof fetch>(async () => new Response(
+        JSON.stringify({ status: "waiting_for_user", waitId: "question-456", stage: "analysis" }), { status: 202 })) })
+      const result = await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+      expect(result).toEqual({ status: "waiting_for_user", waitId: "question-456" })
+      expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({
+        result: expect.objectContaining({ status: "waiting_for_user", waitId: "question-456" }),
+      }))
+      expect(fixture.executionProjection.finish).not.toHaveBeenCalled()
+      expect(fixture.sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
+        result: expect.objectContaining({ status: "waiting_for_user", waitId: "question-456" }),
+      }))
+    } finally { run.mockRestore() }
   })
 
 

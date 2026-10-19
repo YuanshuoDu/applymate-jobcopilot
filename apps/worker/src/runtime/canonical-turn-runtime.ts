@@ -48,6 +48,10 @@ import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletion
 import { configureNativeSemanticProgress } from "./canonical-turn-native-semantic-rejection.js"
 import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
 import { createCanonicalScheduledDraftRuntime } from "./scheduled-draft-runtime.js"
+import { createScheduledAutomationPipelineBridge, type ScheduledAutomationPipelineBridgeResult, type ScheduledAutomationPipelineBridgeScope, type ScheduledAutomationPersistedRoot, type ScheduledAutomationPersistedTask, type ScheduledAutomationPersistedTurn } from "./subagents/scheduled-automation-pipeline-bridge.js"
+import { currentTaskGraph, loadTaskGraph } from "./subagents/task-graph-pg-state.js"
+import { verifyCompletedTaskGraphNodeEvidence } from "./subagents/task-graph-pg-verification.js"
+import { postScheduledPipelineContinuation } from "./subagents/scheduled-pipeline-handoff.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"; export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
@@ -74,6 +78,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly turnBoundaryCompactionRunner?: (input: Parameters<typeof runTurnBoundaryContextCompaction>[0]) => Promise<{ readonly status: string }>
   readonly contextBuilderFactory?: (input: { pool: pg.Pool; scope: { userId: string } }) => TurnEngineOptions["contextBuilder"]
   readonly lifecycleSinkFactory?: (input: { lease: TurnLease; store: TurnEngineStore; owner: ExecutionOwnerFence }) => ToolLifecycleSink
+  /** Test seams for the scheduled-only, persisted-evidence handoff. */ readonly scheduledPipelineBridge?: (scope: ScheduledAutomationPipelineBridgeScope) => Promise<ScheduledAutomationPipelineBridgeResult>; readonly scheduledPipelineFetch?: typeof fetch
   /** Optional server-owned automation control projection; ordinary sessions are ignored by its SQL scope. */
   readonly executionProjection?: CanonicalExecutionProjection
   /** Optional server-owned automation session projection; ordinary sessions are ignored by its SQL scope. */
@@ -95,6 +100,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const artifactRepository = createAgentArtifactRepository(pool)
   const executionProjection = options.executionProjection ?? noopCanonicalExecutionProjection
   const sessionProjection = options.sessionProjection ?? noopCanonicalSessionProjection
+  const scheduledPipelineBridge = options.scheduledPipelineBridge ?? createPersistedScheduledPipelineBridge(pool)
   const reconcileTerminal = options.executionProjection || options.sessionProjection ? rootTasks.reconcileTerminal : undefined
   const productionFlags = options.productionFlags
   const consumeWaitOutcomes = productionFlags?.consumeWaitOutcomes ?? options.consumeWaitOutcomes === true
@@ -126,6 +132,15 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now, turnSource: state.source, automationRunMode: state.automationRunMode, turnInput: state.turnInput,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, applicationFillPreparationLoader: options.applicationFillPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
+    if (state.source === "automation" && state.automationRunMode === "scheduled"
+      && (!taskGraphPlanningEnabled || !childExecutionEnabled || !coordinationEnabled || !consumeWaitOutcomes) && !signal.aborted) {
+      const result = { status: "failed" as const, errorCode: "scheduled_task_graph_unavailable", stepCount: 0, toolCallCount: 0 }
+      const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions: [], now: now() })
+      await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })
+      await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+      await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+      return { status: "failed", summary: result.errorCode }
+    }
     if (!taskGraphPlanningEnabled && !signal.aborted) {
       const selectedJobPreparation = await (options.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(pool, lease, now())
       // Let TurnEngine preserve interruption if Stop or lease loss arrives during this async read.
@@ -244,13 +259,42 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     })
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     await sessionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
-    const result = await engine.run()
+    let result = await engine.run()
+    let webOwnsExecution = false
+    if (result.status === "completed" && taskGraphPlanningEnabled && state.source === "automation" && state.automationRunMode === "scheduled") {
+      const owner: ScheduledAutomationPipelineBridgeScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: root.id, rootAttemptCount: root.attemptCount, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
+      const evidence = await scheduledPipelineBridge(owner)
+      if (evidence.status === "blocked") result = { ...result, status: "failed", errorCode: `scheduled_pipeline_${evidence.reasonCode}` }
+      else {
+        const handoff = await postScheduledPipelineContinuation({ owner, attestation: evidence.attestation }, signal, options.scheduledPipelineFetch)
+        if (handoff.status === "blocked") result = { ...result, status: "failed", errorCode: handoff.errorCode }
+        else {
+          webOwnsExecution = true
+          if (handoff.status === "waiting_for_user") result = { ...result, status: "waiting_for_user", waitId: handoff.waitId }
+        }
+      }
+    }
     const discoveryShortlist = interactiveDiscoveryMode ? terminalInteractiveDiscoveryShortlist(result.status, acceptedDiscoveryShortlist, discoveryFailureCode) : undefined
     await rootTasks.finish({ lease, rootTaskId: root.id, result, ...(discoveryShortlist ? { metadata: { interactiveDiscoveryShortlist: discoveryShortlist } } : {}), now: now() })
     // The durable root is finalized first; a projection failure remains surfaced so queue retry can reconcile it.
-    await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
-    await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+    if (!webOwnsExecution) await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result }); await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     return { status: result.status, summary: result.errorCode, ...(result.waitId ? { waitId: result.waitId } : {}) }
   }
   return { execute, manager, childExecutionEnabled, coordinationEnabled, async close() { closed = true } }
+}
+function createPersistedScheduledPipelineBridge(pool: pg.Pool) { return createScheduledAutomationPipelineBridge({
+    load: scope => withScheduledPipelineRead(pool, scope.userId, async client => {
+      const turn = (await client.query<ScheduledAutomationPersistedTurn>(`SELECT "userId", "sessionId", "id" AS "turnId", "rootTaskId", "source", "executionMode", "input", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [scope.turnId, scope.sessionId, scope.userId])).rows[0]
+      const root = (await client.query<ScheduledAutomationPersistedRoot>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."status", task."attemptCount" FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId" WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1 AND task."parentTaskId" IS NULL AND session."userId" = $4`, [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])).rows[0]
+      if (!turn || !root) throw new Error("scheduled_pipeline_lineage_missing"); const graph = await loadTaskGraph(client, { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId }, false)
+      if (!graph.snapshot || !graph.state) throw new Error("scheduled_pipeline_graph_missing")
+      const tasks = (await client.query<ScheduledAutomationPersistedTask>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", task."role", task."taskType", task."status", task."attemptCount", task."failureReason", task."expectedOutputSchema", task."allowedActions", task."result" FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND session."userId" = $5`, [graph.snapshot.nodes.map(node => node.taskId), scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId])).rows
+      return { turn, root, snapshot: graph.snapshot, current: currentTaskGraph(graph), tasks }
+    }),
+    verifyCompletedNode: input => withScheduledPipelineRead(pool, input.scope.userId, client => verifyCompletedTaskGraphNodeEvidence(client, input)),
+  }) }
+async function withScheduledPipelineRead<T>(pool: Pick<pg.Pool, "connect">, userId: string, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect(); let committed = false
+  try { await client.query("BEGIN"); await client.query("SELECT set_config($1, $2, true)", ["app.user_id", userId]); const value = await work(client); await client.query("COMMIT"); committed = true; return value }
+  catch (error: unknown) { if (!committed) await client.query("ROLLBACK").catch(() => undefined); throw error } finally { client.release() }
 }

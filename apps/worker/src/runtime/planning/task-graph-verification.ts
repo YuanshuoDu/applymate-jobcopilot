@@ -6,6 +6,7 @@ import {
   parseFindingsFromScoutDependencyCheck,
   parseTaskGraphVerificationDependencyEvidence,
   parseTaskGraphVerificationEvidenceProjection,
+  taskGraphVerificationDependencyNodeKeys,
 } from "./task-graph-verification-cross-node.js"
 import type {
   TaskGraphVerificationDependencyEvidence,
@@ -21,6 +22,7 @@ export {
 } from "./task-graph-verification-cross-node.js"
 export type {
   TaskGraphVerificationCandidateProjection,
+  TaskGraphEmptyDiscoveryReceiptProjection,
   TaskGraphVerificationDependencyEvidence,
   TaskGraphVerificationDependencyGraphNode,
   TaskGraphVerificationEvidenceProjection,
@@ -203,12 +205,13 @@ function unverifiedEvaluation(contract: TaskGraphVerificationContract, reasonCod
   return { status: "unverified", reasonCode, criteria: contract.criteria.map(c => ({ criterionId: c.id, status: "unverified", reasonCode })) }
 }
 type CheckEvaluation = "passed" | "criterion_not_met" | "reported_score_below_minimum"
-function evaluateCheck(check: TaskGraphVerificationCheck, p: TaskGraphVerificationParsedProjection): CheckEvaluation {
+function evaluateCheck(check: TaskGraphVerificationCheck, p: TaskGraphVerificationParsedProjection, verifiedEmptyDiscovery: boolean): CheckEvaluation {
   if (check.kind === "findings_from_scout_dependency" || check.kind === "findings_cover_scout_candidates_gte") return "criterion_not_met"
-  if (check.kind === "candidate_count_gte") return p.role === "scout" && p.items.length >= check.minimum ? "passed" : "criterion_not_met"
-  if (check.kind === "finding_count_gte") return p.role === "analyst" && p.items.length >= check.minimum ? "passed" : "criterion_not_met"
-  if (check.kind === "evidence_count_gte") return p.evidenceIds.length >= check.minimum ? "passed" : "criterion_not_met"
-  if (check.kind === "all_candidates_have_evidence" || check.kind === "all_findings_have_evidence") return p.items.length >= check.minimumItems ? "passed" : "criterion_not_met"
+  if (check.kind === "candidate_count_gte") return p.role === "scout" && (p.items.length >= check.minimum || verifiedEmptyDiscovery && p.items.length === 0) ? "passed" : "criterion_not_met"
+  if (check.kind === "finding_count_gte") return p.role === "analyst" && (p.items.length >= check.minimum || verifiedEmptyDiscovery && p.items.length === 0) ? "passed" : "criterion_not_met"
+  if (check.kind === "evidence_count_gte") return (verifiedEmptyDiscovery ? 1 : p.emptyDiscoveryDigest ? 0 : p.evidenceIds.length) >= check.minimum ? "passed" : "criterion_not_met"
+  if (check.kind === "all_candidates_have_evidence" || check.kind === "all_findings_have_evidence") return verifiedEmptyDiscovery && p.items.length === 0 || p.items.length >= check.minimumItems ? "passed" : "criterion_not_met"
+  if (verifiedEmptyDiscovery && p.items.length === 0) return "passed"
   if (p.items.length < check.minimumFindings) return "criterion_not_met"
   const meets = (item: TaskGraphVerificationParsedProjection["items"][number]) => (item.score ?? -1) >= check.minimumScore
   return (check.aggregation === "any" ? p.items.some(meets) : p.items.every(meets)) ? "passed" : "reported_score_below_minimum"
@@ -219,6 +222,26 @@ export function evaluateTaskGraphVerification(
   projectionValue: TaskGraphVerificationEvidenceProjection,
   dependencyEvidence?: TaskGraphVerificationDependencyEvidence,
 ): TaskGraphVerificationEvaluation {
+  return evaluateTaskGraphVerificationInternal(contract, projectionValue, dependencyEvidence)
+}
+
+/** PG verifier only: digest must come from owner/attempt-bound persisted discovery receipts. */
+export function evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery(
+  contract: TaskGraphVerificationContract,
+  projectionValue: TaskGraphVerificationEvidenceProjection,
+  dependencyEvidence: TaskGraphVerificationDependencyEvidence | undefined,
+  verifiedDigest: string,
+): TaskGraphVerificationEvaluation {
+  if (!/^[a-f0-9]{64}$/.test(verifiedDigest)) return unverifiedEvaluation(contract, "canonical_evidence_invalid")
+  return evaluateTaskGraphVerificationInternal(contract, projectionValue, dependencyEvidence, verifiedDigest)
+}
+
+function evaluateTaskGraphVerificationInternal(
+  contract: TaskGraphVerificationContract,
+  projectionValue: TaskGraphVerificationEvidenceProjection,
+  dependencyEvidence?: TaskGraphVerificationDependencyEvidence,
+  verifiedEmptyDiscoveryDigest?: string,
+): TaskGraphVerificationEvaluation {
   try {
     if (contract.schemaVersion !== TASK_GRAPH_VERIFICATION_SCHEMA_VERSION || (contract.role !== "scout" && contract.role !== "analyst") || !Array.isArray(contract.criteria) || contract.criteria.length < 1 || contract.criteria.length > TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria) return { status: "unverified", reasonCode: "contract_invalid", criteria: [] }
     const parsed = parseTaskGraphVerificationEvidenceProjection(projectionValue)
@@ -227,15 +250,32 @@ export function evaluateTaskGraphVerification(
     const dependencies = parseTaskGraphVerificationDependencyEvidence(contract, dependencyEvidence)
     if (!dependencies) return unverifiedEvaluation(contract, "canonical_evidence_invalid")
     const findingJobIds = parsed.value.role === "analyst" ? parsed.value.items.map(item => item.jobId) : []
+    const verifiedEmptyDiscovery = Boolean(verifiedEmptyDiscoveryDigest && parsed.value.items.length === 0
+      && parsed.value.emptyDiscoveryDigest === verifiedEmptyDiscoveryDigest
+      && (parsed.value.role === "scout" ? parsed.value.evidenceIds.length === 1
+        && parsed.value.evidenceIds[0] === `read:source:jobs.discover:${verifiedEmptyDiscoveryDigest}`
+        : singleVerifiedEmptyScoutDependency(contract, dependencies, verifiedEmptyDiscoveryDigest)))
     const criteria = contract.criteria.map(c => {
       const result = c.check.kind === "findings_from_scout_dependency"
-        ? evaluateFindingsFromScoutDependency(c.check.dependencyNodeKey, findingJobIds, dependencies)
+        ? evaluateFindingsFromScoutDependency(c.check.dependencyNodeKey, findingJobIds, dependencies, verifiedEmptyDiscovery ? verifiedEmptyDiscoveryDigest : undefined)
         : c.check.kind === "findings_cover_scout_candidates_gte"
-          ? evaluateFindingsCoverScoutCandidates(c.check.dependencyNodeKey, findingJobIds, dependencies, c.check.minimumPercent)
-          : evaluateCheck(c.check, parsed.value)
+          ? evaluateFindingsCoverScoutCandidates(c.check.dependencyNodeKey, findingJobIds, dependencies, c.check.minimumPercent, verifiedEmptyDiscovery ? verifiedEmptyDiscoveryDigest : undefined)
+          : evaluateCheck(c.check, parsed.value, verifiedEmptyDiscovery)
       return result === "passed" ? { criterionId: c.id, status: "passed" as const, reasonCode: "criteria_met" as const } : { criterionId: c.id, status: "failed" as const, reasonCode: result }
     })
     const failed = criteria.find(c => c.status === "failed")
     return failed ? { status: "failed", reasonCode: failed.reasonCode, criteria } : { status: "passed", reasonCode: "criteria_met", criteria }
   } catch { return { status: "unverified", reasonCode: "contract_invalid", criteria: [] } }
+}
+
+function singleVerifiedEmptyScoutDependency(
+  contract: TaskGraphVerificationContract,
+  dependencies: ReadonlyMap<string, TaskGraphVerificationParsedProjection>,
+  digest: string,
+): boolean {
+  const keys = taskGraphVerificationDependencyNodeKeys(contract)
+  if (keys.length !== 1) return false
+  const source = dependencies.get(keys[0]!)
+  return source?.role === "scout" && source.items.length === 0 && source.emptyDiscoveryDigest === digest
+    && source.evidenceIds.length === 1 && source.evidenceIds[0] === `read:source:jobs.discover:${digest}`
 }
