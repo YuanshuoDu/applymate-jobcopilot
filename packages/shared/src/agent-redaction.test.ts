@@ -65,7 +65,7 @@ describe("agent event redaction", () => {
     expect(safe.data).toEqual({ draft: { name: "Berlin SWE automation", minScore: 85, autoApply: false } })
   })
 
-  it("preserves stable IDs but redacts unsafe question IDs and phone-like text", () => {
+  it("redacts structural IDs outside validated payloads and phone-like text", () => {
     const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
     const durableQuestionId = "0123456789abcdef".repeat(4)
     const safe = redactAgentEvent({
@@ -80,11 +80,28 @@ describe("agent event redaction", () => {
 
     expect(safe.body).toBe("Call [REDACTED_PHONE] about this task.")
     expect(safe.data).toEqual({
-      item: { taskId, questionId: "[REDACTED]", content: "[REDACTED]" },
-      wait: { questionId: durableQuestionId },
+      item: { taskId: "[REDACTED]", questionId: "[REDACTED]", content: "[REDACTED]" },
+      wait: { questionId: "[REDACTED]" },
       note: "Call [REDACTED_PHONE].",
     })
     expect(redactAgentEvent({ type: "task.updated", body: safe.body, data: safe.data })).toEqual(safe)
+  })
+
+  it("rejects underscore-prefixed phone-shaped IDs while redacting phone text", () => {
+    const phoneLikeId = "task_4155550123"
+    const routing: AgentEventRoutingContext = {
+      sessionId, turnId: phoneLikeId, itemId: null, taskId: null, actor: "user",
+      correlationId: phoneLikeId, causationId: null, outboxTopic: "agent.session.event",
+    }
+    const safe = redactAgentEvent({
+      type: "session.pause_requested",
+      body: `Call ${phoneLikeId} about this task.`,
+      data: { turnId: phoneLikeId, expectedRevision: 1, requestedAt: "2026-10-06T17:30:00.000Z" },
+      routing,
+    })
+
+    expect(safe.body).toBe("Call task_[REDACTED_PHONE] about this task.")
+    expect(safe.data).toEqual({ turnId: "[REDACTED]", expectedRevision: 1, requestedAt: "2026-10-06T17:30:00.000Z" })
   })
 
   it("does not exempt invalid or secret-like values in structural ID fields", () => {
@@ -112,7 +129,7 @@ describe("agent event redaction", () => {
     }
   })
 
-  it("preserves structural IDs beside unrelated schema version metadata", () => {
+  it("redacts structural IDs beside unrelated schema version metadata", () => {
     const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
     const safe = redactAgentEvent({
       type: "task.updated",
@@ -129,7 +146,7 @@ describe("agent event redaction", () => {
     expect(safe.data).toEqual({
       schemaVersion: "report.v1",
       report: { schemaVersion: "report.section.v1" },
-      item: { taskId },
+      item: { taskId: "[REDACTED]" },
       note: "Call [REDACTED_PHONE].",
     })
   })
@@ -514,7 +531,7 @@ describe("agent event redaction", () => {
     expect(JSON.stringify(safe)).not.toContain(taskId)
   })
 
-  it("preserves structural IDs in unrelated versioned payloads with event-like fields", () => {
+  it("redacts structural IDs in unrelated versioned payloads with event-like fields", () => {
     const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
     const safe = redactAgentEvent({
       type: "report.updated",
@@ -531,8 +548,8 @@ describe("agent event redaction", () => {
     expect(safe.data).toEqual({
       schemaVersion: "report.v1",
       type: "report.updated",
-      taskId,
-      payload: { taskId, note: "Call [REDACTED_PHONE]." },
+      taskId: "[REDACTED]",
+      payload: { taskId: "[REDACTED]", note: "Call [REDACTED_PHONE]." },
     })
   })
 
@@ -644,7 +661,7 @@ describe("agent event redaction", () => {
     }
   })
 
-  it("keeps opaque approval references and omits absent optional values", () => {
+  it("redacts unvalidated approval IDs and omits absent optional values", () => {
     const safe = redactAgentEvent({
       type: "automation_draft",
       body: "Review the automation before saving it.",
@@ -656,18 +673,18 @@ describe("agent event redaction", () => {
 
     expect(safe.data).toEqual({
       draft: { name: "Berlin SWE automation", triggerType: "weekdays" },
-      approval: { id: "approval_1", scopeHash: "hash_1" },
+      approval: { id: "[REDACTED]", scopeHash: "hash_1" },
     })
   })
 
-  it("keeps resume metadata but removes the resume content", () => {
+  it("keeps non-ID resume metadata and removes the resume content", () => {
     const safe = redactAgentEvent({
       type: "resume_tailored",
       body: "A tailored resume is ready.",
       data: { resume: { id: "resume_1", name: "Tailored CV", content: { summary: "private history" } } },
     })
 
-    expect(safe.data).toEqual({ resume: { id: "resume_1", name: "Tailored CV", content: "[REDACTED]" } })
+    expect(safe.data).toEqual({ resume: { id: "[REDACTED]", name: "Tailored CV", content: "[REDACTED]" } })
   })
 
   it("preserves only validated question and approval routing identities", () => {

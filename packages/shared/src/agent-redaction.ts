@@ -6,12 +6,11 @@ const SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authori
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
 const SENSITIVE_KEY_TOKEN = /\b(?:sk[-_]|gh[pousr]_|github_pat_|xox[baprs]-)[a-z0-9._~+/=-]{8,}/gi
 const SENSITIVE_EMAIL = /\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b/gi
-const SENSITIVE_PHONE = /(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)/g
+const SENSITIVE_PHONE = /(?:(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)|(?<=_)(?:\+?\d[\d\s().-]{8,}\d)(?![a-z0-9]))/gi
 const SENSITIVE_ASSIGNMENT = /\b(password|secret|token|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi
 const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|(?:full[_-]?)?resume(?:[_-]?(?:text|content|data))?|cv(?:[_-]?(?:text|content|data))?|raw[_-]?(?:content|text|data)|content|value|question|answer|sensitive|confirmed[_-]?answers)/i
 const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
 const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid", "id", "intentid", "itemid", "messageid", "questionid", "sessionid", "taskid", "toolcallid", "turnid", "waitid"])
-const ROUTED_AGENT_EVENT_TYPE = new Set(["approval.resolved", "item.started", "question.answered", "task.interrupt.accepted", "turn.wakeup"])
 const AGENT_EVENT_SCHEMA_VERSION = "agent-harness.v2"
 const AGENT_EVENT_SCHEMA_NAMESPACE = "agent-harness."
 const AGENT_EVENT_ENVELOPE_ANCHORS = ["actor", "causationId", "correlationId", "createdAt", "id", "idempotencyKey", "itemId", "sequence", "sessionId", "taskId", "turnId", "type"]
@@ -260,8 +259,7 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
   const route = input.routing && validRouting(input.routing) ? input.routing : envelope?.routing
   const hasEventEnvelopeShape = containsAgentEventEnvelopeShape(input.data, 0, undefined, route)
   const preserveFollowUpMessageId = route !== undefined && validFollowUpPayload(input.type, input.data, route)
-  const allowStructuralIds = input.type !== "input.accepted" && input.routing === undefined && !ROUTED_AGENT_EVENT_TYPE.has(input.type) && !hasEventEnvelopeShape
-  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, allowStructuralIds, !hasEventEnvelopeShape, route, false, preserveFollowUpMessageId)
+  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, false, !hasEventEnvelopeShape, route, false, preserveFollowUpMessageId)
   const data = route && input.data !== undefined ? input.routing ? redactWaitRouting(input.type, input.data, safe, route)
     : envelope ? preserveEnvelope(input.type, envelope.row, safe, route) : safe : safe
   return {
