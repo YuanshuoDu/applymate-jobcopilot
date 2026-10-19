@@ -13,6 +13,8 @@ const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|a
 const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
 const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid", "id", "intentid", "itemid", "questionid", "sessionid", "taskid", "toolcallid", "turnid", "waitid"])
 const ROUTED_AGENT_EVENT_TYPE = new Set(["approval.resolved", "item.started", "question.answered", "task.interrupt.accepted", "turn.wakeup"])
+const AGENT_EVENT_ENVELOPE_ANCHORS = ["actor", "causationId", "correlationId", "createdAt", "id", "idempotencyKey", "itemId", "sequence", "sessionId", "taskId", "turnId", "type"]
+const AGENT_EVENT_ENVELOPE_CORE_IDENTITY = ["id", "sessionId", "turnId", "type"]
 const UUID_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const HASH_ID = /^[0-9a-f]{32,64}$/i
 const PREFIXED_ID = /^[a-z][a-z0-9._:-]{0,63}[_:.-][a-z0-9][a-z0-9._:-]{0,191}$/i
@@ -94,7 +96,8 @@ function validRouting(value: unknown): value is RoutingTuple {
 function hasAgentEventEnvelopeShape(value: unknown): boolean {
   const row = record(value)
   return !!row && (Object.hasOwn(row, "schemaVersion")
-    || Object.hasOwn(row, "payload") && ["id", "sessionId", "turnId", "type", "correlationId"].every(key => Object.hasOwn(row, key)))
+    || Object.hasOwn(row, "payload") && AGENT_EVENT_ENVELOPE_ANCHORS.some(key => Object.hasOwn(row, key))
+    || AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => Object.hasOwn(row, key)))
 }
 
 function fullEnvelope(type: string, value: unknown): { row: JsonRecord; routing: RoutingTuple } | null {

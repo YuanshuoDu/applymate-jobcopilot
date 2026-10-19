@@ -125,6 +125,21 @@ describe("agent event redaction", () => {
       expect(safe.taskId).not.toBe(candidateTaskId)
       expect((safe.payload as Record<string, unknown>).taskId).not.toBe(candidateTaskId)
     }
+
+    const numericUuidTaskId = "12345678-1234-5678-9012-123456789012"
+    const partialEnvelope = {
+      id: "70463535-1444-4bba-ae3b-b80578d2dd0f", sessionId, turnId, type: "future.agent.event",
+      taskId: numericUuidTaskId, payload: { taskId: numericUuidTaskId },
+    }
+    const safePartialEnvelope = redactAgentEvent({ type: "future.agent.event", body: "", data: partialEnvelope }).data as Record<string, unknown>
+    expect(safePartialEnvelope.taskId).not.toBe(numericUuidTaskId)
+    expect((safePartialEnvelope.payload as Record<string, unknown>).taskId).not.toBe(numericUuidTaskId)
+
+    const partialWithoutPayload = {
+      id: "70463535-1444-4bba-ae3b-b80578d2dd0f", sessionId, turnId, type: "future.agent.event", taskId: numericUuidTaskId,
+    }
+    const safeWithoutPayload = redactAgentEvent({ type: "future.agent.event", body: "", data: partialWithoutPayload }).data as Record<string, unknown>
+    expect(safeWithoutPayload.taskId).not.toBe(numericUuidTaskId)
   })
 
   it("keeps opaque approval references and omits absent optional values", () => {
