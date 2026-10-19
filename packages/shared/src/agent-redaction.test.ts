@@ -177,6 +177,64 @@ describe("agent event redaction", () => {
     expect(JSON.stringify(safe)).not.toContain(taskId)
   })
 
+  it("fails closed when conflicting case-variant schema versions wrap an AgentEvent", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "future.agent.event",
+      body: "",
+      data: {
+        SchemaVersion: "report.v1",
+        schemaVersion: "agent-harness.v3",
+        id: "70463535-1444-4bba-ae3b-b80578d2dd0f",
+        sessionId,
+        turnId,
+        type: "future.agent.event",
+        taskId,
+        payload: { taskId },
+      },
+    }).data as { taskId: string; payload: { taskId: string } }
+
+    expect(safe.taskId).toBe("[REDACTED]")
+    expect(safe.payload.taskId).toBe("[REDACTED]")
+    expect(JSON.stringify(safe)).not.toContain(taskId)
+  })
+
+  it("redacts opaque structural IDs from unsupported AgentEvent versions", () => {
+    const ids = {
+      id: "event_opaque_93a1",
+      sessionId: "session_opaque_27b4",
+      turnId: "turn_opaque_815e",
+      taskId: "task_opaque_54c2",
+      nestedTaskId: "child_opaque_741d",
+    }
+    const safe = redactAgentEvent({
+      type: "future.agent.event",
+      body: "",
+      data: {
+        schemaVersion: "agent-harness.v3",
+        id: ids.id,
+        sessionId: ids.sessionId,
+        turnId: ids.turnId,
+        type: "future.agent.event",
+        taskId: ids.taskId,
+        payload: { taskId: ids.nestedTaskId },
+      },
+    }).data as { id: string; sessionId: string; turnId: string; taskId: string; payload: { taskId: string } }
+
+    expect(safe).toEqual({
+      schemaVersion: "agent-harness.v3",
+      id: "[REDACTED]",
+      sessionId: "[REDACTED]",
+      turnId: "[REDACTED]",
+      type: "future.agent.event",
+      taskId: "[REDACTED]",
+      payload: { taskId: "[REDACTED]" },
+    })
+    const serialized = JSON.stringify(safe)
+    for (const id of Object.values(ids)) expect(serialized).not.toContain(id)
+    for (const suffix of ["93a1", "27b4", "815e", "54c2", "741d"]) expect(serialized).not.toContain(suffix)
+  })
+
   it("redacts IDs in incomplete Agent namespace envelopes without anchors", () => {
     const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
     const safe = redactAgentEvent({
@@ -455,5 +513,25 @@ describe("agent event redaction", () => {
     expect(payload).toMatchObject({ waitKind: "question", waitId, itemId, turnId, toolCallId, status: "answered",
       nextTurnRevision: 9, answerAvailable: true, answer: "[REDACTED]" })
     expect(JSON.stringify(twice)).not.toContain("candidate@example.com")
+
+    const nestedDuplicate = {
+      ...raw,
+      payload: { ...raw.payload, metadata: { SchemaVersion: "report.v1", schemaVersion: "agent-harness.v3", taskId: "task_nested_opaque_85d4" } },
+    }
+    const duplicateEnvelopes = [{ ...raw, SchemaVersion: "report.v1" }, nestedDuplicate]
+    const structuralIds = [raw.id, raw.sessionId, raw.turnId, raw.itemId, raw.correlationId, raw.causationId,
+      raw.payload.waitId, raw.payload.itemId, raw.payload.turnId, raw.payload.toolCallId, "task_nested_opaque_85d4"]
+
+    for (const envelope of duplicateEnvelopes) {
+      const ambiguous = redactAgentEvent({ type: "question.answered", body: "", data: envelope }).data as {
+        id: string; sessionId: string; turnId: string; itemId: string; correlationId: string; causationId: string
+        taskId: null; payload: { waitId: string; itemId: string; turnId: string; toolCallId: string }
+      }
+      expect(ambiguous).toMatchObject({ id: "[REDACTED]", sessionId: "[REDACTED]", turnId: "[REDACTED]",
+        itemId: "[REDACTED]", correlationId: "[REDACTED]", causationId: "[REDACTED]", taskId: null,
+        payload: { waitId: "[REDACTED]", itemId: "[REDACTED]", turnId: "[REDACTED]", toolCallId: "[REDACTED]" } })
+      const serialized = JSON.stringify(ambiguous)
+      for (const id of structuralIds) expect(serialized).not.toContain(id)
+    }
   })
 })

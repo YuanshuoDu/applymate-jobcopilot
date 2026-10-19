@@ -105,20 +105,33 @@ function containsAgentEventEnvelopeShape(value: unknown, depth = 0): boolean {
   const entries = Object.entries(row)
   const keys = new Set(entries.map(([key]) => key.toLowerCase()))
   const hasEnvelopeAnchor = AGENT_EVENT_ENVELOPE_ANCHORS.some(key => keys.has(key.toLowerCase()))
-  const hasSchemaVersion = keys.has("schemaversion")
-  const schemaVersion = entries.find(([key]) => key.toLowerCase() === "schemaversion")?.[1]
-  const versionedAgentEnvelope = typeof schemaVersion === "string" && schemaVersion.toLowerCase().startsWith(AGENT_EVENT_SCHEMA_NAMESPACE)
-  const malformedVersionedEnvelope = hasSchemaVersion && typeof schemaVersion !== "string"
+  const schemaVersions = entries.filter(([key]) => key.toLowerCase() === "schemaversion").map(([, version]) => version)
+  const hasSchemaVersion = schemaVersions.length > 0
+  const ambiguousSchemaVersion = schemaVersions.length > 1 && (keys.has("payload") || hasEnvelopeAnchor)
+  const versionedAgentEnvelope = schemaVersions.some(version => typeof version === "string"
+    && version.toLowerCase().startsWith(AGENT_EVENT_SCHEMA_NAMESPACE))
+  const malformedVersionedEnvelope = hasSchemaVersion && schemaVersions.some(version => typeof version !== "string")
     && (keys.has("payload") || hasEnvelopeAnchor)
   const unversionedPartialEnvelope = !hasSchemaVersion && keys.has("payload") && hasEnvelopeAnchor
   const envelopeShape = versionedAgentEnvelope || malformedVersionedEnvelope || unversionedPartialEnvelope
+    || ambiguousSchemaVersion
     || !hasSchemaVersion && AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
   return envelopeShape || entries.some(([, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1))
 }
 
+function containsDuplicateSchemaVersion(value: unknown, depth = 0): boolean {
+  if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
+  if (Array.isArray(value)) return value.some(entry => containsDuplicateSchemaVersion(entry, depth + 1))
+  const row = record(value)
+  if (!row) return false
+  const entries = Object.entries(row)
+  const schemaVersionCount = entries.filter(([key]) => key.toLowerCase() === "schemaversion").length
+  return schemaVersionCount > 1 || entries.some(([, entry]) => containsDuplicateSchemaVersion(entry, depth + 1))
+}
+
 function fullEnvelope(type: string, value: unknown): { row: JsonRecord; routing: RoutingTuple } | null {
   const row = record(value)
-  if (!row || row.schemaVersion !== AGENT_EVENT_SCHEMA_VERSION || row.type !== type || !opaqueId(row.id) || !opaqueId(row.sessionId) || !opaqueId(row.turnId)
+  if (!row || containsDuplicateSchemaVersion(row) || row.schemaVersion !== AGENT_EVENT_SCHEMA_VERSION || row.type !== type || !opaqueId(row.id) || !opaqueId(row.sessionId) || !opaqueId(row.turnId)
     || !nullableId(row.itemId) || !nullableId(row.taskId) || !opaqueId(row.correlationId)
     || !nullableId(row.causationId) || !validIdempotencyKey(row.idempotencyKey) || !record(row.payload)) return null
   if (!validSequence(row.sequence) || (row.createdAt !== undefined && !validTimestamp(row.createdAt))) return null
@@ -216,9 +229,10 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
 function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
   const normalizedKey = key?.toLowerCase()
-  const structuralId = allowStructuralIds && typeof value === "string" && normalizedKey !== undefined
-    && STRUCTURAL_ID_KEY.has(normalizedKey)
+  const structuralIdKey = normalizedKey !== undefined && STRUCTURAL_ID_KEY.has(normalizedKey)
+  const structuralId = allowStructuralIds && typeof value === "string" && structuralIdKey
     && (normalizedKey === "questionid" ? stableOpaqueId(value) : opaqueId(value))
+  if (structuralIdKey && value !== null && !structuralId) return "[REDACTED]"
   const safeKey = normalizedKey ? EVENT_SAFE_KEY.has(normalizedKey) : false
   if (key && !safeKey && !structuralId && EVENT_SENSITIVE_KEY.test(key) && key !== "resume" && key !== "cv") return "[REDACTED]"
   if (insideResume && key === "content") return "[REDACTED]"
