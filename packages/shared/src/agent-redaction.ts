@@ -11,6 +11,7 @@ const SENSITIVE_PHONE = /(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)/g
 const SENSITIVE_ASSIGNMENT = /\b(password|secret|token|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi
 const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|(?:full[_-]?)?resume(?:[_-]?(?:text|content|data))?|cv(?:[_-]?(?:text|content|data))?|raw[_-]?(?:content|text|data)|content|value|question|answer|sensitive|confirmed[_-]?answers)/i
 const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
+const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid", "id", "intentid", "itemid", "questionid", "sessionid", "taskid", "toolcallid", "turnid", "waitid"])
 const UUID_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const HASH_ID = /^[0-9a-f]{32,64}$/i
 const PREFIXED_ID = /^[a-z][a-z0-9._:-]{0,63}[_:.-][a-z0-9][a-z0-9._:-]{0,191}$/i
@@ -33,6 +34,10 @@ function opaqueId(value: unknown): value is string {
     || /(?:^|[:._-])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)
     || /(?:^|[:._-])[0-9a-f]{32,64}$/i.test(value)
   return (stable || PREFIXED_ID.test(value)) && (stable || redactSensitiveText(value) === value)
+}
+
+function stableOpaqueId(value: unknown): value is string {
+  return opaqueId(value) && (UUID_ID.test(value) || HASH_ID.test(value) || CUID_ID.test(value))
 }
 
 function nullableId(value: unknown): value is string | null { return value === null || opaqueId(value) }
@@ -182,10 +187,14 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
  */
 function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = 8, insideResume = false): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
-  const safeKey = key ? EVENT_SAFE_KEY.has(key.toLowerCase()) : false
-  if (key && !safeKey && EVENT_SENSITIVE_KEY.test(key) && key !== "resume" && key !== "cv") return "[REDACTED]"
+  const normalizedKey = key?.toLowerCase()
+  const structuralId = typeof value === "string" && normalizedKey !== undefined
+    && STRUCTURAL_ID_KEY.has(normalizedKey)
+    && (normalizedKey === "questionid" ? stableOpaqueId(value) : opaqueId(value))
+  const safeKey = normalizedKey ? EVENT_SAFE_KEY.has(normalizedKey) : false
+  if (key && !safeKey && !structuralId && EVENT_SENSITIVE_KEY.test(key) && key !== "resume" && key !== "cv") return "[REDACTED]"
   if (insideResume && key === "content") return "[REDACTED]"
-  if (typeof value === "string") return redactSensitiveText(value)
+  if (typeof value === "string") return structuralId ? value : redactSensitiveText(value)
   if (value === null || typeof value === "boolean") return value
   if (typeof value === "number") return Number.isFinite(value) ? value : "[REDACTED]"
   if (depth >= maxDepth) return "[REDACTED]"

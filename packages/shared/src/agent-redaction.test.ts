@@ -65,6 +65,38 @@ describe("agent event redaction", () => {
     expect(safe.data).toEqual({ draft: { name: "Berlin SWE automation", minScore: 85, autoApply: false } })
   })
 
+  it("preserves stable IDs but redacts unsafe question IDs and phone-like text", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const durableQuestionId = "0123456789abcdef".repeat(4)
+    const safe = redactAgentEvent({
+      type: "task.updated",
+      body: "Call 4912-9422 about this task.",
+      data: {
+        item: { taskId, questionId: "question-private-note", content: "Call 4912-9422." },
+        durableQuestion: { questionId: durableQuestionId },
+        note: "Call 4912-9422.",
+      },
+    })
+
+    expect(safe.body).toBe("Call [REDACTED_PHONE] about this task.")
+    expect(safe.data).toEqual({
+      item: { taskId, questionId: "[REDACTED]", content: "[REDACTED]" },
+      durableQuestion: { questionId: durableQuestionId },
+      note: "Call [REDACTED_PHONE].",
+    })
+    expect(redactAgentEvent({ type: "task.updated", body: safe.body, data: safe.data })).toEqual(safe)
+  })
+
+  it("does not exempt invalid or secret-like values in structural ID fields", () => {
+    for (const taskId of ["child-4155550123", "sk_test_private_secret_value"]) {
+      const safe = redactAgentEvent({ type: "task.updated", body: "", data: { item: { taskId } } })
+      const item = (safe.data as { item: { taskId: string } }).item
+
+      expect(item.taskId).not.toBe(taskId)
+      expect(JSON.stringify(safe.data)).not.toContain(taskId)
+    }
+  })
+
   it("keeps opaque approval references and omits absent optional values", () => {
     const safe = redactAgentEvent({
       type: "automation_draft",
