@@ -13,6 +13,8 @@ const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|a
 const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
 const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid", "id", "intentid", "itemid", "questionid", "sessionid", "taskid", "toolcallid", "turnid", "waitid"])
 const ROUTED_AGENT_EVENT_TYPE = new Set(["approval.resolved", "item.started", "question.answered", "task.interrupt.accepted", "turn.wakeup"])
+const AGENT_EVENT_SCHEMA_VERSION = "agent-harness.v2"
+const AGENT_EVENT_SCHEMA_VERSION_PATTERN = /^agent-harness\.v\d+$/
 const AGENT_EVENT_ENVELOPE_ANCHORS = ["actor", "causationId", "correlationId", "createdAt", "id", "idempotencyKey", "itemId", "sequence", "sessionId", "taskId", "turnId", "type"]
 const AGENT_EVENT_ENVELOPE_CORE_IDENTITY = ["id", "sessionId", "turnId", "type"]
 const EVENT_REDACTION_MAX_DEPTH = 8
@@ -97,17 +99,22 @@ function validRouting(value: unknown): value is RoutingTuple {
 
 function containsAgentEventEnvelopeShape(value: unknown, depth = 0): boolean {
   if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
-  const entries = Object.entries(value)
+  if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1))
+  const row = record(value)
+  if (!row) return false
+  const entries = Object.entries(row)
   const keys = new Set(entries.map(([key]) => key.toLowerCase()))
-  const envelopeShape = keys.has("schemaversion")
-    || keys.has("payload") && AGENT_EVENT_ENVELOPE_ANCHORS.some(key => keys.has(key.toLowerCase()))
+  const hasEnvelopeAnchor = AGENT_EVENT_ENVELOPE_ANCHORS.some(key => keys.has(key.toLowerCase()))
+  const schemaVersion = entries.find(([key]) => key.toLowerCase() === "schemaversion")?.[1]
+  const envelopeShape = typeof schemaVersion === "string" && AGENT_EVENT_SCHEMA_VERSION_PATTERN.test(schemaVersion) && hasEnvelopeAnchor
+    || keys.has("payload") && hasEnvelopeAnchor
     || AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
   return envelopeShape || entries.some(([, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1))
 }
 
 function fullEnvelope(type: string, value: unknown): { row: JsonRecord; routing: RoutingTuple } | null {
   const row = record(value)
-  if (!row || row.schemaVersion !== "agent-harness.v2" || row.type !== type || !opaqueId(row.id) || !opaqueId(row.sessionId) || !opaqueId(row.turnId)
+  if (!row || row.schemaVersion !== AGENT_EVENT_SCHEMA_VERSION || row.type !== type || !opaqueId(row.id) || !opaqueId(row.sessionId) || !opaqueId(row.turnId)
     || !nullableId(row.itemId) || !nullableId(row.taskId) || !opaqueId(row.correlationId)
     || !nullableId(row.causationId) || !validIdempotencyKey(row.idempotencyKey) || !record(row.payload)) return null
   if (!validSequence(row.sequence) || (row.createdAt !== undefined && !validTimestamp(row.createdAt))) return null

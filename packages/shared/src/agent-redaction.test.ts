@@ -112,6 +112,40 @@ describe("agent event redaction", () => {
     }
   })
 
+  it("preserves structural IDs beside unrelated schema version metadata", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "task.updated",
+      body: "Call 4912-9422 about this task.",
+      data: {
+        schemaVersion: "report.v1",
+        report: { schemaVersion: "report.section.v1" },
+        item: { taskId },
+        note: "Call 4912-9422.",
+      },
+    })
+
+    expect(safe.body).toBe("Call [REDACTED_PHONE] about this task.")
+    expect(safe.data).toEqual({
+      schemaVersion: "report.v1",
+      report: { schemaVersion: "report.section.v1" },
+      item: { taskId },
+      note: "Call [REDACTED_PHONE].",
+    })
+  })
+
+  it("redacts IDs in unsupported versioned envelopes with partial identity", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "future.agent.event",
+      body: "",
+      data: { schemaVersion: "agent-harness.v3", type: "future.agent.event", taskId },
+    }).data as Record<string, unknown>
+
+    expect(safe.taskId).not.toBe(taskId)
+    expect(JSON.stringify(safe)).not.toContain(taskId)
+  })
+
   it("requires validated routing before preserving IDs from routed payloads or event envelopes", () => {
     const candidateTaskId = "task-70463535-1444-4bba-ae3b-b80578d2dd0a"
     const intentId = "70463535-1444-4bba-ae3b-b80578d2dd0e"
