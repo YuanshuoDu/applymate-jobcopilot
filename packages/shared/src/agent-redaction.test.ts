@@ -55,6 +55,16 @@ describe("agent event redaction", () => {
     expect(safe).toEqual(["password=[REDACTED]", { answer: "[REDACTED]", ok: true }])
   })
 
+  it("redacts credential tokens after underscores in body and plain text", () => {
+    const value = "approval_sk_0123456789abcdef approval_ghp_0123456789abcdef approval_github_pat_0123456789abcdef notghp_0123456789abcdef"
+    const redacted = "approval_[REDACTED] approval_[REDACTED] approval_[REDACTED] notghp_0123456789abcdef"
+    const safe = redactAgentEvent({ type: "task.updated", body: value, data: { note: value } })
+
+    expect(safe.body).toBe(redacted)
+    expect(safe.data).toEqual({ note: redacted })
+    expect(redactSensitiveValue(value)).toBe(redacted)
+  })
+
   it("keeps safe automation structure available to the transcript UI", () => {
     const safe = redactAgentEvent({
       type: "automation_draft",
@@ -65,14 +75,37 @@ describe("agent event redaction", () => {
     expect(safe.data).toEqual({ draft: { name: "Berlin SWE automation", minScore: 85, autoApply: false } })
   })
 
-  it("preserves only validated approval IDs in legacy payloads", () => {
+  it("preserves approval IDs only in validated legacy schemas", () => {
     const approvalId = "approval_4912-9422"
+    const legacyPayload = { approvalId, action: "submit_application", scopeHash: "hash_1", revision: 1 }
     const requested = redactAgentEvent({
       type: "approval.requested",
       body: "",
-      data: { approvalId, action: "submit_application", scopeHash: "hash_1", revision: 1, email: "candidate@example.com" },
+      data: legacyPayload,
     })
-    expect(requested.data).toEqual({ approvalId, action: "submit_application", scopeHash: "hash_1", revision: 1, email: "[REDACTED]" })
+    expect(requested.data).toEqual(legacyPayload)
+
+    const malformed = redactAgentEvent({ type: "approval.requested", body: "", data: { ...legacyPayload, email: "candidate@example.com" } })
+    expect(malformed.data).toEqual({ ...legacyPayload, approvalId: "[REDACTED]", email: "[REDACTED]" })
+    const storedRequest = redactAgentEvent({ type: "approval.requested", body: "", data: {
+      approvalId, email: "candidate@example.com", resumeContent: "private resume", draft: { name: "Berlin scout", targetRoles: ["Engineer"] },
+    } })
+    expect(storedRequest.data).toEqual({
+      approvalId, email: "[REDACTED]", resumeContent: "[REDACTED]", draft: { name: "Berlin scout", targetRoles: ["Engineer"] },
+    })
+    const malformedStored = redactAgentEvent({ type: "approval.requested", body: "", data: {
+      approvalId, email: "candidate@example.com", resumeContent: "private resume", draft: { name: "Berlin scout", targetRoles: ["Engineer"] }, extra: true,
+    } }).data as Record<string, unknown>
+    expect(malformedStored.approvalId).toBe("[REDACTED]")
+
+    const response = { approvalId, decision: "approved" }
+    expect(redactAgentEvent({ type: "approval_response", body: "", data: response }).data).toEqual(response)
+    for (const invalidResponse of [{ ...response, decision: "maybe" }, { ...response, body: "unexpected" }]) {
+      const safe = redactAgentEvent({ type: "approval_response", body: "", data: invalidResponse }).data as Record<string, unknown>
+      expect(safe.approvalId).toBe("[REDACTED]")
+    }
+    const unrelated = redactAgentEvent({ type: "task.updated", body: "", data: { approvalId } })
+    expect(unrelated.data).toEqual({ approvalId: "[REDACTED]" })
 
     const automation = redactAgentEvent({
       type: "automation_draft",
@@ -80,9 +113,17 @@ describe("agent event redaction", () => {
       data: { approval: { id: "approval_1", receiptNonce: "nonce_1", scopeHash: "hash_1" } },
     })
     expect(automation.data).toEqual({ approval: { id: "approval_1", receiptNonce: "nonce_1", scopeHash: "hash_1" } })
+    const unrelatedApproval = redactAgentEvent({ type: "task.updated", body: "", data: { approval: { id: "approval_1", receiptNonce: "nonce_1", scopeHash: "hash_1" } } })
+    expect(unrelatedApproval.data).toEqual({ approval: { id: "[REDACTED]", receiptNonce: "nonce_1", scopeHash: "hash_1" } })
 
-    const invalid = redactAgentEvent({ type: "approval.requested", body: "", data: { approvalId: "sk_private_secret" } })
-    expect(invalid.data).toEqual({ approvalId: "[REDACTED]" })
+    const invalid = redactAgentEvent({ type: "approval.requested", body: "", data: { ...legacyPayload, approvalId: "sk_private_secret" } })
+    expect(invalid.data).toEqual({ ...legacyPayload, approvalId: "[REDACTED]" })
+    for (const embeddedSecretId of ["approval_sk_0123456789abcdef", "approval_ghp_0123456789abcdef", "approval_github_pat_0123456789abcdef"]) {
+      const request = redactAgentEvent({ type: "approval.requested", body: "", data: { ...legacyPayload, approvalId: embeddedSecretId } }).data as Record<string, unknown>
+      const response = redactAgentEvent({ type: "approval_response", body: "", data: { approvalId: embeddedSecretId, decision: "approved" } }).data as Record<string, unknown>
+      expect(request.approvalId).toBe("[REDACTED]")
+      expect(response.approvalId).toBe("[REDACTED]")
+    }
   })
 
   it("redacts structural IDs outside validated payloads and phone-like text", () => {
@@ -107,7 +148,7 @@ describe("agent event redaction", () => {
     expect(redactAgentEvent({ type: "task.updated", body: safe.body, data: safe.data })).toEqual(safe)
   })
 
-  it("rejects underscore-prefixed phone-shaped IDs while redacting phone text", () => {
+  it("rejects underscore-prefixed phone-shaped IDs without changing free-form phone rules", () => {
     for (const phoneLikeId of ["task_4155550123", "task_415-555-0123"]) {
       const routing: AgentEventRoutingContext = {
         sessionId, turnId: phoneLikeId, itemId: null, taskId: null, actor: "user",
@@ -120,9 +161,11 @@ describe("agent event redaction", () => {
         routing,
       })
 
-      expect(safe.body).toBe("Call task_[REDACTED_PHONE] or [REDACTED_PHONE] about this task.")
+      expect(safe.body).toBe(`Call ${phoneLikeId} or [REDACTED_PHONE] about this task.`)
       expect(safe.data).toEqual({ turnId: "[REDACTED]", expectedRevision: 1, requestedAt: "2026-10-06T17:30:00.000Z" })
     }
+    const boundary = redactAgentEvent({ type: "task.updated", body: "Call note_4155550123 or 4155550123.", data: {} })
+    expect(boundary.body).toBe("Call note_4155550123 or [REDACTED_PHONE].")
 
     const approvalId = "approval_4912-9422"
     const validatedApproval = redactAgentEvent({

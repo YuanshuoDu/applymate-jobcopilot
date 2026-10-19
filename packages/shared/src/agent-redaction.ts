@@ -4,9 +4,9 @@ import { knownAgentEventPayloadFields, type AgentEventRoutingContext } from "./a
 export type { AgentEventRoutingContext } from "./agent-event-routing"
 const SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|resume|cv|raw[_-]?(?:content|text|data)|content|value|question|answer|draft|sensitive|confirmed[_-]?answers|\bname\b)/i
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
-const SENSITIVE_KEY_TOKEN = /\b(?:sk[-_]|gh[pousr]_|github_pat_|xox[baprs]-)[a-z0-9._~+/=-]{8,}/gi
+const SENSITIVE_KEY_TOKEN = /(?<![a-z0-9])(?:sk[-_]|gh[pousr]_|github_pat_|xox[baprs]-)[a-z0-9._~+/=-]{8,}/gi
 const SENSITIVE_EMAIL = /\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+\b/gi
-const SENSITIVE_PHONE = /(?:(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)|(?<=_)(?:\+?\d[\d\s().-]{8,}\d)(?![a-z0-9]))/gi
+const SENSITIVE_PHONE = /(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)/g
 const SENSITIVE_ASSIGNMENT = /\b(password|secret|token|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi
 const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|(?:full[_-]?)?resume(?:[_-]?(?:text|content|data))?|cv(?:[_-]?(?:text|content|data))?|raw[_-]?(?:content|text|data)|content|value|question|answer|sensitive|confirmed[_-]?answers)/i
 const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
@@ -24,9 +24,8 @@ const HASH_ID = /^[0-9a-f]{32,64}$/i
 const PREFIXED_ID = /^[a-z][a-z0-9._:-]{0,63}[_:.-][a-z0-9][a-z0-9._:-]{0,191}$/i
 const CUID_ID = /^c[a-z0-9]{23,31}$/i
 const PHONE_SHAPED_UNDERSCORE_ID_COMPONENT = /_(\+?[\d\s().-]*\d)(?=$|[_:.-])/g
-const SECRET_ID = /^(?:bearer\b|sk[-_]|xox[baprs]-|gh[pousr]_|github_pat_|ghs_|glpat-|AIza|ya29\.|secret[_:-]|password[_:-]|api[_-]?key[_:-]|token[_:-])|(?:password|secret|token|api[_-]?key)=/i
+const SECRET_ID = /(?:^|[:._-])(?:bearer\b|sk[-_]|xox[baprs]-|gh[pousr]_|github_pat_|ghs_|glpat-|AIza|ya29\.|secret[_:-]|password[_:-]|api[_-]?key[_:-]|token[_:-])|(?:password|secret|token|api[_-]?key)=/i
 const STABLE_ID_COMPONENT = /(^|[:._-])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32,64})(?=$|[:._-])/gi
-
 type RoutingTuple = AgentEventRoutingContext
 type JsonRecord = Record<string, unknown>
 function hasPhoneShapedUnderscoreIdComponent(value: string): boolean {
@@ -83,8 +82,7 @@ function jsonValue(value: unknown, depth = 0): value is RepositoryJsonValue {
 function validRouting(value: unknown): value is RoutingTuple {
   const row = record(value)
   return !!row && opaqueId(row.sessionId) && opaqueId(row.turnId) && nullableId(row.itemId) && nullableId(row.taskId)
-    && (row.actor === "user" || row.actor === "orchestrator" || row.actor === "system")
-    && opaqueId(row.correlationId) && nullableId(row.causationId)
+    && (row.actor === "user" || row.actor === "orchestrator" || row.actor === "system") && opaqueId(row.correlationId) && nullableId(row.causationId)
     && (row.outboxTopic === "agent.session.event" || row.outboxTopic === "agent.turn.wakeup")
 }
 function isNestedAgentItem(value: unknown, parentKey: string | undefined, route?: RoutingTuple): boolean {
@@ -111,9 +109,22 @@ function validFollowUpPayload(type: string, value: unknown, route: RoutingTuple)
     && row.delivery === "follow_up" && row.source === "user" && row.disposition === "queued_follow_up"
     && Number.isSafeInteger(row.targetAttemptCount) && (row.targetAttemptCount as number) > 0 && isNestedAgentItem(row.item, "item", route)
 }
-function exactPayloadKeys(row: JsonRecord, keys: readonly string[]): boolean {
-  const actual = Object.keys(row)
-  return actual.length === keys.length && actual.every(key => keys.includes(key))
+function exactPayloadKeys(row: JsonRecord, keys: readonly string[]): boolean { const actual = Object.keys(row); return actual.length === keys.length && actual.every(key => keys.includes(key)) }
+function validLegacyApprovalRequested(type: string, payload: unknown): payload is JsonRecord {
+  const row = record(payload); return type === "approval.requested" && !!row && exactPayloadKeys(row, ["approvalId", "action", "scopeHash", "revision"]) && opaqueId(row.approvalId)
+    && typeof row.action === "string" && /^[a-z][a-z0-9_]{0,63}$/i.test(row.action) && typeof row.scopeHash === "string" && row.scopeHash.length > 0 && row.scopeHash.length <= 256
+    && Number.isSafeInteger(row.revision) && (row.revision as number) >= 0
+}
+function validStoredApprovalRequested(type: string, payload: unknown): payload is JsonRecord {
+  const row = record(payload), draft = record(record(payload)?.draft)
+  return type === "approval.requested" && !!row && exactPayloadKeys(row, ["approvalId", "email", "resumeContent", "draft"]) && opaqueId(row.approvalId)
+    && typeof row.email === "string" && typeof row.resumeContent === "string" && !!draft && exactPayloadKeys(draft, ["name", "targetRoles"])
+    && typeof draft.name === "string" && Array.isArray(draft.targetRoles) && draft.targetRoles.every(role => typeof role === "string")
+}
+function validLegacyApprovalResponse(type: string, payload: unknown): payload is JsonRecord {
+  const row = record(payload)
+  return type === "approval_response" && !!row && exactPayloadKeys(row, ["approvalId", "decision"]) && opaqueId(row.approvalId)
+    && ["approved", "rejected", "cancelled", "review"].includes(row.decision as string)
 }
 function validQuestionSourceEnvelope(type: string, payload: JsonRecord, route: RoutingTuple): boolean {
   const legacy = record(payload.legacy), source = record(payload.sourcePayload)
@@ -136,13 +147,8 @@ function validatedPayloadFields(type: string, payload: JsonRecord, route: Routin
     && payload.turnId === route.turnId && Number.isSafeInteger(payload.expectedRevision) && (payload.expectedRevision as number) >= 0
     && validTimestamp(payload.requestedAt) && route.itemId === null && route.taskId === null && route.actor === "user"
     && route.correlationId === route.turnId && route.causationId === null && route.outboxTopic === "agent.session.event") return ["turnId"]
-  if (type === "approval.requested" && exactPayloadKeys(payload, ["approvalId", "action", "scopeHash", "revision"])
-    && opaqueId(payload.approvalId) && payload.approvalId === route.correlationId
-    && typeof payload.action === "string" && /^[a-z][a-z0-9_]{0,63}$/i.test(payload.action)
-    && typeof payload.scopeHash === "string" && payload.scopeHash.length > 0 && payload.scopeHash.length <= 256
-    && Number.isSafeInteger(payload.revision) && (payload.revision as number) >= 0
-    && route.actor === "orchestrator" && route.itemId === null && route.causationId === null
-    && route.outboxTopic === "agent.session.event") return ["approvalId"]
+  if (validLegacyApprovalRequested(type, payload) && payload.approvalId === route.correlationId && route.actor === "orchestrator" && route.itemId === null
+    && route.causationId === null && route.outboxTopic === "agent.session.event") return ["approvalId"]
   if (type === "approval.resolved" && exactPayloadKeys(payload, ["waitKind", "waitId", "itemId", "toolCallId", "outcome", "reason"])
     && payload.waitKind === "approval" && opaqueId(payload.waitId) && payload.itemId === route.itemId
     && payload.itemId === `agent-wait:approval:${payload.waitId}` && nullableId(payload.toolCallId)
@@ -199,10 +205,7 @@ function preserveFields(safe: unknown, raw: JsonRecord, fields: readonly string[
   const output = record(safe)
   if (!output) return safe as RepositoryJsonValue
   const result = { ...output } as Record<string, RepositoryJsonValue>
-  for (const field of fields) {
-    const value = raw[field]
-    if (value === null || opaqueId(value)) result[field] = value
-  }
+  for (const field of fields) { const value = raw[field]; if (value === null || opaqueId(value)) result[field] = value }
   return result
 }
 function redactWaitRouting(type: string, raw: unknown, safe: RepositoryJsonValue, route: RoutingTuple): RepositoryJsonValue {
@@ -226,8 +229,7 @@ function preserveEnvelope(type: string, raw: JsonRecord, safe: RepositoryJsonVal
   const safeEnvelope = record(safe)
   if (!payload || !safeEnvelope) return safe
   const nested = redactWaitRouting(type, payload, safeEnvelope.payload as RepositoryJsonValue, route)
-  const envelope = preserveFields({ ...safeEnvelope, payload: nested }, raw,
-    ["id", "sessionId", "turnId", "itemId", "taskId", "correlationId", "causationId"])
+  const envelope = preserveFields({ ...safeEnvelope, payload: nested }, raw, ["id", "sessionId", "turnId", "itemId", "taskId", "correlationId", "causationId"])
   const result = record(envelope)
   if (result && raw.idempotencyKey === null) result.idempotencyKey = null
   else if (result && safeWaitIdempotencyKey(type, raw.idempotencyKey, route)) result.idempotencyKey = raw.idempotencyKey
@@ -235,19 +237,14 @@ function preserveEnvelope(type: string, raw: JsonRecord, safe: RepositoryJsonVal
   if (result && validTimestamp(raw.createdAt)) result.createdAt = raw.createdAt
   return envelope
 }
-
 function isLegacyApprovalReference(value: unknown, key: string): boolean {
   const row = record(value); return key === "approval" && !!row && exactPayloadKeys(row, ["id", "receiptNonce", "scopeHash"]) && opaqueId(row.id) && opaqueId(row.receiptNonce)
     && typeof row.scopeHash === "string" && row.scopeHash.length > 0 && row.scopeHash.length <= 256
 }
 
 export function redactSensitiveText(value: string): string {
-  return value
-    .replace(SENSITIVE_TOKEN, "Bearer [REDACTED]")
-    .replace(SENSITIVE_KEY_TOKEN, "[REDACTED]")
-    .replace(SENSITIVE_EMAIL, "[REDACTED_EMAIL]")
-    .replace(SENSITIVE_PHONE, "[REDACTED_PHONE]")
-    .replace(SENSITIVE_ASSIGNMENT, "$1=[REDACTED]")
+  return value.replace(SENSITIVE_TOKEN, "Bearer [REDACTED]").replace(SENSITIVE_KEY_TOKEN, "[REDACTED]")
+    .replace(SENSITIVE_EMAIL, "[REDACTED_EMAIL]").replace(SENSITIVE_PHONE, "[REDACTED_PHONE]").replace(SENSITIVE_ASSIGNMENT, "$1=[REDACTED]")
 }
 export function redactSensitiveValue(value: unknown, key: string | null = null, depth = 0, maxDepth = 8): RepositoryJsonValue {
   if (key && SENSITIVE_KEY.test(key)) return "[REDACTED]"
@@ -265,20 +262,19 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
   const route = input.routing && validRouting(input.routing) ? input.routing : envelope?.routing
   const hasEventEnvelopeShape = containsAgentEventEnvelopeShape(input.data, 0, undefined, route)
   const preserveFollowUpMessageId = route !== undefined && validFollowUpPayload(input.type, input.data, route)
-  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, false, !hasEventEnvelopeShape, route, false, preserveFollowUpMessageId, !input.routing && !hasEventEnvelopeShape)
-  const data = route && input.data !== undefined ? input.routing ? redactWaitRouting(input.type, input.data, safe, route)
-    : envelope ? preserveEnvelope(input.type, envelope.row, safe, route) : safe : safe
-  return {
-    body: redactSensitiveText(input.body),
-    data,
-  }
+  const legacyApprovalPayload = !input.routing && !hasEventEnvelopeShape && (validLegacyApprovalRequested(input.type, input.data)
+    || validStoredApprovalRequested(input.type, input.data) || validLegacyApprovalResponse(input.type, input.data))
+  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, false, !hasEventEnvelopeShape, route, false, preserveFollowUpMessageId, !input.routing && !hasEventEnvelopeShape && input.type === "automation_draft")
+  let data = route && input.data !== undefined ? input.routing ? redactWaitRouting(input.type, input.data, safe, route) : envelope ? preserveEnvelope(input.type, envelope.row, safe, route) : safe : safe
+  if (legacyApprovalPayload) data = preserveFields(data, input.data as JsonRecord, ["approvalId"])
+  return { body: redactSensitiveText(input.body), data }
 }
 /** Keep user-facing event structure while removing credentials, answers, resumes, and contact data. */
-function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true, allowNestedAgentItems = true, route?: RoutingTuple, preserveItemStepId = false, preserveFollowUpMessageId = false, preserveLegacyApprovalIds = false): RepositoryJsonValue {
+function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true, allowNestedAgentItems = true, route?: RoutingTuple, preserveItemStepId = false, preserveFollowUpMessageId = false, preserveLegacyAutomationApproval = false): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
   const normalizedKey = key?.toLowerCase()
   const structuralIdKey = normalizedKey !== undefined && (STRUCTURAL_ID_KEY.has(normalizedKey) || normalizedKey === "stepid")
-  const structuralId = typeof value === "string" && (structuralIdKey && (allowStructuralIds || preserveLegacyApprovalIds && normalizedKey === "approvalid")
+  const structuralId = typeof value === "string" && (structuralIdKey && allowStructuralIds
     && (normalizedKey === "questionid" ? stableOpaqueId(value) : normalizedKey === "stepid" ? preserveItemStepId && opaqueId(value) : opaqueId(value))
     || key === "messageId" && preserveFollowUpMessageId && opaqueId(value))
   if (structuralIdKey && value !== null && !structuralId) return "[REDACTED]"
@@ -289,16 +285,15 @@ function redactEventValue(value: unknown, key: string | null = null, depth = 0, 
   if (value === null || typeof value === "boolean") return value
   if (typeof value === "number") return Number.isFinite(value) ? value : "[REDACTED]"
   if (depth >= maxDepth) return "[REDACTED]"
-  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer, allowStructuralIds, allowNestedAgentItems, route, preserveItemStepId, preserveFollowUpMessageId, preserveLegacyApprovalIds))
+  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer, allowStructuralIds, allowNestedAgentItems, route, preserveItemStepId, preserveFollowUpMessageId, preserveLegacyAutomationApproval))
   if (typeof value !== "object" || value === undefined) return "[REDACTED]"
   const entries: Array<[string, RepositoryJsonValue]> = []
   for (const [entryKey, entryValue] of Object.entries(value)) {
     // Omit absent fields so reconnect clients rotate receipts instead of seeing a false redaction marker.
     if (entryValue === undefined) continue
-    const preserveItemIds = allowNestedAgentItems && isNestedAgentItem(entryValue, entryKey, route) || preserveLegacyApprovalIds && isLegacyApprovalReference(entryValue, entryKey)
+    const preserveItemIds = allowNestedAgentItems && isNestedAgentItem(entryValue, entryKey, route) || preserveLegacyAutomationApproval && depth === 0 && isLegacyApprovalReference(entryValue, entryKey)
     const preserveStepId = preserveItemIds || preserveItemStepId && entryKey === "stepId"
-    entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer, allowStructuralIds || preserveItemIds,
-      allowNestedAgentItems, route, preserveStepId, preserveFollowUpMessageId && entryKey === "messageId", preserveLegacyApprovalIds)])
+    entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer, allowStructuralIds || preserveItemIds, allowNestedAgentItems, route, preserveStepId, preserveFollowUpMessageId && entryKey === "messageId", preserveLegacyAutomationApproval)])
   }
   return Object.fromEntries(entries)
 }
