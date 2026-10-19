@@ -12,6 +12,7 @@ const SENSITIVE_ASSIGNMENT = /\b(password|secret|token|api[_-]?key|authorization
 const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|(?:full[_-]?)?resume(?:[_-]?(?:text|content|data))?|cv(?:[_-]?(?:text|content|data))?|raw[_-]?(?:content|text|data)|content|value|question|answer|sensitive|confirmed[_-]?answers)/i
 const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
 const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid", "id", "intentid", "itemid", "questionid", "sessionid", "taskid", "toolcallid", "turnid", "waitid"])
+const ROUTED_AGENT_EVENT_TYPE = new Set(["approval.resolved", "item.started", "question.answered", "task.interrupt.accepted", "turn.wakeup"])
 const UUID_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const HASH_ID = /^[0-9a-f]{32,64}$/i
 const PREFIXED_ID = /^[a-z][a-z0-9._:-]{0,63}[_:.-][a-z0-9][a-z0-9._:-]{0,191}$/i
@@ -88,6 +89,12 @@ function validRouting(value: unknown): value is RoutingTuple {
     && (row.actor === "user" || row.actor === "orchestrator" || row.actor === "system")
     && opaqueId(row.correlationId) && nullableId(row.causationId)
     && (row.outboxTopic === "agent.session.event" || row.outboxTopic === "agent.turn.wakeup")
+}
+
+function hasAgentEventEnvelopeShape(value: unknown): boolean {
+  const row = record(value)
+  return !!row && (Object.hasOwn(row, "schemaVersion")
+    || Object.hasOwn(row, "payload") && ["id", "sessionId", "turnId", "type", "correlationId"].every(key => Object.hasOwn(row, key)))
 }
 
 function fullEnvelope(type: string, value: unknown): { row: JsonRecord; routing: RoutingTuple } | null {
@@ -167,7 +174,9 @@ export function redactSensitiveValue(value: unknown, key: string | null = null, 
 export function redactAgentEvent(input: { type: string; body: string; data?: unknown; routing?: AgentEventRoutingContext }): { body: string; data: RepositoryJsonValue | null } {
   const envelope = input.routing ? null : fullEnvelope(input.type, input.data)
   const route = input.routing && validRouting(input.routing) ? input.routing : envelope?.routing
-  const safe = input.data === undefined ? null : redactEventValue(input.data)
+  const allowStructuralIds = input.routing === undefined && !ROUTED_AGENT_EVENT_TYPE.has(input.type)
+    && !hasAgentEventEnvelopeShape(input.data)
+  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, 8, false, allowStructuralIds)
   const data = route && input.data !== undefined
     ? input.routing
       ? redactWaitRouting(input.type, input.data, safe, route)
@@ -185,10 +194,10 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
  * and direct contact data. Lifecycle/tool payloads use the stricter generic
  * redactor above because they are not rendered back into the user transcript.
  */
-function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = 8, insideResume = false): RepositoryJsonValue {
+function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = 8, insideResume = false, allowStructuralIds = true): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
   const normalizedKey = key?.toLowerCase()
-  const structuralId = typeof value === "string" && normalizedKey !== undefined
+  const structuralId = allowStructuralIds && typeof value === "string" && normalizedKey !== undefined
     && STRUCTURAL_ID_KEY.has(normalizedKey)
     && (normalizedKey === "questionid" ? stableOpaqueId(value) : opaqueId(value))
   const safeKey = normalizedKey ? EVENT_SAFE_KEY.has(normalizedKey) : false
@@ -198,7 +207,7 @@ function redactEventValue(value: unknown, key: string | null = null, depth = 0, 
   if (value === null || typeof value === "boolean") return value
   if (typeof value === "number") return Number.isFinite(value) ? value : "[REDACTED]"
   if (depth >= maxDepth) return "[REDACTED]"
-  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer))
+  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer, allowStructuralIds))
   if (typeof value !== "object" || value === undefined) return "[REDACTED]"
   const entries: Array<[string, RepositoryJsonValue]> = []
   for (const [entryKey, entryValue] of Object.entries(value)) {
@@ -206,7 +215,7 @@ function redactEventValue(value: unknown, key: string | null = null, depth = 0, 
     // reconnect clients on the receipt-rotation path instead of fabricating a
     // truthy redaction marker that looks like a usable nonce.
     if (entryValue === undefined) continue
-    entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer)])
+    entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer, allowStructuralIds)])
   }
   return Object.fromEntries(entries)
 }

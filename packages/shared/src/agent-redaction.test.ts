@@ -73,7 +73,7 @@ describe("agent event redaction", () => {
       body: "Call 4912-9422 about this task.",
       data: {
         item: { taskId, questionId: "question-private-note", content: "Call 4912-9422." },
-        durableQuestion: { questionId: durableQuestionId },
+        wait: { questionId: durableQuestionId },
         note: "Call 4912-9422.",
       },
     })
@@ -81,7 +81,7 @@ describe("agent event redaction", () => {
     expect(safe.body).toBe("Call [REDACTED_PHONE] about this task.")
     expect(safe.data).toEqual({
       item: { taskId, questionId: "[REDACTED]", content: "[REDACTED]" },
-      durableQuestion: { questionId: durableQuestionId },
+      wait: { questionId: durableQuestionId },
       note: "Call [REDACTED_PHONE].",
     })
     expect(redactAgentEvent({ type: "task.updated", body: safe.body, data: safe.data })).toEqual(safe)
@@ -94,6 +94,36 @@ describe("agent event redaction", () => {
 
       expect(item.taskId).not.toBe(taskId)
       expect(JSON.stringify(safe.data)).not.toContain(taskId)
+    }
+  })
+
+  it("requires validated routing before preserving IDs from routed payloads or event envelopes", () => {
+    const candidateTaskId = "task-70463535-1444-4bba-ae3b-b80578d2dd0a"
+    const intentId = "70463535-1444-4bba-ae3b-b80578d2dd0e"
+    const payload = { intentId, taskId: candidateTaskId, status: "accepted" }
+    const invalidRouting: AgentEventRoutingContext = {
+      sessionId, turnId, itemId: null, taskId: candidateTaskId, actor: "user",
+      correlationId: turnId, causationId: null, outboxTopic: "agent.turn.wakeup",
+    }
+    const direct = redactAgentEvent({ type: "task.interrupt.accepted", body: "", data: payload, routing: invalidRouting }).data as Record<string, unknown>
+    expect(direct.taskId).not.toBe(candidateTaskId)
+
+    const malformedEnvelope = {
+      schemaVersion: "agent-harness.v2", id: "70463535-1444-4bba-ae3b-b80578d2dd0f", sessionId, turnId,
+      itemId: null, taskId: candidateTaskId, sequence: "1", type: "task.interrupt.accepted", actor: "user",
+      correlationId: "70463535-1444-4bba-ae3b-b80578d2dd01", causationId: null,
+      idempotencyKey: "accepted:attempt_1", payload,
+    }
+    const safeEnvelope = redactAgentEvent({ type: "task.interrupt.accepted", body: "", data: malformedEnvelope }).data as Record<string, unknown>
+    expect(safeEnvelope.taskId).not.toBe(candidateTaskId)
+    expect((safeEnvelope.payload as Record<string, unknown>).taskId).not.toBe(candidateTaskId)
+
+    const { schemaVersion, ...missingSchemaVersion } = malformedEnvelope
+    expect(schemaVersion).toBe("agent-harness.v2")
+    for (const candidate of [{ ...malformedEnvelope, schemaVersion: "agent-harness.v3" }, missingSchemaVersion]) {
+      const safe = redactAgentEvent({ type: "task.interrupt.accepted", body: "", data: candidate }).data as Record<string, unknown>
+      expect(safe.taskId).not.toBe(candidateTaskId)
+      expect((safe.payload as Record<string, unknown>).taskId).not.toBe(candidateTaskId)
     }
   })
 
