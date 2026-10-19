@@ -138,48 +138,68 @@ describe("agent event redaction", () => {
     const messageId = "12345678-1234-5678-1234-123456789011"
     const itemId = "12345678-1234-5678-1234-123456789012"
     const taskId = "child-12345678-1234-5678-1234-123456789013"
+    const stepId = "12345678-1234-5678-1234-123456789014"
+    const payload = {
+      messageId,
+      clientMessageId: "client-once",
+      delivery: "follow_up",
+      source: "user",
+      disposition: "queued_follow_up",
+      targetAttemptCount: 2,
+      item: {
+        schemaVersion: "agent-harness.v2",
+        id: itemId,
+        sessionId,
+        turnId,
+        stepId,
+        taskId,
+        type: "user_message",
+        status: "completed",
+        phase: "commentary",
+        revision: 0,
+        content: { parts: [{ type: "text", text: "Call 4912-9422." }] },
+        startedAt: "2026-10-06T17:30:00.000Z",
+        completedAt: "2026-10-06T17:30:00.000Z",
+        createdAt: "2026-10-06T17:30:00.000Z",
+        updatedAt: "2026-10-06T17:30:00.000Z",
+      },
+    }
+    const routing = { sessionId, turnId, itemId, taskId, actor: "user", correlationId: turnId,
+      causationId: null, outboxTopic: "agent.session.event" as const }
     const result = redactAgentEvent({
       type: "input.accepted",
       body: "Call 4912-9422 about this follow-up.",
-      data: {
-        messageId,
-        clientMessageId: "client-once",
-        delivery: "follow_up",
-        source: "user",
-        disposition: "queued_follow_up",
-        targetAttemptCount: 2,
-        item: {
-          schemaVersion: "agent-harness.v2",
-          id: itemId,
-          sessionId,
-          turnId,
-          stepId: null,
-          taskId,
-          type: "user_message",
-          status: "completed",
-          phase: "commentary",
-          revision: 0,
-          content: { parts: [{ type: "text", text: "Call 4912-9422." }] },
-          startedAt: "2026-10-06T17:30:00.000Z",
-          completedAt: "2026-10-06T17:30:00.000Z",
-          createdAt: "2026-10-06T17:30:00.000Z",
-          updatedAt: "2026-10-06T17:30:00.000Z",
-        },
-      },
+      data: payload,
+      routing,
     })
     const safe = result.data as {
       messageId: string
-      item: { id: string; taskId: string; content: unknown }
+      item: { id: string; taskId: string; stepId: string; content: unknown }
     }
 
     expect(result.body).toBe("Call [REDACTED_PHONE] about this follow-up.")
-    expect(safe.messageId).toBe(messageId)
+    expect(safe.messageId).toBe("[REDACTED]")
     expect(safe.item.id).toBe(itemId)
     expect(safe.item.taskId).toBe(taskId)
+    expect(safe.item.stepId).toBe(stepId)
     expect(safe.item.content).toBe("[REDACTED]")
     const serialized = JSON.stringify(safe)
-    for (const id of [messageId, itemId, taskId]) expect(serialized).toContain(id)
+    for (const id of [itemId, taskId, stepId]) expect(serialized).toContain(id)
+    expect(serialized).not.toContain(messageId)
     expect(serialized).not.toContain("Call 4912-9422.")
+
+    const mismatched = redactAgentEvent({ type: "input.accepted", body: "", data: payload,
+      routing: { ...routing, itemId: "other-item-12345678-1234-5678-1234-123456789099" } }).data as {
+      item: { id: string; taskId: string; stepId: string; content: unknown }
+    }
+    expect(mismatched.item.id).toBe("[REDACTED]")
+    expect(mismatched.item.taskId).toBe("[REDACTED]")
+    expect(mismatched.item.stepId).toBe("[REDACTED]")
+    expect(mismatched.item.content).toBe("[REDACTED]")
+    expect(JSON.stringify(mismatched)).not.toContain(stepId)
+
+    const unboundStepId = redactAgentEvent({ type: "task.updated", body: "", data: { stepId } }).data as { stepId: string }
+    expect(unboundStepId.stepId).toBe("[REDACTED]")
   })
 
   it("redacts IDs from a partial v2 item-shaped object", () => {
@@ -242,6 +262,51 @@ describe("agent event redaction", () => {
     })
     const serialized = JSON.stringify(safe)
     for (const id of Object.values(ids)) expect(serialized).not.toContain(id)
+  })
+
+  it("does not preserve nested AgentItem IDs inside an ambiguous event envelope", () => {
+    const item = {
+      schemaVersion: "agent-harness.v2",
+      id: "12345678-1234-5678-1234-123456789041",
+      sessionId,
+      turnId,
+      stepId: null,
+      taskId: "child-12345678-1234-5678-1234-123456789042",
+      type: "user_message",
+      status: "completed",
+      phase: "commentary",
+      revision: 0,
+      content: { parts: [{ type: "text", text: "Follow up" }] },
+      startedAt: "2026-10-06T17:30:00.000Z",
+      completedAt: "2026-10-06T17:30:00.000Z",
+      createdAt: "2026-10-06T17:30:00.000Z",
+      updatedAt: "2026-10-06T17:30:00.000Z",
+    }
+    const eventId = "12345678-1234-5678-1234-123456789043"
+    const safe = redactAgentEvent({
+      type: "question.answered",
+      body: "",
+      data: {
+        schemaVersion: "agent-harness.v2",
+        SchemaVersion: "report.v1",
+        id: eventId,
+        sessionId,
+        turnId,
+        itemId: item.id,
+        taskId: item.taskId,
+        sequence: "1",
+        type: "question.answered",
+        actor: "user",
+        correlationId: waitId,
+        causationId: null,
+        idempotencyKey: null,
+        createdAt: "2026-10-06T17:30:00.000Z",
+        payload: { item, taskId: item.taskId },
+      },
+    }).data
+    const serialized = JSON.stringify(safe)
+
+    for (const id of [eventId, item.id, item.taskId]) expect(serialized).not.toContain(id)
   })
 
   it("redacts IDs in unsupported versioned envelopes with partial identity", () => {

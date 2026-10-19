@@ -113,11 +113,19 @@ function validRouting(value: unknown): value is RoutingTuple {
     && (row.outboxTopic === "agent.session.event" || row.outboxTopic === "agent.turn.wakeup")
 }
 
-function isNestedAgentItem(row: JsonRecord, parentKey: string | undefined, schemaVersions: unknown[], hasEventAnchor: boolean, eventType: boolean): boolean {
-  const keys = Object.keys(row)
-  return parentKey === "item" && keys.length === AGENT_ITEM_RECORD_KEYS.size && keys.every(key => AGENT_ITEM_RECORD_KEYS.has(key))
+function isNestedAgentItem(value: unknown, parentKey: string | undefined, route?: RoutingTuple): boolean {
+  const row = record(value)
+  if (!row || parentKey !== "item") return false
+  const entries = Object.entries(row)
+  const keys = entries.map(([key]) => key)
+  const normalizedKeys = new Set(keys.map(key => key.toLowerCase()))
+  const schemaVersions = entries.filter(([key]) => key.toLowerCase() === "schemaversion").map(([, version]) => version)
+  const hasEventAnchor = AGENT_EVENT_DISTINCTIVE_ANCHORS.some(key => normalizedKeys.has(key.toLowerCase()))
+  const eventType = typeof row.type === "string" && AGENT_EVENT_TYPE.test(row.type)
+  return keys.length === AGENT_ITEM_RECORD_KEYS.size && keys.every(key => AGENT_ITEM_RECORD_KEYS.has(key))
     && schemaVersions.length === 1 && schemaVersions[0] === AGENT_EVENT_SCHEMA_VERSION
     && !hasEventAnchor && !eventType && opaqueId(row.id) && opaqueId(row.sessionId) && opaqueId(row.turnId)
+    && !!route && row.id === route.itemId && row.sessionId === route.sessionId && row.turnId === route.turnId && row.taskId === route.taskId
     && nullableId(row.stepId) && nullableId(row.taskId)
     && typeof row.type === "string" && AGENT_ITEM_TYPES.has(row.type)
     && typeof row.status === "string" && AGENT_ITEM_STATUSES.has(row.status)
@@ -127,9 +135,9 @@ function isNestedAgentItem(row: JsonRecord, parentKey: string | undefined, schem
     && validTimestamp(row.createdAt) && validTimestamp(row.updatedAt)
 }
 
-function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: string): boolean {
+function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: string, route?: RoutingTuple): boolean {
   if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
-  if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1, parentKey))
+  if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1, parentKey, route))
   const row = record(value)
   if (!row) return false
   const entries = Object.entries(row)
@@ -139,7 +147,7 @@ function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: 
   const eventType = typeof row.type === "string" && AGENT_EVENT_TYPE.test(row.type)
   const schemaVersions = entries.filter(([key]) => key.toLowerCase() === "schemaversion").map(([, version]) => version)
   const hasSchemaVersion = schemaVersions.length > 0
-  const nestedAgentItem = isNestedAgentItem(row, parentKey, schemaVersions, hasEventAnchor, eventType)
+  const nestedAgentItem = isNestedAgentItem(row, parentKey, route)
   const ambiguousSchemaVersion = !nestedAgentItem && schemaVersions.length > 1 && (hasEventAnchor || eventType)
   const versionedAgentEnvelope = !nestedAgentItem && schemaVersions.some(version => typeof version === "string"
     && version.toLowerCase().startsWith(AGENT_EVENT_SCHEMA_NAMESPACE))
@@ -149,7 +157,7 @@ function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: 
   const envelopeShape = versionedAgentEnvelope || malformedVersionedEnvelope || unversionedPartialEnvelope
     || ambiguousSchemaVersion
     || !hasSchemaVersion && AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
-  return envelopeShape || entries.some(([key, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1, key.toLowerCase()))
+  return envelopeShape || entries.some(([key, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1, key, route))
 }
 
 function containsDuplicateSchemaVersion(value: unknown, depth = 0): boolean {
@@ -239,9 +247,9 @@ export function redactSensitiveValue(value: unknown, key: string | null = null, 
 export function redactAgentEvent(input: { type: string; body: string; data?: unknown; routing?: AgentEventRoutingContext }): { body: string; data: RepositoryJsonValue | null } {
   const envelope = input.routing ? null : fullEnvelope(input.type, input.data)
   const route = input.routing && validRouting(input.routing) ? input.routing : envelope?.routing
-  const allowStructuralIds = input.routing === undefined && !ROUTED_AGENT_EVENT_TYPE.has(input.type)
-    && !containsAgentEventEnvelopeShape(input.data)
-  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, allowStructuralIds)
+  const hasEventEnvelopeShape = containsAgentEventEnvelopeShape(input.data, 0, undefined, route)
+  const allowStructuralIds = input.routing === undefined && !ROUTED_AGENT_EVENT_TYPE.has(input.type) && !hasEventEnvelopeShape
+  const safe = input.data === undefined ? null : redactEventValue(input.data, null, 0, EVENT_REDACTION_MAX_DEPTH, false, allowStructuralIds, !hasEventEnvelopeShape, route)
   const data = route && input.data !== undefined
     ? input.routing
       ? redactWaitRouting(input.type, input.data, safe, route)
@@ -259,12 +267,12 @@ export function redactAgentEvent(input: { type: string; body: string; data?: unk
  * and direct contact data. Lifecycle/tool payloads use the stricter generic
  * redactor above because they are not rendered back into the user transcript.
  */
-function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true): RepositoryJsonValue {
+function redactEventValue(value: unknown, key: string | null = null, depth = 0, maxDepth = EVENT_REDACTION_MAX_DEPTH, insideResume = false, allowStructuralIds = true, allowNestedAgentItems = true, route?: RoutingTuple, preserveItemStepId = false): RepositoryJsonValue {
   const resumeContainer = insideResume || key === "resume" || key === "cv"
   const normalizedKey = key?.toLowerCase()
-  const structuralIdKey = normalizedKey !== undefined && STRUCTURAL_ID_KEY.has(normalizedKey)
+  const structuralIdKey = normalizedKey !== undefined && (STRUCTURAL_ID_KEY.has(normalizedKey) || normalizedKey === "stepid")
   const structuralId = allowStructuralIds && typeof value === "string" && structuralIdKey
-    && (normalizedKey === "questionid" ? stableOpaqueId(value) : opaqueId(value))
+    && (normalizedKey === "questionid" ? stableOpaqueId(value) : normalizedKey === "stepid" ? preserveItemStepId && opaqueId(value) : opaqueId(value))
   if (structuralIdKey && value !== null && !structuralId) return "[REDACTED]"
   const safeKey = normalizedKey ? EVENT_SAFE_KEY.has(normalizedKey) : false
   if (key && !safeKey && !structuralId && EVENT_SENSITIVE_KEY.test(key) && key !== "resume" && key !== "cv") return "[REDACTED]"
@@ -273,7 +281,7 @@ function redactEventValue(value: unknown, key: string | null = null, depth = 0, 
   if (value === null || typeof value === "boolean") return value
   if (typeof value === "number") return Number.isFinite(value) ? value : "[REDACTED]"
   if (depth >= maxDepth) return "[REDACTED]"
-  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer, allowStructuralIds))
+  if (Array.isArray(value)) return value.map((entry) => redactEventValue(entry, null, depth + 1, maxDepth, resumeContainer, allowStructuralIds, allowNestedAgentItems, route, preserveItemStepId))
   if (typeof value !== "object" || value === undefined) return "[REDACTED]"
   const entries: Array<[string, RepositoryJsonValue]> = []
   for (const [entryKey, entryValue] of Object.entries(value)) {
@@ -281,7 +289,10 @@ function redactEventValue(value: unknown, key: string | null = null, depth = 0, 
     // reconnect clients on the receipt-rotation path instead of fabricating a
     // truthy redaction marker that looks like a usable nonce.
     if (entryValue === undefined) continue
-    entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer, allowStructuralIds)])
+    const preserveItemIds = allowNestedAgentItems && isNestedAgentItem(entryValue, entryKey, route)
+    const preserveStepId = preserveItemIds || preserveItemStepId && entryKey === "stepId"
+    entries.push([entryKey, redactEventValue(entryValue, entryKey, depth + 1, maxDepth, resumeContainer,
+      allowStructuralIds || preserveItemIds, allowNestedAgentItems, route, preserveStepId)])
   }
   return Object.fromEntries(entries)
 }
