@@ -56,7 +56,7 @@ function structuredFailureNode(
   return {
     key: "typed-failure", taskId: "structured-private-task", templateId: role, goal: "PRIVATE_STRUCTURED_GOAL",
     successCriteria: ["PRIVATE_STRUCTURED_CRITERION"], dependsOn: [], status: "failed", readiness: "terminal",
-    resultSummary: null, failureReason: null, resultProjection: UNAVAILABLE_PROJECTION,
+    resultSummary: null, failureReason: "task_graph_verification_unverified", resultProjection: UNAVAILABLE_PROJECTION,
     verificationCriterionIds: [criterionId], verification,
     verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
       criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null },

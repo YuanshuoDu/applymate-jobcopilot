@@ -12,7 +12,7 @@ import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
 import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
 import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
 import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
-import { projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
+import { hasTaskGraphVerificationUnverifiedFailureReason, projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
 import { parseTaskGraphCurrentDiscoveryAttemptHealth } from "./subagents/task-graph-discovery-attempt-health.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
@@ -190,7 +190,7 @@ function node(value: unknown): TaskGraphCurrentNode {
   const native = nativeGraphNodeFields(row)
   const discoveryAttemptHealth = parseTaskGraphCurrentDiscoveryAttemptHealth(row, { templateId, status: row.status, verification: verification.verification, repairOf: verification.repairOf, repairReceipt: verification.repairReceipt, native: Boolean(native.native), nativeResult: Boolean(native.nativeResult) })
   const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, { hasVerifiedReport: Boolean(verification.verificationReport), isNative: Boolean(native.native || native.nativeResult) })
-  const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult ? undefined
+  const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult || !hasTaskGraphVerificationUnverifiedFailureReason(row) ? undefined
     : projectTaskGraphStructuredFailureCategory(row, { status: row.status, templateId, verification: verification.verification, verificationReport: verification.verificationReport })
   return {
     key, templateId,
