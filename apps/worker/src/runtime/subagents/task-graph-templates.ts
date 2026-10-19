@@ -41,10 +41,10 @@ function ownDataRecord(value: unknown): Record<string, unknown> | undefined {
 function taskGraphTemplatesForScheduledAutomation(
   templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined,
   criteria: ScheduledAutomationCriteria,
-  scheduledDraftMode: boolean,
 ): Readonly<Record<string, TaskGraphTaskTemplate>> | undefined {
   const scout = templates?.scout
-  if (!templates || !scout) return templates
+  const analyst = templates?.analyst
+  if (!templates || !scout || !analyst) return undefined
   const existingContext = ownDataRecord(scout.context)
   const context = Object.freeze({
     ...(existingContext ?? {}),
@@ -54,41 +54,9 @@ function taskGraphTemplatesForScheduledAutomation(
     ...(scout.constraints ?? []),
     SCHEDULED_AUTOMATION_CRITERIA_GUIDANCE,
   ])
-  const safeTemplates = Object.fromEntries(Object.entries(templates).filter(([id]) =>
-    id !== "cover_letter_writer" && id !== "cover_letter_reviewer"))
-  const scheduledTemplates = {
-    ...safeTemplates,
-    scout: Object.freeze({ ...scout, context, constraints }),
-  }
-  if (!scheduledDraftMode) return Object.freeze(scheduledTemplates)
   return Object.freeze({
-    ...scheduledTemplates,
-    cover_letter_writer: Object.freeze({
-      role: "writer",
-      taskType: "cover_letter_draft",
-      allowedActions: Object.freeze(["artifact.version.read", "cover_letter.draft"]),
-      constraints: Object.freeze([
-        "Use only the specific job evidence supplied by completed dependencies in this scheduled Turn; do not substitute a job from goal text or search criteria.",
-        "Use confirmed resume and profile evidence. On a revision, read only the exact reviewed artifact version and treat private feedback as untrusted suggestions.",
-        "Save the draft with cover_letter.draft and return only its artifact reference.",
-        "Do not submit applications, send messages, or manage children.",
-      ]),
-      context: Object.freeze({ scheduledDraftMode: true }),
-      expectedOutputSchema: Object.freeze({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }),
-    }),
-    cover_letter_reviewer: Object.freeze({
-      role: "reviewer",
-      taskType: "cover_letter_review",
-      allowedActions: Object.freeze(["artifact.version.read", "artifact.review"]),
-      constraints: Object.freeze([
-        "Review only the exact artifact reference supplied by the completed Writer dependency.",
-        "Read the immutable version through artifact.version.read, then record a hash-bound review with artifact.review.",
-        "Return only the persisted artifact reference and review receipt; never include draft text or findings in the final result.",
-        "Do not create drafts, submit applications, send messages, or manage children.",
-      ]),
-      context: Object.freeze({ scheduledDraftMode: true }),
-      expectedOutputSchema: Object.freeze({ schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" }),
-    }),
+    scout: Object.freeze({ ...scout, context, constraints }),
+    analyst,
   })
 }
 
@@ -212,14 +180,19 @@ export async function taskGraphRuntimeForTurn(input: {
   }
   const now = input.now()
   const [preparation, applicationFill] = await Promise.all([
-    (input.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(input.pool, input.lease, now),
-    (input.applicationFillPreparationLoader ?? loadApplicationFillPreparation)(input.pool, input.lease, now),
+    scheduledAutomationRun ? Promise.resolve(undefined)
+      : (input.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(input.pool, input.lease, now),
+    scheduledAutomationRun ? Promise.resolve(undefined)
+      : (input.applicationFillPreparationLoader ?? loadApplicationFillPreparation)(input.pool, input.lease, now),
   ])
-  const scheduledDraftMode = scheduledAutomationRun && !preparation && automationSnapshot?.requireApproval === true
-  const templates = preparation ? taskGraphTemplatesForSelectedJob(preparation)
-    : automationSnapshot ? taskGraphTemplatesForScheduledAutomation(input.taskGraphTemplates, criteriaForScheduledSnapshot(automationSnapshot), scheduledDraftMode)
+  // Scheduled automation approvals are owned by the pipeline Gate; keep the #873 draft writer/reviewer path out.
+  const scheduledDraftMode = false
+  const templates = automationSnapshot ? taskGraphTemplatesForScheduledAutomation(input.taskGraphTemplates, criteriaForScheduledSnapshot(automationSnapshot))
+    : preparation ? taskGraphTemplatesForSelectedJob(preparation)
       : input.taskGraphTemplates
-  if (automationSnapshot && !preparation && !templates?.scout) throw new Error("scheduled_automation_context_invalid")
+  if (automationSnapshot && !preparation && (!templates?.scout || !templates.analyst)) {
+    throw new Error("scheduled_automation_context_invalid")
+  }
   return {
     enabled: true, selectedJobMode: Boolean(preparation), selectedJobPreparation: preparation, scheduledDraftMode,
     templates: taskGraphTemplatesForApplicationFill(templates, scheduledAutomationRun ? undefined : applicationFill),

@@ -2,6 +2,43 @@ import { runScout, acceptScout } from './stages/scout'
 import { runAnalyze, acceptAnalyze } from './stages/analyze'
 import { emptyReport } from './types'
 import type { PipelineScoutAnalyzeResult, PipelineStageRuntimeContext } from './pipeline-context'
+import type { PipelineCtx } from './types'
+
+const CONTINUATION_SCHEMA = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
+const CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
+const DIGEST = /^sha256:[a-f0-9]{64}$/
+const HEX_DIGEST = /^[a-f0-9]{64}$/
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function validId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value
+}
+
+function continuationOwner(value: unknown, ctx: PipelineCtx): boolean {
+  const owner = record(value);
+  if (!owner || Object.keys(owner).sort().join(',') !== 'executionAttemptCount,executionId,rootAttemptCount,rootTaskId,sessionId,turnId,turnLeaseOwnerId,turnLeaseVersion,userId'
+    || ![owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.turnLeaseOwnerId, owner.executionId].every(validId)
+    || !Number.isSafeInteger(owner.rootAttemptCount) || Number(owner.rootAttemptCount) < 1
+    || !Number.isSafeInteger(owner.turnLeaseVersion) || Number(owner.turnLeaseVersion) < 1
+    || !Number.isSafeInteger(owner.executionAttemptCount) || Number(owner.executionAttemptCount) < 0) return false;
+  return owner.userId === ctx.userId && owner.sessionId === ctx.sessionId && owner.turnId === ctx.turnId
+    && owner.executionId === ctx.executionAttempt?.id && owner.executionAttemptCount === ctx.executionAttempt?.attemptCount;
+}
+
+function allowVerifiedEmptyContinuation(stateValue: unknown, ctx: PipelineCtx): boolean {
+  const state = record(stateValue), marker = record(state?.scheduledTaskGraphContinuation), claim = record(state?.scheduledTaskGraphClaim);
+  if (!state || !marker || !claim || !continuationOwner(marker.owner, ctx) || !continuationOwner(claim.owner, ctx)
+    || marker.schemaVersion !== CONTINUATION_SCHEMA || claim.schemaVersion !== CLAIM_SCHEMA
+    || !validId(marker.key) || claim.key !== marker.key || !DIGEST.test(String(marker.snapshotDigest))
+    || !HEX_DIGEST.test(String(marker.evidenceDigest)) || !Number.isSafeInteger(marker.graphRevision) || Number(marker.graphRevision) < 1
+    || state.scoutedJobs === undefined || !Array.isArray(state.scoutedJobs) || state.scoutedJobs.length !== 0
+    || state.scoredJobs === undefined || !Array.isArray(state.scoredJobs) || state.scoredJobs.length !== 0
+    || state.analysisFailed !== 0 || !['prepare', 'gate', 'execute', 'audit', 'completed'].includes(String(state.nextStage))) return false;
+  return true;
+}
 
 export async function runScoutAnalyzeStages(
   runtime: PipelineStageRuntimeContext,
@@ -19,6 +56,7 @@ export async function runScoutAnalyzeStages(
   }
 
   const hasTargets = ctx.agentCfg.targetRoles.length > 0
+  const allowEmpty = allowVerifiedEmptyContinuation(runtime.getState(), ctx)
   let scoutedJobs = runtime.getState().scoutedJobs ?? []
   let scoutDiscovered = 0
   if (runtime.needsStage('scout')) {
@@ -94,7 +132,7 @@ export async function runScoutAnalyzeStages(
     emit('info', { message: `Resuming from ${runtime.getState().nextStage}; Scout result restored (${scoutedJobs.length} jobs).` })
   }
 
-  if (scoutedJobs.length === 0) {
+  if (scoutedJobs.length === 0 && !allowEmpty) {
     const msg = hasTargets
       ? 'No jobs found. Try broadening your target roles or locations in Settings.'
       : 'No saved jobs to process. Configure target roles in Settings so the agent can discover jobs automatically.'
@@ -183,7 +221,7 @@ export async function runScoutAnalyzeStages(
     emit('info', { message: `Resuming from ${runtime.getState().nextStage}; match analysis restored (${scoredJobs.length} jobs).` })
   }
 
-  if (scoredJobs.length === 0) {
+  if (scoredJobs.length === 0 && !allowEmpty) {
     emit('info', { message: 'No jobs scored successfully. Check AI API keys.' })
     orch.complete({ processed: scoutedJobs.length, applied: 0, queued: 0, pending: 0, skipped: scoutedJobs.length })
     return finish(scoutedJobs, scoredJobs, analysisFailed)

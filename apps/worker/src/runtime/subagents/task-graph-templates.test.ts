@@ -102,6 +102,7 @@ describe("TaskGraph server-owned templates", () => {
   it("returns selected-job mode only when the server-side preparation loader finds a selection", async () => {
     const base = {
       pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true,
+      selectedJobPreparationLoader: async () => undefined,
       applicationFillPreparationLoader: async () => undefined,
     }
     const selected = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => ({ jobId: "job-1" }) })
@@ -153,17 +154,25 @@ describe("TaskGraph server-owned templates", () => {
     expect(absent.templates).toBe(baseTemplates)
   })
 
-  it("enables scheduled draft templates only for an approved scheduled automation snapshot", async () => {
+  it("keeps scheduled automation on the registered Scout and Analyst workflow", async () => {
+    const templatesWithDraftRoles = {
+      ...taskGraphTemplatesForSelectedJob({ jobId: "job-1" }),
+      ...TASK_GRAPH_TEMPLATES,
+      other_registered_role: TASK_GRAPH_TEMPLATES.scout,
+    }
     const approved = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
       turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: true, autoApply: false }) },
       applicationFillPreparationLoader: async () => ({ available: true }),
+      taskGraphTemplates: templatesWithDraftRoles,
     }))
     const autoApply = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
       turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: true, autoApply: true }) },
+      taskGraphTemplates: templatesWithDraftRoles,
     }))
     const approvalNotRequired = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
       turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: false, autoApply: true }) },
       applicationFillPreparationLoader: async () => ({ available: true }),
+      taskGraphTemplates: templatesWithDraftRoles,
     }))
     const manual = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
       automationRunMode: "manual",
@@ -174,22 +183,28 @@ describe("TaskGraph server-owned templates", () => {
       turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: true }) },
     }))
 
-    expect(approved.scheduledDraftMode).toBe(true)
-    expect(approved.templates).toHaveProperty("cover_letter_writer")
-    expect(approved.templates).toHaveProperty("cover_letter_reviewer")
-    expect(approved.templates?.cover_letter_writer.allowedActions).toEqual(["artifact.version.read", "cover_letter.draft"])
-    expect(approved.templates?.cover_letter_reviewer.allowedActions).toEqual(["artifact.version.read", "artifact.review"])
-    expect(approved.templates?.cover_letter_writer.context).toEqual({ scheduledDraftMode: true })
-    expect(approved.templates?.cover_letter_reviewer.context).toEqual({ scheduledDraftMode: true })
+    expect(approved.scheduledDraftMode).toBe(false)
+    expect(Object.keys(approved.templates ?? {})).toEqual(["scout", "analyst"])
+    expect(approved.templates?.scout).toMatchObject({
+      role: TASK_GRAPH_TEMPLATES.scout.role,
+      taskType: TASK_GRAPH_TEMPLATES.scout.taskType,
+      allowedActions: TASK_GRAPH_TEMPLATES.scout.allowedActions,
+      context: { scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 } },
+    })
+    expect(approved.templates?.analyst).toBe(TASK_GRAPH_TEMPLATES.analyst)
     expect(approved.templates).not.toHaveProperty("application_filler")
+    for (const result of [approved, autoApply, approvalNotRequired]) {
+      expect(Object.keys(result.templates ?? {})).toEqual(["scout", "analyst"])
+      expect(result.templates).not.toHaveProperty("cover_letter_writer")
+      expect(result.templates).not.toHaveProperty("cover_letter_reviewer")
+      expect(result.templates).not.toHaveProperty("other_registered_role")
+      expect(result.templates).not.toHaveProperty("application_filler")
+    }
     expect(autoApply).toEqual(approved)
     expect(approvalNotRequired).toMatchObject({
       scheduledDraftMode: false,
       templates: { scout: expect.any(Object), analyst: expect.any(Object) },
     })
-    expect(approvalNotRequired.templates).not.toHaveProperty("cover_letter_writer")
-    expect(approvalNotRequired.templates).not.toHaveProperty("cover_letter_reviewer")
-    expect(approvalNotRequired.templates).not.toHaveProperty("application_filler")
     expect(manual.scheduledDraftMode).toBe(false)
     expect(manual.templates).toBe(TASK_GRAPH_TEMPLATES)
     expect(userTurn.scheduledDraftMode).toBe(false)
@@ -264,10 +279,12 @@ describe("TaskGraph server-owned templates", () => {
     })
   })
 
-  it("fails closed when scheduled automation has no server-owned Scout template to bind", async () => {
-    await expect(taskGraphRuntimeForTurn(scheduledRuntimeInput({
-      taskGraphTemplates: { analyst: TASK_GRAPH_TEMPLATES.analyst },
-    }))).rejects.toThrow("scheduled_automation_context_invalid")
+  it.each([
+    ["Scout", { analyst: TASK_GRAPH_TEMPLATES.analyst }],
+    ["Analyst", { scout: TASK_GRAPH_TEMPLATES.scout }],
+  ])("fails closed when scheduled automation has no server-owned %s template to bind", async (_name, taskGraphTemplates) => {
+    await expect(taskGraphRuntimeForTurn(scheduledRuntimeInput({ taskGraphTemplates })))
+      .rejects.toThrow("scheduled_automation_context_invalid")
   })
 
   it.each([
@@ -351,15 +368,27 @@ describe("TaskGraph server-owned templates", () => {
     expect(selectedJobLoader).not.toHaveBeenCalled()
   })
 
-  it("preserves selected-job templates after validating a scheduled snapshot", async () => {
+  it("keeps scheduled automation on Scout and Analyst even when selected-job preparation is available", async () => {
+    const selectedJobLoader = vi.fn(async () => ({ jobId: "job-1" }))
+    const applicationFillLoader = vi.fn(async () => ({ available: true }))
     const result = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
-      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      selectedJobPreparationLoader: selectedJobLoader,
+      applicationFillPreparationLoader: applicationFillLoader,
     }))
 
-    expect(result).toMatchObject({ scheduledDraftMode: false, selectedJobMode: true })
-    expect(result.templates?.scout).toMatchObject({
-      allowedActions: ["jobs.get"], context: { selectedJobPreparation: { jobId: "job-1" } },
+    expect(result).toMatchObject({
+      scheduledDraftMode: false, selectedJobMode: false, selectedJobPreparation: undefined,
     })
-    expect(result.templates?.scout.context).not.toHaveProperty("scheduledAutomationCriteria")
+    expect(selectedJobLoader).not.toHaveBeenCalled()
+    expect(applicationFillLoader).not.toHaveBeenCalled()
+    expect(Object.keys(result.templates ?? {})).toEqual(["scout", "analyst"])
+    expect(result.templates).not.toHaveProperty("cover_letter_writer")
+    expect(result.templates).not.toHaveProperty("cover_letter_reviewer")
+    expect(result.templates).not.toHaveProperty("application_filler")
+    expect(result.templates?.scout).toMatchObject({
+      role: TASK_GRAPH_TEMPLATES.scout.role,
+      context: { scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 } },
+    })
+    expect(result.templates?.analyst).toBe(TASK_GRAPH_TEMPLATES.analyst)
   })
 })
