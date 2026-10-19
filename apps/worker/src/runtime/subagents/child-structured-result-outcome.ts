@@ -76,6 +76,9 @@ function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedE
   if (value.role === "scout") {
     const candidates = []
     for (const candidate of value.candidates) {
+      const jobKey = evidenceKey("job", candidate.jobId)
+      const observedJob = index.entries.get(jobKey)
+      if (!observedJob || index.conflicts.has(jobKey) || candidate.source !== observedJob.source) return undefined
       const evidenceIds = rewriteEvidenceIds(candidate.evidenceIds)
       if (!evidenceIds) return undefined
       candidates.push({ ...candidate, evidenceIds })

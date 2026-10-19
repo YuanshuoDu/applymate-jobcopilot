@@ -3,7 +3,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-command.js"
 import type { TaskGraphEvent } from "../planning/task-graph.js"
 import {
-  canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId,
+  canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey,
   TASK_GRAPH_ITEM_TYPE, type TaskGraphSnapshot,
 } from "./task-graph-snapshot.js"
 
@@ -24,6 +24,11 @@ function object(value: unknown): Row | null {
 }
 function text(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
 function revision(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
+function observedRevision(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
+// Keep persisted receipt parsing independent of the write-side supersession module.
+function supersessionProposalKey(rootTaskId: string, observedRevision: number): string {
+  return `${taskGraphItemId(rootTaskId)}:supersession:${observedRevision}`
+}
 function graph(value: unknown): TaskGraphSnapshot {
   try { return parseTaskGraphSnapshot(value) } catch { throw new Error("task_graph_receipt_invalid") }
 }
@@ -88,10 +93,25 @@ export function parsePersistedTaskGraphReceipt(eventType: unknown, value: unknow
   }
   if ((eventType === "item.started" || eventType === "item.delta") && payload.kind === "proposal") {
     if (eventType === "item.delta" && !Object.hasOwn(payload, "content")) throw new Error("task_graph_receipt_invalid")
+    const hasObservedRevision = Object.hasOwn(payload, "observedRevision")
+    const hasOperationKey = Object.hasOwn(payload, "operationKey")
+    const isV2 = hasObservedRevision && hasOperationKey
+    if (hasObservedRevision !== hasOperationKey) throw new Error("task_graph_receipt_invalid")
+    if (isV2 && (eventType !== "item.delta" || !identity
+      || !observedRevision(payload.observedRevision) || payload.observedRevision > Number.MAX_SAFE_INTEGER - 2
+      || payload.revision !== payload.observedRevision + 2
+      || typeof payload.operationKey !== "string"
+      || !/^agent\.plan\.reconciliation:sha256:[0-9a-f]{64}$/.test(payload.operationKey)
+      || typeof payload.fingerprint !== "string" || !/^[0-9a-f]{64}$/.test(payload.fingerprint)
+      || identity.itemId !== taskGraphItemId(scope.parentTaskId) || identity.taskId !== scope.parentTaskId
+      || identity.idempotencyKey !== supersessionProposalKey(scope.parentTaskId, payload.observedRevision))) {
+      throw new Error("task_graph_receipt_invalid")
+    }
     validateProposal(payload, loaded, current, scope)
     const expectedRevision = Number(object(payload.receipt)?.revision) - 1
     if (identity && (identity.itemId !== taskGraphItemId(scope.parentTaskId) || identity.taskId !== scope.parentTaskId
-      || identity.idempotencyKey !== `${taskGraphItemId(scope.parentTaskId)}:proposal:${expectedRevision}`
+      || identity.idempotencyKey !== (isV2 ? supersessionProposalKey(scope.parentTaskId, payload.observedRevision as number)
+        : taskGraphProposalKey(scope.parentTaskId, expectedRevision))
       || eventType !== (payload.revision === 1 ? "item.started" : "item.delta"))) throw new Error("task_graph_receipt_invalid")
     return null
   }

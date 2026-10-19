@@ -71,12 +71,17 @@ function keysetPage(rows: Row[], query: unknown, marker: string, sequenceKey: st
   }).slice(0, pageSize)
 }
 
-function capacityQueryMock(data: { inputs: Row[]; receiptEvents: Row[]; callRows: Row[]; historyStep: Row[]; agendas: Row[] }) {
+function capacityQueryMock(data: { inputs: Row[]; receiptEvents: Row[]; callRows: Row[]; historyStep: Row[]; agendas: Row[]; linkedEvents?: Row[]; graphRevision?: number }) {
   return vi.fn(async (query: unknown): Promise<Row[]> => {
     const { sql, values } = queryData(query)
     if (sql.includes('SELECT "input", "rootTaskId" FROM "agent_turns"')) return [{ input: { clientMessageId: "root-client" }, rootTaskId: scope.rootTaskId }]
     if (sql.includes('FROM "sub_agent_tasks"')) return [{ id: scope.rootTaskId, sessionId: scope.sessionId, turnId: scope.turnId, attemptCount: 1 }]
-    if (sql.includes('SELECT "revision" FROM "agent_items"')) return [{ revision: 1 }]
+    if (sql.includes('SELECT "revision" FROM "agent_items"')) return [{ revision: data.graphRevision ?? 1 }]
+    if (sql.includes('event."id" = ANY')) {
+      const ids = values.find(Array.isArray) as string[] | undefined
+      return (data.linkedEvents ?? []).filter(row => ids?.includes(String(row.eventId))
+        && (row.sessionId === undefined || row.sessionId === scope.sessionId) && (row.turnId === undefined || row.turnId === scope.turnId))
+    }
     if (sql.includes('FROM "agent_inputs" AS input')) return keysetPage(data.inputs, query, 'input."acceptedSequence" >', "acceptedSequence", 3, (row, text, params) =>
       !text.includes('input."acceptedSequence" <=') || BigInt(row.acceptedSequence as bigint) <= BigInt(params[3 + (text.includes('input."acceptedSequence" >') ? 3 : 0)] as bigint))
     if (sql.includes("event.\"type\" = 'agent.plan.reconciliation'")) return keysetPage(data.receiptEvents, query, 'event."sequence" >', "sequence", 2)
@@ -107,7 +112,7 @@ function agenda(stepId: string) {
   }
 }
 
-function facts(count: number, withReceipt = false) {
+function facts(count: number, withReceipt = false, options: { graphRevision?: number; linkedEvents?: Row[] } = {}) {
   const first = acceptedRow(0, withReceipt ? "consumed" : "accepted", withReceipt ? "origin-step" : null)
   const rest = Array.from({ length: count - 1 }, (_, index) => acceptedRow(index + 1, index % 2 ? "queued" : "accepted"))
   const inputs = [rootInput(), first, ...rest]
@@ -139,9 +144,78 @@ function facts(count: number, withReceipt = false) {
   const receiptEvents = withReceipt ? [receiptEvent] : []
   const callRows = withReceipt ? [call] : []
   const agendas = withReceipt ? [{ id: "agenda-decision-step", sequence: first.acceptedSequence + BigInt(60), actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: "decision-step", payload: agenda("decision-step") }] : []
-  const queryRaw = capacityQueryMock({ inputs, receiptEvents, callRows, historyStep, agendas })
+  const queryRaw = capacityQueryMock({ inputs, receiptEvents, callRows, historyStep, agendas, ...options })
   const tx = { $queryRaw: queryRaw } as unknown as CommandTransaction
-  return { tx, queryRaw, inputs, receiptEvents, callRows, sourceStep, decisionStep, first }
+  return { tx, queryRaw, inputs, receiptEvents, callRows, sourceStep, decisionStep, first, historyStep, agendas, linkedEvents: options.linkedEvents ?? [] }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
+  if (value && typeof value === "object") {
+    const row = value as Row
+    return `{${Object.keys(row).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(row[key])}`).join(",")}}`
+  }
+  return JSON.stringify(value) ?? "null"
+}
+
+function v2Facts() {
+  const repairOf = { graphRootTaskId: scope.rootTaskId, nodeKey: "target-node", taskId: "target-task", criterionIds: ["finding-count"] }
+  const verification = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
+  const source = { key: "stale-node", taskId: "source-task", templateId: "scout", goal: "old goal", successCriteria: ["old"], dependsOn: [], depth: 1, verificationDisposition: "typed", verification, repairOf }
+  const replacement = { ...source, key: "fresh-node", taskId: "replacement-task", goal: "new goal", successCriteria: ["new"] }
+  const unrelated = { key: "stable-node", taskId: "stable-task", templateId: "analyst", goal: "stable", successCriteria: ["stable"], dependsOn: [], depth: 1, verificationDisposition: "legacy_unverified" }
+  const rawRepairOf = { nodeKey: repairOf.nodeKey, taskId: repairOf.taskId, criterionIds: repairOf.criterionIds }
+  const input = { expectedRevision: 1, replaceUnstarted: { nodeKey: source.key }, nodes: [{ key: replacement.key, templateId: replacement.templateId,
+    goal: replacement.goal, successCriteria: replacement.successCriteria, dependsOn: replacement.dependsOn, verification, repairOf: rawRepairOf }] }
+  const normalizedInput = { ...input, nodes: input.nodes.map(node => ({ ...node, repairOf: { ...node.repairOf, graphRootTaskId: scope.rootTaskId } })) }
+  const fingerprint = createHash("sha256").update(canonicalJson({ source: { nodeKey: source.key, taskId: source.taskId }, expectedRevision: input.expectedRevision,
+    replaceUnstarted: input.replaceUnstarted, nodes: normalizedInput.nodes }), "utf8").digest("hex")
+  const base = facts(2, true, { graphRevision: 3 })
+  const call = base.callRows[0]!
+  Object.assign(call, { eventSequence: BigInt(52), payload: { taskId: scope.rootTaskId, toolCallId: "call-1", toolName: "agent.plan" } })
+  Object.assign(call, { itemContent: { toolCallId: "call-1", toolName: "agent.plan", toolVersion: "1", input } })
+  const operationKey = String(base.receiptEvents[0]!.idempotencyKey)
+  const graphId = `task-graph-${createHash("sha256").update(scope.rootTaskId).digest("hex")}`
+  const cancellationKey = `${graphId}:node:${createHash("sha256").update(source.key).digest("hex").slice(0, 20)}:0:task.cancelled`
+  const before = { schemaVersion: "agent-harness.v2.task-graph", nodes: [source, unrelated] }
+  const after = { schemaVersion: "agent-harness.v2.task-graph", nodes: [unrelated, replacement] }
+  const relation = { schemaVersion: "agent-harness.v2.task-graph-supersession.v2", operationKey, observedRevision: 1, cancellationRevision: 2, resultingRevision: 3,
+    source: { nodeKey: source.key, taskId: source.taskId }, replacement: { nodeKey: replacement.key, taskId: replacement.taskId },
+    cancellationEvent: { id: "cancel-event", sequence: "80" }, planEvent: { id: "plan-event", sequence: "90", idempotencyKey: `${graphId}:supersession:1` }, replacementFingerprint: fingerprint,
+    agentPlanCall: { callId: "call-1", stepId: "decision-step", expectedRevision: 1, replaceUnstarted: { nodeKey: source.key } } }
+  base.receiptEvents[0]!.sequence = BigInt(100)
+  Object.assign(base.receiptEvents[0]!, { payload: { ...base.receiptEvents[0]!.payload as object, schemaVersion: "agent-harness.v2.plan-reconciliation.v2", decision: "revise",
+    resultingRevision: 3, supersession: relation } })
+  const cancelItem = { id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, type: "task_graph", revision: 2, content: before }
+  const planItem = { id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, type: "task_graph", revision: 3, content: after }
+  const linkedEvents: Row[] = [
+    { eventId: relation.cancellationEvent.id, eventSequence: "80", sessionId: scope.sessionId, turnId: scope.turnId, type: "item.delta", actor: "system", hasOutbox: true,
+      eventTaskId: source.taskId, eventItemId: graphId, correlationId: scope.turnId, causationId: "decision-step", idempotencyKey: cancellationKey,
+      payload: { kind: "lifecycle", revision: 2, event: { type: "task.cancelled", nodeKey: source.key, expectedRevision: 1, idempotencyKey: cancellationKey }, item: cancelItem } },
+    { eventId: relation.planEvent.id, eventSequence: "90", sessionId: scope.sessionId, turnId: scope.turnId, type: "item.delta", actor: "orchestrator", hasOutbox: true,
+      eventTaskId: scope.rootTaskId, eventItemId: graphId, correlationId: scope.turnId, causationId: "decision-step", idempotencyKey: relation.planEvent.idempotencyKey,
+      payload: { kind: "proposal", observedRevision: 1, operationKey, fingerprint, revision: 3, receipt: { status: "accepted", revision: 3,
+        nodes: [{ key: replacement.key, taskId: replacement.taskId, status: "queued" }], readyTaskIds: [replacement.taskId] }, item: planItem, content: after } },
+  ]
+  const queryRaw = capacityQueryMock({ inputs: base.inputs, receiptEvents: base.receiptEvents, callRows: base.callRows, historyStep: base.historyStep,
+    agendas: base.agendas, linkedEvents, graphRevision: 3 })
+  return { ...base, tx: { $queryRaw: queryRaw } as unknown as CommandTransaction, queryRaw, linkedEvents, relation, before, after, source, replacement, unrelated, input }
+}
+
+function tamperPlanSnapshot(fixture: ReturnType<typeof v2Facts>, field: string, value: unknown, mirrorSource = false) {
+  const update = (eventIndex: number, nodeKey: string) => {
+    const event = fixture.linkedEvents[eventIndex]!, payload = event.payload as Row, item = payload.item as Row, content = item.content as Row
+    const nodes = content.nodes as Row[], changes = { [field]: value, ...(field === "verification" ? { verificationDisposition: "typed" } : {}) }
+    const changed = { ...content, nodes: nodes.map(node => node.key === nodeKey ? { ...node, ...changes } : node) }
+    event.payload = { ...payload, item: { ...item, content: changed }, ...(eventIndex === 1 ? { content: changed } : {}) }
+  }
+  update(1, fixture.replacement.key)
+  if (mirrorSource) update(0, fixture.source.key)
+}
+
+function tamperPlanReceipt(fixture: ReturnType<typeof v2Facts>, update: (receipt: Row) => Row) {
+  const event = fixture.linkedEvents[1]!, payload = event.payload as Row
+  event.payload = { ...payload, receipt: update(payload.receipt as Row) }
 }
 
 function largeFacts(receiptCount: number, unresolvedCount = 2) {
@@ -312,7 +386,7 @@ describe("steer acceptance capacity", () => {
     await expect(assertSteeringCapacity(below.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })).resolves.toBeUndefined()
   })
 
-  it("reclaims capacity only for a complete validated receipt and agrees with the Worker unresolved reader", async () => {
+  it("preserves v1 capacity reclamation for a complete validated receipt and agrees with the Worker reader", async () => {
     const fixture = facts(MAX_UNRESOLVED_STEERING_INPUTS, true)
     const count = await readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })
     expect(count).toBe(MAX_UNRESOLVED_STEERING_INPUTS - 1)
@@ -320,6 +394,99 @@ describe("steer acceptance capacity", () => {
     const workerCount = await invokeWorkerReader(fixture)
     expect(workerCount).toBe(MAX_UNRESOLVED_STEERING_INPUTS - 1)
     expect(count).toBe(workerCount)
+  })
+
+  it("accepts the exact R+2 supersession relation and replays it consistently", async () => {
+    const fixture = v2Facts()
+    expect(fixture.relation.planEvent.idempotencyKey).toBe(`task-graph-${createHash("sha256").update(scope.rootTaskId).digest("hex")}:supersession:1`)
+    const input = fixture.input, normalizedNode = { ...input.nodes[0]!, repairOf: { ...input.nodes[0]!.repairOf, graphRootTaskId: scope.rootTaskId } }
+    const fingerprint = createHash("sha256").update(canonicalJson({ source: { nodeKey: fixture.source.key, taskId: fixture.source.taskId }, expectedRevision: input.expectedRevision,
+      replaceUnstarted: input.replaceUnstarted, nodes: [normalizedNode] }), "utf8").digest("hex")
+    const otherSourceFingerprint = createHash("sha256").update(canonicalJson({ source: { nodeKey: fixture.source.key, taskId: "other-source" }, expectedRevision: input.expectedRevision,
+      replaceUnstarted: input.replaceUnstarted, nodes: [normalizedNode] }), "utf8").digest("hex")
+    expect(fingerprint).toBe(fixture.relation.replacementFingerprint)
+    expect(otherSourceFingerprint).not.toBe(fingerprint)
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })).resolves.toBe(1)
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })).resolves.toBe(1)
+  })
+
+  it("accepts a waiting replacement only when it has no ready task IDs", async () => {
+    const fixture = v2Facts()
+    tamperPlanReceipt(fixture, receipt => ({ ...receipt, nodes: [{ ...(receipt.nodes as Row[])[0]!, status: "waiting" }], readyTaskIds: [] }))
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })).resolves.toBe(1)
+  })
+
+  it.each([["empty", ""], ["null", null]] as const)("rejects an explicitly %s repair root instead of normalizing it", async (_name, rootTaskId) => {
+    const fixture = v2Facts(), call = fixture.callRows[0]!, content = call.itemContent as Row, input = content.input as Row
+    const proposal = (input.nodes as Row[])[0]!, repair = proposal.repairOf as Row
+    call.itemContent = { ...content, input: { ...input, nodes: [{ ...proposal, repairOf: { ...repair, graphRootTaskId: rootTaskId } }] } } as unknown as typeof call.itemContent
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
+  })
+
+  it.each([
+    ["goal", "changed goal", false],
+    ["successCriteria", ["changed criterion"], false],
+    ["templateId", "custom_agent", true],
+    ["verification", { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }] }, true],
+    ["dependsOn", ["stable-node"], true],
+  ] as const)("rejects plan-event %s tampering when the persisted call is unchanged", async (field, value, mirrorSource) => {
+    const fixture = v2Facts(), callContent = JSON.stringify(fixture.callRows[0]!.itemContent)
+    tamperPlanSnapshot(fixture, field, value, mirrorSource)
+    expect(JSON.stringify(fixture.callRows[0]!.itemContent)).toBe(callContent)
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
+  })
+
+  it.each([
+    ["missing relation", (f: ReturnType<typeof v2Facts>) => { delete (f.receiptEvents[0]!.payload as Row).supersession }],
+    ["foreign relation field", (f: ReturnType<typeof v2Facts>) => Object.assign(f.receiptEvents[0]!.payload as Row, { supersession: { ...f.relation, foreign: true } })],
+    ["malformed revision", (f: ReturnType<typeof v2Facts>) => Object.assign(f.receiptEvents[0]!.payload as Row, { supersession: { ...f.relation, cancellationRevision: 3 } })],
+    ["wrong operation key", (f: ReturnType<typeof v2Facts>) => Object.assign(f.receiptEvents[0]!.payload as Row, { supersession: { ...f.relation, operationKey: `agent.plan.reconciliation:sha256:${"0".repeat(64)}` } })],
+    ["missing plan event key", (f: ReturnType<typeof v2Facts>) => { delete (f.relation.planEvent as Row).idempotencyKey }],
+    ["old proposal event key", (f: ReturnType<typeof v2Facts>) => { f.relation.planEvent.idempotencyKey = f.relation.planEvent.idempotencyKey.replace(":supersession:", ":proposal:") }],
+    ["event key conflicts with relation", (f: ReturnType<typeof v2Facts>) => { f.linkedEvents[1]!.idempotencyKey = `${f.linkedEvents[1]!.idempotencyKey}:conflict` }],
+    ["multiple result nodes", (f: ReturnType<typeof v2Facts>) => tamperPlanReceipt(f, receipt => ({ ...receipt, nodes: [...receipt.nodes as Row[], ...(receipt.nodes as Row[])] }))],
+    ["foreign result node identity", (f: ReturnType<typeof v2Facts>) => tamperPlanReceipt(f, receipt => ({ ...receipt, nodes: [{ ...(receipt.nodes as Row[])[0]!, taskId: "foreign-task" }] }))],
+    ["extra result node field", (f: ReturnType<typeof v2Facts>) => tamperPlanReceipt(f, receipt => ({ ...receipt, nodes: [{ ...(receipt.nodes as Row[])[0]!, extra: true }] }))],
+    ["missing queued ready ID", (f: ReturnType<typeof v2Facts>) => tamperPlanReceipt(f, receipt => ({ ...receipt, readyTaskIds: [] }))],
+    ["foreign queued ready ID", (f: ReturnType<typeof v2Facts>) => tamperPlanReceipt(f, receipt => ({ ...receipt, readyTaskIds: ["foreign-task"] }))],
+    ["ready ID on waiting node", (f: ReturnType<typeof v2Facts>) => tamperPlanReceipt(f, receipt => ({ ...receipt,
+      nodes: [{ ...(receipt.nodes as Row[])[0]!, status: "waiting" }] }))],
+    ["missing linked event", (f: ReturnType<typeof v2Facts>) => { f.relation.planEvent.id = "foreign-plan" }],
+    ["missing cancellation outbox copy", (f: ReturnType<typeof v2Facts>) => { delete f.linkedEvents[0]!.hasOutbox }],
+    ["missing plan outbox copy", (f: ReturnType<typeof v2Facts>) => { delete f.linkedEvents[1]!.hasOutbox }],
+    ["foreign event scope", (f: ReturnType<typeof v2Facts>) => { f.linkedEvents[0]!.sessionId = "other-session" }],
+    ["stored sequence differs from relation", (f: ReturnType<typeof v2Facts>) => { f.linkedEvents[1]!.eventSequence = "89" }],
+    ["cancellation event follows plan", (f: ReturnType<typeof v2Facts>) => { f.linkedEvents[0]!.eventSequence = "91" }],
+    ["changed cancellation source", (f: ReturnType<typeof v2Facts>) => {
+      const event = f.linkedEvents[0]!, payload = event.payload as Row, item = payload.item as Row, content = item.content as Row
+      event.payload = { ...payload, item: { ...item, content: { ...content, nodes: [{ ...f.source, taskId: "other-source" }, f.unrelated] } } }
+    }],
+    ["changed persisted proposal", (f: ReturnType<typeof v2Facts>) => {
+      const call = f.callRows[0]!, content = call.itemContent as Row, input = content.input as Row, node = (input.nodes as Row[])[0]!
+      Object.assign(call, { itemContent: { ...content, input: { ...input, nodes: [{ ...node, goal: "tampered" }] } } })
+    }],
+    ["changed replacement envelope", (f: ReturnType<typeof v2Facts>) => {
+      const event = f.linkedEvents[1]!, payload = event.payload as Row, item = payload.item as Row, content = item.content as Row
+      const nodes = content.nodes as Row[], replacement = nodes.find(node => node.key === f.replacement.key)!
+      const changed = { ...content, nodes: nodes.map(node => node === replacement ? { ...node, templateId: "other-template" } : node) }
+      event.payload = { ...payload, item: { ...item, content: changed }, content: changed }
+    }],
+    ["changed unrelated node", (f: ReturnType<typeof v2Facts>) => {
+      const event = f.linkedEvents[1]!, payload = event.payload as Row, item = payload.item as Row, content = item.content as Row
+      const nodes = content.nodes as Row[], changed = { ...content, nodes: nodes.map(node => node.key === f.unrelated.key ? { ...node, goal: "tampered" } : node) }
+      event.payload = { ...payload, item: { ...item, content: changed }, content: changed }
+    }],
+    ["different duplicate content", (f: ReturnType<typeof v2Facts>) => {
+      const event = f.linkedEvents[1]!, payload = event.payload as Row, content = payload.content as Row
+      event.payload = { ...payload, content: { ...content, nodes: [] } }
+    }],
+  ] as const)("fails closed for v2 with %s", async (_name, mutate) => {
+    const fixture = v2Facts()
+    mutate(fixture)
+    await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
   })
 
   it("does not let an unconsumed input be covered by a receipt", async () => {

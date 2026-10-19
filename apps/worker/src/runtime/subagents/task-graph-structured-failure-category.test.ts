@@ -6,6 +6,7 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import {
   classifyTaskGraphStructuredOutputFailure,
+  hasTaskGraphVerificationUnverifiedFailureReason,
   projectTaskGraphStructuredFailureCategory,
   taskGraphStructuredFailureCategoryBytes,
   type TaskGraphStructuredOutputFailureCategory,
@@ -14,6 +15,28 @@ import {
 const CATEGORIES: readonly TaskGraphStructuredOutputFailureCategory[] = [
   "missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid",
 ]
+
+describe("hasTaskGraphVerificationUnverifiedFailureReason", () => {
+  it("accepts only the exact own enumerable data failure reason without invoking getters", () => {
+    const reason = "task_graph_verification_unverified"
+    let getterCalls = 0
+    const inherited = Object.assign(Object.create({ failureReason: reason }) as object, {})
+    const accessor = {}
+    Object.defineProperty(accessor, "failureReason", {
+      enumerable: true, get: () => { getterCalls += 1; return reason },
+    })
+    const hidden = {}
+    Object.defineProperty(hidden, "failureReason", { value: reason, enumerable: false })
+
+    expect(hasTaskGraphVerificationUnverifiedFailureReason({ failureReason: reason })).toBe(true)
+    expect(hasTaskGraphVerificationUnverifiedFailureReason({ failureReason: null })).toBe(false)
+    expect(hasTaskGraphVerificationUnverifiedFailureReason({ failureReason: "task_graph_verification_failed" })).toBe(false)
+    expect(hasTaskGraphVerificationUnverifiedFailureReason(inherited)).toBe(false)
+    expect(hasTaskGraphVerificationUnverifiedFailureReason(accessor)).toBe(false)
+    expect(hasTaskGraphVerificationUnverifiedFailureReason(hidden)).toBe(false)
+    expect(getterCalls).toBe(0)
+  })
+})
 
 function eligible(category = "result_shape_invalid", role = "scout") {
   const criterionId = role === "scout" ? "candidate-count" : "finding-count"
@@ -127,6 +150,11 @@ describe("projectTaskGraphStructuredFailureCategory", () => {
     expect(taskGraphStructuredFailureCategoryBytes(category)).toBe(Buffer.byteLength(JSON.stringify({ structuredOutputFailureCategory: category }), "utf8"))
     expect(taskGraphStructuredFailureCategoryBytes(undefined)).toBe(0)
     expect(taskGraphStructuredFailureCategoryBytes("private failure text")).toBe(0)
+  })
+
+  it("keeps shared subtype validation compatible with a sanitized null failure reason", () => {
+    const raw = { ...projectedRaw(), failureReason: null }
+    expect(projectTaskGraphStructuredFailureCategory(raw, parsedProjection())).toBe("result_shape_invalid")
   })
 
   it("rejects category data unless it matches a failed typed node and its exact unverified report", () => {

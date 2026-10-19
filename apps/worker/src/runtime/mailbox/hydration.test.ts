@@ -6,6 +6,7 @@ import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 
 type Call = { readonly sql: string; readonly values: readonly unknown[] }
 type Checkpoint = Omit<ChildMailboxHydrationInput, "ownerId" | "limit" | "toTaskId"> & { readonly id: string; readonly taskId: string; readonly messageId: string }
+type StoredMessage = CoordinationMailboxMessage & { readonly targetAttemptCount?: number | null }
 type State = {
   sessionUser: string
   sessionStatus: string
@@ -18,7 +19,7 @@ type State = {
   turnStatus: string
   stepStatus: string
   stepAttempt: number
-  messages: CoordinationMailboxMessage[]
+  messages: StoredMessage[]
   checkpoints: Checkpoint[]
   failOnInsert: boolean
 }
@@ -29,9 +30,9 @@ const input: ChildMailboxHydrationInput = {
 }
 const now = new Date("2026-09-14T12:00:00.000Z")
 
-function message(id: string, createdAt = now, payload: unknown = { id }): CoordinationMailboxMessage {
+function message(id: string, createdAt = now, payload: unknown = { id }, attempt: number | null = null, kind = "result"): StoredMessage {
   return { id, sessionId: input.sessionId, turnId: input.turnId, fromTaskId: "root-a", toTaskId: input.toTaskId,
-    kind: "result", payload, idempotencyKey: `key-${id}`, createdAt, deliveredAt: null, consumedAt: null }
+    kind, payload, targetAttemptCount: attempt, idempotencyKey: `key-${id}`, createdAt, deliveredAt: null, consumedAt: null }
 }
 
 function state(overrides: Partial<State> = {}): State {
@@ -104,8 +105,10 @@ class FakeClient {
     return empty()
   }
 
-  private pending(values: readonly unknown[]): CoordinationMailboxMessage[] {
+  private pending(values: readonly unknown[]): StoredMessage[] {
+    const attempt = Number(values.length > 7 ? values[6] : values[5])
     return this.db.messages.filter(row => row.sessionId === values[1] && row.turnId === values[2] && row.toTaskId === values[4] && row.consumedAt === null)
+      .filter(row => row.targetAttemptCount === attempt || (row.targetAttemptCount == null && row.kind !== "human_follow_up"))
       .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id))
   }
 
@@ -127,6 +130,10 @@ describe("hydrateChildMailbox", () => {
     expect(db.checkpoints).toHaveLength(2)
     expect(db.messages.map(row => ({ id: row.id, deliveredAt: row.deliveredAt, consumedAt: row.consumedAt }))).toEqual(before)
     expect(client.calls.some(call => /^\s*UPDATE\b/.test(call.sql) || call.sql.includes("agent_outbox"))).toBe(false)
+    const messageReads = client.calls.filter(call => call.sql.includes('FROM "agent_mailbox_messages" AS message'))
+    expect(messageReads.length).toBeGreaterThan(0)
+    expect(messageReads.every(call => call.sql.includes('message."targetAttemptCount"'))).toBe(true)
+    expect(messageReads.every(call => call.sql.includes("message.\"kind\" <> 'human_follow_up'"))).toBe(true)
     expect(client.calls.find(call => call.sql.includes("lockCheckpoints") || call.sql.includes('SELECT checkpoint."id"'))?.values).toEqual([input.userId, input.sessionId, input.turnId, input.rootTaskId, input.toTaskId, input.attemptCount])
   })
 
@@ -139,6 +146,21 @@ describe("hydrateChildMailbox", () => {
     expect(second.result.map(row => row.id)).toEqual(["message-a", "message-b", "message-c"])
     expect(db.checkpoints).toHaveLength(3)
     expect(new Set(db.checkpoints.map(row => row.id)).size).toBe(3)
+  })
+
+  it("blocks attempt K human messages on K+1 while retaining legacy messages and matching human messages", async () => {
+    const db = state({ messages: [
+      message("human-old", now, { text: "old" }, 1, "human_follow_up"),
+      message("human-current", now, { text: "current" }, 2, "human_follow_up"),
+      message("legacy-model", now, { answer: "legacy" }, null, "result"),
+    ] })
+
+    const { result } = await hydrate(db)
+
+    expect(result.map(row => row.id)).toEqual(["human-current", "legacy-model"])
+    expect(db.checkpoints.map(row => row.messageId)).toEqual(["human-current", "legacy-model"])
+    expect(db.checkpoints.some(row => row.messageId === "human-old")).toBe(false)
+    expect(db.messages.find(row => row.id === "human-old")?.targetAttemptCount).toBe(1)
   })
 
   it("caps at twenty and preserves createdAt/id order", async () => {

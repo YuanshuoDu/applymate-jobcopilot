@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 
 import { TaskGraphCommandError, parseRegisteredScoutEnvelope, parseTaskGraphVerificationReport, taskGraphNodeKeysMatch } from "./task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphExecutionScope } from "./task-graph-command-port.js"
+import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "./task-graph-historical-discovery-page-contract.js"
+import type { TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
 
 describe("TaskGraphCommandError", () => {
   it("exposes a stable name, code, message, and optional current revision", () => {
@@ -84,5 +87,45 @@ describe("registered Scout template envelope", () => {
     expect(taskGraphNodeKeysMatch(node, keys)).toBe(true)
     expect(taskGraphNodeKeysMatch({ ...node, registeredScoutEnvelope: envelope }, keys)).toBe(true)
     expect(taskGraphNodeKeysMatch({ ...node, registeredScoutEnvelope: envelope, private: true }, keys)).toBe(false)
+  })
+})
+
+describe("optional historical discovery command", () => {
+  it("accepts only server-supplied execution identity and a normalized page request", async () => {
+    const scope: TaskGraphExecutionScope = {
+      userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", parentTaskId: "root",
+      stepId: "step", turnLeaseOwner: "worker", turnLeaseVersion: 2, parentLeaseOwner: "worker", parentAttemptCount: 1,
+    }
+    const readPage: NonNullable<TaskGraphCommandPort["readHistoricalDiscoveryPage"]> = async (receivedScope, request) => {
+      expect(receivedScope).toBe(scope)
+      expect(request).toEqual({ offset: 0 })
+      return { schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "unavailable",
+        observation: "historical_discovery", verificationStatus: "unverified", reason: "no_source" }
+    }
+
+    await expect(readPage(scope, { offset: 0 })).resolves.toMatchObject({ availability: "unavailable", reason: "no_source" })
+  })
+})
+
+describe("optional discovery-recovery command port", () => {
+  it("keeps existing read ports valid while exposing recovery as a separate optional read", async () => {
+    const legacyPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
+      readCurrent: async () => ({ revision: 0, nodes: [] }),
+    }
+    expect(legacyPort.readCurrentDiscoveryRecoveryPage).toBeUndefined()
+    const request: TaskGraphDiscoveryRecoveryPageRequest = {
+      mode: "discovery_recovery", nodeKey: "scout-a", expectedRevision: 5, offset: 0,
+    }
+    const recoveryPort: TaskGraphCommandPort = {
+      ...legacyPort,
+      readCurrentDiscoveryRecoveryPage: async (_scope, received) => ({
+        schemaVersion: "agent-harness.v2.task-graph.discovery-recovery-page.v1", trust: "untrusted", availability: "unavailable",
+        graphRevision: received.expectedRevision, reason: "recovery_unavailable",
+      }),
+    }
+    await expect(recoveryPort.readCurrentDiscoveryRecoveryPage!({} as never, request)).resolves.toMatchObject({
+      availability: "unavailable", graphRevision: 5,
+    })
   })
 })

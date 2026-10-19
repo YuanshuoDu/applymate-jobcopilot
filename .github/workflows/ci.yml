@@ -87,25 +87,51 @@ jobs:
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify backfill script argument parser
+        working-directory: apps/worker
+        run: |
+          config="scripts/.backfill-script-vitest.config.mjs"
+          test ! -e "$config"
+          trap 'rm -f "$config"' EXIT
+          cat > "$config" <<'EOF'
+          import workerConfig from "../vitest.config.ts"
+
+          export default {
+            ...workerConfig,
+            test: {
+              ...workerConfig.test,
+              include: ["scripts/backfill-objective-history.test.ts"],
+            },
+          }
+          EOF
+          pnpm exec vitest run --config "$config" scripts/backfill-objective-history.test.ts
       - name: Verify submit outbox retry and duplicate-delivery fencing
         run: >-
           pnpm --filter @jobcopilot/worker exec vitest run
           src/queue/application-submit-outbox.test.ts
           src/queue/application-submit-outbox-terminal-recovery.test.ts
           src/queue/apply-queue-pipeline.test.ts
-      - name: Verify application submit recovery commit orders on disposable PostgreSQL
+      - name: Verify application submit publisher and recovery commit orders on disposable PostgreSQL and Redis
         env:
           CI: "true"
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
           AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
           AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
           AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          REDIS_URL: redis://127.0.0.1:6379/15
         run: |
           test "$CI" = "true"
           test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
           test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/queue/apply-queue-submit-recovery-pg.integration.test.ts
       - name: Verify application fill Stop and late Worker callbacks on disposable PostgreSQL
         env:
@@ -134,6 +160,19 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/task-interrupt-outbox-pg.integration.test.ts
+      - name: Verify attempt-bound child follow-ups on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/lib/agent/control-plane/commands/task-message-service.pg.integration.test.ts
+          pnpm --filter @jobcopilot/worker exec vitest run src/runtime/mailbox/attempt-bound-message-pg.integration.test.ts
       - name: Verify context compaction snapshot publication on disposable PostgreSQL
         env:
           CI: "true"
@@ -197,6 +236,19 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
             src/runtime/context/root-task-history-direct-pg.integration.test.ts
+      - name: Verify historical discovery result pages on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/context/root-task-history-result-page-pg.integration.test.ts
       - name: Verify objective history projection on disposable PostgreSQL
         env:
           CI: "true"
@@ -209,6 +261,18 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/runtime/context/objective-history-projection-pg.integration.test.ts
+      - name: Verify objective history backfill on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/runtime/context/objective-history-backfill-pg.integration.test.ts
       - name: Verify native delegation, independent proof, and durable questions/planning clarifications on disposable PostgreSQL/Redis
         env:
           CI: "true"

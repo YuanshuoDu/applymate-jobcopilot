@@ -99,7 +99,7 @@ function fixture(options: Options = {}) {
       }] }
       if (sql.includes("WITH terminal_window AS MATERIALIZED")) {
         if (options.candidateError) throw options.candidateError
-        const limit = Number(values?.[4] ?? 0)
+        const limit = Number(values?.[values.length - 1] ?? 0)
         const rows = [...sourceRows].sort((left, right) => sql.includes('ORDER BY terminal."createdAt" DESC')
           ? (right.terminalCreatedAt instanceof Date && left.terminalCreatedAt instanceof Date
             ? right.terminalCreatedAt.getTime() - left.terminalCreatedAt.getTime() : 0) || String(right.turnId).localeCompare(String(left.turnId))
@@ -173,8 +173,8 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(outcomes[0]?.terminalSequence).toBe(8n)
     expect(outcomes.every(value => value.taskGraph.nodes.length === 1)).toBe(true)
     const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
-    expect(scan?.sql).toContain("LIMIT $5")
-    expect(scan?.values?.[4]).toBe(64)
+    expect(scan?.sql).toContain("LIMIT $6")
+    expect(scan?.values?.[5]).toBe(64)
     const graphReads = test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))
     expect(graphReads).toHaveLength(2)
     expect(graphReads.every(query => !["root-source-4", "root-source-5"].includes(String(query.values?.[3])))).toBe(true)
@@ -216,9 +216,9 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(outcomes).toHaveLength(8)
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(8)
     const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
-    const windowLimit = scan?.sql.indexOf("LIMIT $5") ?? -1
+    const windowLimit = scan?.sql.indexOf("LIMIT $6") ?? -1
     const rootsJoin = scan?.sql.indexOf("), roots AS (") ?? -1
-    expect(scan?.values?.[4]).toBe(64)
+    expect(scan?.values?.[5]).toBe(64)
     expect(scan?.sql).toContain('WHERE event."sessionId" = $1 AND event."sequence" < $4::bigint')
     expect(scan?.sql.indexOf('ORDER BY event."sequence" DESC')).toBeLessThan(windowLimit)
     expect(windowLimit).toBeGreaterThanOrEqual(0)
@@ -241,9 +241,9 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(outcomes).toHaveLength(8)
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(8)
     const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
-    const windowLimit = scan?.sql.indexOf("LIMIT $5") ?? -1
+    const windowLimit = scan?.sql.indexOf("LIMIT $6") ?? -1
     const rootsJoin = scan?.sql.indexOf("), roots AS (") ?? -1
-    expect(scan?.values?.[4]).toBe(64)
+    expect(scan?.values?.[5]).toBe(64)
     expect(scan?.sql).toContain('event."createdAt" < $4::timestamptz')
     expect(scan?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
     expect(windowLimit).toBeGreaterThanOrEqual(0)

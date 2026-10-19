@@ -98,9 +98,15 @@ export async function claimUnattendedSubmission(
 /** Resolves a browser claim only after its terminal BullMQ event and lock check. */
 export async function reconcileClaimedSubmissionUncertain(
   pool: Pool, identity: ApplicationSubmitIdentity, workerTaskId: string,
+  isCurrentTerminalDelivery: (client: PoolClient) => Promise<boolean>,
 ): Promise<boolean> {
   if (!workerTaskId.trim()) return false;
   const outcome = await withExactSubmissionWrite(pool, identity, "terminal_submit_claim_recovery", async client => {
+    // Worker terminal callbacks must validate the current BullMQ delivery only
+    // after acquiring the same attempt fence as claim and outbox retry. An old
+    // callback can otherwise observe an absent lock, wait here, and recover a
+    // newer retry after it has claimed the browser attempt.
+    if (!await isCurrentTerminalDelivery(client)) return false;
     const task = await client.query<{ sessionId: string | null }>(
       `UPDATE application_tasks SET status = 'waiting_for_user', "checkpoint" = 'submission_uncertain', error = $7, "updatedAt" = NOW()
        WHERE id = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 AND "fillTurnId" = $5 AND "workerTaskId" = $6

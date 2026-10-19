@@ -153,6 +153,49 @@ describe("TaskGraph server-owned templates", () => {
     expect(absent.templates).toBe(baseTemplates)
   })
 
+  it("enables scheduled draft templates only for an approved scheduled automation snapshot", async () => {
+    const approved = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: true, autoApply: false }) },
+      applicationFillPreparationLoader: async () => ({ available: true }),
+    }))
+    const autoApply = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: true, autoApply: true }) },
+    }))
+    const approvalNotRequired = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: false, autoApply: true }) },
+      applicationFillPreparationLoader: async () => ({ available: true }),
+    }))
+    const manual = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      automationRunMode: "manual",
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: true }) },
+    }))
+    const userTurn = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      turnSource: "user",
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot({ requireApproval: true }) },
+    }))
+
+    expect(approved.scheduledDraftMode).toBe(true)
+    expect(approved.templates).toHaveProperty("cover_letter_writer")
+    expect(approved.templates).toHaveProperty("cover_letter_reviewer")
+    expect(approved.templates?.cover_letter_writer.allowedActions).toEqual(["artifact.version.read", "cover_letter.draft"])
+    expect(approved.templates?.cover_letter_reviewer.allowedActions).toEqual(["artifact.version.read", "artifact.review"])
+    expect(approved.templates?.cover_letter_writer.context).toEqual({ scheduledDraftMode: true })
+    expect(approved.templates?.cover_letter_reviewer.context).toEqual({ scheduledDraftMode: true })
+    expect(approved.templates).not.toHaveProperty("application_filler")
+    expect(autoApply).toEqual(approved)
+    expect(approvalNotRequired).toMatchObject({
+      scheduledDraftMode: false,
+      templates: { scout: expect.any(Object), analyst: expect.any(Object) },
+    })
+    expect(approvalNotRequired.templates).not.toHaveProperty("cover_letter_writer")
+    expect(approvalNotRequired.templates).not.toHaveProperty("cover_letter_reviewer")
+    expect(approvalNotRequired.templates).not.toHaveProperty("application_filler")
+    expect(manual.scheduledDraftMode).toBe(false)
+    expect(manual.templates).toBe(TASK_GRAPH_TEMPLATES)
+    expect(userTurn.scheduledDraftMode).toBe(false)
+    expect(userTurn.templates).toBe(TASK_GRAPH_TEMPLATES)
+  })
+
   it("propagates invalid bound-fill or loader failures before runtime root creation", async () => {
     const base = {
       pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true,
@@ -303,7 +346,7 @@ describe("TaskGraph server-owned templates", () => {
       selectedJobPreparationLoader: selectedJobLoader,
     }))
 
-    expect(result).toMatchObject({ enabled: false, selectedJobMode: false, selectedJobPreparation: undefined })
+    expect(result).toMatchObject({ enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode: false })
     expect(result.templates).toBe(TASK_GRAPH_TEMPLATES)
     expect(selectedJobLoader).not.toHaveBeenCalled()
   })
@@ -313,7 +356,7 @@ describe("TaskGraph server-owned templates", () => {
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
     }))
 
-    expect(result.selectedJobMode).toBe(true)
+    expect(result).toMatchObject({ scheduledDraftMode: false, selectedJobMode: true })
     expect(result.templates?.scout).toMatchObject({
       allowedActions: ["jobs.get"], context: { selectedJobPreparation: { jobId: "job-1" } },
     })

@@ -9,6 +9,13 @@ import { isSessionPauseRequestedError } from "./session-gate.js"
 
 export type NativeGraphCompletionDecision = Readonly<{ ok: false; blocker: string; feedback: string }>
 const graphFences = new Set(["task_graph_session_fenced", "task_graph_turn_fenced", "task_graph_parent_fenced", "task_graph_step_fenced"])
+type PlanningCurrentState = TaskGraphCurrentState & Readonly<{ sourceIntent?: unknown }>
+type PlanningReadPort = TaskGraphCommandPort & Readonly<{
+  readCurrentForPlanning?: (scope: TaskGraphReadScope) => Promise<Readonly<{
+    current: PlanningCurrentState
+    currentInputCheckpoint: unknown
+  }>>
+}>
 
 /** Shares root fencing, refresh and durable native-receipt requirements across one Turn. */
 export function createCanonicalTurnCoordination(input: Readonly<{
@@ -53,9 +60,12 @@ export function createCanonicalTurnCoordination(input: Readonly<{
       turnLeaseVersion: input.lease.leaseVersion, parentLeaseOwner: input.lease.ownerId, parentAttemptCount: root.attemptCount,
     }
   }
-  async function currentGraph() {
+  async function currentGraph(forPlanning = false) {
     if (!input.commandPort) throw new Error("task_graph_runtime_dependencies_unavailable")
-    currentState = await input.commandPort.readCurrent(readScope())
+    const port = input.commandPort as PlanningReadPort
+    currentState = forPlanning && port.readCurrentForPlanning
+      ? (await port.readCurrentForPlanning(readScope())).current
+      : await port.readCurrent(readScope())
     return currentState
   }
   return {
@@ -72,7 +82,7 @@ export function createCanonicalTurnCoordination(input: Readonly<{
     },
     async refresh(snapshot) {
       remember(snapshot)
-      const state = await currentGraph()
+      const state = await currentGraph(true)
       const required = [...receipts.values()]
       if (!root || !nativeReceiptsMatchGraph(required, state, root.id)) throw new Error("task_graph_native_coordination_missing")
       return mergeTaskGraphCurrentObservation(snapshot, state)

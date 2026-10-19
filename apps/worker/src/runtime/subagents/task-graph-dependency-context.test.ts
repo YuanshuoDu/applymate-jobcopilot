@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import {
@@ -20,6 +21,14 @@ const scoutResult = {
   candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://example.test/apply?email=person@example.com", evidenceIds: ["job-evidence"] }],
   evidence: [{ id: "job-evidence", kind: "job", ref: "job-1", source: "greenhouse" }],
   summary: "Alice Example found a candidate; https://private.example/apply; contact user@example.com",
+}
+const discoveryAttemptSidecar = {
+  attemptCount: 2,
+  health: {
+    schemaVersion: "agent-harness.v2.task-graph.discovery-attempt-health.v1",
+    attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+    candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
+  },
 }
 function dependency(overrides: Partial<ScopedDependencyResult> = {}): ScopedDependencyResult {
   return {
@@ -173,6 +182,37 @@ describe("TaskGraph dependency result context", () => {
     expect(encoded).not.toMatch(/lease|owner|budget|permission|capabilit/i)
   })
 
+  it("keeps bounded source intent beside only the matching typed direct result", () => {
+    const sourceIntent = {
+      goal: "Find senior backend engineering roles in Dublin.",
+      successCriteria: ["Return current roles and direct application links."],
+      inputRelation: "predates_current_inputs" as const,
+    }
+    const source = dependency({ sourceIntent })
+    const sibling = dependency({ key: "sibling", taskId: "sibling-task", sourceIntent: { ...sourceIntent, inputRelation: "unknown" } })
+    const context = materializeTaskGraphDependencyContext({}, scope, ["source", "sibling"], [source, sibling]) as Record<string, unknown>
+    const items = (context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }).items
+
+    expect(items.map(item => item.sourceIntent)).toEqual([sourceIntent, { ...sourceIntent, inputRelation: "unknown" }])
+    expect(items.map(item => item.dependencyKey)).toEqual(["source", "sibling"])
+    expect(JSON.stringify(items)).not.toMatch(/sourceStepId|inputId|cursor|inputThroughSequence/)
+  })
+
+  it("drops only optional source intent when it would crowd out valid dependency evidence", () => {
+    const largeIntent = {
+      goal: "g".repeat(1200), successCriteria: Array(8).fill("c".repeat(320)), inputRelation: "unknown" as const,
+    }
+    const first = dependency({ sourceIntent: largeIntent, result: envelope(manyScoutResult(8)) })
+    const second = dependency({ key: "second", taskId: "second-task", sourceIntent: largeIntent, result: envelope(manyScoutResult(8)) })
+    const context = materializeTaskGraphDependencyContext({}, scope, ["source", "second"], [first, second]) as Record<string, unknown>
+    const evidence = context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
+
+    expect(evidence.items).toHaveLength(2)
+    expect(evidence.items.every(item => item.result !== undefined)).toBe(true)
+    expect(evidence.items.every(item => !Object.hasOwn(item, "sourceIntent"))).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(evidence), "utf8")).toBeLessThanOrEqual(TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT)
+  })
+
   it("normalizes unrecognized model-authored sources before exposing them", () => {
     const unsafeResult = {
       ...scoutResult,
@@ -264,6 +304,33 @@ describe("TaskGraph dependency result context", () => {
       .toThrow("task_graph_dependency_result_invalid")
     expect(() => materializeTaskGraphDependencyContext({}, scope, ["source"], [dependency({
       result: { ...envelope(scoutResult), ownerId: "forbidden" },
+    })])).toThrow("task_graph_dependency_result_invalid")
+  })
+
+  it("accepts a valid Scout attempt sidecar but never forwards it as dependency evidence", () => {
+    const result = { ...envelope(scoutResult), discoveryAttempt: discoveryAttemptSidecar }
+    const context = materializeTaskGraphDependencyContext({}, scope, ["source"], [dependency({ result })]) as Record<string, unknown>
+    const evidence = context.taskGraphDependencyResults
+
+    expect(evidence).toMatchObject({ schemaVersion: "agent-harness.v2.task-graph.dependency-evidence" })
+    expect(JSON.stringify(evidence)).not.toContain("discovery-attempt-health")
+    expect(JSON.stringify(evidence)).not.toContain("attemptedCalls")
+    expect(JSON.stringify(evidence)).not.toContain("attemptCount")
+  })
+
+  it("rejects malformed Scout sidecars and sidecars on other roles", () => {
+    const malformed = { ...discoveryAttemptSidecar, health: { ...discoveryAttemptSidecar.health, extra: true } }
+    expect(() => materializeTaskGraphDependencyContext({}, scope, ["source"], [dependency({
+      result: { ...envelope(scoutResult), discoveryAttempt: malformed },
+    })])).toThrow("task_graph_dependency_result_invalid")
+
+    const reviewerResult = envelope({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef: writerArtifactRef,
+      reviewStatus: "needs_revision", reviewHash: `sha256:${"c".repeat(64)}`,
+    })
+    expect(() => materializeTaskGraphDependencyContext({}, scope, ["review"], [dependency({
+      key: "review", role: "reviewer", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" },
+      result: { ...reviewerResult, discoveryAttempt: discoveryAttemptSidecar },
     })])).toThrow("task_graph_dependency_result_invalid")
   })
 

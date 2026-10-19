@@ -8,7 +8,6 @@ import { insertApplyResult, getPool, type InsertApplyResult } from "../db/apply-
 import * as legacyFillOutcomes from "./legacy-apply-outcomes.js";
 import {
   claimUnattendedSubmission,
-  reconcileClaimedSubmissionUncertain,
   updateJobForSubmission,
   UNCONFIRMED_SUBMISSION_MESSAGE,
 } from "../db/submission-guard.js";
@@ -51,6 +50,7 @@ import {
 import { redisConnection } from "../redis.js";
 import { createPgApplicationSubmitTool, type ApplicationSubmitOutput } from "../runtime/tools/application-submit-tool.js";
 import { recordSubmissionExecutionSettled, type ApplicationSubmitIdentity } from "./application-submit-fence.js";
+import { reconcileTerminalSubmitJob } from "./application-submit-outbox-terminal-recovery.js";
 import { createBrowserApplicationSubmitProvider } from "../runtime/tools/browser-submit-provider.js";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
 import { linkAbortSignals } from "../runtime/interrupt/bridge.js";
@@ -1149,26 +1149,14 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 );
 
 applyWorker.on("completed", async (job) => {
-  try { await reconcileTerminalSubmissionClaim(job); }
+  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job, "completed"); }
   catch (error: unknown) { console.warn("[apply-worker] Terminal submit recovery failed:", error instanceof Error ? error.message : String(error)); }
 });
 applyWorker.on("failed", async (job) => {
   if (!job || job.attemptsMade < (job.opts.attempts ?? 1)) return;
-  try { await reconcileTerminalSubmissionClaim(job); }
+  try { await reconcileTerminalSubmitJob(getPool(), applyQueue, job, "failed"); }
   catch (error: unknown) { console.warn("[apply-worker] Terminal submit recovery failed:", error instanceof Error ? error.message : String(error)); }
 });
-
-async function reconcileTerminalSubmissionClaim(job: Job<ApplyTaskPayload> | undefined): Promise<void> {
-  if (!job || typeof job.id !== "string" || !job.id || job.data.operation !== "submit") return;
-  if (!matchesApplyTaskSubmitPayload(job.data, job.data) || !/^[a-f0-9]{64}$/.test(job.data.constraintHash)) return;
-  const lockKey = applyQueue.toKey(`${job.id}:lock`);
-  if (await redisConnection.exists(lockKey)) return;
-  await reconcileClaimedSubmissionUncertain(getPool(), {
-    applicationTaskId: job.data.applicationTaskId, userId: job.data.userId, jobId: job.data.jobId,
-    sessionId: job.data.sessionId, fillTurnId: job.data.fillTurnId,
-    approvalId: job.data.receiptId, constraintHash: job.data.constraintHash,
-  }, job.id);
-}
 
 async function loadApprovedTurnScope(
   pool: Pool,

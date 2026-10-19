@@ -3,7 +3,10 @@ import { parseArtifactReference, ROLE_RESULT_SCHEMA, validateRoleResult, type Ar
 import { projectValidatedRoleResult } from "./task-graph-result-projection.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
+import { parseDiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { TaskGraphRepairReceipt, TaskGraphVerificationReport } from "./task-graph-command-port.js"
+import type { TaskGraphSourceIntent } from "./task-graph-pg-source-provenance.js"
+import { projectTaskGraphDependencySourceIntent } from "./task-graph-source-intent-context.js"
 import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope, GraphTaskRow } from "./task-graph-pg-state.js"
 
@@ -62,6 +65,7 @@ export type ScopedDependencyResult = GraphIdentityScope & Readonly<{
   repairComposite?: true
   verificationReport?: TaskGraphVerificationReport
   repairLineage?: readonly (Pick<TaskGraphRepairReceipt, "criterionIds" | "evidenceDigest" | "verifierVersion"> & { resultDigest: string })[]
+  sourceIntent?: TaskGraphSourceIntent
 }>
 
 /** Resolve the one direct Writer dependency from server-materialized Reviewer context. */
@@ -109,7 +113,7 @@ export function materializeTaskGraphDependencyContext(
     throw new Error("task_graph_dependency_set_invalid")
   }
   const byKey = new Map(dependencies.map(dependency => [dependency.key, dependency] as const))
-  const items = dependencyKeys.map(key => {
+  const projected = dependencyKeys.map(key => {
     let dependency = byKey.get(key)
     if (!dependency) throw new Error("task_graph_dependency_missing")
     if (dependency.userId !== scope.userId || dependency.sessionId !== scope.sessionId
@@ -145,11 +149,16 @@ export function materializeTaskGraphDependencyContext(
       reasonCode: dependency.verificationReport.reasonCode, criteria: dependency.verificationReport.criteria,
       evidenceDigest: dependency.verificationReport.evidenceDigest, resultDigest: dependency.verificationReport.resultDigest,
     } : undefined
-    return { dependencyKey: safeDependencyKey(dependency.key), role: dependency.role, taskStatus: "completed", result: projected,
+    const item = { dependencyKey: safeDependencyKey(dependency.key), role: dependency.role, taskStatus: "completed", result: projected,
       ...(dependency.role === "reviewer" ? { dependencyTaskId: safeDependencyKey(dependency.taskId) } : {}),
       ...(verification ? { verification } : {}), ...(dependency.repairLineage ? { repairLineage: dependency.repairLineage } : {}) }
+    return { item, sourceIntent: projectTaskGraphDependencySourceIntent(dependency.sourceIntent) }
   })
-  const evidence = { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items }
+  const withSourceIntent = projected.map(({ item, sourceIntent }) => sourceIntent ? { ...item, sourceIntent } : item)
+  const withMetadata = { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: withSourceIntent }
+  const evidence = encodedBytes(withMetadata) <= TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT
+    ? withMetadata
+    : { schemaVersion: "agent-harness.v2.task-graph.dependency-evidence", items: projected.map(({ item }) => item) }
   if (encodedBytes(evidence) > TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT) {
     throw new Error("task_graph_dependency_context_too_large")
   }
@@ -191,8 +200,12 @@ function parseCompletedResultEnvelope(dependency: ScopedDependencyResult): {
     || typeof parsed.finalText !== "string" || !Object.hasOwn(parsed, "structuredResult")) {
     throw new Error("task_graph_dependency_result_envelope_invalid")
   }
+  const hasDiscoveryAttempt = Object.hasOwn(parsed, "discoveryAttempt")
+  if (hasDiscoveryAttempt && !validDiscoveryAttemptSidecar(parsed.discoveryAttempt, dependency)) {
+    throw new Error("task_graph_dependency_result_envelope_invalid")
+  }
   if (dependency.repairComposite === true) {
-    if (keys !== base || dependency.verificationDisposition !== "typed" || !dependency.verification || dependency.repairOf) {
+    if (hasDiscoveryAttempt || keys !== base || dependency.verificationDisposition !== "typed" || !dependency.verification || dependency.repairOf) {
       throw new Error("task_graph_dependency_result_envelope_invalid")
     }
     const report = parseTaskGraphVerificationReport(dependency.verificationReport, dependency.verification.criteria.map(item => item.id))
@@ -214,7 +227,8 @@ function parseCompletedResultEnvelope(dependency: ScopedDependencyResult): {
       parsed.taskGraphVerificationReport, dependency.verification.criteria.map(item => item.id),
     )
     const hasReceipt = Object.hasOwn(parsed, "taskGraphRepairReceipt")
-    const expected = [...base.split(","), "taskGraphVerificationReport", ...(hasReceipt ? ["taskGraphRepairReceipt"] : [])].sort().join(",")
+    const expected = [...base.split(","), "taskGraphVerificationReport", ...(hasReceipt ? ["taskGraphRepairReceipt"] : []),
+      ...(hasDiscoveryAttempt ? ["discoveryAttempt"] : [])].sort().join(",")
     const receipt = hasReceipt && dependency.repairOf && report ? parseTaskGraphRepairReceipt(parsed.taskGraphRepairReceipt, {
       repairOf: dependency.repairOf, repairNodeKey: dependency.key, repairTaskId: dependency.taskId, report,
     }) : undefined
@@ -223,9 +237,19 @@ function parseCompletedResultEnvelope(dependency: ScopedDependencyResult): {
       throw new Error("task_graph_dependency_result_envelope_invalid")
     }
     return { structuredResult: parsed.structuredResult, verificationReport: report, repairLineage: dependency.repairLineage }
-  } else if (keys !== base || dependency.repairOf || Object.hasOwn(parsed, "taskGraphVerificationReport")
+  } else if (keys !== [...base.split(","), ...(hasDiscoveryAttempt ? ["discoveryAttempt"] : [])].sort().join(",")
+    || dependency.repairOf || Object.hasOwn(parsed, "taskGraphVerificationReport")
     || Object.hasOwn(parsed, "taskGraphRepairReceipt")) throw new Error("task_graph_dependency_result_envelope_invalid")
   return { structuredResult: parsed.structuredResult }
+}
+
+function validDiscoveryAttemptSidecar(value: unknown, dependency: ScopedDependencyResult): boolean {
+  if (dependency.role !== "scout" || dependency.repairComposite === true || dependency.repairOf
+    || !expectedSchema(dependency.expectedOutputSchema, "scout") || !isPlainRecord(value)) return false
+  const attemptCount = Object.getOwnPropertyDescriptor(value, "attemptCount")
+  return !!attemptCount && "value" in attemptCount && typeof attemptCount.value === "number"
+    && Number.isSafeInteger(attemptCount.value) && attemptCount.value > 0
+    && parseDiscoveryAttemptSidecar(value, attemptCount.value) !== null
 }
 
 function encodedBytes(value: unknown): number {

@@ -18,13 +18,15 @@ import { EvidenceSummary, statusLabel } from './agent-supervisor-evidence'
 import { SelectedJobPreparationCard } from './SelectedJobPreparationCard'
 import { SelectedJobDraftArtifact } from './SelectedJobDraftArtifact'
 import { latestWriterArtifact } from './draft-artifact-projection'
+import { ChildWorkerAttachView, type ChildWorkerTask } from './ChildWorkerAttachView'
+import type { TaskTreeNode } from './types'
 
 export { EvidenceSummary, projectSelectedEvidence } from './agent-supervisor-evidence'
 export type { SelectedEvidenceProjection } from './agent-supervisor-evidence'
 
 interface PageInfo { hasMore?: boolean; nextCursor?: string | null }
 interface TurnsResponse { turns?: SupervisorTurnSummary[]; page?: PageInfo }
-interface TasksResponse { tasks?: SupervisorTaskSummary[]; planLedger?: unknown; discoveryShortlist?: unknown; page?: PageInfo }
+interface TasksResponse { tasks?: ChildWorkerTask[]; planLedger?: unknown; discoveryShortlist?: unknown; page?: PageInfo }
 
 export interface AgentSupervisorPanelProps {
   readonly sessionId: string | null
@@ -38,7 +40,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
   const selectionControls = supervisorPlanSelectionControls(selectedNodeState, sessionId, setSelectedNodeState)
   const selectedId = selectionControls.selectedId
   const [extraTurns, setExtraTurns] = useState<SupervisorTurnSummary[]>([])
-  const [extraTasks, setExtraTasks] = useState<SupervisorTaskSummary[]>([])
+  const [extraTasks, setExtraTasks] = useState<ChildWorkerTask[]>([])
   const [loadingMore, setLoadingMore] = useState(false)
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
   const [acceptedPreparation, setAcceptedPreparation] = useState<{ sessionId: string; turnId: string; sequence: string } | null>(null)
@@ -137,6 +139,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
     root: !task.parentTaskId,
   }])), [tasks])
   const selectedNode = useMemo(() => flattenTaskTree(nodes).find(node => node.id === selectedId), [nodes, selectedId])
+  const selectedWorker = selectedWorkerForNode(selectedNode, tasks)
   const selectedTaskInterrupt = projectSelectedTaskInterrupt(tasks, turns, selectedNode, timeline.items)
   const selectedTaskInterruptVersion = selectedTaskInterrupt ? taskInterruptEventVersion(timeline.items, selectedTaskInterrupt.task.id) : null
   const selectedTurn = useMemo(() => selectedNode?.kind === 'turn' && selectedNode.id.startsWith('turn:')
@@ -221,12 +224,10 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
             {selectedNode.detail && <span style={{ color: 'var(--c-danger)', fontSize: 10, overflowWrap: 'anywhere' }}>{selectedNode.detail}</span>}
             {selectedNode.resultAvailable && <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{t('agent.toolResult')}</span>}
           </div>
-          {selectedItem && <EvidenceSummary item={selectedItem} t={t} />}
-          <AgentTurnRetryControl
-            sessionId={sessionId}
-            turn={selectedTurn}
-            onAccepted={refetchSupervisorRecords}
-          />
+          {selectedWorker?.parentTaskId && selectedWorker.id !== selectedWorker.rootTaskId
+            ? <ChildWorkerAttachView key={selectedWorker.id} sessionId={sessionId} task={selectedWorker} items={timeline.items} onClose={selectionControls.onReturnToCurrent} onConflict={refetchTasks} />
+            : selectedItem && <EvidenceSummary item={selectedItem} t={t} />}
+          <AgentTurnRetryControl sessionId={sessionId} turn={selectedTurn} onAccepted={refetchSupervisorRecords} />
           {selectedTaskInterrupt && <TaskInterruptControl sessionId={sessionId} taskId={selectedTaskInterrupt.task.id} taskLabel={selectedNode.label} eligible={selectedTaskInterrupt.eligible} status={selectedTaskInterrupt.status} statusVersion={selectedTaskInterruptVersion} onAccepted={refetchSupervisorRecords} />}
         </section>
       )}
@@ -234,10 +235,10 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
   )
 }
 
-function connectionLabel(connection: AgentTimelineSnapshot['connection'], t: (key: string) => string): string {
-  if (connection === 'connected') return t('agent.connected')
-  if (connection === 'reconnecting') return t('agent.reconnecting')
-  return t('agent.loading')
+function connectionLabel(connection: AgentTimelineSnapshot['connection'], t: (key: string) => string): string { return connection === 'connected' ? t('agent.connected') : connection === 'reconnecting' ? t('agent.reconnecting') : t('agent.loading') }
+
+export function selectedWorkerForNode(selectedNode: TaskTreeNode | undefined, tasks: readonly ChildWorkerTask[]): ChildWorkerTask | null {
+  return selectedNode?.kind === 'task' ? tasks.find(task => `task:${task.id}` === selectedNode.id) ?? null : null
 }
 
 function safeAgendaTaskLabel(value: string): string {

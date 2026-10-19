@@ -570,6 +570,66 @@ describe("TurnEngine model message mapping", () => {
     expect(request.tools.map(tool => (tool as { name: string }).name)).toEqual(["agent.plan", "agent.reconcile", "agent.ask_user", "agent.list"])
   })
 
+  it("keeps historical category advice separate, deduplicated, and order-stable beside current guidance", () => {
+    const historicalCategoryNode = (taskKind: string, nodeOrdinal: number, category: string) => ({
+      taskKind, status: "failed", lesson: { ordinalScope: "source_graph_local", advisoryOnly: true,
+        notCurrentEvidence: true, nodeOrdinal, criterionFailures: [], executionFailureCategory: category },
+    })
+    const turns = [
+      { label: "earlier terminal attempt", nodes: [
+        historicalCategoryNode("scout", 1, "execution_setup_unavailable"),
+        historicalCategoryNode("analyst", 2, "resume_state_unavailable"),
+        historicalCategoryNode("writer", 3, "structured_output_invalid"),
+      ] },
+      { label: "earlier terminal attempt", nodes: [
+        historicalCategoryNode("scout", 1, "resume_state_unavailable"),
+        historicalCategoryNode("analyst", 2, "execution_setup_unavailable"),
+      ] },
+    ]
+    const history = {
+      id: "observation:root-task-history", layer: "tool_observation" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "tool_or_subagent",
+      content: { kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+        label: "Earlier outcomes for the same verifier objective; advisory context only.", turns },
+    } as StepContext["blocks"][number]
+    const reorderedHistory = { ...history, content: {
+      ...(history.content as Record<string, unknown>),
+      turns: [...turns].reverse().map(turn => ({ ...turn, nodes: [...turn.nodes].reverse() })),
+    } } as StepContext["blocks"][number]
+    const currentContext = taskGraphContext([
+      failedTaskGraphNode("child_turn_missing", "current-setup"),
+      failedTaskGraphNode("child_resume_unavailable", "current-resume"),
+      failedTaskGraphNode("invalid_structured_result", "current-structured"),
+    ])
+    const tools = [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }]
+    const currentOnly = requestFor(currentContext, tools)
+    const withHistory = requestFor({ ...currentContext, blocks: [...currentContext.blocks, history] }, tools)
+    const withReorderedHistory = requestFor({ ...currentContext, blocks: [...currentContext.blocks, reorderedHistory] }, tools)
+    const uniqueSystemMessage = (request: ReturnType<typeof requestFor>, marker: string) => {
+      const matches = request.messages.filter(message => message.role === "system"
+        && message.content.some(part => part.type === "text" && part.text.includes(marker)))
+      expect(matches).toHaveLength(1)
+      return matches[0]!
+    }
+    const currentMessage = uniqueSystemMessage(currentOnly, "Current child failure-category cues")
+    const currentMessageWithHistory = uniqueSystemMessage(withHistory, "Current child failure-category cues")
+    expect(JSON.stringify(currentMessageWithHistory)).toBe(JSON.stringify(currentMessage))
+
+    const historicalMessage = uniqueSystemMessage(withHistory, "Historical execution-category lessons identify")
+    const reorderedHistoricalMessage = uniqueSystemMessage(withReorderedHistory, "Historical execution-category lessons identify")
+    expect(JSON.stringify(reorderedHistoricalMessage)).toBe(JSON.stringify(historicalMessage))
+    const historicalText = historicalMessage.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const expectedAdvice = [HISTORICAL_EXECUTION_INSPECTION_PREFIX, ...EXECUTION_FAILURE_GUIDANCE].join(" ")
+    expect(historicalText).toContain(expectedAdvice)
+    expect(historicalText.split("Historical execution-category lessons identify").length - 1).toBe(1)
+    for (const advice of EXECUTION_FAILURE_GUIDANCE) expect(historicalText.split(advice).length - 1).toBe(1)
+    for (const category of ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"]) {
+      expect(historicalText).not.toContain(category)
+    }
+    expect(withHistory.tools).toEqual(tools)
+    expect(withReorderedHistory.tools).toEqual(tools)
+  })
+
   it("adds fixed advisory guidance from the actual current projection and keeps every category signal untrusted", () => {
     const nodes = [
       failedTaskGraphNode("child_turn_missing", "setup"),

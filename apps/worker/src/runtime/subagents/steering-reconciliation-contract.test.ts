@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
+import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import {
   parseSteeringReconciliationReceipt,
   steeringReconciliationIdempotencyKey,
@@ -9,6 +10,7 @@ import {
   validSteeringReconciliationToolCall,
   STEERING_RECONCILIATION_EVENT_TYPE,
   STEERING_RECONCILIATION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BLOCKER,
   STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationReceipt,
@@ -29,6 +31,21 @@ function receipt(patch: Partial<SteeringReconciliationReceipt> = {}): SteeringRe
     rootTaskId: scope.rootTaskId, stepId: scope.stepId, decision: "keep", observedRevision: 0,
     resultingRevision: 0, steerInputIds: ["steer-1", "steer-2"], inputCheckpoint: { throughSequence: "9" }, ...patch,
   }
+}
+function supersession() {
+  return {
+    schemaVersion: "agent-harness.v2.task-graph-supersession.v2",
+    operationKey: steeringReconciliationIdempotencyKey(scope, "call-revise"),
+    observedRevision: 0, cancellationRevision: 1, resultingRevision: 2,
+    source: { nodeKey: "stale-scout", taskId: "source-task" }, replacement: { nodeKey: "fresh-scout", taskId: "replacement-task" },
+    cancellationEvent: { id: "cancel-event", sequence: "41" }, planEvent: { id: "plan-event", sequence: "42", idempotencyKey: taskGraphSupersessionProposalKey(scope.rootTaskId, 0) },
+    replacementFingerprint: "a".repeat(64),
+    agentPlanCall: { callId: "call-revise", stepId: scope.stepId, expectedRevision: 0, replaceUnstarted: { nodeKey: "stale-scout" } },
+  }
+}
+function v2Receipt(relation: unknown = supersession()) {
+  return { ...receipt({ decision: "revise", observedRevision: 0, resultingRevision: 2 }),
+    schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, supersession: relation }
 }
 
 describe("steering reconciliation receipt contract", () => {
@@ -52,6 +69,31 @@ describe("steering reconciliation receipt contract", () => {
     expect(parseSteeringReconciliationReceipt(receipt({ steerInputIds: [] }))).toBeNull()
     expect(parseSteeringReconciliationReceipt(receipt({ decision: "revise", resultingRevision: 0 }))).toBeNull()
     expect(parseSteeringReconciliationReceipt(receipt({ decision: "revise", observedRevision: 0, resultingRevision: 1 }))).not.toBeNull()
+    expect(parseSteeringReconciliationReceipt({ ...receipt(), supersession: supersession() })).toBeNull()
+  })
+
+  it("parses the closed v2 supersession relation while preserving the v1 R-to-R+1 contract", () => {
+    const value = v2Receipt()
+    expect(parseSteeringReconciliationReceipt(value, scope)).toEqual(value)
+    expect(parseSteeringReconciliationReceipt(receipt({ decision: "revise", observedRevision: 0, resultingRevision: 1 }), scope)).not.toBeNull()
+    expect(parseSteeringReconciliationReceipt(receipt({ decision: "revise", observedRevision: 0, resultingRevision: 2 }), scope)).toBeNull()
+    expect(parseSteeringReconciliationReceipt(receipt({ resultingRevision: 1 }), scope)).toBeNull()
+  })
+
+  it.each([
+    ["outer schema", { ...v2Receipt(), schemaVersion: STEERING_RECONCILIATION_SCHEMA_VERSION }],
+    ["unknown relation field", v2Receipt({ ...supersession(), unexpected: true })],
+    ["wrong relation schema", v2Receipt({ ...supersession(), schemaVersion: "agent-harness.v1" })],
+    ["wrong source", v2Receipt({ ...supersession(), source: { nodeKey: "other", taskId: "source-task" } })],
+    ["wrong call source key", v2Receipt({ ...supersession(), agentPlanCall: { ...supersession().agentPlanCall, replaceUnstarted: { nodeKey: "other" } } })],
+    ["wrong call revision", v2Receipt({ ...supersession(), agentPlanCall: { ...supersession().agentPlanCall, expectedRevision: 1 } })],
+    ["wrong event order", v2Receipt({ ...supersession(), cancellationEvent: { id: "cancel-event", sequence: "43" } })],
+    ["wrong observed revision", v2Receipt({ ...supersession(), observedRevision: 1, cancellationRevision: 2, resultingRevision: 3 })],
+    ["wrong resulting revision", { ...v2Receipt(), resultingRevision: 3 }],
+    ["wrong operation key", v2Receipt({ ...supersession(), operationKey: `agent.plan.reconciliation:sha256:${"0".repeat(64)}` })],
+    ["wrong fingerprint", v2Receipt({ ...supersession(), replacementFingerprint: "not-a-sha256" })],
+  ] as const)("rejects malformed v2 %s claims", (_name, value) => {
+    expect(parseSteeringReconciliationReceipt(value, scope)).toBeNull()
   })
 
   it("bounds revisions and PostgreSQL cursors without lossy number conversion", () => {
@@ -109,5 +151,26 @@ describe("steering reconciliation receipt contract", () => {
     }
     expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria: ["💼".repeat(128)] }),
       scope, scope.stepId, "revise", 0)).toBe(true)
+  })
+
+  it("requires the exact source key and a single node on a supersession agent.plan call", () => {
+    const callId = "call-revise"
+    const event = { type: "tool_call.started", actor: "orchestrator", taskId: scope.rootTaskId, itemId: "call-item",
+      correlationId: callId, idempotencyKey: toolStartKey(callId),
+      payload: { toolCallId: callId, toolName: "agent.plan", taskId: scope.rootTaskId } }
+    const item = { id: "call-item", stepId: scope.stepId, taskId: scope.rootTaskId, type: "tool_call",
+      content: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input: {
+        expectedRevision: 0, nodes: [{ key: "fresh-scout" }], replaceUnstarted: { nodeKey: "stale-scout" },
+        rootSuccessCriteria: ["Include evidence for each role"],
+      } } }
+    expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(true)
+    expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0)).toBe(false)
+    expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0, "other-node")).toBe(false)
+    const multiNode = { ...item, content: { ...item.content, input: { ...item.content.input, nodes: [{ key: "a" }, { key: "b" }] } } }
+    expect(validSteeringReconciliationToolCall(event, multiNode, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(false)
+    const malformedCriteria = { ...item, content: { ...item.content, input: { ...item.content.input, rootSuccessCriteria: [] } } }
+    expect(validSteeringReconciliationToolCall(event, malformedCriteria, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(false)
+    const missingSource = { ...item, content: { ...item.content, input: { ...item.content.input, replaceUnstarted: undefined } } }
+    expect(validSteeringReconciliationToolCall(event, missingSource, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(false)
   })
 })

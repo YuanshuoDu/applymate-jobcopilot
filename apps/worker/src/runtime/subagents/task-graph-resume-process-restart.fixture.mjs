@@ -314,7 +314,7 @@ function isExpectedSourceProjection(value, jobId = "fixture-job-restart") {
   return projection?.schemaVersion === "agent-harness.v2.task-graph.result-projection" && projection.trust === "untrusted"
     && projection.availability === "available" && projection.role === "scout" && projection.status === "completed"
     && projection.candidateCount === 1 && projection.evidenceCount === 1 && candidates.length === 1
-    && candidate?.jobId === jobId && candidate.source === "other"
+    && candidate?.jobId === jobId && candidate.source === "greenhouse"
     && Array.isArray(candidate.evidenceKinds) && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
 }
 const SOURCE_PROJECTION_AVAILABILITY = new Set(["available", "unavailable"])
@@ -482,7 +482,7 @@ function sourceProjectionDiagnostic(value) {
   if (!candidate || !Array.isArray(candidate.evidenceKinds) || !candidate.evidenceKinds.every(kind => typeof kind === "string")) {
     return { ...details, invalidField: "candidate_shape" }
   }
-  const candidateMatches = candidate.jobId === "fixture-job-restart" && candidate.source === "other"
+  const candidateMatches = candidate.jobId === "fixture-job-restart" && candidate.source === "greenhouse"
     && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
   return { ...details, category: candidateMatches ? "valid" : "candidate_identity_mismatch", candidateIdentity: candidateMatches ? "match" : "mismatch" }
 }
@@ -490,7 +490,7 @@ function assertSourceProjectionDiagnostic() {
   const valid = {
     schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
     role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
-    candidates: [{ jobId: "fixture-job-restart", source: "other", evidenceKinds: ["job"] }],
+    candidates: [{ jobId: "fixture-job-restart", source: "greenhouse", evidenceKinds: ["job"] }],
   }
   const cases = [
     [null, "absent"],
@@ -1731,7 +1731,7 @@ async function runSecondWorker() {
         const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: job.source ?? "greenhouse" }]
         const summary = task.goal === sourceGoal ? resultMarker : task.goal === dependentGoal ? dependentGoal : followUpGoal
         const result = task.role === "scout"
-          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
+          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: evidence[0].source, url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
           : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: ids.jobId, score: 8, evidenceIds: [evidence[0].id] }], evidence, summary }
         if (task.goal === followUpGoal) await waitForCommand("complete-follow-up-child")
         yield { type: "text_delta", text: JSON.stringify(result) }
@@ -1878,7 +1878,7 @@ async function runDiscoverySecondWorker() {
         if (task.role !== "scout" && task.role !== "analyst") throw new Error("p3_unexpected_discovery_child_role")
         const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: "greenhouse" }]
         const result = task.role === "scout"
-          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary: "Found the persisted fixture role" }
+          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: evidence[0].source, url: null, evidenceIds: [evidence[0].id] }], evidence, summary: "Found the persisted fixture role" }
           : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: ids.jobId, score: 8.5, evidenceIds: [evidence[0].id] }], evidence, summary: "Scored the persisted fixture role" }
         yield { type: "text_delta", text: JSON.stringify(result) }
         yield { type: "completed", finishReason: "stop" }

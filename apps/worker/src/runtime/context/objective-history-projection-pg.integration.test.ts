@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
 import { rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin } from "./root-task-history-fence.js"
-import { updateRootObjectiveHistoryProjection, type RootObjectiveHistoryIdentity } from "./objective-history-projection.js"
+import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection, type RootObjectiveHistoryIdentity } from "./objective-history-projection.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -143,11 +143,11 @@ describePg("objective history projection on disposable PostgreSQL", () => {
     const saved = await pool!.query(`SELECT "objectiveDigest", "canonicalOriginDigest", "objectiveIndexSemanticsVersion"
       FROM "agent_turns" WHERE "id" = $1`, [identity.turnId])
     const origin = rootTaskHistoryOrigin("user", turnInput)!
-    const cross = rootTaskHistoryObjectiveDigest(turnInput, { goal, successCriteria: criteria }, true)!
-    const canonical = createHash("sha256").update(JSON.stringify({ objectiveDigest: cross, canonicalOrigin: origin })).digest("hex")
+    const objectiveDigest = rootTaskHistoryObjectiveDigest(turnInput, { goal, successCriteria: criteria })!
+    const canonical = createHash("sha256").update(JSON.stringify({ objectiveDigest, canonicalOrigin: origin })).digest("hex")
     expect(saved.rows[0]).toEqual({
-      objectiveDigest: rootTaskHistoryObjectiveDigest(turnInput, { goal, successCriteria: criteria }, false),
-      canonicalOriginDigest: canonical, objectiveIndexSemanticsVersion: 1,
+      objectiveDigest,
+      canonicalOriginDigest: canonical, objectiveIndexSemanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
     })
 
   })

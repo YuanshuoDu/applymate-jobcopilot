@@ -8,6 +8,12 @@ import { parseTaskGraphSnapshot, taskGraphSnapshot } from "./task-graph-snapshot
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { selectVerifiedScheduledDraftCandidate } from "./scheduled-draft-candidate.js"
+
+vi.mock("./scheduled-draft-candidate.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-draft-candidate.js")>()
+  return { ...actual, selectVerifiedScheduledDraftCandidate: vi.fn() }
+})
 
 const analystVerification = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
@@ -93,6 +99,43 @@ function ownedTurnScopeRow(sql: string, values?: unknown[]) {
 }
 
 describe("createGraphTasks", () => {
+  it("strictly rejects an initial plan missing one canonical requirement before database work", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 0, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze results", successCriteria: ["done"], dependsOn: [] })] },
+      templates: {
+        analyst: { role: "analyst", taskType: "analysis", allowedActions: [] },
+        scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      },
+      verificationRequirements: { status: "valid", requirements: [
+        { id: "finding-count", kind: "finding_count_gte", minimum: 1 },
+        { id: "candidate-count", kind: "candidate_count_gte", minimum: 2 },
+      ] },
+    }
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map()))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", role: "scout", minimum: 2 },
+      ] })
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it("rejects an uncovered revision after locking its repair target and before any writes", async () => {
+    const fixture = repairFixture()
+    const input: TaskGraphScheduleInput = { ...fixture.input, verificationRequirements: { status: "valid", requirements: [
+      { id: "finding-count", kind: "finding_count_gte", minimum: 1 },
+      { id: "candidate-count", kind: "candidate_count_gte", minimum: 1 },
+    ] } }
+    await expect(createGraphTasks(fixture.client, input, fixture.parent, fixture.current, fixture.taskIds))
+      .rejects.toMatchObject({ code: "task_graph_objective_coverage_incomplete", requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", role: "scout", minimum: 1 },
+      ] })
+    expect(fixture.query.mock.calls.some(([sql]) => sql.includes('task."failureReason"'))).toBe(true)
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
   it("preserves the filler template's empty actions while generic roles keep parent action inheritance", async () => {
     const create = async (templateId: string, role: string, taskType: string) => {
       let insertedActions: unknown
@@ -223,7 +266,10 @@ describe("createGraphTasks", () => {
     expect(query).not.toHaveBeenCalled()
   })
 
-  it("persists scoped completed direct prerequisite evidence before dispatching a ready child", async () => {
+  it.each([
+    { recipientRole: "analyst" as const, exposesSourceIntent: true },
+    { recipientRole: "scout" as const, exposesSourceIntent: false },
+  ])("persists scoped direct prerequisite evidence for a ready $recipientRole without leaking source intent", async ({ recipientRole, exposesSourceIntent }) => {
     const scoutResult = {
       schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
       candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["job-evidence"] }],
@@ -261,27 +307,35 @@ describe("createGraphTasks", () => {
       return { rows: [], rowCount: 1 }
     })
     const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const recipientVerification = recipientRole === "analyst" ? analystVerification : scoutVerification
     const input: TaskGraphScheduleInput = {
       scope: {
         userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
         stepId: "step-2", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "parent-owner", parentAttemptCount: 1,
       },
-      proposal: { expectedRevision: 1, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze source", successCriteria: ["done"], dependsOn: ["source"] })] },
-      templates: { analyst: {
-        role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
-        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
+      proposal: { expectedRevision: 1, nodes: [{
+        ...plannedNode({ key: "analysis", templateId: recipientRole, goal: "Analyze source", successCriteria: ["done"], dependsOn: ["source"] }),
+        verification: recipientVerification,
+      }] },
+      templates: { [recipientRole]: {
+        role: recipientRole, taskType: "job_analysis", allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: recipientRole },
       } },
     }
     const current: TaskGraphState = {
       revision: 1, nodes: [{ key: "source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "typed", verification: scoutVerification }], appliedEvents: [],
     }
 
-    const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]]))
+    const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]]), {
+      sourceInputCheckpointByNodeKey: new Map([["source", { inputThroughSequence: 3n }]]),
+      currentInputCheckpoint: { inputThroughSequence: 4n },
+    })
 
     const stored = createdContext as Record<string, unknown>
     const dependencyEvidence = stored.taskGraphDependencyResults as Record<string, unknown>
+    const evidenceItems = dependencyEvidence.items as Array<Record<string, unknown>>
     expect(receipt.readyTaskIds).toEqual(["child-2"])
-    expect(dependencyEvidence.items).toMatchObject([{
+    expect(evidenceItems).toMatchObject([{
       dependencyKey: "source", role: "scout", taskStatus: "completed",
       result: {
         availability: "available", trust: "untrusted", role: "scout", status: "completed",
@@ -289,6 +343,9 @@ describe("createGraphTasks", () => {
         candidates: [{ jobId: "job-1", source: "greenhouse", evidenceKinds: ["job"] }],
       },
     }])
+    expect(evidenceItems[0]?.sourceIntent).toEqual(exposesSourceIntent ? {
+      goal: "Find source", successCriteria: ["done"], inputRelation: "predates_current_inputs",
+    } : undefined)
     expect(JSON.stringify(dependencyEvidence)).not.toContain("job-evidence")
     expect(query.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBeDefined()
     const turnLock = query.mock.calls.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR UPDATE"))
@@ -771,7 +828,21 @@ describe("createGraphTasks", () => {
     expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
   })
 
-  it("allows an unsuccessful terminal repair to be retried", async () => {
+  it("allows a one-node failed-target repair while retaining the other canonical objective requirement", async () => {
+    const fixture = repairFixture({ scoutRepair: true, analystRequirement: true })
+    const input: TaskGraphScheduleInput = {
+      ...fixture.input,
+      verificationRequirements: { status: "valid", requirements: [
+        { id: "candidate-count", kind: "candidate_count_gte", minimum: 1 },
+        { id: "finding-count", kind: "finding_count_gte", minimum: 1 },
+      ] },
+    }
+    const result = await createGraphTasks(fixture.client, input, fixture.parent, fixture.current, fixture.taskIds)
+    expect(result.created).toMatchObject([{ key: "repair-next", status: "queued" }])
+    expect(result.snapshot.nodes.some(node => node.key === "analyst-source")).toBe(true)
+  })
+
+  it("allows an unsuccessful terminal repair to be retried against the same target", async () => {
     const fixture = repairFixture({ priorRepairStatus: "failed" })
     const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds)
     expect(result.created).toMatchObject([{ key: "repair-next", status: "queued" }])
@@ -779,14 +850,50 @@ describe("createGraphTasks", () => {
 
   it("queues a newly planned dependent with the receipt-backed composite while the original row stays failed", async () => {
     const fixture = repairFixture({ priorReceipt: true, scheduleDependent: true })
-    const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds)
+    const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds, {
+      sourceInputCheckpointByNodeKey: new Map([["target", { inputThroughSequence: 3n }]]),
+      currentInputCheckpoint: { inputThroughSequence: 4n },
+    })
     expect(result.created).toMatchObject([{ key: "after-target", status: "queued" }])
     expect(result.state.nodes.find(node => node.key === "target")?.status).toBe("failed")
     const insert = fixture.query.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
     const context = JSON.parse(String(insert?.[1]?.[13])) as Record<string, unknown>
     const evidence = context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
-    expect(evidence.items[0]).toMatchObject({ dependencyKey: "target", taskStatus: "completed", repairLineage: [{ criterionIds: ["finding-count"] }] })
+    expect(evidence.items[0]).toMatchObject({ dependencyKey: "target", taskStatus: "completed", repairLineage: [{ criterionIds: ["finding-count"] }],
+      sourceIntent: { goal: "Find evidence", successCriteria: ["find evidence"], inputRelation: "predates_current_inputs" } })
     expect(evidence.items[0]?.result).toMatchObject({ role: "analyst", findingCount: 1, evidenceCount: 1 })
+  })
+
+  it("rejects a Writer that omits the server-selected 10-point source in favor of its 9-point dependency", async () => {
+    const query = vi.fn(async (_sql: string) => ({ rows: [], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const current: TaskGraphState = { revision: 2, appliedEvents: [], nodes: [10, 9].map(score => ({
+      key: `analyst-${score}`, templateId: "analyst", taskId: `task-${score}`, goal: `Analyze ${score}`,
+      successCriteria: ["Return findings"], dependsOn: [], depth: 1, status: "completed" as const,
+      verificationDisposition: "typed" as const, verification: analystVerification,
+    })) }
+    vi.mocked(selectVerifiedScheduledDraftCandidate).mockResolvedValueOnce({
+      candidate: { jobId: "job-high", score: 10 }, sourceAnalystKeys: ["analyst-10"], witness: {} as never,
+    })
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 2, nodes: [
+        { key: "new-analyst", templateId: "analyst", goal: "Analyze the new batch", successCriteria: ["Return findings"], dependsOn: [], verification: analystVerification },
+        writerReviewNode({ key: "writer", templateId: "cover_letter_writer", dependsOn: ["analyst-9"] }),
+        writerReviewNode({ key: "reviewer", templateId: "cover_letter_reviewer", dependsOn: ["writer"] }),
+      ] },
+      templates: {
+        analyst: { role: "analyst", taskType: "research", allowedActions: [] },
+        cover_letter_writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: [], context: { scheduledDraftMode: true } },
+        cover_letter_reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: [], context: { scheduledDraftMode: true } },
+      },
+    }
+    const parent = { budgetSnapshot: { subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 } } }
+    const priorIds = new Map([["analyst-10", "task-10"], ["analyst-9", "task-9"]])
+    await expect(createGraphTasks(client, input, parent, current, priorIds)).rejects.toMatchObject({ code: "task_graph_scheduled_draft_candidate_dependency_missing" })
+    expect(vi.mocked(selectVerifiedScheduledDraftCandidate).mock.calls[0]?.[4]).toEqual(["analyst-10", "analyst-9"])
+    expect(vi.mocked(selectVerifiedScheduledDraftCandidate).mock.calls[0]?.[6]).toEqual(["new-analyst"])
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
   })
 })
 
@@ -797,28 +904,37 @@ const repairVerification = {
     { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
   ],
 } as const
-type RepairFixtureOptions = { resolved?: boolean; targetMissing?: boolean; rootId?: string; priorReceipt?: boolean; priorRepairStatus?: TaskGraphState["nodes"][number]["status"]; scheduleDependent?: boolean; additionalTypedNodes?: number; mixedBatch?: boolean; repairLast?: boolean; ordinaryOnly?: boolean }
+type RepairFixtureOptions = { resolved?: boolean; targetMissing?: boolean; rootId?: string; priorReceipt?: boolean; priorRepairStatus?: TaskGraphState["nodes"][number]["status"]; scheduleDependent?: boolean; additionalTypedNodes?: number; mixedBatch?: boolean; repairLast?: boolean; ordinaryOnly?: boolean; scoutRepair?: boolean; analystRequirement?: boolean }
 function repairFixture(options: RepairFixtureOptions = {}) {
-  const relation = { graphRootTaskId: options.rootId ?? "root-1", nodeKey: "target", taskId: "target-1", criterionIds: ["finding-count"] }
+  const repairTemplateId = options.scoutRepair ? "scout" : "analyst"
+  const repairCriterionId = options.scoutRepair ? "candidate-count" : "finding-count"
+  const targetVerification = options.scoutRepair ? scoutVerification : repairVerification
+  const repairNodeVerification = options.scoutRepair ? scoutVerification : analystVerification
+  const relation = { graphRootTaskId: options.rootId ?? "root-1", nodeKey: "target", taskId: "target-1", criterionIds: [repairCriterionId] }
   const report = {
     verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
-    criteria: [
-      { criterionId: "finding-count", status: options.resolved ? "passed" : "failed", reasonCode: options.resolved ? "criteria_met" : "criterion_not_met" },
-      { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
-    ], evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
+    criteria: targetVerification.criteria.map(item => ({
+      criterionId: item.id,
+      status: item.id === repairCriterionId && options.resolved ? "passed" : "failed",
+      reasonCode: item.id === repairCriterionId && options.resolved ? "criteria_met" : "criterion_not_met",
+    })), evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
   }
-  const target = { key: "target", templateId: "analyst", goal: "Find evidence", successCriteria: ["find evidence"], dependsOn: [], depth: 1, status: "failed" as const, taskId: "target-1", verificationDisposition: "typed" as const, verification: repairVerification }
-  const priorRepair = { key: "repair-old", templateId: "analyst", goal: "Repair finding", successCriteria: ["repair"], dependsOn: [], depth: 1, status: options.priorRepairStatus ?? "completed", taskId: "repair-old-1", verificationDisposition: "typed" as const, verification: analystVerification, repairOf: { ...relation, graphRootTaskId: "root-1" } }
+  const target = { key: "target", templateId: repairTemplateId, goal: "Find evidence", successCriteria: ["find evidence"], dependsOn: [], depth: 1, status: "failed" as const, taskId: "target-1", verificationDisposition: "typed" as const, verification: targetVerification }
+  const priorRepair = { key: "repair-old", templateId: repairTemplateId, goal: "Repair finding", successCriteria: ["repair"], dependsOn: [], depth: 1, status: options.priorRepairStatus ?? "completed", taskId: "repair-old-1", verificationDisposition: "typed" as const, verification: repairNodeVerification, repairOf: { ...relation, graphRootTaskId: "root-1" } }
   const fillers = Array.from({ length: options.additionalTypedNodes ?? 0 }, (_, index) => ({
     key: `filler-${index}`, templateId: "analyst", goal: "Prior typed work", successCriteria: ["done"], dependsOn: [],
     depth: 1, status: "completed" as const, taskId: `filler-task-${index}`, verificationDisposition: "typed" as const, verification: analystVerification,
   }))
+  const analyst = options.analystRequirement ? {
+    key: "analyst-source", templateId: "analyst", goal: "Analyze candidates", successCriteria: ["Return findings"], dependsOn: [],
+    depth: 1, status: "completed" as const, taskId: "analyst-task", verificationDisposition: "typed" as const, verification: analystVerification,
+  } : undefined
   const hasPriorRepair = options.priorReceipt || options.priorRepairStatus !== undefined
-  const currentNodes = [target, ...fillers, ...(hasPriorRepair ? [priorRepair] : [])]
+  const currentNodes = [target, ...fillers, ...(analyst ? [analyst] : []), ...(hasPriorRepair ? [priorRepair] : [])]
   const current: TaskGraphState = { revision: hasPriorRepair ? 2 : 1, nodes: currentNodes, appliedEvents: [], repairSatisfiedNodeKeys: options.priorReceipt ? ["target"] : [] }
   const taskIds = new Map<string, string>(currentNodes.map(node => [node.key, node.taskId!] as const))
   const snapshot = taskGraphSnapshot(current, taskIds)
-  const repairNode = { key: "repair-next", templateId: "analyst", goal: "Repair the missing finding", successCriteria: ["Resolve the finding"], dependsOn: [], verification: analystVerification, repairOf: relation }
+  const repairNode = { key: "repair-next", templateId: repairTemplateId, goal: "Repair the missing finding", successCriteria: ["Resolve the finding"], dependsOn: [], verification: repairNodeVerification, repairOf: relation }
   const ordinaryNode = plannedNode({ key: "ordinary-next", templateId: "analyst", goal: "Continue bounded analysis", successCriteria: ["done"], dependsOn: [] })
   const input: TaskGraphScheduleInput = {
     scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
@@ -827,23 +943,31 @@ function repairFixture(options: RepairFixtureOptions = {}) {
       : options.ordinaryOnly ? [plannedNode({ key: "ordinary-next", templateId: "analyst", goal: "Continue bounded analysis", successCriteria: ["done"], dependsOn: [] })]
         : options.mixedBatch ? options.repairLast ? [ordinaryNode, repairNode] : [repairNode, ordinaryNode]
           : [repairNode] },
-    templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+    templates: {
+      analyst: { role: "analyst", taskType: "research", allowedActions: [] },
+      ...(options.scoutRepair ? { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } } : {}),
+    },
   }
   const evidence = [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }]
-  const targetStructured = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence, summary: "Original incomplete result" }
-  const repairStructured = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: "job-1", score: 7, evidenceIds: ["read:job:job-1"] }], evidence, summary: "Repair result" }
+  const targetStructured = repairTemplateId === "scout"
+    ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence, summary: "Original incomplete result" }
+    : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence, summary: "Original incomplete result" }
+  const repairStructured = repairTemplateId === "scout"
+    ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }], evidence, summary: "Repair result" }
+    : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: "job-1", score: 7, evidenceIds: ["read:job:job-1"] }], evidence, summary: "Repair result" }
   const receipt = { schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: "root-1", targetNodeKey: "target", targetTaskId: "target-1", criterionIds: ["finding-count"], repairNodeKey: "repair-old", repairTaskId: "repair-old-1", verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: "b".repeat(64) }
   const priorResult = {
     finalItemId: "repair-item", finalText: "Repair result", status: "completed", stepCount: 1, toolCallCount: 1,
     structuredResult: repairStructured,
-    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met", criteria: analystVerification.criteria.map(item => ({ criterionId: item.id, status: "passed", reasonCode: "criteria_met" })), evidenceDigest: "b".repeat(64), resultDigest: taskGraphResultDigest(repairStructured) },
+    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met", criteria: repairNodeVerification.criteria.map(item => ({ criterionId: item.id, status: "passed", reasonCode: "criteria_met" })), evidenceDigest: "b".repeat(64), resultDigest: taskGraphResultDigest(repairStructured) },
     taskGraphRepairReceipt: receipt,
   }
   const targetResult = {
     finalItemId: "target-item", finalText: "Incomplete", status: "completed", stepCount: 1, toolCallCount: 1, structuredResult: targetStructured,
-    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met", criteria: [
-      { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }, { criterionId: "evidence-count", status: "passed", reasonCode: "criteria_met" },
-    ], evidenceDigest: "a".repeat(64), resultDigest: taskGraphResultDigest(targetStructured) },
+    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met", criteria: targetVerification.criteria.map(item => ({
+      criterionId: item.id, status: item.id === repairCriterionId ? "failed" : "passed",
+      reasonCode: item.id === repairCriterionId ? "criterion_not_met" : "criteria_met",
+    })), evidenceDigest: "a".repeat(64), resultDigest: taskGraphResultDigest(targetStructured) },
   }
   let insertedChildren = 0
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
@@ -852,14 +976,14 @@ function repairFixture(options: RepairFixtureOptions = {}) {
     if (sql.includes('SELECT item."content"')) return { rows: [{ content: snapshot }], rowCount: 1 }
     if (sql.includes("ANY($1::text[])")) return options.scheduleDependent
       ? { rows: [
-        { id: "target-1", status: "failed", failureReason: "task_graph_verification_failed", role: "analyst", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, result: targetResult, ...input.scope, userId: "user-1" },
-        { id: "repair-old-1", status: "completed", failureReason: null, role: "analyst", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, result: priorResult, ...input.scope, userId: "user-1" },
+        { id: "target-1", status: "failed", failureReason: "task_graph_verification_failed", role: repairTemplateId, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: repairTemplateId }, result: targetResult, ...input.scope, userId: "user-1" },
+        { id: "repair-old-1", status: "completed", failureReason: null, role: repairTemplateId, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: repairTemplateId }, result: priorResult, ...input.scope, userId: "user-1" },
       ], rowCount: 2 }
       : { rows: [{ id: "repair-old-1", status: options.priorRepairStatus ?? "completed", result: options.priorReceipt ? priorResult : { ...priorResult, taskGraphRepairReceipt: undefined } }], rowCount: 1 }
-    if (sql.includes('task."failureReason"')) return { rows: options.targetMissing ? [] : [{ id: "target-1", status: "failed", role: "analyst", failureReason: "task_graph_verification_failed", result: { taskGraphVerificationReport: report }, rootTaskId: "root-1", parentTaskId: "root-1", sessionId: "session-1", turnId: "turn-1" }], rowCount: options.targetMissing ? 0 : 1 }
+    if (sql.includes('task."failureReason"')) return { rows: options.targetMissing ? [] : [{ id: "target-1", status: "failed", role: repairTemplateId, failureReason: "task_graph_verification_failed", result: { taskGraphVerificationReport: report }, rootTaskId: "root-1", parentTaskId: "root-1", sessionId: "session-1", turnId: "turn-1" }], rowCount: options.targetMissing ? 0 : 1 }
     if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
     if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) return { rows: [{ id: `repair-next-${++insertedChildren}` }], rowCount: 1 }
-    if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [{ ...taskRow(), id: `repair-next-${insertedChildren}`, goal: insertedChildren === 1 ? repairNode.goal : "Continue bounded analysis" }], rowCount: 1 }
+    if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [{ ...taskRow(repairTemplateId), id: `repair-next-${insertedChildren}`, goal: insertedChildren === 1 ? repairNode.goal : "Continue bounded analysis" }], rowCount: 1 }
     if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [{ id: "outbox-1" }], rowCount: 1 }
     if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [], modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {} }], rowCount: 1 }
     return { rows: [], rowCount: 1 }
@@ -867,11 +991,11 @@ function repairFixture(options: RepairFixtureOptions = {}) {
   return { client: { query } as unknown as Pick<pg.PoolClient, "query">, query, input, current, taskIds, parent: { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } } }
 }
 
-function taskRow() {
+function taskRow(role: "analyst" | "scout" = "analyst") {
   return {
     id: "child-2", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
-    path: "/root-1/child-2", depth: 1, role: "analyst", taskType: "research", status: "queued", goal: "Continue after prior result",
-    constraints: [], successCriteria: ["done"], allowedActions: [], context: {}, expectedOutputSchema: {}, result: null, failureReason: null,
+    path: "/root-1/child-2", depth: 1, role, taskType: role === "scout" ? "job_discovery" : "research", status: "queued", goal: "Continue after prior result",
+    constraints: [], successCriteria: ["done"], allowedActions: role === "scout" ? ["jobs.search"] : [], context: {}, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role }, result: null, failureReason: null,
     attemptCount: 0, maxAttempts: 2, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
     budgetSnapshot: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {},
   }

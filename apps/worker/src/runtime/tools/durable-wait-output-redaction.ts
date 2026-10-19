@@ -45,7 +45,7 @@ export function redactDurableWaitOutput(value: unknown): RepositoryJsonValue {
       ...receipt,
       tasks: taskRows.map(value => {
         const task = value as Record<string, RepositoryJsonValue>
-        return { ...task, result: projectNativeVerificationResult(task.result) }
+        return { ...task, result: projectNativeVerificationResult(withoutDiscoveryRecovery(task.result)) }
       }),
     }
     const redacted = redactSensitiveValue(projected)
@@ -66,6 +66,41 @@ export function redactDurableWaitOutput(value: unknown): RepositoryJsonValue {
   } catch {
     throw invalidReceipt()
   }
+}
+
+function withoutDiscoveryRecovery(value: RepositoryJsonValue | undefined): RepositoryJsonValue {
+  if (value === undefined) return null
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as RepositoryJsonValue
+      const projected = withoutDiscoveryRecovery(parsed)
+      return projected === parsed ? value : JSON.stringify(projected)
+    } catch { return containsDiscoveryRecoveryMarker(value) ? null : value }
+  }
+  if (value === null || typeof value !== "object") {
+    return value
+  }
+  if (Array.isArray(value)) {
+    const projected = value.map(withoutDiscoveryRecovery)
+    return projected.some((entry, index) => entry !== value[index]) ? projected : value
+  }
+  let changed = false
+  const entries: Array<[string, RepositoryJsonValue]> = []
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "discoveryRecovery") {
+      changed = true
+      continue
+    }
+    const projected = withoutDiscoveryRecovery(child)
+    if (projected !== child) changed = true
+    entries.push([key, projected])
+  }
+  return changed ? Object.fromEntries(entries) : value
+}
+
+function containsDiscoveryRecoveryMarker(value: string): boolean {
+  const decoded = value.replace(/\\u([0-9a-fA-F]{4})/g, (_match, code: string) => String.fromCharCode(Number.parseInt(code, 16)))
+  return decoded.includes("discoveryRecovery")
 }
 
 function readTaskIds(value: RepositoryJsonValue | undefined, allowEmpty: boolean): string[] {

@@ -896,6 +896,77 @@ describe("child executor composition", () => {
     expect(result.result).not.toHaveProperty("structuredResult")
   })
 
+  it("keeps server discovery health outside an invalid Scout structured result and gates it to ordinary discovery", async () => {
+    const health = {
+      schemaVersion: "agent-harness.v2.task-graph.discovery-attempt-health.v1",
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+      candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
+    } as const
+    const sidecar = { attemptCount: 2, health }
+    const recovery = {
+      schemaVersion: "agent-harness.v2.task-graph.discovery-recovery.v1",
+      attemptCount: 2,
+      jobIds: ["c123456789012345678901234"],
+      truncated: false,
+    } as const
+    const discoverTool = {
+      ...tool("jobs.discover", "jobs"), risk: "internal_write" as const,
+      capabilities: ["read", "write"] as const, requiredCapabilities: ["read"] as const,
+      idempotency: "idempotent" as const,
+    }
+    const ordinaryScout = { ...structuredLease("scout"), taskType: "job_discovery", allowedActions: ["jobs.discover"] }
+    const discoveredJob = {
+      id: "c123456789012345678901234", title: "Engineer", company: "Example", location: "Dublin", url: "https://example.test/job-1",
+      description: "Role description", fullDescription: "Role description", salary: null, logo: null, source: "greenhouse", evidenceRefs: ["evidence-1"],
+    }
+    const discoveredOutput = {
+      jobs: [discoveredJob],
+      evidence: [{ evidenceId: "evidence-1", jobId: discoveredJob.id, kind: "source", source: "greenhouse", url: discoveredJob.url, summary: "Source listing" }],
+      nextCursor: null,
+      usage: { toolName: "jobs.discover", toolVersion: "1", requests: 1, jobsProcessed: 1, jobsSucceeded: 1, jobsFailed: 0,
+        aiCalls: 0, providers: ["greenhouse"], estimatedCostUsd: 0, durationMs: 1 },
+    }
+    const runtime = childToolRuntime([discoverTool], async (_context, request) => ({
+      ...request, status: "completed", output: discoveredOutput, errorCode: null,
+    }))
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => readSequenceModel("not-json", ["jobs.discover"]),
+      toolRuntimeFactory: () => ({ ...runtime, discoveryAttemptSidecar: () => sidecar, discoveryRecoverySidecar: () => recovery }),
+    })
+
+    const failedScout = await executor({ lease: ordinaryScout })
+    expect(failedScout).toMatchObject({
+      status: "failed", failureReason: "invalid_structured_result",
+      result: { status: "failed", discoveryAttempt: sidecar, discoveryRecovery: recovery, structuredOutputFailureCategory: "result_shape_invalid" },
+    })
+    expect(failedScout.result).not.toHaveProperty("structuredResult")
+    expect(failedScout.result).not.toHaveProperty("discoveryAttemptHealth")
+
+    const genericScout = await executor({ lease: { ...ordinaryScout, taskType: "research" } })
+    expect(genericScout.result).not.toHaveProperty("discoveryAttempt")
+    expect(genericScout.result).not.toHaveProperty("discoveryRecovery")
+    const analyst = await executor({ lease: { ...ordinaryScout, role: "analyst", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" } } })
+    expect(analyst.result).not.toHaveProperty("discoveryAttempt")
+    expect(analyst.result).not.toHaveProperty("discoveryRecovery")
+    const selectedScout = await executor({ lease: { ...ordinaryScout, context: { selectedJobPreparation: {} } } })
+    expect(selectedScout.result).not.toHaveProperty("discoveryRecovery")
+
+    const completedText = JSON.stringify({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId: discoveredJob.id, source: "greenhouse", url: discoveredJob.url, evidenceIds: ["evidence-1"] }],
+      evidence: [{ id: "evidence-1", kind: "job", ref: discoveredJob.id, source: "greenhouse" }], summary: "One observed role",
+    })
+    const successfulExecutor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => readSequenceModel(completedText, ["jobs.discover"]),
+      toolRuntimeFactory: () => ({ ...runtime, discoveryAttemptSidecar: () => sidecar, discoveryRecoverySidecar: () => recovery }),
+    })
+    const completedScout = await successfulExecutor({ lease: ordinaryScout })
+    expect(completedScout.status).toBe("completed")
+    expect(completedScout.result).toHaveProperty("discoveryRecovery", recovery)
+  })
+
   it("fails closed before parsing oversized structured output", async () => {
     const text = JSON.stringify({ ...validScoutResult(), summary: "x".repeat(9_000) })
     expect(Buffer.byteLength(text, "utf8")).toBeGreaterThan(8 * 1024)

@@ -177,6 +177,75 @@ describe("durable wait output redaction", () => {
     expect((legacySafe.tasks as Array<Record<string, unknown>>)[0]?.result).toEqual(legacyResult)
   })
 
+  it.each(["legacy", "current"] as const)("omits discovery recovery from %s durable wait results", rowKind => {
+    const recoveryJobId = "c123456789012345678901234"
+    const recovery = {
+      schemaVersion: "agent-harness.v2.task-graph.discovery-recovery.v1",
+      attemptCount: 3, jobIds: [recoveryJobId], truncated: false,
+    }
+    const output = validOutput()
+    const result = { status: "failed", stepCount: 4, toolCallCount: 3, discoveryRecovery: recovery }
+    const row = { ...output.tasks[0]!, status: "failed", result,
+      ...(rowKind === "current" ? {
+        attemptCount: 3, maxAttempts: 4, leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: null,
+      } : {}),
+    }
+    const value = { ...output, tasks: [row] }
+
+    const safe = redactDurableWaitOutput(value) as Record<string, unknown>
+    const safeTask = (safe.tasks as Array<Record<string, unknown>>)[0]!
+    expect(safeTask.result).toEqual({ status: "failed", stepCount: 4, toolCallCount: 3 })
+    expect(JSON.stringify(safe)).not.toContain(recoveryJobId)
+    if (rowKind === "current") expect(safeTask).toMatchObject({ attemptCount: 3, maxAttempts: 4 })
+    expect(row.result).toEqual(result)
+  })
+
+  it.each(["legacy", "current"] as const)("recursively omits recovery metadata from nested %s results", rowKind => {
+    const recoveryJobId = "c223456789012345678901234"
+    const recovery = { attemptCount: 9, jobIds: [recoveryJobId] }
+    const result = {
+      status: "failed",
+      details: { keep: "nested-safe", deeper: { keep: "deep-safe", discoveryRecovery: recovery } },
+      rows: [{ keep: "array-safe", discoveryRecovery: recovery }],
+      serialized: JSON.stringify({ envelope: { keep: "serialized-safe", discoveryRecovery: recovery } }),
+    }
+    const output = validOutput()
+    const row = {
+      ...output.tasks[0]!, status: "failed", result,
+      ...(rowKind === "current" ? {
+        attemptCount: 3, maxAttempts: 4, leaseExpiresAt: "2026-10-12T10:15:30.000Z", interruptRequestedAt: null,
+      } : {}),
+    }
+    const safe = redactDurableWaitOutput({ ...output, tasks: [row] }) as Record<string, unknown>
+    const safeTask = (safe.tasks as Array<Record<string, unknown>>)[0]!
+
+    expect(safeTask.result).toEqual({
+      status: "failed",
+      details: { keep: "nested-safe", deeper: { keep: "deep-safe" } },
+      rows: [{ keep: "array-safe" }],
+      serialized: JSON.stringify({ envelope: { keep: "serialized-safe" } }),
+    })
+    expect(JSON.stringify(safe)).not.toContain(recoveryJobId)
+    expect(JSON.stringify(safe)).not.toContain('"attemptCount":9')
+    expect(row.result).toEqual(result)
+  })
+
+  it.each([
+    `prefix: {"discoveryRecovery":{"attemptCount":9,"jobIds":["c323456789012345678901234"]}`,
+    String.raw`prefix: {"discovery\u0052ecovery":{"attemptCount":9,"jobIds":["c323456789012345678901234"]}`,
+  ])("fails closed on malformed serialized recovery markers: %s", rawResult => {
+    const output = validOutput()
+    const row = { ...output.tasks[0]!, status: "failed", result: rawResult }
+    const safe = redactDurableWaitOutput({ ...output, tasks: [row] }) as Record<string, unknown>
+    const safeTask = (safe.tasks as Array<Record<string, unknown>>)[0]!
+    expect(safeTask.result).toBeNull()
+    expect(row.result).toBe(rawResult)
+
+    const ordinary = { ...output, tasks: [{ ...row, result: "ordinary text without recovery metadata" }] }
+    const safeOrdinary = redactDurableWaitOutput(ordinary) as Record<string, unknown>
+    expect((safeOrdinary.tasks as Array<Record<string, unknown>>)[0]?.result).toBe("ordinary text without recovery metadata")
+  })
+
   it("fails closed on invalid or contradictory IDs", () => {
     const invalid = [
       { ...validOutput(), waitId: "wait-123" },

@@ -512,6 +512,18 @@ describe("production child runtime", () => {
     })
     const ownerReadCalls: unknown[][] = []
     const ownerGateCalls: unknown[][] = []
+    const provenanceQueries: string[] = []
+    const provenanceParameters: Array<readonly unknown[] | undefined> = []
+    const provenanceConnection = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        provenanceQueries.push(sql)
+        provenanceParameters.push(values)
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql === "SELECT set_config($1, $2, true)") return { rows: [] }
+        if (sql.includes('FROM "agent_items" AS item')) return { rows: [] }
+        throw new Error(`unexpected production provenance query: ${sql}`)
+      }),
+      release: vi.fn(),
+    }
     const poolFixture = {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         if (sql.includes('FROM "Job" WHERE "id" = $1 AND "userId" = $2')) {
@@ -531,6 +543,7 @@ describe("production child runtime", () => {
         }
         throw new Error(`unexpected composed discovery fixture query: ${sql}`)
       }),
+      connect: vi.fn(async () => provenanceConnection),
     }
     const scoutRequests: HarnessModelRequest[] = []
     const scoutModel: ModelAdapter = {
@@ -564,18 +577,33 @@ describe("production child runtime", () => {
     const scoutLease: SubagentLease = {
       ...lease(), id: "scout-task", userId: ownerUserId, role: "scout", taskType: "job_discovery",
       allowedActions: ["jobs.search", "jobs.get", "jobs.discover"],
-      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, leaseExpiresAt: new Date(Date.now() + 60_000),
     }
     const turnPersistence = recordingStore()
     const scoutExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
-      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => scoutModel, jobDiscoveryClient: discoveryClient,
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => scoutModel,
+      jobDiscoveryClient: discoveryClient, mailboxReader: emptyMailboxReader,
     })
     if (!scoutExecutor) throw new Error("generic Scout child executor was not created")
 
     const scoutExecution = await scoutExecutor({ lease: scoutLease })
     expect(scoutExecution).toMatchObject({ status: "completed" })
     const scoutChildResult = completedResult(scoutExecution.result)
+    expect(scoutChildResult).toMatchObject({ discoveryAttempt: {
+      attemptCount: scoutLease.attemptCount,
+      health: {
+        schemaVersion: "agent-harness.v2.task-graph.discovery-attempt-health.v1",
+        attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+        candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false,
+      },
+    } })
+    expect(provenanceQueries).toEqual([
+      "BEGIN", "SELECT set_config($1, $2, true)", expect.stringContaining('FROM "agent_items" AS item'), "COMMIT",
+    ])
+    expect(provenanceParameters[1]).toEqual(["app.user_id", ownerUserId])
+    expect(provenanceConnection.release).toHaveBeenCalledOnce()
+    expect(JSON.stringify(scoutChildResult.discoveryAttempt)).not.toMatch(/provider-private|ledgerKey|toolCallId|sessionId|turnId|stepId|estimatedCost/i)
     const scoutResult = completedResult(scoutChildResult.structuredResult)
     const savedScoutJob = [...savedJobs.values()].find(row => row.userId === ownerUserId && row.url === providerUrl)
     if (!savedScoutJob) throw new Error("the production discovery route did not materialize the owner job")
@@ -646,6 +674,7 @@ describe("production child runtime", () => {
     const analystExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
       authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => analystModel,
+      mailboxReader: emptyMailboxReader,
     })
     if (!analystExecutor) throw new Error("Analyst child executor was not created")
 

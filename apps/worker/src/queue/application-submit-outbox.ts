@@ -53,7 +53,7 @@ async function selectOutboxRows(pool: Pool, limit: number, published: boolean): 
   const cursors = published ? publishedCursorByPool : pendingCursorByPool
   const page = (after?: string) => transaction(pool, async client => (await client.query<OutboxRow>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload"
     FROM "agent_outbox" WHERE "topic" = $1 AND "publishedAt" IS ${published ? "NOT " : ""}NULL
-      AND ("lastError" IS NULL OR "lastError" NOT LIKE 'terminal:%') AND ($3 IS NULL OR "id" > $3)
+      AND ("lastError" IS NULL OR "lastError" NOT LIKE 'terminal:%') AND ($3::text IS NULL OR "id" > $3::text)
     ORDER BY "id" ASC LIMIT $2 ${published ? "" : "FOR UPDATE SKIP LOCKED"}`, [APPLICATION_SUBMIT_OUTBOX_TOPIC, limit, after ?? null])).rows)
   let cursor = cursors.get(pool), rows = await page(cursor)
   if (!rows.length && cursor !== undefined) { cursor = undefined; rows = await page() }
@@ -108,6 +108,8 @@ async function terminalizeClaimed(pool: Pool, queue: SubmitQueue, id: string, in
 async function processRow(pool: Pool, queue: SubmitQueue, id: string, published = false): Promise<ProcessOutcome> {
   let scanned: OutboxRow | undefined
   let claimedRecovery: Intent | undefined
+  let terminalCleanup: Intent | undefined
+  let terminalCleanupReason: string | undefined
   try {
     const outcome = await transaction(pool, async client => {
       const marker = published ? `"publishedAt" IS NOT NULL` : `"publishedAt" IS NULL`
@@ -141,12 +143,8 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
             row.idempotencyKey !== dispatchIds(currentIntent).idempotencyKey ? "outbox_identity_mismatch"
             : await validateCurrentSubmit(client, currentIntent)
           if (reason === "claimed_delivery_recovery") {
-            const delivery = await inspectSubmitDelivery(queue, currentIntent, false)
-            if (delivery === "terminal") { claimedRecovery = currentIntent; return "skipped" as const }
-            if (delivery === "missing") {
-              const terminalized = await markTerminal(client, row, "claimed_delivery_missing", queue, currentIntent.workerTaskId, published)
-              return terminalized ? "terminalized" as const : "skipped" as const
-            }
+            const delivery = await inspectSubmitDelivery(queue, currentIntent, true)
+            if (delivery === "terminal" || delivery === "absent") { claimedRecovery = currentIntent; return "skipped" as const }
             if (delivery === "mismatch") {
               const terminalized = await markTerminal(client, row, "queue_job_identity_mismatch", queue, currentIntent.workerTaskId, published)
               return terminalized ? "terminalized" as const : "skipped" as const
@@ -160,11 +158,17 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
               return terminalized ? "terminalized" as const : "skipped" as const
             }
             if (delivery !== "absent" && delivery !== "terminal") return "skipped" as const
-            if (!await markTerminal(client, row, reason, queue, currentIntent.workerTaskId, published)) return "skipped" as const
             await resetExpiredSubmitAuthorization(client, currentIntent)
-            return "terminalized" as const
+            terminalCleanup = currentIntent
+            terminalCleanupReason = reason
+            return "skipped" as const
           }
           if (reason) {
+            if (reason === "attempt_already_claimed_or_terminal") {
+              terminalCleanup = currentIntent
+              terminalCleanupReason = reason
+              return "skipped" as const
+            }
             const terminalized = await markTerminal(client, row, reason, queue, currentIntent.workerTaskId, published)
             return terminalized ? "terminalized" as const : "skipped" as const
           }
@@ -195,6 +199,12 @@ async function processRow(pool: Pool, queue: SubmitQueue, id: string, published 
       if (recovery === "reconciled") return terminalizeClaimed(pool, queue, id, claimedRecovery, "terminal_submit_reconciled", published)
       if (recovery === "mismatch") return terminalizeClaimed(pool, queue, id, claimedRecovery, "queue_job_identity_mismatch", published)
       return "skipped"
+    }
+    if (terminalCleanup) {
+      const cleanup = await reconcileClaimedTerminalSubmit(pool, queue, terminalCleanup)
+      if (cleanup === "mismatch") return terminalizeClaimed(pool, queue, id, terminalCleanup, "queue_job_identity_mismatch", published)
+      if (cleanup !== "reconciled") return "skipped"
+      return terminalizeClaimed(pool, queue, id, terminalCleanup, terminalCleanupReason!, published)
     }
     return outcome
   } catch (error: unknown) {

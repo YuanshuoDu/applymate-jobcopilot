@@ -4,6 +4,7 @@ import { getPool } from "../../db/apply-results.js"
 import { prepareGraphTransition, reconcileGraphDependents } from "../subagents/task-graph-pg-lifecycle.js"
 
 export const SUBAGENT_MAILBOX_OUTBOX_TOPIC = "agent.subagent.mailbox"
+const TASK_INTERRUPT_OUTBOX_TOPIC = "agent.subagent.task-interrupt"
 const DEFAULT_BATCH_SIZE = 10
 const MAX_BATCH_SIZE = 50
 const DEFAULT_POLL_MS = 1_000
@@ -12,16 +13,20 @@ const TERMINAL_STATUSES = ["completed", "failed", "interrupted", "cancelled", "c
 type PoolLike = Pick<pg.Pool, "connect">
 type Queryable = Pick<pg.PoolClient, "query">
 type OutboxRow = { id: string; aggregateId: string; payload: unknown }
-type MailboxPayload = { messageId: string; sessionId: string; turnId: string; toTaskId: string }
+type MailboxPayload = { messageId: string; sessionId: string; turnId: string; toTaskId: string; targetAttemptCount?: number }
 type MailboxLineage = {
   id: string
   deliveredAt: Date | string | null
+  kind: string
+  messageTargetAttemptCount: number | null
+  targetAttemptCount: number
   targetStatus: string
   targetSessionId: string
   targetTurnId: string | null
   targetRootTaskId: string | null
   targetLeaseOwner: string | null
   targetLeaseExpiresAt: Date | string | null
+  targetHasLiveLease: boolean
   targetInterruptRequestedAt: Date | string | null
   rootId: string
   rootSessionId: string
@@ -40,10 +45,12 @@ function nonEmptyString(value: unknown): value is string {
 function parseMailboxPayload(value: unknown): MailboxPayload | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
-  if (Object.keys(row).sort().join(",") !== "messageId,sessionId,toTaskId,turnId") return null
+  const keys = Object.keys(row).sort().join(",")
+  if (keys !== "messageId,sessionId,toTaskId,turnId" && keys !== "messageId,sessionId,targetAttemptCount,toTaskId,turnId") return null
   const { messageId, sessionId, turnId, toTaskId } = row
   if (!nonEmptyString(messageId) || !nonEmptyString(sessionId) || !nonEmptyString(turnId) || !nonEmptyString(toTaskId)) return null
-  return { messageId, sessionId, turnId, toTaskId }
+  if ("targetAttemptCount" in row && (!Number.isSafeInteger(row.targetAttemptCount) || Number(row.targetAttemptCount) < 1)) return null
+  return { messageId, sessionId, turnId, toTaskId, ...(typeof row.targetAttemptCount === "number" ? { targetAttemptCount: row.targetAttemptCount } : {}) }
 }
 
 function boundedBatchSize(value: number | undefined): number {
@@ -108,6 +115,7 @@ async function wakeWaitingTask(client: Queryable, payload: MailboxPayload, linea
     SET "status" = 'queued', "updatedAt" = CURRENT_TIMESTAMP
     WHERE target."id" = $1 AND target."sessionId" = $2 AND target."turnId" = $3
       AND target."rootTaskId" = $4 AND target."status" = 'waiting'
+      AND target."attemptCount" = $5
       AND target."leaseOwner" IS NULL AND target."leaseExpiresAt" IS NULL
       AND target."interruptRequestedAt" IS NULL
       AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
@@ -120,7 +128,7 @@ async function wakeWaitingTask(client: Queryable, payload: MailboxPayload, linea
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
           AND turn."id" = target."turnId" AND turn."sessionId" = target."sessionId"
           AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
-  [payload.toTaskId, payload.sessionId, payload.turnId, lineage.targetRootTaskId])
+  [payload.toTaskId, payload.sessionId, payload.turnId, lineage.targetRootTaskId, lineage.targetAttemptCount])
   if (queued.rowCount !== 1) return
   await client.query(`UPDATE "agent_outbox"
     SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
@@ -148,10 +156,12 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
     await markOutbox(client, row.id, "mailbox_outbox_aggregate_mismatch")
     return
   }
-  const message = await client.query<MailboxLineage>(`SELECT message."id", message."deliveredAt",
+  const message = await client.query<MailboxLineage>(`SELECT message."id", message."deliveredAt", message."kind",
+      message."targetAttemptCount" AS "messageTargetAttemptCount", target."attemptCount" AS "targetAttemptCount",
       target."status" AS "targetStatus", target."sessionId" AS "targetSessionId", target."turnId" AS "targetTurnId",
       target."rootTaskId" AS "targetRootTaskId", target."leaseOwner" AS "targetLeaseOwner",
       target."leaseExpiresAt" AS "targetLeaseExpiresAt", target."interruptRequestedAt" AS "targetInterruptRequestedAt",
+      COALESCE(target."leaseExpiresAt" > clock_timestamp(), false) AS "targetHasLiveLease",
       root."id" AS "rootId", root."sessionId" AS "rootSessionId", root."turnId" AS "rootTurnId", root."status" AS "rootStatus",
       turn."id" AS "turnId", turn."sessionId" AS "turnSessionId", turn."status" AS "turnStatus"
     FROM "agent_mailbox_messages" AS message
@@ -171,6 +181,44 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
     return
   }
   const lineage = message.rows[0]
+  const attemptMatches = payload.targetAttemptCount === undefined
+    ? lineage.messageTargetAttemptCount === null && lineage.kind !== "human_follow_up"
+    : lineage.messageTargetAttemptCount === payload.targetAttemptCount && lineage.targetAttemptCount === payload.targetAttemptCount
+  if (!attemptMatches) {
+    await markOutbox(client, row.id, "mailbox_attempt_mismatch")
+    return
+  }
+  if (payload.targetAttemptCount !== undefined && (lineage.targetStatus !== "running"
+    || !lineage.targetLeaseOwner || !lineage.targetHasLiveLease || lineage.targetInterruptRequestedAt !== null
+    || isTerminal(lineage.rootStatus) || isTerminal(lineage.turnStatus))) {
+    await markOutbox(client, row.id, "mailbox_attempt_stale")
+    return
+  }
+  if (payload.targetAttemptCount !== undefined) {
+    const pendingInterrupt = await client.query<{ id: string }>(`WITH RECURSIVE ancestors AS (
+        SELECT task."id", task."parentTaskId", ARRAY[task."id"]::text[] AS "visited"
+        FROM "sub_agent_tasks" AS task
+        WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+        UNION ALL
+        SELECT parent."id", parent."parentTaskId", child."visited" || parent."id"
+        FROM "sub_agent_tasks" AS parent JOIN ancestors AS child ON child."parentTaskId" = parent."id"
+        WHERE parent."sessionId" = $2 AND parent."turnId" = $3 AND parent."rootTaskId" = $4
+          AND NOT parent."id" = ANY(child."visited") AND cardinality(child."visited") < 11
+      ) SELECT intent."id" FROM "agent_outbox" AS intent
+        JOIN "agent_events" AS accepted ON accepted."sessionId" = intent."aggregateId"
+          AND accepted."taskId" = intent."payload"->>'taskId' AND accepted."turnId" = $3
+          AND accepted."type" = 'task.interrupt.accepted' AND accepted."actor" = 'user'
+          AND accepted."payload"->>'status' = 'accepted'
+          AND accepted."payload"->>'intentId' = intent."payload"->>'intentId'
+        WHERE intent."aggregateId" = $2 AND intent."topic" = $5 AND intent."publishedAt" IS NULL
+          AND intent."payload"->>'sessionId' = $2 AND intent."payload"->>'turnId' = $3
+          AND intent."payload"->>'taskId' IN (SELECT "id" FROM ancestors) LIMIT 1`,
+    [payload.toTaskId, payload.sessionId, payload.turnId, lineage.targetRootTaskId, TASK_INTERRUPT_OUTBOX_TOPIC])
+    if (pendingInterrupt.rows.length > 0) {
+      await markOutbox(client, row.id, "mailbox_attempt_stale")
+      return
+    }
+  }
   // Session and lineage locks precede the task CAS; the dispatch reset is last.
   await wakeWaitingTask(client, payload, lineage)
   if (lineage.deliveredAt === null) {

@@ -21,9 +21,9 @@ import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import { createJobDiscoveryClient, type JobDiscoveryClient } from "../tools/job-discovery-client.js"
-import type { JobDiscoveryExecutionFence } from "../tools/job-discover-tool.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
+import { childDiscoveryExecutionFence, createChildDiscoveryObservers } from "./child-discovery-observers.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -175,22 +175,20 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     ...(coverLetterBase ? { coverLetterBase } : {}),
   } : undefined
   const toolPolicy = createProductionChildPolicy(task, Boolean(selectedJob || selectedJobPreparation))
-  const actions = Array.isArray(task.allowedActions) ? task.allowedActions : []
-  const canDiscover = task.role === "scout" && lease.role === "scout" && task.taskType === "job_discovery" && !selectedJob
-    && !selectedJobPreparation && actions.includes("jobs.discover") && task.id === lease.id && task.userId === lease.userId
-    && task.sessionId === lease.sessionId && task.turnId === lease.turnId && task.rootTaskId === lease.rootTaskId && lease.turnId !== null
-    && typeof lease.leaseOwner === "string" && lease.leaseOwner.trim() === lease.ownerId && Number.isSafeInteger(lease.attemptCount) && lease.attemptCount >= 1
-  const discoveryFence: JobDiscoveryExecutionFence | undefined = canDiscover ? {
-    userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId as string, taskId: lease.id, rootTaskId: lease.rootTaskId,
-    role: "scout", leaseOwner: lease.leaseOwner as string, attemptCount: lease.attemptCount,
-  } : undefined
+  const discoveryFence = childDiscoveryExecutionFence(task, lease, selectedJob, selectedJobPreparation)
+  const discoveryObservers = discoveryFence ? await createChildDiscoveryObservers(pool, lease, discoveryFence) : undefined
   const runtime = createWorkerToolRuntime(pool, {
     sink: durableLifecycleSink(store, owner),
     resolveOwner: () => executionOwner,
+    ...(discoveryObservers ? { onDiscoveryAttemptLifecycleEvent: discoveryObservers.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
   discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined)
   return {
     definitions: runtime.registry.list(), router: runtime.router,
+    ...(discoveryObservers ? {
+      discoveryAttemptSidecar: () => discoveryObservers.discoveryAttemptSidecar(),
+      discoveryRecoverySidecar: () => discoveryObservers.discoveryRecoverySidecar(),
+    } : {}),
     ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
     ...(serverContext ? { serverContext } : {}),
     ...(writerReviewRevision ? { writerReviewRevision } : {}),
@@ -258,7 +256,6 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
 }
 
 export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean { return value === "1" }
-
 function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReader"] | undefined {
   // Keep lightweight construction fixtures usable; a real pg.Pool exposes
   // both methods and therefore gets the server-owned reader.
@@ -266,13 +263,11 @@ function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReade
   if (typeof candidate.connect !== "function" || typeof candidate.query !== "function") return undefined
   return new PgCoordinationStore(pool)
 }
-
 function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"] | undefined {
   const candidate = pool as unknown as { readonly connect?: unknown }
   if (typeof candidate.connect !== "function") return undefined
   return lease => loadChildAttemptResume(pool, lease)
 }
-
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   let genericExecutor: SubagentExecutor | undefined
@@ -294,7 +289,6 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
     return genericExecutor({ lease })
   }
 }
-
 export function createOptionalProductionChildExecutor(options: ProductionChildRuntimeOptions & { readonly enabled?: boolean }): SubagentExecutor | undefined {
   return (options.enabled ?? childExecutionEnabled()) ? createProductionChildExecutor(options) : undefined
 }

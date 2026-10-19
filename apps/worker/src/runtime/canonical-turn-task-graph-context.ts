@@ -1,13 +1,11 @@
 import { Buffer } from "node:buffer"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
-  TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
-  type TaskGraphAnalystProjectionItem, type TaskGraphArtifactProjectionReference, type TaskGraphCommandPort, type TaskGraphCurrentNode,
-  type TaskGraphCurrentState, type TaskGraphProjectionEvidenceKind, type TaskGraphProjectionSource, type TaskGraphReadScope,
-  type TaskGraphResultProjection, type TaskGraphScoutProjectionItem,
+  TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphAnalystProjectionItem, type TaskGraphArtifactProjectionReference,
+  type TaskGraphCurrentNode, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphProjectionEvidenceKind,
+  type TaskGraphProjectionSource, type TaskGraphReadScope, type TaskGraphResultProjection, type TaskGraphScoutProjectionItem,
 } from "./subagents/task-graph-command-port.js"
 import { parseTaskGraphCurrentVerificationMetadata, taskGraphCurrentVerificationMetadataBytes, validateTaskGraphCurrentVerificationGraph } from "./canonical-turn-task-graph-verification-context.js"
-import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { readRootPlanCriteriaObservation } from "./subagents/root-plan-criteria.js"
@@ -15,7 +13,9 @@ import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
 import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
 import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
 import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
-import { projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
+import { hasTaskGraphVerificationUnverifiedFailureReason, projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
+import { parseTaskGraphCurrentDiscoveryAttemptHealth } from "./subagents/task-graph-discovery-attempt-health.js"
+import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -188,8 +188,9 @@ function node(value: unknown): TaskGraphCurrentNode {
   const verification = parseTaskGraphCurrentVerificationMetadata(row, templateId, key, taskId)
   if (!verification) throw new Error("task_graph_current_state_invalid:verification")
   const native = nativeGraphNodeFields(row)
+  const discoveryAttemptHealth = parseTaskGraphCurrentDiscoveryAttemptHealth(row, { templateId, status: row.status, verification: verification.verification, repairOf: verification.repairOf, repairReceipt: verification.repairReceipt, native: Boolean(native.native), nativeResult: Boolean(native.nativeResult) })
   const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, { hasVerifiedReport: Boolean(verification.verificationReport), isNative: Boolean(native.native || native.nativeResult) })
-  const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult ? undefined
+  const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult || !hasTaskGraphVerificationUnverifiedFailureReason(row) ? undefined
     : projectTaskGraphStructuredFailureCategory(row, { status: row.status, templateId, verification: verification.verification, verificationReport: verification.verificationReport })
   return {
     key, templateId,
@@ -197,14 +198,14 @@ function node(value: unknown): TaskGraphCurrentNode {
     dependsOn: stringList(row.dependsOn, MAX_NODES, 128, "dependsOn"), taskId,
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],
     resultSummary: null,
-    resultProjection: projection(row.resultProjection),
+    resultProjection: projection(row.resultProjection), ...(discoveryAttemptHealth ? { discoveryAttemptHealth } : {}),
     ...verification, ...native, ...(executionFailureCategory ? { executionFailureCategory } : {}), ...(structuredOutputFailureCategory ? { structuredOutputFailureCategory } : {}),
     failureReason: null,
   }
 }
 
 /** Replace an old read with the server-fenced current graph, as untrusted model evidence. */
-export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, value: TaskGraphCurrentState): StepContextSnapshot {
+export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, value: TaskGraphCurrentState & { sourceIntent?: unknown }): StepContextSnapshot {
   const state = record(value)
   if (!state || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0 || !Array.isArray(state.nodes) || state.nodes.length > MAX_NODES) throw new Error("task_graph_current_state_invalid")
   const rootSuccessCriteria = readRootPlanCriteriaObservation(state)
@@ -215,7 +216,7 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
     const item = node(value)
     const bytes = projectionBytes(item.resultProjection!)
     const count = projectionItems(item.resultProjection!)
-    verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1)
+    verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1) + (item.discoveryAttemptHealth ? Buffer.byteLength(JSON.stringify(item.discoveryAttemptHealth), "utf8") : 0)
     if (verificationBytes > MAX_VERIFICATION_CONTEXT_BYTES) throw new Error("task_graph_current_verification_too_large")
     if (projectedBytes + bytes > MAX_RESULT_PROJECTION_TOTAL_BYTES
       || projectedItems + count > MAX_RESULT_PROJECTION_TOTAL_ITEMS) {
@@ -229,7 +230,13 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   if (keys.size !== nodes.length || !validateTaskGraphCurrentVerificationGraph(nodes)) throw new Error("task_graph_current_state_invalid:dependencies")
   let planningFacts: unknown
   try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
-  const content = withTaskGraphCurrentPlanningObservation({ kind: "task_graph_current", revision: Number(state.revision), ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), nodes }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
+  const baseContent = withTaskGraphCurrentPlanningObservation({
+    kind: "task_graph_current", revision: Number(state.revision),
+    ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), nodes,
+  }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
+  let sourceIntent: unknown
+  try { sourceIntent = Object.getOwnPropertyDescriptor(state, "sourceIntent")?.value } catch { sourceIntent = undefined }
+  const content = withTaskGraphRootSourceIntent(baseContent, sourceIntent, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
   return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)

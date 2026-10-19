@@ -1,9 +1,14 @@
-import { randomUUID } from "node:crypto"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { createHash, randomUUID } from "node:crypto"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool, type Pool, type PoolClient } from "pg"
+import { Queue, Worker } from "bullmq"
+import { Redis } from "ioredis"
+import type { ApplyTaskSubmitPayload } from "@jobcopilot/shared"
 
 import { markSubmissionRequestStarted } from "../db/application-task-state.js"
 import { claimUnattendedSubmission, reconcileClaimedSubmissionUncertain } from "../db/submission-guard.js"
+import { APPLICATION_SUBMIT_OUTBOX_TOPIC, drainApplicationSubmitOutbox } from "./application-submit-outbox.js"
+import { reconcileClaimedTerminalSubmit, reconcileTerminalSubmitJob, type SubmitOutboxIntent, type SubmitOutboxQueue } from "./application-submit-outbox-terminal-recovery.js"
 import { recordSubmissionExecutionSettled, withExactAttemptFence, type ApplicationSubmitIdentity, type ExactAttemptFenceResult } from "./application-submit-fence.js"
 
 function disposableTestUrl(): string | null {
@@ -27,15 +32,51 @@ function disposableTestUrl(): string | null {
 
 const databaseUrl = disposableTestUrl()
 const describeWithPostgres = databaseUrl ? describe : describe.skip
+function disposableRedisTestUrl(): string | null {
+  if (process.env.RUN_AGENT_TURN_REDIS_INTEGRATION !== "1") return null
+  if (process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true") {
+    throw new Error("Application submit publisher integration requires an explicitly disposable Redis service")
+  }
+  const value = process.env.AGENT_TURN_REDIS_TEST_URL
+  if (!value) throw new Error("AGENT_TURN_REDIS_TEST_URL is required when the Redis integration gate is enabled")
+  const url = new URL(value)
+  if (url.protocol !== "redis:" || !["127.0.0.1", "localhost", "::1"].includes(url.hostname)
+    || url.port !== "6379" || url.pathname !== "/15" || url.username !== "" || url.password !== ""
+    || url.search !== "" || url.hash !== "") {
+    throw new Error("Application submit publisher integration accepts only a disposable loopback Redis DB 15 URL")
+  }
+  return value
+}
+const redisUrl = disposableRedisTestUrl()
 const schema = `submit_fence_${randomUUID().replaceAll("-", "")}`
 const appPrefix = `submit_fence_${process.pid}_${randomUUID().slice(0, 8)}`
 const pool = new PgPool({ connectionString: databaseUrl ?? "postgresql://postgres:postgres@127.0.0.1:5432/applymate_skip", max: 6, options: `-c search_path=${schema}` })
+let testRedis: Redis | undefined
+let testQueueRedis: Redis | undefined
+let submitQueue: Queue<ApplyTaskSubmitPayload> | undefined
+const submitJobIds: string[] = []
 
 type Scenario = ApplicationSubmitIdentity & { readonly successorTurnId: string; readonly workerTaskId: string; readonly executionId: string }
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void
   const promise = new Promise<void>(done => { resolve = done })
   return { promise, resolve }
+}
+
+async function submitRecoverySnapshot(identity: ApplicationSubmitIdentity) {
+  const task = await pool.query<{
+    status: string; checkpoint: string; workerTaskId: string | null; error: string | null; updatedAt: Date
+  }>(`SELECT "status", "checkpoint", "workerTaskId", "error", "updatedAt"
+       FROM "${schema}"."application_tasks" WHERE "id" = $1`, [identity.applicationTaskId])
+  const job = await pool.query<{
+    status: string; workflowState: string; appliedAt: Date | null; updatedAt: Date
+  }>(`SELECT "status", "workflowState", "appliedAt", "updatedAt"
+       FROM "${schema}"."Job" WHERE "id" = $1`, [identity.jobId])
+  const events = await pool.query<{
+    id: string; type: string; actor: string; body: string | null; data: unknown; createdAt: Date
+  }>(`SELECT "id", "type", "actor", "body", "data", "createdAt"
+       FROM "${schema}"."application_task_events" WHERE "taskId" = $1 ORDER BY "id"`, [identity.applicationTaskId])
+  return { task: task.rows[0] ?? null, job: job.rows[0] ?? null, events: events.rows }
 }
 
 async function waitForSignal(signal: Promise<void>, label: string): Promise<void> {
@@ -130,6 +171,41 @@ async function prepareSubmitClaim(identity: Scenario): Promise<void> {
   ])
 }
 
+async function prepareOutboxedSubmit(label: string) {
+  const seeded = await seedScenario(label)
+  const digest = createHash("sha256").update(JSON.stringify([seeded.applicationTaskId, seeded.fillTurnId, seeded.approvalId])).digest("hex")
+  const identity: Scenario = { ...seeded, workerTaskId: `apply-submit-${digest}` }
+  const submitPayload: ApplyTaskSubmitPayload = {
+    applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+    sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
+    constraintHash: identity.constraintHash, operation: "submit", applyUrl: `https://jobs.example/${label}`,
+    personaId: "server-side", resumePath: "",
+  }
+  const outbox = {
+    id: `application-submit-outbox-${digest}`, topic: APPLICATION_SUBMIT_OUTBOX_TOPIC,
+    aggregateId: identity.sessionId, idempotencyKey: `application-submit:${digest}`,
+    payload: {
+      applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+      sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
+      constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId, submitPayload,
+    },
+  }
+  await prepareSubmitClaim(identity)
+  const event = {
+    applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+    sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, approvalId: identity.approvalId,
+    receiptId: identity.approvalId, constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId,
+  }
+  await pool.query(`INSERT INTO "${schema}"."application_task_events" ("id", "taskId", "type", "actor", "body", "data")
+    VALUES ($1, $2, 'submission_queued', 'user', 'User approved this job for background submission.', $3::jsonb)`, [
+    `queued-${label}-${randomUUID()}`, identity.applicationTaskId, JSON.stringify(event),
+  ])
+  await pool.query(`INSERT INTO "${schema}"."agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+    VALUES ($1, $2, $3, $4, $5::jsonb)`, [outbox.id, outbox.topic, outbox.aggregateId, outbox.idempotencyKey, JSON.stringify(outbox.payload)])
+  submitJobIds.push(identity.workerTaskId)
+  return { identity, submitPayload, outboxId: outbox.id }
+}
+
 async function effectCount(identity: ApplicationSubmitIdentity): Promise<number> {
   const result = await pool.query<{ count: number }>(
     `SELECT count(*)::int AS count FROM "${schema}"."submit_effects" WHERE "applicationTaskId" = $1`, [identity.applicationTaskId],
@@ -215,14 +291,152 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
         "responseRef" text, "errorCode" text, "createdAt" timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
         "updatedAt" timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`)
+      await client.query(`CREATE TABLE "agent_outbox" (
+        "id" text PRIMARY KEY, "topic" text NOT NULL, "aggregateId" text NOT NULL, "idempotencyKey" text NOT NULL UNIQUE,
+        "payload" jsonb NOT NULL, "attemptCount" integer NOT NULL DEFAULT 0, "publishedAt" timestamptz, "lastError" text
+      )`)
     } finally { client.release() }
   })
 
+  beforeAll(async () => {
+    if (!redisUrl) return
+    testRedis = new Redis(redisUrl, {
+      lazyConnect: true, maxRetriesPerRequest: null, enableReadyCheck: false, connectTimeout: 2_000,
+      retryStrategy: attempt => attempt > 3 ? null : 100,
+    })
+    await testRedis.connect()
+    await testRedis.ping()
+    testQueueRedis = testRedis.duplicate()
+    submitQueue = new Queue<ApplyTaskSubmitPayload>("apply-tasks", { connection: testQueueRedis })
+    await submitQueue.waitUntilReady()
+  }, 15_000)
+
   afterAll(async () => {
     try {
+      for (const id of submitJobIds) {
+        const job = await submitQueue?.getJob(id).catch(() => undefined)
+        if (!job) continue
+        if (await job.getState().catch(() => "unknown") !== "active") await job.remove().catch(() => undefined)
+      }
+      await submitQueue?.close().catch(() => undefined)
+      await testQueueRedis?.quit().catch(() => undefined)
+      if (testRedis && testRedis.status !== "end") await testRedis.quit().catch(() => testRedis?.disconnect())
       if (schemaCreated) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`)
     } finally { await pool.end() }
   })
+
+  it.skipIf(!redisUrl)("rejects a real Redis publish when recovery binds a successor first", async () => {
+    const { identity, outboxId } = await prepareOutboxedSubmit("publisher-recovery-first")
+    const recoveryLocked = deferred()
+    const allowRecoveryCommit = deferred()
+    const recoveryApp = `${appPrefix}_recovery_before_publish`
+    const publisherApp = `${appPrefix}_publisher_after_recovery`
+    let recovery: Promise<ExactAttemptFenceResult<string>> | undefined
+    let publishing: Promise<number> | undefined
+    const add = vi.spyOn(submitQueue!, "add")
+    try {
+      recovery = inTransaction(recoveryApp, client => withExactAttemptFence(client, identity, async () => {
+        const task = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_user', "checkpoint" = 'submission_uncertain',
+            "fillTurnId" = $1, "fillTurnSessionId" = $2, "fillTurnUserId" = $3
+          WHERE "id" = $4 AND "fillTurnId" = $5 RETURNING "id"`, [
+          identity.successorTurnId, identity.sessionId, identity.userId, identity.applicationTaskId, identity.fillTurnId,
+        ])
+        if (task.rowCount !== 1) throw new Error("Recovery did not bind the successor fill Turn")
+        await client.query(`UPDATE "Job" SET "workflowState" = 'submitting' WHERE "id" = $1 AND "userId" = $2`, [identity.jobId, identity.userId])
+        recoveryLocked.resolve()
+        await allowRecoveryCommit.promise
+        return "rebound"
+      }))
+      await waitForSignal(recoveryLocked.promise, "Recovery did not acquire the exact submit fence")
+
+      publishing = drainApplicationSubmitOutbox(
+        claimPool(publisherApp), submitQueue as unknown as SubmitOutboxQueue,
+      )
+      await waitUntilLockBlocked(publisherApp)
+      allowRecoveryCommit.resolve()
+
+      await expect(recovery).resolves.toEqual({ kind: "current", value: "rebound" })
+      await expect(publishing).resolves.toBe(0)
+      expect(add).not.toHaveBeenCalled()
+      await expect(submitQueue!.getJob(identity.workerTaskId)).resolves.toBeUndefined()
+      const outbox = await pool.query<{ publishedAt: Date | null; lastError: string | null }>(
+        `SELECT "publishedAt", "lastError" FROM "${schema}"."agent_outbox" WHERE "id" = $1`, [outboxId],
+      )
+      expect(outbox.rows[0]).toMatchObject({ publishedAt: null, lastError: "terminal:attempt_superseded" })
+    } finally {
+      allowRecoveryCommit.resolve()
+      const pending: Promise<unknown>[] = []
+      if (recovery) pending.push(recovery)
+      if (publishing) pending.push(publishing)
+      await Promise.allSettled(pending)
+      add.mockRestore()
+    }
+  }, 20_000)
+
+  it.skipIf(!redisUrl)("publishes under the fence first so recovery can inspect and cancel that exact Redis job", async () => {
+    const { identity, outboxId, submitPayload } = await prepareOutboxedSubmit("publisher-before-recovery")
+    const addReached = deferred()
+    const allowAdd = deferred()
+    const originalAdd = submitQueue!.add.bind(submitQueue!)
+    const gatedQueue = new Proxy(submitQueue!, {
+      get(target, property) {
+        if (property === "add") return async (name: string, data: ApplyTaskSubmitPayload, options: { jobId: string }) => {
+          addReached.resolve()
+          await allowAdd.promise
+          return originalAdd(name, data, options)
+        }
+        const value = Reflect.get(target, property, target) as unknown
+        return typeof value === "function" ? value.bind(target) : value
+      },
+    }) as unknown as SubmitOutboxQueue
+    const publisherApp = `${appPrefix}_publisher_before_recovery`
+    const recoveryApp = `${appPrefix}_recovery_after_publish`
+    let publishing: Promise<number> | undefined
+    let recovery: Promise<ExactAttemptFenceResult<string>> | undefined
+    try {
+      publishing = drainApplicationSubmitOutbox(claimPool(publisherApp), gatedQueue)
+      await waitForSignal(addReached.promise, "Publisher did not reach Queue.add while holding the submit fence")
+      recovery = inTransaction(recoveryApp, client => withExactAttemptFence(client, identity, async () => {
+        const id = identity.workerTaskId
+        const job = await submitQueue!.getJob(id)
+        if (!job || job.id !== id) {
+          throw new Error("Recovery could not inspect the exact published submit job")
+        }
+        expect(job.data).toEqual(submitPayload)
+        if (await job.getState() !== "waiting") throw new Error("The exact submit job was not pending at recovery")
+        await job.remove()
+        if (await submitQueue!.getJob(id)) throw new Error("The exact submit job remained after recovery cancellation")
+        if (await (await submitQueue!.client).get(submitQueue!.toKey(`${id}:lock`)) !== null) {
+          throw new Error("The exact submit job lock remained after recovery cancellation")
+        }
+        const task = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_user', "checkpoint" = 'submission_uncertain',
+            "fillTurnId" = $1, "fillTurnSessionId" = $2, "fillTurnUserId" = $3
+          WHERE "id" = $4 AND "fillTurnId" = $5 RETURNING "id"`, [
+          identity.successorTurnId, identity.sessionId, identity.userId, identity.applicationTaskId, identity.fillTurnId,
+        ])
+        if (task.rowCount !== 1) throw new Error("Recovery did not bind the successor fill Turn")
+        await client.query(`UPDATE "Job" SET "workflowState" = 'submitting' WHERE "id" = $1 AND "userId" = $2`, [identity.jobId, identity.userId])
+        return "rebound"
+      }))
+      await waitUntilLockBlocked(recoveryApp)
+      allowAdd.resolve()
+
+      await expect(publishing).resolves.toBe(1)
+      await expect(recovery).resolves.toEqual({ kind: "current", value: "rebound" })
+      expect(await submitQueue!.getJob(identity.workerTaskId)).toBeUndefined()
+      const outbox = await pool.query<{ publishedAt: Date | null; lastError: string | null }>(
+        `SELECT "publishedAt", "lastError" FROM "${schema}"."agent_outbox" WHERE "id" = $1`, [outboxId],
+      )
+      expect(outbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      expect(outbox.rows[0]?.lastError).toBeNull()
+    } finally {
+      allowAdd.resolve()
+      const pending: Promise<unknown>[] = []
+      if (publishing) pending.push(publishing)
+      if (recovery) pending.push(recovery)
+      await Promise.allSettled(pending)
+    }
+  }, 20_000)
 
   it("accepts only a settled event from the invocation that atomically started submission", async () => {
     const identity = await seedScenario("execution-proof")
@@ -281,6 +495,226 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
     }
   }, 15_000)
 
+  it.skipIf(!redisUrl)("does not reconcile a terminal preflight after the same BullMQ delivery is retried and claimed", async () => {
+    const identity = await seedScenario("stale-terminal-after-retry-claim")
+    await prepareSubmitClaim(identity)
+    const submitPayload: ApplyTaskSubmitPayload = {
+      applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+      sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
+      constraintHash: identity.constraintHash, operation: "submit", applyUrl: "https://jobs.example/retried-submit",
+      personaId: "server-side", resumePath: "",
+    }
+    const workerTaskId = identity.workerTaskId
+    const queueName = `apply-submit-recovery-${randomUUID()}`
+    const queueRedis = testRedis!.duplicate()
+    const firstWorkerRedis = testRedis!.duplicate()
+    const retryWorkerRedis = testRedis!.duplicate()
+    const queue = new Queue<ApplyTaskSubmitPayload>(queueName, { connection: queueRedis })
+    const terminalFailure = deferred()
+    const activeClaimReached = deferred()
+    const holdRetryProcessor = deferred()
+    const poolConnectionRequested = deferred()
+    const allowPoolConnection = deferred()
+    let staleTerminalEvent: { readonly id: string; readonly payload: ApplyTaskSubmitPayload; readonly attemptsMade: number } | undefined
+    let activeClaim: string | undefined
+    let firstWorker: Worker<ApplyTaskSubmitPayload, void> | undefined
+    let retryWorker: Worker<ApplyTaskSubmitPayload, void> | undefined
+    let firstWorkerClosed = false
+    let recovery: Promise<Awaited<ReturnType<typeof reconcileClaimedTerminalSubmit>>> | undefined
+
+    try {
+      await queue.waitUntilReady()
+      firstWorker = new Worker<ApplyTaskSubmitPayload, void>(queueName, async () => {
+        throw new Error("injected pre-claim Worker failure")
+      }, { connection: firstWorkerRedis, concurrency: 1 })
+      firstWorker.on("failed", job => {
+        if (!job || job.id !== workerTaskId) return
+        staleTerminalEvent = { id: job.id, payload: structuredClone(job.data), attemptsMade: job.attemptsMade }
+        terminalFailure.resolve()
+      })
+      await firstWorker.waitUntilReady()
+      await queue.add("submit", submitPayload, {
+        jobId: workerTaskId, attempts: 1, removeOnComplete: false, removeOnFail: false,
+      })
+      await waitForSignal(terminalFailure.promise, "Initial BullMQ delivery did not reach terminal failure")
+      await firstWorker.close()
+      firstWorkerClosed = true
+
+      const terminalJob = await queue.getJob(workerTaskId)
+      expect(terminalJob?.id).toBe(workerTaskId)
+      expect(terminalJob?.data).toEqual(submitPayload)
+      expect(await terminalJob?.getState()).toBe("failed")
+      const staleEvent = staleTerminalEvent
+      if (!staleEvent) throw new Error("The failed delivery did not produce a terminal event identity")
+      expect(staleEvent.attemptsMade).toBe(1)
+
+      const intent: SubmitOutboxIntent = {
+        applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+        sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
+        constraintHash: identity.constraintHash, workerTaskId, submitPayload,
+      }
+      const gatedPool = {
+        connect: async () => {
+          poolConnectionRequested.resolve()
+          await allowPoolConnection.promise
+          return claimPool(`${appPrefix}_stale_terminal_after_retry`).connect()
+        },
+      } as unknown as Pool
+      recovery = reconcileClaimedTerminalSubmit(gatedPool, queue as unknown as SubmitOutboxQueue, intent)
+      await waitForSignal(poolConnectionRequested.promise, "Terminal delivery preflight did not reach the database fence")
+      expect(await (await queue.getJob(workerTaskId))?.getState()).toBe("failed")
+
+      await terminalJob!.retry("failed", { resetAttemptsMade: true, resetAttemptsStarted: true })
+      expect(await (await queue.getJob(workerTaskId))?.getState()).toBe("waiting")
+
+      retryWorker = new Worker<ApplyTaskSubmitPayload, void>(queueName, async job => {
+        if (job.id !== workerTaskId) throw new Error("Retry Worker received a different submit delivery")
+        activeClaim = await claimUnattendedSubmission(pool, identity, job.id)
+        activeClaimReached.resolve()
+        await holdRetryProcessor.promise
+      }, { connection: retryWorkerRedis, concurrency: 1 })
+      await retryWorker.waitUntilReady()
+      await waitForSignal(activeClaimReached.promise, "Retried BullMQ delivery did not reach its fenced claim")
+      expect(activeClaim).toBe("claimed")
+
+      const activeJob = await queue.getJob(workerTaskId)
+      expect(activeJob?.id).toBe(staleEvent.id)
+      expect(activeJob?.data).toEqual(staleEvent.payload)
+      expect(await activeJob?.getState()).toBe("active")
+      const lockKey = queue.toKey(`${staleEvent.id}:lock`)
+      expect(await (await queue.client).get(lockKey)).not.toBeNull()
+
+      const beforeRecovery = await submitRecoverySnapshot(identity)
+      expect(beforeRecovery.task).toMatchObject({ status: "filling", checkpoint: "browser_active", workerTaskId })
+      expect(beforeRecovery.job).toMatchObject({ status: "saved", workflowState: "submitting", appliedAt: null })
+
+      allowPoolConnection.resolve()
+      await expect(recovery).resolves.toBe("deferred")
+      expect(await submitRecoverySnapshot(identity)).toEqual(beforeRecovery)
+      expect(await (await queue.getJob(workerTaskId))?.getState()).toBe("active")
+      expect(await (await queue.client).get(lockKey)).not.toBeNull()
+    } finally {
+      allowPoolConnection.resolve()
+      holdRetryProcessor.resolve()
+      const pending: Promise<unknown>[] = []
+      if (recovery) pending.push(recovery)
+      if (firstWorker && !firstWorkerClosed) pending.push(firstWorker.close())
+      if (retryWorker) pending.push(retryWorker.close())
+      await Promise.allSettled(pending)
+      const remaining = await queue.getJob(workerTaskId).catch(() => undefined)
+      if (remaining && await remaining.getState().catch(() => "unknown") !== "active") await remaining.remove().catch(() => undefined)
+      await queue.obliterate({ force: true }).catch(() => undefined)
+      await queue.close().catch(() => undefined)
+      for (const connection of [firstWorkerRedis, retryWorkerRedis, queueRedis]) {
+        if (connection.status !== "end") await connection.quit().catch(() => connection.disconnect())
+      }
+    }
+  }, 30_000)
+
+  it.skipIf(!redisUrl)("keeps a pruned claimed job blocked without Worker terminal evidence", async () => {
+    const { identity } = await prepareOutboxedSubmit("claimed-terminal-job-pruned-without-proof")
+    await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(1)
+    await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("claimed")
+    const waiting = await submitQueue!.getJob(identity.workerTaskId)
+    expect(await waiting?.getState()).toBe("waiting")
+    await waiting!.remove()
+    await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+    const unchanged = await submitRecoverySnapshot(identity)
+    expect(unchanged.task).toMatchObject({ status: "filling", checkpoint: "browser_active", workerTaskId: identity.workerTaskId })
+    expect(unchanged.events.filter(event => event.type === "submission_terminal_observed")).toHaveLength(0)
+  }, 20_000)
+
+  it.skipIf(!redisUrl)("retries failed terminal-proof persistence from retained delivery before pruning", async () => {
+    const { identity, outboxId } = await prepareOutboxedSubmit("claimed-terminal-proof-retry")
+    const completed = deferred()
+    let workerRedis: Redis | undefined
+    let worker: Worker<ApplyTaskSubmitPayload, void> | undefined
+    try {
+      await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(1)
+      await expect(claimUnattendedSubmission(pool, identity, identity.workerTaskId)).resolves.toBe("claimed")
+
+      // Simulate Worker exit after its durable claim, before application-state finalization.
+      workerRedis = testRedis!.duplicate()
+      worker = new Worker<ApplyTaskSubmitPayload, void>("apply-tasks", async job => {
+        if (job.id !== identity.workerTaskId) throw new Error("Terminal test Worker received a different submit job")
+      }, { connection: workerRedis, concurrency: 1 })
+      worker.on("completed", job => { if (job?.id === identity.workerTaskId) completed.resolve() })
+      await worker.waitUntilReady()
+      await waitForSignal(completed.promise, "Claimed submit delivery did not complete before pruning")
+      await worker.close()
+      worker = undefined
+
+      const terminalJob = await submitQueue!.getJob(identity.workerTaskId)
+      expect(await terminalJob?.getState()).toBe("completed")
+      expect(terminalJob?.opts.removeOnComplete).toBe(false)
+      expect(terminalJob?.opts.removeOnFail).toBe(false)
+      const lockKey = submitQueue!.toKey(`${identity.workerTaskId}:lock`)
+      expect(await (await submitQueue!.client).get(lockKey)).toBeNull()
+
+      await pool.query(`CREATE FUNCTION "${schema}"."reject_terminal_proof"() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW."type" = 'submission_terminal_observed' THEN RAISE EXCEPTION 'injected terminal proof write failure'; END IF; RETURN NEW; END $$`)
+      await pool.query(`CREATE TRIGGER "reject_terminal_proof" BEFORE INSERT ON "${schema}"."application_task_events"
+        FOR EACH ROW EXECUTE FUNCTION "${schema}"."reject_terminal_proof"()`)
+      try {
+        await expect(reconcileTerminalSubmitJob(pool, submitQueue as unknown as SubmitOutboxQueue, terminalJob, "completed"))
+          .rejects.toThrow("injected terminal proof write failure")
+      } finally {
+        await pool.query(`DROP TRIGGER "reject_terminal_proof" ON "${schema}"."application_task_events"`)
+        await pool.query(`DROP FUNCTION "${schema}"."reject_terminal_proof"()`)
+      }
+      const retainedJob = await submitQueue!.getJob(identity.workerTaskId)
+      expect(retainedJob?.id).toBe(identity.workerTaskId)
+      expect(retainedJob?.data).toEqual(terminalJob?.data)
+      expect(await retainedJob?.getState()).toBe("completed")
+      expect(await (await submitQueue!.client).get(lockKey)).toBeNull()
+      expect((await submitRecoverySnapshot(identity)).task).toMatchObject({ status: "filling", checkpoint: "browser_active" })
+      expect((await submitRecoverySnapshot(identity)).events.filter(event => event.type === "submission_terminal_observed")).toHaveLength(0)
+
+      const addSpy = vi.spyOn(submitQueue!, "add")
+      try {
+        await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+        expect(addSpy).not.toHaveBeenCalled()
+        const proof = await pool.query<{ data: Record<string, unknown> }>(
+          `SELECT "data" FROM "${schema}"."application_task_events" WHERE "taskId" = $1 AND "type" = 'submission_terminal_observed'`,
+          [identity.applicationTaskId],
+        )
+        expect(proof.rows).toHaveLength(1)
+        expect(proof.rows[0]?.data).toMatchObject({ applicationTaskId: identity.applicationTaskId, userId: identity.userId,
+          jobId: identity.jobId, sessionId: identity.sessionId, fillTurnId: identity.fillTurnId,
+          workerTaskId: identity.workerTaskId, approvalId: identity.approvalId, receiptId: identity.approvalId,
+          constraintHash: identity.constraintHash, terminalState: "completed" })
+        expect(await submitQueue!.getJob(identity.workerTaskId)).toBeUndefined()
+        const recoveredIntent: SubmitOutboxIntent = {
+          applicationTaskId: identity.applicationTaskId, userId: identity.userId, jobId: identity.jobId,
+          sessionId: identity.sessionId, fillTurnId: identity.fillTurnId, receiptId: identity.approvalId,
+          constraintHash: identity.constraintHash, workerTaskId: identity.workerTaskId,
+          submitPayload: terminalJob!.data,
+        }
+        await expect(reconcileClaimedTerminalSubmit(pool, submitQueue as unknown as SubmitOutboxQueue, recoveredIntent))
+          .resolves.toBe("reconciled")
+        expect((await submitRecoverySnapshot(identity)).events.filter(event => event.type === "submission_terminal_observed")).toHaveLength(1)
+        await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+        expect(addSpy).not.toHaveBeenCalled()
+        await expect(drainApplicationSubmitOutbox(pool, submitQueue as unknown as SubmitOutboxQueue)).resolves.toBe(0)
+        expect(addSpy).not.toHaveBeenCalled()
+      } finally { addSpy.mockRestore() }
+
+      const recovered = await submitRecoverySnapshot(identity)
+      expect(recovered.task).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain", workerTaskId: identity.workerTaskId })
+      expect(recovered.job).toMatchObject({ status: "saved", workflowState: "submitting", appliedAt: null })
+      expect(recovered.events.filter(event => event.type === "waiting_for_user")).toHaveLength(1)
+      const outbox = await pool.query<{ publishedAt: Date | null; lastError: string | null }>(
+        `SELECT "publishedAt", "lastError" FROM "${schema}"."agent_outbox" WHERE "id" = $1`, [outboxId],
+      )
+      expect(outbox.rows[0]?.lastError).toMatch(/^terminal:/)
+      expect(outbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      addSpy.mockRestore()
+    } finally {
+      if (worker) await worker.close().catch(() => undefined)
+      if (workerRedis && workerRedis.status !== "end") await workerRedis.quit().catch(() => workerRedis?.disconnect())
+    }
+  }, 20_000)
+
   it("surfaces a crashed pre-marker claim for review after terminal redelivery", async () => {
     const identity = await seedScenario("crashed-pre-marker-claim")
     await prepareSubmitClaim(identity)
@@ -292,7 +726,7 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
     )
     expect(beforeRecovery.rows[0]).toEqual({ checkpoint: "browser_active", workflowState: "submitting" })
 
-    await expect(reconcileClaimedSubmissionUncertain(pool, identity, identity.workerTaskId)).resolves.toBe(true)
+    await expect(reconcileClaimedSubmissionUncertain(pool, identity, identity.workerTaskId, async () => true)).resolves.toBe(true)
     const recovered = await pool.query<{ status: string; checkpoint: string; workflowState: string }>(
       `SELECT task."status", task."checkpoint", job."workflowState" FROM "${schema}"."application_tasks" task
        JOIN "${schema}"."Job" job ON job."id" = task."jobId" WHERE task."id" = $1`, [identity.applicationTaskId],
@@ -323,7 +757,7 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       taskStatus: "filling", checkpoint: "submission_request_started", jobStatus: "saved", workflowState: "submitting",
     })
 
-    await expect(reconcileClaimedSubmissionUncertain(pool, identity, identity.workerTaskId)).resolves.toBe(true)
+    await expect(reconcileClaimedSubmissionUncertain(pool, identity, identity.workerTaskId, async () => true)).resolves.toBe(true)
     const recovered = await pool.query<{ taskStatus: string; checkpoint: string; jobStatus: string; workflowState: string }>(
       `SELECT task."status" AS "taskStatus", task."checkpoint", job."status" AS "jobStatus", job."workflowState"
          FROM "${schema}"."application_tasks" task JOIN "${schema}"."Job" job ON job."id" = task."jobId"

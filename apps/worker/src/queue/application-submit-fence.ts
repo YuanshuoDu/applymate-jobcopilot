@@ -13,6 +13,31 @@ export type ApplicationSubmitIdentity = Readonly<{
 export type ApplicationSubmissionExecution = ApplicationSubmitIdentity & Readonly<{ workerTaskId: string; executionId: string }>
 export type ExactAttemptFenceResult<T> = Readonly<{ kind: "current"; value: T }> | Readonly<{ kind: "superseded" }>
 
+export type ApplicationSubmitTerminalObservation = Readonly<{
+  terminalState: "completed" | "failed"
+  attemptsMade: number
+  attempts: number
+}>
+type ExactTerminalProofIdentity = Omit<ApplicationSubmitIdentity, "approvalId"> & Readonly<{ workerTaskId: string; receiptId: string }>
+
+export function isValidApplicationSubmitTerminalObservation(value: unknown): value is ApplicationSubmitTerminalObservation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const data = value as Record<string, unknown>
+  return (data.terminalState === "completed" || data.terminalState === "failed")
+    && typeof data.attemptsMade === "number" && Number.isSafeInteger(data.attemptsMade) && data.attemptsMade >= 0
+    && typeof data.attempts === "number" && Number.isSafeInteger(data.attempts) && data.attempts >= 1
+    && (data.terminalState !== "failed" || data.attemptsMade >= data.attempts)
+}
+
+export function matchesExactApplicationSubmitTerminalProof(value: unknown, expected: ExactTerminalProofIdentity): boolean {
+  if (!isValidApplicationSubmitTerminalObservation(value)) return false
+  const data = value as Record<string, unknown>
+  return data.applicationTaskId === expected.applicationTaskId && data.userId === expected.userId
+    && data.jobId === expected.jobId && data.sessionId === expected.sessionId && data.fillTurnId === expected.fillTurnId
+    && data.workerTaskId === expected.workerTaskId && data.approvalId === expected.receiptId
+    && data.receiptId === expected.receiptId && data.constraintHash === expected.constraintHash
+}
+
 export class ApplicationSubmitFenceError extends Error {
   constructor(readonly code: "submission_scope_mismatch" | "submission_attempt_fenced", message: string) {
     super(message)

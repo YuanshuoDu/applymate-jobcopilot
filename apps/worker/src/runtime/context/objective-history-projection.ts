@@ -4,7 +4,7 @@ import { hasSelectedJobPreparation, rootTaskHistoryObjectiveDigest, rootTaskHist
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
-const SEMANTICS_VERSION = 1
+export const OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION = 2
 const TERMINAL_TYPES = ["turn.completed", "turn.failed", "turn.interrupted"] as const
 
 export type RootObjectiveHistoryIdentity = Readonly<{
@@ -15,6 +15,19 @@ export type RootObjectiveHistoryIdentity = Readonly<{
 }>
 
 export type RootObjectiveHistoryProjectionOptions = Readonly<{ terminalEventId?: string }>
+
+export type RootObjectiveHistoryProjectionSnapshot = Readonly<{
+  inputJsonbText: string | null
+  source: unknown
+  goal: unknown
+  successCriteriaJsonbText: string | null
+}>
+
+export type RootObjectiveHistoryProjectionOutcome =
+  | Readonly<{ kind: "evaluated_indexable"; objectiveDigest: string; canonicalOriginDigest: string | null; semanticsVersion: number }>
+  | Readonly<{ kind: "evaluated_unindexable"; objectiveDigest: null; canonicalOriginDigest: null; semanticsVersion: number; reason: "selected_job_scoped" | "unsupported_or_invalid_objective" }>
+  | Readonly<{ kind: "ineligible"; reason: "invalid_identity" | "unlinked_root_turn" }>
+  | Readonly<{ kind: "retryable_conflict"; reason: "persisted_input_changed" | "projection_write_conflict" }>
 
 function text(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.trim() === value
@@ -87,31 +100,63 @@ function validTerminal(row: Row, identity: RootObjectiveHistoryIdentity): bigint
     && row.terminalIdempotencyKey === prefix + "turn-interrupted" ? value : undefined
 }
 
-async function updateObjective(client: Queryable, identity: RootObjectiveHistoryIdentity): Promise<boolean> {
+async function updateObjective(
+  client: Queryable,
+  identity: RootObjectiveHistoryIdentity,
+  expected?: RootObjectiveHistoryProjectionSnapshot,
+): Promise<RootObjectiveHistoryProjectionOutcome> {
+  const expectedWhere = expected ? `AND turn."input" IS NOT DISTINCT FROM $5::jsonb
+      AND turn."source" IS NOT DISTINCT FROM $6::text AND root."goal" IS NOT DISTINCT FROM $7::text
+      AND root."successCriteria" IS NOT DISTINCT FROM $8::jsonb` : ""
   const found = await client.query<Row>(`SELECT turn."input", turn."source", root."goal", root."successCriteria"
     FROM "agent_turns" AS turn
     JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
       AND root."turnId" = turn."id" AND root."rootTaskId" = root."id"
     WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4
       AND root."id" = $4 AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."taskType" = 'root'
-    FOR UPDATE OF turn, root`, [identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId])
-  if (found.rows.length !== 1) return false
+      ${expectedWhere}
+    FOR UPDATE OF turn, root`, [identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId,
+    ...(expected ? [expected.inputJsonbText, expected.source, expected.goal, expected.successCriteriaJsonbText] : [])])
+  if (found.rows.length !== 1) return expected
+    ? { kind: "retryable_conflict", reason: "persisted_input_changed" }
+    : { kind: "ineligible", reason: "unlinked_root_turn" }
   const row = found.rows[0]!
   const selectedJobScoped = hasSelectedJobPreparation(row.input)
-  const objectiveDigest = selectedJobScoped ? null : rootTaskHistoryObjectiveDigest(row.input, row, false) ?? null
-  const crossSessionDigest = selectedJobScoped ? undefined : rootTaskHistoryObjectiveDigest(row.input, row, true)
+  const objectiveDigest = selectedJobScoped ? null : rootTaskHistoryObjectiveDigest(row.input, row) ?? null
   const canonicalOrigin = selectedJobScoped ? undefined : rootTaskHistoryOrigin(row.source, row.input)
-  const canonicalOriginDigest = crossSessionDigest && canonicalOrigin
-    ? createHash("sha256").update(JSON.stringify({ objectiveDigest: crossSessionDigest, canonicalOrigin })).digest("hex")
+  const canonicalOriginDigest = objectiveDigest && canonicalOrigin
+    ? createHash("sha256").update(JSON.stringify({ objectiveDigest, canonicalOrigin })).digest("hex")
     : null
-  const version = objectiveDigest ? SEMANTICS_VERSION : null
+  const version = OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION
+  const rootGuard = expected ? `AND EXISTS (SELECT 1 FROM "sub_agent_tasks" root
+      WHERE root."id" = $7 AND root."sessionId" = $5 AND root."turnId" = $4 AND root."rootTaskId" = $7
+        AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."taskType" = 'root'
+        AND root."goal" IS NOT DISTINCT FROM $10::text AND root."successCriteria" IS NOT DISTINCT FROM $11::jsonb)` : ""
   const result = await client.query(`UPDATE "agent_turns" SET "objectiveDigest" = $1, "canonicalOriginDigest" = $2,
-      "objectiveIndexSemanticsVersion" = $3 WHERE "id" = $4 AND "sessionId" = $5 AND "userId" = $6 AND "rootTaskId" = $7`,
-  [objectiveDigest, canonicalOriginDigest, version, identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId])
-  return result.rowCount === 1
+      "objectiveIndexSemanticsVersion" = $3 WHERE "id" = $4 AND "sessionId" = $5 AND "userId" = $6 AND "rootTaskId" = $7
+      ${expected ? `AND "input" IS NOT DISTINCT FROM $8::jsonb AND "source" IS NOT DISTINCT FROM $9::text` : ""}
+      ${rootGuard}`,
+  [objectiveDigest, canonicalOriginDigest, version, identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId,
+    ...(expected ? [expected.inputJsonbText, expected.source, expected.goal, expected.successCriteriaJsonbText] : [])])
+  if (result.rowCount !== 1) return { kind: "retryable_conflict", reason: "projection_write_conflict" }
+  if (objectiveDigest) return { kind: "evaluated_indexable", objectiveDigest, canonicalOriginDigest, semanticsVersion: version }
+  return {
+    kind: "evaluated_unindexable", objectiveDigest: null, canonicalOriginDigest: null, semanticsVersion: version,
+    reason: selectedJobScoped ? "selected_job_scoped" : "unsupported_or_invalid_objective",
+  }
 }
 
-async function updateTerminal(client: Queryable, identity: RootObjectiveHistoryIdentity, eventId: string): Promise<boolean> {
+/** Evaluates one persisted Root/Turn snapshot for an explicit bounded backfill. */
+export async function projectRootObjectiveHistoryForBackfill(
+  client: Queryable,
+  identity: RootObjectiveHistoryIdentity,
+  expected?: RootObjectiveHistoryProjectionSnapshot,
+): Promise<RootObjectiveHistoryProjectionOutcome> {
+  if (!validIdentity(identity)) return { kind: "ineligible", reason: "invalid_identity" }
+  return updateObjective(client, identity, expected)
+}
+
+async function updateTerminal(client: Queryable, identity: RootObjectiveHistoryIdentity, eventId: string, validateOnly = false): Promise<boolean> {
   const found = await client.query<Row>(`SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus",
       event."sessionId", event."turnId", event."taskId" AS "terminalTaskId", event."itemId" AS "terminalItemId",
       event."sequence" AS "terminalSequence", event."type" AS "terminalType", event."actor" AS "terminalActor",
@@ -157,17 +202,29 @@ async function updateTerminal(client: Queryable, identity: RootObjectiveHistoryI
       AND root."id" = $4 AND root."parentTaskId" IS NULL AND root."role" = 'orchestrator' AND root."taskType" = 'root'
       AND ((turn."status" = 'in_progress' AND root."status" = 'running')
         OR (turn."status" IN ('completed', 'failed', 'interrupted') AND root."status" = turn."status"))
-    FOR UPDATE OF turn, root, event`, [identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId, eventId])
+      ${validateOnly ? "" : "FOR UPDATE OF turn, root, event"}`, [identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId, eventId])
   if (found.rows.length !== 1) return false
   const row = found.rows[0]!, terminal = validTerminal(row, identity)
   const at = row.terminalAt instanceof Date && Number.isFinite(row.terminalAt.getTime()) ? row.terminalAt : undefined
   const start = validStart(row, identity.turnId, identity.rootTaskId)
   if (!terminal || !at || start === undefined || terminal <= start
     || (row.turnStatus === "completed" && !validCompletedReceipt(row, identity.turnId, identity.rootTaskId, start, terminal))) return false
+  if (validateOnly) return true
   const result = await client.query(`UPDATE "agent_turns" SET "terminalEventSequence" = $1, "terminalEventAt" = $2
     WHERE "id" = $3 AND "sessionId" = $4 AND "userId" = $5 AND "rootTaskId" = $6 AND "status" = $7`,
   [terminal.toString(), at, identity.turnId, identity.sessionId, identity.userId, identity.rootTaskId, row.turnStatus])
   return result.rowCount === 1
+}
+
+/** Checks a persisted terminal locator with the same receipt validation used by the writer. */
+export async function isValidRootObjectiveHistoryTerminalReceipt(
+  client: Queryable,
+  identity: RootObjectiveHistoryIdentity,
+  eventId: string,
+): Promise<boolean> {
+  return validIdentity(identity) && text(eventId)
+    ? updateTerminal(client, identity, eventId, true)
+    : false
 }
 
 /** Updates one projection inside the caller's transaction; terminal mode accepts only the supplied persisted receipt. */
@@ -179,5 +236,6 @@ export async function updateRootObjectiveHistoryProjection(
   if (!validIdentity(identity)) return false
   if (options.terminalEventId !== undefined) return text(options.terminalEventId)
     ? updateTerminal(client, identity, options.terminalEventId) : false
-  return updateObjective(client, identity)
+  const outcome = await updateObjective(client, identity)
+  return outcome.kind === "evaluated_indexable" || outcome.kind === "evaluated_unindexable"
 }

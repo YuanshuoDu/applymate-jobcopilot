@@ -39,6 +39,11 @@ function dataRecord(value: unknown): DataRecord | undefined {
   }
 }
 
+/** Checks the raw failure marker without invoking getters or accepting inherited fields. */
+export function hasTaskGraphVerificationUnverifiedFailureReason(value: unknown): boolean {
+  return dataRecord(value)?.failureReason === "task_graph_verification_unverified"
+}
+
 function exactKeys(value: DataRecord, expected: string): boolean {
   return Object.keys(value).sort().join(",") === expected
 }

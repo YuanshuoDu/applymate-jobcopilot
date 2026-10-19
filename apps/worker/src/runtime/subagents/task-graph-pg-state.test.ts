@@ -8,13 +8,15 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attempt.js"
 
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
 type ClientOptions = {
   itemContent?: unknown
   taskRows?: Array<Record<string, unknown>>
-  events?: Array<{ type: string; payload: unknown }>
+  events?: Array<Record<string, unknown>>
+  sourceStepRows?: Array<Record<string, unknown>>
   failFence?: "session" | "turn" | "parent" | "step"
   sessionLockWait?: () => Promise<void>
   expireDuringSessionLockWait?: "turn" | "parent"
@@ -41,7 +43,25 @@ function validSnapshot(nodeCount = 1) {
 }
 
 function validTaskRow(overrides: Record<string, unknown> = {}) {
-  return { id: "child-1", status: "queued", role: "analyst", failureReason: null, result: null, ...overrides }
+  return { id: "child-1", status: "queued", role: "analyst", attemptCount: 1, failureReason: null, result: null, ...overrides }
+}
+
+const discoveryAttemptHealth = {
+  schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+  attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+  candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
+}
+
+function typedScoutDiscoverySnapshot() {
+  const snapshot = typedSnapshotForRole("scout")
+  return { ...snapshot, nodes: snapshot.nodes.map(node => ({ ...node, registeredScoutEnvelope: {
+    role: "scout", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+    allowedActions: ["jobs.discover"],
+  } })) }
+}
+
+function failedScoutResult(discoveryAttempt: unknown) {
+  return { discoveryAttempt, taskGraphVerificationReport: structuredFailureReportFor("scout") }
 }
 
 const analystVerification = {
@@ -150,6 +170,10 @@ function fakeClient(options: ClientOptions = {}) {
         const rows = options.events ?? []
         return { rows, rowCount: rows.length }
       }
+      if (sql.startsWith("WITH current_candidates AS MATERIALIZED")) {
+        const rows = options.sourceStepRows ?? []
+        return { rows, rowCount: rows.length }
+      }
       return empty
     }),
   }
@@ -157,6 +181,45 @@ function fakeClient(options: ClientOptions = {}) {
 }
 
 describe("TaskGraph PostgreSQL state loading", () => {
+  it("keeps provenance opt-in and returns only the private current checkpoint on a planning read", async () => {
+    const currentStep = { id: "root-step", userId: identity.userId, turnUserId: identity.userId,
+      sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId, taskId: identity.rootTaskId,
+      status: "streaming", attempt: 1, inputThroughSequence: "4", consumedInputIds: [], sessionEventSequence: "4", checkpointInputsValid: true,
+      hasPendingAcceptedInputs: false, isDiscoveredCurrent: true, isExplicitCurrent: false, activeCount: 1 }
+    const ordinary = fakeClient()
+    const plain = await loadTaskGraph(ordinary.client, identity, false)
+    expect(ordinary.calls.some(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toBe(false)
+    expect(plain).not.toHaveProperty("currentInputCheckpoint")
+    expect(currentTaskGraph(plain)).not.toHaveProperty("sourceIntent")
+
+    const planning = fakeClient({ sourceStepRows: [currentStep] })
+    const loaded = await loadTaskGraph(planning.client, identity, false, { includeSourceProvenance: true, discoverCurrentStep: true })
+    expect(planning.calls.filter(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toHaveLength(1)
+    expect(loaded.currentInputCheckpoint).toEqual({ inputThroughSequence: 4n })
+    expect(loaded.sourceInputCheckpointByNodeKey?.get("child")).toBeNull()
+    expect(loaded.sourceInputRelationByNodeKey?.get("child")).toBe("unknown")
+    expect(currentTaskGraph(loaded)).not.toHaveProperty("currentInputCheckpoint")
+  })
+
+  it("loads persisted actions and only derived context flags with the existing task-row query", async () => {
+    const allowedActions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
+    const fake = fakeClient({ taskRows: [validTaskRow({ allowedActions, contextIsObject: true, hasPrivateSelectionContext: false })] })
+
+    const loaded = await loadTaskGraph(fake.client, identity)
+    expect(loaded.tasks.get("child-1")).toMatchObject({ allowedActions, contextIsObject: true, hasPrivateSelectionContext: false })
+    expect(loaded.tasks.get("child-1")).not.toHaveProperty("context")
+    const taskQueries = fake.calls.filter(call => call.sql.startsWith('SELECT task."id", task."status"'))
+    expect(taskQueries).toHaveLength(1)
+    expect(taskQueries[0]?.sql).toContain('task."allowedActions"')
+    expect(taskQueries[0]?.sql).toContain('AS "contextIsObject"')
+    expect(taskQueries[0]?.sql).toContain('AS "hasPrivateSelectionContext"')
+    expect(taskQueries[0]?.sql).toContain('task."context" ?| ARRAY[')
+    expect(taskQueries[0]?.sql).toContain("selectedJobPreparation")
+    expect(taskQueries[0]?.sql).toContain("coverLetterBase")
+    expect(taskQueries[0]?.sql).toContain("writerReviewFeedback")
+    expect(taskQueries[0]?.sql).not.toMatch(/task\."context",/)
+  })
+
   it("restores a typed contract from persisted canonical content across a Worker restart", async () => {
     const persisted = canonicalTaskGraphJson(typedSnapshot())
     const firstWorker = await loadTaskGraph(fakeClient({ itemContent: persisted }).client, identity)
@@ -354,6 +417,7 @@ describe("TaskGraph PostgreSQL state loading", () => {
     expect(item?.values).toEqual([taskGraphItemId("root-1"), "session-1", "turn-1", "root-1", "user-1"])
     const tasks = fake.calls.find(call => call.sql.startsWith('SELECT task."id", task."status"'))
     expect(tasks?.sql).toContain('task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6')
+    expect(tasks?.sql).toContain('task."attemptCount"')
     expect(tasks?.values).toEqual([["child-1"], "session-1", "turn-1", "root-1", "root-1", "user-1"])
     const events = fake.calls.find(call => call.sql.startsWith('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"'))
     expect(events?.sql).toContain('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"')
@@ -398,6 +462,37 @@ describe("TaskGraph PostgreSQL state loading", () => {
     expect(encodedProjection).not.toContain("private-evidence-id")
     expect(encodedProjection).not.toContain("internal-item-id")
     expect(encodedProjection).not.toContain("final text beyond wait cap")
+  })
+
+  it("projects only a matching server discovery sidecar for a failed generic Scout", async () => {
+    const secret = "private provider name and raw result"
+    const fake = fakeClient({ itemContent: typedScoutDiscoverySnapshot(), taskRows: [validTaskRow({
+      status: "failed", role: "scout", taskType: "job_discovery",
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+      result: { ...failedScoutResult({ attemptCount: 1, health: discoveryAttemptHealth }), finalText: secret, structuredResult: { private: secret } },
+    })] })
+    const node = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes[0]!
+
+    expect(node.discoveryAttemptHealth).toEqual(discoveryAttemptHealth)
+    expect(node.resultProjection).toEqual({
+      schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable",
+    })
+    expect(JSON.stringify(node)).not.toContain(secret)
+    expect(node).not.toHaveProperty("attemptCount")
+  })
+
+  it("omits discovery health when the current-attempt fence or generic Scout markers do not match", async () => {
+    const sidecar = { attemptCount: 2, health: discoveryAttemptHealth }
+    const cases = [
+      { itemContent: typedScoutDiscoverySnapshot(), taskRows: [validTaskRow({ status: "failed", role: "scout", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, result: failedScoutResult(sidecar) })] },
+      { itemContent: validSnapshot(), taskRows: [validTaskRow({ status: "failed", role: "scout", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, result: { discoveryAttempt: { attemptCount: 1, health: discoveryAttemptHealth } } })] },
+      { itemContent: typedScoutDiscoverySnapshot(), taskRows: [validTaskRow({ status: "failed", role: "scout", taskType: "selected_job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, result: failedScoutResult({ attemptCount: 1, health: discoveryAttemptHealth }) })] },
+    ]
+
+    for (const input of cases) {
+      const node = currentTaskGraph(await loadTaskGraph(fakeClient(input).client, identity)).nodes[0]!
+      expect(node).not.toHaveProperty("discoveryAttemptHealth")
+    }
   })
 
   it("maps unknown Scout source labels to other and omits model-authored URL and name text", async () => {

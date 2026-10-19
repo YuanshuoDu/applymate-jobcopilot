@@ -201,6 +201,49 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
 }
 
 describe("subagent PostgreSQL lifecycle helpers", () => {
+  it("persists discovery recovery only for the terminal failed status", async () => {
+    const discoveryRecovery = {
+      schemaVersion: "agent-harness.v2.task-graph.discovery-recovery.v1", attemptCount: 3,
+      jobIds: ["c123456789012345678901234"], truncated: false,
+    }
+    const discoveryAttempt = { attemptCount: 3, health: { attemptedCalls: 1 } }
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValue(null)
+    try {
+      const retry = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 1, status: "queued", retry: true,
+        result: { status: "failed", discoveryRecovery, discoveryAttempt },
+      })
+      expect(retry.result).not.toHaveProperty("discoveryRecovery")
+      expect(retry.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
+
+      const retryDecision = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 1, status: "failed", retry: true,
+        result: { status: "failed", discoveryRecovery, discoveryAttempt },
+      })
+      expect(retryDecision.result).not.toHaveProperty("discoveryRecovery")
+      expect(retryDecision.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
+
+      for (const status of ["cancelled", "interrupted", "completed", "running"]) {
+        const nonFailed = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+          taskId: "child-1", sessionId: "session-1", attemptCount: 1, status, retry: false,
+          result: { status: "failed", discoveryRecovery, discoveryAttempt },
+        })
+        expect(nonFailed.status).toBe(status)
+        expect(nonFailed.result).not.toHaveProperty("discoveryRecovery")
+        expect(nonFailed.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
+      }
+
+      const terminal = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 3, status: "failed", retry: false,
+        result: { status: "failed", discoveryRecovery, discoveryAttempt },
+      })
+      expect(terminal.result).toHaveProperty("discoveryRecovery", discoveryRecovery)
+      expect(Object.keys((terminal.result as Record<string, unknown>).discoveryRecovery as object).sort())
+        .toEqual(["attemptCount", "jobIds", "schemaVersion", "truncated"])
+      expect(terminal.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
+    } finally { prepare.mockRestore() }
+  })
+
   it("preserves JSON-text finalText when persisting a completed typed TaskGraph result", async () => {
     const structuredResult = {
       schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed",

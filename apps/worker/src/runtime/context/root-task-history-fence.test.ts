@@ -1,12 +1,13 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
-import { readRootTaskHistoryFence, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
-import { rootTaskObjectiveDigest } from "./root-task-objective.js"
+import { readRootTaskHistoryFence, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 
 type Row = Record<string, unknown>
 type Options = Readonly<{
   turnInput?: unknown
+  turnSource?: string
   rootGoal?: string
   rootCriteria?: readonly string[]
   stepAttempt?: number
@@ -44,7 +45,7 @@ function fixture(options: Options = {}) {
       }] }
       if (sql.includes('SELECT "id", "sessionId", "userId", "rootTaskId", "status", "source", "input"')) return { rows: [{
         id: "turn-current", sessionId: "session-1", userId: "user-1", rootTaskId: "root-current", status: "in_progress",
-        source: "user",
+        source: options.turnSource ?? "user",
         input: options.turnInput ?? { goal: " Plan a role " },
       }] }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [start()] }
@@ -65,7 +66,7 @@ describe("root task history current fence", () => {
 
     await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toEqual({
       currentStartSequence: 20n,
-      objectiveDigest: rootTaskObjectiveDigest({ goal: "Plan a role", criteria: [{ criterionId: "criterion-1", requirement: "Compare roles" }] }),
+      objectiveDigest: rootTaskHistoryObjectiveDigest({ goal: "Plan a role" }, { goal: "Plan a role", successCriteria: ["Compare roles"] }),
     })
     const index = (part: string) => test.queries.findIndex(sql => sql.includes(part))
     expect(index('SELECT "id" FROM "agent_sessions"')).toBeLessThan(index('SELECT "id" FROM "agent_turns"'))
@@ -102,6 +103,50 @@ describe("root task history current fence", () => {
     }
   })
 
+  it("records validated scheduled criteria on the current fence", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "scheduled", scheduledAutomationSnapshot: {
+        schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+        targetRoles: [" Engineer "], targetLocations: ["Dublin"], minScore: 70,
+        dailyCap: 10, requireApproval: true, autoApply: false,
+      } },
+    })
+
+    await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toMatchObject({
+      scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 },
+    })
+  })
+
+  it("returns no history fence for a scheduled Turn with a malformed snapshot", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "scheduled", scheduledAutomationSnapshot: {
+        schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+        targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70,
+        dailyCap: 10, requireApproval: true, autoApply: "false",
+      } },
+    })
+
+    await expect(readRootTaskHistoryFence(test.client, test.input)).resolves.toBeUndefined()
+    expect(test.queries.some(sql => sql.includes("turn.started"))).toBe(false)
+  })
+
+  it("keeps manual automation history ordinary even if a scheduled snapshot is malformed", async () => {
+    const test = fixture({
+      turnSource: "automation",
+      turnInput: { goal: "Plan a role", automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "wrong" } },
+    })
+
+    const result = await readRootTaskHistoryFence(test.client, test.input)
+
+    expect(result?.scheduledAutomationCriteria).toBeUndefined()
+    expect(result?.objectiveDigest).toBe(rootTaskHistoryObjectiveDigest(
+      { goal: "Plan a role", automationRunMode: "manual", scheduledAutomationSnapshot: { schemaVersion: "wrong" } },
+      { goal: "Plan a role", successCriteria: ["Compare roles"] },
+    ))
+  })
+
   it("requires one canonical current Root start receipt", async () => {
     for (const startRows of [[], [start(), { ...start("21"), startEventCount: 2 }], [{ ...start(), actor: "system" }]]) {
       const test = fixture({ startRows })
@@ -133,7 +178,51 @@ describe("root task history current fence", () => {
     expect(rootTaskHistoryOrigin("user", { intent: supported, input: { goal: "x", intent: { kind: "unknown", version: 1 } } })).toBeUndefined()
   })
 
-  it("fails closed on invalid origin, malformed start time, or invalid typed requirements only in opt-in mode", async () => {
+  it("uses one canonical typed-aware identity for history fences and projection lookup keys", async () => {
+    const turnInput = {
+      goal: " Plan a role ", intent: { kind: "interactive_discovery_shortlist", version: 1 },
+      verificationRequirements: { schemaVersion: "agent-harness.v2.objective-requirements.v1",
+        requirements: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } }] },
+    }
+    const test = fixture({ turnInput })
+    const legacy = await readRootTaskHistoryFence(test.client, test.input)
+    const sameSession = await readRootTaskHistoryFence(test.client, { ...test.input, objectiveHistoryIndexEnabled: true })
+    const crossSession = await readRootTaskHistoryFence(test.client, {
+      ...test.input, crossSessionRootTaskHistoryEnabled: true, objectiveHistoryIndexEnabled: true,
+    })
+    const root = { goal: "Plan a role", successCriteria: ["Compare roles"] }
+    const objectiveDigest = rootTaskHistoryObjectiveDigest(turnInput, root)
+    const canonicalOrigin = rootTaskHistoryOrigin("user", turnInput)
+    const expectedCanonicalDigest = createHash("sha256")
+      .update(JSON.stringify({ objectiveDigest, canonicalOrigin })).digest("hex")
+
+    expect(legacy?.objectiveDigest).toBe(objectiveDigest)
+    expect(sameSession?.objectiveDigest).toBe(objectiveDigest)
+    expect(sameSession?.objectiveHistoryIndexObjectiveDigest).toBe(objectiveDigest)
+    expect(sameSession?.objectiveHistoryIndexCanonicalOriginDigest).toBeUndefined()
+    expect(crossSession?.objectiveDigest).toBe(objectiveDigest)
+    expect(crossSession?.objectiveHistoryIndexObjectiveDigest).toBe(objectiveDigest)
+    expect(crossSession?.objectiveHistoryIndexCanonicalOriginDigest).toBe(expectedCanonicalDigest)
+    expect(rootTaskHistoryIndexKeys("user", turnInput, root, true)?.canonicalOriginDigest).toBe(expectedCanonicalDigest)
+  })
+
+  it("makes typed requirement changes part of the identity independent of history mode", async () => {
+    const requirement = (minimum: number) => ({ schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum } },
+      { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    ] })
+    const root = { goal: "Plan a role", successCriteria: ["Compare roles"] }
+    const inputFor = (value: unknown) => ({ input: { goal: root.goal, verificationRequirements: value } })
+    const full = requirement(3), reordered = { ...full, requirements: [...full.requirements].reverse() }
+    const fullDigest = rootTaskHistoryObjectiveDigest(inputFor(full), root)
+    expect(rootTaskHistoryObjectiveDigest(inputFor(reordered), root)).toBe(fullDigest)
+    expect(rootTaskHistoryObjectiveDigest(inputFor(requirement(4)), root)).not.toBe(fullDigest)
+    expect(rootTaskHistoryObjectiveDigest(inputFor({ ...full, requirements: [full.requirements[0]] }), root)).not.toBe(fullDigest)
+    expect(rootTaskHistoryObjectiveDigest({ input: { goal: root.goal } }, root)).not.toBe(fullDigest)
+    expect(rootTaskHistoryObjectiveDigest(inputFor({ schemaVersion: "bad", requirements: [] }), root)).toBeUndefined()
+  })
+
+  it("fails closed on invalid origin or malformed start time and invalid requirements in every mode", async () => {
     const unknownIntent = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "unknown", version: 1 } } })
     await expect(readRootTaskHistoryFence(unknownIntent.client, { ...unknownIntent.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()
 
@@ -142,6 +231,7 @@ describe("root task history current fence", () => {
 
     const invalidRequirements = fixture({ turnInput: { goal: " Plan a role ", verificationRequirements: { schemaVersion: "bad", requirements: [] } } })
     await expect(readRootTaskHistoryFence(invalidRequirements.client, { ...invalidRequirements.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()
-    await expect(readRootTaskHistoryFence(invalidRequirements.client, invalidRequirements.input)).resolves.toMatchObject({ objectiveDigest: expect.any(String) })
+    await expect(readRootTaskHistoryFence(invalidRequirements.client, invalidRequirements.input)).resolves.toBeUndefined()
+    expect(invalidRequirements.queries.some(sql => sql.includes("turn.started"))).toBe(false)
   })
 })

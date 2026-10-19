@@ -5,6 +5,8 @@ import { ToolRegistry } from "./registry.js"
 import { ToolSchemaValidator } from "./schema-validator.js"
 import { createCoordinationTools } from "./coordination-tools.js"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA } from "../subagents/task-graph-result-page-contract.js"
+import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "../subagents/task-graph-historical-discovery-page-contract.js"
+import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA } from "../subagents/task-graph-discovery-recovery-page-contract.js"
 import type { CoordinationStore } from "./coordination-types.js"
 
 const options = {
@@ -145,6 +147,9 @@ describe("coordination tool definitions", () => {
     expect(listDescription).toContain("stale or unavailable, refresh current state")
     expect(listDescription).toContain("Never invent offsets, silently switch modes")
     expect(listDescription).toContain("verification proof")
+    expect(listDescription).toContain("fresh ordinary Scout jobs.get")
+    expect(listDescription).toContain("sourceToken binds pages only")
+    expect(listDescription).toContain("establish global discovery completeness")
     const spawnDescription = registry.resolve("agent.spawn", "1").description
     const followupDescription = registry.resolve("agent.followup", "1").description
     expect(spawnDescription).toContain("eight-node lifetime cap separate from active-child concurrency")
@@ -164,7 +169,7 @@ describe("coordination tool definitions", () => {
     expect(new ToolRegistry(definitions).list(["other"])).toHaveLength(0)
   })
 
-  it("gives only agent.list the strict exclusive current-result page mode", () => {
+  it("gives only agent.list strict exclusive current, historical, and recovery page modes", () => {
     const definitions = createCoordinationTools(options)
     const registry = new ToolRegistry(definitions)
     const request = { nodeKey: "candidate-node", expectedRevision: 2, offset: 3 }
@@ -172,6 +177,13 @@ describe("coordination tool definitions", () => {
     expect(registry.validateArguments("list_subagents", request)).not.toBe(true)
     expect(registry.validateArguments("agent.list", { ...request, includeTerminal: true })).not.toBe(true)
     expect(registry.validateArguments("agent.list", { ...request, taskId: "forged" })).not.toBe(true)
+    const historicalRequest = { mode: "historical_discovery", offset: 0 }
+    expect(registry.validateArguments("agent.list", historicalRequest)).toBe(true)
+    expect(registry.validateArguments("agent.list", { mode: "historical_discovery", offset: 3, sourceToken: "a".repeat(64) })).toBe(true)
+    expect(registry.validateArguments("agent.list", { mode: "historical_discovery", offset: 3 })).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...historicalRequest, expectedAttemptCount: 2 })).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...historicalRequest, taskId: "forged" })).not.toBe(true)
+    expect(registry.validateArguments("list_subagents", historicalRequest)).not.toBe(true)
     const page = {
       schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 2,
       role: "scout", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
@@ -179,6 +191,43 @@ describe("coordination tool definitions", () => {
     }
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, page, "agent.list output")).not.toThrow()
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()
+    const historicalPage = {
+      schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+      observation: "historical_discovery", verificationStatus: "unverified", sourceToken: "a".repeat(64),
+      sourceResultStatus: "completed", offset: 0, nextOffset: null, totalCount: 1, truncated: false,
+      items: [{ jobId: "00000000-0000-4000-8000-000000000000" }],
+    }
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, historicalPage, "agent.list historical output")).not.toThrow()
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, {
+      schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "unavailable",
+      observation: "historical_discovery", verificationStatus: "unverified", reason: "no_source",
+    }, "agent.list unavailable historical output")).not.toThrow()
+  })
+
+  it("accepts only exact recovery mode requests and exposes unverified ID-only pages through agent.list", () => {
+    const definitions = createCoordinationTools(options)
+    const registry = new ToolRegistry(definitions)
+    const request = { mode: "discovery_recovery", nodeKey: "scout-a", expectedRevision: 2, offset: 0 }
+    expect(registry.validateArguments("agent.list", request)).toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, offset: 3 })).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, offset: 3, expectedAttemptCount: 4 })).toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, sourceToken: "a".repeat(64) })).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, expectedAttemptCount: 0 })).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, includeTerminal: true })).not.toBe(true)
+    expect(registry.validateArguments("agent.list", { ...request, mode: "result_page" })).not.toBe(true)
+    expect(registry.validateArguments("list_subagents", request)).not.toBe(true)
+    const recoveryPage = {
+      schemaVersion: TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
+      observation: "partial_discovery", verificationStatus: "unverified", graphRevision: 2, attemptCount: 4,
+      taskStatus: "failed", totalCount: 1, offset: 0, nextOffset: null, truncated: false,
+      items: [{ jobId: "00000000-0000-4000-8000-000000000000" }],
+    }
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, recoveryPage, "agent.list output")).not.toThrow()
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, recoveryPage, "list_subagents output")).toThrow()
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema,
+      { ...recoveryPage, score: 9 }, "agent.list output")).toThrow()
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema,
+      { ...recoveryPage, sourceToken: "a".repeat(64) }, "agent.list output")).toThrow()
   })
 
   it("accepts exact legacy or complete current wait task outputs with canonical timestamps", () => {

@@ -24,18 +24,36 @@ describe("TaskGraph failure-category advice lookup", () => {
     expect(getTaskGraphExecutionFailureInspectionAdvice(value)).toBeUndefined()
   })
 
-  it("does not inspect or coerce accessor-backed category objects", () => {
-    let getterCalls = 0
-    const getter = () => {
-      getterCalls += 1
-      return "execution_setup_unavailable"
-    }
-    const value = Object.defineProperties({}, {
-      category: { enumerable: true, get: getter },
-      toString: { enumerable: true, get: getter },
+  it("rejects inherited and accessor-backed category properties without invoking getters or toString", () => {
+    let getterInvocations = 0
+    let toStringInvocations = 0
+    const inherited = Object.create({
+      executionFailureCategory: categories[0][0],
+      toString() {
+        toStringInvocations += 1
+        return categories[0][0]
+      },
     })
-    expect(getTaskGraphExecutionFailureInspectionAdvice(value)).toBeUndefined()
-    expect(getterCalls).toBe(0)
+    const accessor = Object.defineProperty({}, "executionFailureCategory", {
+      get() {
+        getterInvocations += 1
+        return categories[1][0]
+      },
+    })
+    Object.defineProperty(accessor, "toString", {
+      get() {
+        getterInvocations += 1
+        return () => {
+          toStringInvocations += 1
+          return categories[1][0]
+        }
+      },
+    })
+
+    expect(getTaskGraphExecutionFailureInspectionAdvice(inherited)).toBeUndefined()
+    expect(getTaskGraphExecutionFailureInspectionAdvice(accessor)).toBeUndefined()
+    expect(getterInvocations).toBe(0)
+    expect(toStringInvocations).toBe(0)
   })
 })
 

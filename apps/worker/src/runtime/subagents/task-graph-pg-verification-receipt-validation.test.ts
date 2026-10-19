@@ -28,6 +28,36 @@ describe("TaskGraph canonical verification receipt validation", () => {
   })
 
   it.each([
+    ["missing", { job: { id: "job-1" } }],
+    ["null", { job: { id: "job-1", source: null } }],
+    ["empty", { job: { id: "job-1", source: "" } }],
+    ["whitespace-only", { job: { id: "job-1", source: " \t " } }],
+  ] as const)("uses the generic jobs.read source fallback for %s jobs.get source", (_name, output) => {
+    const items = validateTaskGraphVerificationItems(pair({ call: { toolName: "jobs.get" }, output }), scope)
+    const observations = canonicalTaskGraphReadObservations(items, new Map([["call-1", "completed"]]))
+
+    expect(observations[0]?.content).toMatchObject({ toolName: "jobs.get", output: { job: { id: "job-1", source: "jobs.read" } } })
+  })
+
+  it.each([
+    ["a non-string", { job: { id: "job-1", source: 7 } }],
+    ["an over-bound", { job: { id: "job-1", source: "x".repeat(257) } }],
+  ] as const)("rejects %s jobs.get source instead of normalizing it", (_name, output) => {
+    const items = validateTaskGraphVerificationItems(pair({ call: { toolName: "jobs.get" }, output }), scope)
+
+    expect(() => canonicalTaskGraphReadObservations(items, new Map([["call-1", "completed"]])))
+      .toThrow("task_graph_verification_output_invalid")
+  })
+
+  it("preserves a bounded nonempty jobs.get source exactly", () => {
+    const source = " greenhouse "
+    const items = validateTaskGraphVerificationItems(pair({ call: { toolName: "jobs.get" }, output: { job: { id: "job-1", source } } }), scope)
+    const observations = canonicalTaskGraphReadObservations(items, new Map([["call-1", "completed"]]))
+
+    expect(observations[0]?.content).toMatchObject({ toolName: "jobs.get", output: { job: { id: "job-1", source } } })
+  })
+
+  it.each([
     ["truncated output", { jobs: [{ id: "job-1" }], truncated: true, preview: "x", byteLength: 99 }],
     ["duplicate outputs", { jobs: [{ id: "job-1" }, { id: "job-1" }] }],
     ["unrecognized tool payload", { other: true }],

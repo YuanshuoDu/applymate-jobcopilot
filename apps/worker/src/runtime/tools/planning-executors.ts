@@ -3,7 +3,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
-import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
+import type { TaskGraphObjectiveCoverageRejection } from "../planning/task-graph-objective-coverage.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import type {
   TaskGraphCommandPort,
@@ -90,6 +90,9 @@ function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?:
     expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
     nodes: Type.Array(nodeSchema, { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
     rootSuccessCriteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 4 })),
+    replaceUnstarted: Type.Optional(Type.Object({
+      nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    }, { additionalProperties: false })),
   }, { additionalProperties: false })
 }
 
@@ -100,6 +103,7 @@ type ModelTaskGraphNodeProposal = Omit<TaskGraphNodeProposal, "repairOf"> & Read
 export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{
   nodes: readonly ModelTaskGraphNodeProposal[]
   rootSuccessCriteria?: readonly string[]
+  replaceUnstarted?: Readonly<{ nodeKey: string }>
 }>
 
 export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
@@ -135,7 +139,29 @@ function scheduleErrorCode(error: unknown): string {
   return "task_graph_schedule_failed"
 }
 
-function safeScheduleError(error: unknown, code: string): Readonly<{ code: string; currentRevision?: number }> {
+function safeCoverageRequirements(value: unknown): readonly TaskGraphObjectiveCoverageRejection[] | undefined {
+  if (!Array.isArray(value) || value.length < 1 || value.length > TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria) return undefined
+  const safe: TaskGraphObjectiveCoverageRejection[] = []
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return undefined
+    const row = item as Record<string, unknown>
+    const kind = row.kind
+    const role = kind === "candidate_count_gte" ? "scout" : kind === "finding_count_gte" ? "analyst" : undefined
+    if (!role || Object.keys(row).sort().join(",") !== "id,kind,minimum,role" || typeof row.id !== "string"
+      || !/^[a-z][a-z0-9._-]{0,63}$/.test(row.id) || row.role !== role
+      || !Number.isSafeInteger(row.minimum) || typeof row.minimum !== "number" || row.minimum < 1
+      || row.minimum > TASK_GRAPH_VERIFICATION_LIMITS.maxItems) return undefined
+    safe.push({ id: row.id, kind: kind as TaskGraphObjectiveCoverageRejection["kind"], role, minimum: row.minimum })
+  }
+  return safe
+}
+
+function safeScheduleError(error: unknown, code: string): Readonly<{ code: string; currentRevision?: number; requirements?: readonly TaskGraphObjectiveCoverageRejection[] }> {
+  if (code === "task_graph_objective_coverage_incomplete") {
+    const requirements = error && typeof error === "object" && "requirements" in error
+      ? safeCoverageRequirements(error.requirements) : undefined
+    return requirements ? { code, requirements } : { code }
+  }
   if (code !== "revision_mismatch" && code !== "task_graph_revision_mismatch") return { code }
   if (!error || typeof error !== "object" || !("currentRevision" in error)) return { code }
   const currentRevision = error.currentRevision
@@ -176,7 +202,13 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
-    const operation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
+    if (input.replaceUnstarted && input.nodes.length !== 1) {
+      throw new ToolExecutionError("task_graph_supersession_requires_one_replacement", "Supersession accepts exactly one replacement node")
+    }
+    const reconciliation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
+    const operation = input.replaceUnstarted
+      ? { ...reconciliation, replaceUnstartedNodeKey: input.replaceUnstarted.nodeKey }
+      : reconciliation
     const scope = operation.scope
     const proposal: TaskGraphProposal = {
       expectedRevision: input.expectedRevision,
@@ -193,13 +225,6 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
         }
       }),
     }
-    const coverage = evaluateTaskGraphObjectiveCoverage(options.verificationRequirements ?? { status: "absent" }, proposal, options.templates)
-    if (coverage.status === "incomplete") {
-      const code = "task_graph_objective_coverage_incomplete"
-      throw new ToolExecutionError(code, "TaskGraph plan does not cover the canonical objective requirements", {
-        code, requirements: coverage.requirements,
-      })
-    }
     try {
       if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {
         throw new ToolExecutionError("steering_reconciliation_unavailable", "TaskGraph revision requires an atomic reconciliation-capable port")
@@ -209,6 +234,10 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
         proposal,
         ...(rootSuccessCriteria === undefined ? {} : { rootSuccessCriteria }),
         templates: options.templates,
+        verificationRequirements: options.verificationRequirements ?? { status: "absent" },
+        ...(input.replaceUnstarted ? {
+          replaceUnstarted: { nodeKey: input.replaceUnstarted.nodeKey },
+        } : {}),
       }, operation)
       return receipt
     } catch (error: unknown) {

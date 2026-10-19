@@ -24,11 +24,17 @@ function graph(nodes: TaskGraphCurrentState["nodes"] = [{
   native: { operationKind: "spawn", operationId: "operation-1", requestFingerprint: digest, callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: digest },
 }]): TaskGraphCurrentState { return { revision: 3, nodes } }
 
-function makeCoordination(readCurrent = vi.fn(async () => graph())) {
-  const commandPort = { appendAndSchedule: vi.fn(), appendNativeCoordination: vi.fn(), readCurrent } as unknown as TaskGraphCommandPort
+function makeCoordination(
+  readCurrent = vi.fn(async () => graph()),
+  readCurrentForPlanning?: ReturnType<typeof vi.fn>,
+) {
+  const commandPort = {
+    appendAndSchedule: vi.fn(), appendNativeCoordination: vi.fn(), readCurrent,
+    ...(readCurrentForPlanning ? { readCurrentForPlanning } : {}),
+  } as unknown as TaskGraphCommandPort
   const coordination = createCanonicalTurnCoordination({ enabled: true, commandPort, lease })
   coordination.bindRoot({ id: "root-1", attemptCount: 2 } as never)
-  return { coordination, readCurrent }
+  return { coordination, readCurrent, readCurrentForPlanning }
 }
 
 describe("canonical Turn native coordination", () => {
@@ -48,6 +54,28 @@ describe("canonical Turn native coordination", () => {
     })
     await expect(current.coordination.hasNativeTasks()).resolves.toBe(true)
     expect(current.readCurrent).toHaveBeenCalledTimes(2)
+  })
+
+  it("uses the provenance-aware planning read only for Root refresh", async () => {
+    const genericRead = vi.fn(async () => graph())
+    const planningRead = vi.fn(async () => ({ current: {
+      ...graph(), sourceIntent: [{ nodeKey: "node-1", goal: "Find roles", successCriteria: ["Direct URLs"], inputRelation: "unknown" }],
+    }, currentInputCheckpoint: { inputThroughSequence: 99n } }))
+    const current = makeCoordination(genericRead, planningRead)
+
+    const refreshed = await current.coordination.refresh(snapshot as never)
+    const observation = refreshed.toolObservations.find(item => item.id === "task-graph-current")?.content as Record<string, unknown>
+
+    expect(planningRead).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", turnId: "turn-1" }))
+    expect(genericRead).not.toHaveBeenCalled()
+    expect(observation.sourceIntent).toEqual([{
+      nodeKey: "node-1", goal: "Find roles", successCriteria: ["Direct URLs"], inputRelation: "unknown",
+    }])
+    expect(JSON.stringify(observation)).not.toMatch(/currentInputCheckpoint|inputThroughSequence|stepId|cursor/)
+
+    await expect(current.coordination.checkNativeGraphCompletion()).resolves.toBeNull()
+    expect(genericRead).toHaveBeenCalledTimes(1)
+    expect(planningRead).toHaveBeenCalledTimes(1)
   })
 
   it("keeps a recovered native receipt as a completion requirement when the graph is absent", async () => {

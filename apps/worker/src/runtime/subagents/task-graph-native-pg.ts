@@ -7,7 +7,7 @@ import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-conte
 import { enqueueGraphTask } from "./task-graph-pg-create.js"
 import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
 import { TASK_GRAPH_LIMITS, type TaskGraphState } from "../planning/task-graph.js"
-import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphSnapshot } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, TASK_GRAPH_ITEM_TYPE, taskGraphItemId, taskGraphSnapshot } from "./task-graph-snapshot.js"
 import { appendTaskGraphReceipt, writeTaskGraphSnapshot } from "./task-graph-pg-events.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord, type SubagentTaskStatus } from "./types.js"
@@ -18,6 +18,11 @@ import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-comman
 import { taskGraphNativeResultReceipt } from "./task-graph-native-result.js"
 import { waitResult } from "../tools/coordination-executor-support.js"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import {
+  parseSteeringReconciliationReceipt, steeringReconciliationId, steeringReconciliationSequence,
+  STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+  type SteeringReconciliationScope,
+} from "./steering-reconciliation-contract.js"
 
 type Row = Record<string, unknown>
 type Source = Row & { provenance: TaskGraphNativeSourceProvenance }
@@ -150,6 +155,7 @@ async function followupSource(client: Queryable, input: TaskGraphNativeCommandIn
   }
   taskGraphNativeResultReceipt(row.role, row.status as SubagentTaskStatus, row.result ?? null, row.expectedOutputSchema)
   const graphNode = loaded.snapshot?.nodes.find(node => node.taskId === taskId)
+  await assertNotSupersededSource(client, input, taskId, !graphNode)
   const currentNode = loaded.state?.nodes.find(node => node.taskId === taskId)
   if (graphNode && (!currentNode || currentNode.status !== row.status || loaded.tasks.get(taskId)?.id !== taskId)) {
     throw commandError("native_source_graph_invalid")
@@ -165,6 +171,59 @@ async function followupSource(client: Queryable, input: TaskGraphNativeCommandIn
       origin: graphNode ? "task_graph" : "native_legacy",
     },
   }
+}
+
+async function assertNotSupersededSource(client: Queryable, input: TaskGraphNativeCommandInput, taskId: string, requireHistoryCheck: boolean): Promise<void> {
+  const scope: SteeringReconciliationScope = {
+    userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
+    rootTaskId: input.scope.rootTaskId, parentTaskId: input.scope.rootTaskId,
+    turnLeaseOwner: input.scope.turnLeaseOwner, turnLeaseVersion: input.scope.turnLeaseVersion,
+    parentLeaseOwner: input.scope.parentLeaseOwner, parentAttemptCount: input.scope.parentAttemptCount,
+  }
+  const result = await client.query<Row>(`SELECT event."id", event."itemId", event."taskId", event."type", event."actor",
+      event."correlationId", event."causationId", event."sequence", event."idempotencyKey", event."payload",
+      EXISTS (SELECT 1 FROM "agent_outbox" AS outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
+    FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3 AND event."type" = $4
+      AND event."payload"->'supersession'->'source'->>'taskId' = $5
+      AND session."userId" = $6 AND turn."userId" = $6 LIMIT 2`,
+  [input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, STEERING_RECONCILIATION_EVENT_TYPE, taskId, input.scope.userId])
+  if (result.rows.length === 0) {
+    if (requireHistoryCheck) await assertNoTaskGraphHistory(client, input, taskId)
+    return
+  }
+  if (result.rows.length !== 1) throw commandError("native_source_unavailable")
+  const event = result.rows[0]!, receipt = parseSteeringReconciliationReceipt(event.payload, scope)
+  const relation = receipt?.supersession
+  if (!steeringReconciliationId(event.id) || event.itemId !== null || event.taskId !== input.scope.rootTaskId
+    || event.type !== STEERING_RECONCILIATION_EVENT_TYPE || event.actor !== "orchestrator"
+    || event.correlationId !== input.scope.turnId || event.causationId !== receipt?.stepId
+    || event.hasOutbox !== false || steeringReconciliationSequence(event.sequence) === null
+    || typeof event.idempotencyKey !== "string" || !receipt
+    || receipt.schemaVersion !== STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION || !relation
+    || relation.source.taskId !== taskId || event.idempotencyKey !== relation.operationKey) {
+    throw commandError("native_source_unavailable")
+  }
+  throw commandError("native_source_superseded")
+}
+
+async function assertNoTaskGraphHistory(client: Queryable, input: TaskGraphNativeCommandInput, taskId: string): Promise<void> {
+  const result = await client.query<{ hasMembership: boolean }>(`SELECT (
+      EXISTS (SELECT 1 FROM "agent_items" AS item JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+        WHERE item."id" = $3 AND item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $4 AND item."type" = $5
+          AND item."content"->'nodes' @> jsonb_build_array(jsonb_build_object('taskId', $6::text))
+          AND session."userId" = $7 AND turn."userId" = $7)
+      OR EXISTS (SELECT 1 FROM "agent_events" AS history JOIN "agent_sessions" AS session ON session."id" = history."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = history."turnId" AND turn."sessionId" = history."sessionId"
+        WHERE history."sessionId" = $1 AND history."turnId" = $2 AND history."itemId" = $3
+          AND (history."payload"->'content'->'nodes' @> jsonb_build_array(jsonb_build_object('taskId', $6::text))
+            OR history."payload"->'item'->'content'->'nodes' @> jsonb_build_array(jsonb_build_object('taskId', $6::text)))
+          AND session."userId" = $7 AND turn."userId" = $7)) AS "hasMembership"`,
+  [input.scope.sessionId, input.scope.turnId, taskGraphItemId(input.scope.rootTaskId), input.scope.rootTaskId,
+    TASK_GRAPH_ITEM_TYPE, taskId, input.scope.userId])
+  if (result.rows.length !== 1 || result.rows[0]?.hasMembership !== false) throw commandError("native_source_unavailable")
 }
 
 async function withVerifiedDependencyContext(

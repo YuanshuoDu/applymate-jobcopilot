@@ -10,7 +10,7 @@ vi.mock('@/lib/hooks', () => ({ useApi: (url: string) => {
 vi.mock('next-auth/react', () => ({ useSession: () => ({ data: null, status: 'unauthenticated' }) }))
 
 import { translate } from '@/lib/i18n'
-import { AgentSupervisorPanel, EvidenceSummary, projectSelectedEvidence } from './AgentSupervisorPanel'
+import { AgentSupervisorPanel, EvidenceSummary, projectSelectedEvidence, selectedWorkerForNode } from './AgentSupervisorPanel'
 import { projectSelectedTaskInterrupt } from './task-tree-projection'
 import { TaskInterruptControl } from './TaskTreePanel'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
@@ -31,6 +31,16 @@ const t = (key: string) => translate('en', key)
 
 describe('AgentSupervisorPanel selected evidence', () => {
   beforeEach(() => { supervisorApi.calls = []; supervisorApi.responses.clear() })
+
+  it('resolves the selected child node to exactly that worker task', () => {
+    const tasks = [
+      { id: 'root-1', sessionId: 'session-1', role: 'orchestrator', taskType: 'root', status: 'running', goal: 'Root', hasResult: false },
+      { id: 'child-a', sessionId: 'session-1', rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'scout', taskType: 'scout', status: 'running', goal: 'A', hasResult: false, attemptCount: 1 },
+      { id: 'child-b', sessionId: 'session-1', rootTaskId: 'root-1', parentTaskId: 'root-1', role: 'analyst', taskType: 'analyst', status: 'running', goal: 'B', hasResult: false, attemptCount: 2 },
+    ]
+    expect(selectedWorkerForNode({ id: 'task:child-b', kind: 'task', label: 'B', status: 'running' }, tasks)?.id).toBe('child-b')
+    expect(selectedWorkerForNode({ id: 'turn:turn-1', kind: 'turn', label: 'Turn', status: 'running' }, tasks)).toBeNull()
+  })
 
   it('projects an eligible selected child into the accessible interrupt action', () => {
     const task = {
