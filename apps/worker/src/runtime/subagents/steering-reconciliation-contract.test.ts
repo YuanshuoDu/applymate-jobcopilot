@@ -87,4 +87,27 @@ describe("steering reconciliation receipt contract", () => {
     expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "keep", 1)).toBe(false)
     expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0)).toBe(false)
   })
+
+  it("accepts bounded optional root criteria on reconciled agent.plan calls and preserves the stored input", () => {
+    const callId = "call-revise"
+    const event = { type: "tool_call.started", actor: "orchestrator", taskId: scope.rootTaskId, itemId: "plan-item",
+      correlationId: callId, idempotencyKey: toolStartKey(callId),
+      payload: { toolCallId: callId, toolName: "agent.plan", taskId: scope.rootTaskId } }
+    const makeItem = (input: Record<string, unknown>) => ({ id: "plan-item", stepId: scope.stepId, taskId: scope.rootTaskId, type: "tool_call",
+      content: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input } })
+    const criteria = ["  Include evidence for each role  ", "Include evidence for each role", "Keep the full search scope", "Keep the timeline"]
+    const item = makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria: criteria })
+
+    expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0)).toBe(true)
+    expect(item.content.input.rootSuccessCriteria).toEqual(criteria)
+    expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }] }), scope, scope.stepId, "revise", 0)).toBe(true)
+
+    const invalidCriteria: unknown[] = [[], Array.from({ length: 5 }, () => "criterion"), ["  "], ["x".repeat(513)], ["💼".repeat(129)]]
+    for (const rootSuccessCriteria of invalidCriteria) {
+      expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria }),
+        scope, scope.stepId, "revise", 0)).toBe(false)
+    }
+    expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria: ["💼".repeat(128)] }),
+      scope, scope.stepId, "revise", 0)).toBe(true)
+  })
 })

@@ -9,6 +9,8 @@ import type { StepContext } from "../context/step-context-builder.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_SCHEMA_VERSION, validSteeringReconciliationToolCall } from "./steering-reconciliation-contract.js"
 import { assertSteeringReconciliationCall, readSteeringReconciliationHistory, type SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
+import { resolveRootPlanCriteria } from "./root-plan-criteria.js"
+import { taskGraphFingerprint, taskGraphProposalKey } from "./task-graph-snapshot.js"
 
 const scope: TaskGraphExecutionScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   stepId: "later-step", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "root-owner", parentAttemptCount: 1 }
@@ -60,15 +62,19 @@ function agenda(stepId = decisionStepId) {
   return payload
 }
 function fixture(change: Readonly<{ event?: Record<string, unknown>; tool?: Record<string, unknown>; step?: Record<string, unknown>;
-  agenda?: Record<string, unknown>; noReceipt?: boolean }> = {}) {
-  const receipt = { ...baseReceipt, ...(change.event?.payload && typeof change.event.payload === "object" ? { ...baseReceipt, ...(change.event.payload as Record<string, unknown>) } : {}) }
+  agenda?: Record<string, unknown>; noReceipt?: boolean; planInput?: Readonly<Record<string, unknown>> }> = {}) {
+  const decision = change.planInput ? "revise" : "keep"
+  const defaultReceipt = decision === "revise" ? { ...baseReceipt, decision, resultingRevision: 2 } : baseReceipt
+  const receipt = { ...defaultReceipt, ...(change.event?.payload && typeof change.event.payload === "object" ? change.event.payload as Record<string, unknown> : {}) }
   const receiptKey = steeringReconciliationIdempotencyKey({ ...scope, stepId: decisionStepId }, callId)
   const storedEvent = { id: "receipt-event", itemId: null, taskId: scope.rootTaskId, type: "agent.plan.reconciliation", actor: "orchestrator",
     correlationId: scope.turnId, causationId: decisionStepId, sequence: "30", idempotencyKey: receiptKey, payload: receipt, hasOutbox: false, ...change.event }
-  const toolName = "agent.reconcile"
+  const toolName = decision === "keep" ? "agent.reconcile" : "agent.plan"
+  const input = decision === "keep" ? { decision: "keep", expectedRevision: 1 }
+    : { expectedRevision: 1, nodes: [{ key: "research" }], ...change.planInput }
   const toolEvent = { eventId: "tool-event", eventSequence: "20", type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item", correlationId: callId,
     idempotencyKey: toolStartKey(callId), payload: { toolCallId: callId, toolName, taskId: scope.rootTaskId }, callItemId: "call-item", stepId: decisionStepId,
-    itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: callId, toolName, toolVersion: "1", input: { decision: "keep", expectedRevision: 1 } }, ...change.tool }
+    itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: callId, toolName, toolVersion: "1", input }, ...change.tool }
   const step = { id: decisionStepId, taskId: scope.rootTaskId, ordinal: 1, attempt: 1, status: "completed", inputThroughSequence: "10", ...change.step }
   const agendaRow = { actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: decisionStepId, payload: agenda(), ...change.agenda }
   const calls: string[] = []
@@ -86,11 +92,11 @@ function fixture(change: Readonly<{ event?: Record<string, unknown>; tool?: Reco
     if (sql.includes("cognitive.agenda")) return { rows: [agendaRow], rowCount: 1 }
     return { rows: [], rowCount: 0 }
   }) } as unknown as Pick<pg.PoolClient, "query">
-  return { client, calls, storedEvent }
+  return { client, calls, storedEvent, toolEvent }
 }
-async function historyEntries(client: Pick<pg.PoolClient, "query">): Promise<SteeringReconciliationHistoryEntry[]> {
+async function historyEntries(client: Pick<pg.PoolClient, "query">, currentRevision = 1): Promise<SteeringReconciliationHistoryEntry[]> {
   const history: SteeringReconciliationHistoryEntry[] = []
-  for await (const entry of readSteeringReconciliationHistory(client, scope, 1)) history.push(entry)
+  for await (const entry of readSteeringReconciliationHistory(client, scope, currentRevision)) history.push(entry)
   return history
 }
 function longHistoryFixture(count: number, malformedIndex = -1) {
@@ -139,6 +145,44 @@ describe("durable steering reconciliation history", () => {
     const history = await historyEntries(f.client)
     expect(history).toEqual([{ receipt: baseReceipt, stepOrdinal: 1, stepAttempt: 1 }])
     expect(f.calls.some(sql => sql.includes('item."stepId" = ANY($4::text[])'))).toBe(true)
+  })
+
+  it("accepts reconciled agent.plan history with a pinned checklist and keeps omission compatible", async () => {
+    const criteria = ["  Include evidence for each role  ", "Include evidence for each role", "Keep the full search scope"]
+    const revised = fixture({ planInput: { rootSuccessCriteria: criteria } })
+    const history = await historyEntries(revised.client, 2)
+    expect(history).toEqual([{ receipt: { ...baseReceipt, decision: "revise", resultingRevision: 2 }, stepOrdinal: 1, stepAttempt: 1 }])
+    expect(revised.toolEvent.itemContent).toMatchObject({ toolName: "agent.plan", input: { expectedRevision: 1, rootSuccessCriteria: criteria } })
+
+    const omitted = fixture({ planInput: {} })
+    await expect(historyEntries(omitted.client, 2)).resolves.toHaveLength(1)
+    expect(omitted.toolEvent.itemContent).toMatchObject({ toolName: "agent.plan", input: { expectedRevision: 1, nodes: [{ key: "research" }] } })
+    expect(omitted.toolEvent.itemContent.input).not.toHaveProperty("rootSuccessCriteria")
+  })
+
+  it.each([
+    { rootSuccessCriteria: [] },
+    { rootSuccessCriteria: Array.from({ length: 5 }, () => "criterion") },
+    { rootSuccessCriteria: ["  "] },
+    { rootSuccessCriteria: ["x".repeat(513)] },
+    { rootSuccessCriteria: ["💼".repeat(129)] },
+  ])("rejects reconciled agent.plan history with invalid root criteria $rootSuccessCriteria", async ({ rootSuccessCriteria }) => {
+      await expect(historyEntries(fixture({ planInput: { rootSuccessCriteria } }).client, 2))
+        .rejects.toThrow("steering_reconciliation_receipt_call_invalid")
+    })
+
+  it("uses the pinned checklist in durable plan replay fingerprints and preserves it when omitted", () => {
+    const proposal = { expectedRevision: 1, nodes: [{ key: "research" }] }
+    const identity = taskGraphProposalKey(scope.rootTaskId, proposal.expectedRevision)
+    const pinned = ["Find EU software roles", "Include evidence for each role"]
+    const fingerprint = taskGraphFingerprint({ proposal, rootSuccessCriteria: pinned.slice(1) })
+    const omittedRootSuccessCriteria: readonly string[] | undefined = undefined
+
+    expect(taskGraphProposalKey(scope.rootTaskId, proposal.expectedRevision)).toBe(identity)
+    expect(taskGraphFingerprint({ proposal, rootSuccessCriteria: pinned.slice(1) })).toBe(fingerprint)
+    expect(taskGraphFingerprint({ proposal, rootSuccessCriteria: ["Keep the full search scope"] })).not.toBe(fingerprint)
+    expect(resolveRootPlanCriteria(pinned[0], pinned, omittedRootSuccessCriteria ?? pinned.slice(1), []))
+      .toEqual({ status: "unchanged", criteria: pinned })
   })
 
   it("accepts the exact normal root payload emitted by executeToolWithItems and rejects child replay metadata", async () => {
