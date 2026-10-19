@@ -137,7 +137,8 @@ describe("durable native TaskGraph replay", () => {
     nativeAppendMocks.writeSnapshot.mockResolvedValue({ itemId: taskGraphItemId(scope.rootTaskId), revision: 2 })
     nativeAppendMocks.appendReceipt.mockResolvedValue("event-2")
     const query = vi.fn(async (sql: string) => sql.includes("FROM \"sub_agent_tasks\" AS task JOIN")
-      ? { rows: [sourceRow], rowCount: 1 } : { rows: [], rowCount: 1 })
+      ? { rows: [sourceRow], rowCount: 1 }
+      : sql.includes("FROM \"agent_items\" AS item") ? { rows: [{ hasMembership: false }], rowCount: 1 } : { rows: [], rowCount: 1 })
     const client = { query } as unknown as Queryable
     const request = kind === "spawn"
       ? { kind, idempotencyKey: "native-spawn-pin", role: "scout" as const, taskType: "research", goal: "Find roles" }

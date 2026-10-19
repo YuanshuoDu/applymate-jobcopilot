@@ -1,4 +1,7 @@
 import { Buffer } from "node:buffer"
+import { TaskGraphCommandError } from "./task-graph-command-port.js"
+import type { Queryable } from "./pg-store-persistence.js"
+import { resolveRootTaskObjective } from "../context/root-task-objective.js"
 
 const MAX_ADDITIONAL_CRITERIA = 4
 const MAX_ADDITIONAL_CRITERION_BYTES = 512
@@ -9,6 +12,9 @@ export type RootPlanCriteriaResolution = Readonly<{
   status: "unchanged" | "persist" | "conflict" | "invalid"
   criteria?: readonly string[]
 }>
+
+type RootPlanScope = Readonly<{ turnId: string; sessionId: string; userId: string; rootTaskId: string }>
+type RootPlanOwner = Readonly<{ goal?: unknown; successCriteria?: unknown }>
 
 /** Normalizes only outer whitespace; the accepted wording remains otherwise unchanged. */
 export function normalizeRootPlanCriteria(value: unknown): readonly string[] | undefined | null {
@@ -22,6 +28,12 @@ export function normalizeRootPlanCriteria(value: unknown): readonly string[] | u
     if (!item || Buffer.byteLength(item, "utf8") > MAX_ADDITIONAL_CRITERION_BYTES) return null
     if (!criteria.includes(item)) criteria.push(item)
   }
+  return criteria
+}
+
+export function requireNormalizedRootPlanCriteria(value: unknown): readonly string[] | undefined {
+  const criteria = normalizeRootPlanCriteria(value)
+  if (criteria === null) throw new TaskGraphCommandError("root_success_criteria_invalid", "Additional root criteria are invalid")
   return criteria
 }
 
@@ -62,6 +74,23 @@ export function readRootPlanCriteriaObservation(state: Record<string, unknown>):
   return readRootCriteriaProperty(state, parsePersistedRootCriteria, "task_graph_current_state_invalid:rootSuccessCriteria")
 }
 
+export function resolveRootPlanCriteriaReadback(
+  goal: unknown, rootCriteriaValue: unknown, pinnedValue: unknown,
+): Readonly<{ valid: boolean; criteria?: readonly string[] }> {
+  const rootCriteria = parsePersistedRootCriteria(rootCriteriaValue)
+  const pinned = pinnedValue === undefined ? undefined : parsePinnedRootCriteria(pinnedValue)
+  if (!rootCriteria || pinnedValue !== undefined && !pinned
+    || pinned && (typeof goal !== "string" || goal.trim() !== pinned[0])) return { valid: false }
+  const criteria = pinned ?? (rootCriteria.length ? rootCriteria : undefined)
+  return { valid: true, ...(criteria ? { criteria } : {}) }
+}
+
+export function requireRootPlanCriteriaReadback(goal: unknown, rootCriteriaValue: unknown, pinnedValue: unknown): readonly string[] | undefined {
+  const result = resolveRootPlanCriteriaReadback(goal, rootCriteriaValue, pinnedValue)
+  if (!result.valid) throw new TaskGraphCommandError("root_success_criteria_invalid", "Persisted root criteria do not match the owned objective")
+  return result.criteria
+}
+
 export function readPinnedRootCriteria(state: Record<string, unknown>): readonly string[] | undefined {
   return readRootCriteriaProperty(state, parsePinnedRootCriteria, "task_graph_snapshot_root_criteria_invalid")
 }
@@ -98,4 +127,27 @@ export function resolveRootPlanCriteria(
   return current.length === criteria.length && current.every((item, index) => item === criteria[index])
     ? { status: "unchanged", criteria }
     : { status: "conflict" }
+}
+
+/** Resolves a new or existing pin against the server-owned Turn and Root rows. */
+export async function resolveOwnedRootPlanCriteria(
+  client: Queryable, scope: RootPlanScope, root: RootPlanOwner,
+  currentValue: readonly string[] | undefined, additional: readonly string[] | undefined,
+): Promise<RootPlanCriteriaResolution> {
+  const turn = await client.query<Record<string, unknown>>(`SELECT "input" FROM "agent_turns"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4 AND "status" = 'in_progress' FOR UPDATE`,
+  [scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId])
+  const objective = resolveRootTaskObjective(turn.rows[0]?.input, root)
+  if (!objective.goal || objective.turnGoalConflict || !objective.criteriaValid) return { status: "invalid" }
+  return resolveRootPlanCriteria(root.goal, currentValue ?? [], additional ?? currentValue?.slice(1) ?? [], objective.criteria)
+}
+
+export async function requireOwnedRootPlanCriteria(
+  client: Queryable, scope: RootPlanScope, root: RootPlanOwner,
+  currentValue: readonly string[] | undefined, additional: readonly string[] | undefined,
+): Promise<readonly string[]> {
+  const resolved = await resolveOwnedRootPlanCriteria(client, scope, root, currentValue, additional)
+  if (resolved.status === "invalid") throw new TaskGraphCommandError("root_success_criteria_invalid", "The owned root objective or criteria are invalid")
+  if (resolved.status === "conflict") throw new TaskGraphCommandError("root_success_criteria_conflict", "The root acceptance criteria are already pinned")
+  return resolved.criteria!
 }
