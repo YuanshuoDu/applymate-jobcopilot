@@ -179,6 +179,7 @@ describe("agent timeline query API", () => {
     ["duplicate", "?itemId=first&itemId=second"],
     ["cursor mixed in", "?itemId=first&cursor=eyJ4IjoxfQ"],
     ["limit mixed in", "?itemId=first&limit=1"],
+    ["unrelated query key", "?itemId=first&extra=1"],
     ["control character", "?itemId=%00"],
   ])("rejects an %s direct item target after the owner check", async (_name, path) => {
     const { GET } = await import("./route")

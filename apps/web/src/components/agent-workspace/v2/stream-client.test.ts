@@ -190,9 +190,9 @@ async function runFinalItemStream(items: unknown[]) {
   let finalHydrationCount = 0
   const dispatch = (action: TimelineAction) => {
     state = timelineReducer(state, action)
-    if (action.type === 'hydrate' && action.items.some(value => isRecord(value) && value.id === FINAL_ITEM_ID)) finalHydrationCount++
+    if ((action.type === 'hydrate' || action.type === 'replay') && action.items.some(value => isRecord(value) && value.id === FINAL_ITEM_ID)) finalHydrationCount++
     if (action.type === 'event' && isRecord(action.event) && action.event.type === 'item.completed') redactedContent = state.itemsById[FINAL_ITEM_ID]?.content
-    if (action.type === 'hydrate' && state.itemsById[FINAL_ITEM_ID]?.source === 'replay') controller.abort()
+    if ((action.type === 'hydrate' || action.type === 'replay') && state.itemsById[FINAL_ITEM_ID]?.source === 'replay') controller.abort()
     if (action.type === 'disconnected' && state.events.some(event => event.type === 'turn.completed')) controller.abort()
   }
   const fetcher = vi.fn<typeof fetch>()
@@ -410,6 +410,25 @@ describe('V2 timeline stream client', () => {
       `/api/agent/sessions/session-1/timeline?itemId=${encodeURIComponent(FINAL_ITEM_ID)}`,
     ])
     expect(JSON.stringify(live.state.itemsById[FINAL_ITEM_ID]?.content)).not.toContain('PRIVATE')
+  })
+
+  it('preserves a pending resync signal when hydrating one final item', async () => {
+    let state: TimelineState = timelineReducer(createTimelineState('session-1'), { type: 'snapshot-required' })
+    const dispatch = (action: TimelineAction) => { state = timelineReducer(state, action) }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({ items: [finalMessageDto()] })))
+
+    await hydrateTimeline({
+      sessionId: 'session-1', dispatch, fetcher, finalItemTarget: { itemId: FINAL_ITEM_ID, turnId: 'turn-1' },
+    })
+
+    expect(state.snapshotRequired).toBe(true)
+    expect(state.itemsById[FINAL_ITEM_ID]).toMatchObject({
+      type: 'agent_message', status: 'completed', phase: 'final_answer',
+      content: { text: 'The final response stays unchanged.', summary: 'A short supported summary.' },
+    })
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      `/api/agent/sessions/session-1/timeline?itemId=${encodeURIComponent(FINAL_ITEM_ID)}`,
+    ])
   })
 
   it.each([
