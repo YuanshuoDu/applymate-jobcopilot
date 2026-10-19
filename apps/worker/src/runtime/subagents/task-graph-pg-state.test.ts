@@ -15,7 +15,8 @@ type QueryCall = { sql: string; values: readonly unknown[] }
 type ClientOptions = {
   itemContent?: unknown
   taskRows?: Array<Record<string, unknown>>
-  events?: Array<{ type: string; payload: unknown }>
+  events?: Array<Record<string, unknown>>
+  sourceStepRows?: Array<Record<string, unknown>>
   failFence?: "session" | "turn" | "parent" | "step"
   sessionLockWait?: () => Promise<void>
   expireDuringSessionLockWait?: "turn" | "parent"
@@ -169,6 +170,10 @@ function fakeClient(options: ClientOptions = {}) {
         const rows = options.events ?? []
         return { rows, rowCount: rows.length }
       }
+      if (sql.startsWith("WITH current_candidates AS MATERIALIZED")) {
+        const rows = options.sourceStepRows ?? []
+        return { rows, rowCount: rows.length }
+      }
       return empty
     }),
   }
@@ -176,6 +181,26 @@ function fakeClient(options: ClientOptions = {}) {
 }
 
 describe("TaskGraph PostgreSQL state loading", () => {
+  it("keeps provenance opt-in and returns only the private current checkpoint on a planning read", async () => {
+    const currentStep = { id: "root-step", userId: identity.userId, turnUserId: identity.userId,
+      sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId, taskId: identity.rootTaskId,
+      status: "streaming", attempt: 1, inputThroughSequence: "4", consumedInputIds: [], sessionEventSequence: "4", checkpointInputsValid: true,
+      hasPendingAcceptedInputs: false, isDiscoveredCurrent: true, isExplicitCurrent: false, activeCount: 1 }
+    const ordinary = fakeClient()
+    const plain = await loadTaskGraph(ordinary.client, identity, false)
+    expect(ordinary.calls.some(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toBe(false)
+    expect(plain).not.toHaveProperty("currentInputCheckpoint")
+    expect(currentTaskGraph(plain)).not.toHaveProperty("sourceIntent")
+
+    const planning = fakeClient({ sourceStepRows: [currentStep] })
+    const loaded = await loadTaskGraph(planning.client, identity, false, { includeSourceProvenance: true, discoverCurrentStep: true })
+    expect(planning.calls.filter(call => call.sql.startsWith("WITH current_candidates AS MATERIALIZED"))).toHaveLength(1)
+    expect(loaded.currentInputCheckpoint).toEqual({ inputThroughSequence: 4n })
+    expect(loaded.sourceInputCheckpointByNodeKey?.get("child")).toBeNull()
+    expect(loaded.sourceInputRelationByNodeKey?.get("child")).toBe("unknown")
+    expect(currentTaskGraph(loaded)).not.toHaveProperty("currentInputCheckpoint")
+  })
+
   it("loads persisted actions and only derived context flags with the existing task-row query", async () => {
     const allowedActions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
     const fake = fakeClient({ taskRows: [validTaskRow({ allowedActions, contextIsObject: true, hasPrivateSelectionContext: false })] })

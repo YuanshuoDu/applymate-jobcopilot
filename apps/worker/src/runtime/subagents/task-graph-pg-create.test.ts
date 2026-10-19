@@ -266,7 +266,10 @@ describe("createGraphTasks", () => {
     expect(query).not.toHaveBeenCalled()
   })
 
-  it("persists scoped completed direct prerequisite evidence before dispatching a ready child", async () => {
+  it.each([
+    { recipientRole: "analyst" as const, exposesSourceIntent: true },
+    { recipientRole: "scout" as const, exposesSourceIntent: false },
+  ])("persists scoped direct prerequisite evidence for a ready $recipientRole without leaking source intent", async ({ recipientRole, exposesSourceIntent }) => {
     const scoutResult = {
       schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
       candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["job-evidence"] }],
@@ -304,27 +307,35 @@ describe("createGraphTasks", () => {
       return { rows: [], rowCount: 1 }
     })
     const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const recipientVerification = recipientRole === "analyst" ? analystVerification : scoutVerification
     const input: TaskGraphScheduleInput = {
       scope: {
         userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
         stepId: "step-2", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "parent-owner", parentAttemptCount: 1,
       },
-      proposal: { expectedRevision: 1, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze source", successCriteria: ["done"], dependsOn: ["source"] })] },
-      templates: { analyst: {
-        role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
-        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
+      proposal: { expectedRevision: 1, nodes: [{
+        ...plannedNode({ key: "analysis", templateId: recipientRole, goal: "Analyze source", successCriteria: ["done"], dependsOn: ["source"] }),
+        verification: recipientVerification,
+      }] },
+      templates: { [recipientRole]: {
+        role: recipientRole, taskType: "job_analysis", allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: recipientRole },
       } },
     }
     const current: TaskGraphState = {
       revision: 1, nodes: [{ key: "source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "typed", verification: scoutVerification }], appliedEvents: [],
     }
 
-    const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]]))
+    const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]]), {
+      sourceInputCheckpointByNodeKey: new Map([["source", { inputThroughSequence: 3n }]]),
+      currentInputCheckpoint: { inputThroughSequence: 4n },
+    })
 
     const stored = createdContext as Record<string, unknown>
     const dependencyEvidence = stored.taskGraphDependencyResults as Record<string, unknown>
+    const evidenceItems = dependencyEvidence.items as Array<Record<string, unknown>>
     expect(receipt.readyTaskIds).toEqual(["child-2"])
-    expect(dependencyEvidence.items).toMatchObject([{
+    expect(evidenceItems).toMatchObject([{
       dependencyKey: "source", role: "scout", taskStatus: "completed",
       result: {
         availability: "available", trust: "untrusted", role: "scout", status: "completed",
@@ -332,6 +343,9 @@ describe("createGraphTasks", () => {
         candidates: [{ jobId: "job-1", source: "greenhouse", evidenceKinds: ["job"] }],
       },
     }])
+    expect(evidenceItems[0]?.sourceIntent).toEqual(exposesSourceIntent ? {
+      goal: "Find source", successCriteria: ["done"], inputRelation: "predates_current_inputs",
+    } : undefined)
     expect(JSON.stringify(dependencyEvidence)).not.toContain("job-evidence")
     expect(query.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBeDefined()
     const turnLock = query.mock.calls.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR UPDATE"))
@@ -836,13 +850,17 @@ describe("createGraphTasks", () => {
 
   it("queues a newly planned dependent with the receipt-backed composite while the original row stays failed", async () => {
     const fixture = repairFixture({ priorReceipt: true, scheduleDependent: true })
-    const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds)
+    const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds, {
+      sourceInputCheckpointByNodeKey: new Map([["target", { inputThroughSequence: 3n }]]),
+      currentInputCheckpoint: { inputThroughSequence: 4n },
+    })
     expect(result.created).toMatchObject([{ key: "after-target", status: "queued" }])
     expect(result.state.nodes.find(node => node.key === "target")?.status).toBe("failed")
     const insert = fixture.query.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
     const context = JSON.parse(String(insert?.[1]?.[13])) as Record<string, unknown>
     const evidence = context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
-    expect(evidence.items[0]).toMatchObject({ dependencyKey: "target", taskStatus: "completed", repairLineage: [{ criterionIds: ["finding-count"] }] })
+    expect(evidence.items[0]).toMatchObject({ dependencyKey: "target", taskStatus: "completed", repairLineage: [{ criterionIds: ["finding-count"] }],
+      sourceIntent: { goal: "Find evidence", successCriteria: ["find evidence"], inputRelation: "predates_current_inputs" } })
     expect(evidence.items[0]?.result).toMatchObject({ role: "analyst", findingCount: 1, evidenceCount: 1 })
   })
 

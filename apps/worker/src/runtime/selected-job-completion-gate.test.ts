@@ -128,13 +128,33 @@ describe("selected-job artifact completion gate", () => {
 
   it("returns a graph witness only after all persisted selected-job checks pass", async () => {
     const graph = current([writer(), reviewer()])
+    const planningRead = { ...graph, sourceIntent: [{ nodeKey: "writer", goal: "Draft", successCriteria: ["Review"], inputRelation: "unknown" }],
+      currentInputCheckpoint: { inputThroughSequence: 99n } } as unknown as TaskGraphCurrentState
 
-    await expect(selectedJobArtifactCompletionGateWithWitness({
-      commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
+    const result = await selectedJobArtifactCompletionGateWithWitness({
+      commandPort: commandPort(planningRead), lease, root, selectedJobId: "job-1",
       readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
       readCurrentSourceDigest: async () => reference().sourceDigest,
       readCurrentReviewReceipt: readPersistedReview,
-    })).resolves.toEqual({ ok: true, witness: { revision: graph.revision, nodes: graph.nodes } })
+    })
+
+    expect(result).toEqual({ ok: true, witness: { revision: graph.revision, nodes: graph.nodes } })
+    if (result.ok) {
+      expect(Object.keys(result.witness).sort()).toEqual(["nodes", "revision"])
+      expect(JSON.stringify(result.witness)).not.toMatch(/sourceIntent|inputRelation|currentInputCheckpoint|inputThroughSequence|stepId|cursor/)
+    }
+  })
+
+  it("keeps the existing blocking gate when planning metadata accompanies an incomplete graph", async () => {
+    const planningRead = {
+      ...current([writer()]),
+      sourceIntent: [{ nodeKey: "writer", goal: "Draft", successCriteria: ["Review"], inputRelation: "covers_current_inputs" }],
+    } as unknown as TaskGraphCurrentState
+
+    await expect(check(planningRead)).resolves.toMatchObject({
+      ok: false, blocker: "selected_job_draft_review_required",
+      feedback: "Complete and review the selected job's latest cover-letter draft before finishing.",
+    })
   })
 
   it.each(failingReviewReaders)("fails closed when the durable review receipt is %s", async (_label, readCurrentReviewReceipt) => {

@@ -14,6 +14,7 @@ import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-g
 import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
 import { hasTaskGraphVerificationUnverifiedFailureReason, projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
 import { parseTaskGraphCurrentDiscoveryAttemptHealth } from "./subagents/task-graph-discovery-attempt-health.js"
+import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -205,7 +206,7 @@ function node(value: unknown): TaskGraphCurrentNode {
 }
 
 /** Replace an old read with the server-fenced current graph, as untrusted model evidence. */
-export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, value: TaskGraphCurrentState): StepContextSnapshot {
+export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, value: TaskGraphCurrentState & { sourceIntent?: unknown }): StepContextSnapshot {
   const state = record(value)
   if (!state || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0 || !Array.isArray(state.nodes) || state.nodes.length > MAX_NODES) throw new Error("task_graph_current_state_invalid")
   let projectedBytes = 0
@@ -229,7 +230,10 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   if (keys.size !== nodes.length || !validateTaskGraphCurrentVerificationGraph(nodes)) throw new Error("task_graph_current_state_invalid:dependencies")
   let planningFacts: unknown
   try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
-  const content = withTaskGraphCurrentPlanningObservation({ kind: "task_graph_current", revision: Number(state.revision), nodes }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
+  const baseContent = withTaskGraphCurrentPlanningObservation({ kind: "task_graph_current", revision: Number(state.revision), nodes }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
+  let sourceIntent: unknown
+  try { sourceIntent = Object.getOwnPropertyDescriptor(state, "sourceIntent")?.value } catch { sourceIntent = undefined }
+  const content = withTaskGraphRootSourceIntent(baseContent, sourceIntent, MAX_TEXT)
   if (JSON.stringify(content).length > MAX_TEXT) throw new Error("task_graph_current_state_too_large")
   return retireStaleTaskGraphRepair({ ...snapshot, taskGraphRevision: value.revision,
     toolObservations: [...snapshot.toolObservations.filter(observation => observation.id !== OBSERVATION_ID), { id: OBSERVATION_ID, content }] }, value.revision)

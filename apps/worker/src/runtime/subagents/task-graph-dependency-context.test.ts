@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import {
@@ -179,6 +180,37 @@ describe("TaskGraph dependency result context", () => {
     expect(encoded).not.toContain("Alice Example")
     expect(encoded).not.toContain("opaque final text")
     expect(encoded).not.toMatch(/lease|owner|budget|permission|capabilit/i)
+  })
+
+  it("keeps bounded source intent beside only the matching typed direct result", () => {
+    const sourceIntent = {
+      goal: "Find senior backend engineering roles in Dublin.",
+      successCriteria: ["Return current roles and direct application links."],
+      inputRelation: "predates_current_inputs" as const,
+    }
+    const source = dependency({ sourceIntent })
+    const sibling = dependency({ key: "sibling", taskId: "sibling-task", sourceIntent: { ...sourceIntent, inputRelation: "unknown" } })
+    const context = materializeTaskGraphDependencyContext({}, scope, ["source", "sibling"], [source, sibling]) as Record<string, unknown>
+    const items = (context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }).items
+
+    expect(items.map(item => item.sourceIntent)).toEqual([sourceIntent, { ...sourceIntent, inputRelation: "unknown" }])
+    expect(items.map(item => item.dependencyKey)).toEqual(["source", "sibling"])
+    expect(JSON.stringify(items)).not.toMatch(/sourceStepId|inputId|cursor|inputThroughSequence/)
+  })
+
+  it("drops only optional source intent when it would crowd out valid dependency evidence", () => {
+    const largeIntent = {
+      goal: "g".repeat(1200), successCriteria: Array(8).fill("c".repeat(320)), inputRelation: "unknown" as const,
+    }
+    const first = dependency({ sourceIntent: largeIntent, result: envelope(manyScoutResult(8)) })
+    const second = dependency({ key: "second", taskId: "second-task", sourceIntent: largeIntent, result: envelope(manyScoutResult(8)) })
+    const context = materializeTaskGraphDependencyContext({}, scope, ["source", "second"], [first, second]) as Record<string, unknown>
+    const evidence = context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
+
+    expect(evidence.items).toHaveLength(2)
+    expect(evidence.items.every(item => item.result !== undefined)).toBe(true)
+    expect(evidence.items.every(item => !Object.hasOwn(item, "sourceIntent"))).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(evidence), "utf8")).toBeLessThanOrEqual(TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT)
   })
 
   it("normalizes unrecognized model-authored sources before exposing them", () => {

@@ -161,6 +161,74 @@ describe("prepareGraphTransition", () => {
 })
 
 describe("reconcileGraphDependents", () => {
+  it("forwards bounded unknown provenance to an Analyst on ordinary waiting-to-queued promotion", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+    }
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft a letter", successCriteria: ["Ground it in the selected job"], dependsOn: [], depth: 1, taskId: "writer-1", verificationDisposition: "specialized" },
+      { key: "analyst", templateId: "analyst", goal: "Review the draft", successCriteria: ["Identify gaps"], dependsOn: ["writer"], depth: 2, taskId: "analyst-1", verificationDisposition: "typed", verification },
+    ] }
+    const artifactRef = { artifactId: "draft-1", version: 1, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+    const result = { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: null, finalText: "Draft ready.",
+      structuredResult: { schemaVersion: "agent-harness.v2.subagent.result", role: "writer", status: "completed", artifactRef } }
+    const taskRows = new Map<string, Record<string, unknown>>([
+      ["writer-1", { id: "writer-1", status: "completed", role: "writer", failureReason: null, result,
+        expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "writer" }, context: {},
+        sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId }],
+      ["analyst-1", { id: "analyst-1", status: "waiting", role: "analyst", failureReason: null, result: null,
+        expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "analyst" }, context: {},
+        sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId }],
+    ])
+    const itemId = taskGraphItemId(scope.rootTaskId)
+    const proposal = proposalPayload(snapshot, 2, [
+      { key: "writer", taskId: "writer-1", status: "queued" }, { key: "analyst", taskId: "analyst-1", status: "waiting" },
+    ])
+    const proposalRow = proposalEventRow(proposal)
+    const events: Array<Record<string, unknown>> = [proposalRow]
+    let revision = 2
+    let sequence = 0
+    let promotedContext: unknown
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 0, userId: scope.userId }], rowCount: 1 }
+      if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
+      if (sql.includes('SELECT item."id"')) return { rows: [{ id: itemId, revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
+      if (sql.includes('SELECT task."id", task."status"')) {
+        const ids = params?.[0] as string[]
+        return { rows: ids.map(id => taskRows.get(id)).filter(Boolean), rowCount: ids.length }
+      }
+      if (sql.includes('SELECT event."type", event."itemId"')) return { rows: events, rowCount: events.length }
+      if (sql.includes('SELECT step."id"')) return { rows: [], rowCount: 0 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks" SET "context"')) {
+        promotedContext = JSON.parse(String(params?.[5])) as unknown
+        const row = taskRows.get(String(params?.[0]))
+        if (row) row.status = "queued"
+        return { rows: [], rowCount: row ? 1 : 0 }
+      }
+      if (sql.startsWith('UPDATE "agent_items" AS item')) {
+        revision = Number(params?.[5])
+        return { rows: [{ stepId: null, status: "streaming", phase: null, startedAt: new Date("2026-09-01T00:00:00.000Z"), completedAt: null, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
+      }
+      if (sql.startsWith('UPDATE "agent_sessions" AS session')) return { rows: [{ eventSequence: String(++sequence) }], rowCount: 1 }
+      if (sql.startsWith('INSERT INTO "agent_events"')) {
+        events.push({ type: String(params?.[6]), itemId, taskId: scope.parentTaskId, idempotencyKey: String(params?.[9]), payload: JSON.parse(String(params?.[10])) as unknown })
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.startsWith('INSERT INTO "agent_outbox"') || sql.startsWith('DELETE FROM "agent_outbox"')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 0 }
+    })
+
+    await expect(reconcileGraphDependents({ query } as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))).resolves.toBeUndefined()
+
+    expect(taskRows.get("analyst-1")?.status).toBe("queued")
+    expect(promotedContext).toMatchObject({ taskGraphDependencyResults: { items: [{ dependencyKey: "writer", sourceIntent: {
+      goal: "Draft a letter", successCriteria: ["Ground it in the selected job"], inputRelation: "unknown",
+    } }] } })
+    expect(JSON.stringify(promotedContext)).not.toMatch(/stepId|inputId|inputThroughSequence|cursor/)
+  })
+
   it("does not queue an already queued node again when its dependency is healthy", async () => {
     const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
     const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
@@ -174,7 +242,10 @@ describe("reconcileGraphDependents", () => {
 
     await expect(reconcileGraphDependents(client as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))).resolves.toBeUndefined()
 
-    expect(client.query.mock.calls.every(([sql]) => sql.trimStart().startsWith("SELECT"))).toBe(true)
+    expect(client.query.mock.calls.every(([sql]) => {
+      const statement = sql.trimStart()
+      return statement.startsWith("SELECT") || statement.startsWith("WITH current_candidates")
+    })).toBe(true)
   })
 
   it.each(["waiting", "queued"] as const)("holds a %s dependent for same-Turn repair after an unverified typed prerequisite", async dependentStatus => {

@@ -6,6 +6,7 @@ import { taskGraphLifecycleKey, type StoredTaskGraphNode } from "./task-graph-sn
 import { isTaskGraphDependencyContextError, materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { loadScopedTaskGraphDependencyContext } from "./task-graph-pg-dependency-context-loader.js"
 import { enqueueReadyGraphTask } from "./task-graph-pg-dispatch.js"
+import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
 
 export type PreparedGraphTransition = Readonly<{
   scope: GraphIdentityScope
@@ -105,7 +106,7 @@ export async function reconcileGraphDependents(
   options: { stream?: boolean; allowClosedSession?: boolean } = {},
 ): Promise<void> {
   for (let pass = 0; pass < 8; pass++) {
-    const loaded = await loadTaskGraph(client, scope, true)
+    const loaded = await loadTaskGraph(client, scope, true, { includeSourceProvenance: true, discoverCurrentStep: true })
     if (!loaded.item || !loaded.snapshot || !loaded.state) throw new Error("task_graph_state_missing")
     const taskByKey = new Map(loaded.snapshot.nodes.map(node => [node.key, loaded.tasks.get(node.taskId)!] as const))
     const nodesByKey = new Map(loaded.snapshot.nodes.map(node => [node.key, node] as const))
@@ -175,8 +176,15 @@ export async function reconcileGraphDependents(
       let dependencyContext: unknown
       try {
         const contextRows = await loadScopedTaskGraphDependencyContext(client, scope, row.id, node.dependsOn, loaded.snapshot.nodes)
+        const dependencies = row.role === "analyst" ? contextRows.dependencies.map(dependency => {
+          const sourceNode = nodesByKey.get(dependency.key)
+          if (!sourceNode || !node.dependsOn.includes(sourceNode.key) || sourceNode.taskId !== dependency.taskId) return dependency
+          const sourceIntent = sourceIntentForTaskGraphNode(sourceNode,
+            loaded.sourceInputCheckpointByNodeKey?.get(sourceNode.key), loaded.currentInputCheckpoint)
+          return sourceIntent ? { ...dependency, sourceIntent } : dependency
+        }) : contextRows.dependencies
         dependencyContext = materializeTaskGraphDependencyContext(
-          contextRows.childContext, scope, node.dependsOn, contextRows.dependencies,
+          contextRows.childContext, scope, node.dependsOn, dependencies,
         )
       } catch (error) {
         if (!isTaskGraphDependencyContextError(error)) throw error

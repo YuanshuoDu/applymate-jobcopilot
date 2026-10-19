@@ -14,6 +14,11 @@ import { projectTaskGraphResult, taskGraphResultProjectionBytes, taskGraphResult
   TASK_GRAPH_RESULT_PROJECTION_ITEMS_TOTAL, TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT } from "./task-graph-result-projection.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { projectTaskGraphDiscoveryAttemptHealth } from "./task-graph-discovery-attempt-health.js"
+import {
+  loadTaskGraphSourceProvenance,
+  type TaskGraphInputRelation, type TaskGraphSourceCheckpoint,
+  type TaskGraphSourceLoadOptions,
+} from "./task-graph-pg-source-provenance.js"
 export type GraphIdentityScope = Pick<TaskGraphReadScope, "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId">
 export type GraphEventScope = GraphIdentityScope & Readonly<{ stepId?: string }>
 export type GraphScope = TaskGraphReadScope & Readonly<{ stepId?: string }>
@@ -26,7 +31,11 @@ export type LoadedGraph = Readonly<{
   item: GraphItem | null
   state: ReturnType<typeof taskGraphState> | null
   tasks: ReadonlyMap<string, GraphTaskRow>
+  sourceInputCheckpointByNodeKey?: ReadonlyMap<string, TaskGraphSourceCheckpoint | null>
+  sourceInputRelationByNodeKey?: ReadonlyMap<string, TaskGraphInputRelation>
+  currentInputCheckpoint?: TaskGraphSourceCheckpoint | null
 }>
+export type TaskGraphSourceOptions = TaskGraphSourceLoadOptions & Readonly<{ includeSourceProvenance?: boolean }>
 type Queryable = Pick<pg.PoolClient, "query">
 function nonEmpty(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
 function parseObject(value: unknown): Record<string, unknown> | null {
@@ -88,14 +97,17 @@ export async function lockTaskGraphScope(client: Queryable, scope: GraphScope, r
   if (leaseState.parentLeaseValid !== true) throw new Error("task_graph_parent_fenced")
   return parent.rows[0] as GraphParent
 }
-export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope, forUpdate = true): Promise<LoadedGraph> {
+export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope, forUpdate = true, options: TaskGraphSourceOptions = {}): Promise<LoadedGraph> {
   const item = await client.query(`SELECT item."id", item."revision", item."content", item."createdAt"
     FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
     WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
       AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5${forUpdate ? " FOR UPDATE OF item" : ""}`,
   [taskGraphItemId(scope.parentTaskId), scope.sessionId, scope.turnId, scope.parentTaskId, scope.userId])
-  if (!item.rows[0]) return { rootTaskId: scope.rootTaskId, item: null, snapshot: null, state: null, tasks: new Map() }
+  if (!item.rows[0]) return {
+    rootTaskId: scope.rootTaskId, item: null, snapshot: null, state: null, tasks: new Map(),
+    ...(options.includeSourceProvenance ? { sourceInputCheckpointByNodeKey: new Map(), sourceInputRelationByNodeKey: new Map() } : {}),
+  }
   const stored = item.rows[0] as Record<string, unknown>
   const snapshot = parseTaskGraphSnapshot(stored.content)
   const revision = Number(stored.revision)
@@ -122,7 +134,8 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
       failureReason: nonEmpty(row.failureReason) ? String(row.failureReason) : null, result: row.result ?? null,
     }]
   }))
-  const events = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload" FROM "agent_events" AS event
+  const events = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload",
+      event."actor", event."correlationId", event."causationId" FROM "agent_events" AS event
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3
@@ -134,11 +147,16 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
     const event = parsePersistedTaskGraphReceipt(row.type, row.payload, { id: String(stored.id), revision }, snapshot, scope, { itemId: row.itemId, taskId: row.taskId, idempotencyKey: row.idempotencyKey })
     if (event) appliedEvents.push(event)
   }
+  const sourceProvenance = options.includeSourceProvenance
+    ? await loadTaskGraphSourceProvenance(client, scope, { id: String(stored.id), revision }, snapshot, events.rows, options)
+    : undefined
   const baseState = taskGraphState(snapshot, revision, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), appliedEvents)
   const repairs = resolveTaskGraphRepairDependencies(snapshot, tasks, scope.rootTaskId)
   const state = { ...baseState, repairSatisfiedNodeKeys: repairs.satisfied, repairPendingNodeKeys: repairs.pending }
-  return revalidateTaskGraphDependencyBindings(client, scope, { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks })
+  const graph = await revalidateTaskGraphDependencyBindings(client, scope, { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks })
+  return sourceProvenance ? { ...graph, ...sourceProvenance } : graph
 }
+
 export async function hasPersistedTaskGraphMembership(client: Queryable, scope: GraphIdentityScope, taskId: string): Promise<boolean> {
   const result = await client.query(`SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload" FROM "agent_events" AS event
     JOIN "agent_sessions" AS session ON session."id" = event."sessionId"

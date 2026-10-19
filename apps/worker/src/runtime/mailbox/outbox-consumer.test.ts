@@ -169,6 +169,7 @@ class FakeClient {
       const rows = this.options.pendingInterrupt ? [{ id: "interrupt-intent" } as T] : []
       return { rows, rowCount: rows.length }
     }
+    if (sql.startsWith("WITH current_candidates AS MATERIALIZED")) return { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_outbox"') && sql.includes('"publishedAt" IS NULL')) {
       const limit = Number(values[1])
       const rows = this.outboxRows

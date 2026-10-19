@@ -19,6 +19,7 @@ import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-cat
 import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-structured-failure-category.js"
 import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
+import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -206,6 +207,11 @@ export type TaskGraphCurrentState = Readonly<{
   nodes: readonly TaskGraphCurrentNode[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
 }>
+/** Private planning read; checkpoint data stays outside the model-facing state. */
+export type TaskGraphPlanningCurrentState = Readonly<{
+  current: TaskGraphCurrentState & Readonly<{ sourceIntent: readonly TaskGraphSourceIntentNode[] }>
+  currentInputCheckpoint: TaskGraphSourceCheckpoint | null
+}>
 export class TaskGraphCommandError extends Error {
   constructor(readonly code: string, message: string, readonly currentRevision?: number) {
     super(message)
@@ -222,6 +228,10 @@ export type TaskGraphCommandPort = Readonly<{
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads current graph state using a caller-owned transaction and client. */
   readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
+  /** Root-only planning read with receipt-derived source intent and a private checkpoint for dependency promotion. */
+  readCurrentForPlanning?(scope: TaskGraphReadScope): Promise<TaskGraphPlanningCurrentState>
+  /** Reads planning provenance using a caller-owned transaction; checkpoint remains private to the context builder. */
+  readCurrentForPlanningWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphPlanningCurrentState>
   /** Reads one bounded advisory page from the current owner-fenced graph. */
   readCurrentResultPage?(scope: TaskGraphReadScope, request: TaskGraphResultPageRequest): Promise<TaskGraphResultPage>
   /** Reads unverified Scout IDs only from a reselected same-session prior Root. */
