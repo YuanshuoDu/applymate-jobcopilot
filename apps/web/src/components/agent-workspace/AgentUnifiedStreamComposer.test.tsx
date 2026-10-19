@@ -45,7 +45,7 @@ describe('Agent unified stream composer', () => {
     expect(formSource).toContain("onDraftPendingChange?.(isObjectiveDraftPending(nextState))")
 
     const sendStart = source.indexOf('async function sendChat')
-    const guardAt = source.indexOf('if (!canStartOrdinaryChat(objectiveDraftPendingRef.current))', sendStart)
+    const guardAt = source.indexOf('if (objectiveContextEntryAvailable && !canStartOrdinaryChat(objectiveDraftPendingRef.current))', sendStart)
     const sessionCreationAt = source.indexOf("fetch('/api/agent/sessions'", sendStart)
     expect(sendStart).toBeGreaterThanOrEqual(0)
     expect(guardAt).toBeGreaterThan(sendStart)

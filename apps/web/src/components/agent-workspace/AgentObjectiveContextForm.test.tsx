@@ -89,7 +89,7 @@ describe('AgentObjectiveContextForm', () => {
     expect(source).toContain('attachedFileCount > 0 || ordinaryComposerDraftPresent')
     expect(source).toContain('that content will not be sent or discarded here.')
     expect(source.match(/coordinatorRef\.current\?\.draftEdited\(\)/g)).toHaveLength(2)
-    const acceptedAt = source.indexOf("dispatch({ type: 'accepted' })")
+    const acceptedAt = source.indexOf("dispatchAction({ type: 'accepted' })")
     const callbackAt = source.indexOf('onAccepted(result.sessionId, result.objective)')
     expect(acceptedAt).toBeGreaterThanOrEqual(0)
     expect(callbackAt).toBeGreaterThan(acceptedAt)
