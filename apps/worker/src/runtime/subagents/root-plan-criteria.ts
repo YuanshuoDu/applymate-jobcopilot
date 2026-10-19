@@ -2,6 +2,9 @@ import { Buffer } from "node:buffer"
 import { TaskGraphCommandError } from "./task-graph-command-port.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { resolveRootTaskObjective } from "../context/root-task-objective.js"
+import type { SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
+import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import type { TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 
 const MAX_ADDITIONAL_CRITERIA = 4
 const MAX_ADDITIONAL_CRITERION_BYTES = 512
@@ -15,6 +18,36 @@ export type RootPlanCriteriaResolution = Readonly<{
 
 type RootPlanScope = Readonly<{ turnId: string; sessionId: string; userId: string; rootTaskId: string }>
 type RootPlanOwner = Readonly<{ goal?: unknown; successCriteria?: unknown }>
+export type SupersessionCallBinding = Readonly<{ replaceUnstartedNodeKey: string; replacementFingerprint?: string; source?: TaskGraphSupersessionRelation["source"]; replacementNode?: StoredTaskGraphNode; callId?: string; stepId?: string; operationKey?: string }>
+
+type CallMatchDependencies = Readonly<{
+  object: (value: unknown) => Record<string, unknown> | null
+  validToolCall: typeof import("./steering-reconciliation-contract.js").validSteeringReconciliationToolCall
+  normalizedProposalNode: (value: unknown, rootTaskId: string) => Record<string, unknown> | null
+  fingerprint: typeof import("./task-graph-pg-supersession.js").taskGraphSupersessionFingerprint
+  sameProposalNode: (proposal: Record<string, unknown>, stored: StoredTaskGraphNode) => boolean
+}>
+
+export function callMatches(
+  row: Record<string, unknown>, scope: SteeringReconciliationScope, stepId: string, decision: "keep" | "revise", revision: number,
+  binding: SupersessionCallBinding | undefined, dependencies: CallMatchDependencies,
+): boolean {
+  const matches = dependencies.validToolCall({ type: row.type, actor: row.actor, taskId: row.eventTaskId, itemId: row.eventItemId,
+    correlationId: row.correlationId, idempotencyKey: row.idempotencyKey, payload: row.payload },
+  { id: row.callItemId, stepId: row.stepId, taskId: row.itemTaskId, type: row.itemType, content: row.itemContent }, scope, stepId, decision, revision,
+  binding?.replaceUnstartedNodeKey)
+  if (!matches || !binding?.replacementFingerprint) return matches
+  const content = dependencies.object(row.itemContent), input = dependencies.object(content?.input)
+  const node = input && Array.isArray(input.nodes) && input.nodes.length === 1
+    ? dependencies.normalizedProposalNode(input.nodes[0], scope.rootTaskId) : null
+  const hasRootSuccessCriteria = Boolean(input && Object.hasOwn(input, "rootSuccessCriteria"))
+  const rootSuccessCriteria = hasRootSuccessCriteria ? normalizeRootPlanCriteria(input?.rootSuccessCriteria) : undefined
+  if (rootSuccessCriteria === null || hasRootSuccessCriteria && rootSuccessCriteria === undefined) return false
+  return Boolean(input && node && binding.source && dependencies.fingerprint(binding.source, {
+    expectedRevision: revision, replaceUnstartedNodeKey: binding.replaceUnstartedNodeKey, nodes: [node],
+    rootSuccessCriteria,
+  }) === binding.replacementFingerprint && (binding.replacementNode === undefined || dependencies.sameProposalNode(node, binding.replacementNode)))
+}
 
 /** Normalizes only outer whitespace; the accepted wording remains otherwise unchanged. */
 export function normalizeRootPlanCriteria(value: unknown): readonly string[] | undefined | null {
