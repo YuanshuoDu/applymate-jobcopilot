@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import { executionKey } from "../turns/turn-execution-types.js"
+import { normalizeRootPlanCriteria } from "./root-plan-criteria.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { parseTaskGraphSupersessionRelation, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 
@@ -107,9 +108,16 @@ export function validSteeringReconciliationToolCall(event: Row, item: Row, scope
   const call = record(event.payload), content = record(item.content), input = record(content?.input)
   const toolName = decision === "keep" ? "agent.reconcile" : "agent.plan"
   const callId = call?.toolCallId
-  const expectedInputKeys = decision === "keep" ? "decision,expectedRevision"
-    : replaceUnstartedNodeKey === undefined ? "expectedRevision,nodes" : "expectedRevision,nodes,replaceUnstarted"
+  const inputKeys = input ? Object.keys(input).sort().join(",") : ""
+  const hasRootSuccessCriteria = Boolean(input && Object.hasOwn(input, "rootSuccessCriteria"))
+  const normalizedRootSuccessCriteria = hasRootSuccessCriteria ? normalizeRootPlanCriteria(input?.rootSuccessCriteria) : undefined
+  const expectedInputKeys = decision === "keep" ? ["decision,expectedRevision"]
+    : replaceUnstartedNodeKey === undefined
+      ? ["expectedRevision,nodes", "expectedRevision,nodes,rootSuccessCriteria"]
+      : ["expectedRevision,nodes,replaceUnstarted", "expectedRevision,nodes,replaceUnstarted,rootSuccessCriteria"]
   const replacement = record(input?.replaceUnstarted)
+  const validInputShape = expectedInputKeys.includes(inputKeys)
+    && (!hasRootSuccessCriteria || normalizedRootSuccessCriteria !== null && normalizedRootSuccessCriteria !== undefined)
   const scoped: TaskGraphExecutionScope = { ...scope, stepId }
   const executionIdentity = { kind: "turn" as const, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner,
@@ -123,7 +131,7 @@ export function validSteeringReconciliationToolCall(event: Row, item: Row, scope
     && call.toolCallId === callId && call.toolName === toolName && call.taskId === scope.rootTaskId
     && item.stepId === stepId && item.taskId === scope.rootTaskId && item.type === "tool_call"
     && content?.toolCallId === callId && content.toolName === toolName && content.toolVersion === "1" && input
-    && Object.keys(input).sort().join(",") === expectedInputKeys && input.expectedRevision === expectedRevision
+    && validInputShape && input.expectedRevision === expectedRevision
     && (decision === "keep" ? input.decision === "keep" : Array.isArray(input.nodes)
       && input.nodes.length > 0 && (replaceUnstartedNodeKey === undefined
         || input.nodes.length === 1 && steeringReconciliationId(replaceUnstartedNodeKey)

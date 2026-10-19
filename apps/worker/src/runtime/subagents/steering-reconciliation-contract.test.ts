@@ -130,6 +130,29 @@ describe("steering reconciliation receipt contract", () => {
     expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0)).toBe(false)
   })
 
+  it("accepts bounded optional root criteria on reconciled agent.plan calls and preserves the stored input", () => {
+    const callId = "call-revise"
+    const event = { type: "tool_call.started", actor: "orchestrator", taskId: scope.rootTaskId, itemId: "plan-item",
+      correlationId: callId, idempotencyKey: toolStartKey(callId),
+      payload: { toolCallId: callId, toolName: "agent.plan", taskId: scope.rootTaskId } }
+    const makeItem = (input: Record<string, unknown>) => ({ id: "plan-item", stepId: scope.stepId, taskId: scope.rootTaskId, type: "tool_call",
+      content: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input } })
+    const criteria = ["  Include evidence for each role  ", "Include evidence for each role", "Keep the full search scope", "Keep the timeline"]
+    const item = makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria: criteria })
+
+    expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0)).toBe(true)
+    expect(item.content.input.rootSuccessCriteria).toEqual(criteria)
+    expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }] }), scope, scope.stepId, "revise", 0)).toBe(true)
+
+    const invalidCriteria: unknown[] = [[], Array.from({ length: 5 }, () => "criterion"), ["  "], ["x".repeat(513)], ["💼".repeat(129)]]
+    for (const rootSuccessCriteria of invalidCriteria) {
+      expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria }),
+        scope, scope.stepId, "revise", 0)).toBe(false)
+    }
+    expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria: ["💼".repeat(128)] }),
+      scope, scope.stepId, "revise", 0)).toBe(true)
+  })
+
   it("requires the exact source key and a single node on a supersession agent.plan call", () => {
     const callId = "call-revise"
     const event = { type: "tool_call.started", actor: "orchestrator", taskId: scope.rootTaskId, itemId: "call-item",
@@ -138,11 +161,16 @@ describe("steering reconciliation receipt contract", () => {
     const item = { id: "call-item", stepId: scope.stepId, taskId: scope.rootTaskId, type: "tool_call",
       content: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input: {
         expectedRevision: 0, nodes: [{ key: "fresh-scout" }], replaceUnstarted: { nodeKey: "stale-scout" },
+        rootSuccessCriteria: ["Include evidence for each role"],
       } } }
     expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(true)
     expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0)).toBe(false)
     expect(validSteeringReconciliationToolCall(event, item, scope, scope.stepId, "revise", 0, "other-node")).toBe(false)
     const multiNode = { ...item, content: { ...item.content, input: { ...item.content.input, nodes: [{ key: "a" }, { key: "b" }] } } }
     expect(validSteeringReconciliationToolCall(event, multiNode, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(false)
+    const malformedCriteria = { ...item, content: { ...item.content, input: { ...item.content.input, rootSuccessCriteria: [] } } }
+    expect(validSteeringReconciliationToolCall(event, malformedCriteria, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(false)
+    const missingSource = { ...item, content: { ...item.content, input: { ...item.content.input, replaceUnstarted: undefined } } }
+    expect(validSteeringReconciliationToolCall(event, missingSource, scope, scope.stepId, "revise", 0, "stale-scout")).toBe(false)
   })
 })

@@ -45,6 +45,9 @@ type FakePoolOptions = {
   graphContent?: unknown
   graphRevision?: number
   taskRows?: Array<Record<string, unknown>>
+  rootGoal?: string
+  rootCriteria?: readonly string[]
+  turnInput?: unknown
   sourceStepRows?: Array<Record<string, unknown>>
   replayPayload?: unknown
   sourceEvidence?: Record<string, unknown>
@@ -146,8 +149,13 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
       if (sql.startsWith('SELECT "id" FROM "agent_turns"')) {
         return options.failFence === "turn" ? empty : { rows: [{ id: input.scope.turnId }], rowCount: 1 }
       }
+      if (sql.startsWith('SELECT "input" FROM "agent_turns"')) {
+        return { rows: [{ input: options.turnInput }], rowCount: 1 }
+      }
       if (sql.startsWith('SELECT task.*, session."userId" AS "userId"')) {
-        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, role: "orchestrator", taskType: "root", budgetSnapshot: {}, allowedActions: options.allowedActions ?? ["agent.plan"] }], rowCount: 1 }
+        return options.failFence === "parent" ? empty : { rows: [{ id: input.scope.parentTaskId, goal: options.rootGoal,
+          role: "orchestrator", taskType: "root", budgetSnapshot: {}, allowedActions: options.allowedActions ?? ["agent.plan"],
+          successCriteria: options.rootCriteria ?? [] }], rowCount: 1 }
       }
       if (sql.startsWith('SELECT "id" FROM "agent_steps"')) {
         return { rows: [{ id: input.scope.stepId }], rowCount: 1 }
@@ -254,6 +262,52 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(taskUpdates).toHaveLength(1)
     expect(taskUpdates[0]?.values[0]).toBe(sourceNode.taskId)
     expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
+  })
+
+  it("pins additional root criteria and binds the combined supersession fingerprint", async () => {
+    const fixture = supersessionFixture(), goal = "Refresh Dublin roles", rootSuccessCriteria = ["Include evidence for each role"]
+    const input = { ...fixture.input, rootSuccessCriteria }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: fixture.graphContent,
+      rootGoal: goal, turnInput: { goal, content: goal }, taskRows: fixture.taskRows, sourceEvidence: fixture.sourceEvidence })
+    const finalNode = { ...fixture.replacementNode, depth: 1, taskId: "replacement-task", verificationDisposition: "typed" }
+    reconciliationMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+    reconciliationMocks.writeLifecycleIdentity.mockResolvedValueOnce({ id: "cancel-event", sequence: "11", revision: 2 })
+    reconciliationMocks.create.mockResolvedValueOnce({ state: { revision: 3, nodes: [{ ...finalNode, status: "queued" }], appliedEvents: [] },
+      snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [finalNode] },
+      created: [{ key: finalNode.key, taskId: finalNode.taskId, status: "queued" as const }], readyTaskIds: [finalNode.taskId] })
+    reconciliationMocks.writePlanIdentity.mockResolvedValueOnce({ id: "plan-event", sequence: "12" })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, fixture.operation)).resolves.toMatchObject({
+      status: "accepted", revision: 3,
+    })
+
+    const planInput = reconciliationMocks.writePlanIdentity.mock.calls[0]?.[1] as Record<string, unknown>
+    const expectedFingerprint = taskGraphSupersessionFingerprint({ nodeKey: fixture.sourceNode.key, taskId: fixture.sourceNode.taskId }, {
+      expectedRevision: 1, replaceUnstartedNodeKey: fixture.sourceNode.key, nodes: [fixture.replacementNode], rootSuccessCriteria,
+    })
+    expect(planInput.fingerprint).toBe(expectedFingerprint)
+    expect(planInput.snapshot).toMatchObject({ rootSuccessCriteria: [goal, ...rootSuccessCriteria] })
+    expect(expectedFingerprint).not.toBe(taskGraphSupersessionFingerprint({ nodeKey: fixture.sourceNode.key, taskId: fixture.sourceNode.taskId }, {
+      expectedRevision: 1, replaceUnstartedNodeKey: fixture.sourceNode.key, nodes: [fixture.replacementNode],
+    }))
+  })
+
+  it("preserves an existing root checklist when a supersession omits additional criteria", async () => {
+    const fixture = supersessionFixture(), goal = "Refresh Dublin roles", pinned = [goal, "Keep verified evidence"]
+    const graphContent = { ...fixture.graphContent, rootSuccessCriteria: pinned }
+    const fake = fakePool(fixture.input, { includeReplay: false, graphRevision: 1, graphContent, rootGoal: goal,
+      turnInput: { goal, content: goal }, taskRows: fixture.taskRows, sourceEvidence: fixture.sourceEvidence })
+    const finalNode = { ...fixture.replacementNode, depth: 1, taskId: "replacement-task", verificationDisposition: "typed" }
+    reconciliationMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+    reconciliationMocks.writeLifecycleIdentity.mockResolvedValueOnce({ id: "cancel-event", sequence: "11", revision: 2 })
+    reconciliationMocks.create.mockResolvedValueOnce({ state: { revision: 3, nodes: [{ ...finalNode, status: "queued" }], appliedEvents: [] },
+      snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [finalNode] },
+      created: [{ key: finalNode.key, taskId: finalNode.taskId, status: "queued" as const }], readyTaskIds: [finalNode.taskId] })
+    reconciliationMocks.writePlanIdentity.mockResolvedValueOnce({ id: "plan-event", sequence: "12" })
+
+    await createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(fixture.input, fixture.operation)
+
+    expect(reconciliationMocks.writePlanIdentity.mock.calls[0]?.[1]).toMatchObject({ snapshot: { rootSuccessCriteria: pinned } })
   })
 
   it("preserves the superseded source's nonempty prerequisites on its replacement", async () => {
@@ -403,17 +457,24 @@ describe("createPgTaskGraphCommandPort", () => {
   })
 
   it("returns an exact stale supersession replay before source eligibility or revision rejection", async () => {
-    const fixture = supersessionFixture(), finalNode = { ...fixture.replacementNode, depth: 1, taskId: "replacement-task", verificationDisposition: "typed" }
+    const fixture = supersessionFixture(), goal = "Refresh Dublin roles", rootSuccessCriteria = ["Include evidence for each role"]
+    const input = { ...fixture.input, rootSuccessCriteria }
+    const fingerprint = taskGraphSupersessionFingerprint({ nodeKey: fixture.sourceNode.key, taskId: fixture.sourceNode.taskId }, {
+      expectedRevision: 1, replaceUnstartedNodeKey: fixture.sourceNode.key, nodes: [fixture.replacementNode], rootSuccessCriteria,
+    })
+    const relation = { ...fixture.relation, replacementFingerprint: fingerprint }
+    const finalNode = { ...fixture.replacementNode, depth: 1, taskId: "replacement-task", verificationDisposition: "typed" }
     const prepared = { ...fixture.prepared, resultingRevision: 3, receipt: { ...fixture.prepared.receipt,
-      schemaVersion: "agent-harness.v2.plan-reconciliation.v2", resultingRevision: 3, supersession: fixture.relation } }
-    const replayPayload = { kind: "proposal", fingerprint: fixture.fingerprint, operationKey: fixture.operationKey,
+      schemaVersion: "agent-harness.v2.plan-reconciliation.v2", resultingRevision: 3, supersession: relation } }
+    const replayPayload = { kind: "proposal", fingerprint, operationKey: fixture.operationKey,
       observedRevision: 1, revision: 3, receipt: { revision: 3, nodes: [{ key: finalNode.key, taskId: finalNode.taskId, status: "queued" }], readyTaskIds: [finalNode.taskId] } }
-    const fake = fakePool(fixture.input, { graphRevision: 3, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [finalNode] },
+    const fake = fakePool(input, { graphRevision: 3, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, rootSuccessCriteria: [goal, ...rootSuccessCriteria], nodes: [finalNode] },
+      rootGoal: goal, turnInput: { goal, content: goal },
       taskRows: [{ id: finalNode.taskId, status: "queued", role: "analyst", taskType: "research", expectedOutputSchema: {}, attemptCount: 0, failureReason: null, result: null }],
       replayPayload })
     reconciliationMocks.prepare.mockResolvedValueOnce(prepared)
 
-    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(fixture.input, fixture.operation)).resolves.toMatchObject({
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, fixture.operation)).resolves.toMatchObject({
       status: "duplicate", revision: 3, nodes: [{ key: finalNode.key, taskId: finalNode.taskId }],
     })
     expect(reconciliationMocks.prepare).toHaveBeenCalledOnce()
@@ -461,6 +522,22 @@ describe("createPgTaskGraphCommandPort", () => {
 
     await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(changedInput, fixture.operation)).rejects.toMatchObject({
       code: "idempotency_conflict",
+    })
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlanIdentity).not.toHaveBeenCalled()
+    expect(reconciliationMocks.write).not.toHaveBeenCalled()
+  })
+
+  it("conflicts when a committed supersession retries with a changed pinned checklist", async () => {
+    const fixture = supersessionFixture(), goal = "Refresh Dublin roles", pinnedAdditional = ["Include evidence for each role"]
+    const input = { ...fixture.input, rootSuccessCriteria: ["Change the checklist"] }
+    const finalNode = { ...fixture.replacementNode, depth: 1, taskId: "replacement-task", verificationDisposition: "typed" }
+    const fake = fakePool(input, { graphRevision: 3, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      rootSuccessCriteria: [goal, ...pinnedAdditional], nodes: [finalNode] }, rootGoal: goal, turnInput: { goal, content: goal },
+      taskRows: [{ id: finalNode.taskId, status: "queued", role: "analyst", taskType: "research", expectedOutputSchema: {}, attemptCount: 0, failureReason: null, result: null }] })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, fixture.operation)).rejects.toMatchObject({
+      code: "root_success_criteria_conflict",
     })
     expect(reconciliationMocks.create).not.toHaveBeenCalled()
     expect(reconciliationMocks.writePlanIdentity).not.toHaveBeenCalled()
@@ -1055,6 +1132,50 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_items"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))).toBe(false)
+  })
+
+  it("rejects a pinned requirement that would exceed the 32-item owned verifier set before writes", async () => {
+    const goal = "Original goal"
+    const rootCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `root ${index}`)]
+    const turnCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `turn ${index}`)]
+    const input = { ...scheduleInput(1), rootSuccessCriteria: ["new requirement"] }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, rootGoal: goal, rootCriteria,
+      turnInput: { goal, content: goal, successCriteria: turnCriteria } })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "root_success_criteria_invalid",
+    })
+
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT "input" FROM "agent_turns"'))).toBe(true)
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+  })
+
+  it("accepts a pinned requirement already present in the 32-item owned verifier set", async () => {
+    const goal = "Original goal"
+    const rootCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `root ${index}`)]
+    const turnCriteria = ["shared", ...Array.from({ length: 15 }, (_, index) => `turn ${index}`)]
+    const input = { ...scheduleInput(1), rootSuccessCriteria: ["root 14"] }
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, rootGoal: goal, rootCriteria,
+      turnInput: { goal, content: goal, successCriteria: turnCriteria } })
+    reconciliationMocks.create.mockResolvedValueOnce({
+      state: { revision: 2, nodes: [] }, snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] }, created: [], readyTaskIds: [],
+    })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).resolves.toEqual({
+      status: "accepted", revision: 2, nodes: [], readyTaskIds: [],
+    })
+
+    expect(reconciliationMocks.create).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan).toHaveBeenCalledOnce()
+    expect(reconciliationMocks.writePlan.mock.calls[0]?.[1]).toMatchObject({
+      snapshot: { rootSuccessCriteria: [goal, "root 14"] },
+    })
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
   })
 
   it.each([0, 1])("refuses a new plan with only %i shared Turn step(s) remaining and rolls back before writes", async remaining => {

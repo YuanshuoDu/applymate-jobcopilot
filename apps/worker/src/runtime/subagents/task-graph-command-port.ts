@@ -137,6 +137,8 @@ export type TaskGraphScheduleInput = Readonly<{
   scope: TaskGraphExecutionScope
   proposal: TaskGraphProposal
   templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+  /** Additional untrusted acceptance criteria pinned for the active Root. */
+  rootSuccessCriteria?: readonly string[]
   /** Present only for the atomic native Root typed-leaf supersession path. */
   replaceUnstarted?: Readonly<{ nodeKey: string }>
   /** Server-resolved from the persisted Turn objective; never populated from model tool input. */
@@ -205,6 +207,7 @@ export type TaskGraphCurrentNode = Readonly<{
 export type TaskGraphCurrentState = Readonly<{
   revision: number
   nodes: readonly TaskGraphCurrentNode[]
+  rootSuccessCriteria?: readonly string[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
 }>
 /** Private planning read; checkpoint data stays outside the model-facing state. */
