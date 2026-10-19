@@ -134,6 +134,37 @@ describe("agent event redaction", () => {
     })
   })
 
+  it("preserves follow-up IDs inside versioned AgentItem payloads while redacting text", () => {
+    const messageId = "message-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "input.accepted",
+      body: "Call 4912-9422 about this follow-up.",
+      data: {
+        messageId,
+        item: {
+          schemaVersion: "agent-item.v2",
+          id: "item-0be414dd-f9ec-4912-9422-a3db3100ea4f",
+          sessionId,
+          turnId,
+          type: "user_message",
+          taskId,
+          content: { parts: [{ type: "text", text: "Call 4912-9422." }] },
+        },
+        note: "Call 4912-9422.",
+      },
+    }).data as {
+      messageId: string
+      item: { taskId: string; content: unknown }
+      note: string
+    }
+
+    expect(safe.messageId).toBe(messageId)
+    expect(safe.item.taskId).toBe(taskId)
+    expect(safe.item.content).toBe("[REDACTED]")
+    expect(safe.note).toBe("Call [REDACTED_PHONE].")
+  })
+
   it("redacts IDs in unsupported versioned envelopes with partial identity", () => {
     const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
     const safe = redactAgentEvent({
@@ -143,6 +174,76 @@ describe("agent event redaction", () => {
     }).data as Record<string, unknown>
 
     expect(safe.taskId).not.toBe(taskId)
+    expect(JSON.stringify(safe)).not.toContain(taskId)
+  })
+
+  it("redacts IDs in incomplete Agent namespace envelopes without anchors", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "future.agent.event",
+      body: "",
+      data: { schemaVersion: "agent-harness.v3", item: { taskId } },
+    }).data as { item: { taskId: string } }
+
+    expect(safe.item.taskId).not.toBe(taskId)
+    expect(JSON.stringify(safe)).not.toContain(taskId)
+  })
+
+  it("preserves structural IDs in unrelated versioned payloads with event-like fields", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "report.updated",
+      body: "Call 4912-9422 about this report.",
+      data: {
+        schemaVersion: "report.v1",
+        type: "report.updated",
+        taskId,
+        payload: { taskId, note: "Call 4912-9422." },
+      },
+    })
+
+    expect(safe.body).toBe("Call [REDACTED_PHONE] about this report.")
+    expect(safe.data).toEqual({
+      schemaVersion: "report.v1",
+      type: "report.updated",
+      taskId,
+      payload: { taskId, note: "Call [REDACTED_PHONE]." },
+    })
+  })
+
+  it("redacts IDs in unsupported versioned envelopes with payload only", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "future.agent.event",
+      body: "",
+      data: { schemaVersion: "agent-harness.v3", payload: { taskId } },
+    }).data as { payload: { taskId: string } }
+
+    expect(safe.payload.taskId).not.toBe(taskId)
+    expect(JSON.stringify(safe)).not.toContain(taskId)
+  })
+
+  it("redacts IDs in Agent namespace payloads with nonstandard version suffixes", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "future.agent.event",
+      body: "",
+      data: { schemaVersion: "agent-harness.v3-beta", payload: { taskId } },
+    }).data as { payload: { taskId: string } }
+
+    expect(safe.payload.taskId).not.toBe(taskId)
+    expect(JSON.stringify(safe)).not.toContain(taskId)
+  })
+
+  it("redacts IDs when a non-string schema version accompanies a payload", () => {
+    const taskId = "child-0be414dd-f9ec-4912-9422-a3db3100ea4f"
+    const safe = redactAgentEvent({
+      type: "future.agent.event",
+      body: "",
+      data: { schemaVersion: 3, payload: { taskId } },
+    }).data as { payload: { taskId: string } }
+
+    expect(safe.payload.taskId).not.toBe(taskId)
     expect(JSON.stringify(safe)).not.toContain(taskId)
   })
 

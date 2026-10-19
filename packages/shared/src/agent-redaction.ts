@@ -11,10 +11,10 @@ const SENSITIVE_PHONE = /(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)/g
 const SENSITIVE_ASSIGNMENT = /\b(password|secret|token|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi
 const EVENT_SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|(?:full[_-]?)?resume(?:[_-]?(?:text|content|data))?|cv(?:[_-]?(?:text|content|data))?|raw[_-]?(?:content|text|data)|content|value|question|answer|sensitive|confirmed[_-]?answers)/i
 const EVENT_SAFE_KEY = new Set(["approvalid", "draft", "id", "receiptnonce", "scopehash"])
-const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid", "id", "intentid", "itemid", "questionid", "sessionid", "taskid", "toolcallid", "turnid", "waitid"])
+const STRUCTURAL_ID_KEY = new Set(["approvalid", "causationid", "correlationid", "id", "intentid", "itemid", "messageid", "questionid", "sessionid", "taskid", "toolcallid", "turnid", "waitid"])
 const ROUTED_AGENT_EVENT_TYPE = new Set(["approval.resolved", "item.started", "question.answered", "task.interrupt.accepted", "turn.wakeup"])
 const AGENT_EVENT_SCHEMA_VERSION = "agent-harness.v2"
-const AGENT_EVENT_SCHEMA_VERSION_PATTERN = /^agent-harness\.v\d+$/
+const AGENT_EVENT_SCHEMA_NAMESPACE = "agent-harness."
 const AGENT_EVENT_ENVELOPE_ANCHORS = ["actor", "causationId", "correlationId", "createdAt", "id", "idempotencyKey", "itemId", "sequence", "sessionId", "taskId", "turnId", "type"]
 const AGENT_EVENT_ENVELOPE_CORE_IDENTITY = ["id", "sessionId", "turnId", "type"]
 const EVENT_REDACTION_MAX_DEPTH = 8
@@ -105,10 +105,14 @@ function containsAgentEventEnvelopeShape(value: unknown, depth = 0): boolean {
   const entries = Object.entries(row)
   const keys = new Set(entries.map(([key]) => key.toLowerCase()))
   const hasEnvelopeAnchor = AGENT_EVENT_ENVELOPE_ANCHORS.some(key => keys.has(key.toLowerCase()))
+  const hasSchemaVersion = keys.has("schemaversion")
   const schemaVersion = entries.find(([key]) => key.toLowerCase() === "schemaversion")?.[1]
-  const envelopeShape = typeof schemaVersion === "string" && AGENT_EVENT_SCHEMA_VERSION_PATTERN.test(schemaVersion) && hasEnvelopeAnchor
-    || keys.has("payload") && hasEnvelopeAnchor
-    || AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
+  const versionedAgentEnvelope = typeof schemaVersion === "string" && schemaVersion.toLowerCase().startsWith(AGENT_EVENT_SCHEMA_NAMESPACE)
+  const malformedVersionedEnvelope = hasSchemaVersion && typeof schemaVersion !== "string"
+    && (keys.has("payload") || hasEnvelopeAnchor)
+  const unversionedPartialEnvelope = !hasSchemaVersion && keys.has("payload") && hasEnvelopeAnchor
+  const envelopeShape = versionedAgentEnvelope || malformedVersionedEnvelope || unversionedPartialEnvelope
+    || !hasSchemaVersion && AGENT_EVENT_ENVELOPE_CORE_IDENTITY.every(key => keys.has(key.toLowerCase()))
   return envelopeShape || entries.some(([, entry]) => containsAgentEventEnvelopeShape(entry, depth + 1))
 }
 
