@@ -135,10 +135,9 @@ describe("agent event redaction", () => {
   })
 
   it("preserves follow-up IDs inside versioned AgentItem payloads while redacting text", () => {
-    const messageId = "12345678-1234-5678-1234-123456789011"
+    const messageId = "00004912-9422-5000-8000-000000000001"
     const itemId = "12345678-1234-5678-1234-123456789012"
     const taskId = "child-12345678-1234-5678-1234-123456789013"
-    const stepId = "12345678-1234-5678-1234-123456789014"
     const payload = {
       messageId,
       clientMessageId: "client-once",
@@ -151,7 +150,7 @@ describe("agent event redaction", () => {
         id: itemId,
         sessionId,
         turnId,
-        stepId,
+        stepId: null,
         taskId,
         type: "user_message",
         status: "completed",
@@ -174,32 +173,157 @@ describe("agent event redaction", () => {
     })
     const safe = result.data as {
       messageId: string
-      item: { id: string; taskId: string; stepId: string; content: unknown }
+      item: { id: string; taskId: string; stepId: null; content: unknown }
     }
 
     expect(result.body).toBe("Call [REDACTED_PHONE] about this follow-up.")
-    expect(safe.messageId).toBe("[REDACTED]")
+    expect(safe.messageId).toBe(messageId)
     expect(safe.item.id).toBe(itemId)
     expect(safe.item.taskId).toBe(taskId)
-    expect(safe.item.stepId).toBe(stepId)
+    expect(safe.item.stepId).toBeNull()
     expect(safe.item.content).toBe("[REDACTED]")
     const serialized = JSON.stringify(safe)
-    for (const id of [itemId, taskId, stepId]) expect(serialized).toContain(id)
-    expect(serialized).not.toContain(messageId)
+    for (const id of [messageId, itemId, taskId]) expect(serialized).toContain(id)
     expect(serialized).not.toContain("Call 4912-9422.")
+
+    const twice = redactAgentEvent({ type: "input.accepted", body: "", data: result.data, routing }).data as typeof safe
+    expect(twice.messageId).toBe(messageId)
+    expect(twice.item).toMatchObject({ id: itemId, taskId, stepId: null, content: "[REDACTED]" })
+
+    const sparseWithoutRoute = redactAgentEvent({ type: "input.accepted", body: "", data: { messageId } }).data as { messageId: string }
+    expect(sparseWithoutRoute.messageId).toBe("[REDACTED]")
+    for (const invalidMessageId of ["message-once", "4912-9422", "sk_test_private_secret"]) {
+      const invalid = redactAgentEvent({ type: "input.accepted", body: "", data: { ...payload, messageId: invalidMessageId }, routing }).data as { messageId: string }
+      expect(invalid.messageId).toBe("[REDACTED]")
+      expect(JSON.stringify(invalid)).not.toContain(invalidMessageId)
+    }
 
     const mismatched = redactAgentEvent({ type: "input.accepted", body: "", data: payload,
       routing: { ...routing, itemId: "other-item-12345678-1234-5678-1234-123456789099" } }).data as {
-      item: { id: string; taskId: string; stepId: string; content: unknown }
+      messageId: string; item: { id: string; taskId: string; stepId: null; content: unknown }
     }
+    expect(mismatched.messageId).toBe("[REDACTED]")
     expect(mismatched.item.id).toBe("[REDACTED]")
     expect(mismatched.item.taskId).toBe("[REDACTED]")
-    expect(mismatched.item.stepId).toBe("[REDACTED]")
+    expect(mismatched.item.stepId).toBeNull()
     expect(mismatched.item.content).toBe("[REDACTED]")
-    expect(JSON.stringify(mismatched)).not.toContain(stepId)
+    expect(JSON.stringify(mismatched)).not.toContain(itemId)
+    expect(JSON.stringify(mismatched)).not.toContain(taskId)
 
-    const unboundStepId = redactAgentEvent({ type: "task.updated", body: "", data: { stepId } }).data as { stepId: string }
+    for (const malformedItem of [
+      { ...payload.item, type: "tool_call" },
+      { ...payload.item, type: "future.agent.event" },
+      { ...payload.item, status: "started" },
+      { ...payload.item, phase: "final_answer" },
+      { ...payload.item, revision: 1 },
+      { ...payload.item, stepId: "12345678-1234-5678-1234-123456789014" },
+    ]) {
+      const malformed = redactAgentEvent({ type: "input.accepted", body: "", data: { ...payload, item: malformedItem }, routing }).data as {
+        messageId: string; item: { id: string; taskId: string; content: unknown }
+      }
+      expect(malformed.messageId).toBe("[REDACTED]")
+      expect(malformed.item.id).toBe("[REDACTED]")
+      expect(malformed.item.taskId).toBe("[REDACTED]")
+      expect(malformed.item.content).toBe("[REDACTED]")
+    }
+
+    for (const candidate of [
+      { type: "task.updated", data: payload },
+      { type: "input.accepted", data: { ...payload, delivery: "other" } },
+      { type: "input.accepted", data: { ...payload, unexpected: true } },
+    ]) {
+      const unrelated = redactAgentEvent({ ...candidate, body: "", routing }).data as { messageId: string }
+      expect(unrelated.messageId).toBe("[REDACTED]")
+    }
+    for (const wrongRoute of [
+      { ...routing, actor: "orchestrator" as const },
+      { ...routing, outboxTopic: "agent.turn.wakeup" as const },
+      { ...routing, correlationId: "other-correlation-12345678-1234-5678-1234-123456789099" },
+    ]) {
+      const unrelated = redactAgentEvent({ type: "input.accepted", body: "", data: payload, routing: wrongRoute }).data as { messageId: string }
+      expect(unrelated.messageId).toBe("[REDACTED]")
+    }
+
+    const unboundStepId = redactAgentEvent({ type: "task.updated", body: "", data: { stepId: itemId } }).data as { stepId: string }
     expect(unboundStepId.stepId).toBe("[REDACTED]")
+  })
+
+  it("preserves only matching session-control and cancelled approval-wait IDs", () => {
+    const controlRouting: AgentEventRoutingContext = { sessionId, turnId, itemId: null, taskId: null,
+      actor: "user", correlationId: turnId, causationId: null, outboxTopic: "agent.session.event" }
+    const controlPayload = { turnId, expectedRevision: 4, requestedAt: "2026-10-06T17:30:00.000Z" }
+    const control = redactAgentEvent({ type: "session.pause_requested", body: "", data: controlPayload, routing: controlRouting }).data as typeof controlPayload
+    expect(control.turnId).toBe(turnId)
+    const mismatchedControl = redactAgentEvent({ type: "session.pause_requested", body: "", data: { ...controlPayload, turnId: sessionId }, routing: controlRouting }).data as typeof controlPayload
+    expect(mismatchedControl.turnId).toBe("[REDACTED]")
+    const wrongControlActor = redactAgentEvent({ type: "session.pause_requested", body: "", data: controlPayload,
+      routing: { ...controlRouting, actor: "system" } }).data as typeof controlPayload
+    expect(wrongControlActor.turnId).toBe("[REDACTED]")
+
+    const approvalId = "approval_4912-9422"
+    const approvalPayload = { approvalId, action: "submit_application", scopeHash: `sha256:${"a".repeat(64)}`, revision: 2 }
+    const approvalRouting: AgentEventRoutingContext = { ...controlRouting, actor: "orchestrator", correlationId: approvalId }
+    const requested = redactAgentEvent({ type: "approval.requested", body: "", data: approvalPayload, routing: approvalRouting }).data as typeof approvalPayload
+    expect(requested.approvalId).toBe(approvalId)
+    for (const wrongRoute of [
+      { ...approvalRouting, actor: "user" as const },
+      { ...approvalRouting, correlationId: "approval_other" },
+    ]) {
+      const invalid = redactAgentEvent({ type: "approval.requested", body: "", data: approvalPayload, routing: wrongRoute }).data as typeof approvalPayload
+      expect(invalid.approvalId).toBe("[REDACTED]")
+    }
+
+    const questionId = "question_4912-9422"
+    const questionItemId = `agent-wait:question:${questionId}`
+    const questionPayload = {
+      legacy: { type: "approval_request", speaker: "assistant", title: null, body: "", durationMs: null, data: null },
+      sourceEvent: "orchestrator_question",
+      sourcePayload: { id: questionId, stage: "prepare", question: "Call 4912-9422", options: [] },
+      opaque: false,
+    }
+    const questionRouting: AgentEventRoutingContext = { ...controlRouting, itemId: questionItemId, actor: "orchestrator",
+      correlationId: questionItemId, causationId: questionId }
+    const question = redactAgentEvent({ type: "item.started", body: "", data: questionPayload, routing: questionRouting }).data as typeof questionPayload
+    expect(question.sourcePayload.id).toBe(questionId)
+    expect(question.sourcePayload.question).toBe("[REDACTED]")
+    for (const wrongRoute of [
+      { ...questionRouting, actor: "user" as const },
+      { ...questionRouting, causationId: "question_other" },
+    ]) {
+      const invalid = redactAgentEvent({ type: "item.started", body: "", data: questionPayload, routing: wrongRoute }).data as typeof questionPayload
+      expect(invalid.sourcePayload.id).toBe("[REDACTED]")
+    }
+    const fullQuestion = redactAgentEvent({ type: "item.started", body: "", data: {
+      schemaVersion: "agent-harness.v2", id: "event_question_4912-9422", sessionId, turnId, itemId: questionItemId, taskId: null,
+      type: "item.started", actor: "orchestrator", sequence: "1", correlationId: questionItemId, causationId: questionId,
+      idempotencyKey: null, payload: questionPayload,
+    } }).data as { payload: typeof questionPayload }
+    expect(fullQuestion.payload.sourcePayload.id).toBe(questionId)
+    expect(fullQuestion.payload.sourcePayload.question).toBe("[REDACTED]")
+
+    const itemId = waitItemId("approval")
+    const cancellationRouting: AgentEventRoutingContext = { sessionId, turnId, itemId, taskId: null,
+      actor: "system", correlationId: waitId, causationId: "client_70463535-1444-4bba-ae3b-b80578d2dd0e", outboxTopic: "agent.session.event" }
+    const cancellation = { waitKind: "approval", waitId, itemId, toolCallId, outcome: "cancelled", reason: "interrupt" }
+    const cancelled = redactAgentEvent({ type: "approval.resolved", body: "", data: cancellation, routing: cancellationRouting }).data as typeof cancellation
+    expect(cancelled).toEqual(cancellation)
+
+    for (const unsafeToolCallId of ["4155550123", "sk_test_private_secret"]) {
+      const unsafe = redactAgentEvent({ type: "approval.resolved", body: "", data: { ...cancellation, toolCallId: unsafeToolCallId }, routing: cancellationRouting }).data as Record<string, unknown>
+      expect(unsafe.waitId).toBe("[REDACTED]")
+      expect(unsafe.itemId).toBe("[REDACTED]")
+      expect(unsafe.toolCallId).toBe("[REDACTED]")
+    }
+    for (const wrongRoute of [
+      { ...cancellationRouting, actor: "user" as const },
+      { ...cancellationRouting, correlationId: "other_approval" },
+      { ...cancellationRouting, causationId: null },
+    ]) {
+      const invalid = redactAgentEvent({ type: "approval.resolved", body: "", data: cancellation, routing: wrongRoute }).data as typeof cancellation
+      expect(invalid.waitId).toBe("[REDACTED]")
+      expect(invalid.itemId).toBe("[REDACTED]")
+      expect(invalid.toolCallId).toBe("[REDACTED]")
+    }
   })
 
   it("redacts IDs from a partial v2 item-shaped object", () => {
