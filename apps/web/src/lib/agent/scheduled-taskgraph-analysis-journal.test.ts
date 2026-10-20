@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Job } from '@prisma/client'
+import type { Job, Prisma } from '@prisma/client'
 import { AgentExecutionCancelledError } from './execution-control'
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { AnalyzeRecoveryPersistenceError, runAnalyze } from './stages/analyze'
@@ -39,6 +39,7 @@ const ctx = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.tu
   executionAttempt: { id: owner.executionId, attemptCount: owner.executionAttemptCount } } as PipelineCtx
 const scoreA = scored(jobs[0], 82)
 const scoreB = scored(jobs[1], 74)
+const scoreTransaction = { marker: 'score_transaction' } as never
 
 function job(id: string): Job { return { id, userId: owner.userId } as Job }
 function scored(jobRow: Job, score: number): ScoredJob {
@@ -53,7 +54,7 @@ function initialState(): PipelineCheckpointState & Record<string, unknown> {
     schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key, claimToken, owner,
   } }
 }
-function input(state: unknown, persist: (state: PipelineCheckpointState) => Promise<void>) {
+function input(state: unknown, persist: (state: PipelineCheckpointState, expectedState: unknown, tx?: Prisma.TransactionClient) => Promise<void>) {
   return { jobs, ctx, owner, key, claimToken, snapshot, attestation, state, persist }
 }
 function durableState(state: PipelineCheckpointState): PipelineCheckpointState & Record<string, unknown> {
@@ -64,37 +65,42 @@ describe('runScheduledTaskGraphAnalyze', () => {
   beforeEach(() => vi.resetAllMocks())
 
   it('persists each score before Analyze returns and reuses it on restart while scoring only missing jobs', async () => {
-    const writes: Array<PipelineCheckpointState & Record<string, unknown>> = []
+    const writes: Array<{ state: PipelineCheckpointState & Record<string, unknown>; expectedState: unknown; tx?: Prisma.TransactionClient }> = []
     const attempted: string[] = []
     vi.mocked(runAnalyze).mockImplementation(async (pending, _ctx, recovery) => {
       const ids = pending.map(row => row.id)
       if (ids.includes(jobAId)) {
         attempted.push(jobAId)
         await recovery?.beforeScore?.(jobAId)
-        await recovery?.onScoredJob?.(scoreA)
+        await recovery?.onScoredJob?.(scoreA, scoreTransaction)
         return analyzeResult([scoreA])
       }
       expect(ids).toEqual([jobBId])
       expect(recovery?.existingScoredJobs).toEqual([scoreA])
       attempted.push(jobBId)
       await recovery?.beforeScore?.(jobBId)
-      await recovery?.onScoredJob?.(scoreB)
+      await recovery?.onScoredJob?.(scoreB, scoreTransaction)
       return analyzeResult([...(recovery?.existingScoredJobs ?? [])])
     })
-    const persist = async (state: PipelineCheckpointState) => { writes.push(durableState(state)) }
+    const persist = async (state: PipelineCheckpointState, expectedState: unknown, tx?: Prisma.TransactionClient) => {
+      writes.push({ state: durableState(state), expectedState, tx })
+    }
 
     const first = await runScheduledTaskGraphAnalyze(input(initialState(), persist))
-    const scoredWrite = writes.find(state => state.scoredJobs?.length === 1)!
-    const journal = scoredWrite.scheduledTaskGraphAnalyzeJournal as Record<string, unknown>
+    const scoredWrite = writes.find(write => write.state.scoredJobs?.length === 1)!
+    const journal = scoredWrite.state.scheduledTaskGraphAnalyzeJournal as Record<string, unknown>
 
     expect(first.analysis.data?.scoredJobs).toEqual([scoreA])
-    expect(scoredWrite.nextStage).toBe('scout')
-    expect(scoredWrite.scoredJobs?.[0]).toMatchObject({ job: { id: jobAId }, score: 82, analysisFenceAt: scoreA.analysisFenceAt })
+    expect(scoredWrite.state.nextStage).toBe('scout')
+    expect(scoredWrite.state.scoredJobs?.[0]).toMatchObject({ job: { id: jobAId }, score: 82, analysisFenceAt: scoreA.analysisFenceAt })
     expect(journal).toMatchObject({ key, owner, attemptsByJob: { [jobAId]: 1 }, failedJobIds: [] })
+    expect(scoredWrite.tx).toBe(scoreTransaction)
+    expect(scoredWrite.expectedState).toMatchObject({ scoredJobs: [], scheduledTaskGraphAnalyzeJournal: { attemptsByJob: { [jobAId]: 1 } } })
     expect(first.checkpoint).toMatchObject({ nextStage: 'prepare', scoredJobs: [scoreA] })
     expect(first.checkpoint).not.toHaveProperty('scheduledTaskGraphAnalyzeJournal')
+    expect(first.persistedState).toMatchObject({ nextStage: 'scout', scoredJobs: [scoreA] })
 
-    const second = await runScheduledTaskGraphAnalyze(input(scoredWrite, persist))
+    const second = await runScheduledTaskGraphAnalyze(input(scoredWrite.state, persist))
 
     expect(attempted).toEqual([jobAId, jobBId])
     expect(second.analysis.data?.scoredJobs.map(row => row.score)).toEqual([82, 74])
@@ -173,7 +179,7 @@ describe('runScheduledTaskGraphAnalyze', () => {
       try {
         await recovery?.beforeScore?.(jobAId)
         modelStarts.push(jobAId)
-        await recovery?.onScoredJob?.(scoreA)
+        await recovery?.onScoredJob?.(scoreA, scoreTransaction)
         return analyzeResult([...(recovery?.existingScoredJobs ?? [])])
       } catch (error) {
         if (error instanceof AnalyzeRecoveryPersistenceError) throw error

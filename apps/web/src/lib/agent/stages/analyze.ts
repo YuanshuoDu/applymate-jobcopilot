@@ -20,7 +20,7 @@ export interface AnalyzeRecoveryHooks {
   existingScoredJobs?: readonly ScoredJob[]
   initialFailed?: number
   beforeScore?: (jobId: string) => Promise<void>
-  onScoredJob?: (scored: ScoredJob) => Promise<void>
+  onScoredJob?: (scored: ScoredJob, tx: Prisma.TransactionClient) => Promise<void>
   onScoreFailure?: (jobId: string) => Promise<void>
   assertScoreOwnerCurrent?: (tx: Prisma.TransactionClient) => Promise<boolean>
 }
@@ -165,6 +165,7 @@ export async function runAnalyze(
         const parsed = parseScoreResult(result.text)
 
         const color = SCORE_COLOR(parsed.score)
+        const scored = { job, ...parsed, analysisFenceAt: analysisFenceAt.toISOString() }
         // This conditional UPDATE locks the task through both writes; NULL is
         // explicit because PostgreSQL NOT IN does not match NULL values.
         const persisted = await db.$transaction(async tx => {
@@ -183,17 +184,16 @@ export async function runAnalyze(
           await tx.activity.create({ data: { userId, jobId: job.id, type: 'agent_action', text: `Agent scored ${job.company} · ${job.role}: ${parsed.score}% match`, color } })
           throwIfFatal()
           assertAnalyzeSignalActive(ctx.signal)
+          if (recovery?.onScoredJob) {
+            try { await recovery.onScoredJob(scored, tx) }
+            catch (error) { recoveryHookFailed = true; throw error }
+            recoveryScorePersisted = true
+          }
           return true
         })
         if (!persisted) {
           fenceSkipped++
           return
-        }
-        const scored = { job, ...parsed, analysisFenceAt: analysisFenceAt.toISOString() }
-        if (recovery?.onScoredJob) {
-          try { await recovery.onScoredJob(scored) }
-          catch (error) { recoveryHookFailed = true; throw error }
-          recoveryScorePersisted = true
         }
         scoredJobs.push(scored)
 

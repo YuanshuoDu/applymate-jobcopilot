@@ -289,27 +289,21 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     fixtureUserIds.push(value.userId)
     await seedGraph(pool!, value, graphSnapshot(value))
 
-    const transitionTurnId = `scheduled-transition-turn-${randomUUID()}`
-    const transitionOwnerId = `scheduled-transition-owner-${randomUUID()}`
-    await pool!.query(`INSERT INTO "agent_turns"
-      ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
-        "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "executionMode", "updatedAt")
-      SELECT $1, turn."sessionId", turn."userId", 'in_progress', turn."source", turn."input", turn."modelProfileSnapshot",
-        turn."toolPolicySnapshot", turn."budgetSnapshot", $2, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP,
-        turn."leaseVersion", turn."executionMode", CURRENT_TIMESTAMP
-      FROM "agent_turns" AS turn WHERE turn."id" = $3`, [transitionTurnId, transitionOwnerId, value.turnId])
+    const transition = fixture()
+    fixtureUserIds.push(transition.userId)
+    await seedGraph(pool!, transition, graphSnapshot(transition))
     const transitionLeaseRow = (await pool!.query<{
       userId: string; leaseOwnerId: string; leaseVersion: number; leaseStartedAt: Date | string; leaseExpiresAt: Date | string
-    }>(`SELECT "userId", "leaseOwnerId", "leaseVersion", "leaseStartedAt", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1`, [transitionTurnId])).rows[0]
+    }>(`SELECT "userId", "leaseOwnerId", "leaseVersion", "leaseStartedAt", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1`, [transition.turnId])).rows[0]
     expect(transitionLeaseRow).toBeDefined()
     const transitionLease: TurnLease = {
-      turnId: transitionTurnId, sessionId: value.sessionId, ownerId: transitionLeaseRow!.leaseOwnerId,
+      turnId: transition.turnId, sessionId: transition.sessionId, ownerId: transitionLeaseRow!.leaseOwnerId,
       userId: transitionLeaseRow!.userId, leaseVersion: transitionLeaseRow!.leaseVersion,
       leaseStartedAt: new Date(transitionLeaseRow!.leaseStartedAt), leaseExpiresAt: new Date(transitionLeaseRow!.leaseExpiresAt),
     }
     expect(await releaseTurnLease(pool!, transitionLease, "waiting_for_user")).toBe(true)
     const transitionResult = await pool!.query<{ status: string; revision: number }>(
-      `SELECT "status", "revision" FROM "agent_turns" WHERE "id" = $1`, [transitionTurnId])
+      `SELECT "status", "revision" FROM "agent_turns" WHERE "id" = $1`, [transition.turnId])
     expect(transitionResult.rows[0]).toEqual({ status: "waiting_for_user", revision: 1 })
 
     const waitId = `scheduled-continuation-${randomUUID()}`

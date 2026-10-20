@@ -33,8 +33,8 @@ export async function runScheduledTaskGraphAnalyze(input: {
   jobs: readonly Job[]; ctx: PipelineCtx; owner: ScheduledTaskGraphPipelineOwner; key: string; claimToken: string
   snapshot: unknown; attestation: unknown; state: unknown
   assertScoreOwnerCurrent?: (tx: Prisma.TransactionClient) => Promise<boolean>
-  persist: (state: PipelineCheckpointState) => Promise<void>
-}): Promise<{ analysis: StageResult<AnalyzeOutput>; checkpoint: PipelineCheckpointState }> {
+  persist: (state: PipelineCheckpointState, expectedState: unknown, tx?: Prisma.TransactionClient) => Promise<void>
+}): Promise<{ analysis: StageResult<AnalyzeOutput>; checkpoint: PipelineCheckpointState; persistedState: PipelineCheckpointState }> {
   const jobs = [...input.jobs], jobsById = new Map(jobs.map(job => [job.id, job])), candidateIds = new Set(jobsById.keys())
   if (jobsById.size !== jobs.length || jobs.some(job => job.userId !== input.owner.userId)) throw new AgentExecutionCancelledError()
   let state: unknown = input.state
@@ -69,7 +69,7 @@ export async function runScheduledTaskGraphAnalyze(input: {
     if (scoredJobs.length + failedIds.size > jobs.length) throw new AgentExecutionCancelledError()
   }
   let writeQueue = Promise.resolve()
-  const writeJournal = (change: () => boolean | void) => {
+  const writeJournal = (change: () => boolean | void, tx?: Prisma.TransactionClient) => {
     const write = writeQueue.then(async () => {
       if (change() === false) return
       const next = { ...(record(state) ?? {}), nextStage: 'scout' as const, scoutedJobs: jobs, scoredJobs,
@@ -77,10 +77,11 @@ export async function runScheduledTaskGraphAnalyze(input: {
           schemaVersion: JOURNAL_SCHEMA, key: input.key, owner: { ...input.owner }, attemptsByJob: { ...attempts }, failedJobIds: [...failedIds],
         } }
       if (!scheduledTaskGraphClaimMatches(next, input.key, input.owner, input.claimToken)) throw new AgentExecutionCancelledError()
+      const expectedState = state
       let persistedState: PipelineCheckpointState
       try {
         persistedState = JSON.parse(JSON.stringify(next)) as PipelineCheckpointState
-        await input.persist(persistedState)
+        await input.persist(persistedState, expectedState, tx)
       }
       catch (error) {
         if (error instanceof AgentExecutionCancelledError) throw error
@@ -105,7 +106,7 @@ export async function runScheduledTaskGraphAnalyze(input: {
       })
       if (!allowed) throw new Error('Analyze recovery retry limit reached before a durable score was recorded.')
     },
-    onScoredJob: async scored => { await writeJournal(() => { scoredJobs.push(scored); return true }) },
+    onScoredJob: async (scored, tx) => { await writeJournal(() => { scoredJobs.push(scored); return true }, tx) },
     onScoreFailure: async jobId => { await writeJournal(() => { failedIds.add(jobId); return true }) },
     ...(input.assertScoreOwnerCurrent ? { assertScoreOwnerCurrent: input.assertScoreOwnerCurrent } : {}),
   }
@@ -117,7 +118,7 @@ export async function runScheduledTaskGraphAnalyze(input: {
   if (prepared.alreadyPersisted || prepared.continuationKey !== input.key) throw new AgentExecutionCancelledError()
   const checkpoint = { ...prepared.checkpoint } as PipelineCheckpointState & Record<string, unknown>
   delete checkpoint.scheduledTaskGraphAnalyzeJournal
-  return { analysis, checkpoint }
+  return { analysis, checkpoint, persistedState: state as PipelineCheckpointState }
 }
 
 /** Rebind a partial Analyze journal together with a scheduled claim after Turn lease rollover. */

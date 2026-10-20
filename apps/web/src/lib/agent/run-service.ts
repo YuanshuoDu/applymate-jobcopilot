@@ -13,7 +13,7 @@ import { checkpointState, createDurableEventWriter, createRunAttemptOwnership, i
 import type { AiConfig } from "@/lib/model-router";
 import type { ResumeContent } from "@/lib/types";
 import type { V2TurnSource } from "@/lib/agent/session/v2-turn";
-import type { Job } from "@prisma/client";
+import type { Job, Prisma } from "@prisma/client";
 import { parseScheduledAutomationSnapshot } from "@/lib/agent/scheduled-automation-snapshot";
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
 import { finishScheduledTaskGraphExecution, isScheduledTaskGraphOwnerCurrent, persistScheduledTaskGraphWaitMarker, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
@@ -43,15 +43,9 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     input.userId,
   ).catch(() => false) || Boolean(input.turnId);
   if (input.signal?.aborted) return null
-  const requestedExecution = input.executionId
-    ? await db.agentExecution.findFirst({
-        where: {
-          id: input.executionId,
-          userId: input.userId,
-          ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        },
-      })
-    : null
+  const requestedExecution = input.executionId ? await db.agentExecution.findFirst({
+    where: { id: input.executionId, userId: input.userId, ...(input.sessionId ? { sessionId: input.sessionId } : {}) },
+  }) : null
   if (input.executionId && (!requestedExecution || input.signal?.aborted)) {
     if (!requestedExecution && !input.signal?.aborted) console.warn("Agent execution was not found for the requested session")
     return null
@@ -95,16 +89,13 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     id: execution.id, userId: input.userId, sessionId: recorder.sessionId, attemptCount,
     turnId: recorder.getTurnId, signal: input.signal,
   })
-  const finishOwnedAttempt = scheduled ? (status: "completed" | "failed", error?: string | null) => finishScheduledTaskGraphExecution({
-    state: scheduledState, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
-    status, error, assertOwnerCurrent: assertScheduledOwnerCurrent }) : finishAttempt
+  const finishOwnedAttempt = scheduled
+    ? (status: "completed" | "failed", error?: string | null) => finishScheduledTaskGraphExecution({ state: scheduledState, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, status, error, assertOwnerCurrent: assertScheduledOwnerCurrent })
+    : finishAttempt
   if (!await isCurrentAttempt()) return null
   try {
-    if (!await recorder.activate({
-      executionAttempt: { id: execution.id, attemptCount },
-      signal: input.signal,
-      assertCurrent: isCurrentAttempt,
-    })) return null
+    if (!await recorder.activate({ executionAttempt: { id: execution.id, attemptCount }, signal: input.signal,
+      assertCurrent: isCurrentAttempt })) return null
   } catch (error) {
     if (error instanceof AgentExecutionCancelledError || !await isCurrentAttempt()) return null
     const failed = await finishOwnedAttempt("failed", error instanceof Error ? error.message : "Unable to activate agent session")
@@ -231,12 +222,21 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       } else {
         const result = await runScheduledTaskGraphAnalyze({ jobs: scheduled.ownedJobs, ctx: pipelineInput, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
           snapshot: scheduled.snapshot, attestation: scheduled.attestation, state: scheduledState, assertScoreOwnerCurrent: tx => scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken }),
-          persist: async state => {
-            if (!await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken) || !await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent })) throw new AgentExecutionCancelledError();
-            scheduledState = JSON.parse(JSON.stringify(state));
+          persist: async (state, expectedState, tx) => {
+            if (tx && (!scheduledTaskGraphClaimMatches(expectedState, scheduled.continuationKey, scheduled.owner, scheduled.claimToken)
+                || !scheduledTaskGraphClaimMatches(state, scheduled.continuationKey, scheduled.owner, scheduled.claimToken)
+                || !await assertScheduledOwnerCurrent(tx))) throw new AgentExecutionCancelledError();
+            if (tx) {
+              const saved = await tx.agentExecution.updateMany({ where: { id: scheduled.owner.executionId, userId: scheduled.owner.userId,
+                sessionId: scheduled.owner.sessionId, status: "running", attemptCount: scheduled.owner.executionAttemptCount,
+                state: { equals: expectedState as Prisma.InputJsonValue } }, data: { checkpoint: state.nextStage, state: state as unknown as Prisma.InputJsonValue } });
+              if (saved.count !== 1) throw new AgentExecutionCancelledError();
+            } else if (!await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)
+              || !await saveScheduledTaskGraphCheckpoint({ expectedState, state, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent })) throw new AgentExecutionCancelledError();
+            if (!tx) scheduledState = JSON.parse(JSON.stringify(state));
           } });
         if (!await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)) throw new AgentExecutionCancelledError();
-        const saved = await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state: result.checkpoint,
+        const saved = await saveScheduledTaskGraphCheckpoint({ expectedState: result.persistedState ?? scheduledState, state: result.checkpoint,
           owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent });
         if (!saved) throw new AgentExecutionCancelledError(); resumeState = result.checkpoint; scheduledState = result.checkpoint;
       }

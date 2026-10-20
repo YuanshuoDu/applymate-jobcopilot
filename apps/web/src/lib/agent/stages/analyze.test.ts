@@ -108,13 +108,16 @@ describe('runAnalyze', () => {
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Add cloud experience.' } }))
   })
 
-  it('journals a validated score after its DB transaction and records an attempt before calling the model', async () => {
+  it('journals a validated score in its DB transaction after recording an attempt before the model call', async () => {
     const order: string[] = []
+    let scoringTransaction: unknown
     mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
-      const result = await work({
+      const tx = {
         applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
         job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
-      })
+      }
+      if (mocks.modelChat.mock.calls.length > 0) scoringTransaction = tx
+      const result = await work(tx)
       order.push('db_commit')
       return result
     })
@@ -130,10 +133,10 @@ describe('runAnalyze', () => {
     const result = await runAnalyze([job], context(), recovery)
 
     expect(result).toMatchObject({ ok: true, data: { scoredJobs: [{ score: 73 }] } })
-    expect(order).toEqual(['db_commit', 'journal_attempt', 'model_call', 'db_commit', 'journal_score'])
+    expect(order).toEqual(['db_commit', 'journal_attempt', 'model_call', 'journal_score', 'db_commit'])
     expect(recovery.onScoredJob).toHaveBeenCalledWith(expect.objectContaining({
       job, score: 73, analysisFenceAt: expect.any(String),
-    }))
+    }), scoringTransaction)
   })
 
   it('does not classify a durable-journal write failure as a scoring failure', async () => {
@@ -143,11 +146,24 @@ describe('runAnalyze', () => {
     const writeFailure = new AnalyzeRecoveryPersistenceError()
     const onScoreFailure = vi.fn()
     const onScoredJob = vi.fn(async () => { throw writeFailure })
+    const committedWrites: Array<{ scores: unknown[]; activities: unknown[] }> = []
+    mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
+      const writes = { scores: [] as unknown[], activities: [] as unknown[] }
+      const result = await work({
+        applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
+        job: { update: async (args: unknown) => { writes.scores.push(args); return mocks.update(args) } },
+        activity: { create: async (args: unknown) => { writes.activities.push(args); return mocks.activityCreate(args) } },
+        agentExecution: { updateMany: mocks.executionUpdateMany },
+      })
+      committedWrites.push(writes)
+      return result
+    })
 
     await expect(runAnalyze([job], context(), { onScoredJob, onScoreFailure })).rejects.toBe(writeFailure)
 
     expect(writeFailure).toBeInstanceOf(AgentExecutionCancelledError)
-    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Add cloud experience.' } }))
+    expect(committedWrites).toHaveLength(1)
+    expect(committedWrites[0]).toEqual({ scores: [], activities: [] })
     expect(onScoreFailure).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ status: 'failed', checkpoint: 'match_analysis_failed' }),
