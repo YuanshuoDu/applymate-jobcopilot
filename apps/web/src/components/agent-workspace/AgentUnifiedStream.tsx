@@ -193,6 +193,8 @@ export function AgentUnifiedStream({
         chatRequestVersionRef={chatRequestVersionRef}
         shouldFollowScrollRef={shouldFollowScrollRef}
         liveBlocks={liveBlocks}
+        resumeSessionId={resumeSessionId}
+        timelineRestoring={timeline.restoring}
         setRevealThinkingVersion={setRevealThinkingVersion}
         onSessionRecorded={onSessionRecorded}
       />

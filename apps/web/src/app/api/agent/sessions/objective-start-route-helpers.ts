@@ -47,7 +47,7 @@ function parseContent(value: unknown): InputContentPart[] | null {
   for (const part of value) {
     if (!isRecord(part) || typeof part.type !== "string") return null
     if (part.type === "text") {
-      if (!exactKeys(part, ["type", "text"]) || typeof part.text !== "string" || !part.text.trim() || part.text.length > MAX_TEXT_PART_LENGTH) return null
+      if (!exactKeys(part, ["type", "text"]) || typeof part.text !== "string" || part.text.length === 0 || part.text.length > MAX_TEXT_PART_LENGTH) return null
       content.push({ type: "text", text: part.text })
       continue
     }
