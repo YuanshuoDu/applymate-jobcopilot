@@ -51,7 +51,7 @@ import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./task-graph
 import { projectValidatedRoleResult } from "./task-graph-result-projection.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
-import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
+import { defaultSubagentPolicy, parseSubagentJobPayload, type SubagentJobPayload, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
@@ -4825,6 +4825,16 @@ type LeaseRecoveryModelResult = {
   outputStatus: "accepted" | "duplicate" | "waiting" | "ready" | "timed_out" | "interrupted" | "closed" | "rejected" | "failed" | "completed" | "missing" | "other"
   errorCategory: "none" | "database" | "invalid_output" | "tool_schema" | "wait_receipt" | "tool_replay" | "completion_gate" | "task_graph" | "execution" | "other"
 }
+type LeaseRecoveryRequestTrace = {
+  execution: number
+  round: number
+  branch: LeaseRecoveryAdapterBranch
+  emittedToolName: "none" | "agent.plan" | "agent.wait"
+  graphFound: boolean
+  graphRevision: number | null
+  graphRoles: LeaseRecoveryGraphRole[]
+  toolResults: Record<string, LeaseRecoveryModelResult>
+}
 type LeaseRecoveryFixtureDiagnostics = {
   modelRuntimeFactoryInvocations: number
   adapterStreamInvocations: number
@@ -4852,6 +4862,11 @@ const LEASE_RECOVERY_MODEL_OUTPUT_STATUSES = new Set([
 const LEASE_RECOVERY_MODEL_ERROR_CATEGORIES = new Set([
   "none", "database", "invalid_output", "tool_schema", "wait_receipt", "tool_replay", "completion_gate", "task_graph", "execution", "other",
 ])
+const LEASE_RECOVERY_TRACE_CALL_NAMES = ["initialPlan", "initialWait", "repairPlan", "repairWait"] as const
+const LEASE_RECOVERY_TRACE_BRANCHES = new Set<LeaseRecoveryAdapterBranch>([
+  "not_started", "initial_plan", "initial_wait", "repair_plan", "repair_wait", "final_proof", "unexpected",
+])
+const LEASE_RECOVERY_TRACE_TOOL_NAMES = new Set(["none", "agent.plan", "agent.wait"])
 
 function missingLeaseRecoveryModelResult(): LeaseRecoveryModelResult {
   return { resultStatus: "missing", isError: null, outputStatus: "missing", errorCategory: "none" }
@@ -4946,6 +4961,56 @@ function leaseRecoveryGraphDiagnosticProjection(value: unknown): RecordValue {
   }
 }
 
+function leaseRecoveryRequestTrace(
+  request: HarnessModelRequest,
+  execution: number,
+  round: number,
+  callIds: Readonly<Record<typeof LEASE_RECOVERY_TRACE_CALL_NAMES[number], string>>,
+): LeaseRecoveryRequestTrace {
+  const graph = currentGraphFromRequest(request)
+  const toolResults: Record<string, LeaseRecoveryModelResult> = {}
+  for (const name of LEASE_RECOVERY_TRACE_CALL_NAMES) {
+    toolResults[name] = leaseRecoveryModelResultFromRequest(request, callIds[name])
+  }
+  return {
+    execution: Math.min(execution, 7),
+    round: Math.min(round, 7),
+    branch: "unexpected",
+    emittedToolName: "none",
+    graphFound: graph !== null,
+    graphRevision: diagnosticBoundedCount(graph?.revision),
+    graphRoles: leaseRecoveryGraphRoleOrder(graph).slice(0, 4),
+    toolResults,
+  }
+}
+
+function leaseRecoveryRequestTraceProjection(value: unknown): RecordValue[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 12).flatMap(candidate => {
+    const entry = record(candidate)
+    if (!entry) return []
+    const rawResults = record(entry.toolResults)
+    const toolResults: RecordValue = {}
+    for (const name of LEASE_RECOVERY_TRACE_CALL_NAMES) {
+      toolResults[name] = leaseRecoveryModelResultProjection(rawResults?.[name])
+    }
+    const graphRoleSet = new Set<LeaseRecoveryGraphRole>(["scout", "dependent", "scout-repair", "other"])
+    const roles = Array.isArray(entry.graphRoles)
+      ? entry.graphRoles.slice(0, 4).map(role => diagnosticEnum(role, graphRoleSet) ?? "other")
+      : []
+    return [{
+      execution: diagnosticBoundedCount(entry.execution),
+      round: diagnosticBoundedCount(entry.round),
+      branch: diagnosticEnum(entry.branch, LEASE_RECOVERY_TRACE_BRANCHES) ?? "other",
+      emittedToolName: diagnosticEnum(entry.emittedToolName, LEASE_RECOVERY_TRACE_TOOL_NAMES) ?? "other",
+      graphFound: entry.graphFound === true,
+      graphRevision: diagnosticBoundedCount(entry.graphRevision),
+      graphRoles: roles,
+      toolResults,
+    }]
+  })
+}
+
 async function leaseRecoveryRepairWaitDiagnostic(
   pool: Pool,
   owner: Fixture,
@@ -5002,21 +5067,292 @@ async function leaseRecoveryRepairWaitDiagnostic(
   }
 }
 
-async function leaseRecoveryPersistedGraphDiagnostic(pool: Pool, owner: Fixture): Promise<RecordValue> {
+async function leaseRecoveryPersistedGraphDiagnostic(
+  pool: Pool,
+  owner: Fixture,
+  deadline: number,
+): Promise<RecordValue> {
   try {
-    const result = await pool.query<{ content: unknown }>(
-      `SELECT item."content" FROM "agent_items" AS item
+    const result = await withinRepairWaitDiagnosticDeadline(deadline, () => pool.query<{ content: unknown; revision: number }>(
+      `SELECT item."content", item."revision" FROM "agent_items" AS item
        JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
        JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
        WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" = 'task_graph'
          AND item."taskId" = turn."rootTaskId" AND turn."userId" = $3 AND session."userId" = $3
        ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`,
       [owner.sessionId, owner.turnId, owner.userId],
-    )
+    ))
     const graph = diagnosticJsonRecord(result.rows[0]?.content)
-    return leaseRecoveryGraphDiagnosticProjection({ graphFound: graph !== null, graph })
+    return {
+      ...leaseRecoveryGraphDiagnosticProjection({ graphFound: graph !== null, graph }),
+      revision: graph ? diagnosticBoundedCount(result.rows[0]?.revision) : null,
+    }
   } catch {
-    return { available: false, graphFound: false, orderedRoles: [] }
+    return { available: false, graphFound: false, revision: null, orderedRoles: [] }
+  }
+}
+
+const REPAIR_WAIT_QUEUE_STATES = new Set([
+  "completed", "failed", "waiting", "delayed", "paused", "waiting-children", "prioritized", "active", "unknown", "missing",
+])
+const REPAIR_WAIT_DIAGNOSTIC_BUDGET_MS = 4_000
+const REPAIR_WAIT_DIAGNOSTIC_CLOSE_RESERVE_MS = 500
+
+class RepairWaitDiagnosticDeadlineError extends Error {}
+
+async function withinRepairWaitDiagnosticDeadline<T>(
+  deadline: number,
+  action: () => Promise<T>,
+  closeReserveMs = REPAIR_WAIT_DIAGNOSTIC_CLOSE_RESERVE_MS,
+): Promise<T> {
+  const remainingMs = deadline - Date.now() - closeReserveMs
+  if (remainingMs <= 0) throw new RepairWaitDiagnosticDeadlineError()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new RepairWaitDiagnosticDeadlineError()), remainingMs)
+    })
+    return await Promise.race([action(), timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function repairWaitLockState(ttl: number): string {
+  if (ttl > 0) return "present"
+  if (ttl === -1) return "present_no_expiry"
+  if (ttl === -2) return "absent"
+  return "unavailable"
+}
+
+async function repairWaitQueuedDispatchDiagnostic(
+  pool: Pool,
+  redisClient: Redis | undefined,
+  queueName: string | undefined,
+  owner: Fixture,
+  targetTaskIds: readonly string[],
+  deadline: number,
+): Promise<RecordValue> {
+  const targetIds = [...new Set(targetTaskIds)].slice(0, 7)
+  if (targetIds.length === 0 || targetIds.length !== targetTaskIds.length) {
+    return { available: targetIds.length === 0, targetCount: targetIds.length, targets: [] }
+  }
+  if (!redisClient || !queueName) return { available: false, reason: "queue_unavailable", targetCount: targetIds.length, targets: [] }
+
+  let queue: Queue<SubagentJobPayload> | undefined
+  let diagnostic: RecordValue = { available: false, reason: "diagnostic_unavailable", targetCount: targetIds.length, targets: [] }
+  try {
+    const rootResult = await withinRepairWaitDiagnosticDeadline(deadline, () => pool.query<{ rootTaskId: string | null }>(
+      `SELECT turn."rootTaskId" FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND session."userId" = $3 LIMIT 1`,
+      [owner.turnId, owner.sessionId, owner.userId],
+    ))
+    const rootTaskId = rootResult.rows[0]?.rootTaskId
+    if (typeof rootTaskId !== "string" || rootTaskId.length === 0) {
+      diagnostic = { available: false, reason: "owner_scope_unavailable", targetCount: targetIds.length, targets: [] }
+    } else {
+      const targetRows = await withinRepairWaitDiagnosticDeadline(deadline, () => pool.query<{
+        ordinal: number; taskId: string | null; role: string | null; status: string | null; attemptCount: number | null
+        dispatchId: string | null; dispatchPayload: unknown; publishedAt: Date | null
+        dispatchAttemptCount: number | null; dispatchLastError: string | null
+      }>(
+        `SELECT target."ordinal"::int AS "ordinal", task."id" AS "taskId", task."role", task."status", task."attemptCount",
+            dispatch."id" AS "dispatchId", dispatch."payload" AS "dispatchPayload", dispatch."publishedAt",
+            dispatch."attemptCount" AS "dispatchAttemptCount", dispatch."lastError" AS "dispatchLastError"
+         FROM unnest($3::text[]) WITH ORDINALITY AS target("id", "ordinal")
+         LEFT JOIN "sub_agent_tasks" AS task ON task."id" = target."id" AND task."sessionId" = $2
+           AND task."turnId" = $1 AND task."rootTaskId" = $4
+         LEFT JOIN "agent_outbox" AS dispatch ON dispatch."topic" = 'agent.subagent.dispatch'
+           AND dispatch."aggregateId" = $2 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+         ORDER BY target."ordinal"`,
+        [owner.turnId, owner.sessionId, targetIds, rootTaskId],
+      ))
+      if (targetRows.rows.length !== targetIds.length) throw new Error("target_scope_unavailable")
+      queue = new Queue<SubagentJobPayload>(queueName, { connection: redisClient, skipVersionCheck: true })
+      await withinRepairWaitDiagnosticDeadline(deadline, () => queue!.waitUntilReady())
+      const targets: RecordValue[] = []
+      for (const row of targetRows.rows.slice(0, 7)) {
+        const base = {
+          position: diagnosticBoundedCount(row.ordinal),
+          role: diagnosticEnum(row.role, DISCOVERY_DIAGNOSTIC_ROLES) ?? (row.role === null ? "missing" : "other"),
+          status: diagnosticEnum(row.status, TASK_DIAGNOSTIC_STATUSES) ?? (row.status === null ? "missing" : "other"),
+          taskAttemptCount: diagnosticBoundedCount(row.attemptCount),
+        }
+        if (!row.taskId) {
+          targets.push({ ...base, dispatchState: "unavailable", jobsAvailable: false })
+          continue
+        }
+        const dispatchPayload = parseSubagentJobPayload(row.dispatchPayload)
+        const dispatchOwnerBound = dispatchPayload !== null
+          && dispatchPayload.taskId === row.taskId
+          && dispatchPayload.sessionId === owner.sessionId
+          && dispatchPayload.rootTaskId === rootTaskId
+          && dispatchPayload.ownerId.length > 0
+        const dispatchState = !row.dispatchId ? "missing"
+          : !dispatchOwnerBound ? "owner_mismatch"
+            : row.publishedAt instanceof Date ? "published" : "pending"
+        const dispatch = {
+          state: dispatchState,
+          attemptCount: diagnosticBoundedCount(row.dispatchAttemptCount),
+          lastErrorPresent: typeof row.dispatchLastError === "string" && row.dispatchLastError.length > 0,
+        }
+        if (row.status !== "queued") {
+          targets.push({ ...base, dispatch, jobsAvailable: false, jobsReason: "task_not_queued" })
+          continue
+        }
+        if (!dispatchOwnerBound || row.dispatchAttemptCount === null
+          || !Number.isSafeInteger(Number(row.dispatchAttemptCount)) || Number(row.dispatchAttemptCount) < 0
+          || Number(row.dispatchAttemptCount) > 10_000) {
+          targets.push({ ...base, dispatch, jobsAvailable: false, jobsReason: "dispatch_identity_unavailable" })
+          continue
+        }
+        const attemptCount = Number(row.dispatchAttemptCount)
+        const generations = [...new Set([attemptCount, attemptCount - 1].filter(value => value >= 0))].slice(0, 2)
+        const jobs: RecordValue[] = []
+        for (const generation of generations) {
+          try {
+            // Mirrors subagentJobId's base64url task key so this diagnostic need not load the queue module.
+            const jobId = `agent-subagent-${Buffer.from(row.taskId, "utf8").toString("base64url")}-${generation}`
+            const job = await withinRepairWaitDiagnosticDeadline(deadline, () => queue!.getJob(jobId))
+            if (!job) {
+              const lockState = repairWaitLockState(await withinRepairWaitDiagnosticDeadline(
+                deadline, () => redisClient.pttl(queue!.toKey(`${jobId}:lock`)),
+              ))
+              jobs.push({ generation, state: "missing", lockState })
+              continue
+            }
+            const jobPayload = parseSubagentJobPayload(job.data)
+            const jobOwnerBound = jobPayload !== null
+              && jobPayload.taskId === row.taskId
+              && jobPayload.sessionId === owner.sessionId
+              && jobPayload.rootTaskId === rootTaskId
+              && jobPayload.ownerId === dispatchPayload.ownerId
+            if (!jobOwnerBound) {
+              jobs.push({ generation, state: "unavailable", lockState: "unavailable" })
+              continue
+            }
+            const lockState = repairWaitLockState(await withinRepairWaitDiagnosticDeadline(
+              deadline, () => redisClient.pttl(queue!.toKey(`${jobId}:lock`)),
+            ))
+            const state = diagnosticEnum(await withinRepairWaitDiagnosticDeadline(
+              deadline, () => job.getState(),
+            ), REPAIR_WAIT_QUEUE_STATES) ?? "other"
+            jobs.push({ generation, state, lockState })
+          } catch (error) {
+            if (error instanceof RepairWaitDiagnosticDeadlineError) throw error
+            jobs.push({ generation, state: "unavailable", lockState: "unavailable" })
+          }
+        }
+        targets.push({ ...base, dispatch, jobsAvailable: true, jobs })
+      }
+      diagnostic = {
+        available: true,
+        targetCount: targetIds.length,
+        matchedCount: targetRows.rows.filter(row => row.taskId !== null).length,
+        targets,
+      }
+    }
+  } catch (error) {
+    diagnostic = {
+      available: false,
+      reason: error instanceof RepairWaitDiagnosticDeadlineError ? "deadline" : "diagnostic_unavailable",
+      targetCount: targetIds.length,
+      targets: [],
+    }
+  } finally {
+    if (queue) {
+      try {
+        const closePromise = queue.close().catch(() => undefined)
+        await withinRepairWaitDiagnosticDeadline(deadline, () => closePromise, 0)
+      } catch {
+        diagnostic = { available: false, reason: "deadline", targetCount: targetIds.length, targets: [] }
+      }
+    }
+  }
+  return diagnostic
+}
+
+async function leaseRecoveryPersistedGraphRevisionDiagnostic(
+  pool: Pool,
+  owner: Fixture,
+  deadline: number,
+): Promise<RecordValue> {
+  try {
+    const result = await withinRepairWaitDiagnosticDeadline(deadline, () => pool.query<{ payload: unknown }>(
+      `SELECT event."payload" FROM "agent_events" AS event
+       JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = turn."rootTaskId"
+         AND turn."userId" = $3 AND session."userId" = $3
+         AND event."type" IN ('item.started', 'item.delta')
+         AND event."payload"->>'kind' IN ('proposal', 'lifecycle')
+         AND event."payload"->'item'->>'type' = 'task_graph'
+       ORDER BY event."sequence" DESC LIMIT 8`,
+      [owner.sessionId, owner.turnId, owner.userId],
+    ))
+    const revisions = result.rows.slice(0, 8).reverse().map((row, index) => {
+      const payload = record(row.payload)
+      const item = record(payload?.item)
+      return {
+        ordinal: index + 1,
+        kind: diagnosticEnum(payload?.kind, new Set(["proposal", "lifecycle"])) ?? "other",
+        revision: diagnosticBoundedCount(payload?.revision ?? item?.revision),
+        roles: leaseRecoveryGraphRoleOrder(item?.content).slice(0, 4),
+      }
+    })
+    return { available: true, revisionCount: revisions.length, revisions }
+  } catch {
+    return { available: false, revisionCount: 0, revisions: [] }
+  }
+}
+
+async function leaseRecoveryPersistedToolDiagnostic(
+  pool: Pool,
+  owner: Fixture,
+  callIds: Readonly<Record<typeof LEASE_RECOVERY_TRACE_CALL_NAMES[number], string>>,
+  deadline: number,
+): Promise<RecordValue> {
+  try {
+    const result = await withinRepairWaitDiagnosticDeadline(deadline, () => pool.query<{
+      ordinal: number | null; attempt: number | null; type: string; status: string; toolCallId: string | null
+      toolName: string | null; outputStatus: string | null; errorCode: string | null
+    }>(
+      `SELECT step."ordinal", step."attempt", item."type", item."status",
+          item."content"->>'toolCallId' AS "toolCallId", item."content"->>'toolName' AS "toolName",
+          item."content"->'output'->>'status' AS "outputStatus",
+          item."content"->'output'->>'errorCode' AS "errorCode"
+       FROM "agent_items" AS item
+       JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       LEFT JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."turnId" = item."turnId" AND step."sessionId" = item."sessionId"
+       WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = turn."rootTaskId"
+         AND turn."userId" = $3 AND session."userId" = $3
+         AND item."type" IN ('tool_call', 'tool_result')
+         AND item."content"->>'toolCallId' = ANY($4::text[])
+       ORDER BY step."ordinal" ASC, item."createdAt" ASC,
+         CASE item."type" WHEN 'tool_call' THEN 0 ELSE 1 END ASC LIMIT 16`,
+      [owner.sessionId, owner.turnId, owner.userId, LEASE_RECOVERY_TRACE_CALL_NAMES.map(name => callIds[name])],
+    ))
+    const operationByCallId = new Map(LEASE_RECOVERY_TRACE_CALL_NAMES.map(name => [callIds[name], name]))
+    const toolNames = new Set(["agent.plan", "agent.wait"])
+    return {
+      available: true,
+      itemCount: result.rows.length,
+      items: result.rows.slice(0, 16).map(row => ({
+        operation: operationByCallId.get(row.toolCallId ?? "") ?? "other",
+        stepOrdinal: diagnosticBoundedCount(row.ordinal),
+        attempt: diagnosticBoundedCount(row.attempt),
+        itemType: diagnosticEnum(row.type, TOOL_ITEM_TYPES) ?? "other",
+        itemStatus: diagnosticEnum(row.status, ITEM_DIAGNOSTIC_STATUSES) ?? "other",
+        toolName: diagnosticEnum(row.toolName, toolNames) ?? (row.toolName === null ? "missing" : "other"),
+        outputStatus: diagnosticEnum(row.outputStatus, LEASE_RECOVERY_MODEL_OUTPUT_STATUSES) ?? (row.outputStatus === null ? "missing" : "other"),
+        errorCategory: row.errorCode === null ? "none" : diagnosticErrorClass(row.errorCode) ?? "other",
+      })),
+    }
+  } catch {
+    return { available: false, itemCount: 0, items: [] }
   }
 }
 
@@ -5032,15 +5368,23 @@ async function leaseRecoveryFailureDiagnostic(
   pool: Pool,
   owner: Fixture,
   fixture: LeaseRecoveryFixtureDiagnostics,
+  requestTrace: readonly LeaseRecoveryRequestTrace[],
+  callIds: Readonly<Record<typeof LEASE_RECOVERY_TRACE_CALL_NAMES[number], string>>,
 ): Promise<RecordValue> {
-  const persistedSnapshot = await leaseRecoveryPersistedGraphDiagnostic(pool, owner)
+  const deadline = Date.now() + REPAIR_WAIT_DIAGNOSTIC_BUDGET_MS
+  const persistedSnapshot = await leaseRecoveryPersistedGraphDiagnostic(pool, owner, deadline)
+  const persistedGraphRevisions = await leaseRecoveryPersistedGraphRevisionDiagnostic(pool, owner, deadline)
+  const persistedToolItems = await leaseRecoveryPersistedToolDiagnostic(pool, owner, callIds, deadline)
   return {
     fixtureCounters: leaseRecoveryFixtureDiagnosticProjection(fixture),
+    requestTrace: leaseRecoveryRequestTraceProjection(requestTrace),
     finalRequestGraph: leaseRecoveryGraphDiagnosticProjection({
       graphFound: fixture.finalRequestGraphFound,
       graph: { nodes: fixture.finalRequestGraphRoles.map(key => ({ key })) },
     }),
     persistedSnapshot,
+    persistedGraphRevisions,
+    persistedToolItems,
     repairPlanCategory: leaseRecoveryModelCategoryProjection(fixture.repairPlanResult),
     repairWaitCategory: leaseRecoveryModelCategoryProjection(fixture.repairWaitResult),
   }
@@ -11988,10 +12332,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         pool!, value.turnId, "completed", 90_000, initialWaitCallId, repairWaitCallIds,
       )
     } catch (error) {
+      const failureDiagnosticDeadline = Date.now() + REPAIR_WAIT_DIAGNOSTIC_BUDGET_MS
       let progress = JSON.stringify({ available: false })
       let waitResults: RecordValue = { available: false }
       let repairWaitState: RecordValue = leaseRecoveryWaitDiagnosticProjection({ available: false })
       let repairWaitTargetState: RecordValue = { available: false }
+      let repairWaitDispatchState: RecordValue = { available: false }
       let rootFailure: RecordValue = { available: false }
       let verification: RecordValue = { available: false }
       let scoutResultDiagnostic: RecordValue = { available: false }
@@ -12023,7 +12369,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         if (targetIds.length === 0) {
           repairWaitTargetState = { available: true, targetCount: 0, matchedCount: 0, targets: [] }
         } else {
-          const targetRows = await pool!.query<{
+          const targetRows = await withinRepairWaitDiagnosticDeadline(failureDiagnosticDeadline, () => pool!.query<{
             ordinal: number; role: string | null; status: string | null
             attemptCount: number | null; maxAttempts: number | null; failureReason: string | null
           }>(`SELECT target."ordinal"::int AS "ordinal", task."role", task."status",
@@ -12031,7 +12377,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
              FROM unnest($3::text[]) WITH ORDINALITY AS target("id", "ordinal")
              LEFT JOIN "sub_agent_tasks" AS task
                ON task."id" = target."id" AND task."turnId" = $1 AND task."sessionId" = $2
-             ORDER BY target."ordinal"`, [value.turnId, value.sessionId, targetIds])
+             ORDER BY target."ordinal"`, [value.turnId, value.sessionId, targetIds]))
           const targets = targetRows.rows.slice(0, 7).map(row => ({
             position: diagnosticBoundedCount(row.ordinal),
             role: diagnosticEnum(row.role, DISCOVERY_DIAGNOSTIC_ROLES) ?? (row.role === null ? "missing" : "other"),
@@ -12050,6 +12396,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       } catch {
         repairWaitTargetState = { available: false, targetCount: latestRepairWaitTargetIds.length }
       }
+      repairWaitDispatchState = await repairWaitQueuedDispatchDiagnostic(
+        pool!, redis, childQueueName, value, latestRepairWaitTargetIds, failureDiagnosticDeadline,
+      )
       const failureMessage = error instanceof Error ? error.message : ""
       const failureKind = failureMessage.startsWith("TaskGraph root turn entered failed")
         ? "turn_failed"
@@ -12065,6 +12414,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
         { label: "repairWaitTargetState", value: "", safeValue: JSON.stringify(repairWaitTargetState) },
+        { label: "repairWaitDispatchState", value: "", safeValue: JSON.stringify(repairWaitDispatchState) },
         { label: "privateWaitReaderOrigin", value: "", safeValue: privateWaitRead.origin },
         { label: "privateWaitReaderStage", value: "", safeValue: privateWaitRead.stage },
         { label: "privateWaitRowObservation", value: "", safeValue: privateWaitRead.rowObservation },
@@ -12573,6 +12923,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const repairPlanCallId = `p3-lease-recovery-repair-plan:${value.turnId}`
     const repairWaitKey = `p3-lease-recovery-repair-wait:${value.turnId}`
     const repairWaitCallId = `p3-lease-recovery-repair-wait:${value.turnId}`
+    const initialWaitCallId = `p3-lease-recovery-initial-wait:${value.turnId}`
+    const leaseRecoveryCallIds = {
+      initialPlan: planCallId, initialWait: initialWaitCallId, repairPlan: repairPlanCallId, repairWait: repairWaitCallId,
+    } as const
+    const leaseRecoveryRequestTraces: LeaseRecoveryRequestTrace[] = []
     const fixtureInvocationCounters: LeaseRecoveryFixtureDiagnostics = {
       modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0,
       runtimeExecuteInvocations: 0, runtimeExecuteFailureClass: "none", startupStage: "not_started",
@@ -12634,6 +12989,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             fixtureInvocationCounters.repairPlanResult = leaseRecoveryModelResultFromRequest(request, repairPlanCallId)
             fixtureInvocationCounters.repairWaitResult = leaseRecoveryModelResultFromRequest(request, repairWaitCallId)
             round += 1
+            const requestTrace = leaseRecoveryRequestTrace(request, execution, round, leaseRecoveryCallIds)
+            if (leaseRecoveryRequestTraces.length >= 12) leaseRecoveryRequestTraces.shift()
+            leaseRecoveryRequestTraces.push(requestTrace)
             fixtureInvocationCounters.adapterRoundOrdinal = Math.min(round, 7)
             fixtureInvocationCounters.adapterBranch = "unexpected"
             fixtureInvocationCounters.adapterStage = "stream_entered"
@@ -12644,6 +13002,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (execution === 1 && round === 1) {
               fixtureInvocationCounters.adapterBranch = "initial_plan"
+              requestTrace.branch = "initial_plan"
+              requestTrace.emittedToolName = "agent.plan"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               fixtureInvocationCounters.adapterStage = "tool_call_emitted"
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
@@ -12659,13 +13019,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (execution === 1 && round === 2) {
               fixtureInvocationCounters.adapterBranch = "initial_wait"
+              requestTrace.branch = "initial_wait"
+              requestTrace.emittedToolName = "agent.wait"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const taskIds = planTaskIds(request, planCallId, 2)
               if (taskIds.length !== 2) throw new Error("Lease recovery fixture plan did not persist its dependent task")
               originalDependentTaskId = taskIds[1]!
               fixtureInvocationCounters.adapterStage = "graph_checked"
               fixtureInvocationCounters.adapterStage = "tool_call_emitted"
-              yield { type: "tool_call_completed", callId: `p3-lease-recovery-initial-wait:${value.turnId}`, name: "agent.wait", arguments: {
+              yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: initialWaitKey, taskIds: [taskIds[0]!], mode: "all", timeoutMs: 30_000,
               } }
               fixtureInvocationCounters.adapterStage = "completion_emitted"
@@ -12674,6 +13036,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (execution === 2 && round === 1) {
               fixtureInvocationCounters.adapterBranch = "repair_plan"
+              requestTrace.branch = "repair_plan"
+              requestTrace.emittedToolName = "agent.plan"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
@@ -12728,6 +13092,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (execution === 2 && round === 2) {
               fixtureInvocationCounters.adapterBranch = "repair_wait"
+              requestTrace.branch = "repair_wait"
+              requestTrace.emittedToolName = "agent.wait"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               const graph = currentGraphFromRequest(request)
@@ -12750,6 +13116,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (execution === 3 && round === 1) {
               fixtureInvocationCounters.adapterBranch = "final_proof"
+              requestTrace.branch = "final_proof"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
@@ -13053,9 +13420,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
     expect(rootCompletedAfterRepair).toBe(true)
     } catch (error: unknown) {
-      const diagnostic = await leaseRecoveryFailureDiagnostic(pool!, value, fixtureInvocationCounters)
+      const diagnostic = await leaseRecoveryFailureDiagnostic(
+        pool!, value, fixtureInvocationCounters, leaseRecoveryRequestTraces, leaseRecoveryCallIds,
+      )
       throw new Error(
-        `Lease recovery failure (${leaseRecoveryFailureKind(error)}); diagnostic=${boundedDiagnostic(JSON.stringify(diagnostic), 1_200)}`,
+        `Lease recovery failure (${leaseRecoveryFailureKind(error)}); diagnostic=${boundedDiagnostic(JSON.stringify(diagnostic), 4_000)}`,
       )
     }
   }, 90_000)
