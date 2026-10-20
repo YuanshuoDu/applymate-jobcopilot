@@ -117,6 +117,9 @@ Write the strategy sentence now:`
           stepId: `${turnId}:orchestrator-plan`,
           taskId: turnId,
           userId: this.ctx.userId,
+          ...(this.ctx.aiConfig.usageFeatureKey !== undefined
+            ? { featureId: this.ctx.aiConfig.usageFeatureKey }
+            : {}),
         },
       })
       if (typeof response.text !== 'string') throw new Error('The web model adapter returned no text.')

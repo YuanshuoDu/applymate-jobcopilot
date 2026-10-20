@@ -17,7 +17,7 @@ const planProfile = {
   provider: "minimax", model: "MiniMax-M3", nativeTools: false,
   structuredOutput: false, streaming: true, continuationCursor: false,
 }
-const planConfig = { provider: "minimax", model: "MiniMax-M3" }
+const planConfig = { provider: "minimax", model: "MiniMax-M3", usageFeatureKey: "autoApply" }
 
 async function createPlanAgent(signal = new AbortController().signal) {
   const { OrchestratorAgent } = await import("./orchestrator")
@@ -62,7 +62,7 @@ describe("OrchestratorAgent.plan through ModelAdapter", () => {
       }] }],
       metadata: {
         sessionId: "session_plan", turnId: "turn_plan", stepId: "turn_plan:orchestrator-plan",
-        taskId: "turn_plan", userId: "user_plan",
+        taskId: "turn_plan", userId: "user_plan", featureId: "autoApply",
       },
     })
     expect(request.signal).toBe(ctx.signal)
