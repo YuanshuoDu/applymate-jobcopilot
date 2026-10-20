@@ -51,7 +51,7 @@ import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./task-graph
 import { projectValidatedRoleResult } from "./task-graph-result-projection.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
-import { defaultSubagentPolicy, parseSubagentJobPayload, type SubagentJobPayload, type SubagentLease, type SubagentTaskRecord } from "./types.js"
+import { defaultSubagentPolicy, parseSubagentJobPayload, SubagentLimitError, type SubagentJobPayload, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
@@ -613,6 +613,7 @@ const LEASE_RECOVERY_ADAPTER_BRANCHES = new Set([
 const LEASE_RECOVERY_ADAPTER_STAGES = new Set([
   "not_started", "stream_entered", "branch_entered", "graph_checked", "outcome_checked",
   "database_checked", "tool_call_emitted", "completion_emitted", "final_output_emitted",
+  "final_proof_owner_fence", "final_proof_repair_evidence",
   "final_proof_graph_nodes", "final_proof_node_statuses", "final_proof_dependent_identity",
   "final_proof_dependent_report", "final_proof_repair_report", "final_proof_repair_receipt",
   "final_proof_wait_outcome", "final_proof_wait_task_statuses", "final_proof_repair_wait_report",
@@ -4815,6 +4816,7 @@ type LeaseRecoveryAdapterBranch = "not_started" | "initial_plan" | "initial_wait
 type LeaseRecoveryAdapterStage =
   | "not_started" | "stream_entered" | "branch_entered" | "graph_checked" | "outcome_checked"
   | "database_checked" | "tool_call_emitted" | "completion_emitted" | "final_output_emitted"
+  | "final_proof_owner_fence" | "final_proof_repair_evidence"
   | "final_proof_graph_nodes" | "final_proof_node_statuses" | "final_proof_dependent_identity"
   | "final_proof_dependent_report" | "final_proof_repair_report" | "final_proof_repair_receipt"
   | "final_proof_wait_outcome" | "final_proof_wait_task_statuses" | "final_proof_repair_wait_report"
@@ -4830,10 +4832,30 @@ type LeaseRecoveryRequestTrace = {
   round: number
   branch: LeaseRecoveryAdapterBranch
   emittedToolName: "none" | "agent.plan" | "agent.wait"
+  ownerMatch: boolean
+  sessionMatch: boolean
+  turnMatch: boolean
+  userMatch: boolean
+  rootMatch: boolean
+  fenceTurnCount: number | null
+  fenceRootCount: number | null
+  fenceGraphItemCount: number | null
+  fencePersistedGraphRevision: number | null
   graphFound: boolean
   graphRevision: number | null
+  graphNodeCount: number | null
   graphRoles: LeaseRecoveryGraphRole[]
   toolResults: Record<string, LeaseRecoveryModelResult>
+}
+type LeaseRecoveryRequestFence = Pick<LeaseRecoveryRequestTrace,
+  "ownerMatch" | "sessionMatch" | "turnMatch" | "userMatch" | "rootMatch"
+  | "fenceTurnCount" | "fenceRootCount" | "fenceGraphItemCount" | "fencePersistedGraphRevision"
+>
+type LeaseRecoveryDurableRepairEvidence = { available: boolean; repairPlanPersisted: boolean; repairWaitPersisted: boolean }
+type RepairCapacityFailedJobDiagnostic = {
+  ownerMatched: true
+  attemptsMade: number | null
+  errorCategory: "concurrency" | "other"
 }
 type LeaseRecoveryFixtureDiagnostics = {
   modelRuntimeFactoryInvocations: number
@@ -4867,6 +4889,7 @@ const LEASE_RECOVERY_TRACE_BRANCHES = new Set<LeaseRecoveryAdapterBranch>([
   "not_started", "initial_plan", "initial_wait", "repair_plan", "repair_wait", "final_proof", "unexpected",
 ])
 const LEASE_RECOVERY_TRACE_TOOL_NAMES = new Set(["none", "agent.plan", "agent.wait"])
+const REPAIR_CAPACITY_FAILURE_CATEGORIES = new Set(["concurrency", "other"])
 
 function missingLeaseRecoveryModelResult(): LeaseRecoveryModelResult {
   return { resultStatus: "missing", isError: null, outputStatus: "missing", errorCategory: "none" }
@@ -4930,6 +4953,151 @@ function leaseRecoveryGraphRoleOrder(value: unknown): LeaseRecoveryGraphRole[] {
   })
 }
 
+async function leaseRecoveryRequestFence(
+  pool: Pool,
+  request: HarnessModelRequest,
+  owner: Fixture,
+): Promise<LeaseRecoveryRequestFence> {
+  const metadata = request.metadata
+  const sessionMatch = metadata.sessionId === owner.sessionId
+  const turnMatch = metadata.turnId === owner.turnId
+  const userMatch = metadata.userId === owner.userId
+  const unavailable: LeaseRecoveryRequestFence = {
+    ownerMatch: false, sessionMatch, turnMatch, userMatch, rootMatch: false,
+    fenceTurnCount: null, fenceRootCount: null, fenceGraphItemCount: null, fencePersistedGraphRevision: null,
+  }
+  if (![metadata.sessionId, metadata.turnId, metadata.userId, metadata.taskId].every(value => typeof value === "string" && value.length > 0)) {
+    return unavailable
+  }
+  try {
+    const result = await pool.query<{
+      turnCount: number; rootCount: number; graphItemCount: number; graphRevision: number | null
+    }>(
+      `SELECT COUNT(DISTINCT turn."id")::int AS "turnCount",
+          COUNT(DISTINCT root."id")::int AS "rootCount",
+          COUNT(DISTINCT graph."id")::int AS "graphItemCount",
+          MAX(graph."revision")::int AS "graphRevision"
+       FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+         AND root."turnId" = turn."id" AND root."id" = $4 AND root."rootTaskId" = root."id"
+       LEFT JOIN "agent_items" AS graph ON graph."sessionId" = turn."sessionId" AND graph."turnId" = turn."id"
+         AND graph."taskId" = turn."rootTaskId" AND graph."type" = 'task_graph'
+       WHERE turn."id" = $2 AND turn."sessionId" = $1 AND turn."userId" = $3 AND session."userId" = $3`,
+      [metadata.sessionId, metadata.turnId, metadata.userId, metadata.taskId],
+    )
+    const row = result.rows[0]
+    const turnCount = diagnosticBoundedCount(row?.turnCount)
+    const rootCount = diagnosticBoundedCount(row?.rootCount)
+    const rootMatch = turnCount === 1 && rootCount === 1
+    return {
+      ownerMatch: sessionMatch && turnMatch && userMatch && rootMatch,
+      sessionMatch, turnMatch, userMatch, rootMatch,
+      fenceTurnCount: turnCount,
+      fenceRootCount: rootCount,
+      fenceGraphItemCount: diagnosticBoundedCount(row?.graphItemCount),
+      fencePersistedGraphRevision: diagnosticBoundedCount(row?.graphRevision),
+    }
+  } catch {
+    return unavailable
+  }
+}
+
+async function leaseRecoveryPersistedRepairEvidence(
+  pool: Pool,
+  owner: Fixture,
+  callIds: Readonly<Record<typeof LEASE_RECOVERY_TRACE_CALL_NAMES[number], string>>,
+  expectedWaitTaskIds: readonly string[],
+): Promise<LeaseRecoveryDurableRepairEvidence> {
+  try {
+    const result = await pool.query<{
+      type: string; status: string; toolCallId: string | null; toolName: string | null
+      outputStatus: string | null; outputWaitId: string | null; outputTaskIds: unknown; errorCode: string | null
+    }>(
+      `SELECT item."type", item."status", item."content"->>'toolCallId' AS "toolCallId",
+          item."content"->>'toolName' AS "toolName", item."content"->'output'->>'status' AS "outputStatus",
+          item."content"->'output'->>'waitId' AS "outputWaitId", item."content"->'output'->'taskIds' AS "outputTaskIds",
+          item."content"->>'errorCode' AS "errorCode"
+       FROM "agent_items" AS item
+       JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = turn."rootTaskId"
+         AND turn."userId" = $3 AND session."userId" = $3
+         AND item."type" IN ('tool_call', 'tool_result') AND item."content"->>'toolCallId' = ANY($4::text[])
+       ORDER BY item."createdAt" ASC, CASE item."type" WHEN 'tool_call' THEN 0 ELSE 1 END ASC LIMIT 8`,
+      [owner.sessionId, owner.turnId, owner.userId, [callIds.repairPlan, callIds.repairWait]],
+    )
+    const rowsFor = (callId: string) => result.rows.filter(row => row.toolCallId === callId)
+    const validPair = (callId: string, toolName: string, outputStatus: string) => {
+      const rows = rowsFor(callId)
+      const call = rows.filter(row => row.type === "tool_call")
+      const response = rows.filter(row => row.type === "tool_result")
+      return call.length === 1 && response.length === 1
+        && call[0]?.status === "completed" && call[0]?.toolName === toolName
+        && response[0]?.status === "completed" && response[0]?.outputStatus === outputStatus
+        && response[0]?.errorCode === null
+    }
+    const repairWaitResult = rowsFor(callIds.repairWait).find(row => row.type === "tool_result")
+    const persistedWaitTaskIds = stringIds(repairWaitResult?.outputTaskIds)
+    return {
+      available: true,
+      repairPlanPersisted: validPair(callIds.repairPlan, "agent.plan", "accepted"),
+      repairWaitPersisted: validPair(callIds.repairWait, "agent.wait", "waiting")
+        && typeof repairWaitResult?.outputWaitId === "string" && repairWaitResult.outputWaitId.length > 0
+        && persistedWaitTaskIds !== null && sameUniqueIds(persistedWaitTaskIds, expectedWaitTaskIds),
+    }
+  } catch {
+    return { available: false, repairPlanPersisted: false, repairWaitPersisted: false }
+  }
+}
+
+function repairCapacityFailureCategory(error: unknown): "concurrency" | "other" {
+  return error instanceof SubagentLimitError && error.code === "concurrency" ? "concurrency" : "other"
+}
+
+async function repairCapacityFailedJobOwnerMatch(
+  pool: Pool,
+  owner: Fixture,
+  payload: SubagentJobPayload,
+): Promise<boolean> {
+  if (payload.sessionId !== owner.sessionId || !payload.taskId || !payload.rootTaskId) return false
+  try {
+    const result = await pool.query<{ taskCount: number; turnCount: number; rootCount: number }>(
+      `SELECT COUNT(DISTINCT task."id")::int AS "taskCount",
+          COUNT(DISTINCT turn."id")::int AS "turnCount",
+          COUNT(DISTINCT root."id")::int AS "rootCount"
+       FROM "sub_agent_tasks" AS task
+       JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+         AND root."turnId" = turn."id" AND root."rootTaskId" = root."id"
+       WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+         AND turn."id" = $3 AND turn."sessionId" = $2 AND turn."userId" = $5 AND session."userId" = $5
+         AND turn."rootTaskId" = $4 AND root."id" = $4`,
+      [payload.taskId, payload.sessionId, owner.turnId, payload.rootTaskId, owner.userId],
+    )
+    const row = result.rows[0]
+    return diagnosticBoundedCount(row?.taskCount) === 1
+      && diagnosticBoundedCount(row?.turnCount) === 1
+      && diagnosticBoundedCount(row?.rootCount) === 1
+  } catch {
+    return false
+  }
+}
+
+function repairCapacityFailedJobDiagnosticProjection(value: unknown): RecordValue[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 8).flatMap(candidate => {
+    const source = record(candidate)
+    if (source?.ownerMatched !== true) return []
+    return [{
+      ownerMatched: true,
+      attemptsMade: diagnosticBoundedCount(source.attemptsMade),
+      errorCategory: diagnosticEnum(source.errorCategory, REPAIR_CAPACITY_FAILURE_CATEGORIES) ?? "other",
+    }]
+  })
+}
+
 function leaseRecoveryWaitDiagnosticProjection(value: unknown): RecordValue {
   const source = record(value)
   const waitFound = source?.durableWaitFound === true
@@ -4966,8 +5134,10 @@ function leaseRecoveryRequestTrace(
   execution: number,
   round: number,
   callIds: Readonly<Record<typeof LEASE_RECOVERY_TRACE_CALL_NAMES[number], string>>,
+  fence: LeaseRecoveryRequestFence,
 ): LeaseRecoveryRequestTrace {
   const graph = currentGraphFromRequest(request)
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : []
   const toolResults: Record<string, LeaseRecoveryModelResult> = {}
   for (const name of LEASE_RECOVERY_TRACE_CALL_NAMES) {
     toolResults[name] = leaseRecoveryModelResultFromRequest(request, callIds[name])
@@ -4977,8 +5147,10 @@ function leaseRecoveryRequestTrace(
     round: Math.min(round, 7),
     branch: "unexpected",
     emittedToolName: "none",
+    ...fence,
     graphFound: graph !== null,
     graphRevision: diagnosticBoundedCount(graph?.revision),
+    graphNodeCount: diagnosticBoundedCount(nodes.length),
     graphRoles: leaseRecoveryGraphRoleOrder(graph).slice(0, 4),
     toolResults,
   }
@@ -5003,8 +5175,18 @@ function leaseRecoveryRequestTraceProjection(value: unknown): RecordValue[] {
       round: diagnosticBoundedCount(entry.round),
       branch: diagnosticEnum(entry.branch, LEASE_RECOVERY_TRACE_BRANCHES) ?? "other",
       emittedToolName: diagnosticEnum(entry.emittedToolName, LEASE_RECOVERY_TRACE_TOOL_NAMES) ?? "other",
+      ownerMatch: entry.ownerMatch === true,
+      sessionMatch: entry.sessionMatch === true,
+      turnMatch: entry.turnMatch === true,
+      userMatch: entry.userMatch === true,
+      rootMatch: entry.rootMatch === true,
+      fenceTurnCount: diagnosticBoundedCount(entry.fenceTurnCount),
+      fenceRootCount: diagnosticBoundedCount(entry.fenceRootCount),
+      fenceGraphItemCount: diagnosticBoundedCount(entry.fenceGraphItemCount),
+      fencePersistedGraphRevision: diagnosticBoundedCount(entry.fencePersistedGraphRevision),
       graphFound: entry.graphFound === true,
       graphRevision: diagnosticBoundedCount(entry.graphRevision),
+      graphNodeCount: diagnosticBoundedCount(entry.graphNodeCount),
       graphRoles: roles,
       toolResults,
     }]
@@ -6422,6 +6604,10 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       adapterStage: "final_proof_repair_receipt",
     })
     expect(finalProofStage?.adapterStage).toBe("final_proof_repair_receipt")
+    expect(leaseRecoveryFixtureDiagnosticProjection({ adapterStage: "final_proof_owner_fence" })?.adapterStage)
+      .toBe("final_proof_owner_fence")
+    expect(leaseRecoveryFixtureDiagnosticProjection({ adapterStage: "final_proof_repair_evidence" })?.adapterStage)
+      .toBe("final_proof_repair_evidence")
     const invalid = leaseRecoveryFixtureDiagnosticProjection({
       adapterExecutionOrdinal: 8, adapterRoundOrdinal: -1, adapterBranch: secret, adapterStage: secret,
       startupStage: secret, runtimeExecuteFailureClass: secret, private: secret,
@@ -6431,6 +6617,57 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       startupStage: "other", runtimeExecuteFailureClass: "other",
     })
     expect(JSON.stringify([projected, invalid])).not.toContain(secret)
+  })
+
+  it("projects lease-recovery request ownership and graph fences without request identifiers", () => {
+    const secret = "private-session-turn-root-or-message"
+    const projected = leaseRecoveryRequestTraceProjection([{
+      execution: 2, round: 1, branch: "repair_plan", emittedToolName: "agent.plan",
+      ownerMatch: true, sessionMatch: true, turnMatch: true, userMatch: true, rootMatch: false,
+      fenceTurnCount: 1, fenceRootCount: 0, fenceGraphItemCount: 1, fencePersistedGraphRevision: 1,
+      graphFound: true, graphRevision: 20, graphNodeCount: 4,
+      graphRoles: ["scout", "dependent", "other", "other"],
+      toolResults: {
+        initialPlan: missingLeaseRecoveryModelResult(), initialWait: missingLeaseRecoveryModelResult(),
+        repairPlan: missingLeaseRecoveryModelResult(), repairWait: missingLeaseRecoveryModelResult(),
+      },
+      sessionId: secret, turnId: secret, taskId: secret, metadata: secret, request: secret,
+    }])
+    expect(projected).toEqual([{
+      execution: 2, round: 1, branch: "repair_plan", emittedToolName: "agent.plan",
+      ownerMatch: true, sessionMatch: true, turnMatch: true, userMatch: true, rootMatch: false,
+      fenceTurnCount: 1, fenceRootCount: 0, fenceGraphItemCount: 1, fencePersistedGraphRevision: 1,
+      graphFound: true, graphRevision: 20, graphNodeCount: 4,
+      graphRoles: ["scout", "dependent", "other", "other"],
+      toolResults: {
+        initialPlan: missingLeaseRecoveryModelResult(), initialWait: missingLeaseRecoveryModelResult(),
+        repairPlan: missingLeaseRecoveryModelResult(), repairWait: missingLeaseRecoveryModelResult(),
+      },
+    }])
+    expect(JSON.stringify(projected)).not.toContain(secret)
+  })
+
+  it("projects only owner-bound repair-capacity failed-job attempts and closed error categories", () => {
+    const secret = "private task id or worker error text"
+    const projected = repairCapacityFailedJobDiagnosticProjection([
+      { ownerMatched: true, attemptsMade: 2, errorCategory: "concurrency", taskId: secret, failedReason: secret },
+      { ownerMatched: false, attemptsMade: 4, errorCategory: "concurrency", taskId: secret },
+      { ownerMatched: true, attemptsMade: 10_001, errorCategory: secret, error: secret },
+    ])
+    expect(projected).toEqual([
+      { ownerMatched: true, attemptsMade: 2, errorCategory: "concurrency" },
+      { ownerMatched: true, attemptsMade: null, errorCategory: "other" },
+    ])
+    expect(repairCapacityFailureCategory(new SubagentLimitError("concurrency", secret))).toBe("concurrency")
+    expect(repairCapacityFailureCategory(new SubagentLimitError("fan_out", secret))).toBe("other")
+    expect(repairCapacityFailureCategory({ name: "SubagentLimitError", code: "concurrency" })).toBe("other")
+    const bounded = repairCapacityFailedJobDiagnosticProjection(Array.from({ length: 10 }, (_, index) => ({
+      ownerMatched: true, attemptsMade: index, errorCategory: "other", taskId: secret,
+    })))
+    expect(bounded).toHaveLength(8)
+    expect(bounded.every(row => Object.keys(row).sort().join(",") === "attemptsMade,errorCategory,ownerMatched")).toBe(true)
+    expect(JSON.stringify(projected)).not.toContain(secret)
+    expect(JSON.stringify(bounded)).not.toContain(secret)
   })
 
   it("projects only correlated repair plan and wait result status from captured model input", () => {
@@ -11945,6 +12182,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let terminalGateLease: TurnLease | undefined
     let failedReportBeforeRepair: unknown
     let rootExecution = 0
+    const ownerBoundFailedJobs: RepairCapacityFailedJobDiagnostic[] = []
+    const failedJobDiagnosticWrites: Promise<void>[] = []
     const privateWaitDiagnostics = instrumentPrivateWaitReader(pool!, () => rootExecution)
     const rootRuntime = await canonical.createCanonicalTurnRuntime(privateWaitDiagnostics.pool, {
       workerId: value.ownerId, productionFlags: flags,
@@ -12324,14 +12563,37 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         } finally {
           if (isInitialScout) childLeaseByTaskId.delete(lease.id)
         }
-      }, intervalMs: 10 },
+      }, intervalMs: 10,
+      queueFactory: options => {
+        const consumer = subagentQueue.createSubagentQueue(options)
+        consumer.worker.on("failed", (job, error) => {
+          if (!job) return
+          if (failedJobDiagnosticWrites.length >= 8 || ownerBoundFailedJobs.length >= 8) return
+          const payload = parseSubagentJobPayload(job.data)
+          if (!payload) return
+          const write = async () => {
+            if (!await repairCapacityFailedJobOwnerMatch(pool!, value, payload)) return
+            if (ownerBoundFailedJobs.length >= 8) return
+            ownerBoundFailedJobs.push({
+              ownerMatched: true,
+              attemptsMade: diagnosticBoundedCount(job.attemptsMade),
+              errorCategory: repairCapacityFailureCategory(error),
+            })
+          }
+          failedJobDiagnosticWrites.push(write().catch(() => undefined))
+        })
+        return consumer
+      },
+    },
     })
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
     try {
       await waitForTurnStatus(
         pool!, value.turnId, "completed", 90_000, initialWaitCallId, repairWaitCallIds,
       )
+      await Promise.all(failedJobDiagnosticWrites)
     } catch (error) {
+      await Promise.all(failedJobDiagnosticWrites)
       const failureDiagnosticDeadline = Date.now() + REPAIR_WAIT_DIAGNOSTIC_BUDGET_MS
       let progress = JSON.stringify({ available: false })
       let waitResults: RecordValue = { available: false }
@@ -12410,6 +12672,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const privateWaitRead = privateWaitDiagnostics.latest()
       throw new Error(combineFailureDiagnostics([
         { label: "repairStage", value: repairStage, safeValue: repairStage },
+        { label: "repairCapacityFailedJobs", value: "", safeValue: JSON.stringify(repairCapacityFailedJobDiagnosticProjection(ownerBoundFailedJobs)) },
         { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
@@ -12942,6 +13205,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let repairReceiptReleasedOriginalDependent = false
     let rootCompletedAfterRepair = false
     let repairPlanAccepted = false
+    let repairWaitSent = false
     const productionRootTaskStore = rootTaskStoreModule.createPgRootTaskStore(pool!)
     const runtimeResult = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
@@ -12989,7 +13253,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             fixtureInvocationCounters.repairPlanResult = leaseRecoveryModelResultFromRequest(request, repairPlanCallId)
             fixtureInvocationCounters.repairWaitResult = leaseRecoveryModelResultFromRequest(request, repairWaitCallId)
             round += 1
-            const requestTrace = leaseRecoveryRequestTrace(request, execution, round, leaseRecoveryCallIds)
+            const requestFence = await leaseRecoveryRequestFence(pool!, request, value)
+            const requestTrace = leaseRecoveryRequestTrace(request, execution, round, leaseRecoveryCallIds, requestFence)
             if (leaseRecoveryRequestTraces.length >= 12) leaseRecoveryRequestTraces.shift()
             leaseRecoveryRequestTraces.push(requestTrace)
             fixtureInvocationCounters.adapterRoundOrdinal = Math.min(round, 7)
@@ -13003,9 +13268,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 1 && round === 1) {
               fixtureInvocationCounters.adapterBranch = "initial_plan"
               requestTrace.branch = "initial_plan"
-              requestTrace.emittedToolName = "agent.plan"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+              requestTrace.emittedToolName = "agent.plan"
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
                 nodes: [
@@ -13020,13 +13285,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 1 && round === 2) {
               fixtureInvocationCounters.adapterBranch = "initial_wait"
               requestTrace.branch = "initial_wait"
-              requestTrace.emittedToolName = "agent.wait"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const taskIds = planTaskIds(request, planCallId, 2)
               if (taskIds.length !== 2) throw new Error("Lease recovery fixture plan did not persist its dependent task")
               originalDependentTaskId = taskIds[1]!
               fixtureInvocationCounters.adapterStage = "graph_checked"
               fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+              requestTrace.emittedToolName = "agent.wait"
               yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: initialWaitKey, taskIds: [taskIds[0]!], mode: "all", timeoutMs: 30_000,
               } }
@@ -13037,7 +13302,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 2 && round === 1) {
               fixtureInvocationCounters.adapterBranch = "repair_plan"
               requestTrace.branch = "repair_plan"
-              requestTrace.emittedToolName = "agent.plan"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
@@ -13081,6 +13345,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const graphRootTaskId = root.rows[0]?.rootTaskId
               if (!graphRootTaskId || !scout?.taskId || typeof graph?.revision !== "number") throw new Error("Lease recovery fixture lost its graph identity")
               fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+              requestTrace.emittedToolName = "agent.plan"
               yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
                 expectedRevision: graph.revision,
                 nodes: [{ key: "scout-repair", templateId: "scout", goal: repairGoal, successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION,
@@ -13093,7 +13358,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 2 && round === 2) {
               fixtureInvocationCounters.adapterBranch = "repair_wait"
               requestTrace.branch = "repair_wait"
-              requestTrace.emittedToolName = "agent.wait"
               fixtureInvocationCounters.adapterStage = "branch_entered"
               const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               const graph = currentGraphFromRequest(request)
@@ -13107,6 +13371,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               fixtureInvocationCounters.adapterStage = "graph_checked"
               repairPlanAccepted = true
               fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+              requestTrace.emittedToolName = "agent.wait"
+              repairWaitSent = true
               yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: repairWaitKey, taskIds: [repairTaskIds[0]!, originalDependentTaskId], mode: "all", timeoutMs: 30_000,
               } }
@@ -13117,11 +13383,32 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 3 && round === 1) {
               fixtureInvocationCounters.adapterBranch = "final_proof"
               requestTrace.branch = "final_proof"
-              fixtureInvocationCounters.adapterStage = "branch_entered"
+              fixtureInvocationCounters.adapterStage = "final_proof_owner_fence"
+              expect(requestTrace.ownerMatch).toBe(true)
+              expect(requestTrace.fenceTurnCount).toBe(1)
+              expect(requestTrace.fenceRootCount).toBe(1)
+              expect(requestTrace.rootMatch).toBe(true)
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               fixtureInvocationCounters.adapterStage = "final_proof_graph_nodes"
               expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent", "scout-repair"])
+              expect(nodes.filter(node => node?.key === "scout-repair")).toHaveLength(1)
+              expect(repairTaskId).not.toBe("")
+              expect(originalDependentTaskId).not.toBe("")
+              const expectedRepairWaitTaskIds = [repairTaskId, originalDependentTaskId]
+              fixtureInvocationCounters.adapterStage = "final_proof_repair_evidence"
+              const durableRepairEvidence = await leaseRecoveryPersistedRepairEvidence(
+                pool!, value, leaseRecoveryCallIds, expectedRepairWaitTaskIds,
+              )
+              expect(requestTrace.toolResults.repairPlan).toMatchObject({ resultStatus: "completed", outputStatus: "accepted", errorCategory: "none" })
+              expect(requestTrace.toolResults.repairWait).toMatchObject({ resultStatus: "completed", outputStatus: "waiting", errorCategory: "none" })
+              expect(durableRepairEvidence).toEqual({ available: true, repairPlanPersisted: true, repairWaitPersisted: true })
+              expect(repairPlanAccepted).toBe(true)
+              expect(repairWaitSent).toBe(true)
+              fixtureInvocationCounters.adapterStage = "final_proof_wait_outcome"
+              const resolvedRepairWait = repairWaitOutcomeFromRequest(request, repairWaitCallId, expectedRepairWaitTaskIds)
+              expect(resolvedRepairWait.status).toBe("ready")
+              fixtureInvocationCounters.adapterStage = "branch_entered"
               const scout = nodes.find(node => node?.key === "scout")
               const dependent = nodes.find(node => node?.key === "dependent")
               const repair = nodes.find(node => node?.key === "scout-repair")
