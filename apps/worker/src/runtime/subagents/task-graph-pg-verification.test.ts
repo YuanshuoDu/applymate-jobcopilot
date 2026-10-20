@@ -182,11 +182,13 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
       { ...output, usage: { ...output.usage, jobsProcessed: 1 } },
       { ...output, nextCursor: "next-page" },
       { ...output, evidence: [{ id: "unbound" }] },
+      { ...output, truncated: true, byteLength: 9_000, preview: "{" },
     ]) {
       const invalid = await verifyCompletedTaskGraphNodeEvidence(emptyDiscoveryRows(incomplete).client, {
         scope, snapshot: zeroSnapshot, node: zeroSnapshot.nodes[0]!, structuredResult: emptyResult,
       })
       expect(invalid.verified).toBe(false)
+      expect(invalid.report.status).toBe("unverified")
       expect(invalid.projection).toBeUndefined()
     }
 
