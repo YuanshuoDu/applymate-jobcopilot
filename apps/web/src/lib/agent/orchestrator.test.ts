@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const mocks = vi.hoisted(() => ({ findFirst: vi.fn(), create: vi.fn(), modelChat: vi.fn(), updateMany: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  findFirst: vi.fn(), create: vi.fn(), modelChat: vi.fn(), updateMany: vi.fn(),
+  createWebModelAdapter: vi.fn(), complete: vi.fn(),
+}))
 vi.mock("@/lib/db", () => ({
   db: {
     agentRunQuestion: { findFirst: mocks.findFirst, create: mocks.create },
@@ -8,6 +11,83 @@ vi.mock("@/lib/db", () => ({
   },
 }))
 vi.mock("@/lib/model-router", () => ({ modelChat: mocks.modelChat }))
+vi.mock("@/lib/agent-model-compat", () => ({ createWebModelAdapter: mocks.createWebModelAdapter }))
+
+const planProfile = {
+  provider: "minimax", model: "MiniMax-M3", nativeTools: false,
+  structuredOutput: false, streaming: true, continuationCursor: false,
+}
+const planConfig = { provider: "minimax", model: "MiniMax-M3" }
+
+async function createPlanAgent(signal = new AbortController().signal) {
+  const { OrchestratorAgent } = await import("./orchestrator")
+  const emit = vi.fn()
+  const agentCfg = {
+    targetRoles: ["Engineer", "Data Scientist", "Product Engineer"],
+    targetLocations: ["Berlin", "Dublin"], minMatchScore: 72, autoApply: false, dailyLimit: 12,
+  }
+  const ctx = {
+    userId: "user_plan", sessionId: "session_plan", turnId: "turn_plan",
+    agentCfg, aiConfig: planConfig, emit, signal,
+  }
+  return { agent: new OrchestratorAgent(ctx as never, false), emit, ctx, agentCfg }
+}
+
+describe("OrchestratorAgent.plan through ModelAdapter", () => {
+  beforeEach(() => {
+    mocks.createWebModelAdapter.mockReset()
+    mocks.complete.mockReset()
+    mocks.modelChat.mockReset()
+    mocks.createWebModelAdapter.mockReturnValue({ id: "web:fixture", profile: planProfile, complete: mocks.complete })
+  })
+
+  it("plans through the web ModelAdapter and preserves the legacy request and output events", async () => {
+    mocks.complete.mockResolvedValue({
+      text: "Thinking: inspect the user's goal first.\nPrioritize strong Berlin matches and prepare them for review.",
+    })
+    const { agent, emit, ctx } = await createPlanAgent()
+
+    await expect(agent.plan()).resolves.toBe("Prioritize strong Berlin matches and prepare them for review.")
+
+    expect(mocks.createWebModelAdapter).toHaveBeenCalledWith(planConfig)
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    const [request] = mocks.complete.mock.calls[0]
+    expect(request).toMatchObject({
+      schemaVersion: "agent-harness.v2",
+      provider: "minimax", model: "MiniMax-M3", tools: [], maxOutputTokens: 80,
+      capabilities: { nativeTools: false, structuredOutput: false, streaming: true, continuationCursor: false },
+      messages: [{ role: "user", content: [{
+        type: "text",
+        text: `You are an OrchestratorAgent.\n\nRESPOND WITH EXACTLY ONE SENTENCE. No preamble, no explanation, no thinking. Just the sentence.\n\nContext:\n- Target roles: Engineer, Data Scientist, Product Engineer\n- Locations: Berlin, Dublin\n- Min match score: 72%\n- Auto-apply: OFF\n- Daily limit: 12\n- Mode: INTERACTIVE\n\nWrite the strategy sentence now:`,
+      }] }],
+      metadata: {
+        sessionId: "session_plan", turnId: "turn_plan", stepId: "turn_plan:orchestrator-plan",
+        taskId: "turn_plan", userId: "user_plan",
+      },
+    })
+    expect(request.signal).toBe(ctx.signal)
+    expect(emit).toHaveBeenCalledWith("orchestrator_thinking", {
+      thinking: "Prioritize strong Berlin matches and prepare them for review.", autonomous: false,
+    })
+    agent.complete({ processed: 0, applied: 0, queued: 0, pending: 0, skipped: 0 })
+    expect(emit).toHaveBeenCalledWith("orchestrator_complete", expect.objectContaining({
+      thinking: expect.stringContaining("[Plan] Prioritize strong Berlin matches and prepare them for review."),
+    }))
+  })
+
+  it("returns and emits the existing fallback plan when the adapter fails", async () => {
+    mocks.complete.mockRejectedValue(new Error("provider secret: token-123"))
+    const { agent, emit } = await createPlanAgent()
+
+    await expect(agent.plan()).resolves.toBe("deal with Engineer/Data Scientist Position, threshold 72%")
+
+    expect(emit).toHaveBeenCalledWith("orchestrator_thinking", {
+      thinking: "deal with Engineer/Data Scientist Position, threshold 72%", autonomous: false,
+    })
+    agent.complete({ processed: 0, applied: 0, queued: 0, pending: 0, skipped: 0 })
+    expect(emit).toHaveBeenCalledWith("orchestrator_complete", expect.objectContaining({ thinking: "" }))
+  })
+})
 
 describe("OrchestratorAgent durable questions", () => {
   beforeEach(() => { mocks.findFirst.mockReset(); mocks.create.mockReset(); mocks.modelChat.mockReset() })
