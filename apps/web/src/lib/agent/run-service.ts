@@ -63,10 +63,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     ensureTurn: true,
   });
   const execution = requestedExecution ?? await ensureAgentExecution({ userId: input.userId, sessionId: recorder.sessionId, autonomous: input.autonomous })
-  if (!execution) {
-    console.warn("Agent execution was not found for the requested session")
-    return null
-  }
+  if (!execution) { console.warn("Agent execution was not found for the requested session"); return null }
   const scheduled = input.scheduledTaskGraph;
   const assertScheduledOwnerCurrent = createScheduledTaskGraphOwnerFence(scheduled && { owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken });
   let scheduledState: unknown = execution.state;
@@ -82,9 +79,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
           ? { sessionId: recorder.sessionId, workerTaskId: input.workerTaskId, expectedAttemptCount: input.expectedAttemptCount }
           : {}),
       })
-  if (attemptCount === null) {
-    return null
-  }
+  if (attemptCount === null) return null
   const { isCurrentAttempt, finishAttempt, canPublishAttemptResult, recorderOwner } = createRunAttemptOwnership({
     id: execution.id, userId: input.userId, sessionId: recorder.sessionId, attemptCount,
     turnId: recorder.getTurnId, signal: input.signal,
@@ -265,8 +260,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     return report;
   } catch (error) {
     if (error instanceof AgentExecutionCancelledError) {
-      await eventWriter.drain()
-      return null
+      await eventWriter.drain(); return null
     }
     if (error instanceof AgentPauseError) {
       await eventWriter.drain()
