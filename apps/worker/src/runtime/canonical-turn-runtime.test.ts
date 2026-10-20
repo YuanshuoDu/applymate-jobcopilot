@@ -555,14 +555,23 @@ describe("createCanonicalTurnRuntime", () => {
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
     expect(runner).toHaveBeenCalledOnce()
     expect(runner).toHaveBeenCalledWith(expect.objectContaining({ taskGraphCommandPort: graph }))
-    expect(loadOptions).toEqual([{ consumeWaitOutcomes: true }, { consumeWaitOutcomes: false }])
+    const durableWaitControlReader = loadOptions[0]?.durableWaitControlReader
+    if (!durableWaitControlReader || typeof durableWaitControlReader.readByInvocation !== "function") throw new Error("fixture_wait_reader_missing")
+    expect(loadOptions[1]?.durableWaitControlReader).toBe(durableWaitControlReader)
+    expect(loadOptions).toEqual([
+      { consumeWaitOutcomes: true, durableWaitControlReader },
+      { consumeWaitOutcomes: false, durableWaitControlReader },
+    ])
     expect(graph.readCurrent).toHaveBeenCalledTimes(4)
     expect(observedSnapshots[0]?.goal).toEqual(initial.snapshot.goal)
     expect(observedSnapshots[0]?.steerHistory).toContainEqual({ id: "cursor-tail:9", content: "recent turn history" })
     expect(observedSnapshots[0]?.businessRefs).toEqual(refreshed.snapshot.businessRefs)
     expect(observedSnapshots[0]?.toolObservations).toEqual([
       { id: "wait-result:wait-1", content: { toolName: "agent.wait", output: { status: "ready" } } },
-      { id: "task-graph-current", content: { kind: "task_graph_current", revision: 9, nodes: [] } },
+      { id: "task-graph-current", content: {
+        kind: "task_graph_current", revision: 9, nodes: [],
+        nodeCapacity: { nodeCount: 0, maxNodes: 8, remaining: 8, ordinaryRemaining: 8, reserveActive: false, repairRecorded: false },
+      } },
     ])
     expect(modelRequests).toHaveLength(1)
   })
@@ -666,6 +675,7 @@ describe("createCanonicalTurnRuntime", () => {
       content: {
         kind: "task_graph_current",
         revision: 1,
+        nodeCapacity: { nodeCount: 1, maxNodes: 8, remaining: 7, ordinaryRemaining: 7, reserveActive: false, repairRecorded: false },
         nodes: expect.arrayContaining([expect.objectContaining({
           key: "research",
           status: "completed",
@@ -2345,6 +2355,21 @@ describe("createCanonicalTurnRuntime", () => {
       expectedFactsByRevision[0]!.counts, expectedFactsByRevision[0]!.counts, expectedFactsByRevision[0]!.counts,
       expectedFactsByRevision[0]!.counts, expectedFactsByRevision[1]!.counts, expectedFactsByRevision[1]!.counts,
     ])
+    const legacyGraphCapacity = {
+      nodeCount: 2, maxNodes: 8, remaining: 6, ordinaryRemaining: 6, reserveActive: false, repairRecorded: false,
+    }
+    expect(currentBlocks.map(block => (block?.content as { nodeCapacity?: unknown }).nodeCapacity))
+      .toEqual(Array(6).fill(legacyGraphCapacity))
+    const capturedGraphObservations = requests.map(request => {
+      const text = request.messages.flatMap(message => message.content)
+        .find(part => part.type === "text" && part.text.includes('"kind":"task_graph_current"'))
+      if (!text || text.type !== "text") throw new Error("captured_request_missing_current_task_graph")
+      const observation = JSON.parse(text.text.slice(text.text.indexOf("\n") + 1)) as Record<string, unknown>
+      return observation
+    })
+    expect(capturedGraphObservations.map(observation => observation.nodeCapacity))
+      .toEqual(Array(6).fill(legacyGraphCapacity))
+    expect(capturedGraphObservations.every(observation => !Object.hasOwn(observation, "rootTaskId"))).toBe(true)
     expect(expectedFactsByRevision.map(facts => facts.counts.discoveredJobs.knownCount)).toEqual([4, 5])
     expect(currentBlocks.map(block => (block?.content as { revision?: number }).revision)).toEqual([7, 7, 7, 7, 8, 8])
     const currentGraphNodes = currentBlocks.map(block => (block?.content as { nodes?: Array<{ status?: string; verificationCriterionIds?: unknown }> }).nodes ?? [])

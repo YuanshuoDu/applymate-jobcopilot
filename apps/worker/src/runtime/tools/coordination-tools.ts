@@ -141,6 +141,7 @@ const InterruptOutputSchema = Type.Object({
 const CloseOutputSchema = Type.Object({
   taskId: IdSchema, status: StatusSchema, closed: Type.Boolean(),
 }, { additionalProperties: false })
+const NATIVE_CAPACITY_GUIDANCE = " For a graph-backed root, TaskGraph maxNodes is an eight-node lifetime cap separate from active-child concurrency. Read the current task_graph_current.nodeCapacity fields nodeCount, maxNodes, remaining, ordinaryRemaining, reserveActive, and repairRecorded before appending. If reserveActive is true, leave the final slot for one exact failed-criterion repair through agent.plan. A native append consumes one lifetime slot. An accepted repair sets repairRecorded and consumes the reserve even while queued or if it fails; that does not pass the target or promise another retry. If remaining is zero, stop with the fixed capacity denial; do not infer room from concurrency."
 
 function metadata(name: string, description: string, risk: "read" | "internal_write", idempotency: "read_only" | "idempotent" | "requires_key"): Pick<RuntimeToolDefinition, "schemaVersion" | "name" | "version" | "description" | "capabilities" | "risk" | "domain" | "idempotency" | "timeoutMs" | "requiredCapabilities"> {
   return {
@@ -159,17 +160,17 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
   const closeExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeCloseSubagent(context, input as CloseSubagentInput, options)
   return [
     {
-      ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
+      ...metadata("spawn_subagent", `Create one permission-scoped child task and durably enqueue it.${NATIVE_CAPACITY_GUIDANCE}`, "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
       execute: spawnExecutor,
     },
     {
-      ...metadata("agent.spawn", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
+      ...metadata("agent.spawn", `Create one permission-scoped child task and durably enqueue it.${NATIVE_CAPACITY_GUIDANCE}`, "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
       execute: spawnExecutor,
     },
     {
-      ...metadata("agent.followup", "Create a follow-up from a terminal result, or on a general native root replace an unstarted leaf with mode=replace_unstarted and its current graph expectedRevision; replacement inherits source criteria and policy", "internal_write", "requires_key"),
+      ...metadata("agent.followup", `Create a follow-up from a terminal result, or on a general native root replace an unstarted leaf with mode=replace_unstarted and its current graph expectedRevision; replacement inherits source criteria and policy.${NATIVE_CAPACITY_GUIDANCE} A replacement retains its canceled source and appends its successor, so it also consumes a lifetime slot. An accepted repair relation consumes the one reserve even if queued or failed, but does not make its target successful or guarantee another retry.`, "internal_write", "requires_key"),
       inputSchema: FollowupInputSchema, outputSchema: FollowupOutputSchema,
       execute: (context, input) => executeFollowup(context, input as FollowupInput, options),
     },
