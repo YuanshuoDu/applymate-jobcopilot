@@ -9,7 +9,7 @@ type DispatchState = { id: string; attemptCount: number; publishedAt: string | n
 
 function fixture(initial: DispatchState | null = {
   id: "dispatch_1", attemptCount: 3, publishedAt: "2026-09-24 01:00:00.123456+00", payload: {},
-}) {
+}, turn: { source?: string; executionMode?: string | null } = {}) {
   const state: { dispatch: DispatchState | null } = { dispatch: initial }
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -29,13 +29,14 @@ function fixture(initial: DispatchState | null = {
       if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) return { rows: [{ id: "session_1" }], rowCount: 1 }
       if (sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) {
         const dispatch = state.dispatch
+        const modeAllowsRecovery = turn.source !== "automation" || turn.executionMode === "canonical_task_graph"
         return {
-          rows: [{
+          rows: modeAllowsRecovery ? [{
             id: "turn_1", sessionId: "session_1", dispatchId: dispatch?.id ?? null,
             dispatchAttemptCount: dispatch?.attemptCount ?? null,
             dispatchPublishedAt: dispatch?.publishedAt ?? null,
-          }],
-          rowCount: 1,
+          }] : [],
+          rowCount: modeAllowsRecovery ? 1 : 0,
         }
       }
       if (sql.includes('SELECT turn."id" FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE OF session, turn")) {
@@ -198,5 +199,57 @@ describe("queued Turn dispatch repair", () => {
     await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_3", 50)).resolves.toBe(0)
 
     expect(fake.state.dispatch).toMatchObject({ attemptCount: 3, publishedAt: "2026-09-24 01:00:00.123456+00" })
+  })
+
+  it.each([null, "legacy_pipeline_adapter"] as const)(
+    "does not synthesize or re-arm an automation Turn with mode %s",
+    async executionMode => {
+      const fake = fixture(null, { source: "automation", executionMode })
+      const queue: TurnDispatchQueue = { add: vi.fn(), getJobState: vi.fn().mockResolvedValue("failed") }
+
+      await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_automation", 10)).resolves.toBe(0)
+
+      expect(queue.getJobState).not.toHaveBeenCalled()
+      expect(fake.client.query.mock.calls.some(([sql]) => String(sql).includes('INSERT INTO "agent_outbox"'))).toBe(false)
+      expect(fake.client.query.mock.calls[1]?.[0]).toContain('(turn."source" <> \'automation\' OR turn."executionMode" = \'canonical_task_graph\')')
+    },
+  )
+
+  it.each([null, "legacy_pipeline_adapter"] as const)(
+    "does not re-arm a published automation dispatch with mode %s",
+    async executionMode => {
+      const fake = fixture(undefined, { source: "automation", executionMode })
+      const queue: TurnDispatchQueue = { add: vi.fn(), getJobState: vi.fn().mockResolvedValue("failed") }
+
+      await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_automation", 10)).resolves.toBe(0)
+
+      expect(queue.getJobState).not.toHaveBeenCalled()
+      expect(fake.client.query.mock.calls.some(([sql]) => String(sql).includes('UPDATE "agent_outbox" AS dispatch'))).toBe(false)
+      expect(fake.state.dispatch).toMatchObject({ attemptCount: 3, publishedAt: "2026-09-24 01:00:00.123456+00" })
+    },
+  )
+
+  it("repairs only an automation Turn already pinned canonical", async () => {
+    const fake = fixture(null, { source: "automation", executionMode: "canonical_task_graph" })
+    const queue: TurnDispatchQueue = { add: vi.fn() }
+
+    await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_automation", 10)).resolves.toBe(1)
+
+    expect(fake.client.query.mock.calls.some(([sql]) => String(sql).includes('(turn."source" <> \'automation\' OR turn."executionMode" = \'canonical_task_graph\')'))).toBe(true)
+  })
+
+  it("re-arms only a canonical-pinned automation dispatch", async () => {
+    const fake = fixture(undefined, { source: "automation", executionMode: "canonical_task_graph" })
+    const queue: TurnDispatchQueue = { add: vi.fn(), getJobState: vi.fn().mockResolvedValue("failed") }
+
+    await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_automation", 10)).resolves.toBe(1)
+
+    expect(queue.getJobState).toHaveBeenCalledOnce()
+    expect(fake.state.dispatch).toMatchObject({ attemptCount: 4, publishedAt: null })
+    for (const [sql] of fake.client.query.mock.calls) {
+      if (String(sql).includes("FOR UPDATE OF session, turn") || String(sql).includes('UPDATE "agent_outbox" AS dispatch')) {
+        expect(sql).toContain('(turn."source" <> \'automation\' OR turn."executionMode" = \'canonical_task_graph\')')
+      }
+    }
   })
 })

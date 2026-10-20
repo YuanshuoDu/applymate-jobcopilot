@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Queue, type Job } from "bullmq"
 import { Redis } from "ioredis"
+import { SESSION_CONTROL_RECOVERY_MAX_BATCH } from "../runtime/session-control/pause-recovery.js"
 
 const RUN_REDIS_INTEGRATION = process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1"
 
@@ -45,6 +46,8 @@ type FixtureTurn = {
   id: string
   sessionId: string
   userId: string
+  source: string
+  executionMode: string | null
   status: string
   leaseOwnerId: string | null
   leaseVersion: number
@@ -55,13 +58,15 @@ type FixtureTurn = {
 /** Only the SQL state needed by the real dispatch scanner and lease fence. */
 function createSqlFixture(ids: { turnId: string; sessionId: string; userId: string }) {
   const turn: FixtureTurn = {
-    id: ids.turnId, sessionId: ids.sessionId, userId: ids.userId, status: "queued",
+    id: ids.turnId, sessionId: ids.sessionId, userId: ids.userId,
+    source: "user", executionMode: null, status: "queued",
     leaseOwnerId: null, leaseVersion: 0, leaseStartedAt: null, leaseExpiresAt: null,
   }
   const state = {
     turn,
     outbox: null as FixtureOutbox | null,
     claimAttempts: [] as Array<{ turnId: string; sessionId: string; ownerId: string }>,
+    modeLookupShapes: [] as Array<"id-source-mode" | "source-mode">,
   }
 
   const client = {
@@ -69,7 +74,29 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
       const none = { rows: [] as Array<Record<string, unknown>>, rowCount: 0 }
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return none
       if (sql.includes("SELECT set_config('app.user_id'")) return { rows: [], rowCount: 1 }
+      if (
+        sql.includes('SELECT session."userId", session."id" AS "sessionId", control."turnId", session."status"')
+        && values.length === 1
+        && values[0] === SESSION_CONTROL_RECOVERY_MAX_BATCH
+      ) return none
       if (sql.includes("WITH candidates AS") || sql.includes("WITH stale AS")) return none
+      const normalizedSql = sql.replace(/\s+/g, " ").trim()
+      const modeLookupShape = normalizedSql.startsWith('SELECT turn."id", turn."source", turn."executionMode" FROM "agent_turns" AS turn')
+        ? "id-source-mode"
+        : normalizedSql.startsWith('SELECT turn."source", turn."executionMode" FROM "agent_turns" AS turn')
+          ? "source-mode"
+          : null
+      if (modeLookupShape) {
+        state.modeLookupShapes.push(modeLookupShape)
+        return state.turn.id === values[0] && state.turn.sessionId === values[1]
+          ? {
+            rows: [modeLookupShape === "id-source-mode"
+              ? { id: state.turn.id, source: state.turn.source, executionMode: state.turn.executionMode }
+              : { source: state.turn.source, executionMode: state.turn.executionMode }],
+            rowCount: 1,
+          }
+          : none
+      }
       if (sql.includes('SELECT turn."id", turn."sessionId"')) return none
       if (/SELECT\s+turn\."id"\s+FROM\s+"agent_turns"\s+AS\s+turn/.test(sql)) {
         return state.turn.id === values[0] && state.turn.sessionId === values[1]
@@ -159,6 +186,34 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
     },
   }
 }
+
+describe("production bootstrap SQL fixture", () => {
+  it("answers both production execution-mode lookup projections", async () => {
+    const ids = { turnId: "fixture-turn", sessionId: "fixture-session", userId: "fixture-user" }
+    const fixture = createSqlFixture(ids)
+    const client = await fixture.pool.connect()
+    const deliveryLineage = await client.query(
+      `SELECT turn."id", turn."source", turn."executionMode"
+       FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2
+       FOR UPDATE OF turn, session`,
+      [ids.turnId, ids.sessionId],
+    )
+    const canonicalIntake = await client.query(
+      `SELECT turn."source", turn."executionMode"
+       FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session
+         ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2`,
+      [ids.turnId, ids.sessionId],
+    )
+
+    expect(deliveryLineage.rows[0]).toEqual({ id: ids.turnId, source: "user", executionMode: null })
+    expect(canonicalIntake.rows[0]).toEqual({ source: "user", executionMode: null })
+    expect(fixture.state.modeLookupShapes).toEqual(["id-source-mode", "source-mode"])
+  })
+})
 
 async function waitForCompletedJob<T>(queue: Queue<T>, id: string, timeoutMs = 10_000): Promise<Job<T>> {
   const deadline = Date.now() + timeoutMs
@@ -276,5 +331,6 @@ describeWithRedis("production Turn dispatch and consumer (real Redis/BullMQ)", (
     expect(executions).toHaveLength(1)
     expect(executions[0]).toMatchObject({ ...ids, ownerId: payload.ownerId, leaseVersion: 1 })
     expect(fixture.state.turn).toMatchObject({ status: "completed", leaseOwnerId: null, leaseVersion: 1 })
+    expect(fixture.state.modeLookupShapes).toEqual(expect.arrayContaining(["id-source-mode", "source-mode"]))
   }, 25_000)
 })

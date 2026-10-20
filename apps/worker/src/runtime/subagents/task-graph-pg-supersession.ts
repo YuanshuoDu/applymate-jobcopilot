@@ -106,12 +106,14 @@ export function taskGraphSupersessionFingerprint(source: TaskIdentity, proposal:
   expectedRevision: number
   replaceUnstartedNodeKey: string
   nodes: readonly unknown[]
+  rootSuccessCriteria?: readonly string[]
 }>): string {
   return taskGraphFingerprint({
     source: { nodeKey: source.nodeKey, taskId: source.taskId },
     expectedRevision: proposal.expectedRevision,
     replaceUnstarted: { nodeKey: proposal.replaceUnstartedNodeKey },
     nodes: proposal.nodes,
+    ...(proposal.rootSuccessCriteria === undefined ? {} : { rootSuccessCriteria: proposal.rootSuccessCriteria }),
   })
 }
 
@@ -123,7 +125,8 @@ export function taskGraphWaitConditionEvidenceSql(): string {
 }
 
 export async function scheduleTaskGraphSupersession(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent,
-  loaded: LoadedGraph, operation: SteeringReconciliationOperation | undefined, key: string, findReplay: PlanReplayLookup): Promise<TaskGraphScheduleReceipt> {
+  loaded: LoadedGraph, operation: SteeringReconciliationOperation | undefined, key: string, findReplay: PlanReplayLookup,
+  pinnedCriteria?: readonly string[]): Promise<TaskGraphScheduleReceipt> {
   const current = loaded.state, revision = current?.revision ?? 0, sourceKey = input.replaceUnstarted!.nodeKey
   if (!operation || operation.replaceUnstartedNodeKey !== sourceKey || input.proposal.nodes.length !== 1
     || input.scope.parentTaskId !== input.scope.rootTaskId || !input.scope.stepId) throw new TaskGraphCommandError("task_graph_supersession_invalid", "TaskGraph supersession request is invalid")
@@ -132,9 +135,10 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   const priorRelation = parseTaskGraphSupersessionRelation(prepared.receipt.supersession)
   if (prepared.receipt.supersession && !priorRelation) throw new TaskGraphCommandError("idempotency_conflict", "Persisted supersession relation is invalid")
   const normalizedNodes = normalizeSupersessionNodes(input.proposal.nodes, input.scope.rootTaskId)
+  const rootSuccessCriteria = input.rootSuccessCriteria
   if (priorRelation) {
     const fingerprint = taskGraphSupersessionFingerprint(priorRelation.source, { expectedRevision: input.proposal.expectedRevision,
-      replaceUnstartedNodeKey: sourceKey, nodes: normalizedNodes })
+      replaceUnstartedNodeKey: sourceKey, nodes: normalizedNodes, rootSuccessCriteria })
     const replay = await findReplay(input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId), { operationKey: prepared.idempotencyKey, observedRevision: input.proposal.expectedRevision })
     if (!replay || priorRelation.operationKey !== prepared.idempotencyKey || priorRelation.observedRevision !== input.proposal.expectedRevision
       || priorRelation.source.nodeKey !== sourceKey || priorRelation.replacementFingerprint !== fingerprint || priorRelation.planEvent.idempotencyKey !== key
@@ -170,7 +174,7 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   if (!sourceTaskId || sourceTaskId !== source.taskId) throw new TaskGraphCommandError("task_graph_supersession_not_eligible", "The locked source identity changed")
   const sourceIdentity = { nodeKey: sourceKey, taskId: sourceTaskId }
   const fingerprint = taskGraphSupersessionFingerprint(sourceIdentity, { expectedRevision: input.proposal.expectedRevision,
-    replaceUnstartedNodeKey: sourceKey, nodes: normalizedNodes })
+    replaceUnstartedNodeKey: sourceKey, nodes: normalizedNodes, rootSuccessCriteria })
   if (await findReplay(input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId), { operationKey: prepared.idempotencyKey, observedRevision: input.proposal.expectedRevision })) {
     throw new TaskGraphCommandError("idempotency_conflict", "A supersession plan event exists without its validated relation")
   }
@@ -190,8 +194,9 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   const working = { ...cancelled.state, nodes: cancelled.state.nodes.filter(node => node.key !== sourceKey),
     repairSatisfiedNodeKeys: cancelled.state.repairSatisfiedNodeKeys?.filter(nodeKey => nodeKey !== sourceKey), repairPendingNodeKeys: cancelled.state.repairPendingNodeKeys?.filter(nodeKey => nodeKey !== sourceKey) }
   const priorIds = new Map(loaded.snapshot.nodes.filter(node => node.key !== sourceKey).map(node => [node.key, node.taskId] as const))
-  const created = await createGraphTasks(client, { ...input, proposal: { ...input.proposal, expectedRevision: revision + 1 } }, parent, working, priorIds)
-  const snapshot = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
+  const created = await createGraphTasks(client, { ...input, proposal: { ...input.proposal, expectedRevision: revision + 1 } }, parent, working, priorIds, loaded)
+  const stamped = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates)
+  const snapshot = pinnedCriteria ? parseTaskGraphSnapshot({ ...stamped, rootSuccessCriteria: pinnedCriteria }) : stamped
   const replacementNode = snapshot.nodes.find(node => node.key === created.created[0]?.key)
   if (created.state.revision !== revision + 2 || created.created.length !== 1 || !replacementNode || replacementNode.taskId === source.taskId
     || !taskGraphSupersessionEnvelopeMatches(source, replacementNode) || snapshot.nodes.some(node => node.key === sourceKey || node.taskId === sourceTaskId)

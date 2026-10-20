@@ -37,6 +37,7 @@ export type NativeVerificationTarget = Readonly<{
 type Row = Record<string, unknown>
 type Queryable = Pick<pg.PoolClient, "query">
 const MAX_RESULT_BYTES = 16 * 1024
+const MAX_ROOT_CRITERIA = 32
 
 function record(value: unknown): Row | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
@@ -56,7 +57,17 @@ export async function loadNativeVerificationOwnedState(
   [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])
   if (rootTurn.rows.length !== 1) throw new Error("native_verification_root_scope_invalid")
   const root = rootTurn.rows[0] as Row
-  const { goal, criteria, criteriaValid, turnGoalConflict } = resolveRootTaskObjective(root.input, root)
+  const objective = resolveRootTaskObjective(root.input, root)
+  const goal = objective.goal
+  const pinnedCriteria = snapshot?.rootSuccessCriteria
+  const pinMatchesGoal = pinnedCriteria === undefined || (goal !== null && pinnedCriteria[0] === goal)
+  const preservesLegacyFallback = !objective.criteriaValid && pinnedCriteria === undefined && goal !== null
+    && objective.criteria.length === 1 && objective.criteria[0] === goal
+  const criteria = pinMatchesGoal && (objective.criteriaValid || preservesLegacyFallback)
+    ? mergePinnedCriteria(goal, objective.criteria, pinnedCriteria)
+    : []
+  const criteriaValid = pinMatchesGoal && objective.criteriaValid && criteria.length > 0
+  const turnGoalConflict = objective.turnGoalConflict
   let turnInputDigest: string | null = null
   try { turnInputDigest = digestNativeVerificationValue(root.input) } catch { /* unavailable input is carried as a failed binding */ }
 
@@ -111,6 +122,12 @@ export function deriveNativeVerificationObjective(
     : resolveRootTaskObjective(turnInput, root)
   return objective.goal && !objective.turnGoalConflict && objective.criteriaValid
     ? { goal: objective.goal, criteria: objective.criteria } : null
+}
+
+function mergePinnedCriteria(goal: string | null, criteria: readonly string[], pinned?: readonly string[]): readonly string[] {
+  if (!pinned || !goal) return criteria
+  const merged = [...new Set([goal, ...criteria, ...pinned.slice(1)])]
+  return merged.length <= MAX_ROOT_CRITERIA ? merged : []
 }
 /** A predecessor leaves the active frontier only when an owned followup still proves its exact source. */
 export function nativeVerificationFrontier(state: NativeVerificationOwnedState): readonly StoredTaskGraphNode[] {

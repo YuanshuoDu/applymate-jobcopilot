@@ -70,6 +70,18 @@ describe("recovery scanner persistence helpers", () => {
     await expect(reclaimExpiredTurns(fake.pool, new Date("2026-09-23T12:00:00Z"), 10)).resolves.toEqual([
       { turnId: "turn-1", sessionId: "session-1", previousLeaseVersion: 7 },
     ])
-    expect(fake.calls.find(([sql]) => sql.includes("WITH stale"))?.[0]).toContain("SKIP LOCKED")
+    const stale = fake.calls.find(([sql]) => sql.includes("WITH stale"))?.[0] ?? ""
+    expect(stale).toContain("SKIP LOCKED")
+    expect(stale).toContain('(turn."source" <> \'automation\' OR turn."executionMode" = \'canonical_task_graph\')')
+    expect(fake.calls.some(([sql]) => sql.includes('WHERE turn."id" = stale."id"'))).toBe(true)
+  })
+
+  it("leaves unresolved and legacy automation Turns to their AgentRun retry", async () => {
+    const fake = fakePool(sql => sql.includes("WITH stale") ? { rows: [], rowCount: 0 } : {})
+
+    await expect(reclaimExpiredTurns(fake.pool, new Date("2026-09-23T12:00:00Z"), 10)).resolves.toEqual([])
+
+    const stale = fake.calls.find(([sql]) => sql.includes("WITH stale"))?.[0] ?? ""
+    expect(stale).toContain('turn."executionMode" = \'canonical_task_graph\'')
   })
 })

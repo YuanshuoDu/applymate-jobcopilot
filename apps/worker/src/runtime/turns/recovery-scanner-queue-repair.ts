@@ -46,6 +46,7 @@ export async function ensureQueuedTurnDispatches(
       AND dispatch."aggregateId" = turn."sessionId"
       AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
      WHERE turn."status" = 'queued' AND turn."leaseOwnerId" IS NULL
+       AND (turn."source" <> 'automation' OR turn."executionMode" = 'canonical_task_graph')
        AND (dispatch."id" IS NULL OR dispatch."publishedAt" IS NOT NULL)
      ORDER BY turn."createdAt" ASC, turn."id" ASC
      LIMIT $2 FOR UPDATE OF turn, session SKIP LOCKED`,
@@ -80,6 +81,7 @@ async function insertMissingDispatch(pool: LeasePool, turnId: string, payload: T
          JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
          WHERE turn."id" = $6 AND turn."sessionId" = $3
            AND turn."status" = 'queued' AND turn."leaseOwnerId" IS NULL
+           AND (turn."source" <> 'automation' OR turn."executionMode" = 'canonical_task_graph')
            AND ${RUNNABLE_SESSION}
        )
        ON CONFLICT ("idempotencyKey") DO NOTHING`,
@@ -102,6 +104,7 @@ async function rearmMissingPublishedDispatch(
        JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
        WHERE turn."id" = $1 AND turn."sessionId" = $2
          AND turn."status" = 'queued' AND turn."leaseOwnerId" IS NULL
+         AND (turn."source" <> 'automation' OR turn."executionMode" = 'canonical_task_graph')
          AND ${RUNNABLE_SESSION}
        FOR UPDATE OF session, turn`,
       [payload.turnId, payload.sessionId],
@@ -120,6 +123,7 @@ async function rearmMissingPublishedDispatch(
            JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
            WHERE turn."id" = $8 AND turn."sessionId" = $4
              AND turn."status" = 'queued' AND turn."leaseOwnerId" IS NULL
+             AND (turn."source" <> 'automation' OR turn."executionMode" = 'canonical_task_graph')
              AND ${RUNNABLE_SESSION}
          )`,
       [JSON.stringify(payload), row.dispatchId, TURN_DISPATCH_TOPIC, payload.sessionId,

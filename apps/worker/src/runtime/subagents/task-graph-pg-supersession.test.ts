@@ -114,6 +114,11 @@ describe("parseTaskGraphSupersessionRelation", () => {
     expect(taskGraphSupersessionFingerprint({ ...source, taskId: "different-task" }, proposal)).not.toBe(fingerprint)
     expect(taskGraphSupersessionFingerprint({ ...source, nodeKey: "different-node" }, proposal)).not.toBe(fingerprint)
     expect(taskGraphSupersessionFingerprint(source, { ...proposal, nodes: [{ ...proposal.nodes[0], goal: "Changed" }] })).not.toBe(fingerprint)
+    const rootSuccessCriteria = ["Include evidence for each role"]
+    const checklistFingerprint = taskGraphSupersessionFingerprint(source, { ...proposal, rootSuccessCriteria })
+    expect(checklistFingerprint).toBe(taskGraphSupersessionFingerprint(source, { ...proposal, rootSuccessCriteria: [...rootSuccessCriteria] }))
+    expect(checklistFingerprint).not.toBe(fingerprint)
+    expect(taskGraphSupersessionFingerprint(source, { ...proposal, rootSuccessCriteria: ["Changed checklist"] })).not.toBe(checklistFingerprint)
   })
 
   it("rejects a persisted call that does not describe the superseded source request", () => {

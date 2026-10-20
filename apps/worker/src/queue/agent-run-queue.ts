@@ -6,6 +6,7 @@ import { getPool } from "../db/apply-results.js";
 import { measureWorkerResponseBytes, recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
 import { runCanonicalAgentTurn } from "./agent-run-turn-executor.js";
 import { createAgentRunCanonicalProducer, type AgentRunCanonicalProducer } from "./agent-run-canonical-dispatch.js";
+import { pinAgentRunMode } from "./agent-run-mode.js";
 import { resolveProductionAgentFlags } from "../runtime/production-agent-flags.js";
 import { TURN_QUEUE_NAME } from "../runtime/turns/turn-queue.js";
 import { AGENT_EXECUTION_DISPATCH_POLL_MS, dispatchPendingAgentExecutionOutbox } from "./agent-execution-dispatch-recovery.js";
@@ -103,9 +104,12 @@ function startExecutionDispatchRecovery() {
 export function createAgentRunProcessor(canonicalProducer: AgentRunCanonicalProducer = agentRunCanonicalProducer) {
   return async (task: AgentRunJob) => {
     if (task.data.turnId) {
-      if (!resolveProductionAgentFlags().canonicalAutomationEnabled) {
-        // Gate-off is an explicit, durable rollback to the existing pipeline
-        // adapter so a queued automation still reaches a terminal outcome.
+      const executionMode = await pinAgentRunMode(getPool(), {
+        userId: task.data.userId,
+        sessionId: task.data.sessionId,
+        turnId: task.data.turnId,
+      }, resolveProductionAgentFlags().canonicalAutomationEnabled);
+      if (executionMode === "legacy_pipeline_adapter") {
         return runCanonicalAgentTurn(task, getPool());
       }
       await canonicalProducer.enqueue({ sessionId: task.data.sessionId, turnId: task.data.turnId });
