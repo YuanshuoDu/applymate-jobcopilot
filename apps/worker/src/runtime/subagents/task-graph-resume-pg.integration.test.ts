@@ -3423,6 +3423,7 @@ async function checkTerminalTaskGraph(pool: Pool, lease: TurnLease, rootTaskId: 
 }
 
 type ProcessFixtureChild = ChildProcess & { output: string[]; errors: string[] }
+const activeProcessFixtureChildren = new Set<ProcessFixtureChild>()
 const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-process-restart.fixture.mjs", import.meta.url))
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 const DISCOVERY_TURN_WORKER_MARKER = "P3_DISCOVERY_TURN_WORKER "
@@ -3501,6 +3502,8 @@ function startTaskGraphRestartWorker(
   }) as ProcessFixtureChild
   child.output = []
   child.errors = []
+  activeProcessFixtureChildren.add(child)
+  child.once("exit", () => activeProcessFixtureChildren.delete(child))
   let stdout = ""
   let stderr = ""
   child.stdout?.setEncoding("utf8")
@@ -6895,20 +6898,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   afterAll(async () => {
     const cleanupFailures: string[] = []
     const attempt = async (label: string, action: () => Promise<unknown>) => {
-      try { await action() } catch (error: unknown) {
+      try { await action(); return true } catch (error: unknown) {
         cleanupFailures.push(label + ": " + (error instanceof Error ? error.stack ?? error.message : String(error)))
+        return false
       }
     }
-    await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner, archivedWaitOwner]) {
-      await attempt("delete outbox for " + current.sessionId, () => pool!.query(
-        "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
-      ))
-      await attempt("delete user " + current.userId, () => pool!.query(
-        "DELETE FROM \"User\" WHERE \"id\" = $1", [current.userId],
-      ))
+    const fixtureOwners = [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner, archivedWaitOwner]
+    // Restart subprocess fixtures are awaited in each test's finally block; close any leftover before queue cleanup.
+    const bootstrapClosed = await attempt("bootstrap close", async () => { await bootstrap?.close() })
+    let processFixturesStopped = true
+    let processFixtureIndex = 0
+    for (const child of [...activeProcessFixtureChildren]) {
+      processFixtureIndex += 1
+      if (processFixtureExited(child)) {
+        activeProcessFixtureChildren.delete(child)
+        continue
+      }
+      await attempt("stop outstanding process fixture " + processFixtureIndex, async () => { await stopProcessFixture(child) })
+      if (!processFixtureExited(child)) processFixturesStopped = false
     }
-    if (redis && turnQueueName && childQueueName) {
+    if (!processFixturesStopped) {
+      cleanupFailures.push("preserve fixture queues because a process fixture did not exit (category=fixture_process_exit)")
+    }
+    let fixtureQueueCleanupSafe = bootstrapClosed && processFixturesStopped
+    if (redis && turnQueueName && childQueueName && fixtureQueueCleanupSafe) {
       const queueSpecs = [
         { name: turnQueueName, label: "turn queue" },
         { name: childQueueName, label: "subagent queue" },
@@ -6916,23 +6929,71 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       ]
       const queues: Array<{ name: string; label: string; queue: Queue }> = []
       for (const spec of queueSpecs) {
-        await attempt("create " + spec.label, async () => {
+        if (!await attempt("create " + spec.label, async () => {
           queues.push({ ...spec, queue: new Queue(spec.name, { connection: redis!, skipVersionCheck: true }) })
-        })
+        })) fixtureQueueCleanupSafe = false
       }
+      const fixtureLockDeadline = Date.now() + 45_000
       for (const currentQueue of queues) {
         const { queue, label } = currentQueue
-        await attempt("wait for " + label, () => queue.waitUntilReady())
+        if (!await attempt("wait for " + label, () => queue.waitUntilReady())) fixtureQueueCleanupSafe = false
         let jobs: Awaited<ReturnType<typeof queue.getJobs>> = []
-        await attempt("list jobs from " + label, async () => {
-          jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
-        })
-        for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner, archivedWaitOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
-            await attempt("remove " + label + " job " + job.id, () => job.remove())
+        if (!await attempt("list jobs from " + label, async () => {
+          jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "prioritized", "active"])
+        })) fixtureQueueCleanupSafe = false
+        const fixtureJobIds = new Set(jobs.flatMap(job => job.id && fixtureOwners.some(current =>
+          job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId,
+        ) ? [job.id] : []))
+        const lockedFixtureJobIds = new Set(fixtureJobIds)
+        let lockProbeFailed = false
+        // BullMQ rejects removal while the exact job's lock key exists; the active list can outlive a dead worker.
+        while (lockedFixtureJobIds.size > 0 && Date.now() < fixtureLockDeadline) {
+          try {
+            const lockStates = await Promise.all([...lockedFixtureJobIds].map(async id => ({
+              id,
+              locked: (await redis!.exists(queue.toKey(`${id}:lock`))) > 0,
+            })))
+            for (const state of lockStates) if (!state.locked) lockedFixtureJobIds.delete(state.id)
+          } catch {
+            lockProbeFailed = true
+          }
+          if (lockedFixtureJobIds.size > 0) {
+            await new Promise(resolve => setTimeout(resolve, Math.min(200, Math.max(1, fixtureLockDeadline - Date.now()))))
           }
         }
-        await attempt("close " + label, () => queue.close())
+        if (lockedFixtureJobIds.size > 0) {
+          cleanupFailures.push(`wait for ${label} fixture job locks: ${lockProbeFailed ? "verification_failed" : "timeout"} (state=active_or_unknown; category=fixture_lock_release)`)
+          fixtureQueueCleanupSafe = false
+        }
+        for (const id of fixtureJobIds) {
+          if (lockedFixtureJobIds.has(id)) continue
+          if (!await attempt("re-read and remove " + label + " fixture job", async () => {
+            const currentJob = await queue.getJob(id)
+            if (!currentJob || !fixtureOwners.some(current =>
+              currentJob.data?.turnId === current.turnId || currentJob.data?.sessionId === current.sessionId,
+            )) return
+            await currentJob.remove()
+          })) fixtureQueueCleanupSafe = false
+        }
+        if (!await attempt("close " + label, () => queue.close())) fixtureQueueCleanupSafe = false
+      }
+    }
+    const fixtureQueueIdentitiesAvailable = Boolean(redis && turnQueueName && childQueueName)
+    if (pool && !fixtureQueueIdentitiesAvailable) {
+      fixtureQueueCleanupSafe = false
+      cleanupFailures.push("preserve fixture PostgreSQL rows because fixture queue identities were unavailable (category=fixture_queue_identity)")
+    }
+    if (pool && !fixtureQueueCleanupSafe && fixtureQueueIdentitiesAvailable) {
+      cleanupFailures.push("preserve fixture PostgreSQL rows because fixture worker shutdown or queue cleanup was not verified (category=fixture_queue_cleanup)")
+    }
+    if (pool && fixtureQueueCleanupSafe) for (const current of fixtureOwners) {
+      const outboxDeleted = await attempt("delete outbox for " + current.sessionId, () => pool!.query(
+        "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
+      ))
+      if (outboxDeleted) {
+        await attempt("delete user " + current.userId, () => pool!.query(
+          "DELETE FROM \"User\" WHERE \"id\" = $1", [current.userId],
+        ))
       }
     }
     await attempt("PostgreSQL pool close", async () => { await pool?.end() })
@@ -6943,7 +7004,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     else process.env.BULLMQ_STALLED_INTERVAL_MS = priorStalledIntervalMs
     vi.doUnmock("../../redis.js")
     if (cleanupFailures.length > 0) throw new Error("TaskGraph integration cleanup failed:\n" + cleanupFailures.join("\n"))
-  })
+  }, 120_000)
 
   it("rejects a consumed wait archive whose target belongs to another session", async () => {
     const value = fixture(), foreign = fixture(), tasks = new PgSubagentTaskStore(pool!, 300_000)
@@ -8927,17 +8988,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         try { await stopProcessFixture(workerTwo) } catch (error) {
           teardownFailureCategories.push("worker2_" + processCleanupFailureCategory(error))
         }
-      }
-      // artifactOwner is suite-scoped; retire its task rows and unlinked outbox before the next fixture runs.
-      try {
-        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [artifactOwner.sessionId])
-      } catch (error: unknown) {
-        teardownFailureCategories.push("selected_job_outbox_" + processCleanupFailureCategory(error))
-      }
-      try {
-        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [artifactOwner.userId])
-      } catch (error: unknown) {
-        teardownFailureCategories.push("selected_job_user_" + processCleanupFailureCategory(error))
       }
       if (teardownFailureCategories.length > 0) {
         const visibleCleanupCategories = teardownFailureCategories.slice(0, 4).join(",")
@@ -12179,11 +12229,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(dispatch.rowCount).toBe(0)
       expect((await rootAndTurn()).rows).toEqual(beforeRecovery.rows)
     } finally {
-      try {
-        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
-      } finally {
-        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
-      }
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
     }
   }, 30_000)
 
@@ -12264,11 +12311,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(turnAfter.rows[0]!.leaseExpiresAt!.getTime()).toBe(lease.leaseExpiresAt.getTime())
       expect(turnAfter.rows[0]!.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now())
     } finally {
-      try {
-        await pool!.query("DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [value.sessionId])
-      } finally {
-        await pool!.query("DELETE FROM \"User\" WHERE \"id\" = $1", [value.userId])
-      }
+      await pool!.query("DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [value.sessionId])
+      await pool!.query("DELETE FROM \"User\" WHERE \"id\" = $1", [value.userId])
     }
   }, 30_000)
 
@@ -12450,11 +12494,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [value.turnId, value.sessionId, value.userId, root.id])
       expect(failedTurnAfterRecovery.rows).toEqual(failedTurnBeforeRecovery.rows)
     } finally {
-      try {
-        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
-      } finally {
-        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
-      }
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
     }
   }, 30_000)
 
