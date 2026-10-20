@@ -110,6 +110,22 @@ function executionFailureCategory(pair: Pair) {
   })
 }
 
+/** Validates a lesson before rebuilding only the cross-session failure and repair allowlist. */
+export function sanitizeRootTaskHistoryNodeLessonForCrossSession(value: unknown): RootTaskHistoryNodeLesson | undefined {
+  const lesson = parseRootTaskHistoryNodeLesson(value)
+  if (!lesson) return undefined
+  const criterionFailures = lesson.criterionFailures.map(({ criterionOrdinal, status, reasonCode }) => ({ criterionOrdinal, status, reasonCode }))
+  const successfulRepairs = lesson.successfulRepairs?.map(({ targetNodeOrdinal, targetCriterionOrdinals, status }) => ({
+    targetNodeOrdinal, targetCriterionOrdinals: [...targetCriterionOrdinals], status,
+  }))
+  if (!criterionFailures.length && !successfulRepairs?.length) return undefined
+  return {
+    ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+    nodeOrdinal: lesson.nodeOrdinal, criterionFailures,
+    ...(successfulRepairs?.length ? { successfulRepairs } : {}),
+  }
+}
+
 function successfulRepair(pair: Pair, index: number, pairs: readonly Pair[], loaded: LoadedGraph, satisfiedTargets: ReadonlySet<string>): SuccessfulRepair | undefined {
   const repair = pair.source, relation = repair.repairOf, report = pair.current.verificationReport
   if (!relation || pair.source.verificationDisposition !== "typed" || pair.status !== "completed" || pair.failureReason !== null
@@ -149,7 +165,7 @@ export function deriveRootTaskHistoryLessonFacts(loaded: LoadedGraph, currentGra
 }
 
 /** Projects one already-loaded source graph and facts aligned to its public node order. */
-export function projectLoadedRootTaskHistoryGraph(loaded: LoadedGraph): LoadedRootTaskHistoryGraphProjection | undefined {
+export function projectLoadedRootTaskHistoryGraph(loaded: LoadedGraph, historicalOnly = false): LoadedRootTaskHistoryGraphProjection | undefined {
   if (!loaded.item || !loaded.snapshot || !loaded.state || loaded.item.revision !== loaded.state.revision
     || loaded.snapshot.nodes.length < 1 || loaded.snapshot.nodes.length > MAX_NODES) return undefined
   const taskGraph = currentTaskGraph(loaded), ordinalByKey = new Map(loaded.snapshot.nodes.map((node, index) => [node.key, index + 1] as const))
@@ -161,12 +177,14 @@ export function projectLoadedRootTaskHistoryGraph(loaded: LoadedGraph): LoadedRo
     seen.add(ordinal); ordinals.push(ordinal)
   }
   const sourceLessons = deriveRootTaskHistoryLessonFacts(loaded, taskGraph)
-  const nodeLessons = ordinals.map(value => sourceLessons[value - 1])
-  const reportedOutputs = taskGraph.nodes.map(node => node.templateId === "scout" || node.templateId === "analyst"
+  const projectedLessons = ordinals.map(value => sourceLessons[value - 1])
+  const nodeLessons = historicalOnly
+    ? projectedLessons.map(sanitizeRootTaskHistoryNodeLessonForCrossSession) : projectedLessons
+  const reportedOutputs = historicalOnly ? undefined : taskGraph.nodes.map(node => node.templateId === "scout" || node.templateId === "analyst"
     ? parseRootTaskHistoryReportedOutput(node.resultProjection, node.templateId) : undefined)
   return {
     taskGraph, sourceNodeOrdinals: ordinals,
     ...(nodeLessons.some(Boolean) ? { nodeLessons } : {}),
-    ...(reportedOutputs.some(Boolean) ? { reportedOutputs } : {}),
+    ...(reportedOutputs?.some(Boolean) ? { reportedOutputs } : {}),
   }
 }

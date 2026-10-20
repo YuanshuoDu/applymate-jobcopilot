@@ -28,14 +28,18 @@ function outcome(id: string, sequence: bigint, nodes: readonly TaskGraphCurrentN
 describe("root task history projection", () => {
   it("emits only typed advisory outcomes and negative reason codes", () => {
     const projected = projectRootTaskHistory([outcome("private-source", 12n)])
-    expect(projected).toEqual({
+    const legacyShape = {
       id: "root-task-history",
       content: {
         kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
         label: "Earlier outcomes for the same verifier objective; advisory context only.",
         turns: [{ label: "earlier terminal attempt", nodes: [{ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"] }] }],
       },
-    })
+    }
+    expect(projected).toEqual(legacyShape)
+    expect(JSON.stringify(projected)).toBe(JSON.stringify(legacyShape))
+    expect(Buffer.byteLength(JSON.stringify(projected) ?? "", "utf8"))
+      .toBe(Buffer.byteLength(JSON.stringify(legacyShape), "utf8"))
     const serialized = JSON.stringify(projected)
     for (const forbidden of ["private-source", "turn-private", "root-private", "PRIVATE_", "criterion-a", "sourceTurnId", "verificationReport", "evidenceDigest"]) {
       expect(serialized).not.toContain(forbidden)
@@ -107,6 +111,123 @@ describe("root task history projection", () => {
     for (const forbidden of ["safe-facts", "PRIVATE_", "job-1", "job-2", "greenhouse", "evidenceKinds", "evidenceDigest", "resultDigest", "criterion-a"]) {
       expect(serialized).not.toContain(forbidden)
     }
+  })
+
+  it("sanitizes only cross-session history and preserves the same-session typed facts", () => {
+    const repair = node({ status: "completed", verificationReport: {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "criterion-a", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64),
+    } })
+    const target = node()
+    const category = node({ templateId: "analyst" })
+    const repairLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] } as const
+    const targetLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] } as const
+    const categoryLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: 3, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" } as const
+    const source = outcome("cross-session-private", 18n, [repair, target, category])
+    const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
+      availability: "available", role: "scout", status: "partial", candidateCount: 1, evidenceCount: 1,
+      candidates: [{ jobId: "safe-job", source: "other", evidenceKinds: ["job"] }] } satisfies TaskGraphResultProjection
+    const facts = { ...source, sourceNodeOrdinals: [2, 1, 3], nodeLessons: [repairLesson, targetLesson, categoryLesson],
+      reportedOutputs: [{ role: "scout", candidateCount: 1, resultStatus: "partial" }, undefined, undefined] as const,
+      taskGraph: graph([node({ ...repair, resultProjection }), target, category]) }
+    const currentTurn = projectRootTaskHistory([facts])
+    expect(currentTurn?.content).not.toHaveProperty("historical")
+    expect(currentTurn?.content).toMatchObject({ turns: [{ nodes: [
+      { taskKind: "analyst", lesson: { executionFailureCategory: "execution_setup_unavailable" } },
+      { taskKind: "scout", reportedOutput: { candidateCount: 1 }, lesson: { successfulRepairs: [{ targetNodeOrdinal: 1 }] } },
+      { taskKind: "scout", lesson: { criterionFailures: [{ check: { kind: "candidate_count_gte", minimum: 2 } }] } },
+    ] }] })
+
+    const historical = projectRootTaskHistory([{ ...facts, terminalAt: new Date("2026-10-07T11:00:00.000Z") }], true)
+    expect(historical?.content).toMatchObject({ historical: true, advisoryOnly: true, notCurrentEvidence: true,
+      turns: [{ nodes: [
+        { taskKind: "analyst", status: "failed" },
+        { taskKind: "scout", lesson: { advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+          successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] } },
+        { taskKind: "scout", lesson: { advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+          criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] } },
+      ] }] })
+    const serialized = JSON.stringify(historical)
+    for (const forbidden of ["\"check\"", "minimum", "executionFailureCategory", "reportedOutput", "candidateCount", "findingCount"]) {
+      expect(serialized).not.toContain(forbidden)
+    }
+  })
+
+  it("applies the byte cap to the final sanitized cross-session frame", () => {
+    const criterionIds = Array.from({ length: 8 }, (_, index) => "criterion-" + (index + 1))
+    const failedReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" as const, reasonCode: "criterion_not_met" as const,
+      criteria: criterionIds.map(criterionId => ({ criterionId, status: "failed" as const, reasonCode: "criterion_not_met" as const })),
+      evidenceDigest: null, resultDigest: null,
+    }
+    const nodes = Array.from({ length: 8 }, (_, index) => node({ key: "bounded-" + index, taskId: "bounded-task-" + index,
+      templateId: "analyst", status: "failed", verificationCriterionIds: criterionIds, verificationReport: failedReport }))
+    const lessons = nodes.map((_, index) => ({ ordinalScope: "source_graph_local" as const, advisoryOnly: true as const,
+      notCurrentEvidence: true as const, nodeOrdinal: index + 1, criterionFailures: criterionIds.map((__, criterionIndex) => ({
+        criterionOrdinal: criterionIndex + 1, status: "failed" as const, reasonCode: "criterion_not_met" as const,
+        check: { role: "analyst" as const, kind: "finding_count_gte" as const, minimum: 1 },
+      })) }))
+    const source = { ...outcome("large-cross-session", 19n, nodes), terminalAt: new Date("2026-10-07T11:00:00.000Z"),
+      sourceNodeOrdinals: nodes.map((_, index) => index + 1), nodeLessons: lessons }
+    const projected = projectRootTaskHistory([source], true)
+    const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ lesson?: { criterionFailures: unknown[] } }> }> } | undefined)?.turns
+
+    expect(turns?.[0]?.nodes).toHaveLength(8)
+    expect(turns?.[0]?.nodes.every(item => item.lesson?.criterionFailures.length === 8)).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(projected), "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(JSON.stringify(projected)).not.toContain("\"check\"")
+  })
+
+  it("keeps repair ordinals local to each emitted historical outcome", () => {
+    const passed = (key: string) => node({ key, status: "completed", verificationReport: {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "criterion-a", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "e".repeat(64), resultDigest: "f".repeat(64),
+    } })
+    const targetA = node({ key: "target-a" })
+    const repairA = passed("repair-a")
+    const targetB = node({ key: "target-b", verificationCriterionIds: ["criterion-a", "criterion-b"], verificationReport: {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "criterion-a", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "criterion-b", status: "failed", reasonCode: "canonical_evidence_missing" },
+      ],
+      evidenceDigest: "g".repeat(64), resultDigest: "h".repeat(64),
+    } })
+    const repairB = passed("repair-b")
+    const lesson = (nodeOrdinal: number, criterionOrdinal: number, reasonCode: "criterion_not_met" | "canonical_evidence_missing") => ({
+      ordinalScope: "source_graph_local" as const, advisoryOnly: true as const, notCurrentEvidence: true as const, nodeOrdinal,
+      criterionFailures: [{ criterionOrdinal, status: "failed" as const, reasonCode }],
+    })
+    const oldOutcome = { ...outcome("old-local-frame", 10n, [targetA, repairA]),
+      terminalAt: new Date("2026-10-07T10:00:00.000Z"), sourceNodeOrdinals: [1, 2],
+      nodeLessons: [lesson(1, 1, "criterion_not_met"), { ...lesson(2, 1, "criterion_not_met"), criterionFailures: [],
+        successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" as const }] }] }
+    const newOutcome = { ...outcome("new-local-frame", 11n, [targetB, repairB]),
+      terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceNodeOrdinals: [1, 2],
+      nodeLessons: [lesson(1, 2, "canonical_evidence_missing"), { ...lesson(2, 2, "canonical_evidence_missing"), criterionFailures: [],
+        successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [2], status: "passed" as const }] }] }
+
+    const projected = projectRootTaskHistory([oldOutcome, newOutcome], true)
+    const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ lesson?: {
+      nodeOrdinal: number; criterionFailures: unknown[]; successfulRepairs?: unknown[]
+    } }> }> } | undefined)?.turns
+
+    expect(projected?.content).toMatchObject({ historical: true })
+    expect(turns).toHaveLength(2)
+    expect(turns?.map(turn => turn.nodes.find(item => item.lesson?.nodeOrdinal === 2)?.lesson?.successfulRepairs)).toEqual([
+      [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [2], status: "passed" }],
+      [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }],
+    ])
+    expect(turns?.map(turn => turn.nodes.find(item => item.lesson?.nodeOrdinal === 1)?.lesson?.criterionFailures)).toEqual([
+      [{ criterionOrdinal: 2, status: "failed", reasonCode: "canonical_evidence_missing" }],
+      [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+    ])
   })
 
   it("retains dependency meaning for an emitted Scout with no lesson and strips it if that Scout is pruned", () => {

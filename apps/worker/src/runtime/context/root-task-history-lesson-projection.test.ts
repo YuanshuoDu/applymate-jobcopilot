@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { deriveRootTaskHistoryLessonFacts, filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson,
-  projectLoadedRootTaskHistoryGraph } from "./root-task-history-lesson-projection.js"
+  projectLoadedRootTaskHistoryGraph, sanitizeRootTaskHistoryNodeLessonForCrossSession } from "./root-task-history-lesson-projection.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState, type StoredTaskGraphNode, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "../subagents/task-graph-command-port.js"
@@ -17,12 +17,15 @@ const CRITERIA = [
 const CONTRACT = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout", criteria: CRITERIA } as const
 const DIGEST = "a".repeat(64)
 
-function report(status: "failed" | "passed", ids: readonly string[] = CRITERIA.map(item => item.id), statuses?: readonly ("failed" | "passed")[]) {
+function report(status: "failed" | "passed" | "unverified", ids: readonly string[] = CRITERIA.map(item => item.id),
+  statuses?: readonly ("failed" | "passed" | "unverified")[]) {
   const criteria = ids.map((criterionId, index) => {
     const criterionStatus = statuses?.[index] ?? status
-    return { criterionId, status: criterionStatus, reasonCode: criterionStatus === "passed" ? "criteria_met" : "criterion_not_met" }
+    const reasonCode = criterionStatus === "passed" ? "criteria_met" : criterionStatus === "failed" ? "criterion_not_met" : "canonical_evidence_missing"
+    return { criterionId, status: criterionStatus, reasonCode }
   })
-  return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status, reasonCode: status === "passed" ? "criteria_met" : "criterion_not_met",
+  return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status,
+    reasonCode: status === "passed" ? "criteria_met" : status === "failed" ? "criterion_not_met" : "canonical_evidence_missing",
     criteria, evidenceDigest: DIGEST, resultDigest: DIGEST }
 }
 function snapshotWith(repairCount: number, targetStatuses?: readonly ("failed" | "passed")[]): TaskGraphSnapshot {
@@ -36,14 +39,15 @@ function snapshotWith(repairCount: number, targetStatuses?: readonly ("failed" |
   })
   return parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [target, ...repairNodes] })
 }
-function fixture(options: { repairCount?: number; targetStatuses?: readonly ("failed" | "passed")[]; repairStatus?: "failed" | "completed" } = {}) {
+function fixture(options: { repairCount?: number; targetStatuses?: readonly ("failed" | "passed")[]; repairStatus?: "failed" | "completed";
+  repairReportStatus?: "failed" | "passed" | "unverified" } = {}) {
   const repairCount = options.repairCount ?? 1, snapshot = snapshotWith(repairCount, options.targetStatuses)
   const tasks = new Map<string, GraphTaskRow>()
   tasks.set("source-task-private", { id: "source-task-private", status: "failed", role: "scout", failureReason: "task_graph_verification_failed",
     result: { taskGraphVerificationReport: report("failed", undefined, options.targetStatuses) } })
   for (let index = 0; index < repairCount; index++) {
     const node = snapshot.nodes[index + 1]!, repairStatus = options.repairStatus ?? "completed"
-    const taskReport = report(repairStatus === "completed" ? "passed" : "failed")
+    const taskReport = report(options.repairReportStatus ?? (repairStatus === "completed" ? "passed" : "failed"))
     const receipt = { schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: ROOT, targetNodeKey: snapshot.nodes[0]!.key,
       targetTaskId: snapshot.nodes[0]!.taskId, criterionIds: CRITERIA.map(item => item.id), repairNodeKey: node.key,
       repairTaskId: node.taskId, verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: taskReport.evidenceDigest }
@@ -236,6 +240,29 @@ describe("root history ordinal lessons", () => {
     expect(projectLoadedRootTaskHistoryGraph({ ...loaded, item: null })).toBeUndefined()
   })
 
+  it("keeps same-session details by default and limits historical-only projections to failures and repairs", () => {
+    const { loaded } = fixture(), standard = projectLoadedRootTaskHistoryGraph(loaded)
+    const historical = projectLoadedRootTaskHistoryGraph(loaded, true)
+    expect(standard?.nodeLessons?.[0]?.criterionFailures[0]?.check).toEqual({ role: "scout", kind: "candidate_count_gte", minimum: 2 })
+    expect(historical?.nodeLessons).toEqual([
+      { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+        criterionFailures: [
+          { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+          { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+        ] },
+      { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+        criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1, 2], status: "passed" }] },
+    ])
+    expect(JSON.stringify(historical?.nodeLessons)).not.toMatch(/check|minimum|executionFailureCategory|Count|count/)
+
+    const reported = reportedOutputFixture()
+    expect(projectLoadedRootTaskHistoryGraph(reported)?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 5, resultStatus: "partial" }])
+    expect(projectLoadedRootTaskHistoryGraph(reported, true)?.reportedOutputs).toBeUndefined()
+
+    const categorized = executionFailureFixture("child_turn_missing")
+    expect(projectLoadedRootTaskHistoryGraph(categorized.loaded, true)?.nodeLessons).toBeUndefined()
+  })
+
   it("derives reported counts from the already-built projection without exposing its samples", () => {
     const loaded = reportedOutputFixture(), projection = projectLoadedRootTaskHistoryGraph(loaded)
     expect(projection?.sourceNodeOrdinals).toEqual([1])
@@ -256,6 +283,23 @@ describe("root history ordinal lessons", () => {
     const getter = { ...valid }
     Object.defineProperty(getter, "criterionFailures", { enumerable: true, get() { throw new Error("must not read accessors") } })
     expect(parseRootTaskHistoryNodeLesson(getter)).toBeUndefined()
+  })
+
+  it("validates before reconstructing the cross-session failure and repair allowlist", () => {
+    const lesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "unverified", reasonCode: "canonical_evidence_missing",
+        check: { role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75 } }],
+      successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] }
+    expect(sanitizeRootTaskHistoryNodeLessonForCrossSession(lesson)).toEqual({
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "unverified", reasonCode: "canonical_evidence_missing" }],
+      successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }],
+    })
+    expect(sanitizeRootTaskHistoryNodeLessonForCrossSession({ ...lesson, criterionFailures: [
+      { ...lesson.criterionFailures[0]!, untrusted: "forged" },
+    ] })).toBeUndefined()
+    expect(sanitizeRootTaskHistoryNodeLessonForCrossSession({ ordinalScope: "source_graph_local", advisoryOnly: true,
+      notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" })).toBeUndefined()
   })
 
   it("retains source ordinals through selection and drops links when target evidence is absent", () => {
@@ -280,6 +324,36 @@ describe("root history ordinal lessons", () => {
     expect(deriveRootTaskHistoryLessonFacts({ ...loaded, state: { ...loaded.state!, repairSatisfiedNodeKeys: [] } }, graph)[1]?.successfulRepairs).toBeUndefined()
     const missing = new Map(loaded.tasks).set(repair.taskId, { ...oldTask, result: { taskGraphVerificationReport: badResult.taskGraphVerificationReport } })
     expect(deriveRootTaskHistoryLessonFacts({ ...loaded, tasks: missing }, graph)[1]?.successfulRepairs).toBeUndefined()
+
+    const malformedReceipt = { ...badReceipt, extraPrivateField: "forged" }
+    const malformed = new Map(loaded.tasks).set(repair.taskId, { ...oldTask,
+      result: { ...badResult, taskGraphRepairReceipt: malformedReceipt } })
+    expect(deriveRootTaskHistoryLessonFacts({ ...loaded, tasks: malformed }, graph)[1]?.successfulRepairs).toBeUndefined()
+  })
+
+  it("rejects a receipt repointed to a different existing failed target", () => {
+    const original = fixture(), originalSnapshot = original.loaded.snapshot!, originalRepair = originalSnapshot.nodes[1]!
+    const otherTarget = { ...originalSnapshot.nodes[0]!, key: "other-target-private", taskId: "other-target-task-private" }
+    const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [originalSnapshot.nodes[0]!, otherTarget, originalRepair] })
+    const tasks = new Map(original.loaded.tasks)
+    tasks.set(otherTarget.taskId, { id: otherTarget.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed",
+      result: { taskGraphVerificationReport: report("failed") } })
+    const statuses = new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }] as const))
+    const base = taskGraphState(snapshot, 7, statuses, []), coverage = resolveTaskGraphRepairDependencies(snapshot, tasks, ROOT)
+    const state = { ...base, repairSatisfiedNodeKeys: coverage.satisfied, repairPendingNodeKeys: coverage.pending }
+    const loaded: LoadedGraph = { ...original.loaded, snapshot, tasks, state }
+    const graph = currentTaskGraph(loaded), repairTask = tasks.get(originalRepair.taskId)!, result = repairTask.result as Record<string, unknown>
+    const receipt = result.taskGraphRepairReceipt as Record<string, unknown>
+    const repointedReceipt = { ...receipt, targetNodeKey: otherTarget.key, targetTaskId: otherTarget.taskId }
+    const repointedTasks = new Map(tasks).set(repairTask.id, { ...repairTask,
+      result: { ...result, taskGraphRepairReceipt: repointedReceipt } })
+    const repairIndex = graph.nodes.findIndex(node => node.key === originalRepair.key)
+    const repointedGraph = { ...graph, nodes: graph.nodes.map((node, index) => index === repairIndex
+      ? { ...node, repairReceipt: repointedReceipt as typeof node.repairReceipt } : node) }
+
+    expect(snapshot.nodes.some(node => node.key === otherTarget.key)).toBe(true)
+    expect(deriveRootTaskHistoryLessonFacts({ ...loaded, tasks: repointedTasks }, repointedGraph)[repairIndex]?.successfulRepairs).toBeUndefined()
   })
 
   it("omits an exact-repair relationship when successful receipt coverage partially overlaps", () => {
@@ -297,6 +371,16 @@ describe("root history ordinal lessons", () => {
     expect(failedFacts[1]?.successfulRepairs).toBeUndefined()
     const otherSource = fixture()
     expect(deriveRootTaskHistoryLessonFacts(otherSource.loaded, otherSource.graph).map(item => item?.nodeOrdinal)).toEqual([1, 2])
+  })
+
+  it("keeps an unverified repair report from becoming a success link", () => {
+    const unverified = fixture({ repairStatus: "failed", repairReportStatus: "unverified" })
+    const lesson = deriveRootTaskHistoryLessonFacts(unverified.loaded, unverified.graph)[1]
+    expect(lesson?.criterionFailures).toMatchObject([
+      { criterionOrdinal: 1, status: "unverified", reasonCode: "canonical_evidence_missing" },
+      { criterionOrdinal: 2, status: "unverified", reasonCode: "canonical_evidence_missing" },
+    ])
+    expect(lesson?.successfulRepairs).toBeUndefined()
   })
 
   it("rejects mismatched graph/report identity and changed same-ID repair checks", () => {

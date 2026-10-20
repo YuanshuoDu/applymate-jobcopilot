@@ -43,7 +43,7 @@ async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInpu
   try {
     const loaded = await loadTaskGraph(client, scope, false)
     if (!loaded.item || !loaded.snapshot || !loaded.state) return undefined
-    const graph = projectLoadedRootTaskHistoryGraph(loaded)
+    const graph = projectLoadedRootTaskHistoryGraph(loaded, input.crossSessionRootTaskHistoryEnabled === true)
     return graph?.taskGraph.nodes.length ? graph : undefined
   } catch (error: unknown) {
     if (graphEvidenceError(error)) return undefined

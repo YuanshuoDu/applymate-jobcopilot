@@ -8,7 +8,7 @@ import {
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { ContextSeedBlock } from "./step-context-builder.js"
-import { filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
+import { filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson, sanitizeRootTaskHistoryNodeLessonForCrossSession, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
 
 export type ValidatedRootTaskHistoryOutcome = Readonly<{
@@ -163,32 +163,32 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }
-function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeNode[] }>[]) {
+function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeNode[] }>[], crossSession = false) {
   return {
     kind: "root_task_history",
     informationalOnly: true,
-    advisoryOnly: true,
-    notCurrentEvidence: true,
+    advisoryOnly: true, notCurrentEvidence: true,
+    ...(crossSession ? { historical: true } : {}),
     label: "Earlier outcomes for the same verifier objective; advisory context only.",
     turns,
   }
 }
-function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutputs: boolean): SafeNode[] {
+function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutputs: boolean, crossSession = false): SafeNode[] {
   const facts = withLessons && turn.candidate.lessonsBySourceOrdinal
     ? filterRootTaskHistoryLessonsForEmittedNodes(turn.candidate.lessonsBySourceOrdinal, [...turn.lessonOrdinals], turn.nodes.map(node => node.nodeOrdinal)) : []
   const byOrdinal = new Map<number, RootTaskHistoryNodeLesson>()
   for (const fact of facts) if (fact) byOrdinal.set(fact.nodeOrdinal, fact)
   return turn.nodes.map(node => {
-    const lesson = byOrdinal.get(node.nodeOrdinal)
-    const reportedOutput = withReportedOutputs && turn.reportedOutputOrdinals.has(node.nodeOrdinal) ? node.reportedOutput : undefined
-    return { ...node.projection, ...(reportedOutput ? { reportedOutput } : {}), ...(lesson ? { lesson } : {}) }
+    const lesson = byOrdinal.get(node.nodeOrdinal), publicLesson = lesson && crossSession ? sanitizeRootTaskHistoryNodeLessonForCrossSession(lesson) : lesson
+    const reportedOutput = withReportedOutputs && !crossSession && turn.reportedOutputOrdinals.has(node.nodeOrdinal) ? node.reportedOutput : undefined
+    return { ...node.projection, ...(reportedOutput ? { reportedOutput } : {}), ...(publicLesson ? { lesson: publicLesson } : {}) }
   })
 }
-function emittedTurns(turns: readonly SelectedTurn[], withLessons: boolean, withReportedOutputs: boolean) {
-  return turns.map(turn => ({ label: turn.label, nodes: emittedNodes(turn, withLessons, withReportedOutputs) }))
+function emittedTurns(turns: readonly SelectedTurn[], withLessons: boolean, withReportedOutputs: boolean, crossSession = false) {
+  return turns.map(turn => ({ label: turn.label, nodes: emittedNodes(turn, withLessons, withReportedOutputs, crossSession) }))
 }
-function withinContentLimit(turns: readonly SelectedTurn[], withLessons = false, withReportedOutputs = false): boolean {
-  const serialized = JSON.stringify({ id: "root-task-history", content: content(emittedTurns(turns, withLessons, withReportedOutputs)) })
+function withinContentLimit(turns: readonly SelectedTurn[], withLessons = false, withReportedOutputs = false, crossSession = false): boolean {
+  const serialized = JSON.stringify({ id: "root-task-history", content: content(emittedTurns(turns, withLessons, withReportedOutputs, crossSession), crossSession) })
   return typeof serialized === "string" && Buffer.byteLength(serialized, "utf8") <= MAX_CONTENT_BYTES
 }
 function projectCandidates(values: readonly Candidate[], crossSession: boolean): ContextSeedBlock | undefined {
@@ -221,22 +221,22 @@ function projectCandidates(values: readonly Candidate[], crossSession: boolean):
     if (entry.nodes.length) turns.push(entry)
   }
   if (!turns.length) return undefined
-  if (!withinContentLimit(turns, true, true)) {
+  if (!withinContentLimit(turns, true, true, crossSession)) {
     for (const turn of [...turns].reverse()) for (const node of [...turn.nodes].reverse()) turn.reportedOutputOrdinals.delete(node.nodeOrdinal)
   }
-  while (!withinContentLimit(turns, true, false)) {
+  while (!withinContentLimit(turns, true, false, crossSession)) {
     const turn = [...turns].reverse().find(value => value.lessonOrdinals.size > 0)
     const node = turn && [...turn.nodes].reverse().find(value => turn.lessonOrdinals.has(value.nodeOrdinal))
     if (!turn || !node) break
     turn.lessonOrdinals.delete(node.nodeOrdinal)
   }
-  while (!withinContentLimit(turns, false, false)) {
+  while (!withinContentLimit(turns, false, false, crossSession)) {
     const turn = turns.at(-1), node = turn?.nodes.pop()
     if (!turn || !node) return undefined
     turn.lessonOrdinals.delete(node.nodeOrdinal); turn.reportedOutputOrdinals.delete(node.nodeOrdinal); nodeCount -= 1
     if (!turn.nodes.length) turns.pop()
   }
-  return { id: "root-task-history", content: content(emittedTurns(turns, true, true)) }
+  return { id: "root-task-history", content: content(emittedTurns(turns, true, true, crossSession), crossSession) }
 }
 /** Projects bounded typed historical outcomes; private source identity is used only for ordering and deduplication. */
 export function projectRootTaskHistory(
