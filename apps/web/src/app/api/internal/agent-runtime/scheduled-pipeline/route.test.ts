@@ -165,6 +165,114 @@ describe("scheduled pipeline continuation route", () => {
     }));
   });
 
+  it("reclaims an expired same-owner markerless claim only at the Scout stage", async () => {
+    const prior = { nextStage: "scout", scheduledTaskGraphClaim: ownerClaim(new Date(Date.now() - 1).toISOString()) };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state: prior });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(200);
+    const nextState = mocks.claim.mock.calls[0]?.[0]?.data?.state as Record<string, unknown>;
+    const nextClaim = nextState.scheduledTaskGraphClaim as Record<string, unknown>;
+    expect(nextState.nextStage).toBe("scout");
+    expect(nextState).not.toHaveProperty("scheduledTaskGraphContinuation");
+    expect(nextClaim.claimToken).toEqual(expect.any(String));
+    expect(nextClaim.claimToken).not.toBe(claimToken);
+    expect(nextClaim.owner).toEqual(fullOwner);
+    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      executionId: "execution-1",
+      scheduledTaskGraph: expect.objectContaining({ owner: fullOwner, continuationKey: key, claimToken: nextClaim.claimToken }),
+    }));
+  });
+
+  it.each(["missing expiry", "malformed expiry", "malformed claimedAt", "invalid token", "unexpected field"])(
+    "rejects markerless recovery with a %s persisted claim",
+    async defect => {
+      const claim = ownerClaim(new Date(Date.now() - 1).toISOString());
+      if (defect === "missing expiry") Reflect.deleteProperty(claim, "leaseExpiresAt");
+      if (defect === "malformed expiry") claim.leaseExpiresAt = "not-a-timestamp";
+      if (defect === "malformed claimedAt") claim.claimedAt = "not-a-timestamp";
+      if (defect === "invalid token") claim.claimToken = "";
+      if (defect === "unexpected field") Object.assign(claim, { legacy: true });
+      const prior = { nextStage: "scout", scheduledTaskGraphClaim: claim };
+      mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state: prior });
+      const { POST } = await import("./route");
+
+      const response = await POST(request());
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+      expect(mocks.claim).not.toHaveBeenCalled();
+      expect(mocks.runPipeline).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects prepared recovery with a malformed persisted lease expiry", async () => {
+    const prior = waitingState();
+    Reflect.deleteProperty(prior, "scheduledTaskGraphWait");
+    (prior.scheduledTaskGraphClaim as Record<string, unknown>).leaseExpiresAt = "not-a-timestamp";
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state: prior });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it.each(["analyze", "prepare", "gate", "execute", "audit"])(
+    "rejects an expired same-owner markerless claim at the %s stage",
+    async nextStage => {
+      const state = { nextStage, scheduledTaskGraphClaim: ownerClaim(new Date(Date.now() - 1).toISOString()) };
+      mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state });
+      const { POST } = await import("./route");
+
+      const response = await POST(request());
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_analysis_interrupted" });
+      expect(mocks.claim).not.toHaveBeenCalled();
+      expect(mocks.runPipeline).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["root attempt", { ...fullOwner, rootAttemptCount: fullOwner.rootAttemptCount + 1 }, key],
+    ["execution attempt", { ...fullOwner, executionAttemptCount: fullOwner.executionAttemptCount + 1 }, key],
+    ["evidence key", { ...fullOwner, turnLeaseOwnerId: "worker-old", turnLeaseVersion: 3 }, "continuation-stale-evidence"],
+  ])("rejects an expired markerless claim with a mismatched %s", async (_label, priorOwner, priorKey) => {
+    const state = { nextStage: "scout", scheduledTaskGraphClaim: { ...ownerClaim(new Date(Date.now() - 1).toISOString()),
+      owner: priorOwner, key: priorKey } };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("does not start another pipeline when markerless claim recovery loses its CAS", async () => {
+    const prior = { nextStage: "scout", scheduledTaskGraphClaim: ownerClaim(new Date(Date.now() - 1).toISOString()) };
+    const competingClaim = { ...ownerClaim(new Date(Date.now() + 60_000).toISOString()), claimToken: "claim-token-other" };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state: prior })
+      .mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0,
+        state: { nextStage: "scout", scheduledTaskGraphClaim: competingClaim } });
+    mocks.claim.mockResolvedValueOnce({ count: 0 });
+    const { POST } = await import("./route");
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ status: "accepted", duplicate: true });
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
   it("replays a completed report for the same persisted continuation without claiming or rerunning", async () => {
     mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "completed", attemptCount: 0,
       state: { nextStage: "completed", scheduledTaskGraphContinuation: {

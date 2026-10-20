@@ -97,9 +97,23 @@ function claimLeaseIsActive(state: Record<string, unknown>): boolean {
   const timestamp = typeof expires === "string" ? Date.parse(expires) : Number.NaN;
   return Number.isFinite(timestamp) && timestamp > Date.now();
 }
+function claimLeaseIsValidAndExpired(claim: Record<string, unknown>, key: string,
+  owner: ScheduledTaskGraphPipelineOwner, now = Date.now()): boolean {
+  const fields = ["schemaVersion", "key", "claimToken", "owner", "claimedAt", "leaseExpiresAt"];
+  if (Object.keys(claim).length !== fields.length || !fields.every(field => Object.hasOwn(claim, field))
+    || claim.schemaVersion !== CLAIM_SCHEMA || claim.key !== key || !validId(claim.claimToken)
+    || !scheduledTaskGraphOwnerMatches(claim.owner, owner)) return false;
+  const claimedAt = typeof claim.claimedAt === "string" ? Date.parse(claim.claimedAt) : Number.NaN;
+  const expiresAt = typeof claim.leaseExpiresAt === "string" ? Date.parse(claim.leaseExpiresAt) : Number.NaN;
+  return Number.isFinite(claimedAt) && Number.isFinite(expiresAt) && expiresAt <= now;
+}
 function hasPrepareCheckpoint(state: Record<string, unknown>, key: string, owner: ScheduledTaskGraphPipelineOwner): boolean {
   const marker = record(state.scheduledTaskGraphContinuation);
   return marker?.key === key && scheduledTaskGraphOwnerMatches(marker.owner, owner) && typeof state.nextStage === "string" && state.nextStage !== "scout";
+}
+function hasMarkerlessScoutState(state: Record<string, unknown>): boolean {
+  return state.nextStage === "scout" && state.scheduledTaskGraphContinuation === undefined
+    && state.scheduledTaskGraphWait === undefined;
 }
 function mapCheckpointError(error: unknown): string {
   const reason = record(error)?.reason;
@@ -213,7 +227,13 @@ export async function POST(request: Request): Promise<Response> {
       claimToken, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } };
   } else if (existingClaim && sameClaim(state, key, executionOwner)) {
     if (claimLeaseIsActive(state)) return json(202, { status: "accepted", duplicate: true });
-    if (!hasPrepareCheckpoint(state, key, executionOwner)) return blocked(409, "scheduled_pipeline_analysis_interrupted");
+    if (!claimLeaseIsValidAndExpired(existingClaim, key, executionOwner)) {
+      return blocked(409, "scheduled_pipeline_claim_conflict");
+    }
+    const markerlessScout = hasMarkerlessScoutState(state);
+    if (!hasPrepareCheckpoint(state, key, executionOwner) && !markerlessScout) {
+      return blocked(409, "scheduled_pipeline_analysis_interrupted");
+    }
     claimedState = { ...state, scheduledTaskGraphClaim: { ...existingClaim, claimToken, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } };
   } else if (existingClaim) {
     const claimedAt = new Date().toISOString(), leaseExpiresAt = new Date(Date.now() + 600_000).toISOString();
