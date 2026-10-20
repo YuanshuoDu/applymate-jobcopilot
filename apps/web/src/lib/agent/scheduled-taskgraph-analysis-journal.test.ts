@@ -6,9 +6,11 @@ import { AnalyzeRecoveryPersistenceError, runAnalyze } from './stages/analyze'
 import type { AnalyzeOutput, PipelineCheckpointState, PipelineCtx, ScoredJob, StageResult } from './types'
 import { rebindScheduledTaskGraphAnalysisJournalForLease, runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from './scheduled-taskgraph-analysis-journal'
 
+const gateFence = vi.hoisted(() => ({ proof: vi.fn() }))
 vi.mock('./stages/analyze', async importOriginal => ({
   ...await importOriginal<typeof import('./stages/analyze')>(), runAnalyze: vi.fn(),
 }))
+vi.mock('./scheduled-taskgraph-approval-fence', () => ({ hasScheduledTaskGraphGateProof: gateFence.proof }))
 
 const jobAId = `c${'1'.repeat(24)}`
 const jobBId = `c${'2'.repeat(24)}`
@@ -250,9 +252,9 @@ describe('runScheduledTaskGraphAnalyze', () => {
   it('locks and checks the Turn, root attempt, and execution claim inside the score transaction', async () => {
     const queryRaw = vi.fn()
       .mockResolvedValueOnce([{ id: owner.turnId }])
-      .mockResolvedValueOnce([{ id: owner.turnId }])
+      .mockResolvedValueOnce([{ id: owner.turnId, status: 'in_progress' }])
       .mockResolvedValueOnce([{ id: owner.rootTaskId }])
-      .mockResolvedValueOnce([{ id: owner.executionId }])
+      .mockResolvedValueOnce([{ id: owner.executionId, checkpoint: 'prepare', state: {} }])
     const tx = { $queryRaw: queryRaw } as never
 
     await expect(scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key, claimToken })).resolves.toBe(true)
@@ -263,11 +265,55 @@ describe('runScheduledTaskGraphAnalyze', () => {
     expect(sql[0]).toContain('FOR UPDATE')
     expect(sql[0]).toContain('"rootTaskId" =')
     expect(sql[1]).toContain('"rootTaskId" =')
+    expect(sql[1]).toContain('"source"')
+    expect(sql[1]).toContain('"executionMode"')
+    expect(sql[1]).toContain('"input"')
+    expect(sql[2]).toContain('"role" = \'orchestrator\'')
+    expect(sql[2]).toContain('"taskType" = \'root\'')
     expect(sql[1]).toContain('clock_timestamp()')
     expect(sql.slice(2).every(query => query.includes('FOR UPDATE'))).toBe(true)
     expect(queryRaw.mock.calls[0]?.[0]).toMatchObject({ values: expect.arrayContaining([owner.rootTaskId]) })
     expect(queryRaw.mock.calls[1]?.[0]).toMatchObject({ values: expect.arrayContaining([owner.rootTaskId]) })
     expect(queryRaw.mock.calls[3]?.[0]).toMatchObject({ values: expect.arrayContaining([key, claimToken, JSON.stringify(owner)]) })
+    expect(sql[3]).toContain('jsonb_object_length')
+  })
+
+  it('permits a waiting approval only when the shared Gate proof validates the live scheduled state', async () => {
+    const state = { nextStage: 'execute' }, queryRaw = vi.fn()
+      .mockResolvedValueOnce([{ id: owner.turnId }])
+      .mockResolvedValueOnce([{ id: owner.turnId, status: 'waiting_for_approval', source: 'automation',
+        executionMode: 'canonical_task_graph', input: { automationRunMode: 'scheduled' } }])
+      .mockResolvedValueOnce([{ id: owner.rootTaskId }])
+      .mockResolvedValueOnce([{ id: owner.executionId, checkpoint: 'execute', state }])
+    const tx = { $queryRaw: queryRaw } as never
+    gateFence.proof.mockResolvedValueOnce(true)
+
+    await expect(scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key, claimToken })).resolves.toBe(true)
+    expect(gateFence.proof).toHaveBeenCalledWith({ reader: tx, owner, key, claimToken, executionStatus: 'running',
+      checkpoint: 'execute', state })
+    expect(queryRaw.mock.calls[1]?.[0]).toMatchObject({ values: expect.arrayContaining([owner.turnLeaseOwnerId]) })
+
+    gateFence.proof.mockResolvedValueOnce(false)
+    const stale = vi.fn().mockResolvedValueOnce([{ id: owner.turnId }])
+      .mockResolvedValueOnce([{ id: owner.turnId, status: 'waiting_for_approval', source: 'automation',
+        executionMode: 'canonical_task_graph', input: { automationRunMode: 'scheduled' } }])
+      .mockResolvedValueOnce([{ id: owner.rootTaskId }])
+      .mockResolvedValueOnce([{ id: owner.executionId, checkpoint: 'gate', state }])
+    await expect(scheduledTaskGraphScoreOwnerIsCurrent({ tx: { $queryRaw: stale } as never, owner, key, claimToken })).resolves.toBe(false)
+  })
+
+  it.each([
+    ['user source', { source: 'user' }],
+    ['legacy execution mode', { executionMode: 'legacy_pipeline_adapter' }],
+    ['manual automation', { input: { automationRunMode: 'manual' } }],
+  ])('rejects a waiting Turn with %s', async (_name, overrides) => {
+    const turn = { id: owner.turnId, status: 'waiting_for_approval', source: 'automation',
+      executionMode: 'canonical_task_graph', input: { automationRunMode: 'scheduled' }, ...overrides }
+    const queryRaw = vi.fn().mockResolvedValueOnce([{ id: owner.turnId }]).mockResolvedValueOnce([turn])
+      .mockResolvedValueOnce([{ id: owner.rootTaskId }])
+      .mockResolvedValueOnce([{ id: owner.executionId, checkpoint: 'gate', state: {} }])
+    await expect(scheduledTaskGraphScoreOwnerIsCurrent({ tx: { $queryRaw: queryRaw } as never, owner, key, claimToken })).resolves.toBe(false)
+    expect(gateFence.proof).not.toHaveBeenCalled()
   })
 
   it('rejects a stale execution claim after locking the still-current Turn and root', async () => {

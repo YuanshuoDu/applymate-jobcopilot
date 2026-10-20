@@ -4,6 +4,7 @@ import { createScheduledTaskGraphWaitState, finishScheduledTaskGraphExecution, l
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey } from "./scheduled-taskgraph-pipeline-checkpoint";
 
 const mocks = vi.hoisted(() => ({ turn: vi.fn(), root: vi.fn(), execution: vi.fn(), executionUpdateMany: vi.fn(), transaction: vi.fn(), item: vi.fn() }));
+const gateFence = vi.hoisted(() => ({ proof: vi.fn() }));
 vi.mock("@/lib/db", () => ({
   db: {
     $transaction: mocks.transaction,
@@ -13,6 +14,7 @@ vi.mock("@/lib/db", () => ({
     agentItem: { findFirst: mocks.item },
   },
 }));
+vi.mock("./scheduled-taskgraph-approval-fence", () => ({ hasScheduledTaskGraphGateProof: gateFence.proof }));
 
 const owner = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
@@ -20,7 +22,8 @@ const owner = {
   executionId: "execution-1", executionAttemptCount: 0,
 };
 const key = "continuation-key", claimToken = "claim-token-a";
-const claim = { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner };
+const claim = { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner,
+  claimedAt: "2026-10-20T11:50:00.000Z", leaseExpiresAt: "2026-10-20T12:10:00.000Z" };
 const waitId = "agent-question:turn-1:canonical:q1", waitStage = "writer";
 let transactionClient: unknown;
 const snapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"], targetLocations: ["Dublin"],
@@ -58,14 +61,15 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
   beforeEach(() => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
+    gateFence.proof.mockReset();
     mocks.executionUpdateMany.mockResolvedValue({ count: 1 });
     transactionClient = { agentExecution: { updateMany: mocks.executionUpdateMany } };
     mocks.transaction.mockImplementation((work: (tx: unknown) => Promise<unknown>) => work(transactionClient));
     mocks.turn.mockResolvedValue({ status: "in_progress", leaseOwnerId: owner.turnLeaseOwnerId,
       leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() + 60_000) });
-    mocks.root.mockResolvedValue({ status: "running", attemptCount: owner.rootAttemptCount,
+    mocks.root.mockResolvedValue({ status: "running", attemptCount: owner.rootAttemptCount, role: "orchestrator", taskType: "root",
       interruptRequestedAt: null, closedAt: null });
-    mocks.execution.mockResolvedValue({ state: { scheduledTaskGraphClaim: claim } });
+    mocks.execution.mockResolvedValue({ status: "running", checkpoint: "prepare", state: { scheduledTaskGraphClaim: claim } });
   });
 
   it("matches an exact owner, including the execution attempt and lease identity", async () => {
@@ -107,11 +111,11 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     const fence = await import("./scheduled-taskgraph-pipeline-fence");
     await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(true);
     expect(mocks.turn).toHaveBeenCalledWith(expect.objectContaining({ where: {
-      id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+      id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, rootTaskId: owner.rootTaskId,
     } }));
     expect(mocks.root).toHaveBeenCalledWith(expect.objectContaining({ where: {
       id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, session: { userId: owner.userId },
-      rootTaskId: owner.rootTaskId, parentTaskId: null,
+      rootTaskId: owner.rootTaskId, parentTaskId: null, role: "orchestrator", taskType: "root",
     } }));
     expect(mocks.execution).toHaveBeenCalledWith(expect.objectContaining({ where: {
       id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId,
@@ -130,6 +134,62 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(false);
     mocks.execution.mockResolvedValueOnce({ state: { scheduledTaskGraphClaim: { ...claim, claimToken: "new-claim" } } });
     await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(false);
+  });
+
+  it.each(["gate", "execute", "audit", "completed"])("allows a live owner through the %s checkpoint only with Gate proof", async checkpoint => {
+    const fence = await import("./scheduled-taskgraph-pipeline-fence");
+    const state = { nextStage: checkpoint, scheduledTaskGraphClaim: claim,
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner,
+        snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 9, evidenceDigest: "b".repeat(64) } };
+    mocks.turn.mockResolvedValueOnce({ status: "waiting_for_approval", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled" }, leaseOwnerId: owner.turnLeaseOwnerId,
+      leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.execution.mockResolvedValueOnce({ status: "running", checkpoint, state });
+    gateFence.proof.mockResolvedValueOnce(true);
+
+    await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(true);
+    expect(gateFence.proof).toHaveBeenCalledWith({ reader: expect.anything(), owner, key, claimToken,
+      executionStatus: "running", checkpoint, state });
+  });
+
+  it("does not relax waiting approval for a stale lease, root, execution, or claim", async () => {
+    const fence = await import("./scheduled-taskgraph-pipeline-fence");
+    const waitingTurn = { status: "waiting_for_approval", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled" }, leaseOwnerId: owner.turnLeaseOwnerId,
+      leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() + 60_000) };
+    const exactState = { nextStage: "gate", scheduledTaskGraphClaim: claim };
+
+    mocks.turn.mockResolvedValueOnce({ ...waitingTurn, leaseExpiresAt: new Date(Date.now() - 1) });
+    mocks.execution.mockResolvedValueOnce({ status: "running", checkpoint: "gate", state: exactState });
+    await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(false);
+    mocks.root.mockResolvedValueOnce({ status: "running", attemptCount: owner.rootAttemptCount,
+      interruptRequestedAt: new Date(), closedAt: null });
+    mocks.turn.mockResolvedValueOnce(waitingTurn);
+    mocks.execution.mockResolvedValueOnce({ status: "running", checkpoint: "gate", state: exactState });
+    await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(false);
+    mocks.turn.mockResolvedValueOnce(waitingTurn);
+    mocks.execution.mockResolvedValueOnce(null);
+    await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(false);
+    mocks.turn.mockResolvedValueOnce(waitingTurn);
+    mocks.execution.mockResolvedValueOnce({ status: "running", checkpoint: "gate",
+      state: { nextStage: "gate", scheduledTaskGraphClaim: { ...claim, claimToken: "other" } } });
+    await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(false);
+    expect(gateFence.proof).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["user source", { source: "user" }],
+    ["legacy execution mode", { executionMode: "legacy_pipeline_adapter" }],
+    ["manual automation", { input: { automationRunMode: "manual" } }],
+  ])("rejects waiting approval for a Turn with %s", async (_name, overrides) => {
+    const fence = await import("./scheduled-taskgraph-pipeline-fence");
+    mocks.turn.mockResolvedValueOnce({ status: "waiting_for_approval", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled" }, leaseOwnerId: owner.turnLeaseOwnerId,
+      leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() + 60_000), ...overrides });
+    mocks.execution.mockResolvedValueOnce({ status: "running", checkpoint: "gate", state: {
+      nextStage: "gate", scheduledTaskGraphClaim: claim } });
+    await expect(fence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)).resolves.toBe(false);
+    expect(gateFence.proof).not.toHaveBeenCalled();
   });
 
   it("fails closed if any durable owner read fails", async () => {

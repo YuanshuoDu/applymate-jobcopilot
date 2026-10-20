@@ -2,6 +2,7 @@ import { Prisma, type Job } from '@prisma/client'
 import { AgentExecutionCancelledError } from './execution-control'
 import { rebindScheduledTaskGraphClaimForLease, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from './scheduled-taskgraph-pipeline-fence'
 import { buildScheduledTaskGraphPrepareCheckpoint, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
+import { hasScheduledTaskGraphGateProof } from './scheduled-taskgraph-approval-fence'
 import { AnalyzeRecoveryPersistenceError, runAnalyze, type AnalyzeRecoveryHooks } from './stages/analyze'
 import type { AnalyzeOutput, PipelineCheckpointState, PipelineCtx, ScoredJob, StageResult } from './types'
 
@@ -183,11 +184,11 @@ export async function scheduledTaskGraphScoreOwnerIsCurrent(input: {
     FOR UPDATE
   `)
   if (lockedTurn.length !== 1) return false
-  const turn = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-    SELECT "id" FROM "agent_turns"
+  const turn = await tx.$queryRaw<Array<{ id: string; status: string; source: string; executionMode: string | null; input: unknown }>>(Prisma.sql`
+    SELECT "id", "status", "source", "executionMode", "input" FROM "agent_turns"
     WHERE "id" = ${owner.turnId} AND "userId" = ${owner.userId} AND "sessionId" = ${owner.sessionId}
       AND "rootTaskId" = ${owner.rootTaskId}
-      AND "status" = 'in_progress' AND "leaseOwnerId" = ${owner.turnLeaseOwnerId}
+      AND "status" IN ('in_progress', 'waiting_for_approval') AND "leaseOwnerId" = ${owner.turnLeaseOwnerId}
       AND "leaseVersion" = ${owner.turnLeaseVersion} AND "leaseExpiresAt" > clock_timestamp()
   `)
   if (turn.length !== 1) return false
@@ -195,22 +196,29 @@ export async function scheduledTaskGraphScoreOwnerIsCurrent(input: {
     SELECT "id" FROM "sub_agent_tasks"
     WHERE "id" = ${owner.rootTaskId} AND "sessionId" = ${owner.sessionId} AND "turnId" = ${owner.turnId}
       AND "rootTaskId" = ${owner.rootTaskId} AND "parentTaskId" IS NULL
+      AND "role" = 'orchestrator' AND "taskType" = 'root'
       AND "attemptCount" = ${owner.rootAttemptCount} AND "status" = 'running'
       AND "interruptRequestedAt" IS NULL AND "closedAt" IS NULL
     FOR UPDATE
   `)
   if (root.length !== 1) return false
-  const execution = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-    SELECT "id" FROM "agent_executions"
+  const execution = await tx.$queryRaw<Array<{ id: string; checkpoint: string; state: unknown }>>(Prisma.sql`
+    SELECT "id", "checkpoint", "state" FROM "agent_executions"
     WHERE "id" = ${owner.executionId} AND "userId" = ${owner.userId} AND "sessionId" = ${owner.sessionId}
       AND "status" = 'running' AND "attemptCount" = ${owner.executionAttemptCount}
+      AND jsonb_object_length("state"->'scheduledTaskGraphClaim') = 6
       AND "state"->'scheduledTaskGraphClaim'->>'schemaVersion' = 'agent-harness.v2.scheduled-pipeline-claim.v1'
       AND "state"->'scheduledTaskGraphClaim'->>'key' = ${key}
       AND "state"->'scheduledTaskGraphClaim'->>'claimToken' = ${claimToken}
       AND "state"->'scheduledTaskGraphClaim'->'owner' = CAST(${JSON.stringify(owner)} AS jsonb)
     FOR UPDATE
   `)
-  return execution.length === 1
+  if (execution.length !== 1) return false
+  if (turn[0].status === 'in_progress') return true
+  return turn[0].status === 'waiting_for_approval' && turn[0].source === 'automation'
+    && turn[0].executionMode === 'canonical_task_graph' && record(turn[0].input)?.automationRunMode === 'scheduled'
+    && await hasScheduledTaskGraphGateProof({ reader: tx, owner, key, claimToken,
+      executionStatus: 'running', checkpoint: execution[0].checkpoint, state: execution[0].state })
 }
 
 export function createScheduledTaskGraphOwnerFence(scheduled: {

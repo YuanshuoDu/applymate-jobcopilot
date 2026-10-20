@@ -1,6 +1,7 @@
 import { db } from "@/lib/db";
 import { Prisma, type Job } from "@prisma/client";
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint";
+import { hasScheduledTaskGraphGateProof } from "./scheduled-taskgraph-approval-fence";
 import type { PipelineCheckpointState } from "./types";
 
 const CLAIM_SCHEMA = "agent-harness.v2.scheduled-pipeline-claim.v1";
@@ -256,14 +257,8 @@ export function rebindScheduledTaskGraphWaitState(input: {
   return { state: rebound, waitId: priorWait.waitId, stage: priorWait.stage };
 }
 
-function sameStableOwner(previous: ScheduledTaskGraphPipelineOwner, current: ScheduledTaskGraphPipelineOwner): boolean {
-  return scheduledTaskGraphOwnerMatches({ ...previous, turnLeaseOwnerId: current.turnLeaseOwnerId,
-    turnLeaseVersion: current.turnLeaseVersion }, current);
-}
-
-function validId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value;
-}
+function sameStableOwner(previous: ScheduledTaskGraphPipelineOwner, current: ScheduledTaskGraphPipelineOwner): boolean { return scheduledTaskGraphOwnerMatches({ ...previous, turnLeaseOwnerId: current.turnLeaseOwnerId, turnLeaseVersion: current.turnLeaseVersion }, current); }
+function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value; }
 function positiveInteger(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) > 0; }
 function isDigest(value: unknown): boolean { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value); }
 function isSnapshotDigest(value: unknown): boolean { return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value); }
@@ -276,24 +271,29 @@ export async function isScheduledTaskGraphOwnerCurrent(
   try {
     const [turn, root, execution] = await Promise.all([
       db.agentTurn.findFirst({
-        where: { id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId },
-        select: { status: true, leaseOwnerId: true, leaseVersion: true, leaseExpiresAt: true },
+        where: { id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, rootTaskId: owner.rootTaskId },
+        select: { status: true, source: true, executionMode: true, input: true, leaseOwnerId: true, leaseVersion: true, leaseExpiresAt: true },
       }),
       db.subAgentTask.findFirst({
         where: { id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
-          parentTaskId: null, session: { userId: owner.userId } },
+          parentTaskId: null, role: "orchestrator", taskType: "root", session: { userId: owner.userId } },
         select: { status: true, attemptCount: true, interruptRequestedAt: true, closedAt: true },
       }),
       db.agentExecution.findFirst({
         where: { id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId, status: "running", attemptCount: owner.executionAttemptCount },
-        select: { state: true },
+        select: { state: true, checkpoint: true, status: true },
       }),
     ]);
-    return turn?.status === "in_progress" && turn.leaseOwnerId === owner.turnLeaseOwnerId
+    const live = turn?.leaseOwnerId === owner.turnLeaseOwnerId
       && turn.leaseVersion === owner.turnLeaseVersion && turn.leaseExpiresAt instanceof Date
       && turn.leaseExpiresAt.getTime() > Date.now() && root?.status === "running"
-      && root.attemptCount === owner.rootAttemptCount && !root.interruptRequestedAt && !root.closedAt
-      && scheduledTaskGraphClaimMatches(execution?.state, key, owner, claimToken);
+      && root.attemptCount === owner.rootAttemptCount && !root.interruptRequestedAt && !root.closedAt;
+    if (!live || !scheduledTaskGraphClaimMatches(execution?.state, key, owner, claimToken)) return false;
+    if (turn?.status === "in_progress") return true;
+    return turn?.status === "waiting_for_approval" && turn.source === "automation"
+      && turn.executionMode === "canonical_task_graph" && objectRow(turn.input)?.automationRunMode === "scheduled" && execution !== null
+      && await hasScheduledTaskGraphGateProof({ reader: db, owner, key, claimToken, executionStatus: execution.status,
+        checkpoint: execution.checkpoint, state: execution.state });
   } catch {
     return false;
   }
