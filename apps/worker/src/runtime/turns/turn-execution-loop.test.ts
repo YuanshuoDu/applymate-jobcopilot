@@ -1801,6 +1801,44 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(diagnostic)).not.toContain(lateSteer.id)
   })
 
+  it("keeps private repeated tool data out of no-progress events and the final blocker", async () => {
+    const markers = ["private-tool-argument-675", "private-observation-input-675", "private-observation-output-675"]
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "private-observation", content: {
+      toolName: "jobs.search", input: { query: markers[1] }, status: "completed", output: { detail: markers[2] }, errorCode: null,
+    } }])
+    let modelCalls = 0, dispatches = 0
+    const executeTool = root.options.executeTool
+    root.options = {
+      ...root.options,
+      model: {
+        ...root.options.model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          modelCalls += 1
+          yield { type: "tool_call_completed", callId: `private-repeat-${modelCalls}`, name: "jobs.search", arguments: { query: markers[0] } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        },
+      },
+      executeTool: async request => { dispatches += 1; return executeTool(request) },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const diagnostics = root.events.filter(event => event.type === "turn.no_progress" || event.type === "turn.failed")
+    const noProgress = root.events.find(event => event.type === "turn.no_progress")?.payload
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress" })
+    expect(dispatches).toBe(2)
+    expect(noProgress).toMatchObject({
+      reasonCode: "repeated_signature",
+      signature: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      stateFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    })
+    for (const marker of markers) {
+      expect(JSON.stringify(diagnostics)).not.toContain(marker)
+      expect(JSON.stringify(root.finalResponses)).not.toContain(marker)
+    }
+  })
+
   it("opens one repeated-signature window for a trusted TaskGraph revision change", async () => {
     const root = fixture(identity("turn", "root-1")), baseBuilder = root.options.contextBuilder
     const executeTool = root.options.executeTool
