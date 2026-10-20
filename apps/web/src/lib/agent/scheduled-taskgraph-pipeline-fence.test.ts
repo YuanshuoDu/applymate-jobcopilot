@@ -18,6 +18,22 @@ const owner = {
 };
 const key = "continuation-key", claimToken = "claim-token-a";
 const claim = { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner };
+const waitId = "agent-question:turn-1:canonical:q1", waitStage = "writer";
+
+function durableWaitingState() {
+  return createScheduledTaskGraphWaitState({ nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+    scheduledTaskGraphClaim: claim,
+    scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner,
+      snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 9, evidenceDigest: "b".repeat(64) } },
+    owner, key, claimToken, waitId, waitStage);
+}
+
+function unansweredQuestion() {
+  return { id: `agent-wait:question:${waitId}`, sessionId: owner.sessionId, turnId: owner.turnId, type: "question",
+    status: "started", startedAt: new Date(), completedAt: null, content: {
+      waitKind: "question", questionId: waitId, stage: waitStage, answerAvailable: false, answer: null,
+    } };
+}
 
 describe("scheduled TaskGraph pipeline owner fence", () => {
   beforeEach(() => {
@@ -158,6 +174,42 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     mocks.item.mockResolvedValueOnce({ ...item, status: "started", completedAt: null,
       content: { ...item.content, answerAvailable: false, answer: null } });
     await expect(loadDurableScheduledTaskGraphWait({ owner, key, claimToken, answeredOnly: true })).resolves.toBeNull();
+  });
+
+  it("accepts an unanswered durable wait while the exact Turn lease is still in progress", async () => {
+    mocks.execution.mockResolvedValueOnce({ status: "waiting_for_user", state: durableWaitingState() });
+    mocks.turn.mockResolvedValueOnce({ status: "in_progress", leaseOwnerId: owner.turnLeaseOwnerId,
+      leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.item.mockResolvedValueOnce(unansweredQuestion());
+
+    await expect(loadDurableScheduledTaskGraphWait({ owner, key, claimToken })).resolves.toEqual({ waitId, stage: waitStage });
+    expect(mocks.turn).toHaveBeenCalledWith(expect.objectContaining({ select: {
+      status: true, leaseOwnerId: true, leaseVersion: true, leaseExpiresAt: true,
+    } }));
+  });
+
+  it.each([
+    ["different lease owner", { status: "in_progress", leaseOwnerId: "worker-2", leaseVersion: owner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) }],
+    ["different lease version", { status: "in_progress", leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion + 1,
+      leaseExpiresAt: new Date(Date.now() + 60_000) }],
+    ["expired lease", { status: "in_progress", leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() - 1) }],
+  ])("rejects an unanswered durable wait with a %s", async (_label, turn) => {
+    mocks.execution.mockResolvedValueOnce({ status: "waiting_for_user", state: durableWaitingState() });
+    mocks.turn.mockResolvedValueOnce(turn);
+    mocks.item.mockResolvedValueOnce(unansweredQuestion());
+
+    await expect(loadDurableScheduledTaskGraphWait({ owner, key, claimToken })).resolves.toBeNull();
+  });
+
+  it("continues accepting an unanswered wait after the Turn has entered waiting_for_user", async () => {
+    mocks.execution.mockResolvedValueOnce({ status: "waiting_for_user", state: durableWaitingState() });
+    mocks.turn.mockResolvedValueOnce({ status: "waiting_for_user", leaseOwnerId: null,
+      leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: null });
+    mocks.item.mockResolvedValueOnce(unansweredQuestion());
+
+    await expect(loadDurableScheduledTaskGraphWait({ owner, key, claimToken })).resolves.toEqual({ waitId, stage: waitStage });
   });
 
   it("CAS-fences Prepare checkpoints and terminal state by the current claim token", async () => {

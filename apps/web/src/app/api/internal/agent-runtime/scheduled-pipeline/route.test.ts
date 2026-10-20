@@ -497,8 +497,8 @@ describe("scheduled pipeline continuation route", () => {
       status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
       input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
       leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion,
-      leaseExpiresAt: new Date(Date.now() + 60_000) }).mockResolvedValueOnce({ status: "waiting_for_user",
-        leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion });
+      leaseExpiresAt: new Date(Date.now() + 60_000) }).mockResolvedValueOnce({ status: "in_progress",
+        leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() + 60_000) });
     mocks.question.mockResolvedValueOnce(canonicalQuestion(pause.waitId));
     const { POST } = await import("./route");
     const response = await POST(request());

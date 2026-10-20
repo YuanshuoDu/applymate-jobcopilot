@@ -192,14 +192,17 @@ export async function loadDurableScheduledTaskGraphWait(input: {
     db.agentExecution.findFirst({ where: { id: input.owner.executionId, userId: input.owner.userId, sessionId: input.owner.sessionId,
       attemptCount: input.owner.executionAttemptCount }, select: { status: true, state: true } }),
     db.agentTurn.findFirst({ where: { id: input.owner.turnId, userId: input.owner.userId, sessionId: input.owner.sessionId },
-      select: { status: true } }),
+      select: { status: true, leaseOwnerId: true, leaseVersion: true, leaseExpiresAt: true } }),
   ]);
   const marker = readScheduledTaskGraphWaitMarker(execution?.state);
   if (!execution || !turn || !marker || marker.key !== input.key || marker.claimToken !== input.claimToken
     || !scheduledTaskGraphOwnerMatches(marker.owner, input.owner)) return null;
   const question = await loadScheduledTaskGraphWaitQuestion(input.owner, marker.waitId, marker.stage);
   if (!question) return null;
-  const durablePause = execution.status === "waiting_for_user" && turn.status === "waiting_for_user";
+  const leaseExpiresAt = turn.leaseExpiresAt instanceof Date ? turn.leaseExpiresAt.getTime() : Number.NaN;
+  const currentLease = turn.status === "in_progress" && turn.leaseOwnerId === input.owner.turnLeaseOwnerId
+    && turn.leaseVersion === input.owner.turnLeaseVersion && Number.isFinite(leaseExpiresAt) && leaseExpiresAt > Date.now();
+  const durablePause = execution.status === "waiting_for_user" && (turn.status === "waiting_for_user" || currentLease);
   const resumedAnswer = question.answered && ["running", "waiting_for_user"].includes(execution.status)
     && ["in_progress", "waiting_for_user"].includes(turn.status);
   if (input.answeredOnly ? !resumedAnswer : question.answered ? !resumedAnswer : !durablePause) return null;
