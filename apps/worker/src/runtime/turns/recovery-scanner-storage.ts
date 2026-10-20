@@ -65,7 +65,7 @@ async function reclaimExpiredScheduledGateTurns(client: Pick<pg.PoolClient, "que
        FROM "agent_sessions" AS session
        JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"
        JOIN "agent_executions" AS execution ON execution."sessionId" = session."id" AND execution."userId" = session."userId"
-       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId" AND root."userId" = turn."userId"
+       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
        JOIN LATERAL (SELECT execution."state"->'scheduledTaskGraphClaim' AS claim, execution."state"->'scheduledTaskGraphContinuation' AS continuation) AS markers ON TRUE
        WHERE ${RUNNABLE_SESSION}
          AND turn."status" = 'waiting_for_approval' AND turn."leaseExpiresAt" <= $1
