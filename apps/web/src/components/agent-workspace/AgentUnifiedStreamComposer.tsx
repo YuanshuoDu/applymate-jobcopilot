@@ -6,7 +6,7 @@ import { useI18n } from '@/lib/i18n'
 import { AgentObjectiveContextForm, canStartOrdinaryChat, isOrdinaryComposerInputLocked, shouldReleaseInputAfterSessionSelection } from './AgentObjectiveContextForm'
 import { AgentComposer, type ComposerAttachment, type ComposerJob, type ComposerResume } from './AgentComposer'
 import { attachmentComposerContext, jobComposerContext, resumeComposerContext } from './AgentUnifiedStream.helpers'
-import { sendAgentTurnMessage, useAgentTurnComposerContext } from './agent-turn-commands'
+import { AgentTurnComposerProvider, sendAgentTurnMessage, useAgentTurnComposerContext } from './agent-turn-commands'
 import type { AgentTranscriptEvent } from './session-view-model'
 import type { AgentUnifiedStreamProps } from './AgentUnifiedStream.types'
 
@@ -28,6 +28,7 @@ interface AgentUnifiedStreamComposerProps {
   chatRequestVersionRef: MutableRefObject<number>
   shouldFollowScrollRef: MutableRefObject<boolean>
   liveBlocks: AgentTranscriptEvent[]
+  resumeSessionId: AgentUnifiedStreamProps['resumeSessionId']; timelineRestoring: boolean
   setRevealThinkingVersion: Dispatch<SetStateAction<number>>
   onSessionRecorded: AgentUnifiedStreamProps['onSessionRecorded']
 }
@@ -37,10 +38,14 @@ function newClientMessageId() {
   return `message-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
+export function canShowObjectiveContextEntry(hasSelectedSession: boolean, isRestoring: boolean, hasTurnComposer: boolean, liveBlockCount: number, waitingForAnswer: boolean) {
+  return !hasSelectedSession && !isRestoring && !hasTurnComposer && liveBlockCount === 0 && !waitingForAnswer
+}
+
 export function AgentUnifiedStreamComposer({
   waitingForAnswer, chatInput, setChatInput, chatLoading, setChatLoading, addMenuOpen, setAddMenuOpen,
   attachedFiles, setAttachedFiles, composerJobs, composerResumes, inputRef, fileInputRef,
-  chatRequestRef, chatRequestVersionRef, shouldFollowScrollRef, liveBlocks, setRevealThinkingVersion,
+  chatRequestRef, chatRequestVersionRef, shouldFollowScrollRef, liveBlocks, resumeSessionId, timelineRestoring, setRevealThinkingVersion,
   onSessionRecorded,
 }: AgentUnifiedStreamComposerProps) {
   const { t } = useI18n()
@@ -51,15 +56,20 @@ export function AgentUnifiedStreamComposer({
   const objectiveStartInFlightRef = useRef(false)
   const objectiveSessionSwitchPendingRef = useRef(false)
   const objectiveSessionSwitchFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const objectiveContextEntryAvailable = !turnComposer && liveBlocks.length === 0 && !waitingForAnswer
+  const objectiveContextEntryAvailable = canShowObjectiveContextEntry(Boolean(resumeSessionId), timelineRestoring, Boolean(turnComposer), liveBlocks.length, waitingForAnswer)
   const previousObjectiveContextEntryAvailableRef = useRef(objectiveContextEntryAvailable)
+  function refuseSendDuringSessionSwitch() {
+    if (!objectiveSessionSwitchPendingRef.current) return false
+    toast.info('Task is switching', 'Wait for the new task to finish opening before sending more context.'); return true
+  }
+
+  const turnComposerForAgentComposer = turnComposer ? { ...turnComposer, send: (text: string) => {
+    if (refuseSendDuringSessionSwitch()) return; turnComposer.send(text)
+  } } : null
 
   const syncOrdinaryComposerInputLock = useCallback(() => {
     if (!inputRef.current) return
-    inputRef.current.disabled = isOrdinaryComposerInputLocked(
-      objectiveStartInFlightRef.current,
-      objectiveSessionSwitchPendingRef.current,
-    )
+    inputRef.current.disabled = isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)
   }, [inputRef])
 
   const releaseOrdinaryComposerInputLock = useCallback(() => {
@@ -129,6 +139,7 @@ export function AgentUnifiedStreamComposer({
   }
 
   async function sendChat(text: string) {
+    if (refuseSendDuringSessionSwitch()) return
     if (!text.trim() || chatLoading) return
     const draftText = text.trim()
     const draftFiles = attachedFiles
@@ -221,29 +232,19 @@ export function AgentUnifiedStreamComposer({
           onSessionRecorded(sessionId, objective, 'Task · Running')
         }}
       />
-      <AgentComposer
-        waitingForAnswer={waitingForAnswer}
-        chips={chips}
-        chatInput={chatInput}
-        chatLoading={chatLoading}
-        addMenuOpen={addMenuOpen}
-        attachedFiles={attachedFiles}
-        composerJobs={composerJobs}
-        composerResumes={composerResumes}
-        inputRef={inputRef}
-        fileInputRef={fileInputRef}
-        onChatInputChange={value => {
-          if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) return
-          setChatInput(value)
-        }}
-        onAddMenuOpenChange={setAddMenuOpen}
-        onSendChat={sendChat}
+      <AgentTurnComposerProvider value={turnComposerForAgentComposer}><AgentComposer
+        waitingForAnswer={waitingForAnswer} chips={chips} chatInput={chatInput}
+        chatLoading={chatLoading} addMenuOpen={addMenuOpen} attachedFiles={attachedFiles}
+        composerJobs={composerJobs} composerResumes={composerResumes}
+        inputRef={inputRef} fileInputRef={fileInputRef}
+        onChatInputChange={value => { if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) return; setChatInput(value) }}
+        onAddMenuOpenChange={setAddMenuOpen} onSendChat={sendChat}
         onRemoveAttachedFile={id => setAttachedFiles(current => current.filter(file => file.id !== id))}
         onAddSelectedFiles={addSelectedFiles}
         onAddJobContext={job => appendComposerContext(jobComposerContext(job))}
         onAddResumeContext={resume => appendComposerContext(resumeComposerContext(resume))}
         onAppendComposerContext={appendComposerContext}
-      />
+      /></AgentTurnComposerProvider>
     </>
   )
 }

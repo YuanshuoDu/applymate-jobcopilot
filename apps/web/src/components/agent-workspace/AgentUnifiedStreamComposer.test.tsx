@@ -7,10 +7,12 @@ import {
   shouldReleaseInputAfterSessionSelection,
   type AgentObjectiveContextFormState,
 } from './AgentObjectiveContextForm'
+import { canShowObjectiveContextEntry } from './AgentUnifiedStreamComposer'
 
 import { describe, expect, it } from 'vitest'
 
 const source = readFileSync(new URL('./AgentUnifiedStreamComposer.tsx', import.meta.url), 'utf8')
+const streamSource = readFileSync(new URL('./AgentUnifiedStream.tsx', import.meta.url), 'utf8')
 const formSource = readFileSync(new URL('./AgentObjectiveContextForm.tsx', import.meta.url), 'utf8')
 
 const emptyFormState: AgentObjectiveContextFormState = {
@@ -68,7 +70,7 @@ describe('Agent unified stream composer', () => {
     })
     expect(isObjectiveDraftPending(failed)).toBe(true)
 
-    expect(source).toContain('const objectiveContextEntryAvailable = !turnComposer && liveBlocks.length === 0 && !waitingForAnswer')
+    expect(source).toContain('const objectiveContextEntryAvailable = canShowObjectiveContextEntry(Boolean(resumeSessionId), timelineRestoring, Boolean(turnComposer), liveBlocks.length, waitingForAnswer)')
     expect(source).toContain('<AgentObjectiveContextForm')
     expect(source).toContain('available={objectiveContextEntryAvailable}')
     expect(formSource).toContain('if (!available) return null')
@@ -80,6 +82,15 @@ describe('Agent unified stream composer', () => {
     const pendingGuardAt = source.indexOf('if (objectiveContextEntryAvailable && !canStartOrdinaryChat', sendStart)
     expect(activeTurnSendAt).toBeGreaterThan(sendStart)
     expect(pendingGuardAt).toBeGreaterThan(activeTurnSendAt)
+  })
+
+  it('hides the objective entry for selected Sessions and while a Session is restoring', () => {
+    expect(canShowObjectiveContextEntry(true, false, false, 0, false)).toBe(false)
+    expect(canShowObjectiveContextEntry(false, true, false, 0, false)).toBe(false)
+    expect(canShowObjectiveContextEntry(false, false, false, 0, false)).toBe(true)
+    expect(source).toContain('canShowObjectiveContextEntry(Boolean(resumeSessionId), timelineRestoring, Boolean(turnComposer), liveBlocks.length, waitingForAnswer)')
+    expect(streamSource).toContain('resumeSessionId={resumeSessionId}')
+    expect(streamSource).toContain('timelineRestoring={timeline.restoring}')
   })
 
   it('locks ordinary input while objective start is in flight and through the Session switch', () => {
@@ -95,6 +106,22 @@ describe('Agent unified stream composer', () => {
     expect(source).toContain('onChatInputChange={value => {')
     expect(source).toContain('if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) return')
     expect(source).toContain('if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) {')
+
+    const sendStart = source.indexOf('async function sendChat')
+    const switchGuardAt = source.indexOf('if (refuseSendDuringSessionSwitch()) return', sendStart)
+    const activeTurnSendAt = source.indexOf('turnComposer.send(outgoing)', sendStart)
+    const sessionCreationAt = source.indexOf("fetch('/api/agent/sessions'", sendStart)
+    expect(switchGuardAt).toBeGreaterThan(sendStart)
+    expect(switchGuardAt).toBeLessThan(activeTurnSendAt)
+    expect(switchGuardAt).toBeLessThan(sessionCreationAt)
+    expect(source).toContain("toast.info('Task is switching', 'Wait for the new task to finish opening before sending more context.')")
+
+    const guardedControllerAt = source.indexOf('const turnComposerForAgentComposer = turnComposer ? {')
+    const guardedControllerSendAt = source.indexOf('if (refuseSendDuringSessionSwitch()) return', guardedControllerAt)
+    const guardedActiveTurnSendAt = source.indexOf('turnComposer.send(text)', guardedControllerAt)
+    expect(guardedControllerAt).toBeGreaterThanOrEqual(0)
+    expect(guardedControllerSendAt).toBeLessThan(guardedActiveTurnSendAt)
+    expect(source).toContain('<AgentTurnComposerProvider value={turnComposerForAgentComposer}>')
 
     expect(shouldReleaseInputAfterSessionSelection(true, false, true)).toBe(true)
     expect(shouldReleaseInputAfterSessionSelection(true, true, true)).toBe(false)
@@ -118,7 +145,7 @@ describe('Agent unified stream composer', () => {
   })
 
   it('offers objective and background only for a fresh composer without touching ordinary context', () => {
-    expect(source).toContain('!turnComposer && liveBlocks.length === 0 && !waitingForAnswer')
+    expect(source).toContain('canShowObjectiveContextEntry(Boolean(resumeSessionId), timelineRestoring, Boolean(turnComposer), liveBlocks.length, waitingForAnswer)')
     expect(source).toContain('<AgentObjectiveContextForm')
     expect(source).toContain('startLockRef={sessionStartLockRef}')
     expect(source).toContain('turnComposer.send(outgoing)')
