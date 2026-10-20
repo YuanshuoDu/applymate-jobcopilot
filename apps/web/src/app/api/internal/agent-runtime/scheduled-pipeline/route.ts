@@ -129,6 +129,10 @@ async function loadExecution(owner: RequestOwner): Promise<StoredExecution | nul
     select: { id: true, status: true, attemptCount: true, state: true },
   }) as Promise<StoredExecution | null>;
 }
+async function canonicalQuestionItemMissing(owner: RequestOwner, waitId: string): Promise<boolean> {
+  return waitId.startsWith(`agent-question:${owner.turnId}:canonical:`)
+    && !(await db.agentItem.findFirst({ where: { id: `agent-wait:question:${waitId}` }, select: { id: true } }));
+}
 
 export async function POST(request: Request): Promise<Response> {
   const secret = process.env.AGENT_WORKER_SECRET;
@@ -179,12 +183,35 @@ export async function POST(request: Request): Promise<Response> {
     if (replay && currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: replay });
     return blocked(409, "scheduled_pipeline_execution_mismatch");
   }
-  const priorWait = readScheduledTaskGraphWaitMarker(execution.state);
-  if (priorWait && priorWait.key === key && scheduledTaskGraphOwnerMatches(priorWait.owner, executionOwner)
-    && execution.status === "waiting_for_user" && turn.status === "waiting_for_user") {
-    return json(202, { status: "waiting_for_user", waitId: priorWait.waitId, stage: priorWait.stage });
+  const state = record(execution.state);
+  const wait = readScheduledTaskGraphWaitMarker(state);
+  let waitQuestion: Awaited<ReturnType<typeof loadScheduledTaskGraphWaitQuestion>> = null;
+  if (state?.scheduledTaskGraphWait !== undefined && !wait) return blocked(409, "scheduled_pipeline_claim_conflict");
+  if (wait) {
+    const currentWaitOwner = wait.key === key && scheduledTaskGraphOwnerMatches(wait.owner, executionOwner);
+    const prior = currentWaitOwner ? null : priorScheduledTaskGraphContinuation({ state, owner: executionOwner, snapshot, attestation });
+    if (!currentWaitOwner
+      && !(prior && wait.key === prior.key && scheduledTaskGraphOwnerMatches(wait.owner, prior.owner))) return blocked(409, "scheduled_pipeline_claim_conflict");
+    const currentTurn = turn.status === "in_progress" ? leaseIsCurrent(turn, owner)
+      : turn.status === "waiting_for_user" && reportLeaseIsCurrent(turn, owner);
+    if (!rootIsCurrent(root, owner) || !currentTurn) return blocked(409, "scheduled_pipeline_turn_stale");
+    if (execution.status !== "running" && execution.status !== "waiting_for_user") return blocked(409, "scheduled_pipeline_execution_mismatch");
+    const checkedWait = rebindScheduledTaskGraphWaitState({ state, owner: executionOwner, key, claimToken: randomUUID(),
+      snapshotDigest: String(record(attestation)?.snapshotDigest),
+      graphRevision: Number(record(attestation)?.graphRevision), evidenceDigest: String(record(attestation)?.evidenceDigest) });
+    if (!checkedWait || checkedWait.waitId !== wait.waitId || checkedWait.stage !== wait.stage) return blocked(409, "scheduled_pipeline_claim_conflict");
+    waitQuestion = await loadScheduledTaskGraphWaitQuestion(executionOwner, wait.waitId, wait.stage);
+    if (!waitQuestion && currentWaitOwner && turn.status === "in_progress" && leaseIsCurrent(turn, owner)
+      && await canonicalQuestionItemMissing(owner, wait.waitId)) {
+      return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage });
+    }
+    if (!waitQuestion) return blocked(409, "scheduled_pipeline_claim_conflict");
+    const resumable = waitQuestion.answered && ["running", "waiting_for_user"].includes(execution.status)
+      && turn.status === "in_progress" && leaseIsCurrent(turn, owner);
+    if (!resumable) return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage });
+  } else if (!rootIsCurrent(root, owner) || !leaseIsCurrent(turn, owner)) {
+    return blocked(409, "scheduled_pipeline_turn_stale");
   }
-  if (!rootIsCurrent(root, owner) || !leaseIsCurrent(turn, owner)) return blocked(409, "scheduled_pipeline_turn_stale");
   if (user?.accountStatus !== "active") return blocked(403, "scheduled_pipeline_account_unavailable");
   if (!await isFeatureAllowed(owner.userId, "auto_apply")) return blocked(403, "scheduled_pipeline_entitlement_required");
   const aiAccess = await resolveAiAccess(owner.userId);
@@ -196,16 +223,6 @@ export async function POST(request: Request): Promise<Response> {
     ? { ...configured, usageUserId: owner.userId, usageFeatureKey: "autoApply", usageRuntime: "worker" as const }
     : { ...resolveConfig(APPLYMATE_BACKING), usageUserId: owner.userId, usageFeatureKey: "autoApply", usageRuntime: "worker" as const };
 
-  const state = record(execution.state);
-  const wait = readScheduledTaskGraphWaitMarker(state);
-  if (state?.scheduledTaskGraphWait !== undefined && !wait) return blocked(409, "scheduled_pipeline_claim_conflict");
-  if (wait && execution.status !== "waiting_for_user") {
-    const question = await loadScheduledTaskGraphWaitQuestion(executionOwner, wait.waitId, wait.stage);
-    if (!question) return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage });
-    const resumable = question.answered && execution.status === "running"
-      && turn.status === "in_progress" && leaseIsCurrent(turn, owner);
-    if (!resumable) return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage });
-  }
   if (!state || (execution.status !== "running" && !(execution.status === "waiting_for_user" && wait))) {
     return sameClaim(execution.state, key, executionOwner)
       ? blocked(500, "scheduled_pipeline_execution_failed") : blocked(409, "scheduled_pipeline_execution_mismatch");
@@ -215,8 +232,7 @@ export async function POST(request: Request): Promise<Response> {
   let resumeQuestionId: string | undefined;
   const claimToken = randomUUID();
   if (wait) {
-    const question = await loadScheduledTaskGraphWaitQuestion(executionOwner, wait.waitId, wait.stage);
-    if (!question || !question.answered) return blocked(409, "scheduled_pipeline_analysis_interrupted");
+    if (!waitQuestion?.answered) return blocked(409, "scheduled_pipeline_analysis_interrupted");
     const rebind = rebindScheduledTaskGraphWaitState({ state, owner: executionOwner, key, claimToken,
       snapshotDigest: String(record(attestation)?.snapshotDigest),
       graphRevision: Number(record(attestation)?.graphRevision), evidenceDigest: String(record(attestation)?.evidenceDigest) });

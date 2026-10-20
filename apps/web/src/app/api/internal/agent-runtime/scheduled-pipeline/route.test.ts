@@ -138,7 +138,7 @@ describe("scheduled pipeline continuation route", () => {
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 
-  it("returns the durable typed wait while its canonical question item is still publishing", async () => {
+  it("replays a persisted wait while its question is publishing under the exact current Turn lease", async () => {
     mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state: waitingState() });
     const { POST } = await import("./route");
     const response = await POST(request());
@@ -511,6 +511,76 @@ describe("scheduled pipeline continuation route", () => {
     }));
   });
 
+  it.each(["running", "waiting_for_user"] as const)(
+    "replays the same verified unanswered wait when execution is %s under the current Turn lease",
+    async status => {
+      const pause = { waitId: "agent-question:turn-1:canonical:q1", stage: "writer" };
+      mocks.execution.mockResolvedValueOnce({ id: "execution-1", status, attemptCount: 0, state: waitingState() });
+      mocks.question.mockResolvedValueOnce(canonicalQuestion(pause.waitId));
+      const { POST } = await import("./route");
+      const response = await POST(request());
+
+      expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({ status: "waiting_for_user", ...pause });
+      expect(mocks.claim).not.toHaveBeenCalled();
+      expect(mocks.runPipeline).not.toHaveBeenCalled();
+    },
+  );
+
+  it("replays the original unanswered wait after a lease takeover with the same stable owner and checkpoint", async () => {
+    const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
+    const pause = { waitId: "agent-question:turn-1:canonical:q1", stage: "writer" };
+    mocks.turn.mockResolvedValueOnce({ id: nextOwner.turnId, userId: nextOwner.userId, sessionId: nextOwner.sessionId,
+      status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: nextOwner.rootTaskId,
+      leaseOwnerId: nextOwner.turnLeaseOwnerId, leaseVersion: nextOwner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "waiting_for_user", attemptCount: 0, state: waitingState() });
+    mocks.question.mockResolvedValueOnce(canonicalQuestion(pause.waitId));
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner: nextOwner, attestation: { ...attestation, owner: nextOwner } }));
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ status: "waiting_for_user", ...pause });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a lease takeover cannot verify the persisted canonical question", async () => {
+    const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
+    mocks.turn.mockResolvedValueOnce({ id: nextOwner.turnId, userId: nextOwner.userId, sessionId: nextOwner.sessionId,
+      status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: nextOwner.rootTaskId,
+      leaseOwnerId: nextOwner.turnLeaseOwnerId, leaseVersion: nextOwner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "waiting_for_user", attemptCount: 0, state: waitingState() });
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner: nextOwner, attestation: { ...attestation, owner: nextOwner } }));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ status: "blocked", errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("rejects the old Worker lease after another Worker has taken over the Turn", async () => {
+    const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
+    mocks.turn.mockResolvedValueOnce({ id: nextOwner.turnId, userId: nextOwner.userId, sessionId: nextOwner.sessionId,
+      status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: nextOwner.rootTaskId,
+      leaseOwnerId: nextOwner.turnLeaseOwnerId, leaseVersion: nextOwner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "waiting_for_user", attemptCount: 0, state: waitingState() });
+    const { POST } = await import("./route");
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ status: "blocked", errorCode: "scheduled_pipeline_turn_stale" });
+    expect(mocks.question).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
   it("returns the exact typed wait when an answer races the route response", async () => {
     const waitState = waitingState();
     mocks.runPipeline.mockImplementationOnce(async rawInput => {
@@ -597,9 +667,8 @@ describe("scheduled pipeline continuation route", () => {
   });
 
   it.each([
-    ["unanswered", null, attestation.evidenceDigest, {}, "scheduled_pipeline_analysis_interrupted"],
     ["evidence mismatch", "keep_resume", "c".repeat(64), {}, "scheduled_pipeline_claim_conflict"],
-    ["scope-mismatched", "keep_resume", attestation.evidenceDigest, { turnId: "other-turn" }, "scheduled_pipeline_analysis_interrupted"],
+    ["scope-mismatched", "keep_resume", attestation.evidenceDigest, { turnId: "other-turn" }, "scheduled_pipeline_claim_conflict"],
   ])("rejects an %s persisted wait before claiming or resuming", async (_label, answer, evidenceDigest, itemPatch, errorCode) => {
     const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
     const prior = waitingState();
@@ -620,6 +689,24 @@ describe("scheduled pipeline continuation route", () => {
     const response = await POST(request({ owner: nextOwner, attestation }));
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ status: "blocked", errorCode });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["different root attempt", { ...fullOwner, rootAttemptCount: 1 }, "agent-question:turn-1:canonical:q1"],
+    ["different execution attempt", { ...fullOwner, executionAttemptCount: 1 }, "agent-question:turn-1:canonical:q1"],
+    ["different canonical question", fullOwner, "agent-question:turn-1:canonical:q2"],
+  ])("fails closed for a persisted wait with a %s", async (_label, priorOwner, itemQuestionId) => {
+    const prior = waitingState(priorOwner);
+    const waitId = "agent-question:turn-1:canonical:q1";
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "waiting_for_user", attemptCount: 0, state: prior });
+    mocks.question.mockResolvedValue(canonicalQuestion(waitId, null, { questionId: itemQuestionId }));
+    const { POST } = await import("./route");
+    const response = await POST(request());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ status: "blocked", errorCode: "scheduled_pipeline_claim_conflict" });
     expect(mocks.claim).not.toHaveBeenCalled();
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
