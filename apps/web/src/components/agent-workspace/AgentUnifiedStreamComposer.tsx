@@ -120,8 +120,8 @@ export function AgentUnifiedStreamComposer({
   }
 
   function addSelectedFiles(files: FileList | null) {
-    if (sessionStartLockRef.current) {
-      toast.info('Task is starting', 'Wait for the current task start to finish before adding files.')
+    if (sessionStartLockRef.current || refuseSendDuringSessionSwitch()) {
+      if (sessionStartLockRef.current) toast.info('Task is starting', 'Wait for the current task start to finish before adding files.')
       return
     }
     const next = Array.from(files ?? []).map(file => ({
@@ -239,7 +239,7 @@ export function AgentUnifiedStreamComposer({
         inputRef={inputRef} fileInputRef={fileInputRef}
         onChatInputChange={value => { if (isOrdinaryComposerInputLocked(objectiveStartInFlightRef.current, objectiveSessionSwitchPendingRef.current)) return; setChatInput(value) }}
         onAddMenuOpenChange={setAddMenuOpen} onSendChat={sendChat}
-        onRemoveAttachedFile={id => setAttachedFiles(current => current.filter(file => file.id !== id))}
+        onRemoveAttachedFile={id => { if (!objectiveSessionSwitchPendingRef.current) setAttachedFiles(current => current.filter(file => file.id !== id)) }}
         onAddSelectedFiles={addSelectedFiles}
         onAddJobContext={job => appendComposerContext(jobComposerContext(job))}
         onAddResumeContext={resume => appendComposerContext(resumeComposerContext(resume))}

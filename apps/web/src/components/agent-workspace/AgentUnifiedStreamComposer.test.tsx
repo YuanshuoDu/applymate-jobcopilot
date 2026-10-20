@@ -93,6 +93,17 @@ describe('Agent unified stream composer', () => {
     expect(streamSource).toContain('timelineRestoring={timeline.restoring}')
   })
 
+  it('rejects attachment changes while the accepted task switches Sessions', () => {
+    expect(source).toContain('if (sessionStartLockRef.current || refuseSendDuringSessionSwitch()) {')
+    expect(source).toContain('onRemoveAttachedFile={id => { if (!objectiveSessionSwitchPendingRef.current) setAttachedFiles(current => current.filter(file => file.id !== id)) }}')
+    const lockSetAt = source.indexOf('objectiveSessionSwitchPendingRef.current = true')
+    const fileGuardAt = source.indexOf('if (sessionStartLockRef.current || refuseSendDuringSessionSwitch())')
+    const removeGuardAt = source.indexOf('onRemoveAttachedFile={id => { if (!objectiveSessionSwitchPendingRef.current)')
+    expect(lockSetAt).toBeGreaterThanOrEqual(0)
+    expect(fileGuardAt).toBeGreaterThan(lockSetAt)
+    expect(removeGuardAt).toBeGreaterThan(fileGuardAt)
+  })
+
   it('locks ordinary input while objective start is in flight and through the Session switch', () => {
     expect(isOrdinaryComposerInputLocked(false, false)).toBe(false)
     expect(isOrdinaryComposerInputLocked(true, false)).toBe(true)
