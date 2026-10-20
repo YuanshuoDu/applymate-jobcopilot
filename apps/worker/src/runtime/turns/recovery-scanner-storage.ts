@@ -75,16 +75,16 @@ async function reclaimExpiredScheduledGateTurns(client: Pick<pg.PoolClient, "que
           AND root."attemptCount" > 0 AND root."interruptRequestedAt" IS NULL AND root."closedAt" IS NULL
           AND execution."status" = 'running' AND execution."checkpoint" = 'gate' AND execution."state"->>'nextStage' = 'gate'
           AND NOT (execution."state" ? 'scheduledTaskGraphWait')
-          AND CASE WHEN jsonb_typeof(markers.claim) = 'object' THEN jsonb_object_length(markers.claim) = 6 ELSE FALSE END AND markers.claim->>'schemaVersion' = 'agent-harness.v2.scheduled-pipeline-claim.v1'
+          AND CASE WHEN jsonb_typeof(markers.claim) = 'object' THEN (SELECT count(*) FROM jsonb_object_keys(markers.claim)) = 6 ELSE FALSE END AND markers.claim->>'schemaVersion' = 'agent-harness.v2.scheduled-pipeline-claim.v1'
          AND jsonb_typeof(markers.claim->'key') = 'string' AND length(markers.claim->>'key') BETWEEN 1 AND 256 AND btrim(markers.claim->>'key') = markers.claim->>'key'
          AND markers.claim->>'key' = markers.continuation->>'key' AND jsonb_typeof(markers.claim->'claimToken') = 'string'
          AND length(markers.claim->>'claimToken') BETWEEN 1 AND 256 AND btrim(markers.claim->>'claimToken') = markers.claim->>'claimToken'
           AND jsonb_typeof(markers.claim->'claimedAt') = 'string' AND markers.claim->>'claimedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$'
           AND jsonb_typeof(markers.claim->'leaseExpiresAt') = 'string' AND markers.claim->>'leaseExpiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$'
-          AND CASE WHEN jsonb_typeof(markers.claim->'owner') = 'object' THEN jsonb_object_length(markers.claim->'owner') = 9 ELSE FALSE END AND CASE WHEN jsonb_typeof(markers.continuation) = 'object' THEN jsonb_object_length(markers.continuation) = 6 ELSE FALSE END
+          AND CASE WHEN jsonb_typeof(markers.claim->'owner') = 'object' THEN (SELECT count(*) FROM jsonb_object_keys(markers.claim->'owner')) = 9 ELSE FALSE END AND CASE WHEN jsonb_typeof(markers.continuation) = 'object' THEN (SELECT count(*) FROM jsonb_object_keys(markers.continuation)) = 6 ELSE FALSE END
           AND markers.continuation->>'schemaVersion' = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
          AND jsonb_typeof(markers.continuation->'key') = 'string' AND length(markers.continuation->>'key') BETWEEN 1 AND 256 AND btrim(markers.continuation->>'key') = markers.continuation->>'key'
-         AND CASE WHEN jsonb_typeof(markers.continuation->'owner') = 'object' THEN jsonb_object_length(markers.continuation->'owner') = 9 ELSE FALSE END
+         AND CASE WHEN jsonb_typeof(markers.continuation->'owner') = 'object' THEN (SELECT count(*) FROM jsonb_object_keys(markers.continuation->'owner')) = 9 ELSE FALSE END
          AND markers.claim->'owner' = markers.continuation->'owner'
          AND markers.claim->'owner'->'userId' = to_jsonb(turn."userId") AND markers.claim->'owner'->'sessionId' = to_jsonb(turn."sessionId")
          AND markers.claim->'owner'->'turnId' = to_jsonb(turn."id") AND markers.claim->'owner'->'rootTaskId' = to_jsonb(root."id")
