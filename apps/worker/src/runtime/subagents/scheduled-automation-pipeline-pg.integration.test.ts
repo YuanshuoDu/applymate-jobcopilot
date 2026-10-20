@@ -105,7 +105,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     expect(persistedGraph.nodes.every(node => node.verificationReport?.status === "passed")).toBe(true)
 
     const owner = {
-      ...scope, rootAttemptCount: 1, turnLeaseOwnerId: value.leaseOwnerId, turnLeaseVersion: 4,
+      userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId,
+      rootAttemptCount: 1, turnLeaseOwnerId: value.leaseOwnerId, turnLeaseVersion: 4,
     }
     const bridge = createScheduledAutomationPipelineBridge({
       async load(): Promise<ScheduledAutomationPipelineBridgeState> {
@@ -435,7 +436,7 @@ async function persistToolReceipt(database: PgPool, value: Fixture, taskId: stri
       ($7, $2, $3, $4, $5, 'tool_result', 'completed', $8::jsonb, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [callItemId, value.sessionId, value.turnId, stepId, taskId, JSON.stringify(callContent), resultItemId, JSON.stringify(resultContent)])
   await persistToolEvent(database, value, taskId, callItemId, callId, toolName, "tool_call.started", {
-    taskId, toolCallId: callId, toolName,
+    taskId, toolCallId: callId, toolName, toolVersion: "1",
   })
   await persistToolEvent(database, value, taskId, callItemId, callId, toolName, "tool_call.completed", {
     taskId, toolCallId: callId, toolName, toolVersion: "1", status: "completed", errorCode: null, output,
