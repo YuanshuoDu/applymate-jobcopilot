@@ -64,7 +64,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     }, { job: { id: value.jobId, source: "fixture" } }, 2)
     await persistToolReceipt(pool!, value, value.analystTaskId, "analyst-step", "jobs.get", "analyst-read-call", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 2)
+    }, { job: { id: value.jobId, source: "fixture" } }, 3)
 
     const scope = {
       userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
@@ -229,7 +229,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     const scoutProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
       scope: scoutScope, snapshot, node: scoutNode, structuredResult: scoutResult,
     })
-    expect(scoutProof).toMatchObject({ verified: true, projection: { role: "scout", candidates: [] } })
+    expect(scoutProof, `Zero-result Scout verification failed: ${JSON.stringify(scoutProof.evaluation)}`)
+      .toMatchObject({ verified: true, projection: { role: "scout", candidates: [] } })
     expect(scoutProof.projection?.evidenceIds).toHaveLength(1)
     await persistVerification(pool!, value.scoutTaskId, scoutProof, {
       discoveryAttempt: completeDiscoverySidecar(0), toolCallCount: 1,
