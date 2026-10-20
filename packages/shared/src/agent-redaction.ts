@@ -1,6 +1,5 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { knownAgentEventPayloadFields, type AgentEventRoutingContext } from "./agent-event-routing"
-
 export type { AgentEventRoutingContext } from "./agent-event-routing"
 const SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|resume|cv|raw[_-]?(?:content|text|data)|content|value|question|answer|draft|sensitive|confirmed[_-]?answers|\bname\b)/i
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
