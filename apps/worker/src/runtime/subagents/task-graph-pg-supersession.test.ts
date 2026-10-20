@@ -1,12 +1,22 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import {
   parseTaskGraphSupersessionRelation,
+  scheduleTaskGraphSupersession,
   taskGraphSupersessionFingerprint,
   taskGraphSupersessionProposalKey,
   taskGraphWaitConditionEvidenceSql,
   type TaskGraphSupersessionRelation,
 } from "./task-graph-pg-supersession.js"
+import { TaskGraphCommandError, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
 import { taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+
+const runtimeMocks = vi.hoisted(() => ({ prepare: vi.fn() }))
+vi.mock("./steering-reconciliation-ledger.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./steering-reconciliation-ledger.js")>()
+  return { ...actual, prepareSteeringReconciliation: runtimeMocks.prepare }
+})
 
 const validRelation = {
   schemaVersion: "agent-harness.v2.task-graph-supersession.v2",
@@ -137,5 +147,94 @@ describe("taskGraphWaitConditionEvidenceSql", () => {
     expect(predicate).toContain('wait."targetTaskIds" @> jsonb_build_array(task."id")')
     expect(predicate).toContain('wait."matchedTaskIds" @> jsonb_build_array(task."id")')
     expect(predicate).not.toMatch(/status|consumedAt/i)
+  })
+})
+
+function runtimeFixture(revision = 1, replay = false) {
+  const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+    stepId: "step-1", turnLeaseOwner: "turn-owner", turnLeaseVersion: 3, parentLeaseOwner: "parent-owner", parentAttemptCount: 2 }
+  const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const, criteria: [] }
+  const sourceNode = { key: "analyst-old", templateId: "analyst", goal: "Earlier query", successCriteria: ["Find evidence"], dependsOn: [],
+    depth: 1, taskId: "source-task", verificationDisposition: "typed", verification }
+  const replacementNode = { key: "analyst-new", templateId: "analyst", goal: "Updated query", successCriteria: ["Find evidence"], dependsOn: [], verification }
+  const input: TaskGraphScheduleInput = { scope, proposal: { expectedRevision: revision, nodes: [replacementNode] },
+    templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [], constraints: [], expectedOutputSchema: {} } },
+    replaceUnstarted: { nodeKey: sourceNode.key } }
+  const operation: SteeringReconciliationOperation = { scope, decision: "revise", expectedRevision: revision,
+    callId: "supersession-call", replaceUnstartedNodeKey: sourceNode.key }
+  const source = { nodeKey: sourceNode.key, taskId: sourceNode.taskId }
+  const fingerprint = taskGraphSupersessionFingerprint(source, { expectedRevision: revision,
+    replaceUnstartedNodeKey: sourceNode.key, nodes: [replacementNode] })
+  const operationKey = `agent.plan.reconciliation:sha256:${"a".repeat(64)}`
+  const relation: TaskGraphSupersessionRelation = { schemaVersion: "agent-harness.v2.task-graph-supersession.v2", operationKey,
+    observedRevision: revision, cancellationRevision: revision + 1, resultingRevision: revision + 2, source,
+    replacement: { nodeKey: replacementNode.key, taskId: "replacement-task" },
+    cancellationEvent: { id: "cancel-event", sequence: "11" },
+    planEvent: { id: "plan-event", sequence: "12", idempotencyKey: taskGraphSupersessionProposalKey(scope.rootTaskId, revision) },
+    replacementFingerprint: fingerprint,
+    agentPlanCall: { callId: operation.callId, stepId: scope.stepId, expectedRevision: revision, replaceUnstarted: { nodeKey: sourceNode.key } } }
+  const prepared = { scope, callId: operation.callId, decision: "revise", expectedRevision: revision, resultingRevision: revision + 1,
+    steerInputIds: ["steer-1"], inputThroughSequence: 8n, idempotencyKey: operationKey,
+    receipt: { ...(replay ? { supersession: relation } : {}) } }
+  const loaded = { rootTaskId: scope.rootTaskId,
+    state: { revision, nodes: [sourceNode], appliedEvents: [] },
+    snapshot: { nodes: [sourceNode] }, item: { id: "graph-item", revision, content: {}, createdAt: new Date() }, tasks: new Map() }
+  const sourceEvidence = { id: sourceNode.taskId, status: "queued", role: "analyst", taskType: "research", constraints: [],
+    allowedActions: [], expectedOutputSchema: {}, attemptCount: 0, leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: null,
+    startedAt: null, completedAt: null, closedAt: null, interruptRequestedAt: null, failureReason: null, result: null, confidence: null,
+    qualityGateResult: null, outputArtifactIds: [], contextSnapshotId: null, hasExecutionEvidence: false, hasCanonicalDispatch: true }
+  return { input, operation, loaded, prepared, relation, sourceEvidence, sourceNode, replacementNode, operationKey, fingerprint }
+}
+
+describe("scheduleTaskGraphSupersession budget seam", () => {
+  it("returns an exact persisted replay without consulting a depleted budget", async () => {
+    const fixture = runtimeFixture(1, true)
+    runtimeMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+    const replay = { status: "duplicate" as const, revision: 3, nodes: [{ key: "analyst-new", taskId: "replacement-task", status: "queued" as const }], readyTaskIds: ["replacement-task"] }
+    const findReplay = vi.fn(async () => replay)
+    const checkBudget = vi.fn(async () => { throw new Error("budget exhausted") })
+    const client = { query: vi.fn() }
+
+    await expect(scheduleTaskGraphSupersession(client as never, fixture.input, {} as never, fixture.loaded as never,
+      fixture.operation, taskGraphSupersessionProposalKey("root-1", 1), findReplay, checkBudget)).resolves.toEqual(replay)
+
+    expect(findReplay).toHaveBeenCalledOnce()
+    expect(checkBudget).not.toHaveBeenCalled()
+    expect(client.query).not.toHaveBeenCalled()
+  })
+
+  it("runs the shared budget check after validation and before any supersession writes", async () => {
+    const fixture = runtimeFixture()
+    runtimeMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+    const query = vi.fn(async (_sql: string, _values?: readonly unknown[]) => ({ rows: [fixture.sourceEvidence], rowCount: 1 }))
+    const client = { query }
+    const refusal = new TaskGraphCommandError("task_graph_continuation_budget_required", "The Turn needs two remaining steps to supervise a TaskGraph plan")
+    const checkBudget = vi.fn(async () => { throw refusal })
+    const findReplay = vi.fn(async () => null)
+
+    await expect(scheduleTaskGraphSupersession(client as never, fixture.input,
+      { taskType: "root", role: "orchestrator", allowedActions: ["agent.plan"] }, fixture.loaded as never,
+      fixture.operation, taskGraphSupersessionProposalKey("root-1", 1), findReplay, checkBudget)).rejects.toBe(refusal)
+
+    expect(checkBudget).toHaveBeenCalledOnce()
+    expect(findReplay).toHaveBeenCalledOnce()
+    expect(query).toHaveBeenCalledOnce()
+    expect(String(query.mock.calls[0]?.[0])).toContain("FOR UPDATE OF task")
+    expect(query.mock.calls.every(([sql]) => /^\s*SELECT\b/i.test(String(sql)))).toBe(true)
+  })
+
+  it("does not run the budget check for a stale revision", async () => {
+    const fixture = runtimeFixture()
+    const staleLoaded = { ...fixture.loaded, state: { ...fixture.loaded.state, revision: 2 } }
+    runtimeMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+    const checkBudget = vi.fn(async () => undefined)
+
+    await expect(scheduleTaskGraphSupersession({ query: vi.fn() } as never, fixture.input,
+      { taskType: "root", role: "orchestrator", allowedActions: ["agent.plan"] }, staleLoaded as never,
+      fixture.operation, taskGraphSupersessionProposalKey("root-1", 1), vi.fn(async () => null), checkBudget)).rejects.toMatchObject({
+        code: "revision_mismatch",
+      })
+
+    expect(checkBudget).not.toHaveBeenCalled()
   })
 })
