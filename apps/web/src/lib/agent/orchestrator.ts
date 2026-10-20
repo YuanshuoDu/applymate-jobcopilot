@@ -1,6 +1,7 @@
 /** Thin coordinator for the legacy agent pipeline's orchestration behavior. */
 
-import { modelChat } from '@/lib/model-router'
+import { MODEL_SCHEMA_VERSION } from '@jobcopilot/agent-model'
+import { createWebModelAdapter } from '@/lib/agent-model-compat'
 import type { PipelineCtx } from './types'
 import { agentConfigPatchFrom, applyAgentConfigPatch } from './orchestrator-config'
 import {
@@ -93,7 +94,35 @@ Context:
 Write the strategy sentence now:`
 
     try {
-      const response = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 80)
+      const adapter = createWebModelAdapter(this.ctx.aiConfig)
+      if (!adapter.complete) throw new Error('The web model adapter does not support completion.')
+      const turnId = this.ctx.turnId ?? this.runId
+      const response = await adapter.complete({
+        schemaVersion: MODEL_SCHEMA_VERSION,
+        provider: adapter.profile.provider,
+        model: adapter.profile.model,
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+        tools: [],
+        capabilities: {
+          nativeTools: adapter.profile.nativeTools,
+          structuredOutput: adapter.profile.structuredOutput,
+          streaming: adapter.profile.streaming,
+          continuationCursor: adapter.profile.continuationCursor,
+        },
+        maxOutputTokens: 80,
+        signal: this.ctx.signal ?? new AbortController().signal,
+        metadata: {
+          sessionId: this.ctx.sessionId ?? this.runId,
+          turnId,
+          stepId: `${turnId}:orchestrator-plan`,
+          taskId: turnId,
+          userId: this.ctx.userId,
+          ...(this.ctx.aiConfig.usageFeatureKey !== undefined
+            ? { featureId: this.ctx.aiConfig.usageFeatureKey }
+            : {}),
+        },
+      })
+      if (typeof response.text !== 'string') throw new Error('The web model adapter returned no text.')
       const plan = extractFinalSentence(response.text.trim())
       this.history.push(`[Plan] ${plan}`)
       this.emit('orchestrator_thinking', { thinking: plan, autonomous: this.autonomous })
