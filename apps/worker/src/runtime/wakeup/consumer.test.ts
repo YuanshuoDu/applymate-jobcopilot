@@ -21,8 +21,11 @@ type FakeOptions = {
   dispatchRows?: FakeDispatchRow[]
   sessionStatus?: string
   sessionSequenceRows?: Array<string | bigint | null>
-  turn?: { userId: string; status: string; revision: number; leaseOwnerId?: string | null; leaseExpiresAt?: string | null; leaseStartedAt?: string | null } | null
-  item?: { status: string; content: unknown } | null
+  turn?: {
+    userId: string; status: string; revision: number; source?: string; executionMode?: string | null; input?: unknown
+    rootTaskId?: string | null; hasLiveLease?: boolean; leaseOwnerId?: string | null; leaseExpiresAt?: string | null; leaseStartedAt?: string | null
+  } | null
+  item?: { status: string; taskId?: string | null; content: unknown } | null
   event?: { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown } | null
   execution?: { userId: string; sessionId: string; status: string; error: string | null; completedAt: string | null } | null
   failEventOnce?: boolean
@@ -46,11 +49,14 @@ function fakePool(options: FakeOptions = {}) {
   const currentWakeup = options.payload ?? wakeup
   const rows = new Map((options.rows ?? [{ id: "outbox_1", aggregateId: currentWakeup.sessionId, payload: wakeupEnvelope(currentWakeup) }]).map((row) => [row.id, { ...row, publishedAt: row.publishedAt ?? null }]))
   const outboxUpdates: Array<{ id: string; lastError: unknown }> = []
-  let turn = options.turn === undefined ? { userId: "user_1", status: currentWakeup.waitKind === "approval" ? "waiting_for_approval" : "waiting_for_user", revision: currentWakeup.nextTurnRevision } : options.turn
+  let turn = options.turn === undefined ? {
+    userId: "user_1", status: currentWakeup.waitKind === "approval" ? "waiting_for_approval" : "waiting_for_user",
+    revision: currentWakeup.nextTurnRevision, source: "user", executionMode: "canonical_task_graph", input: {}, rootTaskId: null, hasLiveLease: false,
+  } : options.turn
   const item = options.item === undefined
     ? currentWakeup.waitKind === "approval"
-      ? { status: "completed", content: { waitKind: "approval", approvalId: "a1", toolCallId: "call_approval" } }
-      : { status: "completed", content: { waitKind: "question", questionId: "q1", toolCallId: "call_1", answer: "secret-answer" } }
+      ? { status: "completed", taskId: null, content: { waitKind: "approval", approvalId: "a1", toolCallId: "call_approval" } }
+      : { status: "completed", taskId: null, content: { waitKind: "question", questionId: "q1", toolCallId: "call_1", answer: "secret-answer" } }
     : options.item
   const event = options.event === undefined ? { sessionId: currentWakeup.sessionId, turnId: currentWakeup.turnId, itemId: currentWakeup.itemId, type: "turn.wakeup", payload: wakeupEnvelope(currentWakeup).payload } : options.event
   const execution = options.execution === undefined ? { userId: "user_1", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "old error", completedAt: "old completion" } : options.execution
@@ -105,7 +111,7 @@ function fakePool(options: FakeOptions = {}) {
       if (sql.includes('SELECT turn."id"') && sql.includes('FROM "agent_turns"')) return { rows: turn ? [{ id: currentWakeup.turnId }] : [], rowCount: turn ? 1 : 0 }
       if (sql.includes('SELECT turn."userId"')) return { rows: turn ? [turn] : [], rowCount: turn ? 1 : 0 }
       if (sql.includes('SELECT set_config')) return { rows: [], rowCount: 1 }
-      if (sql.includes('SELECT "status", "content"')) return { rows: item ? [item] : [], rowCount: item ? 1 : 0 }
+      if (sql.includes('SELECT "status", "taskId", "content"')) return { rows: item ? [item] : [], rowCount: item ? 1 : 0 }
       if (sql.includes('UPDATE "agent_sessions"')) {
         const configured = options.sessionSequenceRows?.[sessionSequenceCall++]
         const eventSequence = configured === undefined ? "10" : configured
@@ -127,7 +133,7 @@ function fakePool(options: FakeOptions = {}) {
       }
       if (sql.includes('UPDATE "agent_turns"')) {
         const rowCount = options.turnUpdateRows ?? 1
-        if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'")) turn = turn ? { ...turn, status: "queued", revision: turn.revision + 1, leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null } : turn
+        if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'")) turn = turn ? { ...turn, status: "queued", revision: turn.revision + 1, hasLiveLease: false, leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null } : turn
         return { rows: [], rowCount }
       }
       if (sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch") {
@@ -158,7 +164,10 @@ function fakePool(options: FakeOptions = {}) {
     release: vi.fn(),
   }
   const pool = { connect: vi.fn(async () => client) } as unknown as pg.Pool
-  return { pool, client, calls, outboxUpdates, rows, dispatchRows: () => dispatchRows, execution, get turn() { return turn } }
+  return {
+    pool, client, calls, outboxUpdates, rows, dispatchRows: () => dispatchRows, execution,
+    get turn() { return turn }, setLiveLease(hasLiveLease: boolean) { if (turn) turn = { ...turn, hasLiveLease } },
+  }
 }
 
 function hasCall(calls: Array<[string, unknown[] | undefined]>, fragment: string): boolean {
@@ -268,6 +277,102 @@ describe("Agent wakeup consumer", () => {
     expect(pendingSelect?.[0]).toContain('LIMIT $2 FOR UPDATE SKIP LOCKED')
     expect(pendingSelect?.[0]).not.toContain('FOR UPDATE SKIP LOCKED LIMIT')
     expect(fake.calls.some(([sql]) => sql === "COMMIT")).toBe(true)
+  })
+
+  it("defers an exact scheduled continuation answer until its live root lease is released", async () => {
+    const fake = fakePool({
+      rows: [
+        { id: "scheduled_answer_1", aggregateId: wakeup.sessionId, payload: wakeupEnvelope() },
+        { id: "scheduled_answer_2", aggregateId: wakeup.sessionId, payload: wakeupEnvelope() },
+      ],
+      turn: {
+        userId: "user_1", status: "waiting_for_user", revision: wakeup.nextTurnRevision,
+        source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled" },
+        rootTaskId: "root_1", hasLiveLease: true,
+      },
+      item: {
+        status: "completed", taskId: null,
+        content: { waitKind: "question", questionId: wakeup.waitId, toolCallId: wakeup.toolCallId, answer: "continue", answerAvailable: true },
+      },
+    })
+
+    await expect(drainAgentWakeups(fake.pool, 2)).resolves.toBe(0)
+    expect(fake.outboxUpdates).toEqual([])
+    expect(fake.rows.get("scheduled_answer_1")?.publishedAt).toBeNull()
+    expect(fake.rows.get("scheduled_answer_2")?.publishedAt).toBeNull()
+    expect(fake.calls.filter(([sql]) => sql.includes('SELECT turn."userId"'))).toHaveLength(1)
+    expect(fake.dispatchRows()).toHaveLength(0)
+
+    fake.setLiveLease(false)
+    await expect(drainAgentWakeups(fake.pool, 2)).resolves.toBe(2)
+    expect(fake.outboxUpdates).toEqual([
+      { id: "scheduled_answer_1", lastError: null },
+      { id: "scheduled_answer_2", lastError: null },
+    ])
+    expect(fake.calls.filter(([sql]) => sql.includes('UPDATE "agent_turns"') && sql.includes("SET \"status\" = 'queued'")).length).toBe(1)
+    expect(fake.dispatchRows()).toHaveLength(1)
+  })
+
+  it("does not defer a scheduled continuation question attached to a child task", async () => {
+    const fake = fakePool({
+      turn: {
+        userId: "user_1", status: "waiting_for_user", revision: wakeup.nextTurnRevision,
+        source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled" },
+        rootTaskId: "root_1", hasLiveLease: true,
+      },
+      item: {
+        status: "completed", taskId: "child_1",
+        content: { waitKind: "question", questionId: wakeup.waitId, toolCallId: wakeup.toolCallId, answer: "continue", answerAvailable: true },
+      },
+    })
+
+    await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(1)
+    expect(fake.outboxUpdates).toEqual([{ id: "outbox_1", lastError: null }])
+    expect(fake.dispatchRows()).toHaveLength(1)
+  })
+
+  it("keeps a live approval wakeup on the ordinary resume path", async () => {
+    const fake = fakePool({
+      payload: approvalWakeup,
+      turn: {
+        userId: "user_1", status: "waiting_for_approval", revision: approvalWakeup.nextTurnRevision,
+        source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled" },
+        rootTaskId: "root_1", hasLiveLease: true,
+      },
+      item: { status: "completed", taskId: "root_1", content: { waitKind: "approval", approvalId: "a1", toolCallId: "call_approval" } },
+    })
+
+    await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(1)
+    expect(fake.outboxUpdates).toEqual([{ id: "outbox_1", lastError: null }])
+    expect(fake.dispatchRows()).toHaveLength(1)
+  })
+
+  it("keeps a live ordinary question wakeup on the ordinary resume path", async () => {
+    const fake = fakePool({
+      turn: { userId: "user_1", status: "waiting_for_user", revision: wakeup.nextTurnRevision, hasLiveLease: true },
+    })
+
+    await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(1)
+    expect(fake.outboxUpdates).toEqual([{ id: "outbox_1", lastError: null }])
+    expect(fake.dispatchRows()).toHaveLength(1)
+  })
+
+  it("terminalizes stale revisions for an otherwise exact scheduled continuation answer", async () => {
+    const fake = fakePool({
+      turn: {
+        userId: "user_1", status: "waiting_for_user", revision: wakeup.nextTurnRevision + 1,
+        source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled" },
+        rootTaskId: "root_1", hasLiveLease: true,
+      },
+      item: {
+        status: "completed", taskId: "root_1",
+        content: { waitKind: "question", questionId: wakeup.waitId, toolCallId: wakeup.toolCallId, answer: "continue", answerAvailable: true },
+      },
+    })
+
+    await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(1)
+    expect(fake.outboxUpdates).toEqual([{ id: "outbox_1", lastError: "turn_revision_conflict" }])
+    expect(fake.dispatchRows()).toHaveLength(0)
   })
 
   it.each(["aborted", "archived"])("ignores a %s session before touching its Turn", async (sessionStatus) => {

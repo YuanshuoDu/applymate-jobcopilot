@@ -1,10 +1,10 @@
+import { randomUUID } from "node:crypto"
 import type { Prisma } from "@prisma/client"
 import { redactAgentEvent } from "@jobcopilot/shared"
-import { randomUUID } from "node:crypto"
 import { db } from "@/lib/db"
 
 import { AgentExecutionCancelledError } from "../execution-control"
-import { clientReceipt, issueLegacyReceipt } from "../approval/legacy-receipt"
+import { clientReceipt, hashLegacyValue, issueLegacyReceipt } from "../approval/legacy-receipt"
 import type { ApplicationPackage, PipelineCtx } from "../types"
 
 const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
@@ -36,6 +36,35 @@ export async function createGateReviewReceipt(
     jobId: pkg.job.id,
     ...(artifactBindings.length ? { artifactBindings } : {}),
   }
+  const reviewedMaterial = {
+    job: {
+      id: pkg.job.id,
+      company: pkg.job.company,
+      role: pkg.job.role,
+      location: pkg.job.location,
+      url: pkg.job.url,
+      description: pkg.job.description,
+      salary: pkg.job.salary,
+    },
+    match: {
+      score: pkg.score,
+      matchedKeywords: pkg.matchedKeywords,
+      missingKeywords: pkg.missingKeywords,
+      recommendation: pkg.recommendation,
+    },
+    resume: {
+      id: pkg.tailoredResumeId ?? ctx.defaultResume.id,
+      name: pkg.tailoredResumeName ?? ctx.defaultResume.name,
+      artifact: pkg.tailoredResumeArtifact ?? null,
+      sourceContentHash: await hashLegacyValue("reviewed-resume-content", ctx.resumeContent),
+    },
+    coverLetter: {
+      id: pkg.coverLetterId ?? null,
+      content: pkg.coverLetter ?? null,
+      artifact: pkg.coverLetterArtifact ?? null,
+    },
+    artifactReviews: pkg.artifactReviews ?? [],
+  }
   const projectedWait = !projectedWaitAlreadyIssued && currentTurn.status !== "waiting_for_approval"
   const result = await issueLegacyReceipt(db, {
     userId: ctx.userId,
@@ -45,14 +74,20 @@ export async function createGateReviewReceipt(
     jobId: pkg.job.id,
     action: "review_application",
     title: `Review application: ${pkg.job.company} · ${pkg.job.role}`,
-    body: "Review the job, tailored materials, and every proposed answer. Approval here only unlocks the form-fill pass; it never submits by itself.",
+    body: "Review the job and prepared materials. Approval here only unlocks form-fill; it never submits by itself.",
     impact: { externalSubmission: false, jobId: pkg.job.id },
     payload: basePayload,
     resource: { jobId: pkg.job.id },
-    material: basePayload,
+    material: reviewedMaterial,
+    // Gate runs before form-fill, so no proposed form answers exist to bind yet.
+    answers: null,
     revision: currentTurn.revision,
     projectWait: projectedWait,
     executionAttempt: ctx.executionAttempt,
+    ...(ctx.scheduledTaskGraphOwnerFence ? {
+      scheduledOwnerFence: ctx.scheduledTaskGraphOwnerFence,
+      replayMode: "gate-review",
+    } : {}),
     signal: ctx.signal,
     prepareInTransaction: async tx => {
       if (ctx.signal?.aborted) throw new AgentExecutionCancelledError()
@@ -112,7 +147,7 @@ export async function createGateReviewReceipt(
       if (ctx.signal?.aborted) throw new AgentExecutionCancelledError()
 
       const payload = { ...basePayload, applicationTaskId: task.id }
-      return { taskId: task.id, payload, material: payload }
+      return { taskId: task.id, payload, material: reviewedMaterial }
     },
   })
   return {

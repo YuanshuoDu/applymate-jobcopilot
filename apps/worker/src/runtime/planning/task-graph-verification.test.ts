@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   evaluateTaskGraphVerification,
+  evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery,
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
   TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
   validateTaskGraphVerificationContract,
@@ -271,6 +272,101 @@ describe("TaskGraph durable evidence verification", () => {
         { criterionId: "minimum-findings", status: "failed", reasonCode: "criterion_not_met" },
         { criterionId: "in-scout", status: "passed", reasonCode: "criteria_met" },
       ],
+    })
+  })
+
+  it("unlocks only zero-result cardinality checks from a verified complete-discovery digest", () => {
+    const digest = "a".repeat(64)
+    const scoutProjection: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+      role: "scout", candidates: [], evidenceIds: [`read:source:jobs.discover:${digest}`],
+      emptyDiscoveryReceipt: { digest },
+    }
+    const scoutContract = validatedContract("scout", [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+      { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+      { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
+      { id: "evidence-count-two", check: { kind: "evidence_count_gte", minimum: 2 } },
+    ])
+
+    expect(evaluateTaskGraphVerification(scoutContract, scoutProjection)).toMatchObject({ status: "failed", criteria: expect.arrayContaining([
+      { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+    ]) })
+    expect(evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery(scoutContract, scoutProjection, undefined, digest)).toEqual({
+      status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "candidate-evidence", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "evidence-count", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "evidence-count-two", status: "failed", reasonCode: "criterion_not_met" },
+      ],
+    })
+  })
+
+  it("allows empty Analyst dependency coverage only for the matching verified Scout receipt", () => {
+    const digest = "b".repeat(64)
+    const source: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+      role: "scout", candidates: [], evidenceIds: [`read:source:jobs.discover:${digest}`],
+      emptyDiscoveryReceipt: { digest },
+    }
+    const analyst: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+      role: "analyst", findings: [], evidenceIds: [], emptyDiscoveryReceipt: { digest },
+    }
+    const typed = validatedContract("analyst", [
+      { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+      { id: "finding-evidence", check: { kind: "all_findings_have_evidence", minimumItems: 1 } },
+      { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } },
+      { id: "scout-coverage", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-source", minimumPercent: 75 } },
+      { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
+      { id: "evidence-count-two", check: { kind: "evidence_count_gte", minimum: 2 } },
+      { id: "reported-score", check: { kind: "reported_score_gte", minimumScore: 7, minimumFindings: 1, aggregation: "all" } },
+    ])
+    const dependencies: TaskGraphVerificationDependencyEvidence = new Map([["scout-source", source]])
+
+    expect(evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery(typed, analyst, dependencies, digest)).toEqual({
+      status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "finding-evidence", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "scout-membership", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "scout-coverage", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "evidence-count", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "evidence-count-two", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "reported-score", status: "passed", reasonCode: "criteria_met" },
+      ],
+    })
+    expect(evaluateTaskGraphVerification(typed, analyst, dependencies)).toMatchObject({
+      status: "failed", criteria: expect.arrayContaining([
+        { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "reported-score", status: "failed", reasonCode: "criterion_not_met" },
+      ]),
+    })
+    expect(evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery(typed, analyst, dependencies, "c".repeat(64)))
+      .toMatchObject({ status: "failed", criteria: expect.arrayContaining([
+        { criterionId: "scout-membership", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "scout-coverage", status: "failed", reasonCode: "criterion_not_met" },
+      ]) })
+
+    const nonEmptyScout: TaskGraphVerificationEvidenceProjection = projectionForScout(["job-1"])
+    const noFindingAnalyst: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: [],
+      evidenceIds: [canonicalEvidence("job", "job-1")],
+    }
+    const nonEmptyDependencies: TaskGraphVerificationDependencyEvidence = new Map([["scout-source", nonEmptyScout]])
+    const membershipOnly = validatedContract("analyst", [
+      { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } },
+    ])
+    expect(evaluateTaskGraphVerification(membershipOnly, noFindingAnalyst, nonEmptyDependencies)).toEqual({
+      status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "scout-membership", status: "passed", reasonCode: "criteria_met" }],
+    })
+    expect(evaluateTaskGraphVerification(typed, noFindingAnalyst, nonEmptyDependencies)).toMatchObject({
+      status: "failed", criteria: expect.arrayContaining([
+        { criterionId: "scout-membership", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "scout-coverage", status: "failed", reasonCode: "criterion_not_met" },
+      ]),
     })
   })
 

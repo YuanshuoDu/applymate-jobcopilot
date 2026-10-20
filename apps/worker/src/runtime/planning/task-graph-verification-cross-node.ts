@@ -15,13 +15,14 @@ export const TASK_GRAPH_VERIFICATION_LIMITS = Object.freeze({
 
 export type TaskGraphVerificationCandidateProjection = Readonly<{ jobId: string; evidenceIds: readonly string[] }>
 export type TaskGraphVerificationFindingProjection = Readonly<{ jobId: string; score: number; evidenceIds: readonly string[] }>
+export type TaskGraphEmptyDiscoveryReceiptProjection = Readonly<{ digest: string }>
 export type TaskGraphVerificationEvidenceProjection =
-  | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION; role: "scout"; candidates: readonly TaskGraphVerificationCandidateProjection[]; evidenceIds: readonly string[] }>
-  | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION; role: "analyst"; findings: readonly TaskGraphVerificationFindingProjection[]; evidenceIds: readonly string[] }>
+  | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION; role: "scout"; candidates: readonly TaskGraphVerificationCandidateProjection[]; evidenceIds: readonly string[]; emptyDiscoveryReceipt?: TaskGraphEmptyDiscoveryReceiptProjection }>
+  | Readonly<{ schemaVersion: typeof TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION; role: "analyst"; findings: readonly TaskGraphVerificationFindingProjection[]; evidenceIds: readonly string[]; emptyDiscoveryReceipt?: TaskGraphEmptyDiscoveryReceiptProjection }>
 export type TaskGraphVerificationDependencyEvidence = ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>
 
 type ParsedItem = Readonly<{ jobId: string; evidenceIds: readonly string[]; score?: number }>
-export type TaskGraphVerificationParsedProjection = Readonly<{ role: TaskGraphVerificationRole; items: readonly ParsedItem[]; evidenceIds: readonly string[] }>
+export type TaskGraphVerificationParsedProjection = Readonly<{ role: TaskGraphVerificationRole; items: readonly ParsedItem[]; evidenceIds: readonly string[]; emptyDiscoveryDigest?: string }>
 export type TaskGraphVerificationProjectionParse =
   | Readonly<{ ok: true; value: TaskGraphVerificationParsedProjection }>
   | Readonly<{ ok: false; reasonCode: Exclude<import("./task-graph-verification.js").TaskGraphVerificationReasonCode, "criteria_met" | "criterion_not_met" | "reported_score_below_minimum" | "contract_invalid"> }>
@@ -79,16 +80,31 @@ export function parseTaskGraphVerificationEvidenceProjection(value: unknown): Ta
     if (descriptor && "value" in descriptor && (descriptor.value === "scout" || descriptor.value === "analyst")) role = descriptor.value
   } catch { /* Malformed projections are unverified. */ }
   if (!role) return { ok: false, reasonCode: "projection_invalid" }
-  const keys = role === "scout" ? "candidates,evidenceIds,role,schemaVersion" : "evidenceIds,findings,role,schemaVersion"
+  let hasEmptyDiscoveryReceipt = false
+  try { hasEmptyDiscoveryReceipt = Object.hasOwn(value as object, "emptyDiscoveryReceipt") } catch { return { ok: false, reasonCode: "projection_invalid" } }
+  const keys = role === "scout"
+    ? hasEmptyDiscoveryReceipt ? "candidates,emptyDiscoveryReceipt,evidenceIds,role,schemaVersion" : "candidates,evidenceIds,role,schemaVersion"
+    : hasEmptyDiscoveryReceipt ? "emptyDiscoveryReceipt,evidenceIds,findings,role,schemaVersion" : "evidenceIds,findings,role,schemaVersion"
   const row = exactRecord(value, keys)
   if (!row || row.schemaVersion !== TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION || row.role !== role) return { ok: false, reasonCode: "projection_invalid" }
-  const ids = denseList(row.evidenceIds, TASK_GRAPH_VERIFICATION_LIMITS.maxItems, false)
+  let emptyDiscoveryDigest: string | undefined
+  if (hasEmptyDiscoveryReceipt) {
+    const receipt = exactRecord(row.emptyDiscoveryReceipt, "digest")
+    if (!receipt || typeof receipt.digest !== "string" || !/^[a-f0-9]{64}$/.test(receipt.digest)) return { ok: false, reasonCode: "canonical_evidence_invalid" }
+    emptyDiscoveryDigest = receipt.digest
+  }
+  const ids = denseList(row.evidenceIds, TASK_GRAPH_VERIFICATION_LIMITS.maxItems, hasEmptyDiscoveryReceipt && role === "analyst")
   if (!ids) return { ok: false, reasonCode: Array.isArray(row.evidenceIds) && row.evidenceIds.length === 0 ? "canonical_evidence_missing" : "canonical_evidence_invalid" }
-  if (ids.some(id => !canonicalReadEvidenceId(id))) return { ok: false, reasonCode: "canonical_evidence_invalid" }
   const evidenceIds = ids as string[], canonicalIds = new Set(evidenceIds)
   if (canonicalIds.size !== evidenceIds.length) return { ok: false, reasonCode: "canonical_evidence_ambiguous" }
   const rows = denseList(role === "scout" ? row.candidates : row.findings, TASK_GRAPH_VERIFICATION_LIMITS.maxItems, true)
   if (!rows) return { ok: false, reasonCode: "result_invalid" }
+  if (hasEmptyDiscoveryReceipt) {
+    const canonicalMarker = `read:source:jobs.discover:${emptyDiscoveryDigest}`
+    if (rows.length !== 0 || (role === "scout"
+      ? evidenceIds.length !== 1 || evidenceIds[0] !== canonicalMarker
+      : evidenceIds.length !== 0)) return { ok: false, reasonCode: "canonical_evidence_invalid" }
+  } else if (evidenceIds.some(id => !canonicalReadEvidenceId(id))) return { ok: false, reasonCode: "canonical_evidence_invalid" }
   const seenJobs = new Set<string>(), items: ParsedItem[] = []
   for (const valueItem of rows) {
     const item = role === "scout" ? exactRecord(valueItem, "evidenceIds,jobId") : exactRecord(valueItem, "evidenceIds,jobId,score")
@@ -101,7 +117,7 @@ export function parseTaskGraphVerificationEvidenceProjection(value: unknown): Ta
     if (refs.some(ref => !canonicalIds.has(ref)) || !refs.includes("read:job:" + item.jobId)) return { ok: false, reasonCode: "result_evidence_unbound" }
     items.push({ jobId: item.jobId, evidenceIds: refs, ...(role === "analyst" ? { score: item.score as number } : {}) })
   }
-  return { ok: true, value: { role, items, evidenceIds } }
+  return { ok: true, value: { role, items, evidenceIds, ...(emptyDiscoveryDigest ? { emptyDiscoveryDigest } : {}) } }
 }
 
 export function parseFindingsFromScoutDependencyCheck(
@@ -158,18 +174,27 @@ export function evaluateFindingsFromScoutDependency(
   dependencyNodeKey: string,
   findingJobIds: readonly string[],
   dependencies: ReadonlyMap<string, TaskGraphVerificationParsedProjection>,
+  verifiedEmptyDiscoveryDigest?: string,
 ): "passed" | "criterion_not_met" {
   const source = dependencies.get(dependencyNodeKey)
   if (!source || source.role !== "scout") return "criterion_not_met"
+  if (findingJobIds.length === 0) {
+    if (source.items.length > 0) return "passed"
+    return verifiedEmptyDiscoveryDigest !== undefined
+      && source.emptyDiscoveryDigest === verifiedEmptyDiscoveryDigest ? "passed" : "criterion_not_met"
+  }
   const candidateIds = new Set(source.items.map(item => item.jobId))
   return findingJobIds.every(jobId => candidateIds.has(jobId)) ? "passed" : "criterion_not_met"
 }
 
 export function evaluateFindingsCoverScoutCandidates(
   dependencyNodeKey: string, findingJobIds: readonly string[], dependencies: ReadonlyMap<string, TaskGraphVerificationParsedProjection>, minimumPercent: number,
+  verifiedEmptyDiscoveryDigest?: string,
 ): "passed" | "criterion_not_met" {
   const source = dependencies.get(dependencyNodeKey), candidateIds = source?.items.map(item => item.jobId) ?? []
   const candidates = new Set(candidateIds), findings = new Set(findingJobIds)
+  if (source?.role === "scout" && candidateIds.length === 0 && findingJobIds.length === 0) return verifiedEmptyDiscoveryDigest !== undefined
+    && source.emptyDiscoveryDigest === verifiedEmptyDiscoveryDigest ? "passed" : "criterion_not_met"
   if (source?.role !== "scout" || !candidateIds.length || candidates.size !== candidateIds.length
     || findings.size !== findingJobIds.length || !Number.isSafeInteger(minimumPercent) || minimumPercent < 1 || minimumPercent > 100
     || findingJobIds.some(jobId => !candidates.has(jobId))) return "criterion_not_met"

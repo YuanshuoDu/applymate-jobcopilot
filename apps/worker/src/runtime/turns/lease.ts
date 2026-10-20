@@ -196,7 +196,7 @@ export async function releaseTurnLease(
     const result = await client.query(
       `UPDATE "agent_turns"
        SET "status" = $5, "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
-           "leaseStartedAt" = NULL, "revision" = "revision" + 1,
+           "leaseStartedAt" = NULL, "revision" = "revision" + CASE WHEN "status" = $5 THEN 0 ELSE 1 END,
            "completedAt" = CASE WHEN $5 IN ('interrupted', 'failed', 'completed') THEN $6 ELSE NULL END,
            "updatedAt" = $6
        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwnerId" = $3

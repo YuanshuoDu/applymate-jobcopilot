@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { executionId, executionKey, type TurnExecutionIdentity } from "./turn-execution-types.js"
+import { executionId, executionKey, parseScheduledPipelineCompletionDisposition, type TurnExecutionIdentity } from "./turn-execution-types.js"
 
 const root: TurnExecutionIdentity = {
   kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
@@ -22,5 +22,36 @@ describe("turn execution identity helpers", () => {
   it("keeps root and child generated identities disjoint in one turn", () => {
     expect(executionId(root, "step:0")).not.toBe(executionId(child, "step:0"))
     expect(executionId(root, "event:turn-started")).toBe("turn:turn-1:event:turn-started")
+  })
+})
+
+describe("scheduled pipeline completion disposition", () => {
+  it("preserves the exact staged candidate and durable wait receipt", () => {
+    const candidateText = "  Exact candidate with its spacing.  "
+    expect(parseScheduledPipelineCompletionDisposition({ status: "completed", candidateText }))
+      .toEqual({ status: "completed", candidateText })
+    expect(parseScheduledPipelineCompletionDisposition({ status: "waiting_for_user", waitId: "question-123", candidateText }))
+      .toEqual({ status: "waiting_for_user", waitId: "question-123", candidateText })
+    expect(parseScheduledPipelineCompletionDisposition({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" }))
+      .toEqual({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" })
+  })
+
+  it.each([
+    null,
+    { status: "blocked", candidateText: "candidate" },
+    { status: "completed", candidateText: " " },
+    { status: "completed", candidateText: "candidate", waitId: "question-123" },
+    { status: "waiting_for_user", waitId: " question-123", candidateText: "candidate" },
+    { status: "waiting_for_user", waitId: "question-123", candidateText: "candidate", errorCode: "ignored" },
+    { status: "blocked", errorCode: "Not safe" },
+  ])("rejects malformed or non-durable scheduled dispositions", value => {
+    expect(parseScheduledPipelineCompletionDisposition(value)).toBeNull()
+  })
+
+  it("rejects accessors and symbol properties instead of evaluating or ignoring them", () => {
+    const accessor = Object.defineProperty({ status: "completed" }, "candidateText", { enumerable: true, get: () => "candidate" })
+    const symbol = { status: "completed", candidateText: "candidate", [Symbol("extra")]: true }
+    expect(parseScheduledPipelineCompletionDisposition(accessor)).toBeNull()
+    expect(parseScheduledPipelineCompletionDisposition(symbol)).toBeNull()
   })
 })

@@ -170,6 +170,12 @@ describe('runGate', () => {
 
     expect(mocks.createGateReviewReceipt).toHaveBeenCalledWith(ctx, expect.objectContaining({ job: expect.objectContaining({ id: 'job_1' }) }), false)
     expect(ctx.emit).toHaveBeenCalledWith('application_review_ready', { approval: { id: 'approval_1' } })
+    expect(ctx.emit).toHaveBeenCalledWith('agent_question', expect.objectContaining({
+      questionId: 'application_review_job_1',
+      question: expect.stringContaining('The job and prepared materials are ready for review.'),
+    }))
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_question', expect.objectContaining({ question: expect.stringContaining('cover letter') }))
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_question', expect.objectContaining({ question: expect.stringContaining('answers') }))
   })
 
   it('emits no review wait or approval-ready event when Stop wins the receipt fence', async () => {

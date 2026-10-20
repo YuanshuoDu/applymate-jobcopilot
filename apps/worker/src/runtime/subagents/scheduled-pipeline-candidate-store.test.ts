@@ -1,0 +1,114 @@
+import { describe, expect, it, vi } from "vitest"
+import type pg from "pg"
+import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import type { TurnEngineStore } from "../turns/turn-engine-types.js"
+import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT } from "./scheduled-pipeline-candidate-store.js"
+
+const oldOwner: TurnExecutionOwnerFence = {
+  kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
+  ownerId: "worker-old", leaseVersion: 8, leaseExpiresAt: new Date("2026-10-20T12:00:00.000Z"),
+}
+const newOwner: TurnExecutionOwnerFence = { ...oldOwner, ownerId: "worker-recovered", leaseVersion: 9,
+  leaseExpiresAt: new Date("2026-10-20T12:05:00.000Z") }
+const identity = { owner: oldOwner, rootAttemptCount: 2, finalStepId: "step-final-4", finalStepOrdinal: 4 }
+
+function candidateEvent(owner = oldOwner, overrides: Record<string, unknown> = {}) {
+  const payload = { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v1", sessionId: owner.sessionId,
+    turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: 2,
+    finalStepId: "step-final-4", finalStepOrdinal: 4, stepAttempt: 1, candidateText: "Exact final answer.",
+    ...overrides }
+  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
+    type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: "step-final-4", payload, stepId: "step-final-4",
+    stepTaskId: owner.rootTaskId, stepAttempt: 1, stepOrdinal: 4, stepStatus: "streaming", stepInputThroughSequence: "10" }
+}
+
+function poolFor(event: Record<string, unknown> | null, options: { rootAttempt?: number; latestStep?: Record<string, unknown>; unconsumedInput?: boolean } = {}) {
+  const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+  const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+    calls.push({ sql, values })
+    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+    if (sql.includes('SELECT turn."id" FROM "agent_turns"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
+    if (sql.includes('SELECT task."attemptCount"')) return { rows: [{ attemptCount: options.rootAttempt ?? 2 }], rowCount: 1 }
+    if (sql.includes('FROM "agent_events" AS event')) return { rows: event ? [event] : [], rowCount: event ? 1 : 0 }
+    if (sql.includes('SELECT "id", "ordinal", "attempt" FROM "agent_steps"')) return { rows: [options.latestStep ?? { id: "step-final-4", ordinal: 4, attempt: 1 }], rowCount: 1 }
+    if (sql.includes('FROM "agent_inputs"')) return { rows: options.unconsumedInput ? [{ id: "input-1" }] : [], rowCount: options.unconsumedInput ? 1 : 0 }
+    return { rows: [], rowCount: 0 }
+  }), release: vi.fn() }
+  return { pool: { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">, calls, client }
+}
+
+describe("scheduled pipeline durable candidate", () => {
+  it("stages exact text under the live lease and recovers it after lease rollover", async () => {
+    const appended: Array<Record<string, unknown>> = []
+    const accepted = new Map<string, Parameters<TurnEngineStore["appendEvent"]>[0]>()
+    const eventStore = { appendEvent: vi.fn(async (input: Parameters<TurnEngineStore["appendEvent"]>[0]) => {
+      appended.push(input as unknown as Record<string, unknown>)
+      const existing = accepted.get(input.idempotencyKey)
+      if (existing && (existing.owner.userId !== input.owner.userId || existing.owner.sessionId !== input.owner.sessionId
+        || existing.owner.turnId !== input.owner.turnId || existing.owner.taskId !== input.owner.taskId
+        || existing.type !== input.type || existing.itemId !== input.itemId || existing.correlationId !== input.correlationId
+        || existing.causationId !== input.causationId || JSON.stringify(existing.payload) !== JSON.stringify(input.payload))) {
+        throw new Error(`event ${input.idempotencyKey} identity`)
+      }
+      if (!existing) accepted.set(input.idempotencyKey, input)
+      return { id: "event-1" }
+    }) } as unknown as Pick<TurnEngineStore, "appendEvent">
+    const fixture = poolFor(candidateEvent())
+    const store = createScheduledPipelineCandidateStore(fixture.pool, eventStore)
+    await store.stage({ ...identity, candidateText: "Exact final answer." })
+    await store.stage({ ...identity, owner: newOwner, candidateText: "Exact final answer." })
+
+    const staged = appended[0]!
+    expect(staged).toMatchObject({ owner: oldOwner, type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: "step-final-4",
+      idempotencyKey: "scheduled-candidate:root-1:2:step-final-4",
+      payload: { rootAttemptCount: 2, finalStepId: "step-final-4", finalStepOrdinal: 4, stepAttempt: 1,
+        candidateText: "Exact final answer." } })
+    expect(appended).toHaveLength(2)
+    expect(appended[1]).toMatchObject({ owner: newOwner, idempotencyKey: staged.idempotencyKey, payload: staged.payload })
+    expect((staged.payload as Record<string, unknown>).writerLeaseOwnerId).toBeUndefined()
+    expect((staged.payload as Record<string, unknown>).writerLeaseVersion).toBeUndefined()
+    expect(accepted).toHaveProperty("size", 1)
+
+    await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toBe("Exact final answer.")
+    const turnLock = fixture.calls.find(call => call.sql.includes('SELECT turn."id" FROM "agent_turns"'))
+    expect(turnLock?.values).toContain("worker-recovered")
+    expect(turnLock?.values).toContain(9)
+    expect(fixture.calls.some(call => call.sql.includes('FROM "agent_events"') && call.sql.includes('JOIN "agent_steps"'))).toBe(true)
+  })
+
+  it("rejects a candidate written for a different root attempt", async () => {
+    const fixture = poolFor(candidateEvent(), { rootAttempt: 3 })
+    const store = createScheduledPipelineCandidateStore(fixture.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_root_attempt_changed")
+  })
+
+  it("rejects a candidate from a different root or Worker step attempt", async () => {
+    const event = candidateEvent(newOwner, { rootTaskId: "root-stale" })
+    const fixture = poolFor({ ...event, taskId: "root-stale" })
+    const store = createScheduledPipelineCandidateStore(fixture.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_identity_mismatch")
+
+    const wrongAttempt = poolFor({ ...candidateEvent(newOwner), stepAttempt: 2 })
+    const second = createScheduledPipelineCandidateStore(wrongAttempt.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(second.read({ owner: newOwner, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_step_mismatch")
+  })
+
+  it("does not require a staged candidate before the first Turn", async () => {
+    const fixture = poolFor(null)
+    const store = createScheduledPipelineCandidateStore(fixture.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toBeUndefined()
+    expect(fixture.calls.some(call => call.sql.includes('FROM "agent_steps"'))).toBe(false)
+  })
+
+  it("marks a staged candidate invalid after a later root step or new unconsumed input", async () => {
+    const laterStep = poolFor(candidateEvent(newOwner), { latestStep: { id: "step-after-final", ordinal: 5, attempt: 1 } })
+    const first = createScheduledPipelineCandidateStore(laterStep.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(first.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toBeNull()
+
+    const pendingInput = poolFor(candidateEvent(newOwner), { unconsumedInput: true })
+    const second = createScheduledPipelineCandidateStore(pendingInput.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(second.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toBeNull()
+    expect(pendingInput.calls.find(call => call.sql.includes('FROM "agent_inputs"'))?.values).toContain("10")
+  })
+})

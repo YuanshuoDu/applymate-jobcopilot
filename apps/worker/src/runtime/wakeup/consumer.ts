@@ -58,8 +58,13 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
     return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   }
   await client.query(`SELECT set_config($1, $2, true)`, ["app.user_id", session.userId])
-  const turnResult = await client.query<{ userId: string; status: string; revision: number }>(
-    `SELECT turn."userId", turn."status", turn."revision" FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 FOR UPDATE`,
+  const turnResult = await client.query<{
+    userId: string; status: string; revision: number; source: string; executionMode: string | null
+    input: unknown; rootTaskId: string | null; hasLiveLease: boolean
+  }>(
+    `SELECT turn."userId", turn."status", turn."revision", turn."source", turn."executionMode", turn."input", turn."rootTaskId",
+       COALESCE(turn."leaseOwnerId" IS NOT NULL AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP, FALSE) AS "hasLiveLease"
+     FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 FOR UPDATE`,
     [payload.turnId, payload.sessionId, session.userId],
   )
   const turn = turnResult.rows[0]
@@ -76,8 +81,8 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
   if (turn.revision !== payload.nextTurnRevision) {
     throw new TerminalWakeupError("turn_revision_conflict", "Agent Turn revision changed before wakeup")
   }
-  const itemResult = await client.query<{ status: string; content: unknown }>(
-    `SELECT "status", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = $4 FOR UPDATE`,
+  const itemResult = await client.query<{ status: string; taskId: string | null; content: unknown }>(
+    `SELECT "status", "taskId", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = $4 FOR UPDATE`,
     [payload.itemId, payload.sessionId, payload.turnId, payload.waitKind === "approval" ? "approval_request" : "question"],
   )
   const item = itemResult.rows[0]
@@ -89,6 +94,17 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
   if (content.waitKind !== payload.waitKind || itemWaitId !== payload.waitId) throw new TerminalWakeupError("item_lineage_mismatch", "Agent wait item lineage does not match wakeup")
   const itemToolCallId = typeof content.toolCallId === "string" ? content.toolCallId : null
   if (itemToolCallId !== payload.toolCallId) throw new TerminalWakeupError("tool_lineage_mismatch", "Agent wait tool lineage does not match wakeup")
+
+  const turnInput = record(turn.input)
+  const exactScheduledContinuationQuestion = payload.waitKind === "question" && payload.status === "answered"
+    && content.answerAvailable === true && content.answer !== null && content.answer !== undefined
+    && turn.source === "automation" && turn.executionMode === "canonical_task_graph"
+    && turnInput.automationRunMode === "scheduled"
+    && typeof turn.rootTaskId === "string" && turn.rootTaskId.length > 0
+    && (item.taskId === null || item.taskId === turn.rootTaskId)
+  if (exactScheduledContinuationQuestion && turn.hasLiveLease) {
+    return { status: "deferred", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
+  }
 
   const updated = await client.query(
     `UPDATE "agent_turns" AS turn
@@ -152,7 +168,7 @@ async function markWakeupPublished(client: Client, rowId: string, lastError: str
 async function markWakeupAttemptFailed(client: Client, rowId: string): Promise<void> {
   await client.query(`UPDATE "agent_outbox" SET "attemptCount" = "attemptCount" + 1, "lastError" = $3 WHERE "id" = $1 AND "topic" = $2 AND "publishedAt" IS NULL`, [rowId, AGENT_TURN_WAKEUP_TOPIC, "processing_error"])
 }
-type RowOutcome = "published" | "retry" | "skipped"
+type RowOutcome = "published" | "deferred" | "retry" | "skipped"
 async function processWakeupRow(pool: PoolLike, row: OutboxRow): Promise<RowOutcome> {
   const client = await pool.connect()
   let transactionOpen = false
@@ -188,7 +204,12 @@ async function processWakeupRow(pool: PoolLike, row: OutboxRow): Promise<RowOutc
     }
 
     try {
-      await resumeInTransaction(client, payload)
+      const result = await resumeInTransaction(client, payload)
+      if (result.status === "deferred") {
+        await client.query("COMMIT")
+        transactionOpen = false
+        return "deferred"
+      }
       await markWakeupPublished(client, current.id, null)
       await client.query("COMMIT")
       transactionOpen = false
@@ -223,6 +244,7 @@ export async function drainAgentWakeups(pool: PoolLike, batchSize = DEFAULT_BATC
     for (const row of rows) {
       const outcome = await processWakeupRow(pool, row)
       if (outcome === "published") processed += 1
+      if (outcome === "deferred") return processed
       if (outcome === "retry") retryPending = true
     }
     if (retryPending) return processed

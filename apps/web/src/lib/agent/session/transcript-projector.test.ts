@@ -53,8 +53,8 @@ describe("V2 transcript projector", () => {
 
   it("rejects direct transcript projection of private native verification events", () => {
     expect(() => projectV2EventToTranscript({
-      ...baseEvent, type: "native_verification.requested", taskId: "private-control-task",
-      payload: { controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
+      ...baseEvent, type: "native_verification.scheduled_candidate_staged", taskId: "private-control-task",
+      payload: { candidateText: "PRIVATE_SCHEDULED_FINAL_CANDIDATE", controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
     })).toThrow("private_native_verification_event_not_projectable")
   })
 
@@ -142,8 +142,8 @@ describe("V2 transcript projector", () => {
   it("omits private verification, planning, and reconciliation receipts during transcript rebuild", async () => {
     const privateEvent = {
       ...baseEvent, id: "private-event", itemId: null, taskId: "private-control-task",
-      type: "native_verification.requested",
-      payload: { controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
+      type: "native_verification.scheduled_candidate_staged",
+      payload: { candidateText: "PRIVATE_SCHEDULED_FINAL_CANDIDATE", controlOperationId: "private-operation", evidencePacketDigest: "private-digest" },
     }
     const ordinaryEvent = {
       ...baseEvent, id: "ordinary-event",
@@ -227,6 +227,7 @@ describe("V2 transcript projector", () => {
     expect(serializedTranscriptRows).not.toContain("private-denial-digest-sentinel")
     expect(serializedTranscriptRows).not.toContain("task-graph-denial-checkpoint.v1")
     expect(serializedTranscriptRows).not.toContain("private-event")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_SCHEDULED_FINAL_CANDIDATE")
     expect(serializedTranscriptRows).not.toContain("private-clarification-event")
     expect(serializedTranscriptRows).not.toContain("private-reconciliation-event")
     expect(serializedTranscriptRows).not.toContain("private-steer-id")

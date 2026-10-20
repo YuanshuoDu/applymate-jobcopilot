@@ -1,5 +1,6 @@
 import { db } from "@/lib/db";
 import { PipelineInterruptedError, runPipeline } from "@/lib/agent/pipeline";
+import { createScheduledTaskGraphOwnerFence, runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from "@/lib/agent/scheduled-taskgraph-analysis-journal";
 import { AgentPauseError } from "@/lib/agent/orchestrator";
 import { createRunSessionRecorder } from "@/lib/agent/session/run-recorder";
 import { isRuntimeAgentHarnessFeatureEnabled } from "@/lib/runtime-feature-flags";
@@ -12,14 +13,18 @@ import { checkpointState, createDurableEventWriter, createRunAttemptOwnership, i
 import type { AiConfig } from "@/lib/model-router";
 import type { ResumeContent } from "@/lib/types";
 import type { V2TurnSource } from "@/lib/agent/session/v2-turn";
+import type { Job, Prisma } from "@prisma/client";
+import { parseScheduledAutomationSnapshot } from "@/lib/agent/scheduled-automation-snapshot";
+import { buildScheduledTaskGraphPrepareCheckpoint, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
+import { finishScheduledTaskGraphExecution, isScheduledTaskGraphOwnerCurrent, persistScheduledTaskGraphWaitMarker, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
+import type { PipelineCtx } from "@/lib/agent/pipeline-context";
 type HistoryEvent = { event: string; at: string; data: unknown };
+export type ScheduledTaskGraphWaitResult = { status: "waiting_for_user"; waitId: string; stage: string };
 export interface AgentPipelineRunInput {
   userId: string;
   aiConfig: AiConfig;
   sessionId?: string;
-  /** Optional durable control-plane row supplied by the background worker. */
   executionId?: string;
-  /** Canonical automation Turn supplied by the TurnEngine queue adapter. */
   turnId?: string;
   legacyTurnId?: string;
   questionId?: string;
@@ -29,25 +34,18 @@ export interface AgentPipelineRunInput {
   autonomous: boolean;
   source?: V2TurnSource;
   emit?: (event: string, data: unknown) => void;
+  scheduledTaskGraph?: { owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[] };
 }
-/** Runs one pipeline while persisting the same transcript for SSE and worker callers. */
-export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<RunReport | null> {
-  const startedAt = Date.now();
-  const events: HistoryEvent[] = [];
+export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<RunReport | ScheduledTaskGraphWaitResult | null> {
+  const startedAt = Date.now(), events: HistoryEvent[] = [];
   const dualWrite = await isRuntimeAgentHarnessFeatureEnabled(
     "AGENT_PROTOCOL_V2_DUAL_WRITE",
     input.userId,
   ).catch(() => false) || Boolean(input.turnId);
   if (input.signal?.aborted) return null
-  const requestedExecution = input.executionId
-    ? await db.agentExecution.findFirst({
-        where: {
-          id: input.executionId,
-          userId: input.userId,
-          ...(input.sessionId ? { sessionId: input.sessionId } : {}),
-        },
-      })
-    : null
+  const requestedExecution = input.executionId ? await db.agentExecution.findFirst({
+    where: { id: input.executionId, userId: input.userId, ...(input.sessionId ? { sessionId: input.sessionId } : {}) },
+  }) : null
   if (input.executionId && (!requestedExecution || input.signal?.aborted)) {
     if (!requestedExecution && !input.signal?.aborted) console.warn("Agent execution was not found for the requested session")
     return null
@@ -65,42 +63,59 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     ensureTurn: true,
   });
   const execution = requestedExecution ?? await ensureAgentExecution({ userId: input.userId, sessionId: recorder.sessionId, autonomous: input.autonomous })
-  if (!execution) {
-    console.warn("Agent execution was not found for the requested session")
-    return null
-  }
+  if (!execution) { console.warn("Agent execution was not found for the requested session"); return null }
+  const scheduled = input.scheduledTaskGraph;
+  const assertScheduledOwnerCurrent = createScheduledTaskGraphOwnerFence(scheduled && { owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken });
+  let scheduledState: unknown = execution.state;
   if (input.signal?.aborted) return null
-  const attemptCount = await claimAgentExecution({
-    id: execution.id, userId: input.userId,
-    ...(!input.turnId && input.workerTaskId && input.expectedAttemptCount !== undefined
-      ? { sessionId: recorder.sessionId, workerTaskId: input.workerTaskId, expectedAttemptCount: input.expectedAttemptCount }
-      : {}),
-  })
-  if (attemptCount === null) {
-    // Duplicate BullMQ delivery, cancellation, or an already-finished session.
-    // Never run another copy of the same agent session.
-    return null
-  }
+  const attemptCount = scheduled
+    ? execution.status === "running" && execution.attemptCount === scheduled.owner.executionAttemptCount
+      && scheduledTaskGraphContinuationKey(scheduled.owner, scheduled.attestation) === scheduled.continuationKey
+      && scheduledTaskGraphClaimMatches(execution.state, scheduled.continuationKey, scheduled.owner, scheduled.claimToken)
+      ? execution.attemptCount : null
+    : await claimAgentExecution({
+        id: execution.id, userId: input.userId,
+        ...(!input.turnId && input.workerTaskId && input.expectedAttemptCount !== undefined
+          ? { sessionId: recorder.sessionId, workerTaskId: input.workerTaskId, expectedAttemptCount: input.expectedAttemptCount }
+          : {}),
+      })
+  if (attemptCount === null) return null
   const { isCurrentAttempt, finishAttempt, canPublishAttemptResult, recorderOwner } = createRunAttemptOwnership({
     id: execution.id, userId: input.userId, sessionId: recorder.sessionId, attemptCount,
     turnId: recorder.getTurnId, signal: input.signal,
   })
+  const finishOwnedAttempt = scheduled
+    ? (status: "completed" | "failed", error?: string | null) => finishScheduledTaskGraphExecution({ state: scheduledState, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, status, error, assertOwnerCurrent: assertScheduledOwnerCurrent })
+    : finishAttempt
   if (!await isCurrentAttempt()) return null
   try {
-    if (!await recorder.activate({
-      executionAttempt: { id: execution.id, attemptCount },
-      signal: input.signal,
-      assertCurrent: isCurrentAttempt,
-    })) return null
+    if (!await recorder.activate({ executionAttempt: { id: execution.id, attemptCount }, signal: input.signal,
+      assertCurrent: isCurrentAttempt })) return null
   } catch (error) {
     if (error instanceof AgentExecutionCancelledError || !await isCurrentAttempt()) return null
-    const failed = await finishAttempt("failed", error instanceof Error ? error.message : "Unable to activate agent session")
+    const failed = await finishOwnedAttempt("failed", error instanceof Error ? error.message : "Unable to activate agent session")
     if (failed) console.warn("Failed to activate agent session", error)
     return null
   }
   if (!await isCurrentAttempt()) return null
+  let scheduledQuestionPersistenceFailed = false;
   const eventWriter = createDurableEventWriter({
-    record: (event, data) => recorder.record(event, data),
+    record: async (event, data) => {
+      if (!scheduled || event !== "orchestrator_question") return recorder.record(event, data);
+      try {
+        const question = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : null;
+        const waitId = typeof question?.id === "string" ? question.id : question?.questionId;
+        if (typeof waitId !== "string" || typeof question?.stage !== "string") throw new AgentExecutionCancelledError();
+        const waitingState = await persistScheduledTaskGraphWaitMarker({ state: scheduledState, owner: scheduled.owner,
+          key: scheduled.continuationKey, claimToken: scheduled.claimToken, waitId, stage: question.stage, assertOwnerCurrent: assertScheduledOwnerCurrent });
+        if (!waitingState) throw new AgentExecutionCancelledError();
+        scheduledState = waitingState;
+        return await recorder.record(event, data);
+      } catch (error) {
+        scheduledQuestionPersistenceFailed = true;
+        throw error;
+      }
+    },
     publish: (event, data) => {
       events.push({ event, data, at: new Date().toISOString() });
       input.emit?.(event, data);
@@ -115,17 +130,13 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
   };
   const failPreflight = async (message: string, error: string) => {
     if (!await isCurrentAttempt()) return null
-    const failed = await finishAttempt("failed", error)
+    const failed = await finishOwnedAttempt("failed", error)
     if (!failed || !await canPublishAttemptResult("failed")) return null
     emit("error", { message })
     await eventWriter.drain()
     if (!await finalize("failed", null)) return null
-    await saveHistory(input.userId, events, startedAt, null, true)
-    return null
+    await saveHistory(input.userId, events, startedAt, null, true); return null
   }
-  // Web requests check this in requireAuth, but scheduled worker runs carry a
-  // durable user ID instead of a browser session. Re-check it after claiming
-  // the execution so suspension takes effect before any agent work starts.
   try {
     if (!await isActiveAccount(input.userId)) {
       if (!await isCurrentAttempt()) return null
@@ -144,7 +155,10 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
         })
       : null;
     if (!await isCurrentAttempt()) return null
-    const overrides = automationRunOverrides(automationEvent?.data);
+    const scheduledSnapshot = scheduled ? parseScheduledAutomationSnapshot(scheduled.snapshot) : null;
+    const overrides = scheduledSnapshot
+      ? automationRunOverrides({ automation: scheduledSnapshot })
+      : automationRunOverrides(automationEvent?.data);
     const effectiveConfig = withAutomationOverrides(pipelineAgentConfigFrom(agentConfig), overrides);
     let resume = await db.resume.findFirst({ where: { userId: input.userId, isDefault: true } });
     if (!await isCurrentAttempt()) return null
@@ -155,7 +169,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     if (!resume) return await failPreflight("No resume found. Create a resume first.", "No resume found")
     const roleConfigs = toRoleConfigMap(await loadRoleConfigs(input.userId));
     if (!await isCurrentAttempt()) return null
-    const report = await runPipeline({
+    const pipelineInput: PipelineCtx = {
       userId: input.userId,
       sessionId: recorder.sessionId,
       turnId: recorder.getTurnId(),
@@ -175,23 +189,61 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       assertExecutionCurrent: async () => Boolean(await db.agentExecution.findFirst({
         where: { id: execution.id, userId: input.userId, status: "running", attemptCount },
         select: { id: true },
-      })),
-      // Automation can discover and prepare unattended, but may never bypass
-      // the per-application review and submit authorization checkpoints.
+      })) && (!scheduled || await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)),
+      ...(scheduled ? { scheduledTaskGraphOwnerFence: {
+        owner: scheduled.owner,
+        key: scheduled.continuationKey,
+        claimToken: scheduled.claimToken,
+        assertCurrent: assertScheduledOwnerCurrent,
+      } } : {}),
       autonomous: input.autonomous,
       emit,
       signal: input.signal,
       resumeState: checkpointState(execution.state),
       checkpoint: async state => {
         if (!await isActiveAccount(input.userId)) throw new Error("Account is not active")
-        const saved = await saveExecutionCheckpoint({ id: execution.id, userId: input.userId, attemptCount, state })
+        const saved = scheduled
+          ? await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state, owner: scheduled.owner,
+              key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent })
+          : await saveExecutionCheckpoint({ id: execution.id, userId: input.userId, attemptCount, state })
         if (!saved) throw new AgentExecutionCancelledError()
+        if (scheduled) scheduledState = state;
       },
-    });
-    // Finish the durable control row before publishing a completed session.
-    // If the user cancelled while a stage was running, cancellation wins and
-    // must never be overwritten by this runner's stale success result.
-    const finished = await finishAttempt("completed")
+    };
+    let resumeState = checkpointState(execution.state);
+    if (scheduled) {
+      if (!resumeState || !await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)) throw new AgentExecutionCancelledError();
+      if (execution.state && typeof execution.state === "object" && !Array.isArray(execution.state)
+        && "scheduledTaskGraphContinuation" in execution.state) {
+        const prior = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduled.owner, snapshot: scheduled.snapshot,
+          attestation: scheduled.attestation, ownedJobs: scheduled.ownedJobs, existingCheckpoint: execution.state });
+        if (!prior.alreadyPersisted || prior.continuationKey !== scheduled.continuationKey) throw new AgentExecutionCancelledError();
+        resumeState = prior.checkpoint;
+        scheduledState = prior.checkpoint;
+      } else {
+        const result = await runScheduledTaskGraphAnalyze({ jobs: scheduled.ownedJobs, ctx: pipelineInput, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
+          snapshot: scheduled.snapshot, attestation: scheduled.attestation, state: scheduledState, assertScoreOwnerCurrent: tx => scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken }),
+          persist: async (state, expectedState, tx) => {
+            if (tx && (!scheduledTaskGraphClaimMatches(expectedState, scheduled.continuationKey, scheduled.owner, scheduled.claimToken)
+                || !scheduledTaskGraphClaimMatches(state, scheduled.continuationKey, scheduled.owner, scheduled.claimToken)
+                || !await assertScheduledOwnerCurrent(tx))) throw new AgentExecutionCancelledError();
+            if (tx) {
+              const saved = await tx.agentExecution.updateMany({ where: { id: scheduled.owner.executionId, userId: scheduled.owner.userId,
+                sessionId: scheduled.owner.sessionId, status: "running", attemptCount: scheduled.owner.executionAttemptCount,
+                state: { equals: expectedState as Prisma.InputJsonValue } }, data: { checkpoint: state.nextStage, state: state as unknown as Prisma.InputJsonValue } });
+              if (saved.count !== 1) throw new AgentExecutionCancelledError();
+            } else if (!await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)
+              || !await saveScheduledTaskGraphCheckpoint({ expectedState, state, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent })) throw new AgentExecutionCancelledError();
+            if (!tx) scheduledState = JSON.parse(JSON.stringify(state));
+          } });
+        if (!await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)) throw new AgentExecutionCancelledError();
+        const saved = await saveScheduledTaskGraphCheckpoint({ expectedState: result.persistedState ?? scheduledState, state: result.checkpoint,
+          owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent });
+        if (!saved) throw new AgentExecutionCancelledError(); resumeState = result.checkpoint; scheduledState = result.checkpoint;
+      }
+    }
+    const report = await runPipeline({ ...pipelineInput, resumeState });
+    const finished = await finishOwnedAttempt("completed")
     if (!finished || !await canPublishAttemptResult("completed")) return null
     if (report.pending > 0) {
       const owner = recorderOwner("completed");
@@ -208,14 +260,13 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     return report;
   } catch (error) {
     if (error instanceof AgentExecutionCancelledError) {
-      // The cancel endpoint already marked the session as aborted. Do not
-      // replace that user decision with a late failure/completion update.
-      await eventWriter.drain()
-      return null
+      await eventWriter.drain(); return null
     }
     if (error instanceof AgentPauseError) {
       await eventWriter.drain()
+      if (scheduled && scheduledQuestionPersistenceFailed) return null;
       if (!await isCurrentAttempt()) return null
+      if (scheduled && !await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)) return null;
       const owner = recorderOwner("running", "waiting_for_user")
       if (!owner) return null
       const saved = await recorder.pause(
@@ -224,18 +275,18 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
         owner,
       )
       if (!saved) return null
+      if (scheduled) return { status: "waiting_for_user", waitId: error.questionId, stage: error.stage };
       return null
     }
     if (error instanceof PipelineInterruptedError) {
-      await eventWriter.drain()
-      return null
+      await eventWriter.drain(); return null
     }
     const message = error instanceof Error ? error.message : "Agent run failed"
     if (!await isCurrentAttempt()) {
       await eventWriter.drain()
       return null
     }
-    const failed = await finishAttempt("failed", message)
+    const failed = await finishOwnedAttempt("failed", message)
     if (!failed || !await canPublishAttemptResult("failed")) {
       await eventWriter.drain()
       return null

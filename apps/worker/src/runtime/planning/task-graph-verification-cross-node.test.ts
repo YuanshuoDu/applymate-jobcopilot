@@ -7,6 +7,12 @@ import {
   type TaskGraphVerificationContract,
   type TaskGraphVerificationDependencyGraphNode,
 } from "./task-graph-verification.js"
+import {
+  TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
+  evaluateFindingsCoverScoutCandidates,
+  evaluateFindingsFromScoutDependency,
+  parseTaskGraphVerificationEvidenceProjection,
+} from "./task-graph-verification-cross-node.js"
 
 const scoutContract: TaskGraphVerificationContract = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
@@ -40,6 +46,32 @@ describe("TaskGraph cross-node verification selectors", () => {
     expect(taskGraphVerificationDependencyNodeKeys(analystContract)).toEqual(["scout-a", "scout-b"])
     expect(validateTaskGraphVerificationDependencySelectors([scout("scout-b"), scout("scout-a"), analyst(["scout-a", "scout-b"])]))
       .toBe(true)
+  })
+
+  it("accepts zero Scout and Analyst results only when both bind the verified empty-search receipt", () => {
+    const digest = "a".repeat(64)
+    const scoutProjection = parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [],
+      evidenceIds: [`read:source:jobs.discover:${digest}`], emptyDiscoveryReceipt: { digest },
+    })
+    const analystProjection = parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: [],
+      evidenceIds: [], emptyDiscoveryReceipt: { digest },
+    })
+    expect(scoutProjection.ok).toBe(true)
+    expect(analystProjection.ok).toBe(true)
+    if (!scoutProjection.ok || !analystProjection.ok) return
+    const dependencies = new Map([["scout-a", scoutProjection.value]])
+    expect(evaluateFindingsFromScoutDependency("scout-a", [], dependencies, digest)).toBe("passed")
+    expect(evaluateFindingsCoverScoutCandidates("scout-a", [], dependencies, 75, digest)).toBe("passed")
+    expect(evaluateFindingsFromScoutDependency("scout-a", [], dependencies, "b".repeat(64))).toBe("criterion_not_met")
+    expect(evaluateFindingsCoverScoutCandidates("scout-a", [], dependencies, 75)).toBe("criterion_not_met")
+  })
+
+  it("rejects a zero Scout projection that lacks its canonical full-search receipt", () => {
+    expect(parseTaskGraphVerificationEvidenceProjection({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [], evidenceIds: [],
+    })).toMatchObject({ ok: false, reasonCode: "canonical_evidence_missing" })
   })
 
   it("treats coverage as an exact direct typed Scout dependency", () => {

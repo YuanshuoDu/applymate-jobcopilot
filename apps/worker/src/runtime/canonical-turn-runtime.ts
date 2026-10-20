@@ -48,6 +48,11 @@ import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletion
 import { configureNativeSemanticProgress } from "./canonical-turn-native-semantic-rejection.js"
 import { taskGraphDenialCheckpointFromDecision } from "./turns/task-graph-terminal-assessment.js"
 import { createCanonicalScheduledDraftRuntime } from "./scheduled-draft-runtime.js"
+import { createScheduledAutomationPipelineBridge, type ScheduledAutomationPipelineBridgeResult, type ScheduledAutomationPipelineBridgeScope, type ScheduledAutomationPersistedRoot, type ScheduledAutomationPersistedTask, type ScheduledAutomationPersistedTurn } from "./subagents/scheduled-automation-pipeline-bridge.js"
+import { currentTaskGraph, loadTaskGraph } from "./subagents/task-graph-pg-state.js"
+import { verifyCompletedTaskGraphNodeEvidence } from "./subagents/task-graph-pg-verification.js"
+import { attachScheduledPipelineCompletion } from "./subagents/scheduled-pipeline-completion.js"
+import { createScheduledPipelineCandidateStore, type ScheduledPipelineCandidateStore } from "./subagents/scheduled-pipeline-candidate-store.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"; export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
@@ -74,6 +79,8 @@ export type CanonicalTurnRuntimeOptions = {
   readonly turnBoundaryCompactionRunner?: (input: Parameters<typeof runTurnBoundaryContextCompaction>[0]) => Promise<{ readonly status: string }>
   readonly contextBuilderFactory?: (input: { pool: pg.Pool; scope: { userId: string } }) => TurnEngineOptions["contextBuilder"]
   readonly lifecycleSinkFactory?: (input: { lease: TurnLease; store: TurnEngineStore; owner: ExecutionOwnerFence }) => ToolLifecycleSink
+  /** Test seams for the scheduled-only, persisted-evidence handoff. */ readonly scheduledPipelineBridge?: (scope: ScheduledAutomationPipelineBridgeScope) => Promise<ScheduledAutomationPipelineBridgeResult>; readonly scheduledPipelineFetch?: typeof fetch
+  readonly scheduledPipelineCandidateStoreFactory?: (input: { pool: Pick<pg.Pool, "connect">; eventStore: Pick<TurnEngineStore, "appendEvent"> }) => ScheduledPipelineCandidateStore
   /** Optional server-owned automation control projection; ordinary sessions are ignored by its SQL scope. */
   readonly executionProjection?: CanonicalExecutionProjection
   /** Optional server-owned automation session projection; ordinary sessions are ignored by its SQL scope. */
@@ -95,6 +102,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const artifactRepository = createAgentArtifactRepository(pool)
   const executionProjection = options.executionProjection ?? noopCanonicalExecutionProjection
   const sessionProjection = options.sessionProjection ?? noopCanonicalSessionProjection
+  const scheduledPipelineBridge = options.scheduledPipelineBridge ?? createPersistedScheduledPipelineBridge(pool)
   const reconcileTerminal = options.executionProjection || options.sessionProjection ? rootTasks.reconcileTerminal : undefined
   const productionFlags = options.productionFlags
   const consumeWaitOutcomes = productionFlags?.consumeWaitOutcomes ?? options.consumeWaitOutcomes === true
@@ -126,6 +134,15 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now, turnSource: state.source, automationRunMode: state.automationRunMode, turnInput: state.turnInput,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, applicationFillPreparationLoader: options.applicationFillPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
+    if (state.source === "automation" && state.automationRunMode === "scheduled"
+      && (!taskGraphPlanningEnabled || !childExecutionEnabled || !coordinationEnabled || !consumeWaitOutcomes) && !signal.aborted) {
+      const result = { status: "failed" as const, errorCode: "scheduled_task_graph_unavailable", stepCount: 0, toolCallCount: 0 }
+      const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions: [], now: now() })
+      await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })
+      await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+      await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+      return { status: "failed", summary: result.errorCode }
+    }
     if (!taskGraphPlanningEnabled && !signal.aborted) {
       const selectedJobPreparation = await (options.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(pool, lease, now())
       // Let TurnEngine preserve interruption if Stop or lease loss arrives during this async read.
@@ -189,6 +206,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     let discoveryFailureCode: "discovery_runtime_unavailable" | "discovery_runtime_failed" = "discovery_runtime_failed"
     const turnStore = interactiveDiscoveryMode ? withInteractiveDiscoveryFinalResponse(baseTurnStore, () => acceptedDiscoveryShortlist) : baseTurnStore
     const { owner, mode: nativeSemanticProgressMode } = await configureNativeSemanticProgress({ taskId: root.id, lease, store: turnStore, nativeVerification, featureEnabled: productionFlags?.nativeSemanticProgressMemoryEnabled === true, taskGraphPlanningEnabled, now: now() })
+    const scheduledCandidateStore = options.scheduledPipelineCandidateStoreFactory?.({ pool, eventStore: turnStore }) ?? createScheduledPipelineCandidateStore(pool, turnStore)
+    const scheduledPipelineOwner: ScheduledAutomationPipelineBridgeScope | undefined = taskGraphPlanningEnabled
+      && state.source === "automation" && state.automationRunMode === "scheduled"
+      ? { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: root.id, rootAttemptCount: root.attemptCount,
+        turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
+      : undefined
+    const recoveredScheduledCandidate = scheduledPipelineOwner && owner.kind === "turn" ? await scheduledCandidateStore.read({ owner, rootAttemptCount: scheduledPipelineOwner.rootAttemptCount }) : undefined
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
@@ -197,7 +221,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const authorize = options.authorizeUsage ?? defaultAuthorization
     const model = modelWithUsage(modelRuntime, lease, authorize)
     const preparedContext = await prepareNativeVerificationRootContext({
-      state, selectedJobMode, taskGraphPlanningEnabled, ...nativeRootContext, refreshTaskGraph: turnCoordination.refresh,
+      state, selectedJobMode, taskGraphPlanningEnabled, ...nativeRootContext,
+      ...(recoveredScheduledCandidate === undefined ? {} : { nativeRecovery: { ...nativeRootContext.nativeRecovery, candidateText: recoveredScheduledCandidate ?? undefined } }),
+      refreshTaskGraph: turnCoordination.refresh,
       preflight: {
         enabled: productionFlags?.turnBoundaryCompactionEnabled === true && !state.recoveredWaitControl, signal,
         compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, taskGraphCommandPort: options.taskGraphCommandPort, model, signal }),
@@ -205,7 +231,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       },
     })
     state = preparedContext.state
-    const nativeRecovery = preparedContext.nativeRecovery
+    const nativeRecovery = preparedContext.nativeRecovery, recoveredFinalCandidate = recoveredScheduledCandidate === null ? undefined : recoveredScheduledCandidate ?? nativeRecovery.candidateText
     const modelSnapshot = preparedContext.modelSnapshot
     const routeTool = createToolRouterExecutor(toolRuntime.router)
     const rootToolGuards = createCanonicalRootToolGuards({ interactiveDiscoveryMode, selectedJobMode, routeTool, validateArguments: (name, args) => toolRuntime.registry.validateArguments(name, args, "1") })
@@ -219,6 +245,19 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       selectedJobMemories: state.selectedJobMemories, selectedJobId: selectedJobPreparation?.jobId,
     })
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
+    let webOwnsExecution = false
+    const rootCompletionGate = attachScheduledPipelineCompletion({ gate: createCanonicalRootCompletionGate({
+      enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || taskGraphPlanningEnabled, nativeVerification,
+      onCandidateStart: () => { acceptedGraphWitness = undefined; scheduledDraftRuntime?.clear() },
+      checkChildren: () => rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: nativeVerification.accepted() }),
+      readTaskGraphDenialCheckpoint: taskGraphPlanningEnabled && rootTasks.checkCompletion ? async () => {
+        const current = await rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: false })
+        return taskGraphDenialCheckpointFromDecision(current, root.id)
+      } : undefined,
+      interactiveDiscovery: interactiveDiscoveryMode ? () => interactiveDiscoveryCompletionGate({ pool, lease, root, load: options.interactiveDiscoveryShortlistLoader, accept: shortlist => { acceptedDiscoveryShortlist = shortlist }, markUnavailable: () => { discoveryFailureCode = "discovery_runtime_unavailable" } }) : undefined,
+      selectedJobMode, selectedJobCompletion: selectedJobCompletion ?? (scheduledDraftRuntime ? () => scheduledDraftRuntime.complete() : undefined),
+    }), owner: scheduledPipelineOwner, bridge: scheduledPipelineBridge, fetcher: options.scheduledPipelineFetch, onWebAccepted: () => { webOwnsExecution = true },
+      rootAttemptCount: scheduledPipelineOwner?.rootAttemptCount ?? 1, stageCandidate: scheduledCandidateStore.stage })
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
       store: turnStore, model, tools: rootTools, ...rootToolGuards,
@@ -228,19 +267,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphBeforeStep: turnCoordination.refresh, refreshTaskGraphAfterReadyWait: turnCoordination.refresh, refreshTaskGraphAfterPlan: turnCoordination.refresh } : {}),
       durableWaitControlReader: durableWaitPort, ...(state.recoveredWaitControl ? { recoveredWaitControl: state.recoveredWaitControl } : {}),
-      ...(nativeRecovery.candidateText !== undefined ? { recoveredFinalCandidate: nativeRecovery.candidateText } : {}),
+      ...(recoveredFinalCandidate !== undefined ? { recoveredFinalCandidate } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
-      completionGate: createCanonicalRootCompletionGate({
-        enabled: !!rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode || taskGraphPlanningEnabled, nativeVerification,
-        onCandidateStart: () => { acceptedGraphWitness = undefined; scheduledDraftRuntime?.clear() },
-        checkChildren: () => rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: nativeVerification.accepted() }),
-        readTaskGraphDenialCheckpoint: taskGraphPlanningEnabled && rootTasks.checkCompletion ? async () => {
-          const current = await rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now(), taskGraphVerification: true, nativeVerificationPassed: false })
-          return taskGraphDenialCheckpointFromDecision(current, root.id)
-        } : undefined,
-        interactiveDiscovery: interactiveDiscoveryMode ? () => interactiveDiscoveryCompletionGate({ pool, lease, root, load: options.interactiveDiscoveryShortlistLoader, accept: shortlist => { acceptedDiscoveryShortlist = shortlist }, markUnavailable: () => { discoveryFailureCode = "discovery_runtime_unavailable" } }) : undefined,
-        selectedJobMode, selectedJobCompletion: selectedJobCompletion ?? (scheduledDraftRuntime ? () => scheduledDraftRuntime.complete() : undefined),
-      }),
+      completionGate: rootCompletionGate,
     })
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     await sessionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
@@ -248,9 +277,24 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const discoveryShortlist = interactiveDiscoveryMode ? terminalInteractiveDiscoveryShortlist(result.status, acceptedDiscoveryShortlist, discoveryFailureCode) : undefined
     await rootTasks.finish({ lease, rootTaskId: root.id, result, ...(discoveryShortlist ? { metadata: { interactiveDiscoveryShortlist: discoveryShortlist } } : {}), now: now() })
     // The durable root is finalized first; a projection failure remains surfaced so queue retry can reconcile it.
-    await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
-    await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+    if (!webOwnsExecution) await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result }); await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     return { status: result.status, summary: result.errorCode, ...(result.waitId ? { waitId: result.waitId } : {}) }
   }
   return { execute, manager, childExecutionEnabled, coordinationEnabled, async close() { closed = true } }
+}
+function createPersistedScheduledPipelineBridge(pool: pg.Pool) { return createScheduledAutomationPipelineBridge({
+    load: scope => withScheduledPipelineRead(pool, scope.userId, async client => {
+      const turn = (await client.query<ScheduledAutomationPersistedTurn>(`SELECT "userId", "sessionId", "id" AS "turnId", "rootTaskId", "source", "executionMode", "input", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [scope.turnId, scope.sessionId, scope.userId])).rows[0]
+      const root = (await client.query<ScheduledAutomationPersistedRoot>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."status", task."attemptCount" FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId" WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1 AND task."parentTaskId" IS NULL AND session."userId" = $4`, [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])).rows[0]
+      if (!turn || !root) throw new Error("scheduled_pipeline_lineage_missing"); const graph = await loadTaskGraph(client, { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId }, false)
+      if (!graph.snapshot || !graph.state) throw new Error("scheduled_pipeline_graph_missing")
+      const tasks = (await client.query<ScheduledAutomationPersistedTask>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", task."role", task."taskType", task."status", task."attemptCount", task."failureReason", task."expectedOutputSchema", task."allowedActions", task."result" FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND session."userId" = $5`, [graph.snapshot.nodes.map(node => node.taskId), scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId])).rows
+      return { turn, root, snapshot: graph.snapshot, current: currentTaskGraph(graph), tasks }
+    }),
+    verifyCompletedNode: input => withScheduledPipelineRead(pool, input.scope.userId, client => verifyCompletedTaskGraphNodeEvidence(client, input)),
+  }) }
+async function withScheduledPipelineRead<T>(pool: Pick<pg.Pool, "connect">, userId: string, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect(); let committed = false
+  try { await client.query("BEGIN"); await client.query("SELECT set_config($1, $2, true)", ["app.user_id", userId]); const value = await work(client); await client.query("COMMIT"); committed = true; return value }
+  catch (error: unknown) { if (!committed) await client.query("ROLLBACK").catch(() => undefined); throw error } finally { client.release() }
 }

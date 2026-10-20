@@ -109,6 +109,7 @@ describe("V2 agent event stream", () => {
         stepId: "private-step-" + suffix, controlTaskId: "private-control-" + suffix,
         controlOperationId: marker, goalDigest: marker, evidencePacketDigest: marker,
         reference: marker, sentinel: marker,
+        ...(type === "native_verification.scheduled_candidate_staged" ? { candidateText: "PRIVATE_SCHEDULED_FINAL_CANDIDATE" } : {}),
       },
     })
     const rejection = {
@@ -135,7 +136,7 @@ describe("V2 agent event stream", () => {
       return calls === 1
         ? [
             privateEvent(BigInt(2), "native_verification.requested", "request"),
-            privateEvent(BigInt(3), "native_verification.future.v1", "future"),
+            privateEvent(BigInt(3), "native_verification.scheduled_candidate_staged", "candidate"),
           ]
         : calls === 2
           ? [
@@ -187,6 +188,7 @@ describe("V2 agent event stream", () => {
       expect(text).not.toContain('"graphRevision"')
       expect(text).not.toContain("task-graph-denial-checkpoint.v1")
       expect(text).not.toContain(marker)
+      expect(text).not.toContain("PRIVATE_SCHEDULED_FINAL_CANDIDATE")
       expect(text).not.toContain("private-event-")
       expect(text).not.toContain("private-item-")
       expect(text).not.toContain("private-task-")
@@ -210,10 +212,10 @@ describe("V2 agent event stream", () => {
     const marker = "native-private-delta-marker"
     const privateEnvelope = {
       schemaVersion: "agent-harness.v2", id: "private-delta-event", sessionId: "session_1",
-      turnId: "turn_1", itemId: "private-item", taskId: "private-task", type: "native_verification.future.requested",
+      turnId: "turn_1", itemId: "private-item", taskId: "private-task", type: "native_verification.scheduled_candidate_staged",
       actor: "system", correlationId: "private-correlation", causationId: "private-causation",
       idempotencyKey: "private-idempotency", sequence: null,
-      payload: { stepId: "private-step", controlOperationId: marker, goalDigest: marker, evidencePacketDigest: marker },
+      payload: { stepId: "private-step", controlOperationId: marker, goalDigest: marker, evidencePacketDigest: marker, candidateText: "PRIVATE_DELTA_FINAL_CANDIDATE" },
       kind: "snapshot", baseRevision: 0, revision: 1,
     }
     const privateReconciliationEnvelope = {
@@ -272,6 +274,7 @@ describe("V2 agent event stream", () => {
       expect(text).not.toContain('"graphRevision"')
       expect(text).not.toContain("task-graph-denial-checkpoint.v1")
       expect(text).not.toContain(marker)
+      expect(text).not.toContain("PRIVATE_DELTA_FINAL_CANDIDATE")
       expect(text).not.toContain("private-delta-event")
       expect(text).not.toContain("private-clarification-event")
       expect(text).not.toContain("private-denial-checkpoint-event")

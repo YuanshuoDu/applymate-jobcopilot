@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, SCHEDULED_PIPELINE_COMPLETION, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnEngineCompletionGate } from "./turn-execution-types.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
@@ -11,6 +11,7 @@ import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-assessment.js"
+import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
@@ -40,6 +41,43 @@ function gateWriter(): GateWriter {
 }
 
 describe("assertCompletionAllowed", () => {
+  it("runs scheduled continuation only after the ordinary completion gate allows the exact candidate", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    const continuation = vi.fn(async input => ({ status: "waiting_for_user" as const, waitId: "wait-123", candidateText: input.candidateText }))
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = continuation
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, " exact answer "))
+      .resolves.toEqual({ scheduledWaitId: "wait-123", candidateText: " exact answer " })
+    expect(continuation).toHaveBeenCalledWith(expect.objectContaining({ candidateText: " exact answer ", stepId: step.id }))
+  })
+
+  it("does not invoke scheduled continuation after an ordinary denial", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Children still run" })
+    const continuation = vi.fn(async () => ({ status: "completed" as const, candidateText: "answer" }))
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = continuation
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "answer"))
+      .rejects.toMatchObject({ code: "business_precondition_failed" })
+    expect(continuation).not.toHaveBeenCalled()
+  })
+
+  it("returns a typed blocker without fabricating a durable user wait", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async () => ({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" })
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "answer"))
+      .resolves.toEqual({ scheduledBlocker: "scheduled_pipeline_entitlement_required" })
+  })
+
+  it("passes through the same refresh-retry instance from scheduled continuation", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    const retry = new TurnStateRefreshRetryError()
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async () => { throw retry }
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "answer"))
+      .rejects.toBe(retry)
+  })
+
   it("keeps TaskGraph repair guidance and gives steering a distinct recovery instruction", () => {
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
     expect(completionRecoverySnapshot(snapshot, "step-2", STEERING_RECONCILIATION_FEEDBACK).system[0]?.content)
