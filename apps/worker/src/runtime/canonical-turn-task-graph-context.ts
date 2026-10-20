@@ -22,9 +22,7 @@ export function isSelectedJobRootTool(definition: unknown): boolean {
   const name = record(definition)?.name
   return typeof name === "string" && SELECTED_JOB_ROOT_TOOLS.has(name)
 }
-export function selectedJobToolAllowed(name: string): boolean {
-  return SELECTED_JOB_ROOT_TOOLS.has(name)
-}
+export function selectedJobToolAllowed(name: string): boolean { return SELECTED_JOB_ROOT_TOOLS.has(name) }
 /** Restrict selected-job root context to coordination tools and the current graph observation. */
 export function selectedJobSnapshot(snapshot: StepContextSnapshot): StepContextSnapshot {
   return {
@@ -155,17 +153,11 @@ function projectionEvidenceKinds(value: unknown): TaskGraphProjectionEvidenceKin
   return value as TaskGraphProjectionEvidenceKind[]
 }
 
-function safeJobId(value: unknown): value is string {
-  return typeof value === "string" && SAFE_JOB_ID.test(value)
-}
+function safeJobId(value: unknown): value is string { return typeof value === "string" && SAFE_JOB_ID.test(value) }
 
-function count(value: unknown): value is number {
-  return Number.isSafeInteger(value) && Number(value) >= 0
-}
+function count(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 
-function validStatus(value: unknown): value is "completed" | "partial" {
-  return value === "completed" || value === "partial"
-}
+function validStatus(value: unknown): value is "completed" | "partial" { return value === "completed" || value === "partial" }
 
 function exactKeys(value: Record<string, unknown>, expected: string): boolean {
   const keys = Reflect.ownKeys(value)
