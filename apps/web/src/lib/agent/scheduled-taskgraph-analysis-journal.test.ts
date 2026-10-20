@@ -275,7 +275,7 @@ describe('runScheduledTaskGraphAnalyze', () => {
     expect(queryRaw.mock.calls[0]?.[0]).toMatchObject({ values: expect.arrayContaining([owner.rootTaskId]) })
     expect(queryRaw.mock.calls[1]?.[0]).toMatchObject({ values: expect.arrayContaining([owner.rootTaskId]) })
     expect(queryRaw.mock.calls[3]?.[0]).toMatchObject({ values: expect.arrayContaining([key, claimToken, JSON.stringify(owner)]) })
-    expect(sql[3]).toContain('jsonb_object_length')
+    expect(sql[3]).toContain('jsonb_object_keys')
   })
 
   it('permits a waiting approval only when the shared Gate proof validates the live scheduled state', async () => {

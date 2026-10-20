@@ -206,7 +206,8 @@ export async function scheduledTaskGraphScoreOwnerIsCurrent(input: {
     SELECT "id", "checkpoint", "state" FROM "agent_executions"
     WHERE "id" = ${owner.executionId} AND "userId" = ${owner.userId} AND "sessionId" = ${owner.sessionId}
       AND "status" = 'running' AND "attemptCount" = ${owner.executionAttemptCount}
-      AND jsonb_object_length("state"->'scheduledTaskGraphClaim') = 6
+      AND CASE WHEN jsonb_typeof("state"->'scheduledTaskGraphClaim') = 'object'
+        THEN (SELECT count(*) FROM jsonb_object_keys("state"->'scheduledTaskGraphClaim')) = 6 ELSE FALSE END
       AND "state"->'scheduledTaskGraphClaim'->>'schemaVersion' = 'agent-harness.v2.scheduled-pipeline-claim.v1'
       AND "state"->'scheduledTaskGraphClaim'->>'key' = ${key}
       AND "state"->'scheduledTaskGraphClaim'->>'claimToken' = ${claimToken}
