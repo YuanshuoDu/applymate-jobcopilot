@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import { Queue, Worker } from "bullmq"
 import Redis from "ioredis"
 import { Pool as PgPool } from "pg"
 
+import { releaseTurnLease, type TurnLease } from "../turns/lease.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import { drainAgentWakeups } from "../wakeup/consumer.js"
+import { AGENT_TURN_WAKEUP_TOPIC } from "../wakeup/types.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
@@ -13,6 +18,7 @@ import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attem
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT } from "./scheduled-pipeline-candidate-store.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const SCOUT_VERIFICATION: TaskGraphVerificationContract = {
@@ -36,19 +42,361 @@ type Fixture = Readonly<{
   analystTaskId: string
   jobId: string
   leaseOwnerId: string
+  executionId: string
 }>
+type IntegrationScheduledOwner = {
+  userId: string; sessionId: string; turnId: string; rootTaskId: string; rootAttemptCount: number
+  turnLeaseOwnerId: string; turnLeaseVersion: number; executionId: string; executionAttemptCount: number
+}
 
 let pool: PgPool | undefined
 let fixtureUserIds: string[] = []
+let disconnectWebDatabase: (() => Promise<void>) | undefined
+let priorDatabaseUrl: string | undefined
+const prismaApplicationName = `scheduled-analysis-${randomUUID()}`
+const analyzeModulePath = "@/lib/agent/stages/analyze"
+
+afterEach(() => {
+  vi.doUnmock(analyzeModulePath)
+  vi.resetModules()
+})
 
 describeWithServices("scheduled automation TaskGraph continuation on disposable PostgreSQL and Redis", () => {
   beforeAll(async () => {
     pool = new PgPool({ connectionString: databaseUrl!, max: 4 })
+    priorDatabaseUrl = process.env.DATABASE_URL
+    const prismaUrl = new URL(databaseUrl!)
+    prismaUrl.searchParams.set("application_name", prismaApplicationName)
+    process.env.DATABASE_URL = prismaUrl.toString()
   })
 
   afterAll(async () => {
     if (pool && fixtureUserIds.length) await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [fixtureUserIds])
     await pool?.end()
+    await disconnectWebDatabase?.()
+    if (priorDatabaseUrl === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = priorDatabaseUrl
+  })
+
+  it("reuses per-job Analyze journal rows after recreating the Worker runner", async () => {
+    const value = fixture()
+    fixtureUserIds.push(value.userId)
+    await seedGraph(pool!, value, graphSnapshot(value))
+    const owner = {
+      userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId,
+      rootAttemptCount: 1, turnLeaseOwnerId: value.leaseOwnerId, turnLeaseVersion: 4,
+      executionId: value.executionId, executionAttemptCount: 1,
+    }
+    const claimToken = `scheduled-analysis-claim-${randomUUID()}`
+    const jobIds = [value.jobId, `scheduled-pipeline-missing-${randomUUID()}`]
+    const jobs = jobIds.map(id => ({ id, userId: value.userId }))
+    const snapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+      targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], minScore: 70,
+      dailyCap: 10, requireApproval: true, autoApply: false }
+    const checkpointPath = "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint"
+    const checkpointModule = await import(checkpointPath) as unknown as {
+      scheduledAutomationSnapshotDigest: (value: unknown) => string
+      scheduledTaskGraphContinuationKey: (owner: IntegrationScheduledOwner, attestation: unknown) => string
+    }
+    const snapshotDigest = checkpointModule.scheduledAutomationSnapshotDigest(snapshot)
+    const attestation = {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1",
+      owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion },
+      snapshotDigest, graphRevision: 1,
+      scout: { taskId: value.scoutTaskId, attemptCount: 1, status: "completed", verification: "passed",
+        resultDigest: "a".repeat(64), candidateJobIds: jobIds,
+        discoveryReceipt: { status: "complete", taskId: value.scoutTaskId, attemptCount: 1, completedCalls: 1,
+          candidateCount: jobIds.length, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: "b".repeat(64) } },
+      analyst: { taskId: value.analystTaskId, attemptCount: 1, status: "completed", verification: "passed",
+        resultDigest: "c".repeat(64), dependsOnTaskIds: [value.scoutTaskId], jobIds },
+      evidenceDigest: "d".repeat(64),
+    }
+    const key = checkpointModule.scheduledTaskGraphContinuationKey(owner, attestation)
+    const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner,
+    } }
+    await seedScheduledExecution(pool!, value, initialState)
+
+    const pendingCalls: string[][] = [], modeledJobs: string[] = []
+    let crashAfterFirstScore = true
+    vi.doMock(analyzeModulePath, async () => {
+      const actual = await vi.importActual<Record<string, unknown>>(analyzeModulePath)
+      return {
+        ...actual,
+        runAnalyze: async (pending: Array<{ id: string; userId: string }>, _ctx: unknown,
+          recovery?: { existingScoredJobs?: Array<{ job: { id: string }; score: number; matchedKeywords: string[]; missingKeywords: string[]; recommendation: string; analysisFenceAt: string }>; initialFailed?: number;
+            beforeScore?: (jobId: string) => Promise<void>; onScoredJob?: (row: { job: { id: string }; score: number; matchedKeywords: string[]; missingKeywords: string[]; recommendation: string; analysisFenceAt: string }) => Promise<void> }) => {
+          pendingCalls.push(pending.map(job => job.id))
+          const scoredJobs = [...(recovery?.existingScoredJobs ?? [])]
+          for (const job of pending) {
+            modeledJobs.push(job.id)
+            await recovery?.beforeScore?.(job.id)
+            const scored = { job, score: job.id === jobIds[0] ? 82 : 74, matchedKeywords: ["TypeScript"],
+              missingKeywords: ["AWS"], recommendation: "Apply after tailoring.", analysisFenceAt: new Date().toISOString() }
+            await recovery?.onScoredJob?.(scored)
+            scoredJobs.push(scored)
+            if (crashAfterFirstScore) { crashAfterFirstScore = false; throw new Error("simulated worker restart") }
+          }
+          return { stage: "analyze", ok: true, data: { scoredJobs, failed: recovery?.initialFailed ?? 0 },
+            metrics: { durationMs: 1, count: scoredJobs.length } }
+        },
+      }
+    })
+    const webDbPath = "@/lib/db"
+    const webDb = await import(webDbPath) as unknown as { db: { $disconnect: () => Promise<void> } }
+    disconnectWebDatabase = () => webDb.db.$disconnect()
+    const journalPath = "@/lib/agent/scheduled-taskgraph-analysis-journal"
+    const fencePath = "@/lib/agent/scheduled-taskgraph-pipeline-fence"
+    let journal = await import(journalPath) as unknown as {
+      runScheduledTaskGraphAnalyze: (input: { jobs: Array<{ id: string; userId: string }>; ctx: unknown; owner: typeof owner; key: string;
+        claimToken: string; snapshot: unknown; attestation: unknown; state: unknown;
+        persist: (state: unknown) => Promise<void> }) => Promise<{ analysis: { data?: { scoredJobs: Array<{ job: { id: string }; score: number }>; failed: number } }; checkpoint: { scoredJobs?: Array<{ job: { id: string }; score: number }> } }>
+      scheduledTaskGraphScoreOwnerIsCurrent: (input: { tx: unknown; owner: typeof owner; key: string; claimToken: string }) => Promise<boolean>
+    }
+    let fence = await import(fencePath) as unknown as {
+      saveScheduledTaskGraphCheckpoint: (input: { expectedState: unknown; state: unknown; owner: typeof owner; key: string; claimToken: string;
+        assertOwnerCurrent: (tx: unknown) => Promise<boolean> }) => Promise<boolean>
+    }
+    let persistedState: unknown = initialState
+    const persist = async (state: unknown) => {
+      const saved = await fence.saveScheduledTaskGraphCheckpoint({ expectedState: persistedState, state, owner, key, claimToken,
+        assertOwnerCurrent: tx => journal.scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key, claimToken }) })
+      if (!saved) throw new Error("scheduled checkpoint owner fence rejected persistence")
+      persistedState = state
+    }
+    const runInput = (state: unknown, write: typeof persist) => ({ jobs, ctx: {}, owner, key, claimToken, snapshot, attestation, state, persist: write })
+    await expect(journal.runScheduledTaskGraphAnalyze(runInput(initialState, persist))).rejects.toThrow("simulated worker restart")
+    const afterCrash = (await pool!.query<{ state: Record<string, unknown> }>(
+      `SELECT "state" FROM "agent_executions" WHERE "id" = $1`, [value.executionId])).rows[0]?.state
+    expect(afterCrash?.scoredJobs).toMatchObject([{ job: { id: jobIds[0] }, score: 82 }])
+
+    vi.resetModules()
+    journal = await import(journalPath) as typeof journal
+    fence = await import(fencePath) as typeof fence
+    const restartedRun = await journal.runScheduledTaskGraphAnalyze(runInput(afterCrash, persist))
+    expect(pendingCalls).toEqual([[jobIds[0], jobIds[1]], [jobIds[1]]])
+    expect(modeledJobs).toEqual([jobIds[0], jobIds[1]])
+    expect(restartedRun.analysis.data?.scoredJobs.map(row => [row.job.id, row.score])).toEqual([[jobIds[0], 82], [jobIds[1], 74]])
+    expect(restartedRun.checkpoint.scoredJobs?.map(row => row.job.id)).toEqual(jobIds)
+  })
+
+  it("rejects checkpoint, wait and finish writes when the locked Turn lease expires", async () => {
+    const value = fixture()
+    fixtureUserIds.push(value.userId)
+    await seedGraph(pool!, value, graphSnapshot(value))
+    const owner = {
+      userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId,
+      rootAttemptCount: 1, turnLeaseOwnerId: value.leaseOwnerId, turnLeaseVersion: 4,
+      executionId: value.executionId, executionAttemptCount: 1,
+    }
+    const key = `scheduled-taskgraph:${randomUUID()}`
+    const claimToken = `scheduled-analysis-claim-${randomUUID()}`
+    const state = { nextStage: "execute", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner },
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner,
+        snapshotDigest: `sha256:${"e".repeat(64)}`, graphRevision: 1, evidenceDigest: "f".repeat(64) } }
+    await seedScheduledExecution(pool!, value, state)
+    const journalPath = "@/lib/agent/scheduled-taskgraph-analysis-journal"
+    const fencePath = "@/lib/agent/scheduled-taskgraph-pipeline-fence"
+    const journal = await import(journalPath) as unknown as {
+      scheduledTaskGraphScoreOwnerIsCurrent: (input: { tx: unknown; owner: typeof owner; key: string; claimToken: string }) => Promise<boolean>
+    }
+    const fence = await import(fencePath) as unknown as {
+      saveScheduledTaskGraphCheckpoint: (input: { expectedState: unknown; state: unknown; owner: typeof owner; key: string; claimToken: string;
+        assertOwnerCurrent: (tx: unknown) => Promise<boolean> }) => Promise<boolean>
+      persistScheduledTaskGraphWaitMarker: (input: { state: unknown; owner: typeof owner; key: string; claimToken: string; waitId: string; stage: string;
+        assertOwnerCurrent: (tx: unknown) => Promise<boolean> }) => Promise<unknown>
+      finishScheduledTaskGraphExecution: (input: { state: unknown; owner: typeof owner; key: string; claimToken: string; status: "completed";
+        assertOwnerCurrent: (tx: unknown) => Promise<boolean> }) => Promise<boolean>
+    }
+    const assertOwnerCurrent = (tx: unknown) => journal.scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key, claimToken })
+    const attempts: Array<{ name: string; run: () => Promise<unknown> }> = [
+      { name: "checkpoint", run: () => fence.saveScheduledTaskGraphCheckpoint({ expectedState: state, state: { ...state, nextStage: "audit" }, owner, key, claimToken, assertOwnerCurrent }) },
+      { name: "wait marker", run: () => fence.persistScheduledTaskGraphWaitMarker({ state, owner, key, claimToken,
+        waitId: `scheduled-wait-${randomUUID()}`, stage: "post-run", assertOwnerCurrent }) },
+      { name: "finish", run: () => fence.finishScheduledTaskGraphExecution({ state, owner, key, claimToken, status: "completed", assertOwnerCurrent }) },
+    ]
+
+    for (const attempt of attempts) {
+      await pool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = clock_timestamp() + INTERVAL '2 seconds' WHERE "id" = $1`, [value.turnId])
+      const blocker = await pool!.connect()
+      try {
+        await blocker.query("BEGIN")
+        await blocker.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 FOR UPDATE`, [value.turnId])
+        const pending = attempt.run()
+        await waitForTurnOwnerLockWait(pool!, prismaApplicationName)
+        const lease = await pool!.query<{ unexpired: boolean }>(`SELECT "leaseExpiresAt" > clock_timestamp() AS "unexpired"
+          FROM "agent_turns" WHERE "id" = $1`, [value.turnId])
+        expect(lease.rows[0]?.unexpired).toBe(true)
+        await waitUntilTurnLeaseExpires(pool!, value.turnId)
+        await blocker.query("COMMIT")
+        await expect(pending, attempt.name).resolves.toBeFalsy()
+      } finally {
+        await blocker.query("ROLLBACK").catch(() => undefined)
+        blocker.release()
+      }
+      const persisted = (await pool!.query<{ status: string; state: Record<string, unknown> }>(
+        `SELECT "status", "state" FROM "agent_executions" WHERE "id" = $1`, [value.executionId])).rows[0]
+      expect(persisted).toMatchObject({ status: "running", state })
+    }
+  }, 25_000)
+
+  it("recovers a private staged candidate under the live lease after lease rollover", async () => {
+    const value = fixture()
+    fixtureUserIds.push(value.userId)
+    await seedGraph(pool!, value, graphSnapshot(value))
+    const stepId = `scheduled-final-step-${value.turnId}`
+    await pool!.query(`INSERT INTO "agent_steps"
+      ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt")
+      VALUES ($1, $2, $3, $4, 7, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+    [stepId, value.sessionId, value.turnId, value.rootTaskId])
+    const turn = (await pool!.query<{ userId: string; leaseOwnerId: string; leaseVersion: number; leaseExpiresAt: Date | string }>(
+      `SELECT "userId", "leaseOwnerId", "leaseVersion", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1`, [value.turnId])).rows[0]!
+    const writer: TurnExecutionOwnerFence = { kind: "turn", userId: turn.userId, sessionId: value.sessionId, turnId: value.turnId,
+      taskId: value.rootTaskId, rootTaskId: value.rootTaskId, ownerId: turn.leaseOwnerId, leaseVersion: turn.leaseVersion,
+      leaseExpiresAt: new Date(turn.leaseExpiresAt) }
+    const store = createScheduledPipelineCandidateStore(pool!, createPgTurnEngineStore(pool!))
+    await store.stage({ owner: writer, rootAttemptCount: 1, finalStepId: stepId, finalStepOrdinal: 7,
+      candidateText: "Exact durable scheduled final candidate." })
+    const saved = await pool!.query<{ type: string; taskId: string; correlationId: string; payload: Record<string, unknown> }>(
+      `SELECT "type", "taskId", "correlationId", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3`,
+      [value.sessionId, value.turnId, SCHEDULED_PIPELINE_CANDIDATE_EVENT])
+    expect(saved.rows).toHaveLength(1)
+    expect(saved.rows[0]).toMatchObject({ type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, taskId: value.rootTaskId, correlationId: stepId,
+      payload: { candidateText: "Exact durable scheduled final candidate.", rootAttemptCount: 1, stepAttempt: 1,
+        writerLeaseOwnerId: writer.ownerId, writerLeaseVersion: writer.leaseVersion } })
+
+    const recovery = await pool!.query<{ leaseVersion: number; leaseExpiresAt: Date | string }>(`UPDATE "agent_turns"
+      SET "leaseOwnerId" = $1, "leaseVersion" = "leaseVersion" + 1, "leaseStartedAt" = CURRENT_TIMESTAMP,
+          "leaseExpiresAt" = CURRENT_TIMESTAMP + INTERVAL '5 minutes', "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $2 RETURNING "leaseVersion", "leaseExpiresAt"`, [`recovered-${value.leaseOwnerId}`, value.turnId])
+    const current: TurnExecutionOwnerFence = { ...writer, ownerId: `recovered-${value.leaseOwnerId}`,
+      leaseVersion: Number(recovery.rows[0]!.leaseVersion), leaseExpiresAt: new Date(recovery.rows[0]!.leaseExpiresAt) }
+    await expect(store.read({ owner: current, rootAttemptCount: 1 }))
+      .resolves.toBe("Exact durable scheduled final candidate.")
+    await expect(store.read({ owner: current, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_root_attempt_changed")
+    const laterStep = `scheduled-later-step-${value.turnId}`
+    await pool!.query(`INSERT INTO "agent_steps"
+      ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt")
+      VALUES ($1, $2, $3, $4, 8, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+    [laterStep, value.sessionId, value.turnId, value.rootTaskId])
+    await expect(store.read({ owner: current, rootAttemptCount: 1 })).resolves.toBeNull()
+  })
+
+  it("defers an answered scheduled continuation until root settlement and resumes it once", async () => {
+    const value = fixture()
+    fixtureUserIds.push(value.userId)
+    await seedGraph(pool!, value, graphSnapshot(value))
+
+    const transitionTurnId = `scheduled-transition-turn-${randomUUID()}`
+    const transitionOwnerId = `scheduled-transition-owner-${randomUUID()}`
+    await pool!.query(`INSERT INTO "agent_turns"
+      ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+        "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "executionMode", "updatedAt")
+      SELECT $1, turn."sessionId", turn."userId", 'in_progress', turn."source", turn."input", turn."modelProfileSnapshot",
+        turn."toolPolicySnapshot", turn."budgetSnapshot", $2, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP,
+        turn."leaseVersion", turn."executionMode", CURRENT_TIMESTAMP
+      FROM "agent_turns" AS turn WHERE turn."id" = $3`, [transitionTurnId, transitionOwnerId, value.turnId])
+    const transitionLeaseRow = (await pool!.query<{
+      userId: string; leaseOwnerId: string; leaseVersion: number; leaseStartedAt: Date | string; leaseExpiresAt: Date | string
+    }>(`SELECT "userId", "leaseOwnerId", "leaseVersion", "leaseStartedAt", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1`, [transitionTurnId])).rows[0]
+    expect(transitionLeaseRow).toBeDefined()
+    const transitionLease: TurnLease = {
+      turnId: transitionTurnId, sessionId: value.sessionId, ownerId: transitionLeaseRow!.leaseOwnerId,
+      userId: transitionLeaseRow!.userId, leaseVersion: transitionLeaseRow!.leaseVersion,
+      leaseStartedAt: new Date(transitionLeaseRow!.leaseStartedAt), leaseExpiresAt: new Date(transitionLeaseRow!.leaseExpiresAt),
+    }
+    expect(await releaseTurnLease(pool!, transitionLease, "waiting_for_user")).toBe(true)
+    const transitionResult = await pool!.query<{ status: string; revision: number }>(
+      `SELECT "status", "revision" FROM "agent_turns" WHERE "id" = $1`, [transitionTurnId])
+    expect(transitionResult.rows[0]).toEqual({ status: "waiting_for_user", revision: 1 })
+
+    const waitId = `scheduled-continuation-${randomUUID()}`
+    const itemId = `agent-wait:question:${waitId}`
+    const toolCallId = `scheduled-continuation-call-${randomUUID()}`
+    const waitCreated = await pool!.query<{ revision: number }>(`UPDATE "agent_turns"
+      SET "status" = 'waiting_for_user', "revision" = "revision" + 1, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "status" = 'in_progress' RETURNING "revision"`, [value.turnId])
+    expect(Number(waitCreated.rows[0]?.revision)).toBe(1)
+    await pool!.query(`INSERT INTO "agent_items"
+      ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, 'question', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+      itemId, value.sessionId, value.turnId, value.rootTaskId,
+      JSON.stringify({ waitKind: "question", questionId: waitId, toolCallId, answer: "continue", answerAvailable: true }),
+    ])
+    const answeredTurn = await pool!.query<{ revision: number }>(`UPDATE "agent_turns"
+      SET "revision" = "revision" + 1, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "status" = 'waiting_for_user' AND "revision" = $2 RETURNING "revision"`, [value.turnId, waitCreated.rows[0]!.revision])
+    expect(Number(answeredTurn.rows[0]?.revision)).toBe(2)
+
+    const answerEventId = randomUUID()
+    const wakeupEventId = randomUUID()
+    const wakeupPayload = {
+      waitKind: "question", waitId, itemId, turnId: value.turnId, toolCallId, status: "answered", nextTurnRevision: 2,
+    }
+    const sequenceResult = await pool!.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions"
+      SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`, [value.sessionId])
+    const answerSequence = sequenceResult.rows[0]?.eventSequence
+    if (answerSequence === undefined) throw new Error("Scheduled answer fixture could not allocate its event sequence")
+    await pool!.query(`INSERT INTO "agent_events"
+      ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+      VALUES ($1, $2, $3, $4, NULL, $5, 'question.answered', 'user', $6, $7, $8::jsonb)`, [
+      answerEventId, value.sessionId, value.turnId, itemId, String(answerSequence), waitId,
+      `scheduled-answer:${waitId}`, JSON.stringify({ ...wakeupPayload, answerAvailable: true }),
+    ])
+    const wakeupSequenceResult = await pool!.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions"
+      SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`, [value.sessionId])
+    const wakeupSequence = wakeupSequenceResult.rows[0]?.eventSequence
+    if (wakeupSequence === undefined) throw new Error("Scheduled wakeup fixture could not allocate its event sequence")
+    await pool!.query(`INSERT INTO "agent_events"
+      ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+      VALUES ($1, $2, $3, $4, NULL, $5, 'turn.wakeup', 'system', $6, $7, $8, $9::jsonb)`, [
+      wakeupEventId, value.sessionId, value.turnId, itemId, String(wakeupSequence), value.turnId, answerEventId,
+      `scheduled-answer:${waitId}:wakeup`, JSON.stringify(wakeupPayload),
+    ])
+    await pool!.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+      VALUES ($1, $2, $3, $4, $5::jsonb)`, [
+      `scheduled-wakeup-${wakeupEventId}`, AGENT_TURN_WAKEUP_TOPIC, value.sessionId, `scheduled-answer:${waitId}:wakeup`,
+      JSON.stringify({ eventId: wakeupEventId, sessionId: value.sessionId, turnId: value.turnId, itemId, type: "turn.wakeup", payload: wakeupPayload }),
+    ])
+
+    const rootBeforeSettlement = await pool!.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [value.rootTaskId])
+    expect(rootBeforeSettlement.rows[0]?.status).toBe("running")
+    await expect(drainAgentWakeups(pool!, 10)).resolves.toBe(0)
+    const deferred = await pool!.query<{ publishedAt: Date | null; attemptCount: number; lastError: string | null }>(
+      `SELECT "publishedAt", "attemptCount", "lastError" FROM "agent_outbox" WHERE "id" = $1`, [`scheduled-wakeup-${wakeupEventId}`])
+    expect(deferred.rows[0]).toMatchObject({ publishedAt: null, attemptCount: 0, lastError: null })
+    const dispatchBeforeSettlement = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${value.turnId}`])
+    expect(dispatchBeforeSettlement.rows).toHaveLength(0)
+
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'waiting_for_user', "leaseOwner" = NULL,
+      "leaseExpiresAt" = NULL, "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "status" = 'running'`, [value.rootTaskId])
+    const liveTurnRow = (await pool!.query<{
+      userId: string; leaseOwnerId: string; leaseVersion: number; leaseStartedAt: Date | string; leaseExpiresAt: Date | string
+    }>(`SELECT "userId", "leaseOwnerId", "leaseVersion", "leaseStartedAt", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1`, [value.turnId])).rows[0]
+    expect(liveTurnRow).toBeDefined()
+    const rootLease: TurnLease = {
+      turnId: value.turnId, sessionId: value.sessionId, ownerId: liveTurnRow!.leaseOwnerId,
+      userId: liveTurnRow!.userId, leaseVersion: liveTurnRow!.leaseVersion,
+      leaseStartedAt: new Date(liveTurnRow!.leaseStartedAt), leaseExpiresAt: new Date(liveTurnRow!.leaseExpiresAt),
+    }
+    expect(await releaseTurnLease(pool!, rootLease, "waiting_for_user")).toBe(true)
+    const settledTurn = await pool!.query<{ status: string; revision: number; leaseOwnerId: string | null; leaseExpiresAt: Date | null }>(
+      `SELECT "status", "revision", "leaseOwnerId", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1`, [value.turnId])
+    expect(settledTurn.rows[0]).toEqual({ status: "waiting_for_user", revision: 2, leaseOwnerId: null, leaseExpiresAt: null })
+
+    await expect(drainAgentWakeups(pool!, 10)).resolves.toBe(1)
+    await expect(drainAgentWakeups(pool!, 10)).resolves.toBe(0)
+    const resumed = await pool!.query<{ status: string; revision: number; leaseOwnerId: string | null }>(
+      `SELECT "status", "revision", "leaseOwnerId" FROM "agent_turns" WHERE "id" = $1`, [value.turnId])
+    expect(resumed.rows[0]).toEqual({ status: "queued", revision: 3, leaseOwnerId: null })
+    const resumedEvents = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.resumed'`, [value.sessionId, value.turnId])
+    expect(resumedEvents.rows).toHaveLength(1)
+    const dispatchAfterResume = await pool!.query(`SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${value.turnId}`])
+    expect(dispatchAfterResume.rows).toHaveLength(1)
+    expect(dispatchAfterResume.rows[0]?.publishedAt).toBeNull()
   })
 
   it("rechecks persisted Scout → Analyst evidence on duplicate continuation after a Worker restart", async () => {
@@ -338,7 +686,35 @@ function fixture(): Fixture {
     analystTaskId: `scheduled-pipeline-analyst-${suffix}`,
     jobId: `scheduled-pipeline-job-${suffix}`,
     leaseOwnerId: `scheduled-pipeline-turn-owner-${suffix}`,
+    executionId: `scheduled-pipeline-execution-${suffix}`,
   }
+}
+
+async function seedScheduledExecution(database: PgPool, value: Fixture, state: Record<string, unknown>): Promise<void> {
+  await database.query(`INSERT INTO "agent_executions"
+    ("id", "userId", "sessionId", "status", "checkpoint", "state", "attemptCount", "startedAt", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, 'running', 'scout', $4::jsonb, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [value.executionId, value.userId, value.sessionId, JSON.stringify(state)])
+}
+
+async function waitForTurnOwnerLockWait(database: PgPool, applicationName: string): Promise<void> {
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const waiting = await database.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM pg_stat_activity
+      WHERE "application_name" = $1 AND "wait_event_type" = 'Lock' AND "query" ILIKE '%agent_turns%'`, [applicationName])
+    if (Number(waiting.rows[0]?.count) > 0) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error("Scheduled owner fence did not block on the locked Turn row")
+}
+
+async function waitUntilTurnLeaseExpires(database: PgPool, turnId: string): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const result = await database.query<{ expired: boolean }>(`SELECT "leaseExpiresAt" <= clock_timestamp() AS "expired"
+      FROM "agent_turns" WHERE "id" = $1`, [turnId])
+    if (result.rows[0]?.expired) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error("Scheduled Turn lease did not expire while the owner fence was blocked")
 }
 
 function scheduledAutomationSnapshot() {

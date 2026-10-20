@@ -23,6 +23,8 @@ const mocks = vi.hoisted(() => ({
   pause: vi.fn(),
   runPipeline: vi.fn(),
   runAnalyze: vi.fn(),
+  runScheduledTaskGraphAnalyze: vi.fn(),
+  scoreOwnerFence: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -43,6 +45,12 @@ vi.mock("@/lib/agent/pipeline", async (importOriginal) => {
   return { ...actual, runPipeline: mocks.runPipeline };
 });
 vi.mock("@/lib/agent/stages/analyze", () => ({ runAnalyze: mocks.runAnalyze }));
+vi.mock("@/lib/agent/scheduled-taskgraph-analysis-journal", () => ({
+  runScheduledTaskGraphAnalyze: mocks.runScheduledTaskGraphAnalyze,
+  scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwnerFence,
+  createScheduledTaskGraphOwnerFence: (scheduled: { owner: unknown; key: string; claimToken: string } | undefined) => scheduled
+    ? (tx: unknown) => mocks.scoreOwnerFence({ tx, ...scheduled }) : async () => false,
+}));
 vi.mock("@/lib/runtime-feature-flags", () => ({
   isRuntimeAgentHarnessFeatureEnabled: vi.fn(async () => false),
 }));
@@ -110,6 +118,7 @@ describe("runAgentPipeline", () => {
     mocks.executionTransaction.mockImplementation((work: (tx: unknown) => Promise<unknown>) => work({
       agentExecution: { updateMany: mocks.executionUpdateMany, findUnique: mocks.executionFindUnique },
     }));
+    mocks.scoreOwnerFence.mockResolvedValue(true);
     mocks.record.mockResolvedValue({});
     mocks.activate.mockResolvedValue(true);
     mocks.createRecorder.mockResolvedValue({ sessionId: "session_1", activate: mocks.activate, getTurnId: vi.fn(() => undefined), record: mocks.record, finalize: mocks.finalize, pause: mocks.pause });
@@ -166,7 +175,9 @@ describe("runAgentPipeline", () => {
       schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey, claimToken: scheduledClaimToken, owner: scheduledOwner,
     } };
     const timeline: string[] = [];
-    mocks.runAnalyze.mockResolvedValue(emptyAnalysis);
+    mocks.runScheduledTaskGraphAnalyze.mockResolvedValue({ analysis: emptyAnalysis, checkpoint: buildScheduledTaskGraphPrepareCheckpoint({
+      owner: scheduledOwner, snapshot: scheduledSnapshot, attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState,
+    }).checkpoint });
     mocks.executionUpdateMany.mockImplementation(async (input: { data?: { state?: Record<string, unknown> } }) => {
       if (input.data?.state?.scheduledTaskGraphWait) timeline.push("wait_marker");
       return { count: 1 };
@@ -185,10 +196,32 @@ describe("runAgentPipeline", () => {
     await expect(runAgentPipeline(scheduledRunInput(initialState))).resolves.toEqual({
       status: "waiting_for_user", waitId: "agent-question:turn_1:canonical:q1", stage: "writer",
     });
-    expect(mocks.runAnalyze).toHaveBeenCalledTimes(1);
-    expect(mocks.runAnalyze).toHaveBeenCalledWith([], expect.any(Object));
+    expect(mocks.runScheduledTaskGraphAnalyze).toHaveBeenCalledTimes(1);
     expect(timeline).toEqual(["wait_marker", "question"]);
     expect(mocks.pause).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the active scheduled claim fence into the Analyze score transaction hook", async () => {
+    const { runAgentPipeline } = await import("./run-service");
+    const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation);
+    const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey, claimToken: scheduledClaimToken, owner: scheduledOwner,
+    } };
+    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot: scheduledSnapshot,
+      attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState }).checkpoint;
+    const tx = { marker: "score-transaction" };
+    mocks.scoreOwnerFence.mockResolvedValue(true);
+    mocks.runScheduledTaskGraphAnalyze.mockImplementationOnce(async rawInput => {
+      const assertCurrent = (rawInput as { assertScoreOwnerCurrent: (tx: unknown) => Promise<boolean> }).assertScoreOwnerCurrent;
+      await expect(assertCurrent(tx)).resolves.toBe(true);
+      return { analysis: emptyAnalysis, checkpoint };
+    });
+
+    await runAgentPipeline(scheduledRunInput(initialState));
+
+    expect(mocks.scoreOwnerFence).toHaveBeenCalledWith(expect.objectContaining({
+      tx, owner: scheduledOwner, key: continuationKey, claimToken: scheduledClaimToken,
+    }));
   });
 
   it("resumes a persisted Prepare checkpoint without invoking the legacy scorer again", async () => {
@@ -204,10 +237,31 @@ describe("runAgentPipeline", () => {
 
     await expect(runAgentPipeline(scheduledRunInput(prepared.checkpoint))).resolves.toMatchObject({ processed: 0 });
     expect(mocks.runAnalyze).not.toHaveBeenCalled();
+    expect(mocks.runScheduledTaskGraphAnalyze).not.toHaveBeenCalled();
     expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
       resumeState: expect.objectContaining({ nextStage: "prepare", scoredJobs: [],
         scheduledTaskGraphContinuation: expect.objectContaining({ key: continuationKey }) }),
     }));
+  });
+
+  it("does not complete or publish a scheduled execution after Turn ownership is taken over", async () => {
+    const { runAgentPipeline } = await import("./run-service");
+    const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation),
+      claimToken: scheduledClaimToken, owner: scheduledOwner,
+    } };
+    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot: scheduledSnapshot,
+      attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState }).checkpoint;
+    mocks.scoreOwnerFence.mockResolvedValueOnce(false);
+
+    await expect(runAgentPipeline(scheduledRunInput(checkpoint))).resolves.toBeNull();
+
+    expect(mocks.scoreOwnerFence).toHaveBeenCalledWith(expect.objectContaining({
+      owner: scheduledOwner, key: scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation), claimToken: scheduledClaimToken,
+      tx: expect.objectContaining({ agentExecution: expect.objectContaining({ updateMany: mocks.executionUpdateMany }) }),
+    }));
+    expect(mocks.executionUpdateMany).not.toHaveBeenCalled();
+    expect(mocks.finalize).not.toHaveBeenCalled();
   });
 
   it("marks questions canonical when a Turn is explicitly supplied", async () => {

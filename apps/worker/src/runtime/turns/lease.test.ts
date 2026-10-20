@@ -160,6 +160,7 @@ describe("database Turn lease", () => {
     await expect(releaseTurnLease(fake.pool, current, "waiting_for_user", now)).resolves.toBe(true)
     const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status" = $5')) ?? ["", []]
     expect(sql).toContain('"status" = \'in_progress\' OR ("status" = \'waiting_for_user\' AND $5 = \'waiting_for_user\')')
+    expect(sql).toContain('"revision" = "revision" + CASE WHEN "status" = $5 THEN 0 ELSE 1 END')
     expect(sql).toContain('"userId" = $7')
     expect(sql).toContain('"leaseExpiresAt" > $6')
     expect(params).toEqual([current.turnId, current.sessionId, current.ownerId, current.leaseVersion, "waiting_for_user", now, current.userId])
@@ -171,6 +172,7 @@ describe("database Turn lease", () => {
     await expect(releaseTurnLease(fake.pool, current, "waiting_for_approval", now)).resolves.toBe(true)
     const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status" = $5')) ?? ["", []]
     expect(sql).toContain('"status" = \'waiting_for_approval\' AND $5 = \'waiting_for_approval\'')
+    expect(sql).toContain('"revision" = "revision" + CASE WHEN "status" = $5 THEN 0 ELSE 1 END')
     expect(sql).toContain('"leaseOwnerId" = $3')
     expect(sql).toContain('"leaseVersion" = $4')
     expect(sql).toContain('"leaseExpiresAt" > $6')

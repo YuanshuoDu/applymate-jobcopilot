@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Job } from "@prisma/client";
 import { createScheduledTaskGraphWaitState, finishScheduledTaskGraphExecution, loadDurableScheduledTaskGraphWait, loadScheduledTaskGraphWaitQuestion, persistScheduledTaskGraphWaitMarker, readScheduledTaskGraphWaitMarker, rebindScheduledTaskGraphWaitState, saveScheduledTaskGraphCheckpoint } from "./scheduled-taskgraph-pipeline-fence";
+import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey } from "./scheduled-taskgraph-pipeline-checkpoint";
 
-const mocks = vi.hoisted(() => ({ turn: vi.fn(), root: vi.fn(), execution: vi.fn(), executionUpdateMany: vi.fn(), item: vi.fn() }));
+const mocks = vi.hoisted(() => ({ turn: vi.fn(), root: vi.fn(), execution: vi.fn(), executionUpdateMany: vi.fn(), transaction: vi.fn(), item: vi.fn() }));
 vi.mock("@/lib/db", () => ({
   db: {
+    $transaction: mocks.transaction,
     agentTurn: { findFirst: mocks.turn },
     subAgentTask: { findFirst: mocks.root },
     agentExecution: { findFirst: mocks.execution, updateMany: mocks.executionUpdateMany },
@@ -19,6 +22,22 @@ const owner = {
 const key = "continuation-key", claimToken = "claim-token-a";
 const claim = { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key, claimToken, owner };
 const waitId = "agent-question:turn-1:canonical:q1", waitStage = "writer";
+let transactionClient: unknown;
+const snapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"], targetLocations: ["Dublin"],
+  minScore: 70, dailyCap: 5, requireApproval: true, autoApply: false };
+
+function proofFor(evidenceOwner: typeof owner) {
+  const proofOwner = { userId: evidenceOwner.userId, sessionId: evidenceOwner.sessionId, turnId: evidenceOwner.turnId,
+    rootTaskId: evidenceOwner.rootTaskId, rootAttemptCount: evidenceOwner.rootAttemptCount,
+    turnLeaseOwnerId: evidenceOwner.turnLeaseOwnerId, turnLeaseVersion: evidenceOwner.turnLeaseVersion };
+  return { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner: proofOwner,
+    snapshotDigest: scheduledAutomationSnapshotDigest(snapshot), graphRevision: 9,
+    scout: { taskId: "scout-task", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "a".repeat(64),
+      candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete", taskId: "scout-task", attemptCount: 1,
+        completedCalls: 1, candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: "b".repeat(64) } },
+    analyst: { taskId: "analyst-task", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "c".repeat(64),
+      dependsOnTaskIds: ["scout-task"], jobIds: ["job-1"] }, evidenceDigest: "d".repeat(64) };
+}
 
 function durableWaitingState() {
   return createScheduledTaskGraphWaitState({ nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
@@ -40,6 +59,8 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
     mocks.executionUpdateMany.mockResolvedValue({ count: 1 });
+    transactionClient = { agentExecution: { updateMany: mocks.executionUpdateMany } };
+    mocks.transaction.mockImplementation((work: (tx: unknown) => Promise<unknown>) => work(transactionClient));
     mocks.turn.mockResolvedValue({ status: "in_progress", leaseOwnerId: owner.turnLeaseOwnerId,
       leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date(Date.now() + 60_000) });
     mocks.root.mockResolvedValue({ status: "running", attemptCount: owner.rootAttemptCount,
@@ -62,6 +83,24 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     expect(fence.scheduledTaskGraphClaimMatches({ scheduledTaskGraphClaim: { ...claim, owner: { ...owner, turnLeaseVersion: 5 } } }, key, owner)).toBe(false);
     expect(fence.scheduledTaskGraphClaimMatches({ scheduledTaskGraphClaim: { ...claim, schemaVersion: "unknown" } }, key, owner)).toBe(false);
     expect(fence.scheduledTaskGraphClaimMatches({ scheduledTaskGraphClaim: { ...claim, claimToken: "claim-token-b" } }, key, owner, claimToken)).toBe(false);
+  });
+
+  it("validates prior checkpoints against fresh owner-scoped Jobs before accepting or rebinding", async () => {
+    const fence = await import("./scheduled-taskgraph-pipeline-fence");
+    const priorOwner = { ...owner, turnLeaseOwnerId: "worker-old", turnLeaseVersion: 3 };
+    const priorAttestation = proofFor(priorOwner), currentAttestation = proofFor(owner);
+    const row = { id: "job-1", userId: owner.userId } as Job;
+    const prepared = buildScheduledTaskGraphPrepareCheckpoint({ owner: priorOwner, snapshot, attestation: priorAttestation,
+      ownedJobs: [row], analyzeResult: { stage: "analyze", ok: true, data: { scoredJobs: [{ job: row, score: 80,
+        matchedKeywords: ["TypeScript"], missingKeywords: [], recommendation: "Apply.", analysisFenceAt: "2026-10-19T12:00:00.123Z" }], failed: 0 },
+        metrics: { durationMs: 1, count: 1 } } });
+    const input = { state: prepared.checkpoint, owner, snapshot, attestation: currentAttestation, ownedJobs: [{ ...row }] as Job[] };
+
+    expect(fence.priorScheduledTaskGraphContinuation(input)).toEqual({ owner: priorOwner,
+      key: scheduledTaskGraphContinuationKey(priorOwner, priorAttestation) });
+    expect(fence.priorScheduledTaskGraphContinuation({ ...input, ownedJobs: [] })).toBeNull();
+    expect(fence.priorScheduledTaskGraphContinuation({ ...input,
+      state: { ...prepared.checkpoint, scoutedJobs: [], scoredJobs: [] } })).toBeNull();
   });
 
   it("accepts only a live Turn lease, active root attempt, and matching running execution claim", async () => {
@@ -134,7 +173,7 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
       scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
         key, owner, snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 9, evidenceDigest: "b".repeat(64) } };
     const waiting = await persistScheduledTaskGraphWaitMarker({ state: checkpoint, owner, key, claimToken,
-      waitId: "agent-question:turn-1:canonical:q1", stage: "writer" });
+      waitId: "agent-question:turn-1:canonical:q1", stage: "writer", assertOwnerCurrent: async () => true });
     expect(waiting).toMatchObject({ scheduledTaskGraphWait: { key, owner,
       waitId: "agent-question:turn-1:canonical:q1", stage: "writer" } });
     expect(mocks.executionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -143,7 +182,7 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     }));
     mocks.executionUpdateMany.mockResolvedValueOnce({ count: 0 });
     await expect(persistScheduledTaskGraphWaitMarker({ state: checkpoint, owner, key, claimToken,
-      waitId: "agent-question:turn-1:canonical:q1", stage: "writer" })).resolves.toBeNull();
+      waitId: "agent-question:turn-1:canonical:q1", stage: "writer", assertOwnerCurrent: async () => true })).resolves.toBeNull();
   });
 
   it("reads only the exact canonical wait item and recognizes an answered wake", async () => {
@@ -215,15 +254,36 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
   it("CAS-fences Prepare checkpoints and terminal state by the current claim token", async () => {
     const expectedState = { nextStage: "scout", scheduledTaskGraphClaim: claim };
     const checkpoint = { nextStage: "prepare" as const, scheduledTaskGraphClaim: claim } as unknown as import("./types").PipelineCheckpointState;
-    expect(await saveScheduledTaskGraphCheckpoint({ expectedState, state: checkpoint, owner, key, claimToken })).toBe(true);
+    const assertOwnerCurrent = vi.fn(async (tx: unknown) => tx === transactionClient);
+    expect(await saveScheduledTaskGraphCheckpoint({ expectedState, state: checkpoint, owner, key, claimToken, assertOwnerCurrent })).toBe(true);
+    expect(assertOwnerCurrent).toHaveBeenCalledWith(transactionClient);
     expect(mocks.executionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
       id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId, status: "running", attemptCount: 0,
       state: { equals: expectedState },
     }) }));
     const stale = { ...claim, claimToken: "claim-token-b" };
     const staleCheckpoint = { ...checkpoint, scheduledTaskGraphClaim: stale } as unknown as import("./types").PipelineCheckpointState;
-    await expect(saveScheduledTaskGraphCheckpoint({ expectedState, state: staleCheckpoint, owner, key, claimToken })).resolves.toBe(false);
-    await expect(finishScheduledTaskGraphExecution({ state: expectedState, owner, key, claimToken: "claim-token-b", status: "completed" })).resolves.toBe(false);
-    expect(await finishScheduledTaskGraphExecution({ state: expectedState, owner, key, claimToken, status: "completed" })).toBe(true);
+    await expect(saveScheduledTaskGraphCheckpoint({ expectedState, state: staleCheckpoint, owner, key, claimToken, assertOwnerCurrent })).resolves.toBe(false);
+    await expect(finishScheduledTaskGraphExecution({ state: expectedState, owner, key, claimToken: "claim-token-b", status: "completed", assertOwnerCurrent })).resolves.toBe(false);
+    expect(await finishScheduledTaskGraphExecution({ state: expectedState, owner, key, claimToken, status: "completed", assertOwnerCurrent })).toBe(true);
+  });
+
+  it("rejects checkpoint, wait, and terminal writes after a Turn owner takeover", async () => {
+    const expectedState = { nextStage: "scout", scheduledTaskGraphClaim: claim };
+    const checkpoint = { nextStage: "prepare" as const, scheduledTaskGraphClaim: claim } as unknown as import("./types").PipelineCheckpointState;
+    const waitState = { nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
+      scheduledTaskGraphClaim: claim,
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner,
+        snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 9, evidenceDigest: "b".repeat(64) } };
+    const assertOwnerCurrent = vi.fn(async (_tx: unknown) => false);
+
+    await expect(saveScheduledTaskGraphCheckpoint({ expectedState, state: checkpoint, owner, key, claimToken, assertOwnerCurrent })).resolves.toBe(false);
+    await expect(persistScheduledTaskGraphWaitMarker({ state: waitState, owner, key, claimToken,
+      waitId, stage: waitStage, assertOwnerCurrent })).resolves.toBeNull();
+    await expect(finishScheduledTaskGraphExecution({ state: expectedState, owner, key, claimToken, status: "completed", assertOwnerCurrent })).resolves.toBe(false);
+
+    expect(assertOwnerCurrent).toHaveBeenCalledTimes(3);
+    expect(assertOwnerCurrent.mock.calls.map(([tx]) => tx)).toEqual([transactionClient, transactionClient, transactionClient]);
+    expect(mocks.executionUpdateMany).not.toHaveBeenCalled();
   });
 });

@@ -119,10 +119,49 @@ describe("buildScheduledTaskGraphPrepareCheckpoint", () => {
 
   it("returns the persisted checkpoint before requiring another score run", () => {
     const first = build()
+    const rows = [job(jobAId), job(jobBId)]
     const result = buildScheduledTaskGraphPrepareCheckpoint({
-      owner, snapshot, attestation: attestation(), existingCheckpoint: first.checkpoint,
+      owner, snapshot, attestation: attestation(), ownedJobs: rows, existingCheckpoint: first.checkpoint,
     })
-    expect(result).toEqual({ checkpoint: first.checkpoint, continuationKey: first.continuationKey, alreadyPersisted: true })
+    expect(result).toMatchObject({ checkpoint: first.checkpoint, continuationKey: first.continuationKey, alreadyPersisted: true })
+    expect(result.checkpoint.scoutedJobs).toEqual(rows)
+    expect(result.checkpoint.scoredJobs?.every(item => rows.includes(item.job))).toBe(true)
+  })
+
+  it("fails closed when a nonempty attestation has empty persisted candidate and score arrays", () => {
+    const first = build()
+    const empty = { ...first.checkpoint, scoutedJobs: [], scoredJobs: [], analysisFailed: 0 }
+    expectBlocked(() => build({ existingCheckpoint: empty }), "jobs_mismatch")
+  })
+
+  it("rebuilds a persisted checkpoint with fresh owner-scoped Job objects", () => {
+    const first = build()
+    const fresh = [job(jobAId), job(jobBId)]
+    const validPersisted = JSON.parse(JSON.stringify(first.checkpoint)) as Record<string, unknown>
+    const result = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: attestation(), ownedJobs: fresh,
+      existingCheckpoint: validPersisted })
+
+    expect(result.checkpoint.scoutedJobs?.[0]).toBe(fresh[0])
+    expect(result.checkpoint.scoredJobs?.every(item => fresh.includes(item.job))).toBe(true)
+    expect(result.checkpoint.scoredJobs?.every(item => item.score >= 0 && item.score <= 100 && item.analysisFenceAt)).toBe(true)
+  })
+
+  it.each([
+    ["score outside 0–100", { score: 101 }],
+    ["missing analysis fence", { analysisFenceAt: undefined }],
+    ["failure count beyond candidate total", { analysisFailed: 1 }],
+  ])("rejects a persisted checkpoint with %s", (_label, patch) => {
+    const first = build()
+    const invalid = JSON.parse(JSON.stringify(first.checkpoint)) as Record<string, unknown>
+    if ("analysisFailed" in patch) invalid.analysisFailed = 3
+    else {
+      const scores = invalid.scoredJobs as Array<Record<string, unknown>>
+      if ("analysisFenceAt" in patch && patch.analysisFenceAt === undefined) {
+        scores[0] = { ...scores[0] }
+        delete scores[0].analysisFenceAt
+      } else scores[0] = { ...scores[0], ...patch }
+    }
+    expectBlocked(() => build({ existingCheckpoint: invalid }), "analysis_invalid")
   })
 
   it("rejects a persisted checkpoint created from different evidence", () => {
@@ -130,7 +169,7 @@ describe("buildScheduledTaskGraphPrepareCheckpoint", () => {
     const changed = attestation()
     changed.evidenceDigest = "e".repeat(64)
     expectBlocked(() => buildScheduledTaskGraphPrepareCheckpoint({
-      owner, snapshot, attestation: changed, existingCheckpoint: first.checkpoint,
+      owner, snapshot, attestation: changed, ownedJobs: [job(jobAId), job(jobBId)], existingCheckpoint: first.checkpoint,
     }), "checkpoint_conflict")
   })
 
@@ -144,6 +183,15 @@ describe("buildScheduledTaskGraphPrepareCheckpoint", () => {
     const zero = attestation([])
     const result = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: zero, ownedJobs: [] })
     expect(result.checkpoint).toMatchObject({ nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0 })
+  })
+
+  it("replays a valid persisted zero-result checkpoint", () => {
+    const zero = attestation([])
+    const first = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: zero, ownedJobs: [] })
+    const replay = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: zero,
+      ownedJobs: [], existingCheckpoint: first.checkpoint })
+    expect(replay).toMatchObject({ alreadyPersisted: true, continuationKey: first.continuationKey,
+      checkpoint: { nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0 } })
   })
 
   it.each([

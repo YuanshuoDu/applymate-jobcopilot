@@ -191,7 +191,7 @@ export async function taskGraphRuntimeForTurn(input: {
     : preparation ? taskGraphTemplatesForSelectedJob(preparation)
       : input.taskGraphTemplates
   if (automationSnapshot && !preparation && (!templates?.scout || !templates.analyst)) {
-    throw new Error("scheduled_automation_context_invalid")
+    return { enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode, templates: undefined }
   }
   return {
     enabled: true, selectedJobMode: Boolean(preparation), selectedJobPreparation: preparation, scheduledDraftMode,

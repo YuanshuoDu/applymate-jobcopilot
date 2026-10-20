@@ -15,6 +15,9 @@ import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, tagTa
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import { TurnStateRefreshRetryError, isTurnStateRefreshRetryError } from "./turn-execution-question.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
+import { signalWasInterrupted } from "../interrupt/registry.js"
 
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint }>
@@ -105,6 +108,33 @@ export async function completeTurnCandidate(input: Readonly<{
   }
   const gate = await assertCompletionAllowed(options, writer, step, signal, now, output.text,
     output.provider !== "recovered" && output.toolCalls.length === 0)
+  if (gate && "scheduledBlocker" in gate) {
+    await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason,
+      errorCode: gate.scheduledBlocker, inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+      estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now() })
+    await writer.append("step.completed", step.id, null,
+      { stepId: step.id, status: "waiting_for_dependency", errorCode: gate.scheduledBlocker, taskId: options.identity.taskId }, `step-completed:${step.id}`)
+    input.onStepClosed()
+    return { kind: "wait", result: { status: "waiting_for_dependency", errorCode: gate.scheduledBlocker, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
+  }
+  if (gate && "scheduledWaitId" in gate) {
+    if (gate.candidateText !== output.text) throw new TurnEngineError("invalid_output", "Scheduled wait changed the final candidate")
+    await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_user", finishReason: output.finishReason, errorCode: null,
+      inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+      estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now() })
+    await writer.append("step.completed", step.id, null,
+      { stepId: step.id, status: "waiting_for_user", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+    try {
+      if (!options.store.waitForUser) throw new Error("scheduled_wait_store_unavailable")
+      await options.store.waitForUser({ identity: options.identity, now: now() })
+    } catch (error: unknown) {
+      if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(signal)
+        || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
+      throw new TurnStateRefreshRetryError()
+    }
+    input.onStepClosed()
+    return { kind: "wait", result: { status: "waiting_for_user", waitId: gate.scheduledWaitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
+  }
   if (gate && "waitId" in gate) {
     await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason, errorCode: null,
       inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,

@@ -16,7 +16,7 @@ export interface AgentTurnWakeupPayload {
 }
 
 export interface WakeupResult {
-  status: "resumed" | "already_resumed" | "ignored"
+  status: "resumed" | "already_resumed" | "ignored" | "deferred"
   sessionId: string
   turnId: string
   itemId: string

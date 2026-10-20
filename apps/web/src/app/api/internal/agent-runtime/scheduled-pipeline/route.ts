@@ -4,18 +4,17 @@ import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig } from "@/lib/model-
 import { db } from "@/lib/db";
 import { runAgentPipeline, type ScheduledTaskGraphWaitResult } from "@/lib/agent/run-service";
 import { parseScheduledAutomationSnapshot } from "@/lib/agent/scheduled-automation-snapshot";
+import { completedScheduledTaskGraphReport, rebindScheduledTaskGraphAnalysisStateForLease } from "@/lib/agent/scheduled-taskgraph-analysis-journal";
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
-import { loadDurableScheduledTaskGraphWait, loadScheduledTaskGraphWaitQuestion, priorScheduledTaskGraphContinuation, readScheduledTaskGraphWaitMarker, rebindScheduledTaskGraphClaimForLease, rebindScheduledTaskGraphWaitState, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
+import { loadDurableScheduledTaskGraphWait, loadScheduledTaskGraphWaitQuestion, priorScheduledTaskGraphContinuation, readScheduledTaskGraphWaitMarker, rebindScheduledTaskGraphWaitState, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
 import { hasEffectiveEntitlement, isFeatureAllowed, resolveAiAccess } from "@/lib/entitlements";
 
 export const maxDuration = 300;
 const CLAIM_SCHEMA = "agent-harness.v2.scheduled-pipeline-claim.v1";
 const OWNER_KEYS = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion"];
-
 type RequestOwner = Pick<ScheduledTaskGraphPipelineOwner, "userId" | "sessionId" | "turnId" | "rootTaskId" | "rootAttemptCount" | "turnLeaseOwnerId" | "turnLeaseVersion">;
 type ParsedBody = { owner: RequestOwner; attestation: unknown };
 type StoredExecution = { id: string; status: string; attemptCount: number; state: unknown };
-
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
@@ -46,12 +45,6 @@ function candidates(value: unknown): string[] | null {
 function isJsonObject(value: unknown): value is Record<string, unknown> { return Boolean(record(value)); }
 function sameClaim(state: unknown, key: string, owner: ScheduledTaskGraphPipelineOwner): boolean {
   return scheduledTaskGraphClaimMatches(state, key, owner);
-}
-function finalReport(execution: StoredExecution, key: string, owner: ScheduledTaskGraphPipelineOwner) {
-  const state = record(execution.state), marker = record(state?.scheduledTaskGraphContinuation), report = record(state?.report);
-  if (!marker || marker.key !== key || !scheduledTaskGraphOwnerMatches(marker.owner, owner) || execution.status !== "completed"
-    || !report || ![report.processed, report.applied, report.queued, report.pending, report.skipped, report.failed, report.durationMs].every(safeCount)) return null;
-  return report;
 }
 function matchingTurnSnapshot(value: unknown) {
   const input = record(value);
@@ -122,7 +115,6 @@ function mapCheckpointError(error: unknown): string {
   if (reason === "owner_mismatch" || reason === "invalid_owner") return "scheduled_pipeline_owner_mismatch";
   return "scheduled_pipeline_attestation_invalid";
 }
-
 async function loadExecution(owner: RequestOwner): Promise<StoredExecution | null> {
   return db.agentExecution.findFirst({
     where: { userId: owner.userId, sessionId: owner.sessionId },
@@ -133,7 +125,6 @@ async function canonicalQuestionItemMissing(owner: RequestOwner, waitId: string)
   return waitId.startsWith(`agent-question:${owner.turnId}:canonical:`)
     && !(await db.agentItem.findFirst({ where: { id: `agent-wait:question:${waitId}` }, select: { id: true } }));
 }
-
 export async function POST(request: Request): Promise<Response> {
   const secret = process.env.AGENT_WORKER_SECRET;
   if (!secret || request.headers.get("x-agent-worker-secret") !== secret) return blocked(401, "scheduled_pipeline_unauthorized");
@@ -159,7 +150,6 @@ export async function POST(request: Request): Promise<Response> {
     return blocked(409, "scheduled_pipeline_mode_mismatch");
   }
   if (!root || !rootIdentityMatches(root, owner)) return blocked(409, "scheduled_pipeline_owner_mismatch");
-
   const execution = await loadExecution(owner);
   if (!execution || !safeCount(execution.attemptCount)) return blocked(409, "scheduled_pipeline_execution_mismatch");
   const executionOwner: ScheduledTaskGraphPipelineOwner = { ...owner, executionId: execution.id, executionAttemptCount: execution.attemptCount };
@@ -172,13 +162,13 @@ export async function POST(request: Request): Promise<Response> {
   if (!ids) return blocked(409, "scheduled_pipeline_attestation_invalid");
   const jobs = await db.job.findMany({ where: { userId: owner.userId, id: { in: ids } } }) as Job[];
   if (jobs.length !== ids.length || new Set(jobs.map(job => job.id)).size !== ids.length) return blocked(409, "scheduled_pipeline_jobs_mismatch");
-
-  const report = finalReport(execution, key, executionOwner);
+  const report = completedScheduledTaskGraphReport({ execution, key, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
   if (report) return await completedReportLeaseIsCurrent(owner)
     ? json(200, { status: "completed", report }) : blocked(409, "scheduled_pipeline_turn_stale");
   if (execution.status === "completed") {
-    const prior = priorScheduledTaskGraphContinuation({ state: execution.state, owner: executionOwner, snapshot, attestation });
-    const replay = prior && finalReport(execution, prior.key, prior.owner);
+    const prior = priorScheduledTaskGraphContinuation({ state: execution.state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
+    const replay = prior && completedScheduledTaskGraphReport({ execution, key: prior.key, owner: prior.owner, snapshot, attestation,
+      ownedJobs: jobs, checkpointValidatedByPrior: true });
     const currentTurn = replay ? await readTurnLease(owner) : null;
     if (replay && currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: replay });
     return blocked(409, "scheduled_pipeline_execution_mismatch");
@@ -189,7 +179,7 @@ export async function POST(request: Request): Promise<Response> {
   if (state?.scheduledTaskGraphWait !== undefined && !wait) return blocked(409, "scheduled_pipeline_claim_conflict");
   if (wait) {
     const currentWaitOwner = wait.key === key && scheduledTaskGraphOwnerMatches(wait.owner, executionOwner);
-    const prior = currentWaitOwner ? null : priorScheduledTaskGraphContinuation({ state, owner: executionOwner, snapshot, attestation });
+    const prior = currentWaitOwner ? null : priorScheduledTaskGraphContinuation({ state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
     if (!currentWaitOwner
       && !(prior && wait.key === prior.key && scheduledTaskGraphOwnerMatches(wait.owner, prior.owner))) return blocked(409, "scheduled_pipeline_claim_conflict");
     const currentTurn = turn.status === "in_progress" ? leaseIsCurrent(turn, owner)
@@ -222,7 +212,6 @@ export async function POST(request: Request): Promise<Response> {
   const aiConfig = configured.resolvedKey
     ? { ...configured, usageUserId: owner.userId, usageFeatureKey: "autoApply", usageRuntime: "worker" as const }
     : { ...resolveConfig(APPLYMATE_BACKING), usageUserId: owner.userId, usageFeatureKey: "autoApply", usageRuntime: "worker" as const };
-
   if (!state || (execution.status !== "running" && !(execution.status === "waiting_for_user" && wait))) {
     return sameClaim(execution.state, key, executionOwner)
       ? blocked(500, "scheduled_pipeline_execution_failed") : blocked(409, "scheduled_pipeline_execution_mismatch");
@@ -253,7 +242,7 @@ export async function POST(request: Request): Promise<Response> {
     claimedState = { ...state, scheduledTaskGraphClaim: { ...existingClaim, claimToken, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } };
   } else if (existingClaim) {
     const claimedAt = new Date().toISOString(), leaseExpiresAt = new Date(Date.now() + 600_000).toISOString();
-    const rebound = rebindScheduledTaskGraphClaimForLease({ state, owner: executionOwner, key, claimToken, snapshot, attestation, claimedAt, leaseExpiresAt });
+    const rebound = rebindScheduledTaskGraphAnalysisStateForLease({ state, owner: executionOwner, key, claimToken, snapshot, attestation, ownedJobs: jobs, claimedAt, leaseExpiresAt });
     if (!rebound) return blocked(409, "scheduled_pipeline_claim_conflict");
     claimedState = rebound;
   } else {
@@ -270,10 +259,11 @@ export async function POST(request: Request): Promise<Response> {
   });
   if (claimed.count !== 1) {
     const latest = await loadExecution(owner);
-    const exactReport = latest && finalReport(latest, key, executionOwner);
+    const exactReport = latest && completedScheduledTaskGraphReport({ execution: latest, key, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
     if (exactReport && await completedReportLeaseIsCurrent(owner)) return json(200, { status: "completed", report: exactReport });
-    const prior = latest && priorScheduledTaskGraphContinuation({ state: latest.state, owner: executionOwner, snapshot, attestation });
-    const priorReport = latest && prior && finalReport(latest, prior.key, prior.owner);
+    const prior = latest && priorScheduledTaskGraphContinuation({ state: latest.state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
+    const priorReport = latest && prior && completedScheduledTaskGraphReport({ execution: latest, key: prior.key, owner: prior.owner,
+      snapshot, attestation, ownedJobs: jobs, checkpointValidatedByPrior: true });
     if (priorReport) {
       const currentTurn = await readTurnLease(owner).catch(() => null);
       if (currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: priorReport });
@@ -281,7 +271,6 @@ export async function POST(request: Request): Promise<Response> {
     if (latest && sameClaim(latest.state, key, executionOwner)) return json(202, { status: "accepted", duplicate: true });
     return blocked(409, "scheduled_pipeline_claim_conflict");
   }
-
   try {
     const result = await runAgentPipeline({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
       executionId: execution.id, source: "automation", aiConfig, autonomous: snapshot.autoApply,

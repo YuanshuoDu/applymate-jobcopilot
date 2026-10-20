@@ -31,6 +31,40 @@ export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-
 export const RESET_NATIVE_SEMANTIC_PROGRESS: unique symbol = Symbol("reset-native-semantic-progress")
 export const TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("task-graph-denial-checkpoint")
 export const READ_TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("read-task-graph-denial-checkpoint")
+export const SCHEDULED_PIPELINE_COMPLETION: unique symbol = Symbol("scheduled-pipeline-completion")
+
+export type ScheduledPipelineCompletionDisposition =
+  | Readonly<{ status: "completed"; candidateText: string }>
+  | Readonly<{ status: "waiting_for_user"; waitId: string; candidateText: string }>
+  | Readonly<{ status: "blocked"; errorCode: string }>
+
+export function parseScheduledPipelineCompletionDisposition(value: unknown): ScheduledPipelineCompletionDisposition | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) return null
+    const keys = Reflect.ownKeys(value)
+    const record = value as Record<string, unknown>
+    if (keys.some(key => typeof key !== "string") || keys.some(key => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      return !descriptor?.enumerable || !("value" in descriptor)
+    })) return null
+    if (record.status === "completed" && keys.length === 2 && keys.includes("status") && keys.includes("candidateText")
+      && typeof record.candidateText === "string" && record.candidateText.trim().length > 0) {
+      return { status: "completed", candidateText: record.candidateText }
+    }
+    if (record.status === "waiting_for_user" && keys.length === 3 && keys.includes("status") && keys.includes("candidateText") && keys.includes("waitId")
+      && typeof record.candidateText === "string" && record.candidateText.trim().length > 0
+      && typeof record.waitId === "string" && record.waitId.trim() === record.waitId && record.waitId.length > 0 && record.waitId.length <= 256) {
+      return { status: "waiting_for_user", waitId: record.waitId, candidateText: record.candidateText }
+    }
+    if (record.status === "blocked" && keys.length === 2 && keys.includes("status") && keys.includes("errorCode")
+      && typeof record.errorCode === "string" && /^[a-z][a-z0-9_]{0,127}$/.test(record.errorCode)) {
+      return { status: "blocked", errorCode: record.errorCode }
+    }
+    return null
+  } catch { return null }
+}
 
 export type TurnEngineCompletionGateResult =
   | ({ readonly ok: true } & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
@@ -51,6 +85,18 @@ export type TurnEngineCompletionGate = ((input: {
 }) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult) & {
   [RESET_NATIVE_SEMANTIC_PROGRESS]?: () => void
   [READ_TASK_GRAPH_DENIAL_CHECKPOINT]?: () => Promise<TaskGraphDenialCheckpoint | null>
+  [SCHEDULED_PIPELINE_COMPLETION]?: (input: {
+    readonly identity: TurnExecutionIdentity
+    readonly scope: TenantScope
+    readonly rootTaskId: string
+    readonly stepId: string
+    readonly stepOrdinal: number
+    /** Exact verified response candidate staged before terminal Turn persistence. */
+    readonly candidateText: string
+    readonly signal: AbortSignal
+    readonly now: Date
+    readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
+  }) => Promise<ScheduledPipelineCompletionDisposition> | ScheduledPipelineCompletionDisposition
 }
 
 export type TurnExecutionStepBudget = { readonly remainingTurnSteps?: number }

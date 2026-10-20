@@ -1,5 +1,5 @@
 import { db } from "@/lib/db";
-import { Prisma } from "@prisma/client";
+import { Prisma, type Job } from "@prisma/client";
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint";
 import type { PipelineCheckpointState } from "./types";
 
@@ -8,6 +8,7 @@ const CONTINUATION_SCHEMA = "agent-harness.v2.scheduled-pipeline-continuation.v1
 const WAIT_SCHEMA = "agent-harness.v2.scheduled-pipeline-wait.v1";
 const PIPELINE_STAGES = new Set(["prepare", "gate", "execute", "audit"]);
 const WAIT_STAGES = new Set(["scout", "analyst", "writer", "reviewer", "executor", "auditor", "post-run"]);
+type ScheduledOwnerCheck = (tx: Prisma.TransactionClient) => Promise<boolean>;
 
 export interface ScheduledTaskGraphWaitMarker {
   schemaVersion: typeof WAIT_SCHEMA;
@@ -35,27 +36,26 @@ export function scheduledTaskGraphOwnerMatches(value: unknown, owner: ScheduledT
     && row.turnLeaseOwnerId === owner.turnLeaseOwnerId && row.turnLeaseVersion === owner.turnLeaseVersion
     && row.executionId === owner.executionId && row.executionAttemptCount === owner.executionAttemptCount);
 }
-
 export function scheduledTaskGraphClaimMatches(state: unknown, key: string, owner: ScheduledTaskGraphPipelineOwner, claimToken?: string): boolean {
   const claim = objectRow(objectRow(state)?.scheduledTaskGraphClaim);
   return claim?.schemaVersion === CLAIM_SCHEMA && claim.key === key && scheduledTaskGraphOwnerMatches(claim.owner, owner)
     && (claimToken === undefined || claim.claimToken === claimToken);
 }
 
-export function priorScheduledTaskGraphContinuation(input: { state: unknown; owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown }): PriorScheduledTaskGraphContinuation | null {
+export function priorScheduledTaskGraphContinuation(input: { state: unknown; owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; ownedJobs: readonly Job[] }): PriorScheduledTaskGraphContinuation | null {
   const state = objectRow(input.state), marker = objectRow(state?.scheduledTaskGraphContinuation), owner = parseOwner(marker?.owner);
   if (!state || !marker || !owner || !sameStableOwner(owner, input.owner) || owner.turnLeaseVersion >= input.owner.turnLeaseVersion) return null;
   try {
     const attestation = attestationForOwner(input.attestation, owner);
     const key = scheduledTaskGraphContinuationKey(owner, attestation);
-    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot: input.snapshot, attestation, existingCheckpoint: state });
+    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot: input.snapshot, attestation, ownedJobs: input.ownedJobs, existingCheckpoint: state });
     return marker.key === key && checkpoint.alreadyPersisted ? { owner, key } : null;
   } catch { return null; }
 }
 
 export function rebindScheduledTaskGraphClaimForLease(input: {
   state: unknown; owner: ScheduledTaskGraphPipelineOwner; key: string; claimToken: string;
-  snapshot: unknown; attestation: unknown; claimedAt: string; leaseExpiresAt: string;
+  snapshot: unknown; attestation: unknown; ownedJobs: readonly Job[]; claimedAt: string; leaseExpiresAt: string;
 }): Record<string, unknown> | null {
   const state = objectRow(input.state), claim = objectRow(state?.scheduledTaskGraphClaim), priorOwner = parseOwner(claim?.owner);
   if (!state || !claim || !priorOwner || !sameStableOwner(priorOwner, input.owner) || priorOwner.turnLeaseVersion >= input.owner.turnLeaseVersion
@@ -108,44 +108,56 @@ export function createScheduledTaskGraphWaitState(
 
 export async function persistScheduledTaskGraphWaitMarker(input: {
   state: unknown; owner: ScheduledTaskGraphPipelineOwner; key: string; claimToken: string; waitId: string; stage: string;
+  assertOwnerCurrent: ScheduledOwnerCheck;
 }): Promise<Record<string, unknown> | null> {
   const nextState = createScheduledTaskGraphWaitState(input.state, input.owner, input.key, input.claimToken, input.waitId, input.stage);
   if (!nextState) return null;
-  const saved = await db.agentExecution.updateMany({
-    where: { id: input.owner.executionId, userId: input.owner.userId, sessionId: input.owner.sessionId,
-      status: "running", attemptCount: input.owner.executionAttemptCount,
-      state: { equals: input.state as Prisma.InputJsonValue } },
-    data: { state: nextState as Prisma.InputJsonValue },
+  const saved = await db.$transaction(async tx => {
+    if (!await input.assertOwnerCurrent(tx)) return false;
+    const updated = await tx.agentExecution.updateMany({
+      where: { id: input.owner.executionId, userId: input.owner.userId, sessionId: input.owner.sessionId,
+        status: "running", attemptCount: input.owner.executionAttemptCount,
+        state: { equals: input.state as Prisma.InputJsonValue } },
+      data: { state: nextState as Prisma.InputJsonValue },
+    });
+    return updated.count === 1;
   });
-  return saved.count === 1 ? nextState : null;
+  return saved ? nextState : null;
 }
 
 export async function saveScheduledTaskGraphCheckpoint(input: {
   expectedState: unknown; state: PipelineCheckpointState; owner: ScheduledTaskGraphPipelineOwner; key: string; claimToken: string;
+  assertOwnerCurrent: ScheduledOwnerCheck;
 }): Promise<boolean> {
   if (!scheduledTaskGraphClaimMatches(input.expectedState, input.key, input.owner, input.claimToken)
     || !scheduledTaskGraphClaimMatches(input.state, input.key, input.owner, input.claimToken)) return false;
-  const saved = await db.agentExecution.updateMany({
-    where: { id: input.owner.executionId, userId: input.owner.userId, sessionId: input.owner.sessionId,
-      status: "running", attemptCount: input.owner.executionAttemptCount,
-      state: { equals: input.expectedState as Prisma.InputJsonValue } },
-    data: { checkpoint: input.state.nextStage, state: input.state as unknown as Prisma.InputJsonValue },
+  return db.$transaction(async tx => {
+    if (!await input.assertOwnerCurrent(tx)) return false;
+    const saved = await tx.agentExecution.updateMany({
+      where: { id: input.owner.executionId, userId: input.owner.userId, sessionId: input.owner.sessionId,
+        status: "running", attemptCount: input.owner.executionAttemptCount,
+        state: { equals: input.expectedState as Prisma.InputJsonValue } },
+      data: { checkpoint: input.state.nextStage, state: input.state as unknown as Prisma.InputJsonValue },
+    });
+    return saved.count === 1;
   });
-  return saved.count === 1;
 }
 
 export async function finishScheduledTaskGraphExecution(input: {
   state: unknown; owner: ScheduledTaskGraphPipelineOwner; key: string; claimToken: string;
-  status: "completed" | "failed"; error?: string | null;
+  status: "completed" | "failed"; error?: string | null; assertOwnerCurrent: ScheduledOwnerCheck;
 }): Promise<boolean> {
   if (!scheduledTaskGraphClaimMatches(input.state, input.key, input.owner, input.claimToken)) return false;
-  const saved = await db.agentExecution.updateMany({
-    where: { id: input.owner.executionId, userId: input.owner.userId, sessionId: input.owner.sessionId,
-      status: "running", attemptCount: input.owner.executionAttemptCount,
-      state: { equals: input.state as Prisma.InputJsonValue } },
-    data: { status: input.status, error: input.status === "failed" ? input.error ?? null : null, completedAt: new Date() },
+  return db.$transaction(async tx => {
+    if (!await input.assertOwnerCurrent(tx)) return false;
+    const saved = await tx.agentExecution.updateMany({
+      where: { id: input.owner.executionId, userId: input.owner.userId, sessionId: input.owner.sessionId,
+        status: "running", attemptCount: input.owner.executionAttemptCount,
+        state: { equals: input.state as Prisma.InputJsonValue } },
+      data: { status: input.status, error: input.status === "failed" ? input.error ?? null : null, completedAt: new Date() },
+    });
+    return saved.count === 1;
   });
-  return saved.count === 1;
 }
 
 export function scheduledTaskGraphWaitMarker(

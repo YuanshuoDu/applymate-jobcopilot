@@ -7,6 +7,7 @@ describe("V2 private event filter", () => {
     expect(isPrivateV2EventType("agent.plan.clarification")).toBe(true)
     expect(isPrivateV2EventType("agent.plan.denial_checkpoint")).toBe(true)
     expect(isPrivateV2EventType("native_verification.requested")).toBe(true)
+    expect(isPrivateV2EventType("native_verification.scheduled_candidate_staged")).toBe(true)
     expect(isPrivateV2EventType("native_verification.future.v1")).toBe(true)
   })
 

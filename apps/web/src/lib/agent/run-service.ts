@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { PipelineInterruptedError, runPipeline } from "@/lib/agent/pipeline";
-import { runAnalyze } from "@/lib/agent/stages/analyze";
+import { createScheduledTaskGraphOwnerFence, runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from "@/lib/agent/scheduled-taskgraph-analysis-journal";
 import { AgentPauseError } from "@/lib/agent/orchestrator";
 import { createRunSessionRecorder } from "@/lib/agent/session/run-recorder";
 import { isRuntimeAgentHarnessFeatureEnabled } from "@/lib/runtime-feature-flags";
@@ -74,6 +74,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     return null
   }
   const scheduled = input.scheduledTaskGraph;
+  const assertScheduledOwnerCurrent = createScheduledTaskGraphOwnerFence(scheduled && { owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken });
   let scheduledState: unknown = execution.state;
   if (input.signal?.aborted) return null
   const attemptCount = scheduled
@@ -94,10 +95,9 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     id: execution.id, userId: input.userId, sessionId: recorder.sessionId, attemptCount,
     turnId: recorder.getTurnId, signal: input.signal,
   })
-  const finishOwnedAttempt = scheduled
-    ? (status: "completed" | "failed", error?: string | null) => finishScheduledTaskGraphExecution({ state: scheduledState,
-        owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, status, error })
-    : finishAttempt
+  const finishOwnedAttempt = scheduled ? (status: "completed" | "failed", error?: string | null) => finishScheduledTaskGraphExecution({
+    state: scheduledState, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
+    status, error, assertOwnerCurrent: assertScheduledOwnerCurrent }) : finishAttempt
   if (!await isCurrentAttempt()) return null
   try {
     if (!await recorder.activate({
@@ -120,8 +120,8 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
         const question = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : null;
         const waitId = typeof question?.id === "string" ? question.id : question?.questionId;
         if (typeof waitId !== "string" || typeof question?.stage !== "string") throw new AgentExecutionCancelledError();
-        const waitingState = await persistScheduledTaskGraphWaitMarker({ state: scheduledState,
-          owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, waitId, stage: question.stage });
+        const waitingState = await persistScheduledTaskGraphWaitMarker({ state: scheduledState, owner: scheduled.owner,
+          key: scheduled.continuationKey, claimToken: scheduled.claimToken, waitId, stage: question.stage, assertOwnerCurrent: assertScheduledOwnerCurrent });
         if (!waitingState) throw new AgentExecutionCancelledError();
         scheduledState = waitingState;
         return await recorder.record(event, data);
@@ -212,7 +212,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
         if (!await isActiveAccount(input.userId)) throw new Error("Account is not active")
         const saved = scheduled
           ? await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state, owner: scheduled.owner,
-              key: scheduled.continuationKey, claimToken: scheduled.claimToken })
+              key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent })
           : await saveExecutionCheckpoint({ id: execution.id, userId: input.userId, attemptCount, state })
         if (!saved) throw new AgentExecutionCancelledError()
         if (scheduled) scheduledState = state;
@@ -224,21 +224,21 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       if (execution.state && typeof execution.state === "object" && !Array.isArray(execution.state)
         && "scheduledTaskGraphContinuation" in execution.state) {
         const prior = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduled.owner, snapshot: scheduled.snapshot,
-          attestation: scheduled.attestation, existingCheckpoint: execution.state });
+          attestation: scheduled.attestation, ownedJobs: scheduled.ownedJobs, existingCheckpoint: execution.state });
         if (!prior.alreadyPersisted || prior.continuationKey !== scheduled.continuationKey) throw new AgentExecutionCancelledError();
         resumeState = prior.checkpoint;
         scheduledState = prior.checkpoint;
       } else {
-        const analysis = await runAnalyze([...scheduled.ownedJobs], pipelineInput);
+        const result = await runScheduledTaskGraphAnalyze({ jobs: scheduled.ownedJobs, ctx: pipelineInput, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken,
+          snapshot: scheduled.snapshot, attestation: scheduled.attestation, state: scheduledState, assertScoreOwnerCurrent: tx => scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken }),
+          persist: async state => {
+            if (!await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken) || !await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state, owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent })) throw new AgentExecutionCancelledError();
+            scheduledState = JSON.parse(JSON.stringify(state));
+          } });
         if (!await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)) throw new AgentExecutionCancelledError();
-        const prepared = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduled.owner, snapshot: scheduled.snapshot,
-          attestation: scheduled.attestation, ownedJobs: scheduled.ownedJobs, analyzeResult: analysis, existingCheckpoint: execution.state });
-        if (prepared.alreadyPersisted || prepared.continuationKey !== scheduled.continuationKey) throw new AgentExecutionCancelledError();
-        const saved = await saveScheduledTaskGraphCheckpoint({ expectedState: execution.state, state: prepared.checkpoint,
-          owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken });
-        if (!saved) throw new AgentExecutionCancelledError();
-        resumeState = prepared.checkpoint;
-        scheduledState = prepared.checkpoint;
+        const saved = await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state: result.checkpoint,
+          owner: scheduled.owner, key: scheduled.continuationKey, claimToken: scheduled.claimToken, assertOwnerCurrent: assertScheduledOwnerCurrent });
+        if (!saved) throw new AgentExecutionCancelledError(); resumeState = result.checkpoint; scheduledState = result.checkpoint;
       }
     }
     const report = await runPipeline({ ...pipelineInput, resumeState });

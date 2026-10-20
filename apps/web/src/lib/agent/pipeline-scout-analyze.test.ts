@@ -5,6 +5,7 @@ import { acceptScout, runScout } from './stages/scout'
 import type { PipelineScoutAnalyzeResult, PipelineStageRuntimeContext } from './pipeline-context'
 import type { OrchestratorAgent } from './orchestrator'
 import type { PipelineCheckpointState, PipelineCtx, PipelineStage, ScoredJob } from './types'
+import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest } from './scheduled-taskgraph-pipeline-checkpoint'
 import { runPrepareGateStages } from './pipeline-prepare-gate'
 import { runExecuteAuditStages } from './pipeline-execute-audit'
 import { runScoutAnalyzeStages } from './pipeline-scout-analyze'
@@ -76,17 +77,62 @@ function makeRuntime(startStage: PipelineStage, initial: Partial<PipelineCheckpo
   }
 }
 
+const emptyCheckpointOwner = {
+  userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1', rootAttemptCount: 1,
+  turnLeaseOwnerId: 'lease-owner-1', turnLeaseVersion: 2, executionId: 'execution-1', executionAttemptCount: 0,
+}
+const emptyCheckpointSnapshot = {
+  schemaVersion: 'agent-harness.v2.scheduled-automation-snapshot.v1', targetRoles: ['engineer'], targetLocations: ['Dublin'],
+  minScore: 60, dailyCap: 5, requireApproval: true, autoApply: false,
+}
+const emptyCheckpointAttestation = {
+  schemaVersion: 'agent-harness.v2.scheduled-pipeline-attestation.v1',
+  owner: {
+    userId: emptyCheckpointOwner.userId, sessionId: emptyCheckpointOwner.sessionId, turnId: emptyCheckpointOwner.turnId,
+    rootTaskId: emptyCheckpointOwner.rootTaskId, rootAttemptCount: emptyCheckpointOwner.rootAttemptCount,
+    turnLeaseOwnerId: emptyCheckpointOwner.turnLeaseOwnerId, turnLeaseVersion: emptyCheckpointOwner.turnLeaseVersion,
+  },
+  snapshotDigest: scheduledAutomationSnapshotDigest(emptyCheckpointSnapshot), graphRevision: 1,
+  scout: {
+    taskId: 'scout-task-1', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'a'.repeat(64),
+    candidateJobIds: [],
+    discoveryReceipt: {
+      status: 'complete', taskId: 'scout-task-1', attemptCount: 1, completedCalls: 1, candidateCount: 0,
+      providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: 'b'.repeat(64),
+    },
+  },
+  analyst: {
+    taskId: 'analyst-task-1', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'c'.repeat(64),
+    dependsOnTaskIds: ['scout-task-1'], jobIds: [],
+  },
+  evidenceDigest: 'd'.repeat(64),
+}
+
 function verifiedEmptyCheckpoint() {
-  const owner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1', rootAttemptCount: 1,
-    turnLeaseOwnerId: 'lease-owner-1', turnLeaseVersion: 2, executionId: 'execution-1', executionAttemptCount: 0 }
-  const key = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`
+  const prepared = buildScheduledTaskGraphPrepareCheckpoint({
+    owner: emptyCheckpointOwner, snapshot: emptyCheckpointSnapshot, attestation: emptyCheckpointAttestation, ownedJobs: [],
+  })
   return {
-    nextStage: 'prepare', scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
-    scheduledTaskGraphClaim: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key, owner,
-      claimedAt: '2026-10-19T00:00:00.000Z', leaseExpiresAt: '2026-10-19T00:10:00.000Z' },
-    scheduledTaskGraphContinuation: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key, owner,
-      snapshotDigest: `sha256:${'b'.repeat(64)}`, graphRevision: 1, evidenceDigest: 'c'.repeat(64) },
+    ...prepared.checkpoint,
+    scheduledTaskGraphClaim: {
+      schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: prepared.continuationKey,
+      claimToken: 'claim-token-1', owner: { ...emptyCheckpointOwner },
+      claimedAt: '2026-10-19T00:00:00.000Z', leaseExpiresAt: '2026-10-19T00:10:00.000Z',
+    },
   } as unknown as PipelineCheckpointState
+}
+
+async function runPipelineWithResumeState(resumeState: PipelineCheckpointState) {
+  const ctx = {
+    userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', executionAttempt: { id: 'execution-1', attemptCount: 0 },
+    agentCfg: { targetRoles: ['engineer'], excludeCompanies: [], dailyLimit: 5, minMatchScore: 60 } as unknown as PipelineCtx['agentCfg'],
+    roleConfigs: {} as PipelineCtx['roleConfigs'], resumeText: '', resumeContent: {} as PipelineCtx['resumeContent'],
+    defaultResume: { id: 'resume-1', name: 'Resume', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
+    aiConfig: { provider: 'minimax', model: 'test', apiKey: 'key' } as PipelineCtx['aiConfig'],
+    autonomous: false, emit: vi.fn(), resumeState,
+  } satisfies PipelineCtx
+  const { runPipeline } = await import('./pipeline')
+  return runPipeline(ctx)
 }
 
 describe('runScoutAnalyzeStages', () => {
@@ -157,17 +203,8 @@ describe('runScoutAnalyzeStages', () => {
     const report = { processed: 0, applied: 0, queued: 0, pending: 0, skipped: 0, failed: 0, durationMs: 12 }
     vi.mocked(runPrepareGateStages).mockResolvedValueOnce({ preparedPackages: [], gateOutput: { approved: [], pending: [], skipped: [] } })
     vi.mocked(runExecuteAuditStages).mockResolvedValueOnce({ report })
-    const ctx = {
-      userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', executionAttempt: { id: 'execution-1', attemptCount: 0 },
-      agentCfg: { targetRoles: ['engineer'], excludeCompanies: [], dailyLimit: 5, minMatchScore: 60 } as unknown as PipelineCtx['agentCfg'],
-      roleConfigs: {} as PipelineCtx['roleConfigs'], resumeText: '', resumeContent: {} as PipelineCtx['resumeContent'],
-      defaultResume: { id: 'resume-1', name: 'Resume', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
-      aiConfig: { provider: 'minimax', model: 'test', apiKey: 'key' } as PipelineCtx['aiConfig'],
-      autonomous: false, emit: vi.fn(), resumeState,
-    } satisfies PipelineCtx
-    const { runPipeline } = await import('./pipeline')
 
-    await expect(runPipeline(ctx)).resolves.toEqual(report)
+    await expect(runPipelineWithResumeState(resumeState)).resolves.toEqual(report)
 
     expect(runScout).not.toHaveBeenCalled()
     expect(runAnalyze).not.toHaveBeenCalled()
@@ -179,17 +216,33 @@ describe('runScoutAnalyzeStages', () => {
     const resumeState = verifiedEmptyCheckpoint() as unknown as Record<string, unknown>
     const marker = resumeState.scheduledTaskGraphContinuation as Record<string, unknown>
     resumeState.scheduledTaskGraphContinuation = { ...marker, evidenceDigest: 'invalid' }
-    const ctx = {
-      userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', executionAttempt: { id: 'execution-1', attemptCount: 0 },
-      agentCfg: { targetRoles: ['engineer'], excludeCompanies: [], dailyLimit: 5, minMatchScore: 60 } as unknown as PipelineCtx['agentCfg'],
-      roleConfigs: {} as PipelineCtx['roleConfigs'], resumeText: '', resumeContent: {} as PipelineCtx['resumeContent'],
-      defaultResume: { id: 'resume-1', name: 'Resume', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
-      aiConfig: { provider: 'minimax', model: 'test', apiKey: 'key' } as PipelineCtx['aiConfig'],
-      autonomous: false, emit: vi.fn(), resumeState: resumeState as unknown as PipelineCheckpointState,
-    } satisfies PipelineCtx
-    const { runPipeline } = await import('./pipeline')
 
-    await expect(runPipeline(ctx)).resolves.toMatchObject({ processed: 0, failed: 0 })
+    await expect(runPipelineWithResumeState(resumeState as unknown as PipelineCheckpointState)).resolves.toMatchObject({ processed: 0, failed: 0 })
+
+    expect(runPrepareGateStages).not.toHaveBeenCalled()
+    expect(runExecuteAuditStages).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a missing claim token', (state: Record<string, unknown>) => {
+      const claim = state.scheduledTaskGraphClaim as Record<string, unknown>
+      delete claim.claimToken
+    }],
+    ['a mismatched root owner', (state: Record<string, unknown>) => {
+      const marker = state.scheduledTaskGraphContinuation as Record<string, unknown>
+      const owner = marker.owner as Record<string, unknown>
+      owner.rootTaskId = 'foreign-root'
+    }],
+    ['a mismatched lease owner', (state: Record<string, unknown>) => {
+      const claim = state.scheduledTaskGraphClaim as Record<string, unknown>
+      const owner = claim.owner as Record<string, unknown>
+      owner.turnLeaseOwnerId = 'foreign-lease-owner'
+    }],
+  ])('does not bypass the empty-result short circuit with %s', async (_label, invalidate) => {
+    const resumeState = verifiedEmptyCheckpoint() as unknown as Record<string, unknown>
+    invalidate(resumeState)
+
+    await expect(runPipelineWithResumeState(resumeState as unknown as PipelineCheckpointState)).resolves.toMatchObject({ processed: 0, failed: 0 })
 
     expect(runPrepareGateStages).not.toHaveBeenCalled()
     expect(runExecuteAuditStages).not.toHaveBeenCalled()

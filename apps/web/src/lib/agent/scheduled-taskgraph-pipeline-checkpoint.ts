@@ -11,36 +11,26 @@ const SNAPSHOT_DIGEST = /^sha256:[a-f0-9]{64}$/
 const PIPELINE_STAGES = new Set(["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"])
 
 export interface ScheduledTaskGraphPipelineOwner {
-  userId: string; sessionId: string; turnId: string; rootTaskId: string
-  rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number
-  executionId: string; executionAttemptCount: number
+  userId: string; sessionId: string; turnId: string; rootTaskId: string;
+  rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number; executionId: string; executionAttemptCount: number
 }
 interface AttestationOwner { userId: string; sessionId: string; turnId: string; rootTaskId: string; rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number }
-
 interface DiscoveryReceipt { status: "complete"; taskId: string; attemptCount: number; completedCalls: number; candidateCount: number; providerFailures: number; materializationFailures: number; hasMore: boolean; receiptDigest: string }
 
 interface ScheduledPipelineAttestation {
-  schemaVersion: typeof ATTESTATION_SCHEMA; owner: AttestationOwner; snapshotDigest: string; graphRevision: number
-  scout: { taskId: string; attemptCount: number; status: "completed"; verification: "passed"; resultDigest: string; candidateJobIds: string[]; discoveryReceipt: DiscoveryReceipt }
-  analyst: { taskId: string; attemptCount: number; status: "completed"; verification: "passed"; resultDigest: string; dependsOnTaskIds: string[]; jobIds: string[] }
-  evidenceDigest: string
+  schemaVersion: typeof ATTESTATION_SCHEMA; owner: AttestationOwner; snapshotDigest: string; graphRevision: number;
+  scout: { taskId: string; attemptCount: number; status: "completed"; verification: "passed"; resultDigest: string; candidateJobIds: string[]; discoveryReceipt: DiscoveryReceipt };
+  analyst: { taskId: string; attemptCount: number; status: "completed"; verification: "passed"; resultDigest: string; dependsOnTaskIds: string[]; jobIds: string[] }; evidenceDigest: string
 }
-export interface ScheduledTaskGraphPipelineCheckpoint extends PipelineCheckpointState {
-  scheduledTaskGraphContinuation: { schemaVersion: typeof CONTINUATION_SCHEMA; key: string; owner: ScheduledTaskGraphPipelineOwner; snapshotDigest: string; graphRevision: number; evidenceDigest: string }
-}
+export interface ScheduledTaskGraphPipelineCheckpoint extends PipelineCheckpointState { scheduledTaskGraphContinuation: { schemaVersion: typeof CONTINUATION_SCHEMA; key: string; owner: ScheduledTaskGraphPipelineOwner; snapshotDigest: string; graphRevision: number; evidenceDigest: string } }
 export interface BuildScheduledTaskGraphCheckpointInput {
-  owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown
-  ownedJobs?: readonly Job[]; analyzeResult?: StageResult<AnalyzeOutput>
-  existingCheckpoint?: unknown; now?: Date
+  owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; ownedJobs: readonly Job[];
+  analyzeResult?: StageResult<AnalyzeOutput>; existingCheckpoint?: unknown; now?: Date
 }
-export interface BuildScheduledTaskGraphCheckpointResult {
-  checkpoint: ScheduledTaskGraphPipelineCheckpoint; continuationKey: string; alreadyPersisted: boolean
-}
+export interface BuildScheduledTaskGraphCheckpointResult { checkpoint: ScheduledTaskGraphPipelineCheckpoint; continuationKey: string; alreadyPersisted: boolean }
 export type ScheduledTaskGraphCheckpointReason = "invalid_owner" | "invalid_snapshot" | "invalid_attestation" | "owner_mismatch" | "snapshot_mismatch" | "discovery_incomplete" | "checkpoint_conflict" | "jobs_mismatch" | "analysis_invalid"
-
 export class ScheduledTaskGraphCheckpointError extends Error {
   readonly code = "scheduled_taskgraph_checkpoint_blocked"
-
   constructor(readonly reason: ScheduledTaskGraphCheckpointReason) {
     super("Scheduled TaskGraph evidence cannot continue to Prepare."); this.name = "ScheduledTaskGraphCheckpointError"
   }
@@ -72,24 +62,23 @@ export function buildScheduledTaskGraphPrepareCheckpoint(
   assertAttestationOwner(attestation.owner, input.owner)
   if (attestation.snapshotDigest !== snapshotDigest) fail("snapshot_mismatch")
   assertDiscoveryReceipt(attestation.scout)
-
   const continuationKey = scheduledTaskGraphContinuationKey(input.owner, input.attestation)
   const existing = parseExistingCheckpoint(input.existingCheckpoint)
+  const candidateIds = attestation.scout.candidateJobIds
+  const ownedJobs = validateOwnedJobs(input.ownedJobs, candidateIds, input.owner.userId)
   if (existing?.marker) {
     if (existing.marker.key !== continuationKey || !sameOwner(existing.marker.owner, input.owner)
       || existing.marker.snapshotDigest !== snapshotDigest || existing.marker.graphRevision !== attestation.graphRevision
       || existing.marker.evidenceDigest !== attestation.evidenceDigest) fail("checkpoint_conflict")
-    return { checkpoint: existing.value as unknown as ScheduledTaskGraphPipelineCheckpoint, continuationKey, alreadyPersisted: true }
+    const persisted = validatePersistedCheckpoint(existing.value, ownedJobs, candidateIds, attestation.analyst.jobIds)
+    return { checkpoint: { ...existing.value, ...persisted, scheduledTaskGraphContinuation: existing.value.scheduledTaskGraphContinuation } as unknown as ScheduledTaskGraphPipelineCheckpoint, continuationKey, alreadyPersisted: true }
   }
 
-  const candidateIds = attestation.scout.candidateJobIds
-  const ownedJobs = validateOwnedJobs(input.ownedJobs, candidateIds, input.owner.userId)
   const scoredJobs = candidateIds.length === 0
     ? validateZeroCandidateAnalysis(input.analyzeResult)
     : validateAnalysis(input.analyzeResult, ownedJobs, candidateIds, attestation.analyst.jobIds)
   const now = input.now ?? new Date()
   if (!Number.isFinite(now.getTime())) fail("invalid_owner")
-
   const previous = existing?.value
   const checkpoint: ScheduledTaskGraphPipelineCheckpoint = {
     ...previous,
@@ -123,11 +112,9 @@ function parseAttestation(value: unknown): ScheduledPipelineAttestation {
   const owner = parseOwner(row.owner)
   if (row.schemaVersion !== ATTESTATION_SCHEMA || !isSnapshotDigest(row.snapshotDigest)
     || !positiveInteger(row.graphRevision) || !isDigest(row.evidenceDigest)) fail("invalid_attestation")
-
   const scoutRow = exactRecord(row.scout, ["taskId", "attemptCount", "status", "verification", "resultDigest", "candidateJobIds", "discoveryReceipt"])
   const analystRow = exactRecord(row.analyst, ["taskId", "attemptCount", "status", "verification", "resultDigest", "dependsOnTaskIds", "jobIds"])
   if (!scoutRow || !analystRow || !owner) fail("invalid_attestation")
-
   const scout = parseScout(scoutRow)
   const analyst = parseAnalyst(analystRow)
   if (!scout || !analyst || analyst.dependsOnTaskIds.length !== 1 || analyst.dependsOnTaskIds[0] !== scout.taskId
@@ -189,6 +176,23 @@ function validateOwnedJobs(rows: readonly Job[] | undefined, candidateIds: reado
 function validateZeroCandidateAnalysis(result: StageResult<AnalyzeOutput> | undefined): ScoredJob[] {
   if (result && (result.stage !== "analyze" || !result.ok || !result.data || result.data.scoredJobs.length !== 0 || result.data.failed !== 0)) fail("analysis_invalid")
   return []
+}
+function validatePersistedCheckpoint(state: Record<string, unknown>, ownedJobs: readonly Job[], candidateIds: readonly string[], analystJobIds: readonly string[]): Pick<ScheduledTaskGraphPipelineCheckpoint, "scoutedJobs" | "scoredJobs" | "analysisFailed"> {
+  const savedJobs = state.scoutedJobs, rawScores = state.scoredJobs, failed = state.analysisFailed
+  if (!Array.isArray(savedJobs) || savedJobs.length !== candidateIds.length
+    || savedJobs.some((job, index) => record(job)?.id !== candidateIds[index])) fail("jobs_mismatch")
+  if (!Array.isArray(rawScores) || !safeCount(failed)) fail("analysis_invalid")
+  const jobsById = new Map(ownedJobs.map(job => [job.id, job]))
+  const scoredJobs = rawScores.map(raw => {
+    const row = record(raw), id = record(row?.job)?.id
+    if (!row || typeof id !== "string" || !jobsById.has(id)) fail("analysis_invalid")
+    const job = jobsById.get(id)!
+    return { job, score: row.score, matchedKeywords: row.matchedKeywords, missingKeywords: row.missingKeywords,
+      recommendation: row.recommendation, analysisFenceAt: row.analysisFenceAt } as unknown as ScoredJob
+  })
+  const result: StageResult<AnalyzeOutput> = { stage: "analyze", ok: true, data: { scoredJobs, failed }, metrics: { durationMs: 0, count: scoredJobs.length } }
+  return { scoutedJobs: [...ownedJobs], scoredJobs: candidateIds.length === 0 ? validateZeroCandidateAnalysis(result)
+    : validateAnalysis(result, ownedJobs, candidateIds, analystJobIds), analysisFailed: failed }
 }
 function validateAnalysis(
   result: StageResult<AnalyzeOutput> | undefined,
@@ -254,6 +258,7 @@ function sameOwner(left: ScheduledTaskGraphPipelineOwner, right: ScheduledTaskGr
     && left.turnLeaseOwnerId === right.turnLeaseOwnerId && left.turnLeaseVersion === right.turnLeaseVersion
     && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
 }
+function record(value: unknown): Record<string, unknown> | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null }
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const actual = Reflect.ownKeys(value)

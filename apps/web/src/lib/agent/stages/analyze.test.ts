@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Job } from '@prisma/client'
-import type { PipelineCtx } from '../types'
+import type { PipelineCtx, ScoredJob } from '../types'
 import { AgentExecutionCancelledError } from '../execution-control'
 
 const mocks = vi.hoisted(() => ({
@@ -32,7 +32,7 @@ vi.mock('@/lib/model-router', () => ({
   stripFences: (text: string) => text.replace(/```json|```/g, '').trim(),
 }))
 
-import { runAnalyze } from './analyze'
+import { AnalyzeRecoveryPersistenceError, runAnalyze } from './analyze'
 
 const job = {
   id: 'job_1', userId: 'user_1', company: 'Example Co', logo: null,
@@ -108,6 +108,142 @@ describe('runAnalyze', () => {
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Add cloud experience.' } }))
   })
 
+  it('journals a validated score after its DB transaction and records an attempt before calling the model', async () => {
+    const order: string[] = []
+    mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
+      const result = await work({
+        applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
+        job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
+      })
+      order.push('db_commit')
+      return result
+    })
+    mocks.modelChat.mockImplementation(async () => {
+      order.push('model_call')
+      return { text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}' }
+    })
+    const recovery = {
+      beforeScore: vi.fn(async () => { order.push('journal_attempt') }),
+      onScoredJob: vi.fn(async () => { order.push('journal_score') }),
+    }
+
+    const result = await runAnalyze([job], context(), recovery)
+
+    expect(result).toMatchObject({ ok: true, data: { scoredJobs: [{ score: 73 }] } })
+    expect(order).toEqual(['db_commit', 'journal_attempt', 'model_call', 'db_commit', 'journal_score'])
+    expect(recovery.onScoredJob).toHaveBeenCalledWith(expect.objectContaining({
+      job, score: 73, analysisFenceAt: expect.any(String),
+    }))
+  })
+
+  it('does not classify a durable-journal write failure as a scoring failure', async () => {
+    mocks.modelChat.mockResolvedValue({
+      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}',
+    })
+    const writeFailure = new AnalyzeRecoveryPersistenceError()
+    const onScoreFailure = vi.fn()
+    const onScoredJob = vi.fn(async () => { throw writeFailure })
+
+    await expect(runAnalyze([job], context(), { onScoredJob, onScoreFailure })).rejects.toBe(writeFailure)
+
+    expect(writeFailure).toBeInstanceOf(AgentExecutionCancelledError)
+    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Add cloud experience.' } }))
+    expect(onScoreFailure).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'failed', checkpoint: 'match_analysis_failed' }),
+    }))
+  })
+
+  it('checks the scheduled claim in the score transaction before writing Job.score or Activity', async () => {
+    mocks.modelChat.mockResolvedValue({
+      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}',
+    })
+    let scoringTransaction: unknown
+    mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
+      const tx = {
+        applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
+        job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
+      }
+      if (mocks.modelChat.mock.calls.length > 0) scoringTransaction = tx
+      return work(tx)
+    })
+    const assertScoreOwnerCurrent = vi.fn(async (_tx: unknown) => false)
+
+    await expect(runAnalyze([job], context(), { assertScoreOwnerCurrent })).rejects.toBeInstanceOf(AgentExecutionCancelledError)
+
+    expect(assertScoreOwnerCurrent).toHaveBeenCalledOnce()
+    expect(assertScoreOwnerCurrent.mock.calls[0]?.[0]).toBe(scoringTransaction)
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+  })
+
+  it('does not classify an owner-fence transaction failure as an AI scoring failure', async () => {
+    mocks.modelChat.mockResolvedValue({
+      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}',
+    })
+    const fenceFailure = new Error('scheduled owner lock unavailable')
+    const onScoreFailure = vi.fn()
+
+    await expect(runAnalyze([job], context(), {
+      assertScoreOwnerCurrent: async () => { throw fenceFailure }, onScoreFailure,
+    })).rejects.toBe(fenceFailure)
+
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(onScoreFailure).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'failed', checkpoint: 'match_analysis_failed' }),
+    }))
+  })
+
+  it('drains a sibling model call after one durable journal hook fails', async () => {
+    const siblingJob = { ...job, id: 'job_2', role: 'Data Engineer' }
+    const pendingModel = deferred<{ text: string }>()
+    let signalSiblingModelStarted!: () => void
+    const siblingModelStarted = new Promise<void>(resolve => { signalSiblingModelStarted = resolve })
+    let signalJournalStarted!: () => void
+    const journalStarted = new Promise<void>(resolve => { signalJournalStarted = resolve })
+    let failJournal!: () => void
+    const journalFailure = new Promise<void>(resolve => { failJournal = resolve })
+    let modelCalls = 0
+    mocks.modelChat.mockImplementation(async () => {
+      modelCalls++
+      if (modelCalls === 1) return { text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}' }
+      signalSiblingModelStarted()
+      return pendingModel.promise
+    })
+    const persistenceFailure = new AnalyzeRecoveryPersistenceError()
+    const result = runAnalyze([job, siblingJob], context(), {
+      onScoredJob: async () => { signalJournalStarted(); await journalFailure; throw persistenceFailure },
+    })
+    await Promise.all([siblingModelStarted, journalStarted])
+    failJournal()
+    const beforeSiblingSettles = await Promise.race([
+      result.then(() => 'returned', () => 'returned'),
+      new Promise<'waiting'>(resolve => setTimeout(() => resolve('waiting'), 0)),
+    ])
+    expect(beforeSiblingSettles).toBe('waiting')
+
+    pendingModel.resolve({ text: '{"score":91,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Strong fit."}' })
+    await expect(result).rejects.toBe(persistenceFailure)
+    expect(mocks.update).toHaveBeenCalledOnce()
+    expect(mocks.activityCreate).toHaveBeenCalledOnce()
+  })
+
+  it('reuses a durable score without claiming the task or calling the model again', async () => {
+    const durable: ScoredJob = {
+      job, score: 88, matchedKeywords: ['TypeScript'], missingKeywords: ['AWS'],
+      recommendation: 'Apply after tailoring.', analysisFenceAt: '2026-10-19T12:00:00.123Z',
+    }
+
+    const result = await runAnalyze([job], context(), { existingScoredJobs: [durable] })
+
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [durable] } })
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.applicationTaskUpsert).not.toHaveBeenCalled()
+    expect(mocks.transaction).not.toHaveBeenCalled()
+  })
+
   it('treats a non-JSON AI response as a failed score instead of persisting 0%', async () => {
     const emit = vi.fn()
     mocks.modelChat.mockResolvedValue({ text: 'I cannot score this job.' })
@@ -126,10 +262,12 @@ describe('runAnalyze', () => {
     const noDescriptionJob = { ...job, description: null }
     const ctx = context()
     ctx.askUser = vi.fn().mockResolvedValue('skip_no_desc')
+    const onScoreFailure = vi.fn()
 
-    const result = await runAnalyze([noDescriptionJob], ctx)
+    const result = await runAnalyze([noDescriptionJob], ctx, { onScoreFailure })
 
     expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
+    expect(onScoreFailure).not.toHaveBeenCalled()
     expect(ctx.askUser).toHaveBeenCalledWith('analyst', expect.any(String), expect.any(Array))
     expect(mocks.modelChat).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -138,10 +276,12 @@ describe('runAnalyze', () => {
   })
 
   it('screens out a LinkedIn destination before calling the scoring model', async () => {
-    const result = await runAnalyze([{ ...job, url: 'https://www.linkedin.com/jobs/view/123' }], context())
+    const onScoreFailure = vi.fn()
+    const result = await runAnalyze([{ ...job, url: 'https://www.linkedin.com/jobs/view/123' }], context(), { onScoreFailure })
 
     expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
     expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(onScoreFailure).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ status: 'skipped', checkpoint: 'job_preflight_failed' }),
     }))
@@ -164,6 +304,41 @@ describe('runAnalyze', () => {
     expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
     expect(mocks.modelChat).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { label: 'preflight skip', input: { ...job, url: 'https://www.linkedin.com/jobs/view/123' }, mode: 'skip' },
+    { label: 'insufficient-data skip', input: { ...job, role: null, description: null }, mode: 'skip' },
+    { label: 'candidate skip', input: { ...job, description: null }, mode: 'skip' },
+    { label: 'provider-failure transition', input: job, mode: 'failure' },
+  ])('does not persist a stale $label after the scheduled owner is taken over', async ({ input, mode, label }) => {
+    const transactions: unknown[] = []
+    mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => {
+      const tx = {
+        applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
+        job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
+      }
+      transactions.push(tx)
+      return work(tx)
+    })
+    if (mode === 'failure') mocks.modelChat.mockRejectedValue(new Error('provider unavailable'))
+    const ctx = context(vi.fn())
+    if (label === 'candidate skip') ctx.askUser = vi.fn().mockResolvedValue('skip_no_desc')
+    const assertScoreOwnerCurrent = vi.fn(async (_tx: unknown) => false)
+    const onScoreFailure = vi.fn()
+
+    await expect(runAnalyze([input as Job], ctx, { assertScoreOwnerCurrent, onScoreFailure }))
+      .rejects.toBeInstanceOf(AgentExecutionCancelledError)
+
+    expect(assertScoreOwnerCurrent).toHaveBeenCalledOnce()
+    expect(assertScoreOwnerCurrent.mock.calls[0]?.[0]).toBe(transactions[1])
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledOnce()
+    expect(mocks.applicationTaskUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: mode === 'failure' ? 'failed' : 'skipped' }),
+    }))
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(onScoreFailure).not.toHaveBeenCalled()
   })
 
   it('returns an empty successful result when a sticky checkpoint blocks refresh, without scoring or persisting', async () => {
@@ -204,10 +379,12 @@ describe('runAnalyze', () => {
   it('does not let a sessionless Analyze claim a task owned by another V2 session', async () => {
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
     const emit = vi.fn()
+    const onScoreFailure = vi.fn()
 
-    const result = await runAnalyze([job], context(emit))
+    const result = await runAnalyze([job], context(emit), { onScoreFailure })
 
     expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
+    expect(onScoreFailure).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpdateMany).toHaveBeenNthCalledWith(1, expect.objectContaining({
       where: expect.objectContaining({
         AND: expect.arrayContaining([

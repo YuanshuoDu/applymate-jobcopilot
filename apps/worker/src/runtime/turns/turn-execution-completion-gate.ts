@@ -1,6 +1,6 @@
 import { TurnEngineError, type TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, SCHEDULED_PIPELINE_COMPLETION, TASK_GRAPH_DENIAL_CHECKPOINT, parseScheduledPipelineCompletionDisposition, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { parseNativeSemanticRejectionIdentity } from "./native-semantic-rejection-ledger.js"
 import type pg from "pg"
 import type { TurnLease } from "./lease.js"
@@ -14,6 +14,7 @@ import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } fro
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
+import { isTurnStateRefreshRetryError } from "./turn-execution-question.js"
 
 type CompletionGateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate" | "isOwnershipLost">
 type CompletionGateWriter = Pick<TurnExecutionEventWriter, "append">
@@ -146,13 +147,13 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }
 }
 
-export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string, allowTaskGraphDenialCheckpoint = false): Promise<TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity; readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint } | { waitId: string } | undefined> {
+export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string, allowTaskGraphDenialCheckpoint = false): Promise<TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity; readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint } | { waitId: string } | { scheduledWaitId: string; candidateText: string } | { scheduledBlocker: string } | undefined> {
   if (!options.completionGate) return undefined
   let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
   try {
     decision = await options.completionGate({ identity: options.identity, scope: options.scope, rootTaskId: options.identity.rootTaskId, stepId: step.id, candidateText, signal, now: now() })
   } catch (error: unknown) {
-    if (isSessionPauseRequestedError(error) || signalWasInterrupted(signal) || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
+    if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(signal) || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
     if (error instanceof TurnEngineError && error.code === "persistence_conflict") throw error
     throw new TurnEngineError("invalid_output", "Completion gate failed closed")
   }
@@ -161,6 +162,22 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
     if (Object.hasOwn(decision, NATIVE_SEMANTIC_NO_PROGRESS) || Object.hasOwn(decision, NATIVE_SEMANTIC_REJECTION)) throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic progress signal")
     const binding = decision[TASK_GRAPH_FINAL_SUMMARY_BINDING]
     if (binding !== undefined && (!binding || !Number.isSafeInteger(binding.graphRevision) || binding.graphRevision < 1 || !binding.summary || typeof binding.summary !== "object")) throw new TurnEngineError("invalid_output", "Completion gate returned an invalid TaskGraph summary binding")
+    const scheduledCompletion = options.completionGate[SCHEDULED_PIPELINE_COMPLETION]
+    if (scheduledCompletion) {
+      let parsed
+      try {
+        parsed = parseScheduledPipelineCompletionDisposition(await scheduledCompletion({ identity: options.identity, scope: options.scope,
+          rootTaskId: options.identity.rootTaskId, stepId: step.id, stepOrdinal: step.ordinal, candidateText, signal, now: now(), isOwnershipLost: options.isOwnershipLost }))
+      } catch (error: unknown) {
+        if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(signal)
+          || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
+        throw new TurnEngineError("invalid_output", "Scheduled pipeline completion failed closed")
+      }
+      if (!parsed) throw new TurnEngineError("invalid_output", "Scheduled pipeline completion returned an invalid disposition")
+      if (parsed.status === "blocked") return { scheduledBlocker: parsed.errorCode }
+      if (parsed.candidateText !== candidateText) throw new TurnEngineError("invalid_output", "Scheduled pipeline completion changed the final candidate")
+      if (parsed.status === "waiting_for_user") return { scheduledWaitId: parsed.waitId, candidateText: parsed.candidateText }
+    }
     return binding
   }
   if (decision[TASK_GRAPH_FINAL_SUMMARY_BINDING] !== undefined) throw new TurnEngineError("invalid_output", "Completion gate returned a TaskGraph summary binding while denying completion")

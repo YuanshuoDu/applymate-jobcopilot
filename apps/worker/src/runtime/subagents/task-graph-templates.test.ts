@@ -282,9 +282,10 @@ describe("TaskGraph server-owned templates", () => {
   it.each([
     ["Scout", { analyst: TASK_GRAPH_TEMPLATES.analyst }],
     ["Analyst", { scout: TASK_GRAPH_TEMPLATES.scout }],
-  ])("fails closed when scheduled automation has no server-owned %s template to bind", async (_name, taskGraphTemplates) => {
-    await expect(taskGraphRuntimeForTurn(scheduledRuntimeInput({ taskGraphTemplates })))
-      .rejects.toThrow("scheduled_automation_context_invalid")
+  ])("returns an unavailable runtime when scheduled automation has no server-owned %s template to bind", async (_name, taskGraphTemplates) => {
+    await expect(taskGraphRuntimeForTurn(scheduledRuntimeInput({ taskGraphTemplates }))).resolves.toEqual({
+      enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode: false, templates: undefined,
+    })
   })
 
   it.each([
