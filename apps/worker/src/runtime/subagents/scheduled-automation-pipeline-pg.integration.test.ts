@@ -315,10 +315,12 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     expect(Number(waitCreated.rows[0]?.revision)).toBe(1)
     await pool!.query(`INSERT INTO "agent_items"
       ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "completedAt", "createdAt", "updatedAt")
-      VALUES ($1, $2, $3, $4, 'question', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
-      itemId, value.sessionId, value.turnId, value.rootTaskId,
+      VALUES ($1, $2, $3, NULL, 'question', 'completed', 1, $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+      itemId, value.sessionId, value.turnId,
       JSON.stringify({ waitKind: "question", questionId: waitId, toolCallId, answer: "continue", answerAvailable: true }),
     ])
+    const questionTaskId = await pool!.query<{ taskId: string | null }>(`SELECT "taskId" FROM "agent_items" WHERE "id" = $1`, [itemId])
+    expect(questionTaskId.rows[0]?.taskId).toBeNull()
     const answeredTurn = await pool!.query<{ revision: number }>(`UPDATE "agent_turns"
       SET "revision" = "revision" + 1, "updatedAt" = CURRENT_TIMESTAMP
       WHERE "id" = $1 AND "status" = 'waiting_for_user' AND "revision" = $2 RETURNING "revision"`, [value.turnId, waitCreated.rows[0]!.revision])

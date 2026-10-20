@@ -100,7 +100,8 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
     && content.answerAvailable === true && content.answer !== null && content.answer !== undefined
     && turn.source === "automation" && turn.executionMode === "canonical_task_graph"
     && turnInput.automationRunMode === "scheduled"
-    && typeof turn.rootTaskId === "string" && turn.rootTaskId.length > 0 && item.taskId === turn.rootTaskId
+    && typeof turn.rootTaskId === "string" && turn.rootTaskId.length > 0
+    && (item.taskId === null || item.taskId === turn.rootTaskId)
   if (exactScheduledContinuationQuestion && turn.hasLiveLease) {
     return { status: "deferred", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   }

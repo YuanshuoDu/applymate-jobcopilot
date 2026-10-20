@@ -291,7 +291,7 @@ describe("Agent wakeup consumer", () => {
         rootTaskId: "root_1", hasLiveLease: true,
       },
       item: {
-        status: "completed", taskId: "root_1",
+        status: "completed", taskId: null,
         content: { waitKind: "question", questionId: wakeup.waitId, toolCallId: wakeup.toolCallId, answer: "continue", answerAvailable: true },
       },
     })
@@ -310,6 +310,24 @@ describe("Agent wakeup consumer", () => {
       { id: "scheduled_answer_2", lastError: null },
     ])
     expect(fake.calls.filter(([sql]) => sql.includes('UPDATE "agent_turns"') && sql.includes("SET \"status\" = 'queued'")).length).toBe(1)
+    expect(fake.dispatchRows()).toHaveLength(1)
+  })
+
+  it("does not defer a scheduled continuation question attached to a child task", async () => {
+    const fake = fakePool({
+      turn: {
+        userId: "user_1", status: "waiting_for_user", revision: wakeup.nextTurnRevision,
+        source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled" },
+        rootTaskId: "root_1", hasLiveLease: true,
+      },
+      item: {
+        status: "completed", taskId: "child_1",
+        content: { waitKind: "question", questionId: wakeup.waitId, toolCallId: wakeup.toolCallId, answer: "continue", answerAvailable: true },
+      },
+    })
+
+    await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(1)
+    expect(fake.outboxUpdates).toEqual([{ id: "outbox_1", lastError: null }])
     expect(fake.dispatchRows()).toHaveLength(1)
   })
 
