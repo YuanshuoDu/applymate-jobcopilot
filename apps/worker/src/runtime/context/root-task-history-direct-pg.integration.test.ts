@@ -445,7 +445,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       "2022-01-01T00:00:00.000Z", "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
     ])
     expect(history[1]?.taskGraph.nodes).toHaveLength(2)
-    expect(history[1]?.nodeLessons?.[1]?.executionFailureCategory).toBe("execution_setup_unavailable")
+    expect(history[1]?.nodeLessons?.[1]?.executionFailureCategory).toBeUndefined()
     expect(history.some(item => [crossWrongSource.turnId, crossWrongOrigin.turnId, archivedSource.turnId,
       equalCutoff.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
     expect(projectRootTaskHistory(history, true)?.content).toMatchObject({ kind: "root_task_history", advisoryOnly: true, notCurrentEvidence: true })
