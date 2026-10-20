@@ -387,13 +387,15 @@ describe("agent event redaction", () => {
     const fullEnvelopeResult = redactAgentEvent({ type: "input.accepted", body: "Call 4912-9422.", data: fullEnvelope })
     const safeFullEnvelope = fullEnvelopeResult.data as {
       taskId: string
-      payload: { messageId: string; item: { taskId: string; content: unknown } }
+      payload: { messageId: string; item: { id: string; sessionId: string; turnId: string; stepId: null; taskId: string; content: unknown } }
     }
     expect(fullEnvelopeResult.body).toBe("Call [REDACTED_PHONE].")
     expect(safeFullEnvelope.taskId).toBe(phoneShapedTaskId)
     expect(safeFullEnvelope.payload.messageId).toBe(messageId)
     expect(safeFullEnvelope.payload.item.content).toBe("[REDACTED]")
+    expect(safeFullEnvelope.payload.item).toMatchObject({ id: itemId, sessionId, turnId, stepId: null })
     expect(safeFullEnvelope.payload.item.taskId).toBe(phoneShapedTaskId)
+    expect(redactAgentEvent({ type: "input.accepted", body: fullEnvelopeResult.body, data: fullEnvelopeResult.data })).toEqual(fullEnvelopeResult)
 
     const invalidFullEnvelope = redactAgentEvent({
       type: "input.accepted",

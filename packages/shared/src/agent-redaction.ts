@@ -227,7 +227,7 @@ function preserveEnvelope(type: string, raw: JsonRecord, safe: RepositoryJsonVal
   if (!payload || !safeEnvelope) return safe
   const nested = redactWaitRouting(type, payload, safeEnvelope.payload as RepositoryJsonValue, route), safePayload = record(nested), rawItem = record(payload.item), safeItem = record(safePayload?.item)
   const preservedPayload = type === "input.accepted" && validFollowUpPayload(type, payload, route)
-    && safePayload && rawItem && safeItem && opaqueId(rawItem.taskId) && rawItem.taskId === route.taskId ? { ...safePayload, item: preserveFields(safeItem, rawItem, ["taskId"]) } : nested
+    && safePayload && rawItem && safeItem && opaqueId(rawItem.taskId) && rawItem.taskId === route.taskId ? { ...safePayload, item: preserveFields(safeItem, rawItem, ["id", "sessionId", "turnId", "stepId", "taskId"]) } : nested
   const envelope = preserveFields({ ...safeEnvelope, payload: preservedPayload }, raw, ["id", "sessionId", "turnId", "itemId", "taskId", "correlationId", "causationId"])
   const result = record(envelope)
   if (result && raw.idempotencyKey === null) result.idempotencyKey = null
