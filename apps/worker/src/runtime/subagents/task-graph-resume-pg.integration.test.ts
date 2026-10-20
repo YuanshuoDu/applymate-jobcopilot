@@ -12566,6 +12566,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }, intervalMs: 10,
       queueFactory: options => {
         const consumer = subagentQueue.createSubagentQueue(options)
+        // Keep this fixture worker within the default per-session lease cap so
+        // direct sibling fan-out does not exhaust BullMQ retries while slots free.
+        consumer.worker.concurrency = defaultSubagentPolicy().maxConcurrency
         consumer.worker.on("failed", (job, error) => {
           if (!job) return
           if (failedJobDiagnosticWrites.length >= 8 || ownerBoundFailedJobs.length >= 8) return
