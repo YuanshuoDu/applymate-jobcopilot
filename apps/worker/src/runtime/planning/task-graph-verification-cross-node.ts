@@ -178,8 +178,11 @@ export function evaluateFindingsFromScoutDependency(
 ): "passed" | "criterion_not_met" {
   const source = dependencies.get(dependencyNodeKey)
   if (!source || source.role !== "scout") return "criterion_not_met"
-  if (findingJobIds.length === 0) return verifiedEmptyDiscoveryDigest !== undefined
-    && source.items.length === 0 && source.emptyDiscoveryDigest === verifiedEmptyDiscoveryDigest ? "passed" : "criterion_not_met"
+  if (findingJobIds.length === 0) {
+    if (source.items.length > 0) return "passed"
+    return verifiedEmptyDiscoveryDigest !== undefined
+      && source.emptyDiscoveryDigest === verifiedEmptyDiscoveryDigest ? "passed" : "criterion_not_met"
+  }
   const candidateIds = new Set(source.items.map(item => item.jobId))
   return findingJobIds.every(jobId => candidateIds.has(jobId)) ? "passed" : "criterion_not_met"
 }

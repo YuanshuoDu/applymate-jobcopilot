@@ -270,7 +270,7 @@ describe("TaskGraph durable evidence verification", () => {
       status: "failed", reasonCode: "criterion_not_met",
       criteria: [
         { criterionId: "minimum-findings", status: "failed", reasonCode: "criterion_not_met" },
-        { criterionId: "in-scout", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "in-scout", status: "passed", reasonCode: "criteria_met" },
       ],
     })
   })
@@ -348,6 +348,26 @@ describe("TaskGraph durable evidence verification", () => {
         { criterionId: "scout-membership", status: "failed", reasonCode: "criterion_not_met" },
         { criterionId: "scout-coverage", status: "failed", reasonCode: "criterion_not_met" },
       ]) })
+
+    const nonEmptyScout: TaskGraphVerificationEvidenceProjection = projectionForScout(["job-1"])
+    const noFindingAnalyst: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: [],
+      evidenceIds: [canonicalEvidence("job", "job-1")],
+    }
+    const nonEmptyDependencies: TaskGraphVerificationDependencyEvidence = new Map([["scout-source", nonEmptyScout]])
+    const membershipOnly = validatedContract("analyst", [
+      { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-source" } },
+    ])
+    expect(evaluateTaskGraphVerification(membershipOnly, noFindingAnalyst, nonEmptyDependencies)).toEqual({
+      status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "scout-membership", status: "passed", reasonCode: "criteria_met" }],
+    })
+    expect(evaluateTaskGraphVerification(typed, noFindingAnalyst, nonEmptyDependencies)).toMatchObject({
+      status: "failed", criteria: expect.arrayContaining([
+        { criterionId: "scout-membership", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "scout-coverage", status: "failed", reasonCode: "criterion_not_met" },
+      ]),
+    })
   })
 
   it("fails closed when selected dependency evidence is missing, extra, or not a Scout projection", () => {
