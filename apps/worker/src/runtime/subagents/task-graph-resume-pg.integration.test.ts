@@ -5035,6 +5035,7 @@ async function leaseRecoveryFailureDiagnostic(
 ): Promise<RecordValue> {
   const persistedSnapshot = await leaseRecoveryPersistedGraphDiagnostic(pool, owner)
   return {
+    fixtureCounters: leaseRecoveryFixtureDiagnosticProjection(fixture),
     finalRequestGraph: leaseRecoveryGraphDiagnosticProjection({
       graphFound: fixture.finalRequestGraphFound,
       graph: { nodes: fixture.finalRequestGraphRoles.map(key => ({ key })) },
@@ -11581,6 +11582,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let repairWaitSent = false
     const repairWaitCallIds: string[] = []
     const repairWaitStatuses: string[] = []
+    let latestRepairWaitTargetIds: string[] = []
     const repairWaitReadCallIds: string[] = []
     const repairWaitReadCallIdsByWaitCall = new Map<string, string[]>()
     let repairWaitReferenceObserved = false
@@ -11735,6 +11737,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   .map(node => node?.key)).toContain("scout-repair")
               }
               const taskIds = [...repairTaskIds, ...dependentTaskIds]
+              latestRepairWaitTargetIds = taskIds.slice(0, 7)
               const pollIndex = repairWaitCallIds.length
               const pollSuffix = pollIndex === 0 ? "" : `:poll:${pollIndex + 1}`
               const callId = `${repairWaitCallId}${pollSuffix}`
@@ -11988,6 +11991,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       let progress = JSON.stringify({ available: false })
       let waitResults: RecordValue = { available: false }
       let repairWaitState: RecordValue = leaseRecoveryWaitDiagnosticProjection({ available: false })
+      let repairWaitTargetState: RecordValue = { available: false }
       let rootFailure: RecordValue = { available: false }
       let verification: RecordValue = { available: false }
       let scoutResultDiagnostic: RecordValue = { available: false }
@@ -12014,6 +12018,38 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       } catch {
         // Keep only the fixed failure class if durable wait diagnostics are unavailable.
       }
+      try {
+        const targetIds = [...new Set(latestRepairWaitTargetIds)].slice(0, 7)
+        if (targetIds.length === 0) {
+          repairWaitTargetState = { available: true, targetCount: 0, matchedCount: 0, targets: [] }
+        } else {
+          const targetRows = await pool!.query<{
+            ordinal: number; role: string | null; status: string | null
+            attemptCount: number | null; maxAttempts: number | null; failureReason: string | null
+          }>(`SELECT target."ordinal"::int AS "ordinal", task."role", task."status",
+                task."attemptCount", task."maxAttempts", task."failureReason"
+             FROM unnest($3::text[]) WITH ORDINALITY AS target("id", "ordinal")
+             LEFT JOIN "sub_agent_tasks" AS task
+               ON task."id" = target."id" AND task."turnId" = $1 AND task."sessionId" = $2
+             ORDER BY target."ordinal"`, [value.turnId, value.sessionId, targetIds])
+          const targets = targetRows.rows.slice(0, 7).map(row => ({
+            position: diagnosticBoundedCount(row.ordinal),
+            role: diagnosticEnum(row.role, DISCOVERY_DIAGNOSTIC_ROLES) ?? (row.role === null ? "missing" : "other"),
+            status: diagnosticEnum(row.status, TASK_DIAGNOSTIC_STATUSES) ?? (row.status === null ? "missing" : "other"),
+            attemptCount: diagnosticBoundedCount(row.attemptCount),
+            maxAttempts: diagnosticBoundedCount(row.maxAttempts),
+            failureReasonPresent: row.failureReason !== null,
+          }))
+          repairWaitTargetState = {
+            available: true,
+            targetCount: targetIds.length,
+            matchedCount: targets.filter(target => target.status !== "missing").length,
+            targets,
+          }
+        }
+      } catch {
+        repairWaitTargetState = { available: false, targetCount: latestRepairWaitTargetIds.length }
+      }
       const failureMessage = error instanceof Error ? error.message : ""
       const failureKind = failureMessage.startsWith("TaskGraph root turn entered failed")
         ? "turn_failed"
@@ -12028,6 +12064,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
+        { label: "repairWaitTargetState", value: "", safeValue: JSON.stringify(repairWaitTargetState) },
         { label: "privateWaitReaderOrigin", value: "", safeValue: privateWaitRead.origin },
         { label: "privateWaitReaderStage", value: "", safeValue: privateWaitRead.stage },
         { label: "privateWaitRowObservation", value: "", safeValue: privateWaitRead.rowObservation },
