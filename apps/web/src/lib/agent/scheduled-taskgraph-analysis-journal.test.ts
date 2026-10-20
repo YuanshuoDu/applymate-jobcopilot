@@ -261,8 +261,12 @@ describe('runScheduledTaskGraphAnalyze', () => {
     const sql = queryRaw.mock.calls.map(([query]) => (query as { sql: string }).sql)
     expect(sql.map(query => query.match(/FROM "([^"]+)"/)?.[1])).toEqual(['agent_turns', 'agent_turns', 'sub_agent_tasks', 'agent_executions'])
     expect(sql[0]).toContain('FOR UPDATE')
+    expect(sql[0]).toContain('"rootTaskId" =')
+    expect(sql[1]).toContain('"rootTaskId" =')
     expect(sql[1]).toContain('clock_timestamp()')
     expect(sql.slice(2).every(query => query.includes('FOR UPDATE'))).toBe(true)
+    expect(queryRaw.mock.calls[0]?.[0]).toMatchObject({ values: expect.arrayContaining([owner.rootTaskId]) })
+    expect(queryRaw.mock.calls[1]?.[0]).toMatchObject({ values: expect.arrayContaining([owner.rootTaskId]) })
     expect(queryRaw.mock.calls[3]?.[0]).toMatchObject({ values: expect.arrayContaining([key, claimToken, JSON.stringify(owner)]) })
   })
 

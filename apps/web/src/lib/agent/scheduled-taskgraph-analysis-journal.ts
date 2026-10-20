@@ -179,12 +179,14 @@ export async function scheduledTaskGraphScoreOwnerIsCurrent(input: {
   const lockedTurn = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "agent_turns"
     WHERE "id" = ${owner.turnId} AND "userId" = ${owner.userId} AND "sessionId" = ${owner.sessionId}
+      AND "rootTaskId" = ${owner.rootTaskId}
     FOR UPDATE
   `)
   if (lockedTurn.length !== 1) return false
   const turn = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "agent_turns"
     WHERE "id" = ${owner.turnId} AND "userId" = ${owner.userId} AND "sessionId" = ${owner.sessionId}
+      AND "rootTaskId" = ${owner.rootTaskId}
       AND "status" = 'in_progress' AND "leaseOwnerId" = ${owner.turnLeaseOwnerId}
       AND "leaseVersion" = ${owner.turnLeaseVersion} AND "leaseExpiresAt" > clock_timestamp()
   `)

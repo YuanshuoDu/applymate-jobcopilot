@@ -16,6 +16,7 @@ import type {
   ScoredJob,
 } from './types'
 import type { AgentRoleType } from './role-config'
+import type { ScheduledGateReplayOwnerFence } from './approval/gate-replay'
 
 /** Full run context threaded through every pipeline stage. */
 export interface PipelineCtx {
@@ -48,6 +49,8 @@ export interface PipelineCtx {
   executionAttempt?: { id: string; attemptCount: number }
   /** Read-only check used after awaited stages to stop a reclaimed runner. */
   assertExecutionCurrent?: () => Promise<boolean>
+  /** Transactional owner fence for Gate replay in a scheduled TaskGraph run. */
+  scheduledTaskGraphOwnerFence?: ScheduledGateReplayOwnerFence
   /** Durable human-decision boundary supplied by the Orchestrator. */
   askUser?: (stage: string, question: string, options: AgentQuestionOption[]) => Promise<string>
 }

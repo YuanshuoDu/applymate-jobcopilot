@@ -72,6 +72,7 @@ function mockDb(row: Prisma.AgentApprovalGetPayload<{}>, freshness: FreshnessSta
       upsert: vi.fn(async ({ create }: { create: Record<string, unknown> }) => ({ ...create, id: "review_task_1" })),
       updateMany: vi.fn(async () => ({ count: 1 })),
       findUnique: vi.fn(async () => ({ id: "review_task_1" })),
+      findFirst: vi.fn(async () => ({ id: "review_task_1" })),
     },
     applicationTaskEvent: { create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => data) },
     agentEvent: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({ ...row, id: "event_1", sequence: BigInt(9) })) },
@@ -84,6 +85,124 @@ function mockDb(row: Prisma.AgentApprovalGetPayload<{}>, freshness: FreshnessSta
   return { db, tx }
 }
 
+const gateReplayId = "gate_review_stable_id"
+const gateReplayNonce = "a".repeat(64)
+type ApprovalRow = Prisma.AgentApprovalGetPayload<{}>
+type ApprovalCreateArgs = { data: Prisma.AgentApprovalCreateArgs["data"] }
+
+function mockApprovalLookup(tx: ReturnType<typeof mockDb>["tx"], implementation: () => Promise<ApprovalRow | null>) {
+  const lookup = tx.agentApproval.findFirst as unknown as {
+    mockImplementation: (implementation: () => Promise<ApprovalRow | null>) => unknown
+  }
+  lookup.mockImplementation(implementation)
+}
+
+function mockApprovalCreate(
+  tx: ReturnType<typeof mockDb>["tx"],
+  implementation: (args: ApprovalCreateArgs) => Promise<ApprovalRow>,
+) {
+  const create = tx.agentApproval.create as unknown as {
+    mockImplementation: (implementation: (args: ApprovalCreateArgs) => Promise<ApprovalRow>) => unknown
+  }
+  create.mockImplementation(implementation)
+}
+
+function gateReplayScope(overrides: Partial<ApprovalScopeInput> = {}): ApprovalScopeInput {
+  return {
+    ...scopeInput,
+    action: "review_application",
+    toolCallId: "application-review:stable-call",
+    revision: 3,
+    expiresAt: timeAt(60),
+    ...overrides,
+  }
+}
+
+async function gateReplayRow(
+  scope: ApprovalScopeInput,
+  status: "pending" | "approved" | "rejected" | "consumed" = "pending",
+  expiresAt = scope.expiresAt,
+): Promise<Prisma.AgentApprovalGetPayload<{}>> {
+  const nonceHash = await hashApprovalNonce(gateReplayNonce)
+  const storedScope = { ...scope, expiresAt }
+  return {
+    id: gateReplayId,
+    sessionId: scope.sessionId,
+    taskId: "review_task_1",
+    userId: scope.userId,
+    turnId: scope.turnId,
+    toolCallId: scope.toolCallId,
+    jobId: scope.jobId,
+    type: scope.action,
+    status,
+    title: "Review application",
+    body: "Review materials",
+    impact: { externalSubmission: false },
+    payload: { jobId: scope.jobId, applicationTaskId: "review_task_1" },
+    resourceHash: scope.resourceHash,
+    materialHash: scope.materialHash,
+    answersHash: scope.answersHash,
+    scopeHash: await hashApprovalScope(protocolScope(storedScope, nonceHash)),
+    nonceHash,
+    revision: scope.revision,
+    expiresAt,
+    decidedAt: status === "pending" ? null : timeAt(-1),
+    consumedAt: status === "consumed" ? timeAt(-1) : null,
+    createdAt: timeAt(-5),
+  }
+}
+
+function gateReplayInput(
+  scope: ApprovalScopeInput,
+  prepareInTransaction = vi.fn(async () => ({
+    scope,
+    taskId: "review_task_1",
+    payload: { jobId: scope.jobId, applicationTaskId: "review_task_1" },
+  })),
+  scheduledOwnerFence = {
+    owner: {
+      userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: "root_task_1", rootAttemptCount: 2,
+      turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5, executionId: "execution_1", executionAttemptCount: 4,
+    },
+    key: "continuation_key_1",
+    claimToken: "claim_token_1",
+    assertCurrent: vi.fn(async () => true),
+  },
+) {
+  return {
+    approvalId: gateReplayId,
+    nonce: gateReplayNonce,
+    replayExisting: { taskPayloadField: "applicationTaskId" },
+    scheduledOwnerFence,
+    scope,
+    title: "Review application",
+    body: "Review materials",
+    impact: { externalSubmission: false },
+    payload: { jobId: scope.jobId },
+    projectWait: true,
+    executionAttempt: { id: "execution_1", attemptCount: 4 },
+    prepareInTransaction,
+  }
+}
+
+function serializeMockTransactions(db: PrismaClient, tx: ReturnType<typeof mockDb>["tx"]) {
+  let queue = Promise.resolve()
+  const transaction = db.$transaction as unknown as {
+    mockImplementation: (implementation: (work: (transaction: typeof tx) => Promise<unknown>) => Promise<unknown>) => void
+  }
+  transaction.mockImplementation(async work => {
+    const previous = queue
+    let release!: () => void
+    queue = new Promise<void>(resolve => { release = resolve })
+    await previous
+    try {
+      return await work(tx)
+    } finally {
+      release()
+    }
+  })
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(timeAt(0))
@@ -94,6 +213,172 @@ afterEach(() => {
 })
 
 describe("Web approval receipt store", () => {
+  it("serializes concurrent Gate replays and returns the original pending receipt without duplicate writes", async () => {
+    const originalScope = gateReplayScope()
+    const rowTemplate = await gateReplayRow(originalScope)
+    const { db, tx } = mockDb(rowTemplate)
+    let stored: Prisma.AgentApprovalGetPayload<{}> | null = null
+    mockApprovalLookup(tx, async () => stored)
+    tx.applicationTask.findFirst.mockResolvedValue({ id: "review_task_1" })
+    mockApprovalCreate(tx, async ({ data }) => {
+      if (stored) throw Object.assign(new Error("duplicate approval id"), { code: "P2002" })
+      const created = { ...rowTemplate, ...data, status: "pending", decidedAt: null, consumedAt: null } as ApprovalRow
+      stored = created
+      return created
+    })
+    serializeMockTransactions(db, tx)
+
+    const ownerCheck = vi.fn(async () => true)
+    const ownerFence = { ...gateReplayInput(originalScope).scheduledOwnerFence, assertCurrent: ownerCheck }
+    const prepare = vi.fn(async (transaction: Prisma.TransactionClient) => {
+      await (transaction as unknown as typeof tx).applicationTaskEvent.create({ data: { type: "materials_ready" } })
+      return {
+        scope: originalScope,
+        taskId: "review_task_1",
+        payload: { jobId: originalScope.jobId, applicationTaskId: "review_task_1" },
+      }
+    })
+    const first = issueApprovalReceipt(db, gateReplayInput(originalScope, prepare, ownerFence))
+    const replayScope = { ...originalScope, revision: 9, expiresAt: timeAt(90) }
+    const second = issueApprovalReceipt(db, gateReplayInput(replayScope, prepare, ownerFence))
+    const [issued, replayed] = await Promise.all([first, second])
+
+    expect(issued.approval.id).toBe(gateReplayId)
+    expect(replayed.approval).toMatchObject({ id: gateReplayId, status: "pending", scope: { revision: 3, expiresAt: timeAt(60).toISOString() } })
+    expect(replayed.nonce).toBe(issued.nonce)
+    expect(prepare).toHaveBeenCalledOnce()
+    expect(tx.agentApproval.create).toHaveBeenCalledOnce()
+    expect(tx.applicationTaskEvent.create).toHaveBeenCalledOnce()
+    expect(tx.agentItem.create).toHaveBeenCalledOnce()
+    expect(tx.agentEvent.create).toHaveBeenCalledTimes(2)
+    expect(tx.agentOutbox.create).toHaveBeenCalledTimes(2)
+    expect(ownerCheck).toHaveBeenCalledTimes(2)
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(tx.agentExecution.updateMany).toHaveBeenCalledTimes(3)
+  })
+
+  it("reloads and validates a unique-conflict loser after its transaction rolls preparer writes back", async () => {
+    const scope = gateReplayScope()
+    const rowTemplate = await gateReplayRow(scope)
+    const { db, tx } = mockDb(rowTemplate)
+    let stored: Prisma.AgentApprovalGetPayload<{}> | null = null
+    let lookupCount = 0
+    mockApprovalLookup(tx, async () => {
+      lookupCount += 1
+      return lookupCount <= 2 ? null : stored
+    })
+    tx.applicationTask.findFirst.mockResolvedValue({ id: "review_task_1" })
+    mockApprovalCreate(tx, async ({ data }) => {
+      if (stored) throw Object.assign(new Error("duplicate approval id"), { code: "P2002" })
+      const created = { ...rowTemplate, ...data, status: "pending", decidedAt: null, consumedAt: null } as ApprovalRow
+      stored = created
+      return created
+    })
+
+    let pendingMaterialsReady = 0
+    let committedMaterialsReady = 0
+    let materialEventAttempts = 0
+    tx.applicationTaskEvent.create.mockImplementation(async ({ data }) => {
+      materialEventAttempts += 1
+      pendingMaterialsReady += 1
+      return data
+    })
+    const transaction = db.$transaction as unknown as {
+      mockImplementation: (implementation: (work: (value: typeof tx) => Promise<unknown>) => Promise<unknown>) => void
+    }
+    transaction.mockImplementation(async work => {
+      const before = pendingMaterialsReady
+      try {
+        const result = await work(tx)
+        committedMaterialsReady += pendingMaterialsReady - before
+        return result
+      } catch (error) {
+        pendingMaterialsReady = before
+        throw error
+      }
+    })
+
+    const prepare = vi.fn(async (transaction: Prisma.TransactionClient) => {
+      await (transaction as unknown as typeof tx).applicationTaskEvent.create({ data: { type: "materials_ready" } })
+      return {
+        scope,
+        taskId: "review_task_1",
+        payload: { jobId: scope.jobId, applicationTaskId: "review_task_1" },
+      }
+    })
+    const ownerCheck = vi.fn(async () => true)
+    const ownerFence = { ...gateReplayInput(scope).scheduledOwnerFence, assertCurrent: ownerCheck }
+    const issue = gateReplayInput(scope, prepare, ownerFence)
+    const issued = await issueApprovalReceipt(db, issue)
+    const replayed = await issueApprovalReceipt(db, issue)
+
+    expect(replayed.approval.id).toBe(issued.approval.id)
+    expect(replayed.nonce).toBe(issued.nonce)
+    expect(prepare).toHaveBeenCalledTimes(2)
+    expect(materialEventAttempts).toBe(2)
+    expect(committedMaterialsReady).toBe(1)
+    expect(ownerCheck).toHaveBeenCalledTimes(3)
+    expect(tx.agentApproval.create).toHaveBeenCalledTimes(2)
+    expect(tx.agentItem.create).toHaveBeenCalledOnce()
+    expect(tx.agentEvent.create.mock.calls.length).toBe(2)
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("preserves approved Gate replay state and rejects expired, rejected, consumed, or mismatched rows", async () => {
+    const originalScope = gateReplayScope()
+    const currentScope = { ...originalScope, revision: 12, expiresAt: timeAt(90) }
+
+    const approvedRow = await gateReplayRow(originalScope, "approved")
+    const approvedDb = mockDb(approvedRow)
+    approvedDb.tx.agentApproval.findFirst.mockResolvedValue(approvedRow)
+    approvedDb.tx.applicationTask.findFirst.mockResolvedValue({ id: "review_task_1" })
+    const approved = await issueApprovalReceipt(approvedDb.db, gateReplayInput(currentScope))
+    expect(approved.approval).toMatchObject({ status: "approved", scope: { revision: 3, expiresAt: timeAt(60).toISOString() } })
+    expect(approvedDb.tx.agentApproval.create).not.toHaveBeenCalled()
+    expect(approvedDb.tx.agentApproval.updateMany).not.toHaveBeenCalled()
+
+    const cases: Array<{ status: "rejected" | "consumed" | "pending"; expiry?: Date; code: string }> = [
+      { status: "pending", expiry: timeAt(-1), code: "approval_expired" },
+      { status: "rejected", code: "approval_not_approved" },
+      { status: "consumed", code: "approval_already_consumed" },
+    ]
+    for (const item of cases) {
+      const row = await gateReplayRow(originalScope, item.status, item.expiry ?? originalScope.expiresAt)
+      const { db, tx } = mockDb(row)
+      tx.agentApproval.findFirst.mockResolvedValue(row)
+      tx.applicationTask.findFirst.mockResolvedValue({ id: "review_task_1" })
+      const prepare = vi.fn()
+      await expect(issueApprovalReceipt(db, gateReplayInput(currentScope, prepare))).rejects.toMatchObject({ code: item.code })
+      expect(prepare).not.toHaveBeenCalled()
+      expect(tx.agentApproval.create).not.toHaveBeenCalled()
+      expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    }
+
+    const changedMaterialScope = { ...currentScope, materialHash: "e".repeat(64) }
+    const mismatchedDb = mockDb(await gateReplayRow(originalScope))
+    const prepare = vi.fn(async () => ({ scope: changedMaterialScope, taskId: "review_task_1", payload: { jobId: changedMaterialScope.jobId } }))
+    await expect(issueApprovalReceipt(mismatchedDb.db, gateReplayInput(changedMaterialScope, prepare))).rejects.toMatchObject({ code: "approval_scope_mismatch" })
+    expect(prepare).not.toHaveBeenCalled()
+    expect(mismatchedDb.tx.agentApproval.create).not.toHaveBeenCalled()
+  })
+
+  it("fails a scheduled replay closed when its live Turn, root task, or claim fence is stale", async () => {
+    const scope = gateReplayScope()
+    const rowTemplate = await gateReplayRow(scope)
+    const { db, tx } = mockDb(rowTemplate)
+    const assertCurrent = vi.fn(async () => false)
+    const prepare = vi.fn(async () => ({ scope, taskId: "review_task_1", payload: { jobId: scope.jobId } }))
+    const scheduledOwnerFence = gateReplayInput(scope).scheduledOwnerFence
+    const input = gateReplayInput(scope, prepare, { ...scheduledOwnerFence, assertCurrent })
+
+    await expect(issueApprovalReceipt(db, input)).rejects.toMatchObject({ name: "AgentExecutionCancelledError" })
+
+    expect(assertCurrent).toHaveBeenCalledOnce()
+    expect(tx.agentApproval.findFirst).not.toHaveBeenCalled()
+    expect(prepare).not.toHaveBeenCalled()
+    expect(tx.agentApproval.create).not.toHaveBeenCalled()
+  })
+
   it("issues a scoped receipt and emits only a safe audit payload", async () => {
     const row = await approvalRow()
     const { db, tx } = mockDb(row)

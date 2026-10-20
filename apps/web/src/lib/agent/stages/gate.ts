@@ -174,7 +174,7 @@ export async function runGate(
     })
     emit('agent_question', {
       role: 'reviewer', questionId: `application_review_${pkg.job.id}`,
-      question: `${pkg.job.company} · ${pkg.job.role} The application materials are ready.Please check whether the materials correspond to the position, Are all answers true?; Submit can only be authorized after confirmation..`,
+      question: `${pkg.job.company} · ${pkg.job.role}: The job and prepared materials are ready for review. Approval here unlocks form-fill only and does not submit the application.`,
       options: [
         { label: 'Reserved for review', value: 'review' },
       ],

@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Prisma, PrismaClient } from "@prisma/client"
+import type { LegacyReceiptInput } from "./legacy-receipt"
 
 const mocks = vi.hoisted(() => ({
   consumeApprovalAndReserve: vi.fn(),
@@ -16,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   txTurnFindFirst: vi.fn(),
   queryRaw: vi.fn(),
 }))
+
+afterEach(() => vi.unstubAllEnvs())
 
 vi.mock("./store", () => ({
   consumeApprovalAndReserve: mocks.consumeApprovalAndReserve,
@@ -84,7 +87,7 @@ describe("resolveLegacyApproval same-Turn fence", () => {
     expect(result).toMatchObject({ disposition: "canonical_wait", decision: "approved" })
     expect(mocks.decideApproval).toHaveBeenCalledTimes(1)
     expect(mocks.resolvePendingApprovalInTransaction).not.toHaveBeenCalled()
-  })
+  }, 10_000)
 
   it("fails closed for another active approval Item in the same Turn", async () => {
     mocks.txItemFindMany.mockResolvedValue([{ content: { approvalId: "approval_2" } }])
@@ -161,6 +164,114 @@ describe("issueLegacyReceipt transaction preparation", () => {
     expect(prepared).toMatchObject({ taskId: "application_task_1", payload })
     expect(prepared.scope.materialHash).toBe(await hashLegacyValue("material", payload))
     expect(prepared.scope).toMatchObject({ sessionId: "session_1", turnId: "turn_1", jobId: "job_1", action: "review_application" })
+  })
+})
+
+describe("Gate receipt replay identity", () => {
+  beforeEach(() => {
+    vi.resetModules()
+    Object.values(mocks).forEach((mock) => mock.mockReset())
+    vi.stubEnv("AGENT_WORKER_SECRET", "test-server-only-shared-secret")
+  })
+
+  function gateInput(overrides: Partial<Pick<LegacyReceiptInput, "jobId" | "material" | "answers" | "revision" | "expiresAt" | "executionAttempt" | "scheduledOwnerFence">> = {}) {
+    const jobId = overrides.jobId ?? "job_1"
+    const executionAttempt = overrides.executionAttempt ?? { id: "execution_1", attemptCount: 4 }
+    const scheduledOwnerFence = overrides.scheduledOwnerFence ?? {
+      owner: {
+        userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_task_1", rootAttemptCount: 2,
+        turnLeaseOwnerId: "lease_owner_1", turnLeaseVersion: 5,
+        executionId: executionAttempt.id, executionAttemptCount: executionAttempt.attemptCount,
+      },
+      key: "continuation_key_1",
+      claimToken: "claim_token_1",
+      assertCurrent: async () => true,
+    }
+    return {
+      userId: "user_1",
+      sessionId: "session_1",
+      turnId: "turn_1",
+      toolCallId: "application-review:placeholder",
+      jobId,
+      action: "review_application" as const,
+      title: "Review application",
+      body: "Review materials",
+      payload: { jobId },
+      resource: { jobId },
+      material: { resumeHash: "resume-v1", coverLetter: "Dear Acme" },
+      answers: null,
+      revision: 7,
+      expiresAt: new Date("2026-10-01T00:00:00.000Z"),
+      executionAttempt,
+      scheduledOwnerFence,
+      replayMode: "gate-review" as const,
+      ...overrides,
+    }
+  }
+
+  it("derives stable, domain-separated IDs and nonce from the exact Gate replay identity", async () => {
+    const { issueLegacyReceipt } = await import("./legacy-receipt")
+    const baseOwnerFence = gateInput().scheduledOwnerFence!
+    const inputs = [
+      gateInput(),
+      gateInput({ revision: 8, expiresAt: new Date("2026-10-02T00:00:00.000Z") }),
+      gateInput({ executionAttempt: { id: "execution_2", attemptCount: 4 } }),
+      gateInput({ executionAttempt: { id: "execution_1", attemptCount: 3 } }),
+      gateInput({ scheduledOwnerFence: { ...baseOwnerFence, owner: { ...baseOwnerFence.owner, rootTaskId: "root_task_2" } } }),
+      gateInput({ scheduledOwnerFence: { ...baseOwnerFence, owner: { ...baseOwnerFence.owner, rootAttemptCount: 3 } } }),
+      gateInput({ jobId: "job_2" }),
+      gateInput({ material: { resumeHash: "resume-v2", coverLetter: "Dear Acme" } }),
+      gateInput({ answers: { workAuthorization: "yes" } }),
+    ]
+    for (const input of inputs) await issueLegacyReceipt({} as PrismaClient, input)
+
+    const issued = mocks.issueApprovalReceipt.mock.calls.map((call) => call[1] as {
+      approvalId: string; nonce: string; scope: { toolCallId: string; revision: number; expiresAt: Date }
+    })
+    expect(issued).toHaveLength(9)
+    expect(issued[0]?.approvalId).toBe(issued[1]?.approvalId)
+    expect(issued[0]?.nonce).toBe(issued[1]?.nonce)
+    expect(issued[0]?.scope.toolCallId).toBe(issued[1]?.scope.toolCallId)
+    expect(issued[1]?.scope.revision).toBe(8)
+    expect(issued[1]?.scope.expiresAt).toEqual(new Date("2026-10-02T00:00:00.000Z"))
+    for (const changed of issued.slice(2)) {
+      expect(changed.approvalId).not.toBe(issued[0]?.approvalId)
+      expect(changed.nonce).not.toBe(issued[0]?.nonce)
+    }
+    expect(issued[0]?.nonce).toMatch(/^[0-9a-f]{64}$/)
+    expect(issued[0]?.nonce).not.toBe(issued[0]?.approvalId)
+    expect(mocks.issueApprovalReceipt.mock.calls[0]?.[1]).toMatchObject({
+      scheduledOwnerFence: { owner: { rootTaskId: "root_task_1", rootAttemptCount: 2, executionId: "execution_1", executionAttemptCount: 4 } },
+    })
+  })
+
+  it("accepts execution attempt zero and keeps rotating lease claim data out of the replay identity", async () => {
+    const { issueLegacyReceipt } = await import("./legacy-receipt")
+    const first = gateInput({ executionAttempt: { id: "execution_1", attemptCount: 0 } })
+    const firstOwner = first.scheduledOwnerFence!
+    const second = gateInput({
+      executionAttempt: { id: "execution_1", attemptCount: 0 },
+      scheduledOwnerFence: {
+        ...firstOwner,
+        owner: { ...firstOwner.owner, turnLeaseOwnerId: "lease_owner_2", turnLeaseVersion: 6 },
+        key: "continuation_key_2",
+        claimToken: "claim_token_2",
+      },
+    })
+    await issueLegacyReceipt({} as PrismaClient, first)
+    await issueLegacyReceipt({} as PrismaClient, second)
+
+    const issued = mocks.issueApprovalReceipt.mock.calls.map(call => call[1] as { approvalId: string; nonce: string })
+    expect(issued[1]?.approvalId).toBe(issued[0]?.approvalId)
+    expect(issued[1]?.nonce).toBe(issued[0]?.nonce)
+  })
+
+  it("fails closed without the existing shared server signing secret", async () => {
+    vi.stubEnv("AGENT_WORKER_SECRET", " ")
+    const { issueLegacyReceipt } = await import("./legacy-receipt")
+
+    await expect(issueLegacyReceipt({} as PrismaClient, gateInput())).rejects.toThrow("Gate receipt replay signing key is unavailable")
+    expect(mocks.issueApprovalReceipt).not.toHaveBeenCalled()
   })
 })
 

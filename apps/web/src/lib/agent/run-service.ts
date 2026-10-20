@@ -195,6 +195,12 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
         where: { id: execution.id, userId: input.userId, status: "running", attemptCount },
         select: { id: true },
       })) && (!scheduled || await isScheduledTaskGraphOwnerCurrent(scheduled.owner, scheduled.continuationKey, scheduled.claimToken)),
+      ...(scheduled ? { scheduledTaskGraphOwnerFence: {
+        owner: scheduled.owner,
+        key: scheduled.continuationKey,
+        claimToken: scheduled.claimToken,
+        assertCurrent: assertScheduledOwnerCurrent,
+      } } : {}),
       autonomous: input.autonomous,
       emit,
       signal: input.signal,
