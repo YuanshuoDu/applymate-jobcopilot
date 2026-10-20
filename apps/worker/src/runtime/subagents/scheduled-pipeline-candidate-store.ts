@@ -18,8 +18,6 @@ type CandidatePayload = Readonly<{
   finalStepOrdinal: number
   stepAttempt: 1
   candidateText: string
-  writerLeaseOwnerId: string
-  writerLeaseVersion: number
 }>
 type CandidateRow = Record<string, unknown>
 export type ScheduledPipelineCandidateIdentity = Readonly<{
@@ -42,12 +40,11 @@ function object(value: unknown): CandidateRow | null {
 }
 function parseCandidatePayload(value: unknown): CandidatePayload | null {
   const row = object(value)
-  const keys = ["schemaVersion", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "finalStepId", "finalStepOrdinal", "stepAttempt", "candidateText", "writerLeaseOwnerId", "writerLeaseVersion"]
+  const keys = ["schemaVersion", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "finalStepId", "finalStepOrdinal", "stepAttempt", "candidateText"]
   if (!row || Object.keys(row).length !== keys.length || keys.some(key => !Object.hasOwn(row, key))
     || row.schemaVersion !== CANDIDATE_SCHEMA || !nonempty(row.sessionId) || !nonempty(row.turnId) || !nonempty(row.rootTaskId)
     || !positive(row.rootAttemptCount) || !nonempty(row.finalStepId) || row.stepAttempt !== 1
-    || !Number.isSafeInteger(row.finalStepOrdinal) || Number(row.finalStepOrdinal) < 0 || !nonempty(row.candidateText)
-    || !nonempty(row.writerLeaseOwnerId) || !Number.isSafeInteger(row.writerLeaseVersion) || Number(row.writerLeaseVersion) < 0) return null
+    || !Number.isSafeInteger(row.finalStepOrdinal) || Number(row.finalStepOrdinal) < 0 || !nonempty(row.candidateText)) return null
   return row as CandidatePayload
 }
 function candidateIdentityMatches(row: CandidateRow, payload: CandidatePayload, input: Pick<ScheduledPipelineCandidateIdentity, "owner" | "rootAttemptCount">): boolean {
@@ -58,8 +55,6 @@ function candidateIdentityMatches(row: CandidateRow, payload: CandidatePayload, 
     && payload.rootTaskId === owner.rootTaskId && payload.rootAttemptCount === input.rootAttemptCount
     && payload.finalStepId === row.correlationId
     && payload.finalStepOrdinal === Number(row.stepOrdinal) && nonempty(payload.candidateText)
-    && Number.isSafeInteger(payload.writerLeaseVersion) && payload.writerLeaseVersion >= 0
-    && nonempty(payload.writerLeaseOwnerId)
 }
 function assertTurnRoot(input: Pick<ScheduledPipelineCandidateIdentity, "owner" | "rootAttemptCount">): void {
   if (input.owner.kind !== "turn" || input.owner.taskId !== input.owner.rootTaskId
@@ -81,7 +76,6 @@ export function createScheduledPipelineCandidateStore(
         rootAttemptCount: input.rootAttemptCount, finalStepId: input.finalStepId,
         finalStepOrdinal: input.finalStepOrdinal, candidateText: input.candidateText,
         stepAttempt: 1,
-        writerLeaseOwnerId: owner.ownerId, writerLeaseVersion: owner.leaseVersion,
       }
       const identity = `scheduled-candidate:${owner.rootTaskId}:${input.rootAttemptCount}:${input.finalStepId}`
       await eventStore.appendEvent({ owner, id: `scheduled-candidate-${randomUUID()}`, itemId: null,

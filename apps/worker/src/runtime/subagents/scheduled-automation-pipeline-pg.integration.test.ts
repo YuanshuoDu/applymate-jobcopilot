@@ -242,7 +242,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     }
   }, 25_000)
 
-  it("recovers a private staged candidate under the live lease after lease rollover", async () => {
+  it("replays a private staged candidate under the recovered lease after lease rollover", async () => {
     const value = fixture()
     fixtureUserIds.push(value.userId)
     await seedGraph(pool!, value, graphSnapshot(value))
@@ -259,13 +259,13 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     const store = createScheduledPipelineCandidateStore(pool!, createPgTurnEngineStore(pool!))
     await store.stage({ owner: writer, rootAttemptCount: 1, finalStepId: stepId, finalStepOrdinal: 7,
       candidateText: "Exact durable scheduled final candidate." })
-    const saved = await pool!.query<{ type: string; taskId: string; correlationId: string; payload: Record<string, unknown> }>(
-      `SELECT "type", "taskId", "correlationId", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3`,
+    const saved = await pool!.query<{ id: string; idempotencyKey: string; type: string; taskId: string; correlationId: string; payload: Record<string, unknown> }>(
+      `SELECT "id", "idempotencyKey", "type", "taskId", "correlationId", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3`,
       [value.sessionId, value.turnId, SCHEDULED_PIPELINE_CANDIDATE_EVENT])
     expect(saved.rows).toHaveLength(1)
     expect(saved.rows[0]).toMatchObject({ type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, taskId: value.rootTaskId, correlationId: stepId,
       payload: { candidateText: "Exact durable scheduled final candidate.", rootAttemptCount: 1, stepAttempt: 1,
-        writerLeaseOwnerId: writer.ownerId, writerLeaseVersion: writer.leaseVersion } })
+        finalStepId: stepId, finalStepOrdinal: 7 } })
 
     const recovery = await pool!.query<{ leaseVersion: number; leaseExpiresAt: Date | string }>(`UPDATE "agent_turns"
       SET "leaseOwnerId" = $1, "leaseVersion" = "leaseVersion" + 1, "leaseStartedAt" = CURRENT_TIMESTAMP,
@@ -273,6 +273,14 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       WHERE "id" = $2 RETURNING "leaseVersion", "leaseExpiresAt"`, [`recovered-${value.leaseOwnerId}`, value.turnId])
     const current: TurnExecutionOwnerFence = { ...writer, ownerId: `recovered-${value.leaseOwnerId}`,
       leaseVersion: Number(recovery.rows[0]!.leaseVersion), leaseExpiresAt: new Date(recovery.rows[0]!.leaseExpiresAt) }
+    await store.stage({ owner: current, rootAttemptCount: 1, finalStepId: stepId, finalStepOrdinal: 7,
+      candidateText: "Exact durable scheduled final candidate." })
+    const replayed = await pool!.query<{ id: string; idempotencyKey: string; payload: Record<string, unknown> }>(
+      `SELECT "id", "idempotencyKey", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3`,
+      [value.sessionId, value.turnId, SCHEDULED_PIPELINE_CANDIDATE_EVENT])
+    expect(replayed.rows).toHaveLength(1)
+    expect(replayed.rows[0]).toEqual({ id: saved.rows[0]!.id,
+      idempotencyKey: `scheduled-candidate:${value.rootTaskId}:1:${stepId}`, payload: saved.rows[0]!.payload })
     await expect(store.read({ owner: current, rootAttemptCount: 1 }))
       .resolves.toBe("Exact durable scheduled final candidate.")
     await expect(store.read({ owner: current, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_root_attempt_changed")
