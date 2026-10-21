@@ -13,7 +13,7 @@ vi.mock('@/lib/db', () => ({ db: {
   $queryRaw: mocks.queryRaw,
 } }))
 
-import { isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphGateInput, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
+import { isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
 
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 2, turnLeaseOwnerId: 'lease-1', turnLeaseVersion: 4, executionId: 'execution-1', executionAttemptCount: 1 }
@@ -152,17 +152,34 @@ describe('scheduled TaskGraph Gate input reload', () => {
     for (const mock of Object.values(mocks)) mock.mockReset()
   })
 
-  it('locks the current graph, task attempts, and receipt inside the Gate checkpoint transaction', async () => {
+  it.each(['prepare', 'gate', 'execute', 'audit'] as const)('locks the current graph and proof for a %s checkpoint', async stage => {
     const { input, graph } = setup()
+    const recoveryInput = { ...input, analyzeCheckpoint: { ...(input.analyzeCheckpoint as Record<string, unknown>), nextStage: stage } }
     mocks.queryRaw
       .mockResolvedValueOnce([{ id: graph.id }])
       .mockResolvedValueOnce([{ id: owner.rootTaskId }, { id: 'scout-task' }, { id: 'analyst-task' }, { id: 'prepare-task' }])
       .mockResolvedValueOnce([{ id: 'receipt-event' }])
     const tx = { $queryRaw: mocks.queryRaw, agentItem: { findFirst: mocks.graph },
       subAgentTask: { findMany: mocks.tasks }, agentEvent: { findMany: mocks.events } } as unknown as Prisma.TransactionClient
-    await expect(isScheduledTaskGraphGateProofCurrent(input, tx)).resolves.toBe(true)
+    await expect(isScheduledTaskGraphGateProofCurrent(recoveryInput, tx)).resolves.toBe(true)
     expect(mocks.queryRaw).toHaveBeenCalledTimes(3)
     expect(mocks.queryRaw.mock.invocationCallOrder[2]).toBeLessThan(mocks.graph.mock.invocationCallOrder[0]!)
+  })
+
+  it.each(['gate', 'execute', 'audit'] as const)('rebuilds persisted Analyze facts from a %s checkpoint', async stage => {
+    const { input } = setup()
+    const analyzeCheckpoint = { ...(input.analyzeCheckpoint as Record<string, unknown>), nextStage: stage }
+    await expect(loadScheduledTaskGraphGateInput({ ...input, analyzeCheckpoint })).resolves.toMatchObject({
+      packages: [{ userId: owner.userId, sessionId: owner.sessionId, jobId: jobRow.id }],
+    })
+    expect(scheduledTaskGraphAnalyzeCheckpointForGate(analyzeCheckpoint)).toMatchObject({ nextStage: 'prepare' })
+  })
+
+  it('rejects checkpoints outside the scheduled Gate recovery stages', async () => {
+    const { input } = setup()
+    await expect(loadScheduledTaskGraphGateInput({ ...input, analyzeCheckpoint: { ...(input.analyzeCheckpoint as Record<string, unknown>), nextStage: 'completed' } }))
+      .resolves.toBeNull()
+    expect(mocks.graph).not.toHaveBeenCalled()
   })
 
   it('rebuilds packages from persisted scores and exact owner-scoped artifact versions', async () => {

@@ -4,7 +4,7 @@ import { db } from "@/lib/db"
 import { AgentExecutionCancelledError } from "./execution-control"
 import { runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from "./scheduled-taskgraph-analysis-journal"
 import { buildScheduledTaskGraphGateCheckpoint, scheduledTaskGraphAnalyzeCheckpointDigest, type ScheduledTaskGraphPreparedPackageRow } from "./scheduled-taskgraph-gate-checkpoint"
-import { loadScheduledTaskGraphGateInput } from "./scheduled-taskgraph-gate-input"
+import { loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate } from "./scheduled-taskgraph-gate-input"
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { isScheduledTaskGraphOwnerCurrent, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "./scheduled-taskgraph-pipeline-fence"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
@@ -114,17 +114,18 @@ function nonNegative(value: unknown): value is number { return Number.isSafeInte
 export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTaskGraphGateResumeInput): Promise<PipelineCheckpointState> {
   const { owner, continuationKey, claimToken } = input
   const persisted = record(input.persistedCheckpoint), snapshot = parseScheduledAutomationSnapshot(input.snapshot)
+  const analyzeCheckpoint = scheduledTaskGraphAnalyzeCheckpointForGate(input.persistedCheckpoint)
   const persistedWaitId = persisted?.scheduledTaskGraphScheduledWaitId
-  if (scheduledTaskGraphContinuationKey(owner, input.attestation) !== continuationKey
+  if (!analyzeCheckpoint || scheduledTaskGraphContinuationKey(owner, input.attestation) !== continuationKey
     || (snapshot.requireApproval ? persistedWaitId !== undefined && persistedWaitId !== input.scheduledWaitId : persistedWaitId !== undefined || input.scheduledWaitId !== undefined)
     || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) throw new AgentExecutionCancelledError()
   if (!await validateScheduledPrepareWaitIdentity({ owner, snapshot, proof: input.prepareProof, scheduledWaitId: input.scheduledWaitId })) throw new AgentExecutionCancelledError()
   const loaded = await loadScheduledTaskGraphGateInput({ owner, snapshot: input.snapshot,
-    analyzeCheckpoint: input.persistedCheckpoint, analyzeAttestation: input.attestation, prepareProof: input.prepareProof })
+    analyzeCheckpoint, analyzeAttestation: input.attestation, prepareProof: input.prepareProof })
   if (!loaded) throw new AgentExecutionCancelledError()
   const handoff = buildScheduledTaskGraphGateCheckpoint({
     analyze: { owner, snapshot: input.snapshot, attestation: input.attestation, ownedJobs: input.ownedJobs,
-      persistedCheckpoint: input.persistedCheckpoint, activeClaimToken: claimToken },
+      persistedCheckpoint: analyzeCheckpoint, activeClaimToken: claimToken },
     proof: input.prepareProof, packages: loaded.packages, materials: loaded.materials,
   })
   if (!handoff || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) throw new AgentExecutionCancelledError()

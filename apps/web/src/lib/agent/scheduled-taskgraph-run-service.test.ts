@@ -237,9 +237,9 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     const analyzeCheckpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
       ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
     const activeClaim = { ...initialState.scheduledTaskGraphClaim, claimedAt: "2026-10-20T10:00:00.000Z", leaseExpiresAt: "2099-10-20T10:10:00.000Z" }
-    const persisted = { ...analyzeCheckpoint, scheduledTaskGraphClaim: activeClaim }
+    const persisted = { ...analyzeCheckpoint, nextStage: "gate", scheduledTaskGraphClaim: activeClaim }
     const continuation = persisted.scheduledTaskGraphContinuation as Record<string, unknown>
-    const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(persisted)!
+    const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(analyzeCheckpoint)!
     const prepareScheduleRevision = Number(continuation.graphRevision) + 1
     const receiptProjection = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
       owner.executionId, owner.executionAttemptCount, continuation.snapshotDigest, continuation.evidenceDigest, checkpointDigest,
@@ -288,7 +288,7 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
       persistedCheckpoint: persisted, prepareProof,
     })
     expect(mocks.gateInput).toHaveBeenCalledWith(expect.objectContaining({ owner, snapshot,
-      analyzeCheckpoint: persisted, analyzeAttestation: baseAttestation, prepareProof }))
+      analyzeCheckpoint: { ...persisted, nextStage: "prepare" }, analyzeAttestation: baseAttestation, prepareProof }))
     expect(mocks.gateInput.mock.calls[0]?.[0].prepareProof).toBe(prepareProof)
     expect(mocks.gateCheckpoint.mock.calls[0]?.[0].proof).toBe(prepareProof)
     expect(mocks.gateInput.mock.invocationCallOrder[0]).toBeLessThan(mocks.gateCheckpoint.mock.invocationCallOrder[0]!)

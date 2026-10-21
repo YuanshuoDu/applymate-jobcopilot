@@ -22,6 +22,14 @@ export type ScheduledTaskGraphGateInput = Readonly<{
   materials: readonly ScheduledTaskGraphPreparedMaterialRow[]
 }>
 
+/** Reconstructs immutable Analyze facts from an allowed persisted Gate-family stage. */
+export function scheduledTaskGraphAnalyzeCheckpointForGate(value: unknown): Record<string, unknown> | null {
+  const checkpoint = record(value)
+  const stage = checkpoint?.nextStage
+  if (!checkpoint || stage !== 'prepare' && stage !== 'gate' && stage !== 'execute' && stage !== 'audit') return null
+  return checkpoint.nextStage === 'prepare' ? checkpoint : { ...checkpoint, nextStage: 'prepare' }
+}
+
 /** Rechecks the exact Worker proof while the caller's Gate checkpoint transaction holds proof-row locks. */
 export async function isScheduledTaskGraphGateProofCurrent(
   input: ScheduledTaskGraphGateInputRequest,
@@ -29,10 +37,10 @@ export async function isScheduledTaskGraphGateProofCurrent(
 ): Promise<boolean> {
   try {
     const owner = parseOwner(input.owner), snapshot = parseScheduledAutomationSnapshot(input.snapshot)
-    const checkpoint = record(input.analyzeCheckpoint), marker = exactRecord(checkpoint?.scheduledTaskGraphContinuation,
+    const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(input.analyzeCheckpoint), marker = exactRecord(checkpoint?.scheduledTaskGraphContinuation,
       ['schemaVersion', 'key', 'owner', 'snapshotDigest', 'graphRevision', 'evidenceDigest'])
-    const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(input.analyzeCheckpoint)
-    if (!owner || !snapshot || !checkpoint || checkpoint.nextStage !== 'prepare' || !marker
+    const checkpointDigest = checkpoint ? scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint) : null
+    if (!owner || !snapshot || !checkpoint || !marker
       || marker.schemaVersion !== CONTINUATION_SCHEMA || !sameLineageOwner(parseOwner(marker.owner), owner)
       || marker.snapshotDigest !== scheduledAutomationSnapshotDigest(snapshot) || !checkpointDigest) return false
     const proof = parseScheduledTaskGraphPrepareProof(input.prepareProof)
@@ -46,10 +54,10 @@ export async function isScheduledTaskGraphGateProofCurrent(
 export async function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> {
   try {
     const owner = parseOwner(input.owner), snapshot = parseScheduledAutomationSnapshot(input.snapshot)
-    const checkpoint = record(input.analyzeCheckpoint), marker = exactRecord(checkpoint?.scheduledTaskGraphContinuation,
+    const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(input.analyzeCheckpoint), marker = exactRecord(checkpoint?.scheduledTaskGraphContinuation,
       ['schemaVersion', 'key', 'owner', 'snapshotDigest', 'graphRevision', 'evidenceDigest'])
-    const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(input.analyzeCheckpoint)
-    if (!owner || !snapshot || !checkpoint || checkpoint.nextStage !== 'prepare' || !marker
+    const checkpointDigest = checkpoint ? scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint) : null
+    if (!owner || !snapshot || !checkpoint || !marker
       || marker.schemaVersion !== CONTINUATION_SCHEMA || !sameLineageOwner(parseOwner(marker.owner), owner)
       || marker.snapshotDigest !== scheduledAutomationSnapshotDigest(snapshot) || !checkpointDigest) return null
 
