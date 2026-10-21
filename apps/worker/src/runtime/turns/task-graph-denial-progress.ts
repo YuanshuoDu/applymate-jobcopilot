@@ -11,10 +11,11 @@ export function taskGraphDenialProgressFor(
   if (context.taskGraphRevision !== checkpoint.graphRevision || !validCheckpoint(context)) return undefined
   const priorInputEpoch = prior?.taskId === checkpoint.taskId
     && prior.inputThroughSequence === context.inputThroughSequence && validIds(prior.consumedInputIds) ? prior : undefined
-  const noNewInputs = context.consumedInputIds.length === 0
-  const same = !!priorInputEpoch && noNewInputs && priorInputEpoch.graphRevision === checkpoint.graphRevision
+  const sameFence = !!priorInputEpoch && sameAcceptedInputFence(priorInputEpoch.consumedInputIds, context.consumedInputIds)
+  const same = sameFence && priorInputEpoch.graphRevision === checkpoint.graphRevision
     && priorInputEpoch.verificationDigest === checkpoint.verificationDigest
-  const consumedInputIds = priorInputEpoch && noNewInputs ? [...priorInputEpoch.consumedInputIds] : [...context.consumedInputIds]
+  const consumedInputIds = priorInputEpoch && context.consumedInputIds.length === 0
+    ? [...priorInputEpoch.consumedInputIds] : [...context.consumedInputIds]
   return {
     taskId: checkpoint.taskId, graphRevision: checkpoint.graphRevision, verificationDigest: checkpoint.verificationDigest,
     inputThroughSequence: context.inputThroughSequence, consumedInputIds,
@@ -33,7 +34,8 @@ export function taskGraphDenialProgressMatches(
     && progress.graphRevision === checkpoint.graphRevision && progress.graphRevision === context.taskGraphRevision
     && progress.verificationDigest === checkpoint.verificationDigest
     && progress.inputThroughSequence === context.inputThroughSequence
-    && validCheckpoint(context) && context.consumedInputIds.length === 0 && validIds(progress.consumedInputIds)
+    && validCheckpoint(context) && validIds(progress.consumedInputIds)
+    && sameAcceptedInputFence(progress.consumedInputIds, context.consumedInputIds)
 }
 
 export function createTaskGraphDenialProgressTracker(initial?: TaskGraphDenialProgress): {
@@ -73,4 +75,13 @@ function validCheckpoint(context: Pick<StepContext, "inputThroughSequence" | "co
 function validIds(ids: readonly string[]): boolean {
   return Array.isArray(ids) && ids.every(id => typeof id === "string" && id.length > 0)
     && new Set(ids).size === ids.length
+}
+
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((id, index) => id === right[index])
+}
+
+function sameAcceptedInputFence(previousIds: readonly string[], currentIds: readonly string[]): boolean {
+  // With the cursor fixed by the caller, an empty Step claim adds no accepted input.
+  return currentIds.length === 0 || sameIds(previousIds, currentIds)
 }

@@ -9,24 +9,25 @@ describe("TaskGraph denial progress", () => {
   it("counts only an identical checkpoint and accepted-input fence as the second denial", () => {
     const first = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-1", "input-2"] })
     expect(first?.count).toBe(1)
-    const second = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: [] }, first)
+    const second = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-1", "input-2"] }, first)
     expect(second?.count).toBe(2)
-    expect(taskGraphDenialProgressMatches(second, checkpoint, { ...context, consumedInputIds: [] }, "root-1")).toBe(true)
+    expect(taskGraphDenialProgressMatches(second, checkpoint, { ...context, consumedInputIds: ["input-1", "input-2"] }, "root-1")).toBe(true)
+    expect(taskGraphDenialProgressMatches(second, checkpoint, { ...context, consumedInputIds: ["input-1"] }, "root-1")).toBe(false)
   })
 
-  it("preserves a prior Step's accepted-input witness when the next same-cursor denial consumes none", () => {
-    const firstContext = { ...context, consumedInputIds: ["input-3"] }
-    const first = taskGraphDenialProgressFor(checkpoint, firstContext)
+  it("carries the accepted-input witness when the next Step claims no new IDs at the same cursor", () => {
+    const first = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-3"] })
     const second = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: [] }, first)
+
     expect(second).toMatchObject({ count: 2, inputThroughSequence: 12n, consumedInputIds: ["input-3"] })
     expect(taskGraphDenialProgressMatches(second, checkpoint, { ...context, consumedInputIds: [] }, "root-1")).toBe(true)
-    expect(taskGraphDenialProgressMatches(second, checkpoint, firstContext, "root-1")).toBe(false)
   })
 
-  it("rebaselines on any newly consumed Step input and does not carry witnesses across cursor epochs", () => {
+  it("rebaselines when accepted input IDs or their cursor change", () => {
     const first = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-3"] })
-    const repeated = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-3"] }, first)
-    expect(repeated).toMatchObject({ count: 1, consumedInputIds: ["input-3"] })
+    const changedIds = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-4"] }, first)
+    expect(changedIds).toMatchObject({ count: 1, consumedInputIds: ["input-4"] })
+    expect(taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-4"] }, changedIds)?.count).toBe(2)
 
     const advanced = taskGraphDenialProgressFor(checkpoint, { ...context, inputThroughSequence: 13n, consumedInputIds: [] }, first)
     expect(advanced).toMatchObject({ count: 1, inputThroughSequence: 13n, consumedInputIds: [] })
@@ -54,14 +55,13 @@ describe("TaskGraph denial progress", () => {
     const tracker = createTaskGraphDenialProgressTracker()
     const read = vi.fn(async () => checkpoint)
     const firstContext = { ...context, consumedInputIds: ["input-3"] }
-    const noNewInputs = { ...context, consumedInputIds: [] }
     tracker.record(checkpoint, firstContext, true)
 
-    await expect(tracker.shouldStop(noNewInputs, "root-1", read)).resolves.toBe(false)
+    await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(false)
     expect(read).not.toHaveBeenCalled()
 
-    tracker.record(checkpoint, noNewInputs, true)
-    await expect(tracker.shouldStop(noNewInputs, "root-1", read)).resolves.toBe(true)
+    tracker.record(checkpoint, firstContext, true)
+    await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(true)
     expect(read).toHaveBeenCalledOnce()
   })
 
@@ -70,13 +70,12 @@ describe("TaskGraph denial progress", () => {
     const changed = { ...checkpoint, verificationDigest: "b".repeat(64) }
     const read = vi.fn(async () => changed)
     const firstContext = { ...context, consumedInputIds: ["input-3"] }
-    const noNewInputs = { ...context, consumedInputIds: [] }
     tracker.record(checkpoint, firstContext, true)
-    tracker.record(checkpoint, noNewInputs, true)
-    await expect(tracker.shouldStop(noNewInputs, "root-1", read)).resolves.toBe(false)
+    tracker.record(checkpoint, firstContext, true)
+    await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(false)
 
     tracker.record(checkpoint, context, true)
-    await expect(tracker.shouldStop(noNewInputs, "root-1", read)).resolves.toBe(false)
+    await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(false)
     expect(read).toHaveBeenCalledOnce()
   })
 })

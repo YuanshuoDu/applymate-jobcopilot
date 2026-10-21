@@ -84,9 +84,9 @@ describe("TaskGraph denial resume", () => {
   it("resets the trailing count after a changed report digest or intervening tool evidence", () => {
     const first = closedDenial("step-1", 1, 0), changed = closedDenial("step-2", 2, 10, { digest: "b".repeat(64), consumedInputIds: [] })
     expect(restoreTaskGraphDenialProgress({ scope, items: [], steps: [first.step, changed.step], events: [...first.events, ...changed.events] })?.count).toBe(1)
-    const sameCursorFresh = closedDenial("step-2", 2, 10, { consumedInputIds: ["input-3"] })
-    expect(restoreTaskGraphDenialProgress({ scope, items: [], steps: [first.step, sameCursorFresh.step], events: [...first.events, ...sameCursorFresh.events] }))
-      .toMatchObject({ count: 1, consumedInputIds: ["input-3"] })
+    const sameCursorDifferentInput = closedDenial("step-2", 2, 10, { consumedInputIds: ["input-4"] })
+    expect(restoreTaskGraphDenialProgress({ scope, items: [], steps: [first.step, sameCursorDifferentInput.step], events: [...first.events, ...sameCursorDifferentInput.events] }))
+      .toMatchObject({ count: 1, consumedInputIds: ["input-4"] })
     const nextCursor = closedDenial("step-2", 2, 10, { cursor: "4", consumedInputIds: ["input-4"] })
     expect(restoreTaskGraphDenialProgress({ scope, items: [], steps: [first.step, nextCursor.step], events: [...first.events, ...nextCursor.events] }))
       .toMatchObject({ count: 1, inputThroughSequence: 4n, consumedInputIds: ["input-4"] })
@@ -96,7 +96,7 @@ describe("TaskGraph denial resume", () => {
   })
 
   it("accepts a same-Step reasoned summary event before the checkpoint and rejects malformed duplicates or scope", () => {
-    const first = closedDenial("step-1", 1, 0), second = closedDenial("step-2", 2, 10, { cause: "reasoning-summary-completed", consumedInputIds: [] })
+    const first = closedDenial("step-1", 1, 0), second = closedDenial("step-2", 2, 10, { cause: "reasoning-summary-completed" })
     const usage = second.events.find(event => event.type === "model.usage")!
     const summaryStart = { ...second.events[0]!, id: "reasoning-summary-start", type: "item.started", sequence: "15", itemId: "summary-item",
       correlationId: "step-2", causationId: usage.id, idempotencyKey: `turn:${scope.turnId}:event:item-started:summary-item`, payload: null,

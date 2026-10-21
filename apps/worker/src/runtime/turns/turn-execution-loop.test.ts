@@ -2138,11 +2138,7 @@ describe("owner-agnostic turn execution loop", () => {
     const builtInputSequences: bigint[] = []
     root.options = { ...root.options, contextBuilder: { build: async request => {
       const built = await inputBuilder.build(request)
-      inputBuilds += 1
-      const context = inputBuilds === 1 ? { ...built, inputThroughSequence: 1n } : {
-        ...built, inputThroughSequence: 1n, consumedInputIds: [],
-        blocks: built.blocks.filter(block => block.id !== "steer-1:part:0"),
-      }
+      const context = { ...built, inputThroughSequence: 1n, consumedInputIds: inputBuilds++ === 0 ? ["steer-1"] : [] }
       builtInputFences.push([...context.consumedInputIds])
       builtInputSequences.push(context.inputThroughSequence)
       return { ...context, taskGraphRevision: 4 }
@@ -2175,6 +2171,47 @@ describe("owner-agnostic turn execution loop", () => {
     expect(builtInputFences.slice(0, 3)).toEqual([["steer-1"], [], []])
     expect(builtInputSequences.slice(0, 3)).toEqual([1n, 1n, 1n])
     expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(2)
+    expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(2)
+    expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
+  })
+
+  it("stops before a third provider call after two typed final denials with the same non-empty accepted-input IDs", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    addSteeringInput(root)
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const inputBuilder = root.options.contextBuilder
+    const builtInputFences: string[][] = []
+    root.options = { ...root.options, contextBuilder: { build: async request => {
+      const built = await inputBuilder.build(request)
+      const context = { ...built, inputThroughSequence: 1n, consumedInputIds: ["steer-1"] }
+      builtInputFences.push([...context.consumedInputIds])
+      return { ...context, taskGraphRevision: 4 }
+    } } }
+    const checkpoint = taskGraphCheckpoint(4)
+    const read = vi.fn(async () => checkpoint)
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
+    const baseModel = root.options.model
+    const providerCallsWithSteeringInput: boolean[] = []
+    root.options = { ...root.options, completionGate, budget: { maxSteps: 4 }, maxSteps: 4,
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        providerCallsWithSteeringInput.push(request.messages.some(message =>
+          message.content.some(part => part.type === "text" && part.text.includes('"inputId":"steer-1"'))))
+        const candidate = `Candidate wording ${root.requests.length} still lacks the required proof.`
+        yield { type: "text_delta", text: candidate }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 3 })
+    expect(root.requests).toHaveLength(2)
+    expect(providerCallsWithSteeringInput).toEqual([true, true])
+    expect(builtInputFences.slice(0, 3)).toEqual([["steer-1"], ["steer-1"], ["steer-1"]])
+    expect(completionGate).toHaveBeenCalledTimes(2)
+    expect(read).toHaveBeenCalledOnce()
     expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(2)
     expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
   })
@@ -2247,9 +2284,10 @@ describe("owner-agnostic turn execution loop", () => {
       [5, 2n, []], [5, 2n, []], [5, 2n, []],
     ])
     expect(requestText(0)).toContain("Initial accepted instruction")
-    expect(requestText(0)).not.toContain("New accepted instruction changes the cursor")
     expect(requestText(1)).not.toContain("New accepted instruction changes the cursor")
     expect(requestText(2)).toContain("New accepted instruction changes the cursor")
+    expect(requestText(0)).toContain('"revision":4')
+    expect(requestText(1)).toContain('"revision":4')
     expect(requestText(2)).toContain('"revision":4')
     expect(requestText(3)).toContain('"revision":4')
     expect(requestText(4)).toContain('"revision":5')
