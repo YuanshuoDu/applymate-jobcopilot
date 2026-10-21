@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import type { DurableWaitPort } from "../tools/coordination-types.js"
-import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphExecutionScope, TaskGraphScheduledPrepareInput } from "./task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphExecutionScope, TaskGraphReadScope, TaskGraphScheduledPrepareInput } from "./task-graph-command-port.js"
 import type { ScheduledPipelinePrepareContinuation } from "./scheduled-pipeline-completion.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
@@ -64,14 +64,15 @@ export function createScheduledAutomationPrepareContinuation(input: Readonly<{
       || executionOwner.ownerId !== continuation.owner.turnLeaseOwnerId || executionOwner.leaseVersion !== continuation.owner.turnLeaseVersion
       || continuation.proof.continuationKey.trim().length === 0
       || continuation.proof.executionAttemptCount < 0) throw new Error("scheduled_prepare_owner_invalid")
-    const scope: TaskGraphExecutionScope = {
+    const readScope: TaskGraphReadScope = {
       userId: continuation.owner.userId, sessionId: continuation.owner.sessionId, turnId: continuation.owner.turnId,
       rootTaskId: continuation.owner.rootTaskId, parentTaskId: continuation.owner.rootTaskId,
-      stepId: continuation.finalStepId, turnLeaseOwner: continuation.owner.turnLeaseOwnerId,
+      turnLeaseOwner: continuation.owner.turnLeaseOwnerId,
       turnLeaseVersion: continuation.owner.turnLeaseVersion, parentLeaseOwner: continuation.owner.turnLeaseOwnerId,
       parentAttemptCount: continuation.owner.rootAttemptCount,
     }
-    const graph = await input.commandPort.readCurrent(scope)
+    const scope: TaskGraphExecutionScope = { ...readScope, stepId: continuation.finalStepId }
+    const graph = await input.commandPort.readCurrent(readScope)
     const analyzeRevision = continuation.attestation.graphRevision
     if (!Number.isSafeInteger(analyzeRevision) || !Number.isSafeInteger(analyzeRevision + 1)
       || (graph.revision !== analyzeRevision && !hasScheduledPrepare(graph, analyzeRevision + 1))) {

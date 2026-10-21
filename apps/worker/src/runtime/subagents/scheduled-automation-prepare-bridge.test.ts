@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type { DurableWaitPort, DurableWaitInvocation } from "../tools/coordination-types.js"
-import type { TaskGraphCommandPort, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphReadScope, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
 import type { ScheduledPipelinePrepareContinuationInput } from "./scheduled-pipeline-completion.js"
 import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
 import { buildScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
@@ -39,7 +39,7 @@ const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERS
 
 function ports(options: { revision?: number; nodes?: readonly unknown[]; receiptNodes?: readonly unknown[]; waitStatus?: string; waitMatchedTaskIds?: readonly string[];
   receiptStatus?: "accepted" | "duplicate" | "waiting_for_choice"; choice?: TaskGraphScheduledPrepareReceipt["choice"] } = {}) {
-  const readCurrent = vi.fn(async () => ({ revision: options.revision ?? 7, nodes: options.nodes ?? [
+  const readCurrent = vi.fn(async (_scope: TaskGraphReadScope) => ({ revision: options.revision ?? 7, nodes: options.nodes ?? [
     { key: "analysis", templateId: "analyst", taskId: "analyst-task", status: "completed", failureReason: null },
   ] }))
   const appendScheduledPrepare = vi.fn(async () => ({ status: options.receiptStatus ?? "accepted", revision: options.receiptStatus === "waiting_for_choice" ? 7 : 8,
@@ -115,6 +115,8 @@ describe("scheduled automation Prepare continuation", () => {
   it("appends the fixed child and durable same-root wait using the original final step", async () => {
     const fixture = ports({ choice: { required: true, status: "answered", waitId: expectedChoiceWaitId } }), continuation = createScheduledAutomationPrepareContinuation(fixture)
     await expect(continuation(base)).resolves.toEqual({ status: "waiting_for_dependency", waitId: "wait-1" })
+    expect(fixture.readCurrent).toHaveBeenCalledOnce()
+    expect(fixture.readCurrent.mock.calls[0]?.[0]).not.toHaveProperty("stepId")
     expect(fixture.appendScheduledPrepare).toHaveBeenCalledWith(expect.objectContaining({
       scope: expect.objectContaining({ parentTaskId: "root-1", stepId: "step-original", parentAttemptCount: 2 }),
       handoff: proof, attestation,
