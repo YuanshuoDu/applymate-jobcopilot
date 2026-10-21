@@ -2175,6 +2175,46 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
   })
 
+  it("stops before a third provider call after two typed final denials with the same non-empty accepted-input IDs", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    addSteeringInput(root)
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const inputBuilder = root.options.contextBuilder
+    const builtInputFences: string[][] = []
+    root.options = { ...root.options, contextBuilder: { build: async request => {
+      const built = await inputBuilder.build(request)
+      const context = { ...built, inputThroughSequence: 1n, consumedInputIds: ["steer-1"] }
+      builtInputFences.push([...context.consumedInputIds])
+      return { ...context, taskGraphRevision: 4 }
+    } } }
+    const checkpoint = taskGraphCheckpoint(4)
+    const read = vi.fn(async () => checkpoint)
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
+    const baseModel = root.options.model
+    root.options = { ...root.options, completionGate, budget: { maxSteps: 4 }, maxSteps: 4,
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        const candidate = `Candidate wording ${root.requests.length} still lacks the required proof.`
+        yield { type: "text_delta", text: candidate }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const capturedMessages = root.requests.map(request => JSON.stringify(request.messages))
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 3 })
+    expect(root.requests).toHaveLength(2)
+    expect(capturedMessages).toHaveLength(2)
+    expect(capturedMessages.every(messages => messages.includes('"inputId":"steer-1"'))).toBe(true)
+    expect(builtInputFences.slice(0, 3)).toEqual([["steer-1"], ["steer-1"], ["steer-1"]])
+    expect(completionGate).toHaveBeenCalledTimes(2)
+    expect(read).toHaveBeenCalledOnce()
+    expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(2)
+    expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
+  })
+
   it("reopens the model after accepted input and current TaskGraph checkpoint changes", async () => {
     const root = fixture(identity("turn", "root-1"))
     root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
