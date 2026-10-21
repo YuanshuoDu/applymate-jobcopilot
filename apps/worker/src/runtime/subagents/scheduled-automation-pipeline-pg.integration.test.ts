@@ -88,13 +88,6 @@ afterEach(() => {
   vi.resetModules()
 })
 
-describe("scheduled pipeline route test importer", () => {
-  it("loads the Web route through the Worker Vitest alias", async () => {
-    const route = await vi.importActual<{ POST(request: Request): Promise<Response> }>(scheduledPipelineRoutePath)
-    expect(typeof route.POST).toBe("function")
-  }, 30_000)
-})
-
 describeWithServices("scheduled automation TaskGraph continuation on disposable PostgreSQL and Redis", () => {
   beforeAll(async () => {
     pool = new PgPool({ connectionString: databaseUrl!, max: 4 })
@@ -103,6 +96,11 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     prismaUrl.searchParams.set("application_name", prismaApplicationName)
     process.env.DATABASE_URL = prismaUrl.toString()
   })
+
+  it("loads the Web route through the Worker Vitest alias", async () => {
+    const route = await vi.importActual<{ POST(request: Request): Promise<Response> }>(scheduledPipelineRoutePath)
+    expect(typeof route.POST).toBe("function")
+  }, 30_000)
 
   afterAll(async () => {
     if (pool && fixtureUserIds.length) await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [fixtureUserIds])
