@@ -38,25 +38,22 @@ const MAX_TURNS = 2
 const MAX_NODES = 8
 const MAX_REASON_HINTS = 8
 const MAX_CONTENT_BYTES = 8 * 1024
-const STATUSES = new Set<SubagentTaskStatus>([
-  "queued", "running", "retrying", "waiting", "waiting_for_user",
-  "completed", "failed", "interrupted", "cancelled", "closed",
-])
-const TASK_KINDS = new Map<string, TaskKind>([
-  ["scout", "scout"], ["analyst", "analyst"],
-  ["cover_letter_writer", "writer"], ["cover_letter_reviewer", "reviewer"],
-])
-const NEGATIVE_REASON_CODES = new Set<TaskGraphVerificationReasonCode>([
-  "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid",
-  "role_mismatch", "canonical_evidence_missing", "canonical_evidence_invalid",
-  "canonical_evidence_ambiguous", "result_invalid", "result_ambiguous",
-  "result_evidence_unbound", "repair_target_unresolved",
-])
+const STATUSES = new Set<SubagentTaskStatus>(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+const TASK_KINDS = new Map<string, TaskKind>([["scout", "scout"], ["analyst", "analyst"], ["cover_letter_writer", "writer"], ["cover_letter_reviewer", "reviewer"]])
+const NEGATIVE_REASON_CODES = new Set<TaskGraphVerificationReasonCode>(["criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid",
+  "role_mismatch", "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid", "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved"])
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   try {
     const prototype = Object.getPrototypeOf(value)
     return prototype === Object.prototype || prototype === null ? value as Row : null
+  } catch { return null }
+}
+function ownDataProperty(value: object, key: string): { present: boolean; value?: unknown } | null {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor) return { present: false }
+    return "value" in descriptor ? { present: true, value: descriptor.value } : null
   } catch { return null }
 }
 function exact(value: Row, keys: string): boolean {
@@ -131,11 +128,13 @@ function projectNode(value: unknown): Omit<SafeNode, "lesson" | "reportedOutput"
   return { taskKind, status: node.status as SubagentTaskStatus, ...(hints ? { negativeReasonHints: hints } : {}) }
 }
 function candidate(value: unknown, crossSession: boolean): Candidate | null {
-  const item = record(value), hasSourceSessionDiffers = !!item && Object.hasOwn(item, "sourceSessionDiffers")
-  if (!item || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
+  const item = record(value), locality = item && ownDataProperty(item, "sourceSessionDiffers")
+  if (!item || !locality || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
     || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n
-    || (crossSession && ((hasSourceSessionDiffers && typeof item.sourceSessionDiffers !== "boolean")
+    || (crossSession && ((locality.present && typeof locality.value !== "boolean")
       || !(item.terminalAt instanceof Date) || !Number.isFinite(item.terminalAt.getTime())))) return null
+  const hasSourceSessionDiffers = locality.present
+  const sourceSessionDiffers = crossSession && (!hasSourceSessionDiffers || locality.value !== false)
   const hasOrdinals = Object.hasOwn(item, "sourceNodeOrdinals"), hasLessons = Object.hasOwn(item, "nodeLessons"), hasOutputs = Object.hasOwn(item, "reportedOutputs")
   const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(crossSession ? [...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []), "terminalAt"] : []),
     ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : [])].sort().join(",")
@@ -160,7 +159,7 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
   return {
     sourceTurnId: item.sourceTurnId, sourceRootTaskId: item.sourceRootTaskId,
     terminalSequence: item.terminalSequence, ...(crossSession ? { terminalAt: item.terminalAt as Date } : {}),
-    sourceSessionDiffers: crossSession && item.sourceSessionDiffers !== false, ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
+    sourceSessionDiffers, ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }

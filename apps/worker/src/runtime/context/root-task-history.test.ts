@@ -182,6 +182,30 @@ describe("root task history projection", () => {
       .toEqual(projectRootTaskHistory([foreign], true)?.content)
   })
 
+  it("rejects changing locality accessors before they can leak historical private fields", () => {
+    const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
+      availability: "available", role: "scout", status: "partial", candidateCount: 1, evidenceCount: 1,
+      candidates: [{ jobId: "private-job", source: "greenhouse", evidenceKinds: ["job"] }] } satisfies TaskGraphResultProjection
+    const base = { ...outcome("accessor-locality", 31n, [
+      node({ status: "completed", failureReason: null, resultProjection }), node(), node({ templateId: "analyst" }),
+    ]), terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceNodeOrdinals: [1, 2, 3],
+    nodeLessons: [undefined, { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] },
+    { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 3,
+      criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" }] as const,
+    reportedOutputs: [{ role: "scout", candidateCount: 1, resultStatus: "partial" }, undefined, undefined] as const }
+    let localityReads = 0
+    const changingLocality = { ...base, sourceTurnId: "turn-changing-locality", sourceRootTaskId: "root-changing-locality" }
+    Object.defineProperty(changingLocality, "sourceSessionDiffers", { enumerable: true, get: () => ++localityReads === 1 })
+    expect(projectRootTaskHistory([changingLocality], true)).toBeUndefined()
+    expect(localityReads).toBe(0)
+
+    const setterLocality = { ...base, sourceTurnId: "turn-setter-locality", sourceRootTaskId: "root-setter-locality" }
+    Object.defineProperty(setterLocality, "sourceSessionDiffers", { enumerable: true, set: (_value: boolean) => undefined })
+    expect(projectRootTaskHistory([setterLocality], true)).toBeUndefined()
+  })
+
   it("applies the byte cap to the final sanitized cross-session frame", () => {
     const criterionIds = Array.from({ length: 8 }, (_, index) => "criterion-" + (index + 1))
     const failedReport = {
