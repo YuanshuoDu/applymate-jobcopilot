@@ -4,6 +4,7 @@ import { Queue, Worker } from "bullmq"
 import Redis from "ioredis"
 import { Pool as PgPool } from "pg"
 import type { ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 
@@ -17,6 +18,7 @@ import { TurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
 import type { TurnEngineOptions, TurnEngineResult, TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { drainAgentWakeups } from "../wakeup/consumer.js"
+import { drainTaskInterruptOutbox, TASK_INTERRUPT_OUTBOX_TOPIC } from "./task-interrupt-outbox.js"
 import { AGENT_TURN_WAKEUP_TOPIC } from "../wakeup/types.js"
 import { createCanonicalExecutionProjection } from "../canonical-execution-projection.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
@@ -747,13 +749,18 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     expect(dispatchAfterResume.rows[0]?.publishedAt).toBeNull()
   })
 
-  it("replays the persisted Prepare choice and resumes without duplicate material after a Worker restart", async () => {
+  it.each([
+    { name: "eligible job", mode: "success" as const, minScore: 70 },
+    { name: "zero eligible jobs", mode: "zero-eligible" as const, minScore: 90 },
+    { name: "Prepare cancellation", mode: "cancel" as const, minScore: 70 },
+  ])("preserves Prepare invariants in the real PostgreSQL/Redis worker path ($name)", async scenario => {
     const value = fixture()
     fixtureUserIds.push(value.userId)
+    const scheduleSnapshot = scheduledAutomationSnapshot(scenario.minScore)
     const snapshot = parseTaskGraphSnapshot({ ...graphSnapshot(value), rootSuccessCriteria: [
       "Scheduled automation pipeline integration", "Keep Prepare bound to verified Analyze evidence",
     ] })
-    await seedGraph(pool!, value, snapshot)
+    await seedGraph(pool!, value, snapshot, false, scheduleSnapshot)
     const scheduledRootActions = [...new Set([
       ...TASK_GRAPH_TEMPLATES.scout.allowedActions,
       ...TASK_GRAPH_TEMPLATES.analyst.allowedActions,
@@ -866,6 +873,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     let restartedWorker: Worker<ScheduledContinuationPayload, Awaited<ReturnType<typeof bridge>>> | undefined
     let prepareWorker: Worker<SubagentJobPayload, unknown> | undefined
     let restartedPrepareWorker: Worker<SubagentJobPayload, unknown> | undefined
+    let prepareManager: { signalTaskSubtree(sessionId: string, rootTaskId: string, taskIds: readonly string[]): void } | undefined
+    let prepareTaskIdForCleanup: string | undefined
     const jobId = `scheduled-pipeline-${value.turnId}`
     try {
       await redis.ping()
@@ -931,7 +940,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey, claimToken, owner: claimOwner,
         claimedAt: turnLease.leaseStartedAt.toISOString(), leaseExpiresAt: turnLease.leaseExpiresAt.toISOString(),
       }
-      const scheduledSnapshot = scheduledAutomationSnapshot()
+      const scheduledSnapshot = scheduleSnapshot
       const jobRecord = {
         id: value.jobId, userId: value.userId, company: "Fixture Systems", role: "Software Engineer", location: "Dublin",
         status: "saved", score: null, url: "https://jobs.example.invalid/fixture", source: "fixture", salary: null,
@@ -1169,6 +1178,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         nodes: [{ key: "prepare", status: "queued" }], readyTaskIds: [expect.any(String)],
         choice: { required: true, status: "answered", waitId: expectedChoiceWaitId } })
       const prepareTaskId = scheduledReceipt.nodes[0]!.taskId
+      prepareTaskIdForCleanup = prepareTaskId
       const preparedTask = await pool!.query<{ rootTaskId: string; parentTaskId: string; status: string; role: string; taskType: string; allowedActions: string[] }>(
         `SELECT "rootTaskId", "parentTaskId", "status", "role", "taskType", "allowedActions" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
       expect(preparedTask.rows[0]).toMatchObject({ rootTaskId: value.rootTaskId, parentTaskId: value.rootTaskId,
@@ -1219,6 +1229,11 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       }
       let toolModelCalls = 0
       let materialModelCalls = 0
+      const usageSettlements: Array<{ stepId: string; settlement: WorkerUsageSettlementInput }> = []
+      let resolveMaterialCallStarted!: () => void
+      let resolveMaterialCallSettled!: () => void
+      const materialCallStarted = new Promise<void>(resolve => { resolveMaterialCallStarted = resolve })
+      const materialCallSettled = new Promise<void>(resolve => { resolveMaterialCallSettled = resolve })
       const modelRuntimeFactory = (): ModelAdapter => ({
         id: "scheduled-prepare-fixture", profile,
         async *stream(request) {
@@ -1238,6 +1253,19 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           }
           const prompt = parts.filter(part => part.type === "text").map(part => part.text).join("\n")
           materialModelCalls += 1
+          if (scenario.mode === "cancel" && (prompt.includes("Tailor this resume")
+            || prompt.includes("Write a concise, professional European application cover letter"))) {
+            resolveMaterialCallStarted()
+            const signal = request.signal
+            if (!signal) throw new Error("Scheduled Prepare model request omitted its cancellation signal")
+            try {
+              await new Promise<void>((_resolve, reject) => {
+                const abort = () => reject(new Error("cancelled"))
+                if (signal.aborted) abort()
+                else signal.addEventListener("abort", abort, { once: true })
+              })
+            } finally { resolveMaterialCallSettled() }
+          }
           yield { type: "text_delta", text: prompt.includes("Tailor this resume")
             ? JSON.stringify(baseResumeContent)
             : prompt.includes("Write a concise, professional European application cover letter")
@@ -1245,9 +1273,12 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           yield { type: "completed", finishReason: "stop" }
         },
       })
-      const authorizeUsage = async () => ({ settle: async () => undefined })
+      const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => ({
+        settle: async (settlement: WorkerUsageSettlementInput) => { usageSettlements.push({ stepId: input.stepId, settlement }) },
+      })
       const executor = childRuntime.createProductionChildExecutor({ pool: pool!, authorizeUsage, modelRuntimeFactory })
       const manager = new childManager.AgentTreeManager(new childStore.PgSubagentTaskStore(pool!))
+      prepareManager = manager
       await prepareQueue.waitUntilReady()
       expect(await childQueue.dispatchPendingSubagentOutbox(pool as never, prepareQueue, 10)).toBe(1)
       const prepareQueueJobId = childQueue.subagentJobId(prepareTaskId)
@@ -1260,11 +1291,85 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       }, { connection: redis.duplicate(), skipVersionCheck: true, concurrency: 1 })
       const prepareCompleted = waitForSubagentWorkerCompletion(prepareWorker, prepareQueueJobId)
       await prepareWorker.waitUntilReady()
+      let acceptedInterrupt: { intentId: string; taskId: string; turnId: string; disposition: string; sequence: string } | undefined
+      if (scenario.mode === "cancel") {
+        await Promise.race([materialCallStarted, prepareCompleted.then(() => {
+          throw new Error("Scheduled Prepare completed before its material model call could be interrupted")
+        })])
+        const interruptPath = "@/lib/agent/control-plane/commands/task-interrupt-service"
+        const interruptModule = await import(interruptPath) as unknown as {
+          TaskInterruptService: new (db: unknown) => { interrupt(input: { sessionId: string; taskId: string; userId: string;
+            clientMessageId: string }): Promise<{ intentId: string; taskId: string; turnId: string; disposition: string; sequence: string }> }
+        }
+        const interruptService = new interruptModule.TaskInterruptService(webDatabase.db)
+        acceptedInterrupt = await interruptService.interrupt({ sessionId: value.sessionId, taskId: prepareTaskId,
+          userId: value.userId, clientMessageId: `scheduled-prepare-stop-${value.turnId}` })
+        expect(acceptedInterrupt).toMatchObject({ taskId: prepareTaskId, disposition: "accepted" })
+        await expect(drainTaskInterruptOutbox(pool as unknown as PgSubagentPool, manager)).resolves.toBe(1)
+      }
       const prepareOutcome = await prepareCompleted
-      const completedPrepare = await pool!.query<{ status: string; attemptCount: number; failureReason: string | null; result: Record<string, unknown> }>(
-        `SELECT "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
+      const readCompletedPrepare = () => pool!.query<{ status: string; attemptCount: number; failureReason: string | null;
+        result: Record<string, unknown>; interruptRequestedAt: Date | null }>(
+        `SELECT "status", "attemptCount", "failureReason", "result", "interruptRequestedAt" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
+      let completedPrepare = await readCompletedPrepare()
+      if (scenario.mode === "cancel") {
+        await awaitWithTimeout(materialCallSettled, "Scheduled Prepare material call did not settle after cancellation", 5_000)
+        const reconciliationDeadline = Date.now() + 5_000
+        do {
+          await drainTaskInterruptOutbox(pool as unknown as PgSubagentPool, manager)
+          completedPrepare = await readCompletedPrepare()
+          if (completedPrepare.rows[0]?.status === "interrupted") break
+          if (Date.now() >= reconciliationDeadline) {
+            throw new Error("Scheduled Prepare interruption was not persisted after bounded reconciliation")
+          }
+          await new Promise(resolve => setTimeout(resolve, 25))
+        } while (true)
+        expect(prepareOutcome).toMatchObject({ taskId: prepareTaskId, status: "interrupted" })
+        expect(completedPrepare.rows[0]).toMatchObject({ status: "interrupted", attemptCount: 1, interruptRequestedAt: expect.any(Date) })
+        expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toBeUndefined()
+        if (!acceptedInterrupt) throw new Error("Scheduled Prepare cancellation was not durably accepted")
+        const artifacts = await pool!.query(`SELECT "id" FROM "agent_artifact_version" WHERE "taskId" = $1`, [prepareTaskId])
+        expect(artifacts.rows).toHaveLength(0)
+        const artifactHeads = await pool!.query(`SELECT "id", "lifecycle" FROM "agent_artifact"
+          WHERE "userId" = $1 AND "jobId" = $2 AND "lifecycle" IN ('base', 'draft')`, [value.userId, value.jobId])
+        expect(artifactHeads.rows).toHaveLength(0)
+        const interruptedGraph = await loadTaskGraph(pool!, graphScope, false)
+        const interruptedPrepareNode = currentTaskGraph(interruptedGraph).nodes.find(node => node.taskId === prepareTaskId)
+        expect(interruptedPrepareNode).toMatchObject({ key: "prepare", status: "interrupted" })
+        expect(interruptedPrepareNode?.status).not.toBe("running")
+        const completedEvents = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+          AND "taskId" = $3 AND "type" = 'item.delta' AND "payload"->>'kind' = 'lifecycle'
+          AND "payload"->'event'->>'type' = 'task.completed'`, [value.sessionId, value.turnId, prepareTaskId])
+        expect(completedEvents.rows).toHaveLength(0)
+        const persistedInterrupt = await pool!.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox"
+          WHERE "topic" = $1 AND "payload"->>'intentId' = $2 AND "payload"->>'taskId' = $3`,
+        [TASK_INTERRUPT_OUTBOX_TOPIC, acceptedInterrupt.intentId, prepareTaskId])
+        expect(persistedInterrupt.rows).toEqual([{ publishedAt: expect.any(Date) }])
+        const interruptedEvents = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+          AND "taskId" = $3 AND "type" = 'task.interrupted'`, [value.sessionId, value.turnId, prepareTaskId])
+        expect(interruptedEvents.rows).toHaveLength(1)
+        const ledger = await assertScheduledPrepareStepReservations({ pool: pool!, fixture: value, taskId: prepareTaskId,
+          expectedOuterSteps: 1, expectedMaterialSteps: 1,
+          expectedMaterialStep: { status: "interrupted", finishReason: "cancelled", errorCode: "scheduled_prepare_cancelled" } })
+        expect(ledger.reservations.map(row => row.status)).toEqual(["consumed", "consumed"])
+        expect(usageSettlements.map(row => row.settlement.status).sort()).toEqual(["error", "success"])
+        expect(usageSettlements.map(row => row.stepId).sort()).toEqual(ledger.steps.map(row => row.id).sort())
+        expect(usageSettlements).toEqual(expect.arrayContaining([
+          { stepId: ledger.outerSteps[0]!.id, settlement: expect.objectContaining({ status: "success" }) },
+          { stepId: ledger.materialSteps[0]!.id, settlement: expect.objectContaining({ status: "error" }) },
+        ]))
+        await prepareWorker.close()
+        prepareWorker = undefined
+        return
+      }
       const failedReason = completedPrepare.rows[0]?.failureReason
-      const diagnosticReason = typeof failedReason === "string" ? failedReason.slice(0, 160) : null
+      const safePrepareReasonCodes = new Set([
+        "scheduled_prepare_analyze_unverified", "scheduled_prepare_checkpoint_invalid", "scheduled_prepare_claim_invalid",
+        "scheduled_prepare_evidence_missing", "scheduled_prepare_evidence_scope_invalid", "scheduled_prepare_graph_binding_invalid",
+        "scheduled_prepare_graph_invalid", "scheduled_prepare_owner_invalid", "scheduled_prepare_owner_stale",
+        "scheduled_prepare_receipt_invalid", "scheduled_prepare_task_invalid", "load_failed", "invocation_invalid",
+      ])
+      const diagnosticReason = typeof failedReason === "string" && safePrepareReasonCodes.has(failedReason) ? failedReason : null
       const prepareToolEvent = await pool!.query<{ type: string; payload: Record<string, unknown> }>(
         `SELECT "type", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
           AND "correlationId" = $4 AND "type" IN ('tool_call.failed', 'tool_call.completed')
@@ -1275,30 +1380,46 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const toolOutput = toolEvent?.payload.output
       const toolOutputRecord = toolOutput && typeof toolOutput === "object" && !Array.isArray(toolOutput)
         ? toolOutput as Record<string, unknown> : undefined
-      const safeToolReasonCode = toolEvent?.payload.errorCode === "scheduled_prepare_unavailable"
-        && typeof toolOutputRecord?.reasonCode === "string" ? toolOutputRecord.reasonCode : null
-      const safeToolMessage = toolEvent?.payload.errorCode === "scheduled_prepare_unavailable"
-        && typeof toolOutputRecord?.message === "string" ? toolOutputRecord.message.slice(0, 120) : null
-      const toolDiagnostic = toolEvent ? { type: toolEvent.type, toolName: toolEvent.payload.toolName,
-        errorCode: toolEvent.payload.errorCode, reasonCode: safeToolReasonCode, message: safeToolMessage } : null
-      expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ outcome: prepareOutcome,
-        taskStatus: completedPrepare.rows[0]?.status, attemptCount: completedPrepare.rows[0]?.attemptCount,
-        failureReason: diagnosticReason, toolEvent: toolDiagnostic })}`)
+      const safeToolEventType = toolEvent?.type === "tool_call.failed" || toolEvent?.type === "tool_call.completed" ? toolEvent.type : null
+      const safeToolName = toolEvent?.payload.toolName === "scheduled.application.prepare" ? "scheduled.application.prepare" : null
+      const safeToolErrorCode = toolEvent?.payload.errorCode === "scheduled_prepare_unavailable" ? "scheduled_prepare_unavailable" : null
+      const safeToolReasonCode = safeToolErrorCode === "scheduled_prepare_unavailable"
+        && typeof toolOutputRecord?.reasonCode === "string" && safePrepareReasonCodes.has(toolOutputRecord.reasonCode)
+        ? toolOutputRecord.reasonCode : null
+      const safePrepareMessages = new Set([
+        "Scheduled Prepare could not verify its persisted inputs.",
+        "The scheduled resume choice could not be verified.",
+        "Scheduled Prepare is unavailable outside its registered TaskGraph task.",
+      ])
+      const safeToolMessage = safeToolErrorCode && typeof toolOutputRecord?.message === "string"
+        && safePrepareMessages.has(toolOutputRecord.message) ? toolOutputRecord.message.slice(0, 120) : null
+      const toolDiagnostic = toolEvent ? { type: safeToolEventType, toolName: safeToolName,
+        errorCode: safeToolErrorCode, reasonCode: safeToolReasonCode, message: safeToolMessage } : null
+      expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ diagnosticReason, toolDiagnostic })}`)
         .toMatchObject({ taskId: prepareTaskId, status: "completed" })
       await prepareWorker.close()
       prepareWorker = undefined
 
       expect(completedPrepare.rows[0]).toMatchObject({ status: "completed", attemptCount: 1, failureReason: null })
       const structuredResult = completedPrepare.rows[0]?.result.structuredResult as Record<string, unknown> | undefined
-      expect(structuredResult).toMatchObject({ schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId,
+      expect(structuredResult, `Prepare structured result diagnostic: ${JSON.stringify({ diagnosticReason, toolDiagnostic })}`)
+        .toMatchObject({ schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId,
         attemptCount: 1, snapshotDigest: result.attestation.snapshotDigest, checkpointDigest,
-        jobs: [{ jobId: value.jobId, status: "prepared" }], materials: expect.arrayContaining([
+        jobs: scenario.mode === "zero-eligible" ? [] : [{ jobId: value.jobId, status: "prepared" }],
+        materials: scenario.mode === "zero-eligible" ? [] : expect.arrayContaining([
           expect.objectContaining({ jobId: value.jobId, kind: "resume" }),
           expect.objectContaining({ jobId: value.jobId, kind: "cover_letter" }),
         ]) })
       expect(JSON.stringify(structuredResult)).not.toContain(preparedLetter)
       expect(toolModelCalls).toBe(1)
-      expect(materialModelCalls).toBe(1)
+      expect(materialModelCalls).toBe(scenario.mode === "zero-eligible" ? 0 : 1)
+      const ledger = await assertScheduledPrepareStepReservations({ pool: pool!, fixture: value, taskId: prepareTaskId,
+        expectedOuterSteps: 2, expectedMaterialSteps: scenario.mode === "zero-eligible" ? 0 : 1,
+        expectedTerminalStatus: "completed" })
+      expect(ledger.reservations.map(row => row.status)).toEqual(Array(ledger.steps.length).fill("consumed"))
+      expect(usageSettlements).toHaveLength(2 + (scenario.mode === "zero-eligible" ? 0 : 1))
+      expect(usageSettlements.every(row => row.settlement.status === "success")).toBe(true)
+      expect(usageSettlements.map(row => row.stepId).sort()).toEqual(ledger.steps.map(row => row.id).sort())
       expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toBeDefined()
       const verificationGraph = await loadTaskGraph(pool!, graphScope, false)
       const verificationCurrent = currentTaskGraph(verificationGraph)
@@ -1343,10 +1464,12 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const artifactVersions = await pool!.query<{ artifactType: string; content: unknown; version: number; taskId: string; sourceDigest: string; contentHash: string }>(
         `SELECT "artifactType", "content", "version", "taskId", "sourceDigest", "contentHash" FROM "agent_artifact_version"
           WHERE "taskId" = $1 ORDER BY "artifactType"`, [prepareTaskId])
-      expect(artifactVersions.rows).toHaveLength(2)
-      expect(artifactVersions.rows.map(row => row.artifactType)).toEqual(["cover_letter", "resume"])
-      expect(artifactVersions.rows[0]).toMatchObject({ artifactType: "cover_letter", content: preparedLetter, version: 1, taskId: prepareTaskId })
-      expect(artifactVersions.rows[1]).toMatchObject({ artifactType: "resume", content: baseResumeContent, version: 1, taskId: prepareTaskId })
+      expect(artifactVersions.rows).toHaveLength(scenario.mode === "zero-eligible" ? 0 : 2)
+      if (scenario.mode !== "zero-eligible") {
+        expect(artifactVersions.rows.map(row => row.artifactType)).toEqual(["cover_letter", "resume"])
+        expect(artifactVersions.rows[0]).toMatchObject({ artifactType: "cover_letter", content: preparedLetter, version: 1, taskId: prepareTaskId })
+        expect(artifactVersions.rows[1]).toMatchObject({ artifactType: "resume", content: baseResumeContent, version: 1, taskId: prepareTaskId })
+      }
 
       const completedDuplicate = await appendRestartedPrepare(reboundPrepareInput)
       expect(completedDuplicate).toMatchObject({ status: "duplicate", nodes: [{ key: "prepare", taskId: prepareTaskId, status: "waiting" }], readyTaskIds: [] })
@@ -1375,10 +1498,15 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         attestation: resumedBridge.attestation, continuationKey, claimToken: resumedClaimToken, ownedJobs,
         persistedCheckpoint: currentExecutionState, prepareProof: readyPrepare.prepareProof })
       expect(gateState.nextStage).toBe("gate")
-      expect(gateState.scheduledTaskGraphPreparedArtifacts).toHaveLength(2)
-      expect(gateState.preparedPackages).toMatchObject([{ job: { id: value.jobId }, score: 82,
-        matchedKeywords: ["TypeScript"], missingKeywords: ["PostgreSQL"], coverLetter: preparedLetter,
-        tailoredResumeArtifact: { kind: "resume", version: 1 }, coverLetterArtifact: { kind: "cover_letter", version: 1 } }])
+      if (scenario.mode === "zero-eligible") {
+        expect(gateState.scheduledTaskGraphPreparedArtifacts).toEqual([])
+        expect(gateState.preparedPackages).toEqual([])
+      } else {
+        expect(gateState.scheduledTaskGraphPreparedArtifacts).toHaveLength(2)
+        expect(gateState.preparedPackages).toMatchObject([{ job: { id: value.jobId }, score: 82,
+          matchedKeywords: ["TypeScript"], missingKeywords: ["PostgreSQL"], coverLetter: preparedLetter,
+          tailoredResumeArtifact: { kind: "resume", version: 1 }, coverLetterArtifact: { kind: "cover_letter", version: 1 } }])
+      }
 
       const duplicateQueueJob = await prepareQueue.getJob(prepareQueueJobId)
       expect(await duplicateQueueJob?.getState()).toBe("completed")
@@ -1398,9 +1526,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       await restartedPrepareWorker.close()
       restartedPrepareWorker = undefined
       expect(toolModelCalls).toBe(1)
-      expect(materialModelCalls).toBe(2)
+      expect(materialModelCalls).toBe(scenario.mode === "zero-eligible" ? 0 : 2)
       const versionsAfterReplay = await pool!.query(`SELECT "id" FROM "agent_artifact_version" WHERE "taskId" = $1`, [prepareTaskId])
-      expect(versionsAfterReplay.rows).toHaveLength(2)
+      expect(versionsAfterReplay.rows).toHaveLength(scenario.mode === "zero-eligible" ? 0 : 2)
 
       const finalReceiptCount = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'agent.plan.scheduled_prepare_binding'`,
         [value.sessionId, value.turnId])
@@ -1416,6 +1544,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(await redelivery.getState()).toBe("completed")
       expect(deliveries).toHaveLength(2)
     } finally {
+      if (scenario.mode === "cancel" && prepareWorker && prepareTaskIdForCleanup) {
+        prepareManager?.signalTaskSubtree(value.sessionId, value.rootTaskId, [prepareTaskIdForCleanup])
+      }
       await firstWorker?.close().catch(() => undefined)
       await restartedWorker?.close().catch(() => undefined)
       await prepareWorker?.close().catch(() => undefined)
@@ -1427,6 +1558,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       await prepareQueue.obliterate({ force: true }).catch(() => undefined)
       await prepareQueue.close().catch(() => undefined)
       await Promise.all([queueRedis.quit().catch(() => queueRedis.disconnect()), prepareQueueRedis.quit().catch(() => prepareQueueRedis.disconnect()), redis.quit().catch(() => redis.disconnect())])
+      await disconnectWebDatabase?.()
+      disconnectWebDatabase = undefined
     }
   })
 
@@ -1530,6 +1663,68 @@ function waitForSubagentWorkerCompletion(worker: Worker<SubagentJobPayload, unkn
       reject(error)
     })
   })
+}
+
+async function assertScheduledPrepareStepReservations(input: {
+  pool: PgPool
+  fixture: Fixture
+  taskId: string
+  expectedOuterSteps: number
+  expectedMaterialSteps: number
+  expectedTerminalStatus?: "completed"
+  expectedMaterialStep?: { status: "interrupted"; finishReason: "cancelled"; errorCode: "scheduled_prepare_cancelled" }
+}) {
+  const steps = await input.pool.query<{
+    id: string; ordinal: number; attempt: number; status: string
+    finishReason: string | null; errorCode: string | null
+    taskSessionId: string; taskTurnId: string; taskRootTaskId: string; taskAttemptCount: number
+    turnRootTaskId: string | null; turnUserId: string
+  }>(`SELECT step."id", step."ordinal", step."attempt", step."status", step."finishReason", step."errorCode",
+      task."sessionId" AS "taskSessionId", task."turnId" AS "taskTurnId", task."rootTaskId" AS "taskRootTaskId",
+      task."attemptCount" AS "taskAttemptCount", turn."rootTaskId" AS "turnRootTaskId", turn."userId" AS "turnUserId"
+    FROM "agent_steps" AS step
+    JOIN "sub_agent_tasks" AS task ON task."id" = step."taskId" AND task."sessionId" = step."sessionId" AND task."turnId" = step."turnId"
+    JOIN "agent_turns" AS turn ON turn."id" = step."turnId" AND turn."sessionId" = step."sessionId"
+    WHERE step."taskId" = $1 AND step."sessionId" = $2 ORDER BY step."ordinal", step."id"`,
+  [input.taskId, input.fixture.sessionId])
+  const reservations = await input.pool.query<{
+    id: string; userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; stepId: string
+    attempt: number; units: number; status: string; idempotencyKey: string
+  }>(`SELECT "id", "userId", "sessionId", "turnId", "rootTaskId", "taskId", "stepId", "attempt", "units", "status", "idempotencyKey"
+    FROM "agent_tree_budget_reservations" WHERE "taskId" = $1 AND "sessionId" = $2 ORDER BY "stepId"`,
+  [input.taskId, input.fixture.sessionId])
+  const materialSteps = steps.rows.filter(row => row.id.startsWith("scheduled-prepare-model:"))
+  const outerSteps = steps.rows.filter(row => !row.id.startsWith("scheduled-prepare-model:"))
+  const expectedStepCount = input.expectedOuterSteps + input.expectedMaterialSteps
+  expect(steps.rows).toHaveLength(expectedStepCount)
+  expect(materialSteps).toHaveLength(input.expectedMaterialSteps)
+  expect(outerSteps).toHaveLength(input.expectedOuterSteps)
+  expect(steps.rows.map(row => row.ordinal).sort((left, right) => left - right))
+    .toEqual(Array.from({ length: expectedStepCount }, (_value, ordinal) => ordinal))
+  expect(outerSteps.every(row => row.id.startsWith(`task:${input.taskId}:step:`))).toBe(true)
+  expect(steps.rows.every(row => row.attempt === 1 && row.taskAttemptCount === 1
+    && row.taskSessionId === input.fixture.sessionId && row.taskTurnId === input.fixture.turnId
+    && row.taskRootTaskId === input.fixture.rootTaskId && row.turnRootTaskId === input.fixture.rootTaskId
+    && row.turnUserId === input.fixture.userId)).toBe(true)
+  if (input.expectedTerminalStatus) {
+    expect(steps.rows.map(row => row.status)).toEqual(Array(expectedStepCount).fill(input.expectedTerminalStatus))
+    expect(steps.rows.some(row => row.status === "streaming")).toBe(false)
+  }
+  if (input.expectedMaterialStep) expect(materialSteps).toMatchObject([input.expectedMaterialStep])
+  expect(reservations.rows).toHaveLength(expectedStepCount)
+  expect(reservations.rows.map(row => row.stepId).sort()).toEqual(steps.rows.map(row => row.id).sort())
+  expect(reservations.rows.every(row => row.userId === input.fixture.userId && row.sessionId === input.fixture.sessionId
+    && row.turnId === input.fixture.turnId && row.rootTaskId === input.fixture.rootTaskId && row.taskId === input.taskId
+    && row.attempt === 1 && row.units === 1 && row.status === "consumed"
+    && row.idempotencyKey === `model-step:${input.taskId}:1:${row.stepId}`)).toBe(true)
+  return { steps: steps.rows, reservations: reservations.rows, outerSteps, materialSteps }
+}
+
+function awaitWithTimeout<Result>(promise: Promise<Result>, message: string, timeoutMs: number): Promise<Result> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([promise, new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+  })]).finally(() => { if (timer !== undefined) clearTimeout(timer) })
 }
 
 async function readSseThroughEvent(stream: ReadableStream<Uint8Array>, eventName: string): Promise<string> {
@@ -1696,10 +1891,10 @@ async function waitUntilTurnLeaseExpires(database: PgPool, turnId: string): Prom
   throw new Error("Scheduled Turn lease did not expire while the owner fence was blocked")
 }
 
-function scheduledAutomationSnapshot() {
+function scheduledAutomationSnapshot(minScore = 70) {
   return {
     schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
-    targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], minScore: 70,
+    targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], minScore,
     dailyCap: 10, requireApproval: true, autoApply: false,
   }
 }
@@ -1729,8 +1924,9 @@ function graphSnapshot(value: Fixture) {
   })
 }
 
-async function seedGraph(database: PgPool, value: Fixture, snapshot: ReturnType<typeof parseTaskGraphSnapshot>, empty = false): Promise<void> {
-  const scheduledInput = { automationRunMode: "scheduled", scheduledAutomationSnapshot: scheduledAutomationSnapshot() }
+async function seedGraph(database: PgPool, value: Fixture, snapshot: ReturnType<typeof parseTaskGraphSnapshot>, empty = false,
+  automationSnapshot = scheduledAutomationSnapshot()): Promise<void> {
+  const scheduledInput = { automationRunMode: "scheduled", scheduledAutomationSnapshot: automationSnapshot }
   await database.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [value.userId, `${value.userId}@example.invalid`])
   await database.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
     VALUES ($1, $2, 'Scheduled automation pipeline integration', 'running', 'automation', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId])

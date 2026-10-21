@@ -63,6 +63,22 @@ function turnStartBudgetFixture(input: {
   return { calls, client, pool }
 }
 
+function interruptedStepFixture(input: { readonly ownerAuthorized?: boolean; readonly stepUpdated?: boolean }) {
+  const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+  const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+    calls.push({ sql, values })
+    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: childOwner.sessionId }], rowCount: 1 }
+    if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('interruptRequestedAt" IS NOT NULL')) {
+      return input.ownerAuthorized === false ? { rows: [], rowCount: 0 } : { rows: [{ id: childOwner.turnId }], rowCount: 1 }
+    }
+    if (sql.includes('UPDATE "agent_steps" AS step')) return { rows: [], rowCount: input.stepUpdated === false ? 0 : 1 }
+    return { rows: [], rowCount: 1 }
+  }), release: vi.fn() }
+  const pool = { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">
+  return { calls, client, pool }
+}
+
 describe("PostgreSQL TurnEngine store", () => {
   it("projects only the persisted root-owned terminal event and reuses its id on replay", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
@@ -232,6 +248,70 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(calls.some(({ sql }) => sql.includes("owner_task") && sql.includes("leaseVersion"))).toBe(true)
     expect(calls.some(({ values }) => values?.includes(owner.taskId))).toBe(true)
     assertDenseBindings(calls)
+  })
+
+  it("finalizes the exact interrupted task step after parent terminalization", async () => {
+    // Turn/root cancellation can finish before this still-leased child unwinds; its interrupt marker authorizes only this step.
+    const { calls, pool, client } = interruptedStepFixture({})
+    const store = createPgTurnEngineStore(pool)
+    const input = { owner: childOwner, stepId: "scheduled-model-step", inputTokens: 12, outputTokens: 8, estimatedCostUsd: 0.004, now }
+
+    await expect(store.finalizeScheduledPrepareCancellationStep?.(input)).resolves.toBeUndefined()
+
+    const authorization = calls.find(call => call.sql.includes('FROM "agent_turns" AS turn') && call.sql.includes('interruptRequestedAt" IS NOT NULL'))
+    const update = calls.find(call => call.sql.includes('UPDATE "agent_steps" AS step'))
+    expect(authorization).toBeDefined()
+    expect(authorization?.sql).toContain('owner_task."status" = \'running\'')
+    expect(authorization?.sql).toContain('owner_task."leaseExpiresAt" > clock_timestamp()')
+    expect(authorization?.sql).toContain('FOR UPDATE OF turn, owner_task')
+    expect(authorization?.sql).toContain('turn."rootTaskId" = $5')
+    expect(authorization?.sql).not.toContain('turn."status"')
+    expect(authorization?.sql).not.toContain('root_task."status"')
+    expect(authorization?.values).toEqual([childOwner.userId, childOwner.sessionId, childOwner.turnId, childOwner.taskId,
+      childOwner.rootTaskId, childOwner.ownerId, childOwner.attemptCount, childOwner.leaseExpiresAt])
+    expect(update?.sql).toContain('SET "status" = \'interrupted\'')
+    expect(update?.sql).toContain('"finishReason" = \'cancelled\'')
+    expect(update?.sql).toContain('"errorCode" = \'scheduled_prepare_cancelled\'')
+    expect(update?.sql).toContain('step."attempt" = $9 AND step."status" = \'streaming\'')
+    expect(update?.values).toEqual([12, 8, 0.004, now, "scheduled-model-step", childOwner.sessionId,
+      childOwner.turnId, childOwner.taskId, childOwner.attemptCount])
+    expect(calls.map(call => call.sql)).toContain("COMMIT")
+    expect(calls.map(call => call.sql)).not.toContain("ROLLBACK")
+    expect(client.release).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when the interrupted task lease or marker is no longer current", async () => {
+    const { calls, pool } = interruptedStepFixture({ ownerAuthorized: false })
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.finalizeScheduledPrepareCancellationStep?.({ owner: childOwner, stepId: "stale-step", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now }))
+      .rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+
+    expect(calls.some(call => call.sql.includes('UPDATE "agent_steps" AS step'))).toBe(false)
+    expect(calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(calls.map(call => call.sql)).not.toContain("COMMIT")
+  })
+
+  it("rejects non-task owners before opening a cancellation-finalizer transaction", async () => {
+    const { pool } = interruptedStepFixture({})
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.finalizeScheduledPrepareCancellationStep?.({ owner: owner as unknown as typeof childOwner, stepId: "turn-owned-step",
+      inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now })).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+
+    expect(pool.connect).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when the exact step lineage is no longer streaming", async () => {
+    const { calls, pool } = interruptedStepFixture({ stepUpdated: false })
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.finalizeScheduledPrepareCancellationStep?.({ owner: childOwner, stepId: "already-finished-step", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now }))
+      .rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+
+    expect(calls.some(call => call.sql.includes('step."attempt" = $9 AND step."status" = \'streaming\''))).toBe(true)
+    expect(calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(calls.map(call => call.sql)).not.toContain("COMMIT")
   })
 
   it("checks the root step and usage budgets before allocating a new Step", async () => {

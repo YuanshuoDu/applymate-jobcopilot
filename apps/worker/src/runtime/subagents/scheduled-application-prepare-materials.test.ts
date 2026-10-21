@@ -7,11 +7,12 @@ import type { AnalystResult } from "./role-results.js"
 import type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-materials.js"
 import { persistScheduledPrepareMaterial, prepareScheduledJobMaterials, scheduledPrepareArtifactIdentity, scheduledPrepareCitedRefs } from "./scheduled-application-prepare-materials.js"
 
-const { createArtifactRepository, loadSelectedJobArtifactContext } = vi.hoisted(() => ({
-  createArtifactRepository: vi.fn(), loadSelectedJobArtifactContext: vi.fn(),
+const { createArtifactRepository, createTurnEngineStore, loadSelectedJobArtifactContext } = vi.hoisted(() => ({
+  createArtifactRepository: vi.fn(), createTurnEngineStore: vi.fn(), loadSelectedJobArtifactContext: vi.fn(),
 }))
 vi.mock("../../db/agent-artifact-repo.js", () => ({ createAgentArtifactRepository: createArtifactRepository }))
 vi.mock("./selected-job-artifact-context.js", () => ({ loadSelectedJobArtifactContext }))
+vi.mock("../turns/turn-engine-store.js", () => ({ createPgTurnEngineStore: createTurnEngineStore }))
 
 const sourceDigest = `sha256:${"c".repeat(64)}`
 const evidenceRefs = ["job:job-a", "resume:resume-a"]
@@ -48,8 +49,11 @@ describe("scheduled Prepare material persistence", () => {
         { sourceRef: "persona:fact-a", content: { value: "Used fact" } },
         { sourceRef: "persona:fact-b", content: { value: "Unused fact" } },
       ] }
-    const modelInputs: string[] = [], writtenRefs: Record<string, readonly string[]> = {}
+    const modelInputs: string[] = [], writtenRefs: Record<string, readonly string[]> = {}, metadataStepIds: string[] = []
     loadSelectedJobArtifactContext.mockResolvedValue(source)
+    const engineStore = { startStep: vi.fn(async (value: { stepId: string }) => ({ id: value.stepId, ordinal: 17 })),
+      updateStep: vi.fn(async () => undefined), finalizeScheduledPrepareCancellationStep: vi.fn(async () => undefined) }
+    createTurnEngineStore.mockReturnValue(engineStore)
     const adapter = {
       id: "fixture", profile: { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true,
         streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: true,
@@ -57,19 +61,22 @@ describe("scheduled Prepare material persistence", () => {
         supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" },
       complete: vi.fn(async (request: HarnessModelRequest) => {
         modelInputs.push(JSON.stringify(request.messages))
+        metadataStepIds.push(request.metadata.stepId)
         return { text: "Cover letter", finishReason: "stop" as const, toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 } }
       }),
       async *stream() { yield { type: "completed" as const, finishReason: "stop" as const } },
     }
-    const input = { invocation: { owner: { userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "task-a",
-      rootTaskId: "root-a", ownerId: "worker-a", attemptCount: 1 }, taskFence: baseFence },
+    const owner = { kind: "task" as const, userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "prepare-task-a",
+      rootTaskId: "root-a", ownerId: "worker-a", attemptCount: 3, leaseExpiresAt: new Date("2030-01-01T00:00:00Z") }
+    const input = { invocation: { owner, taskFence: baseFence },
       job: { jobId: "job-a", score: 80, sourceDigest, evidenceRefs: ["job:job-a", "persona:fact-a", "resume:resume-a"] },
       resumeTailoringChoice: "keep_resume", artifactBinding: () => binding } as unknown as ScheduledPrepareJobInput
+    const reserve = vi.fn(async (value: { stepId: string }) => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a",
+      taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const, idempotencyKey: "key",
+      createdAt: new Date(), updatedAt: new Date(), settledAt: null }))
     const options = { pool: {} as pg.Pool, owner: input.invocation.owner as never, resolveModel: async () => adapter as never,
       authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
-      treeBudget: ({ reserve: async () => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a",
-        taskId: "task-a", stepId: "scheduled-prepare-cover_letter", attempt: 1, units: 1 as const, status: "reserved" as const, idempotencyKey: "key",
-        createdAt: new Date(), updatedAt: new Date(), settledAt: null }), settle: async () => undefined } as never),
+      treeBudget: ({ reserve, settle: async () => undefined } as never),
       persistMaterial: async (_job: ScheduledPrepareJobInput, kind: "resume" | "cover_letter", _content: unknown,
         _sources: ScheduledPrepareMaterialSources, refs: readonly string[]) => { writtenRefs[kind] = refs; return { artifactId: kind } } }
     const detail = { sources: source, matched: [], missing: [] }
@@ -77,12 +84,130 @@ describe("scheduled Prepare material persistence", () => {
     await expect(prepareScheduledJobMaterials(options, input, detail, new AbortController().signal)).resolves.toMatchObject({ status: "prepared" })
 
     expect(adapter.complete).toHaveBeenCalledTimes(1)
+    expect(createTurnEngineStore).toHaveBeenCalledWith(options.pool)
+    expect(engineStore.startStep).toHaveBeenCalledWith(expect.objectContaining({ owner, attempt: 3, inputThroughSequence: 0n,
+      modelProfileSnapshot: expect.objectContaining({ provider: "fixture", model: "fixture-model", costClass: "low" }) }))
+    const stepId = engineStore.startStep.mock.calls[0]?.[0].stepId
+    expect(stepId).toMatch(/^scheduled-prepare-model:/)
+    expect(metadataStepIds).toEqual([stepId])
+    expect(reserve).toHaveBeenCalledWith(expect.objectContaining({ taskId: "prepare-task-a", attempt: 3, stepId }))
+    expect(engineStore.updateStep).toHaveBeenCalledWith(expect.objectContaining({ owner, stepId, status: "completed", finishReason: "stop",
+      errorCode: null, inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 }))
     expect(modelInputs[0]).toContain("Used fact")
     expect(modelInputs[0]).not.toContain("Unused fact")
     expect(writtenRefs).toEqual({
       resume: ["job:job-a", "resume:resume-a"],
       cover_letter: ["job:job-a", "persona:fact-a", "resume:resume-a"],
     })
+  })
+
+  it("surfaces safe persistence failure when cancellation finalization is rejected", async () => {
+    const source = { preparation: { sourceDigest, evidenceRefs }, baseResumeId: "resume-a", transientSources: [
+      { sourceRef: "resume:resume-a", content: { summary: "confirmed base resume" } },
+      { sourceRef: "job:job-a", content: { title: "Software Engineer" } },
+    ] }
+    const controller = new AbortController()
+    const engineStore = { startStep: vi.fn(async (value: { stepId: string }) => ({ id: value.stepId, ordinal: 17 })),
+      updateStep: vi.fn(async () => undefined), finalizeScheduledPrepareCancellationStep: vi.fn(async () => {
+        throw Object.assign(new Error("TurnEngine persistence conflict: interrupted step"), { name: "TurnEnginePersistenceConflict" })
+      }) }
+    createTurnEngineStore.mockReturnValue(engineStore)
+    loadSelectedJobArtifactContext.mockResolvedValue(source)
+    const providerError = new Error("private provider detail")
+    const adapter = { id: "fixture", profile: { provider: "fixture", model: "fixture-model", nativeTools: false, structuredOutput: false,
+      streaming: false, continuationCursor: false },
+      complete: vi.fn(async () => { controller.abort(); throw providerError }),
+      async *stream() { yield { type: "completed" as const, finishReason: "stop" as const } } }
+    const owner = { kind: "task" as const, userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "prepare-task-a",
+      rootTaskId: "root-a", ownerId: "worker-a", attemptCount: 3, leaseExpiresAt: new Date("2030-01-01T00:00:00Z") }
+    const input = { invocation: { owner, taskFence: baseFence }, job: { jobId: "job-a", score: 80, sourceDigest, evidenceRefs },
+      resumeTailoringChoice: "keep_resume", artifactBinding: () => binding } as unknown as ScheduledPrepareJobInput
+    const options = { pool: {} as pg.Pool, owner: owner as never, resolveModel: async () => adapter as never,
+      authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
+      treeBudget: ({ reserve: async (value: { stepId: string }) => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
+        rootTaskId: "root-a", taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const,
+        idempotencyKey: "key", createdAt: new Date(), updatedAt: new Date(), settledAt: null }), settle: async () => undefined } as never),
+      persistMaterial: vi.fn() }
+
+    await expect(prepareScheduledJobMaterials(options, input, { sources: source as never, matched: [], missing: [] }, controller.signal))
+      .rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+
+    const stepId = engineStore.startStep.mock.calls[0]?.[0].stepId
+    expect(engineStore.finalizeScheduledPrepareCancellationStep).toHaveBeenCalledWith(expect.objectContaining({ owner, stepId, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }))
+    expect(engineStore.updateStep).not.toHaveBeenCalled()
+    expect(JSON.stringify(engineStore.finalizeScheduledPrepareCancellationStep.mock.calls)).not.toContain("private provider detail")
+  })
+
+  it("does not accept a resolved model response after cancellation aborts the request", async () => {
+    const source = { preparation: { sourceDigest, evidenceRefs }, baseResumeId: "resume-a", transientSources: [
+      { sourceRef: "resume:resume-a", content: { summary: "confirmed base resume" } },
+      { sourceRef: "job:job-a", content: { title: "Software Engineer" } },
+    ] }
+    const controller = new AbortController()
+    const engineStore = { startStep: vi.fn(async (value: { stepId: string }) => ({ id: value.stepId, ordinal: 17 })),
+      updateStep: vi.fn(async () => undefined), finalizeScheduledPrepareCancellationStep: vi.fn(async () => undefined) }
+    createTurnEngineStore.mockReturnValue(engineStore)
+    loadSelectedJobArtifactContext.mockResolvedValue(source)
+    const adapter = { id: "fixture", profile: { provider: "fixture", model: "fixture-model", nativeTools: false, structuredOutput: false,
+      streaming: false, continuationCursor: false },
+      complete: vi.fn(async () => {
+        controller.abort()
+        return { text: "Late cover letter", finishReason: "stop" as const, toolCalls: [], usage: { inputTokens: 2, outputTokens: 3, estimatedCostUsd: 0.001 } }
+      }),
+      async *stream() { yield { type: "completed" as const, finishReason: "stop" as const } } }
+    const owner = { kind: "task" as const, userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "prepare-task-a",
+      rootTaskId: "root-a", ownerId: "worker-a", attemptCount: 3, leaseExpiresAt: new Date("2030-01-01T00:00:00Z") }
+    const input = { invocation: { owner, taskFence: baseFence }, job: { jobId: "job-a", score: 80, sourceDigest, evidenceRefs },
+      resumeTailoringChoice: "keep_resume", artifactBinding: () => binding } as unknown as ScheduledPrepareJobInput
+    const persistMaterial = vi.fn(async () => ({ artifactId: "should-not-persist" }))
+    const options = { pool: {} as pg.Pool, owner: owner as never, resolveModel: async () => adapter as never,
+      authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
+      treeBudget: ({ reserve: async (value: { stepId: string }) => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
+        rootTaskId: "root-a", taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const,
+        idempotencyKey: "key", createdAt: new Date(), updatedAt: new Date(), settledAt: null }), settle: async () => undefined } as never), persistMaterial }
+
+    await expect(prepareScheduledJobMaterials(options, input, { sources: source as never, matched: [], missing: [] }, controller.signal))
+      .rejects.toThrow("scheduled_prepare_cancelled")
+
+    expect(engineStore.finalizeScheduledPrepareCancellationStep).toHaveBeenCalledWith(expect.objectContaining({ inputTokens: 2, outputTokens: 3, estimatedCostUsd: 0.001 }))
+    expect(engineStore.updateStep).not.toHaveBeenCalled()
+    expect(persistMaterial).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])("uses the cancellation finalizer after an update fence conflict (preserve update error: %s)", async preserveUpdateError => {
+    const source = { preparation: { sourceDigest, evidenceRefs }, baseResumeId: "resume-a", transientSources: [
+      { sourceRef: "resume:resume-a", content: { summary: "confirmed base resume" } },
+      { sourceRef: "job:job-a", content: { title: "Software Engineer" } },
+    ] }
+    const updateError = Object.assign(new Error("TurnEngine persistence conflict: step"), { name: "TurnEnginePersistenceConflict" })
+    const engineStore = { startStep: vi.fn(async (value: { stepId: string }) => ({ id: value.stepId, ordinal: 17 })),
+      updateStep: vi.fn(async (value: { stepId: string }) => {
+        updateError.message = `TurnEngine persistence conflict: step ${value.stepId}`
+        throw updateError
+      }),
+      finalizeScheduledPrepareCancellationStep: vi.fn(async () => { if (preserveUpdateError) throw new Error("interrupt_marker_missing") }) }
+    createTurnEngineStore.mockReturnValue(engineStore)
+    loadSelectedJobArtifactContext.mockResolvedValue(source)
+    const adapter = { id: "fixture", profile: { provider: "fixture", model: "fixture-model", nativeTools: false, structuredOutput: false,
+      streaming: false, continuationCursor: false },
+      complete: vi.fn(async () => ({ text: "Cover letter", finishReason: "stop" as const, toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 } })),
+      async *stream() { yield { type: "completed" as const, finishReason: "stop" as const } } }
+    const owner = { kind: "task" as const, userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "prepare-task-a",
+      rootTaskId: "root-a", ownerId: "worker-a", attemptCount: 3, leaseExpiresAt: new Date("2030-01-01T00:00:00Z") }
+    const input = { invocation: { owner, taskFence: baseFence }, job: { jobId: "job-a", score: 80, sourceDigest, evidenceRefs },
+      resumeTailoringChoice: "keep_resume", artifactBinding: () => binding } as unknown as ScheduledPrepareJobInput
+    const persistMaterial = vi.fn()
+    const options = { pool: {} as pg.Pool, owner: owner as never, resolveModel: async () => adapter as never,
+      authorize: async () => ({ settle: async () => undefined, release: async () => undefined }) as never,
+      treeBudget: ({ reserve: async (value: { stepId: string }) => ({ id: "reservation", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
+        rootTaskId: "root-a", taskId: "prepare-task-a", stepId: value.stepId, attempt: 3, units: 1 as const, status: "reserved" as const,
+        idempotencyKey: "key", createdAt: new Date(), updatedAt: new Date(), settledAt: null }), settle: async () => undefined } as never), persistMaterial }
+
+    const result = prepareScheduledJobMaterials(options, input, { sources: source as never, matched: [], missing: [] }, new AbortController().signal)
+    if (preserveUpdateError) await expect(result).rejects.toBe(updateError)
+    else await expect(result).rejects.toThrow("scheduled_prepare_cancelled")
+    expect(engineStore.finalizeScheduledPrepareCancellationStep).toHaveBeenCalledOnce()
+    expect(persistMaterial).not.toHaveBeenCalled()
   })
 
   it("stops before generation and persistence when the complete current source digest drifts", async () => {
