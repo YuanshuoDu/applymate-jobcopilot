@@ -1132,7 +1132,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         handoff: reboundHandoff.proof,
         attestation: resumedBridge.attestation,
       }
-      await expect(appendScheduledPrepare(prepareInput)).rejects.toMatchObject({ code: "scheduled_prepare_choice_binding_stale" })
+      await expect(appendScheduledPrepare(prepareInput)).rejects.toThrow("task_graph_turn_fenced")
 
       const restartedCommand = createPgTaskGraphCommandPort(pool as unknown as PgSubagentPool)
       const appendRestartedPrepare = restartedCommand.appendScheduledPrepare
