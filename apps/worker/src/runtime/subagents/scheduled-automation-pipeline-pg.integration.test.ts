@@ -1046,10 +1046,12 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       await executionProjection.finish({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
         result: { status: "waiting_for_user" } })
       await releaseTurnLease(pool!, turnLease, "waiting_for_user")
-      const wakeupIdempotencyKey = `agent-wait-command:scheduled-prepare-answer-${value.turnId}:wakeup`
+      const wakeupEventIdempotencyKey = `agent-wait-command:scheduled-prepare-answer-${value.turnId}:wakeup`
       const pendingWakeup = await pool!.query<{ id: string; publishedAt: Date | null }>(
-        `SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "topic" = $1 AND "idempotencyKey" = $2`,
-        [AGENT_TURN_WAKEUP_TOPIC, wakeupIdempotencyKey])
+        `SELECT outbox."id", outbox."publishedAt" FROM "agent_outbox" AS outbox
+          JOIN "agent_events" AS event ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+          WHERE outbox."topic" = $1 AND event."type" = 'turn.wakeup' AND event."idempotencyKey" = $2`,
+        [AGENT_TURN_WAKEUP_TOPIC, wakeupEventIdempotencyKey])
       expect(pendingWakeup.rows).toHaveLength(1)
       expect(pendingWakeup.rows[0]?.publishedAt).toBeNull()
       expect(await drainAgentWakeups(pool!, 10)).toBeGreaterThanOrEqual(1)
