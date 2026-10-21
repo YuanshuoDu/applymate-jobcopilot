@@ -4,6 +4,7 @@ import { projectTaskGraphPlanningCounts, withTaskGraphPlanningCounts } from "./t
 const counts = {
   discoveredJobs: { knownCount: 8, coverage: "complete" },
   analyzedJobs: { knownCount: 3, coverage: "partial" },
+  prepareJobs: { knownCount: 2, coverage: "partial" },
   artifactReferences: { knownCount: null, coverage: "unavailable" },
   reviewOutcomes: { knownCount: null, coverage: "not_requested" },
 }
@@ -17,8 +18,24 @@ describe("projectTaskGraphPlanningCounts", () => {
     expect(projected).not.toBe(counts)
     expect(projected?.discoveredJobs).not.toBe(counts.discoveredJobs)
     expect(Object.keys(projected ?? {})).toEqual([
-      "discoveredJobs", "analyzedJobs", "artifactReferences", "reviewOutcomes",
+      "discoveredJobs", "analyzedJobs", "prepareJobs", "artifactReferences", "reviewOutcomes",
     ])
+  })
+
+  it("projects valid Prepare counts", () => {
+    const prepareCounts = { ...counts, prepareJobs: { knownCount: 5, coverage: "complete" as const } }
+
+    expect(projectTaskGraphPlanningCounts({ graphRevision: 7, counts: prepareCounts }, 7)).toEqual(prepareCounts)
+  })
+
+  it.each([
+    ["partial Prepare without a known count", { knownCount: null, coverage: "partial" }],
+    ["unknown Prepare coverage", { knownCount: 1, coverage: "scheduled" }],
+    ["extra Prepare count key", { knownCount: 1, coverage: "complete", taskIds: ["private-task"] }],
+  ])("omits %s", (_label, prepareJobs) => {
+    const malformed = { ...facts, counts: { ...counts, prepareJobs } }
+
+    expect(projectTaskGraphPlanningCounts(malformed, 7)).toBeNull()
   })
 
   it("preserves valid empty-role and zero-result semantics", () => {
@@ -27,6 +44,7 @@ describe("projectTaskGraphPlanningCounts", () => {
       counts: {
         discoveredJobs: { knownCount: 0, coverage: "complete" },
         analyzedJobs: { knownCount: 0, coverage: "partial" },
+        prepareJobs: { knownCount: 0, coverage: "complete" },
         artifactReferences: { knownCount: null, coverage: "not_requested" },
         reviewOutcomes: { knownCount: null, coverage: "unavailable" },
       },
@@ -83,6 +101,7 @@ describe("projectTaskGraphPlanningCounts", () => {
     const largestCounts = {
       discoveredJobs: { knownCount: Number.MAX_SAFE_INTEGER, coverage: "complete" },
       analyzedJobs: { knownCount: Number.MAX_SAFE_INTEGER, coverage: "partial" },
+      prepareJobs: { knownCount: Number.MAX_SAFE_INTEGER, coverage: "complete" },
       artifactReferences: { knownCount: null, coverage: "unavailable" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     }

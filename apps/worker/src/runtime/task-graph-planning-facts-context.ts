@@ -4,7 +4,7 @@ import type { TaskGraphFinalSummary } from "./subagents/task-graph-final-summary
 type Counts = TaskGraphFinalSummary["counts"]
 type Count = Counts["discoveredJobs"]
 const MAX_SERIALIZED_CHARS = 1_000
-const CATEGORIES = ["analyzedJobs", "artifactReferences", "discoveredJobs", "reviewOutcomes"] as const
+const CATEGORIES = ["analyzedJobs", "artifactReferences", "discoveredJobs", "prepareJobs", "reviewOutcomes"] as const
 const COUNT_KEYS = ["coverage", "knownCount"] as const
 
 /** Projects only revision-matched count facts; unsafe or stale envelopes are omitted. */
@@ -18,6 +18,7 @@ export function projectTaskGraphPlanningCounts(value: unknown, currentRevision: 
     const projected = {
       discoveredJobs: projectCount(counts.discoveredJobs),
       analyzedJobs: projectCount(counts.analyzedJobs),
+      prepareJobs: projectCount(counts.prepareJobs),
       artifactReferences: projectCount(counts.artifactReferences),
       reviewOutcomes: projectCount(counts.reviewOutcomes),
     }
