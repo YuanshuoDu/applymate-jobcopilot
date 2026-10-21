@@ -734,6 +734,8 @@ describePg("native verification PostgreSQL producer and readback", () => {
     await expectStaleEvidenceRejected(client => client.query(`UPDATE "agent_items"
       SET "content" = jsonb_set("content", '{answer}', $2::jsonb, false) WHERE "id" = $1`,
     [answeredQuestion.itemId, JSON.stringify("Edited persisted answer with the original item revision.")]))
+    await expectStaleEvidenceRejected(client => client.query(`UPDATE "agent_inputs" SET "content" = $2::jsonb WHERE "id" = $1`,
+      [ids.rootOriginalInput, JSON.stringify([{ type: "text", text: `${originalTaskText} Exclude contract roles.` }])]))
 
     const answerBaselineClient = await pool!.connect()
     try {
