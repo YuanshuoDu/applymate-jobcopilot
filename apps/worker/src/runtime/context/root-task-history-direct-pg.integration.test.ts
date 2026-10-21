@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
@@ -68,6 +69,7 @@ type Source = Readonly<{
   status?: "completed" | "failed" | "interrupted"; rootStatus?: "completed" | "failed" | "interrupted"
   correlationTargetId?: string; stepStatus?: "completed" | "streaming" | "failed"
   stepReceipt?: "missing" | "mismatched" | "duplicate"
+  scoutResult?: unknown
   failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
   turnSource?: string; terminalCreatedAt?: Date
 }>
@@ -91,10 +93,16 @@ const scheduledSnapshot = (targetRoles: readonly string[], overrides: Record<str
 function scheduledTurnInput(snapshot: unknown) {
   return { goal: objective, successCriteria: criteria, automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }
 }
+function reportedScoutResult(finalItemId: string) {
+  return { finalItemId, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+    structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial", summary: "private summary",
+      evidence: [{ id: "e1", kind: "job", ref: "job-1", source: "greenhouse" }],
+      candidates: [{ jobId: "job-1", source: "greenhouse", url: "https://private.example/1", evidenceIds: ["e1"] }] } }
+}
 const matching: Source[] = [
   { turnId: `root-history-source-a-${suffix}`, rootTaskId: `root-history-root-a-${suffix}`, childId: `root-history-child-a-${suffix}`,
     finalItemId: `root-history-final-a-${suffix}`, sessionId, userId, goal: objective, criteria, input: { goal: ` ${objective} `, successCriteria: criteria }, startSequence: 1,
-    terminalCreatedAt: new Date("2020-01-01T00:00:00.000Z") },
+    terminalCreatedAt: new Date("2020-01-01T00:00:00.000Z"), scoutResult: reportedScoutResult(`root-history-final-a-${suffix}`) },
   { turnId: `root-history-source-b-${suffix}`, rootTaskId: `root-history-root-b-${suffix}`, childId: `root-history-child-b-${suffix}`,
     finalItemId: `root-history-final-b-${suffix}`, sessionId, userId, goal: objective, criteria,
     input: { input: { goal: objective, successCriteria: criteria } }, startSequence: 5, status: "failed",
@@ -118,6 +126,7 @@ const otherSession: Source = { turnId: `root-history-other-session-turn-${suffix
   childId: `root-history-other-session-child-${suffix}`, finalItemId: `root-history-other-session-final-${suffix}`,
   sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1,
   terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
+  scoutResult: reportedScoutResult(`root-history-other-session-final-${suffix}`),
   failureChildren: [{ key: "foreign-session", templateId: "scout", role: "scout", taskType: "job_discovery", failureReason: "selected_job_context_unavailable" }] }
 const crossEqualTimeHigherTurnId: Source = { turnId: `${otherSession.turnId}-z`, rootTaskId: `root-history-equal-time-root-${suffix}`,
   childId: `root-history-equal-time-child-${suffix}`, finalItemId: `root-history-equal-time-final-${suffix}`,
@@ -204,7 +213,7 @@ async function insertSource(source: Source): Promise<void> {
   const startCreatedAt = new Date(terminalCreatedAt.getTime() - 1)
   const children = [
     { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: "scout", status: "completed" as const,
-      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: null },
+      failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult ?? null },
     ...(source.failureChildren ?? []).map(failure => ({
       id: `${source.childId}-${failure.key}`, key: `failure-${failure.key}`, templateId: failure.templateId,
       role: failure.role, taskType: failure.taskType, status: "failed" as const, failureReason: failure.failureReason,
@@ -445,7 +454,11 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       "2022-01-01T00:00:00.000Z", "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
     ])
     expect(history[1]?.taskGraph.nodes).toHaveLength(2)
-    expect(history[1]?.nodeLessons?.[1]?.executionFailureCategory).toBe("execution_setup_unavailable")
+    expect(history[1]?.nodeLessons?.[1]?.executionFailureCategory).toBeUndefined()
+    expect(history[1]?.reportedOutputs).toBeUndefined()
+    expect(history[2]?.nodeLessons?.[1]?.executionFailureCategory).toBe("execution_setup_unavailable")
+    expect(history[3]?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 1, resultStatus: "partial" }])
+    expect(history.map(item => item.sourceSessionDiffers)).toEqual([true, true, false, false])
     expect(history.some(item => [crossWrongSource.turnId, crossWrongOrigin.turnId, archivedSource.turnId,
       equalCutoff.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
     expect(projectRootTaskHistory(history, true)?.content).toMatchObject({ kind: "root_task_history", advisoryOnly: true, notCurrentEvidence: true })

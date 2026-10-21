@@ -208,6 +208,38 @@ describe("direct Root-task history PostgreSQL store", () => {
     }
   })
 
+  it("uses the historical-only projection for cross-session sources and keeps the same-session default intact", async () => {
+    const source = { ...candidate(1), sessionId: "session-cross", terminalStepSessionId: "session-cross",
+      terminalStepEventSessionId: "session-cross" }
+    const failed = fixture({ candidates: [source], typedFailure: true })
+    failed.input = { ...failed.input, crossSessionRootTaskHistoryEnabled: true }
+    const outcome = (await failed.store.load(failed.input))[0]
+    expect(outcome?.sourceSessionDiffers).toBe(true)
+    expect(outcome?.nodeLessons).toEqual([{ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] }])
+    expect(JSON.stringify(outcome?.nodeLessons)).not.toMatch(/check|minimum|executionFailureCategory|Count|count/)
+
+    const reported = fixture({ candidates: [source], reportedOutput: true })
+    reported.input = { ...reported.input, crossSessionRootTaskHistoryEnabled: true }
+    const historicalOutput = (await reported.store.load(reported.input))[0]
+    expect(historicalOutput?.reportedOutputs).toBeUndefined()
+
+    const sameSession = fixture({ typedFailure: true })
+    const defaultOutput = (await sameSession.store.load(sameSession.input))[0]
+    expect(defaultOutput?.nodeLessons?.[0]?.criterionFailures[0]?.check).toEqual({ kind: "candidate_count_gte", role: "scout", minimum: 1 })
+    sameSession.input = { ...sameSession.input, crossSessionRootTaskHistoryEnabled: true }
+    const sameSessionCrossMode = (await sameSession.store.load(sameSession.input))[0]
+    expect(sameSessionCrossMode?.sourceSessionDiffers).toBe(false)
+    expect(sameSessionCrossMode?.nodeLessons?.[0]?.criterionFailures[0]?.check)
+      .toEqual({ kind: "candidate_count_gte", role: "scout", minimum: 1 })
+
+    const sameSessionReported = fixture({ reportedOutput: true })
+    sameSessionReported.input = { ...sameSessionReported.input, crossSessionRootTaskHistoryEnabled: true }
+    const sameSessionOutput = (await sameSessionReported.store.load(sameSessionReported.input))[0]
+    expect(sameSessionOutput?.sourceSessionDiffers).toBe(false)
+    expect(sameSessionOutput?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 4, resultStatus: "partial" }])
+  })
+
   it("caps the prior terminal scan and graph loads independently", async () => {
     const test = fixture({ candidates: Array.from({ length: 80 }, (_, index) => candidate(index + 1, String(index * 2 + 2))) })
 
