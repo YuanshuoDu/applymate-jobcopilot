@@ -176,6 +176,10 @@ describe("root task history projection", () => {
     expect(foreignFailure?.lesson).not.toHaveProperty("criterionFailures.0.check")
     const serialized = JSON.stringify(historical)
     expect(serialized).not.toContain("sourceSessionDiffers")
+    const unknownLocality = { ...facts, sourceTurnId: "turn-unknown-session", sourceRootTaskId: "root-unknown-session",
+      terminalAt: foreign.terminalAt }
+    expect(projectRootTaskHistory([unknownLocality], true)?.content)
+      .toEqual(projectRootTaskHistory([foreign], true)?.content)
   })
 
   it("applies the byte cap to the final sanitized cross-session frame", () => {
@@ -456,7 +460,10 @@ describe("root task history projection", () => {
     expect(turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "queued"])
     const byTime = projectRootTaskHistory([olderTime, highTurnId], true)?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }
     expect(byTime.turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "interrupted"])
-    expect(projectRootTaskHistory([{ ...outcome("missing-source-session-scope", 3n), terminalAt }], true)).toBeUndefined()
+    expect(projectRootTaskHistory([{ ...outcome("missing-source-session-scope", 3n), terminalAt }], true)?.content)
+      .toMatchObject({ historical: true, advisoryOnly: true })
+    expect(projectRootTaskHistory([{ ...outcome("invalid-source-session-scope", 4n), terminalAt,
+      sourceSessionDiffers: "foreign" as unknown as boolean }], true)).toBeUndefined()
     expect(projectRootTaskHistory([{ ...outcome("missing-terminal-time", 2n), sourceSessionDiffers: false }], true)).toBeUndefined()
   })
 

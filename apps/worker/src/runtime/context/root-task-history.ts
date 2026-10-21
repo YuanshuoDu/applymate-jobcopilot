@@ -132,11 +132,14 @@ function projectNode(value: unknown): Omit<SafeNode, "lesson" | "reportedOutput"
 }
 function candidate(value: unknown, crossSession: boolean): Candidate | null {
   const item = record(value)
+  const hasSourceSessionDiffers = !!item && Object.hasOwn(item, "sourceSessionDiffers")
   if (!item || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
     || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n
-    || (crossSession && (typeof item.sourceSessionDiffers !== "boolean" || !(item.terminalAt instanceof Date) || !Number.isFinite(item.terminalAt.getTime())))) return null
+    || (crossSession && ((hasSourceSessionDiffers && typeof item.sourceSessionDiffers !== "boolean")
+      || !(item.terminalAt instanceof Date) || !Number.isFinite(item.terminalAt.getTime())))) return null
   const hasOrdinals = Object.hasOwn(item, "sourceNodeOrdinals"), hasLessons = Object.hasOwn(item, "nodeLessons"), hasOutputs = Object.hasOwn(item, "reportedOutputs")
-  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(crossSession ? ["sourceSessionDiffers", "terminalAt"] : []),
+  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence",
+    ...(crossSession ? [...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []), "terminalAt"] : []),
     ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : [])].sort().join(",")
   if (!exact(item, keys)) return null
   const graph = record(item.taskGraph)
@@ -159,7 +162,7 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
   return {
     sourceTurnId: item.sourceTurnId, sourceRootTaskId: item.sourceRootTaskId,
     terminalSequence: item.terminalSequence, ...(crossSession ? { terminalAt: item.terminalAt as Date } : {}),
-    sourceSessionDiffers: crossSession && item.sourceSessionDiffers === true, ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
+    sourceSessionDiffers: crossSession && item.sourceSessionDiffers !== false, ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }
