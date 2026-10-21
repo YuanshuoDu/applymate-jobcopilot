@@ -118,11 +118,15 @@ describe("native user question contract", () => {
     expect(content).toMatchObject({ waitKind: "question", questionId: waitId, toolCallId: null, stage: "scheduled_prepare",
       options: [{ value: "apply_ai_changes" }, { value: "keep_resume" }], answer: null, answerAvailable: false })
     expect(parseTurnScheduledPrepareChoiceItem(content, "started", binding)).toBeNull()
-    expect(parseTurnScheduledPrepareChoiceItem({ ...content, answer: "apply_ai_changes", answerAvailable: true }, "completed", binding)).toBe("apply_ai_changes")
-    expect(parseTurnScheduledPrepareChoiceItem({ ...content, answer: "keep_resume", answerAvailable: true }, "completed", binding)).toBe("keep_resume")
+    const answered = { ...content, answer: "apply_ai_changes", answerAvailable: true, answeredAt: "2026-10-21T10:00:00.000Z" }
+    expect(parseTurnScheduledPrepareChoiceItem(answered, "completed", binding)).toBe("apply_ai_changes")
+    expect(parseTurnScheduledPrepareChoiceItem({ ...answered, answer: "keep_resume" }, "completed", binding)).toBe("keep_resume")
+    expect(parseTurnScheduledPrepareChoiceItem({ ...answered, answeredAt: "invalid" }, "completed", binding)).toBeUndefined()
+    expect(parseTurnScheduledPrepareChoiceItem({ ...content, answer: "keep_resume", answerAvailable: true }, "completed", binding)).toBeUndefined()
+    expect(parseTurnScheduledPrepareChoiceItem({ ...answered, extra: true }, "completed", binding)).toBeUndefined()
     expect(parseTurnScheduledPrepareChoiceItem({ ...content, toolCallId: "ask_user" }, "started", binding)).toBeUndefined()
     expect(parseTurnScheduledPrepareChoiceItem({ ...content, stage: "user_input" }, "started", binding)).toBeUndefined()
-    expect(parseTurnScheduledPrepareChoiceItem({ ...content, answer: "maybe", answerAvailable: true }, "completed", binding)).toBeUndefined()
+    expect(parseTurnScheduledPrepareChoiceItem({ ...answered, answer: "maybe" }, "completed", binding)).toBeUndefined()
     expect(parseTurnScheduledPrepareChoiceItem({ ...content, questionId: "foreign" }, "started", binding)).toBeUndefined()
     expect(parseTurnScheduledPrepareChoiceItem({ ...content, extra: true }, "started", binding)).toBeUndefined()
   })

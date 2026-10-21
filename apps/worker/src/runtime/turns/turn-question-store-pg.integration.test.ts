@@ -566,9 +566,10 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
     try {
       await answerClient.query("BEGIN")
       const answeredItem = await answerClient.query(`UPDATE "agent_items" SET "status" = 'completed',
-        "content" = jsonb_set(jsonb_set("content", '{answer}', '"keep_resume"'::jsonb), '{answerAvailable}', 'true'::jsonb),
+        "content" = jsonb_set(jsonb_set(jsonb_set("content", '{answer}', '"keep_resume"'::jsonb), '{answerAvailable}', 'true'::jsonb),
+          '{answeredAt}', to_jsonb($2::text)),
         "revision" = "revision" + 1, "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
-        WHERE "id" = $1 AND "status" = 'started'`, [created.itemId])
+        WHERE "id" = $1 AND "status" = 'started'`, [created.itemId, "2026-10-21T10:00:00.000Z"])
       expect(answeredItem.rowCount).toBe(1)
       const answeredTurn = await answerClient.query(`UPDATE "agent_turns" SET "status" = 'in_progress', "revision" = "revision" + 1,
         "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "status" = 'waiting_for_user' AND "revision" = $2`,

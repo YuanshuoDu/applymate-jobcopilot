@@ -268,12 +268,12 @@ export function createTurnScheduledPrepareChoiceContent(waitId: string, binding:
 }
 export function parseTurnScheduledPrepareChoiceItem(value: unknown, status: unknown, bindingValue: unknown): TurnScheduledPrepareChoice | null | undefined {
   const row = record(value), binding = parseTurnQuestionScheduledChoiceBinding(bindingValue)
-  if (!row || !binding || !exactKeys(row, ["waitKind", "questionId", "toolCallId", "stage", "question", "options", "answer", "answerAvailable", "scheduledPrepareChoiceBinding"])
+  if (!row || !binding || !exactKeys(row, status === "completed" ? ["waitKind", "questionId", "toolCallId", "stage", "question", "options", "answer", "answerAvailable", "scheduledPrepareChoiceBinding", "answeredAt"] : ["waitKind", "questionId", "toolCallId", "stage", "question", "options", "answer", "answerAvailable", "scheduledPrepareChoiceBinding"])
     || row.waitKind !== "question" || row.questionId !== turnScheduledPrepareChoiceWaitId(binding) || row.toolCallId !== null
     || row.stage !== TURN_SCHEDULED_PREPARE_CHOICE_STAGE || row.question !== TURN_SCHEDULED_PREPARE_CHOICE_QUESTION
     || !sameJson(row.options, TURN_SCHEDULED_PREPARE_CHOICE_OPTIONS) || !sameJson(row.scheduledPrepareChoiceBinding, binding)) return undefined
   if (status === "started" && row.answer === null && row.answerAvailable === false) return null
-  return status === "completed" && row.answerAvailable === true
+  return status === "completed" && validIso(row.answeredAt) && row.answerAvailable === true
      && (row.answer === "apply_ai_changes" || row.answer === "keep_resume") ? row.answer : undefined
 }
 function stableChoiceOwner(owner: Record<string, unknown>): TurnQuestionScheduledChoiceOwner {

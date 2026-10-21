@@ -437,7 +437,8 @@ describe("PostgreSQL scheduled Prepare choice", () => {
   })
 
   it("reloads only the exact private answered item bound to the current receipt", async () => {
-    const content = { ...createTurnScheduledPrepareChoiceContent(scheduledWaitId, scheduledBinding), answer: "keep_resume", answerAvailable: true }
+    const content = { ...createTurnScheduledPrepareChoiceContent(scheduledWaitId, scheduledBinding), answer: "keep_resume", answerAvailable: true,
+      answeredAt: now.toISOString() }
     const f = scheduledChoiceFixture({ turnStatus: "in_progress", stepStatus: "waiting_for_user", itemStatus: "completed", itemContent: content })
     await expect(f.store.readScheduledPrepareChoice({ owner, receipt: scheduledReceipt, now })).resolves.toEqual({ status: "answered", waitId: scheduledWaitId,
       itemId: `agent-wait:question:${scheduledWaitId}`, answer: "keep_resume", binding: scheduledBinding })
