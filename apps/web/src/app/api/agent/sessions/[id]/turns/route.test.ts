@@ -69,6 +69,24 @@ describe("agent turns query API", () => {
     expect(JSON.stringify(body)).not.toContain("PRIVATE_CONTEXT")
   })
 
+  it("keeps a listed active Turn out of the objective projection when its goal is missing or malformed", async () => {
+    const inputs = [
+      { content: [{ type: "text", text: "PRIVATE_CONTEXT" }] },
+      { goal: 42, content: [{ type: "text", text: "PRIVATE_CONTEXT" }] },
+    ]
+    for (const input of inputs) {
+      const active = { ...turn("turn_2", 2, "in_progress"), input }
+      mocks.turnFindMany.mockResolvedValueOnce([active])
+      mocks.turnFindFirst.mockResolvedValueOnce(active)
+      const { GET } = await import("./route")
+      const response = await GET(request("?limit=1") as never, params)
+      const body = await response.json()
+      expect(body.turns).toMatchObject([{ id: "turn_2", goal: "Process agent task" }])
+      expect(body.projection.activeTurn).toEqual({ id: "turn_2", status: "in_progress", revision: 2 })
+      expect(JSON.stringify(body)).not.toContain("PRIVATE_CONTEXT")
+    }
+  })
+
   it("omits blank or malformed active goals", async () => {
     for (const goal of ["   ", 42, { value: "not a canonical goal" }]) {
       mocks.turnFindMany.mockResolvedValueOnce([])

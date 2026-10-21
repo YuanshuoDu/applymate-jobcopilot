@@ -43,11 +43,13 @@ describe('agent session URL and active Turn DTO', () => {
       .toEqual({ id: 'turn_1', status: 'in_progress', revision: 4 })
   })
 
-  it('uses a matching listed Turn only when the active projection lacks its goal', () => {
-    expect(parseAgentTurnsResponse({
-      turns: [{ id: 'turn_1', status: 'in_progress', revision: 4, goal: 'Canonical objective' }],
-      projection: { activeTurnId: 'turn_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 } },
-    }).activeTurn).toEqual({ id: 'turn_1', status: 'in_progress', revision: 4, goal: 'Canonical objective' })
+  it('keeps active controls but never promotes a listed Turn goal without a projected goal', () => {
+    for (const goal of ['Canonical objective', 'Process agent task']) {
+      expect(parseAgentTurnsResponse({
+        turns: [{ id: 'turn_1', status: 'in_progress', revision: 4, goal }],
+        projection: { activeTurnId: 'turn_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 } },
+      }).activeTurn).toEqual({ id: 'turn_1', status: 'in_progress', revision: 4 })
+    }
   })
 
   it('clears the objective when the active projection is absent or refers to a different Turn', () => {

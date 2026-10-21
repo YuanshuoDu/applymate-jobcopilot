@@ -67,11 +67,7 @@ export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
   const projectedActiveTurn = !activeTurnId || projection?.activeTurn === null
     ? null
     : projectionMatches ? projectionTurn : listedTurn ? { id: listedTurn.id, status: listedTurn.status, revision: listedTurn.revision } : null
-  const activeTurn = activeTurnId && projectedActiveTurn
-    ? projectionMatches && !projectedActiveTurn.goal && listedTurn?.goal
-      ? { ...projectedActiveTurn, goal: listedTurn.goal }
-      : projectedActiveTurn
-    : null
+  const activeTurn = activeTurnId && projectedActiveTurn ? projectedActiveTurn : null
   return {
     activeTurn,
     queuedInputCount: typeof projection?.queuedInputCount === 'number' && Number.isSafeInteger(projection.queuedInputCount) && projection.queuedInputCount >= 0
