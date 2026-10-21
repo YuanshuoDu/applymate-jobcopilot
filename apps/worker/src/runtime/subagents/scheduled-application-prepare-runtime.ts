@@ -61,7 +61,7 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
     if (!receipt) throw new Error("scheduled_prepare_receipt_invalid")
     const bridge = createScheduledAutomationPipelineBridge({
       load: async () => ({ turn: persisted.turn, root: persisted.root,
-        snapshot: { schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2) },
+        snapshot: scheduledPrepareAnalyzeSnapshot(snapshot),
         current: { revision: receipt.analyzeGraphRevision, nodes: current.nodes.slice(0, 2) },
         tasks: snapshot.nodes.slice(0, 2).map(value => loaded.tasks.get(value.taskId)!).filter(Boolean).map(value => persistedTask(value, lease)) }),
       verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input),
@@ -105,6 +105,11 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
       snapshot: automation, receipt, checkpointJobs }, details }
   } catch (error: unknown) { await client.query("ROLLBACK").catch(() => undefined); throw error }
   finally { client.release() }
+}
+
+export function scheduledPrepareAnalyzeSnapshot(snapshot: TaskGraphSnapshot): TaskGraphSnapshot {
+  return { schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2),
+    ...(snapshot.rootSuccessCriteria ? { rootSuccessCriteria: snapshot.rootSuccessCriteria } : {}) }
 }
 
 async function readPersistedOwner(client: Queryable, lease: SubagentLease, owner: ExecutionOwnerFence) {

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { createScheduledApplicationPrepareRuntime, persistScheduledPrepareMaterial, scheduledPrepareArtifactIdentity,
-  scheduledPrepareLiveCheckpointBinding } from "./scheduled-application-prepare-runtime.js"
+  scheduledPrepareAnalyzeSnapshot, scheduledPrepareLiveCheckpointBinding } from "./scheduled-application-prepare-runtime.js"
 import { SCHEDULED_PREPARE_CHOICE_SCHEMA, type ScheduledPrepareArtifactWriteBinding, type ScheduledPrepareOwner,
   type VerifiedScheduledPrepareInvocation } from "../tools/scheduled-application-prepare.js"
 import type { AgentArtifactBaseInsert, AgentArtifactDraftWrite, AgentArtifactRow, AgentArtifactTaskFence, AgentArtifactVersionRow } from "../../db/agent-artifact-repo.js"
@@ -11,6 +11,7 @@ import { buildScheduledTaskGraphContinuationReceipt,
   scheduledTaskGraphStableContinuationKey, type ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import type { ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
+import { canonicalTaskGraphJson, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { TurnQuestionScheduledChoiceBinding } from "../turns/turn-question-contract.js"
 
 const { readScheduledPrepareChoice } = vi.hoisted(() => ({ readScheduledPrepareChoice: vi.fn() }))
@@ -27,6 +28,7 @@ const stableOwner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1"
 const oldOwner: ScheduledPrepareOwner = { ...stableOwner, turnLeaseOwnerId: "turn-lease-old", turnLeaseVersion: 4 }
 const currentOwner: ScheduledPrepareOwner = { ...stableOwner, turnLeaseOwnerId: "turn-lease-current", turnLeaseVersion: 9 }
 const digest = (char: string) => createHash("sha256").update(char).digest("hex")
+const graphDigest = (value: unknown) => createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex")
 
 function receiptFor(owner: ScheduledPrepareOwner = oldOwner): ScheduledTaskGraphContinuationReceipt {
   const candidate = buildScheduledTaskGraphContinuationReceipt({ owner, continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
@@ -123,6 +125,20 @@ function artifactPool(): pg.Pool {
 }
 
 describe("scheduled Prepare production runtime", () => {
+  it("preserves pinned root criteria in the Analyze prefix digest", () => {
+    const rootSuccessCriteria = ["Scheduled automation pipeline integration", "Keep Prepare bound to verified Analyze evidence"]
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [{ key: "scout" }, { key: "analyst" }, { key: "prepare" }] as unknown as TaskGraphSnapshot["nodes"],
+      rootSuccessCriteria } satisfies TaskGraphSnapshot
+    const projected = scheduledPrepareAnalyzeSnapshot(snapshot)
+    const expectedPrefix = { schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2), rootSuccessCriteria }
+
+    expect(graphDigest(projected)).toBe(graphDigest(expectedPrefix))
+    expect(graphDigest(projected)).not.toBe(graphDigest({ schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2) }))
+    expect(scheduledPrepareAnalyzeSnapshot({ schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes }))
+      .not.toHaveProperty("rootSuccessCriteria")
+  })
+
   it("reloads the exact durable answer under the current Turn lease before preparation", async () => {
     const receipt = receiptFor(), answerBinding: TurnQuestionScheduledChoiceBinding = {
       schemaVersion: "agent-harness.v2.scheduled-prepare-choice-wait.v1", owner: stableOwner,

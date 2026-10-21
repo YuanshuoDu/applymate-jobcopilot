@@ -1195,6 +1195,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         owner: { turnLeaseOwnerId: resumedLease.ownerId, turnLeaseVersion: resumedLease.leaseVersion } })
       await expect(questionStore.readScheduledPrepareChoice({ owner: resumedTurnExecutionOwner, receipt: privateReceipt.payload, now: new Date() }))
         .resolves.toMatchObject({ status: "answered", waitId: expectedChoiceWaitId, itemId: choiceWait.itemId, answer: "keep_resume" })
+      await expect(questionStore.readScheduledPrepareChoice({ owner: turnExecutionOwner, receipt: privateReceipt.payload, now: new Date() }))
+        .rejects.toMatchObject({ code: "question_not_current" })
       const receiptOutbox = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "idempotencyKey" = $1 OR "payload"->>'eventId' = $2`,
         [`agent-event:${privateReceipt.id}`, privateReceipt.id])
       expect(receiptOutbox.rows).toHaveLength(0)
@@ -1298,6 +1300,46 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(toolModelCalls).toBe(1)
       expect(materialModelCalls).toBe(1)
       expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toBeDefined()
+      const verificationGraph = await loadTaskGraph(pool!, graphScope, false)
+      const verificationCurrent = currentTaskGraph(verificationGraph)
+      const verificationAttempt = verificationGraph.tasks.get(prepareTaskId)?.attemptCount
+      if (!verificationGraph.snapshot || !Number.isSafeInteger(verificationAttempt)) {
+        throw new Error("Scheduled Prepare verification fixture did not load its persisted task graph")
+      }
+      const verificationScope = { ...graphScope, taskId: prepareTaskId, attemptCount: verificationAttempt! }
+      const verificationInput = {
+        scope: verificationScope, snapshot: verificationGraph.snapshot, current: verificationCurrent,
+        tasks: verificationGraph.tasks, completionGraphRevision: verificationCurrent.revision,
+      }
+      await expect(verifyScheduledPrepareTaskGraphEvidence(pool!, {
+        ...verificationInput, structuredResult: { ...structuredResult, jobs: "malformed" },
+      })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_evidence_invalid" })
+      await expect(verifyScheduledPrepareTaskGraphEvidence(pool!, {
+        ...verificationInput,
+        structuredResult: { ...structuredResult, status: "partial", jobs: [{ jobId: value.jobId, status: "failed" }], materials: [] },
+      })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_result_invalid" })
+      await expect(verifyScheduledPrepareTaskGraphEvidence(pool!, {
+        ...verificationInput, scope: { ...verificationScope, userId: `${value.userId}-foreign` }, structuredResult,
+      })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_receipt_invalid" })
+      const staleAttemptClient = await pool!.connect()
+      try {
+        await staleAttemptClient.query("BEGIN")
+        const bumpedAttempt = await staleAttemptClient.query<{ attemptCount: number }>(
+          `UPDATE "sub_agent_tasks" SET "attemptCount" = "attemptCount" + 1 WHERE "id" = $1 RETURNING "attemptCount"`, [prepareTaskId])
+        const staleAttemptGraph = await loadTaskGraph(staleAttemptClient, graphScope, false)
+        const staleCurrent = currentTaskGraph(staleAttemptGraph)
+        const currentAttempt = staleAttemptGraph.tasks.get(prepareTaskId)?.attemptCount
+        expect(bumpedAttempt.rows[0]?.attemptCount).toBe(verificationAttempt! + 1)
+        expect(currentAttempt).toBe(bumpedAttempt.rows[0]?.attemptCount)
+        await expect(verifyScheduledPrepareTaskGraphEvidence(staleAttemptClient, {
+          scope: { ...verificationScope, attemptCount: currentAttempt! }, snapshot: staleAttemptGraph.snapshot!,
+          current: staleCurrent, tasks: staleAttemptGraph.tasks, structuredResult,
+          completionGraphRevision: staleCurrent.revision,
+        })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_result_invalid" })
+      } finally {
+        await staleAttemptClient.query("ROLLBACK").catch(() => undefined)
+        staleAttemptClient.release()
+      }
       const artifactVersions = await pool!.query<{ artifactType: string; content: unknown; version: number; taskId: string; sourceDigest: string; contentHash: string }>(
         `SELECT "artifactType", "content", "version", "taskId", "sourceDigest", "contentHash" FROM "agent_artifact_version"
           WHERE "taskId" = $1 ORDER BY "artifactType"`, [prepareTaskId])
