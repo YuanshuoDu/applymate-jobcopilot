@@ -36,14 +36,15 @@ async function lockEligibleSourceSession(client: Client, sessionId: string, user
 }
 
 async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInput, source: RootTaskHistoryCandidate): Promise<LoadedRootTaskHistoryGraphProjection | undefined> {
-  if (input.crossSessionRootTaskHistoryEnabled === true && source.sessionId !== input.lease.sessionId
+  const sourceSessionDiffers = input.crossSessionRootTaskHistoryEnabled === true && source.sessionId !== input.lease.sessionId
+  if (sourceSessionDiffers
     && !await lockEligibleSourceSession(client, source.sessionId, input.lease.userId)) return undefined
   const scope: GraphIdentityScope = { userId: input.lease.userId, sessionId: source.sessionId,
     turnId: source.turnId, rootTaskId: source.rootTaskId, parentTaskId: source.rootTaskId }
   try {
     const loaded = await loadTaskGraph(client, scope, false)
     if (!loaded.item || !loaded.snapshot || !loaded.state) return undefined
-    const graph = projectLoadedRootTaskHistoryGraph(loaded, input.crossSessionRootTaskHistoryEnabled === true)
+    const graph = projectLoadedRootTaskHistoryGraph(loaded, sourceSessionDiffers)
     return graph?.taskGraph.nodes.length ? graph : undefined
   } catch (error: unknown) {
     if (graphEvidenceError(error)) return undefined
@@ -67,6 +68,7 @@ export function createPgDirectRootTaskHistoryStore(pool: Pool) {
           const graph = await graphForCandidate(client, input, source)
           if (graph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
             terminalSequence: source.terminalSequence, ...(source.terminalAt ? { terminalAt: source.terminalAt } : {}),
+            ...(input.crossSessionRootTaskHistoryEnabled === true ? { sourceSessionDiffers: source.sessionId !== input.lease.sessionId } : {}),
             taskGraph: graph.taskGraph, sourceNodeOrdinals: graph.sourceNodeOrdinals,
             ...(graph.nodeLessons ? { nodeLessons: graph.nodeLessons } : {}), ...(graph.reportedOutputs ? { reportedOutputs: graph.reportedOutputs } : {}) })
         }

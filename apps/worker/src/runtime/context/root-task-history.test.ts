@@ -143,19 +143,39 @@ describe("root task history projection", () => {
       { taskKind: "scout", lesson: { criterionFailures: [{ check: { kind: "candidate_count_gte", minimum: 2 } }] } },
     ] }] })
 
-    const historical = projectRootTaskHistory([{ ...facts, terminalAt: new Date("2026-10-07T11:00:00.000Z") }], true)
+    const foreign = { ...facts, terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true }
+    const sameSession = { ...facts, sourceTurnId: "turn-same-session", sourceRootTaskId: "root-same-session",
+      terminalAt: new Date("2026-10-07T11:01:00.000Z"), sourceSessionDiffers: false }
+    const historical = projectRootTaskHistory([foreign, sameSession], true)
     expect(historical?.content).toMatchObject({ historical: true, advisoryOnly: true, notCurrentEvidence: true,
-      turns: [{ nodes: [
-        { taskKind: "analyst", status: "failed" },
-        { taskKind: "scout", lesson: { advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
-          successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] } },
-        { taskKind: "scout", lesson: { advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
-          criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] } },
-      ] }] })
+      turns: expect.any(Array) })
+    const historicalTurns = (historical?.content as { turns?: Array<{ nodes: Array<Record<string, unknown>> }> } | undefined)?.turns
+    expect(historicalTurns).toHaveLength(2)
+    expect(historicalTurns?.[0]?.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskKind: "analyst", lesson: expect.objectContaining({ executionFailureCategory: "execution_setup_unavailable" }) }),
+      expect.objectContaining({ taskKind: "scout", status: "completed", reportedOutput: { role: "scout", candidateCount: 1, resultStatus: "partial" },
+        lesson: expect.objectContaining({ successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] }) }),
+    ]))
+    expect(historicalTurns?.[1]?.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskKind: "analyst", status: "failed" }),
+      expect.objectContaining({ taskKind: "scout", status: "completed", lesson: expect.objectContaining({
+        advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+        successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }],
+      }) }),
+      expect.objectContaining({ taskKind: "scout", status: "failed", lesson: expect.objectContaining({ advisoryOnly: true,
+        notCurrentEvidence: true, nodeOrdinal: 1,
+        criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] }) }),
+    ]))
+    const foreignAnalyst = historicalTurns?.[1]?.nodes.find(item => item.taskKind === "analyst")
+    const foreignOutput = historicalTurns?.[1]?.nodes.find(item => item.taskKind === "scout" && item.status === "completed")
+    const foreignFailure = historicalTurns?.[1]?.nodes.find(item => item.taskKind === "scout" && item.status === "failed")
+    expect(foreignAnalyst?.lesson).toBeUndefined()
+    expect(foreignOutput?.reportedOutput).toBeUndefined()
+    expect(foreignOutput?.lesson).not.toHaveProperty("executionFailureCategory")
+    expect(foreignOutput?.lesson).not.toHaveProperty("criterionFailures.0.check")
+    expect(foreignFailure?.lesson).not.toHaveProperty("criterionFailures.0.check")
     const serialized = JSON.stringify(historical)
-    for (const forbidden of ["\"check\"", "minimum", "executionFailureCategory", "reportedOutput", "candidateCount", "findingCount"]) {
-      expect(serialized).not.toContain(forbidden)
-    }
+    expect(serialized).not.toContain("sourceSessionDiffers")
   })
 
   it("applies the byte cap to the final sanitized cross-session frame", () => {
@@ -172,7 +192,7 @@ describe("root task history projection", () => {
         criterionOrdinal: criterionIndex + 1, status: "failed" as const, reasonCode: "criterion_not_met" as const,
         check: { role: "analyst" as const, kind: "finding_count_gte" as const, minimum: 1 },
       })) }))
-    const source = { ...outcome("large-cross-session", 19n, nodes), terminalAt: new Date("2026-10-07T11:00:00.000Z"),
+    const source = { ...outcome("large-cross-session", 19n, nodes), terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true,
       sourceNodeOrdinals: nodes.map((_, index) => index + 1), nodeLessons: lessons }
     const projected = projectRootTaskHistory([source], true)
     const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ lesson?: { criterionFailures: unknown[] } }> }> } | undefined)?.turns
@@ -205,11 +225,11 @@ describe("root task history projection", () => {
       criterionFailures: [{ criterionOrdinal, status: "failed" as const, reasonCode }],
     })
     const oldOutcome = { ...outcome("old-local-frame", 10n, [targetA, repairA]),
-      terminalAt: new Date("2026-10-07T10:00:00.000Z"), sourceNodeOrdinals: [1, 2],
+      terminalAt: new Date("2026-10-07T10:00:00.000Z"), sourceSessionDiffers: true, sourceNodeOrdinals: [1, 2],
       nodeLessons: [lesson(1, 1, "criterion_not_met"), { ...lesson(2, 1, "criterion_not_met"), criterionFailures: [],
         successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" as const }] }] }
     const newOutcome = { ...outcome("new-local-frame", 11n, [targetB, repairB]),
-      terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceNodeOrdinals: [1, 2],
+      terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true, sourceNodeOrdinals: [1, 2],
       nodeLessons: [lesson(1, 2, "canonical_evidence_missing"), { ...lesson(2, 2, "canonical_evidence_missing"), criterionFailures: [],
         successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [2], status: "passed" as const }] }] }
 
@@ -426,17 +446,18 @@ describe("root task history projection", () => {
 
   it("orders cross-session outcomes by DB time and breaks equal-time ties by descending Turn ID", () => {
     const terminalAt = new Date("2026-10-07T11:00:00.000Z")
-    const highTurnId = { ...outcome("z-source", 1n, [node({ status: "running" })]), terminalAt }
-    const lowTurnId = { ...outcome("a-source", 90n, [node({ status: "queued" })]), terminalAt }
+    const highTurnId = { ...outcome("z-source", 1n, [node({ status: "running" })]), terminalAt, sourceSessionDiffers: true }
+    const lowTurnId = { ...outcome("a-source", 90n, [node({ status: "queued" })]), terminalAt, sourceSessionDiffers: true }
     const olderTime = { ...outcome("older-time", 100n, [node({ status: "interrupted" })]),
-      terminalAt: new Date(terminalAt.getTime() - 1) }
+      terminalAt: new Date(terminalAt.getTime() - 1), sourceSessionDiffers: true }
     const projected = projectRootTaskHistory([lowTurnId, highTurnId], true)
     const turns = (projected?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }).turns
 
     expect(turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "queued"])
     const byTime = projectRootTaskHistory([olderTime, highTurnId], true)?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }
     expect(byTime.turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "interrupted"])
-    expect(projectRootTaskHistory([outcome("missing-terminal-time", 2n)], true)).toBeUndefined()
+    expect(projectRootTaskHistory([{ ...outcome("missing-source-session-scope", 3n), terminalAt }], true)).toBeUndefined()
+    expect(projectRootTaskHistory([{ ...outcome("missing-terminal-time", 2n), sourceSessionDiffers: false }], true)).toBeUndefined()
   })
 
   it("strips large untrusted node strings before applying the byte bound", () => {
