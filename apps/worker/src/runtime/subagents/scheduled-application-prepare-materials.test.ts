@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { HarnessModelRequest } from "@jobcopilot/agent-model"
-import type { AgentArtifactDraftWrite, AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
+import type { AgentArtifactBaseInsert, AgentArtifactDraftWrite, AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ScheduledPrepareArtifactWriteBinding, ScheduledPrepareJobInput } from "../tools/scheduled-application-prepare.js"
 import type { AnalystResult } from "./role-results.js"
 import type { ScheduledPrepareMaterialSources } from "./scheduled-application-prepare-materials.js"
@@ -145,6 +145,41 @@ describe("scheduled Prepare material persistence", () => {
     expect(baseFences[0]).toMatchObject({ taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12 })
     expect(repository.insertBaseWithClient).toHaveBeenCalledWith(client, expect.objectContaining({ id: expect.stringMatching(/^scheduled-base:/) }), baseFences[0])
     expect(repository.saveDraft).toHaveBeenCalledWith(expect.objectContaining({ taskFence: baseFences[0] }), client)
+  })
+
+  it("replays a base identity for the same provenance and separates choice-dependent provenance", async () => {
+    const refsForKeptResume = ["job:job-a", "resume:resume-a"]
+    const refsForTailoredResume = ["job:job-a", "persona:fact-a", "resume:resume-a"]
+    const source = { preparation: { sourceDigest, evidenceRefs: [...refsForTailoredResume] }, baseResumeId: "resume-a", transientSources: [
+      { sourceRef: "resume:resume-a", content: { summary: "source resume" } },
+      { sourceRef: "job:job-a", content: { title: "Software Engineer" } },
+      { sourceRef: "persona:fact-a", content: { value: "confirmed fact" } },
+    ] }
+    const baseWrites: AgentArtifactBaseInsert[] = []
+    const client = { query: vi.fn(async (_sql: string) => ({ rows: [] })), release: vi.fn() }
+    const repository = {
+      insertBaseWithClient: vi.fn(async (_client: unknown, base: AgentArtifactBaseInsert) => { baseWrites.push(base) }),
+      find: vi.fn(async () => null),
+      saveDraft: vi.fn(async (write: AgentArtifactDraftWrite) => ({ artifactId: write.id, version: 1, contentHash: write.hash,
+        sourceDigest: write.sourceDigest } as never)),
+    }
+    const pool = { connect: vi.fn(async () => client) } as unknown as pg.Pool
+    createArtifactRepository.mockReturnValue(repository)
+    loadSelectedJobArtifactContext.mockResolvedValue(source)
+    const input = {
+      invocation: { owner: { rootAttemptCount: 2, turnLeaseOwnerId: "turn-owner-current", turnLeaseVersion: 12 } },
+      artifactBinding: () => binding,
+    } as unknown as ScheduledPrepareJobInput
+
+    await persistScheduledPrepareMaterial(pool, input, "resume", { summary: "kept resume" }, source as never, refsForKeptResume)
+    await persistScheduledPrepareMaterial(pool, input, "resume", { summary: "kept resume" }, source as never, refsForKeptResume)
+    await persistScheduledPrepareMaterial(pool, input, "resume", { summary: "tailored resume" }, source as never, refsForTailoredResume)
+
+    expect(baseWrites).toHaveLength(3)
+    expect(baseWrites[0]?.id).toBe(baseWrites[1]?.id)
+    expect(baseWrites[0]?.id).not.toBe(baseWrites[2]?.id)
+    expect(baseWrites.map(base => base.provenanceRefs)).toEqual([refsForKeptResume, refsForKeptResume, refsForTailoredResume])
+    expect(baseWrites.map(base => base.evidenceRefs)).toEqual([refsForKeptResume, refsForKeptResume, refsForTailoredResume])
   })
 
   it("keeps lease identity out of the stable base, draft, and tool receipt keys", () => {

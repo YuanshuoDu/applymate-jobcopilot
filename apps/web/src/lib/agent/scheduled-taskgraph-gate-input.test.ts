@@ -99,7 +99,7 @@ function sourceDigest(job: Job, resumeRow = resume, facts: typeof fact[] = [fact
 
 function artifactRows(kind: 'resume' | 'cover_letter', ref = reference(kind === 'resume' ? 'artifact-resume' : 'artifact-letter',
   kind === 'resume' ? resumeBody : coverLetterBody), content: unknown = kind === 'resume' ? resumeBody : coverLetterBody) {
-  const refs = [`job:${jobRow.id}`, `resume:${resume.id}`, `persona:${fact.id}`]
+  const refs = [`job:${jobRow.id}`, `resume:${resume.id}`, `persona:${fact.id}`].sort()
   const version = { id: `version-${kind}`, artifactId: ref.artifactId, version: ref.version, userId: owner.userId, sessionId: owner.sessionId,
     jobId: jobRow.id, artifactType: kind, content, contentHash: ref.contentHash, sourceDigest: ref.sourceDigest,
     constraintHash: sha('b'), provenanceRefs: refs, evidenceRefs: refs, baseId: 'base-artifact', baseHash: sha('c'), taskId: 'prepare-task',

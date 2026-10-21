@@ -14,6 +14,12 @@ const scheduledReceipt = {
   evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 7, prepareScheduleRevision: 8,
 }
 
+function reverseObjectKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseObjectKeysDeep)
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(Object.entries(value).reverse().map(([key, nested]) => [key, reverseObjectKeysDeep(nested)]))
+}
+
 describe("native user question contract", () => {
   it("normalizes one question and maps choices into canonical options", () => {
     expect(parseTurnQuestionArguments({ question: "  Which location?  ", choices: [{ label: " Berlin ", value: " de-ber " }] })).toEqual({
@@ -116,5 +122,15 @@ describe("native user question contract", () => {
     expect(parseTurnScheduledPrepareChoiceItem({ ...content, answer: "maybe", answerAvailable: true }, "completed", binding)).toBeUndefined()
     expect(parseTurnScheduledPrepareChoiceItem({ ...content, questionId: "foreign" }, "started", binding)).toBeUndefined()
     expect(parseTurnScheduledPrepareChoiceItem({ ...content, extra: true }, "started", binding)).toBeUndefined()
+  })
+
+  it("compares nested JSON objects independent of key order while preserving array order", () => {
+    const binding = buildTurnQuestionScheduledChoiceBinding({ receipt: scheduledReceipt, finalStepId: "final-step", finalStepOrdinal: 11 })!
+    const waitId = turnScheduledPrepareChoiceWaitId(binding)!
+    const content = createTurnScheduledPrepareChoiceContent(waitId, binding)
+    const reorderedBinding = reverseObjectKeysDeep(content.scheduledPrepareChoiceBinding)
+
+    expect(parseTurnScheduledPrepareChoiceItem({ ...content, scheduledPrepareChoiceBinding: reorderedBinding }, "started", binding)).toBeNull()
+    expect(parseTurnScheduledPrepareChoiceItem({ ...content, options: [...content.options].reverse() }, "started", binding)).toBeUndefined()
   })
 })

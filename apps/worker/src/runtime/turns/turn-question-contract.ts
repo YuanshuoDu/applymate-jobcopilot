@@ -47,7 +47,6 @@ export type TurnQuestionIntentEnvelope = {
   readonly question: string
   readonly options: readonly TurnQuestionChoice[]
 }
-
 export type TurnQuestionStore = {
   stageQuestionUsage(input: TurnQuestionUsageInput): Promise<void>
   cancelPausedQuestion(input: TurnQuestionPauseInput): Promise<"cancelled" | "prepared">
@@ -55,7 +54,6 @@ export type TurnQuestionStore = {
   readPendingQuestion(input: TurnQuestionOwnerInput): Promise<TurnQuestionRecovery>
   readScheduledPrepareChoice(input: TurnQuestionScheduledChoiceReadInput): Promise<TurnQuestionScheduledChoiceRecovery>
 }
-
 export type TurnQuestionUsageInput = {
   readonly owner: TurnExecutionOwnerFence
   readonly stepId: string
@@ -67,7 +65,6 @@ export type TurnQuestionUsageInput = {
 export type TurnQuestionPauseInput = TurnQuestionUsageInput & {
   readonly callArguments: unknown
 }
-
 export type TurnQuestionOwnerInput = { readonly owner: TurnExecutionOwnerFence; readonly now: Date }
 export type TurnQuestionWaitInput = TurnQuestionOwnerInput & {
   readonly stepId: string
@@ -86,13 +83,11 @@ export type TurnQuestionWaitReceipt = {
   readonly toolCallId: string | null
   readonly nextTurnRevision: number
 }
-
 export type TurnQuestionScheduledChoiceReadInput = TurnQuestionOwnerInput & { readonly receipt: unknown }
 export type TurnQuestionScheduledChoiceRecovery =
   | Readonly<{ status: "none" }>
   | Readonly<{ status: "waiting"; waitId: string; itemId: string; binding: TurnQuestionScheduledChoiceBinding }>
   | Readonly<{ status: "answered"; waitId: string; itemId: string; answer: TurnScheduledPrepareChoice; binding: TurnQuestionScheduledChoiceBinding }>
-
 export type TurnQuestionStoreErrorCode = "question_invalid_owner" | "question_not_current" | "question_receipt_missing"
   | "question_receipt_malformed" | "question_usage_unavailable" | "question_conflict"
 
@@ -138,7 +133,6 @@ function choices(value: unknown): TurnQuestionChoice[] | null {
   }
   return result
 }
-
 /** Normalize only the model-facing question and optional choice list. */
 export function parseTurnQuestionArguments(value: unknown): TurnQuestionIntentEnvelope | null {
   const row = record(value)
@@ -147,7 +141,6 @@ export function parseTurnQuestionArguments(value: unknown): TurnQuestionIntentEn
   if (!boundedText(question, TURN_QUESTION_MAX_TEXT_BYTES) || !options) return null
   return { schemaVersion: TURN_QUESTION_INTENT_SCHEMA, kind: "user_question", stage: "user_input", question, options }
 }
-
 export function isTurnQuestionUsage(value: unknown): value is TurnUsage | null {
   const row = record(value)
   return value === null || !!row && exactKeys(row, ["inputTokens", "outputTokens", "estimatedCostUsd"])
@@ -291,7 +284,14 @@ function validScheduledChoiceOwner(owner: Record<string, unknown>): boolean {
   return [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.executionId].every(validId)
     && positive(owner.rootAttemptCount) && Number.isSafeInteger(owner.executionAttemptCount) && Number(owner.executionAttemptCount) >= 0
 }
-function sameJson(left: unknown, right: unknown): boolean { try { return JSON.stringify(left) === JSON.stringify(right) } catch { return false } }
+function sameJson(left: unknown, right: unknown): boolean {
+  const sorted = new WeakMap<object, object>(), stable = (value: unknown) => JSON.stringify(value, (_key, item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return item
+    const canonical = sorted.get(item) ?? Object.fromEntries(Object.entries(item).sort())
+    sorted.set(item, canonical); sorted.set(canonical, canonical); return canonical
+  })
+  try { return stable(left) === stable(right) } catch { return false }
+}
 function validText(value: unknown, pattern: RegExp): value is string { return typeof value === "string" && pattern.test(value) }
 function validId(value: unknown): value is string { return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) }
 function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }

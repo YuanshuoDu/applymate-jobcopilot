@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, buildScheduledTaskGraphPrepareCheckpoint } from "./scheduled-taskgraph-pipeline-checkpoint"
-import { scheduledTaskGraphAnalyzeCheckpointDigest } from "./scheduled-taskgraph-gate-checkpoint"
+import { parseScheduledTaskGraphPrepareProof, scheduledTaskGraphAnalyzeCheckpointDigest, scheduledTaskGraphPrepareResultDigest } from "./scheduled-taskgraph-gate-checkpoint"
 import { runScheduledTaskGraphAnalyzeOnly } from "./scheduled-taskgraph-run-service"
 import type { PipelineCtx } from "./pipeline-context"
 import type { Job } from "@prisma/client"
 
-const mocks = vi.hoisted(() => ({ analyze: vi.fn(), scoreOwner: vi.fn(), ownerCurrent: vi.fn(), save: vi.fn(), gateInput: vi.fn(), gateCheckpoint: vi.fn(), events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
-vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps }, agentItem: { findFirst: mocks.items } } }))
+const mocks = vi.hoisted(() => ({ analyze: vi.fn(), scoreOwner: vi.fn(), ownerCurrent: vi.fn(), save: vi.fn(), gateInput: vi.fn(), gateCheckpoint: vi.fn(),
+  gateMaterials: vi.fn(), taskRows: vi.fn(), useActualGateInput: false, useActualGateCheckpoint: false, events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
+vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps }, agentItem: { findFirst: mocks.items },
+  subAgentTask: { findMany: mocks.taskRows } } }))
 vi.mock("./scheduled-taskgraph-analysis-journal", () => ({
   runScheduledTaskGraphAnalyze: mocks.analyze,
   scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwner,
@@ -16,11 +18,21 @@ vi.mock("./scheduled-taskgraph-pipeline-fence", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-taskgraph-pipeline-fence")>()
   return { ...actual, isScheduledTaskGraphOwnerCurrent: mocks.ownerCurrent, saveScheduledTaskGraphCheckpoint: mocks.save }
 })
-vi.mock("./scheduled-taskgraph-gate-input", () => ({ loadScheduledTaskGraphGateInput: mocks.gateInput }))
+vi.mock("./scheduled-taskgraph-gate-input", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-taskgraph-gate-input")>()
+  return { ...actual, loadScheduledTaskGraphGateInput: (...args: Parameters<typeof actual.loadScheduledTaskGraphGateInput>) => {
+    if (mocks.useActualGateInput) { mocks.gateInput(...args); return actual.loadScheduledTaskGraphGateInput(...args) }
+    return mocks.gateInput(...args)
+  } }
+})
 vi.mock("./scheduled-taskgraph-gate-checkpoint", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-taskgraph-gate-checkpoint")>()
-  return { ...actual, buildScheduledTaskGraphGateCheckpoint: mocks.gateCheckpoint }
+  return { ...actual, buildScheduledTaskGraphGateCheckpoint: (...args: Parameters<typeof actual.buildScheduledTaskGraphGateCheckpoint>) => {
+    if (mocks.useActualGateCheckpoint) { mocks.gateCheckpoint(...args); return actual.buildScheduledTaskGraphGateCheckpoint(...args) }
+    return mocks.gateCheckpoint(...args)
+  } }
 })
+vi.mock("./scheduled-taskgraph-gate-materials", () => ({ loadScheduledTaskGraphGateMaterials: mocks.gateMaterials }))
 
 const owner = { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_1",
   rootAttemptCount: 2, turnLeaseOwnerId: "worker_1", turnLeaseVersion: 4, executionId: "execution_1", executionAttemptCount: 0 }
@@ -52,6 +64,18 @@ const finalStepId = "step_final_1", finalStepOrdinal = 1
 const prepareReceipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1", owner, continuationKey: key,
   snapshotDigest: baseAttestation.snapshotDigest, evidenceDigest: baseAttestation.evidenceDigest, checkpointDigest: "e".repeat(64),
   analyzeGraphRevision: 9, prepareScheduleRevision: 10 }
+function workerPrepareProof(receipt: typeof prepareReceipt = prepareReceipt) {
+  const result = { schemaVersion: "agent-harness.v2.subagent.result", role: "prepare", status: "completed", taskId: "prepare_1", attemptCount: 1,
+    snapshotDigest: receipt.snapshotDigest, checkpointDigest: receipt.checkpointDigest, jobs: [], materials: [] }
+  const resultDigest = scheduledTaskGraphPrepareResultDigest(result)
+  return { receipt, completion: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-prepare-completion.v1", graphRevision: 11,
+    nodes: [
+      { taskId: "scout_1", attemptCount: 1, role: "scout", taskType: "job_discovery", status: "completed", verification: "passed", dependsOnTaskIds: [] },
+      { taskId: "analyst_1", attemptCount: 1, role: "analyst", taskType: "job_analysis", status: "completed", verification: "passed", dependsOnTaskIds: ["scout_1"] },
+      { taskId: "prepare_1", attemptCount: 1, role: "prepare", taskType: "scheduled_application_prepare", status: "completed", verification: "passed",
+        dependsOnTaskIds: ["analyst_1"], tool: "scheduled.application.prepare@1", resultDigest },
+    ], wait: { waitId: "wait_prepare_1", status: "ready", mode: "all", targetTaskIds: ["prepare_1"], matchedTaskIds: ["prepare_1"] } }, result }
+}
 const approvalSnapshot = { ...snapshot, requireApproval: true }
 const approvalAttestation = { ...baseAttestation, snapshotDigest: scheduledAutomationSnapshotDigest(approvalSnapshot) }
 const approvalKey = scheduledTaskGraphContinuationKey(owner, approvalAttestation)
@@ -91,12 +115,17 @@ function context(): PipelineCtx {
 
 describe("runScheduledTaskGraphAnalyzeOnly", () => {
   beforeEach(() => {
-    Object.values(mocks).forEach(mock => mock.mockReset())
+    ;[mocks.analyze, mocks.scoreOwner, mocks.ownerCurrent, mocks.save, mocks.gateInput, mocks.gateCheckpoint, mocks.gateMaterials,
+      mocks.taskRows, mocks.events, mocks.steps, mocks.items].forEach(mock => mock.mockReset())
     mocks.ownerCurrent.mockResolvedValue(true)
     mocks.scoreOwner.mockResolvedValue(true)
     mocks.save.mockResolvedValue(true)
     mocks.gateInput.mockReset()
     mocks.gateCheckpoint.mockReset()
+    mocks.gateMaterials.mockReset().mockResolvedValue({ packages: [], materials: [] })
+    mocks.taskRows.mockReset()
+    mocks.useActualGateInput = false
+    mocks.useActualGateCheckpoint = false
     mocks.gateInput.mockResolvedValue({ packages: [{ userId: owner.userId, sessionId: owner.sessionId, jobId: job.id,
       package: { job: { id: job.id }, coverLetter: "private-letter-body" } as never }],
       materials: [{ userId: owner.userId, sessionId: owner.sessionId, jobId: job.id, kind: "resume",
@@ -205,20 +234,66 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
   }, 30_000)
 
   it("continues to Gate without a scheduled-choice checkpoint when approval is disabled", async () => {
-    mocks.items.mockResolvedValue(null)
-    const persisted = { ...buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
-      ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint,
-      scheduledTaskGraphClaim: initialState.scheduledTaskGraphClaim }
-    const prepareProof = { receipt: prepareReceipt, completion: {}, result: { taskId: "prepare_1" } }
+    const analyzeCheckpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+      ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint
+    const activeClaim = { ...initialState.scheduledTaskGraphClaim, claimedAt: "2026-10-20T10:00:00.000Z", leaseExpiresAt: "2099-10-20T10:10:00.000Z" }
+    const persisted = { ...analyzeCheckpoint, scheduledTaskGraphClaim: activeClaim }
+    const continuation = persisted.scheduledTaskGraphContinuation as Record<string, unknown>
+    const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(persisted)!
+    const prepareScheduleRevision = Number(continuation.graphRevision) + 1
+    const receiptProjection = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
+      owner.executionId, owner.executionAttemptCount, continuation.snapshotDigest, continuation.evidenceDigest, checkpointDigest,
+      continuation.graphRevision, prepareScheduleRevision]
+    const receipt: typeof prepareReceipt = { ...prepareReceipt,
+      continuationKey: `scheduled-taskgraph:sha256:${createHash("sha256").update(JSON.stringify(receiptProjection), "utf8").digest("hex")}`,
+      snapshotDigest: String(continuation.snapshotDigest), evidenceDigest: String(continuation.evidenceDigest), checkpointDigest,
+      analyzeGraphRevision: Number(continuation.graphRevision), prepareScheduleRevision }
+    const prepareProof = workerPrepareProof(receipt)
+    const graphNodes = [
+      { key: "scout", taskId: "scout_1", templateId: "scout", depth: 1, dependsOn: [], verificationDisposition: "typed", verification: { role: "scout", criteria: [{ id: "candidate-count" }] } },
+      { key: "analyst", taskId: "analyst_1", templateId: "analyst", depth: 2, dependsOn: ["scout"], verificationDisposition: "typed", verification: { role: "analyst", criteria: [{ id: "source-match" }] } },
+      { key: "prepare", taskId: "prepare_1", templateId: "prepare", depth: 3, dependsOn: ["analyst"], verificationDisposition: "specialized" },
+    ]
+    const report = (resultDigest: string, criterionId: string) => ({ verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed",
+      reasonCode: "criteria_met", resultDigest, evidenceDigest: "f".repeat(64), criteria: [{ criterionId, status: "passed", reasonCode: "criteria_met" }] })
+    const graphId = `task-graph-${createHash("sha256").update(owner.rootTaskId).digest("hex")}`
+    const graph = { id: graphId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, type: "task_graph", revision: 11,
+      content: { schemaVersion: "agent-harness.v2.task-graph", nodes: graphNodes } }
+    const completionFacts = { schemaVersion: prepareProof.completion.schemaVersion, graphRevision: prepareProof.completion.graphRevision, nodes: prepareProof.completion.nodes }
+    mocks.useActualGateInput = true
+    mocks.useActualGateCheckpoint = true
+    mocks.gateInput.mockImplementation((args: { prepareProof: unknown }) => expect(parseScheduledTaskGraphPrepareProof(args.prepareProof)).not.toBeNull())
+    mocks.gateCheckpoint.mockImplementation((args: { proof: unknown }) => expect(parseScheduledTaskGraphPrepareProof(args.proof)).not.toBeNull())
+    mocks.gateMaterials.mockResolvedValue({ packages: [], materials: [] })
+    mocks.items.mockImplementation((args: { where: { id?: string } }) => Promise.resolve(args.where.id === graphId ? graph : null))
+    mocks.taskRows.mockResolvedValue([
+      { id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: null,
+        attemptCount: owner.rootAttemptCount, status: "running", failureReason: null },
+      { id: "scout_1", sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+        attemptCount: 1, status: "completed", role: "scout", taskType: "job_discovery", failureReason: null,
+        result: { status: "completed", taskGraphVerificationReport: report("a".repeat(64), "candidate-count") } },
+      { id: "analyst_1", sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+        attemptCount: 1, status: "completed", role: "analyst", taskType: "job_analysis", failureReason: null,
+        result: { status: "completed", taskGraphVerificationReport: report("d".repeat(64), "source-match") } },
+      { id: "prepare_1", sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+        attemptCount: 1, status: "completed", role: "prepare", taskType: "scheduled_application_prepare", failureReason: null,
+        result: { status: "completed", structuredResult: prepareProof.result, taskGraphScheduledPrepareProofFacts: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-prepare-proof-facts.v1",
+          receipt, completion: completionFacts, result: prepareProof.result } } },
+    ])
+    mocks.events.mockImplementation((args: { where: { type: string } }) => Promise.resolve(args.where.type === "agent.plan.scheduled_prepare_binding"
+      ? [{ payload: receipt }]
+      : [{ type: "native_verification.scheduled_candidate_staged", taskId: owner.rootTaskId, correlationId: finalStepId, payload: candidatePayload }]))
     const resume = await (await import("./scheduled-taskgraph-run-service")).buildScheduledTaskGraphGateResumeState({
       owner, snapshot, attestation: baseAttestation, continuationKey: key, claimToken, ownedJobs: [job],
       persistedCheckpoint: persisted, prepareProof,
     })
     expect(mocks.gateInput).toHaveBeenCalledWith(expect.objectContaining({ owner, snapshot,
       analyzeCheckpoint: persisted, analyzeAttestation: baseAttestation, prepareProof }))
+    expect(mocks.gateInput.mock.calls[0]?.[0].prepareProof).toBe(prepareProof)
+    expect(mocks.gateCheckpoint.mock.calls[0]?.[0].proof).toBe(prepareProof)
     expect(mocks.gateInput.mock.invocationCallOrder[0]).toBeLessThan(mocks.gateCheckpoint.mock.invocationCallOrder[0]!)
-    expect(resume.preparedPackages?.[0]?.coverLetter).toBe("private-letter-body")
-    expect(resume.scheduledTaskGraphPreparedArtifacts).toHaveLength(1)
+    expect(resume.preparedPackages).toEqual([])
+    expect(resume.scheduledTaskGraphPreparedArtifacts).toEqual([])
     expect(resume).not.toHaveProperty("scheduledTaskGraphScheduledWaitId")
     const full = { ...resume, nextStage: "execute" as const, gateOutput: {
       approved: [{ job: { id: job.id }, coverLetter: "private-letter-body" }], pending: [], skipped: [],

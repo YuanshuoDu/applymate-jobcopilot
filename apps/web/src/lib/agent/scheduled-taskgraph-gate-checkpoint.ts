@@ -4,7 +4,6 @@ import type { ApplicationPackage, PipelineCheckpointState, ScoredJob } from './t
 import { hashArtifactContent } from './artifacts/hash'
 import { buildScheduledTaskGraphPrepareCheckpoint, type ScheduledTaskGraphPipelineCheckpoint, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
-
 const CONTINUATION_SCHEMA = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
 const CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
 const RECEIPT_SCHEMA = 'agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1'
@@ -17,6 +16,9 @@ const PACKAGE_KEYS = ['job', 'score', 'matchedKeywords', 'missingKeywords', 'rec
 export type ScheduledTaskGraphPreparedPackageRow = Readonly<{ userId: string; sessionId: string; jobId: string; package: ApplicationPackage }>
 export type ScheduledTaskGraphPreparedMaterialRow = Readonly<{ userId: string; sessionId: string; jobId: string; kind: 'resume' | 'cover_letter'; artifactRef: ScheduledTaskGraphArtifactReference }>
 export type ScheduledTaskGraphArtifactReference = Readonly<{ artifactId: string; version: number; contentHash: string; sourceDigest: string }>
+export type ScheduledTaskGraphPrepareProofNode = Readonly<{ taskId: string; attemptCount: number; role: 'scout' | 'analyst' | 'prepare'; taskType: string; status: 'completed'; verification: 'passed'; dependsOnTaskIds: string[]; tool?: string; resultDigest?: string }>
+export type ScheduledTaskGraphPrepareProofResult = Readonly<{ raw: Record<string, unknown>; taskId: string; attemptCount: number; snapshotDigest: string; checkpointDigest: string; jobs: Array<{ jobId: string; status: 'prepared' | 'skipped' }>; materials: Array<{ jobId: string; kind: 'resume' | 'cover_letter'; artifactRef: ScheduledTaskGraphArtifactReference }> }>
+export type ParsedScheduledTaskGraphPrepareProof = Readonly<{ receipt: Record<string, unknown>; completion: Record<string, unknown>; graphRevision: number; nodes: [ScheduledTaskGraphPrepareProofNode, ScheduledTaskGraphPrepareProofNode, ScheduledTaskGraphPrepareProofNode]; result: ScheduledTaskGraphPrepareProofResult }>
 export type ScheduledTaskGraphGateCheckpointInput = Readonly<{
   analyze: Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; ownedJobs: readonly Job[]; persistedCheckpoint: unknown; activeClaimToken: string }>
   proof: unknown; packages: readonly ScheduledTaskGraphPreparedPackageRow[]; materials: readonly ScheduledTaskGraphPreparedMaterialRow[]
@@ -29,8 +31,35 @@ export type ScheduledTaskGraphGateHandoff = Readonly<{
 }>
 
 /** Hashes authoritative Analyze facts; job and material bodies are excluded. */
-export function scheduledTaskGraphAnalyzeCheckpointDigest(value: unknown): string | null {
-  try { return analyzeCheckpointDigest(value) } catch { return null }
+export function scheduledTaskGraphAnalyzeCheckpointDigest(value: unknown): string | null { try { return analyzeCheckpointDigest(value) } catch { return null } }
+export function parseScheduledTaskGraphPrepareProof(value: unknown): ParsedScheduledTaskGraphPrepareProof | null {
+  try {
+    const proof = exactRecord(value, ['receipt', 'completion', 'result'])
+    const receipt = exactRecord(proof?.receipt, ['schemaVersion', 'owner', 'continuationKey', 'snapshotDigest', 'evidenceDigest', 'checkpointDigest', 'analyzeGraphRevision', 'prepareScheduleRevision'])
+    const completion = exactRecord(proof?.completion, ['schemaVersion', 'graphRevision', 'nodes', 'wait'])
+    const result = parsePrepareResult(proof?.result), rawNodes = denseArray(completion?.nodes)
+    if (!receipt || !completion || !result || !rawNodes || rawNodes.length !== 3 || receipt.schemaVersion !== RECEIPT_SCHEMA
+      || !isPositiveInteger(receipt.prepareScheduleRevision) || completion.schemaVersion !== COMPLETION_SCHEMA
+      || !isPositiveInteger(completion.graphRevision) || Number(completion.graphRevision) <= Number(receipt.prepareScheduleRevision)) return null
+    const parsedNodes = rawNodes.map(parseCompletionNode)
+    if (parsedNodes.some(node => !node)) return null
+    const nodes = parsedNodes as [ScheduledTaskGraphPrepareProofNode, ScheduledTaskGraphPrepareProofNode, ScheduledTaskGraphPrepareProofNode]
+    const [scout, analyst, prepare] = nodes
+    const wait = exactRecord(completion.wait, ['waitId', 'status', 'mode', 'targetTaskIds', 'matchedTaskIds'])
+    if (scout.role !== 'scout' || scout.taskType !== 'job_discovery' || !exactIdArray(scout.dependsOnTaskIds, [])
+      || analyst.role !== 'analyst' || analyst.taskType !== 'job_analysis' || !exactIdArray(analyst.dependsOnTaskIds, [scout.taskId])
+      || prepare.role !== 'prepare' || prepare.taskType !== 'scheduled_application_prepare' || prepare.tool !== 'scheduled.application.prepare@1'
+      || !exactIdArray(prepare.dependsOnTaskIds, [analyst.taskId]) || new Set(nodes.map(node => node.taskId)).size !== 3
+      || result.taskId !== prepare.taskId || result.attemptCount !== prepare.attemptCount || prepare.resultDigest !== scheduledTaskGraphPrepareResultDigest(result.raw)
+      || !wait || !validId(wait.waitId) || wait.status !== 'ready' || wait.mode !== 'all'
+      || !exactIdArray(wait.targetTaskIds, [prepare.taskId]) || !exactIdArray(wait.matchedTaskIds, [prepare.taskId])) return null
+    return { receipt, completion, graphRevision: Number(completion.graphRevision), nodes, result }
+  } catch { return null }
+}
+export function scheduledTaskGraphPrepareResultDigest(result: Record<string, unknown>): string {
+  const projection = { schemaVersion: result.schemaVersion, role: result.role, status: result.status, taskId: result.taskId,
+    attemptCount: result.attemptCount, snapshotDigest: result.snapshotDigest, checkpointDigest: result.checkpointDigest, jobs: result.jobs, materials: result.materials }
+  return createHash('sha256').update(canonicalJson(projection), 'utf8').digest('hex')
 }
 function analyzeCheckpointDigest(value: unknown): string | null {
   const state = record(value), marker = exactRecord(state?.scheduledTaskGraphContinuation, ['schemaVersion', 'key', 'owner', 'snapshotDigest', 'graphRevision', 'evidenceDigest'])
@@ -74,18 +103,19 @@ export function buildScheduledTaskGraphGateCheckpoint(input: ScheduledTaskGraphG
     const claim = parseClaim(checkpoint.scheduledTaskGraphClaim, input.analyze.owner, prior.continuationKey, now)
     if (!claim || claim.claimToken !== input.analyze.activeClaimToken) return null
     const checkpointDigest = scheduledTaskGraphAnalyzeCheckpointDigest(checkpoint)
-    const proof = parseProof(input.proof)
+    const proof = parseScheduledTaskGraphPrepareProof(input.proof)
     const continuation = record(checkpoint.scheduledTaskGraphContinuation)
     const attestation = record(input.analyze.attestation)
     const scout = record(attestation?.scout), analyst = record(attestation?.analyst)
-    const prepareNode = proof && scout && analyst ? completionMatches(proof.completion, scout, analyst, proof.receipt.prepareScheduleRevision) : null
+    const prepareNode = proof && scout && analyst && proof.nodes[0].taskId === scout.taskId && proof.nodes[0].attemptCount === scout.attemptCount
+      && proof.nodes[1].taskId === analyst.taskId && proof.nodes[1].attemptCount === analyst.attemptCount ? proof.nodes[2] : null
     if (!checkpointDigest || !proof || !continuation || !scout || !analyst || !prepareNode || !receiptMatches(proof.receipt, input.analyze.owner, continuation, checkpointDigest)) return null
     const snapshot = parseScheduledAutomationSnapshot(input.analyze.snapshot)
     const scoredJobs = checkpoint.scoredJobs ?? []
     const byJob = new Map(scoredJobs.map(scored => [scored.job.id, scored]))
     const eligible = scoredJobs.filter(scored => scored.score >= snapshot.minScore).slice(0, snapshot.dailyCap)
-    if (!prepareResultMatches(proof.result, prepareNode, eligible, checkpointDigest, continuation.snapshotDigest)) return null
-    const packages = hydratePackages(input, eligible, proof.result)
+    if (!prepareResultMatches(proof.result.raw, prepareNode, eligible, checkpointDigest, continuation.snapshotDigest)) return null
+    const packages = hydratePackages(input, eligible, proof.result.raw)
     if (!packages) return null
     return {
       checkpoint: { startedAt: checkpoint.startedAt, eventIndex: checkpoint.eventIndex, autonomous: checkpoint.autonomous, nextStage: 'gate',
@@ -94,13 +124,6 @@ export function buildScheduledTaskGraphGateCheckpoint(input: ScheduledTaskGraphG
       packages,
     }
   } catch { return null }
-}
-type ParsedProof = { receipt: Record<string, unknown>; completion: Record<string, unknown>; result: Record<string, unknown> }
-function parseProof(value: unknown): ParsedProof | null {
-  const proof = exactRecord(value, ['receipt', 'completion', 'result'])
-  const receipt = exactRecord(proof?.receipt, ['schemaVersion', 'owner', 'continuationKey', 'snapshotDigest', 'evidenceDigest', 'checkpointDigest', 'analyzeGraphRevision', 'prepareScheduleRevision']), completion = exactRecord(proof?.completion, ['schemaVersion', 'graphRevision', 'nodes', 'wait'])
-  const result = parsePrepareResult(proof?.result)
-  return receipt && completion && result ? { receipt, completion, result } : null
 }
 function parseClaim(value: unknown, expectedOwner: ScheduledTaskGraphPipelineOwner, key: string, now: number): NonNullable<PipelineCheckpointState['scheduledTaskGraphClaim']> | null {
   const row = exactRecord(value, ['schemaVersion', 'key', 'claimToken', 'owner', 'claimedAt', 'leaseExpiresAt']), owner = parseOwner(row?.owner)
@@ -119,45 +142,32 @@ function receiptMatches(receipt: Record<string, unknown>, ownerValue: unknown, c
   return receipt.continuationKey === stableContinuationKey(expected, continuation, digest, prepareRevision)
 }
 function stableContinuationKey(owner: ScheduledTaskGraphPipelineOwner, continuation: Record<string, unknown>, digest: string, prepareRevision: number): string {
-  const projection = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId,
-    owner.executionAttemptCount, continuation.snapshotDigest, continuation.evidenceDigest, digest, continuation.graphRevision, prepareRevision]
+  const projection = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount,
+    continuation.snapshotDigest, continuation.evidenceDigest, digest, continuation.graphRevision, prepareRevision]
   return `scheduled-taskgraph:sha256:${createHash('sha256').update(JSON.stringify(projection), 'utf8').digest('hex')}`
 }
-function completionMatches(value: Record<string, unknown>, scout: Record<string, unknown>, analyst: Record<string, unknown>, prepareScheduleRevision: unknown): Record<string, unknown> | null {
-  const rawNodes = denseArray(value.nodes)
-  if (value.schemaVersion !== COMPLETION_SCHEMA || !isPositiveInteger(value.graphRevision) || !rawNodes || rawNodes.length !== 3) return null
-  const nodes = rawNodes.map(parseCompletionNode)
-  if (nodes.some(node => !node)) return null
-  const parsed = nodes as NonNullable<typeof nodes[number]>[], scouts = parsed.filter(node => node.role === 'scout'), analysts = parsed.filter(node => node.role === 'analyst'), prepares = parsed.filter(node => node.role === 'prepare')
-  if (scouts.length !== 1 || analysts.length !== 1 || prepares.length !== 1) return null
-  const [s] = scouts, [a] = analysts, [p] = prepares
-  if (!s || !a || !p || new Set([s.taskId, a.taskId, p.taskId]).size !== 3) return null
-  if (s.taskId !== scout.taskId || s.attemptCount !== scout.attemptCount || s.taskType !== 'job_discovery' || s.dependencies.length !== 0 || a.taskId !== analyst.taskId
-    || a.attemptCount !== analyst.attemptCount || a.taskType !== 'job_analysis' || !sameIds(a.dependencies, [s.taskId]) || p.taskType !== 'scheduled_application_prepare' || p.tool !== 'scheduled.application.prepare@1' || !sameIds(p.dependencies, [a.taskId])) return null
-  if (!isPositiveInteger(prepareScheduleRevision) || Number(value.graphRevision) <= prepareScheduleRevision) return null
-  const wait = exactRecord(value.wait, ['waitId', 'status', 'mode', 'targetTaskIds', 'matchedTaskIds'])
-  return wait && validId(wait.waitId) && wait.status === 'ready' && wait.mode === 'all' && exactIdArray(wait.targetTaskIds, [p.taskId]) && exactIdArray(wait.matchedTaskIds, [p.taskId]) ? p : null
+function parseCompletionNode(value: unknown): ScheduledTaskGraphPrepareProofNode | null {
+  const role = record(value)?.role, fields = ['taskId', 'attemptCount', 'role', 'taskType', 'status', 'verification', 'dependsOnTaskIds']
+  const row = exactRecord(value, [...fields, ...(role === 'prepare' ? ['tool', 'resultDigest'] : [])])
+  return !row || !validId(row.taskId) || !isPositiveInteger(row.attemptCount) || !['scout', 'analyst', 'prepare'].includes(String(row.role))
+    || typeof row.taskType !== 'string' || row.status !== 'completed' || row.verification !== 'passed' || !denseStringArray(row.dependsOnTaskIds)
+    || row.role === 'prepare' && (row.tool !== 'scheduled.application.prepare@1' || !isHex(row.resultDigest)) || row.role !== 'prepare' && (row.tool !== undefined || row.resultDigest !== undefined)
+    ? null : row as unknown as ScheduledTaskGraphPrepareProofNode
 }
-function parseCompletionNode(value: unknown): (Record<string, unknown> & { taskId: string; attemptCount: number; role: string; taskType: string; dependencies: string[]; tool?: string }) | null {
-  const fields = ['taskId', 'attemptCount', 'role', 'taskType', 'status', 'verification', 'dependencies']
-  const row = exactRecord(value, [...fields, ...(record(value)?.role === 'prepare' ? ['tool', 'resultDigest'] : [])])
-  if (!row || !validId(row.taskId) || !isPositiveInteger(row.attemptCount) || !['scout', 'analyst', 'prepare'].includes(String(row.role)) || typeof row.taskType !== 'string' || row.status !== 'completed' || row.verification !== 'passed' || !denseStringArray(row.dependencies)) return null
-  if (row.role === 'prepare' && !isHex(row.resultDigest)) return null
-  if ((row.role === 'prepare') !== (row.tool === 'scheduled.application.prepare@1')) return null
-  return row as Record<string, unknown> & { taskId: string; attemptCount: number; role: string; taskType: string; dependencies: string[]; tool?: string }
-}
-function parsePrepareResult(value: unknown): Record<string, unknown> | null {
+function parsePrepareResult(value: unknown): ScheduledTaskGraphPrepareProofResult | null {
   const row = exactRecord(value, ['schemaVersion', 'role', 'status', 'taskId', 'attemptCount', 'snapshotDigest', 'checkpointDigest', 'jobs', 'materials'])
   const rawJobs = denseArray(row?.jobs), rawMaterials = denseArray(row?.materials)
   if (!row || row.schemaVersion !== PREPARE_RESULT_SCHEMA || row.role !== 'prepare' || row.status !== 'completed' || !validId(row.taskId) || !isPositiveInteger(row.attemptCount) || !isSnapshotDigest(row.snapshotDigest) || !isHex(row.checkpointDigest) || !rawJobs || !rawMaterials) return null
-  const jobs = rawJobs.map(value => { const job = exactRecord(value, ['jobId', 'status']); return job && validId(job.jobId) && ['prepared', 'skipped'].includes(String(job.status)) ? job : null })
-  const materials = rawMaterials.map(value => { const item = exactRecord(value, ['jobId', 'kind', 'artifactRef']), ref = parseArtifactRef(item?.artifactRef); return item && validId(item.jobId) && (item.kind === 'resume' || item.kind === 'cover_letter') && ref ? { jobId: item.jobId, kind: item.kind, artifactRef: ref } : null })
+  const jobs = rawJobs.map(value => { const job = exactRecord(value, ['jobId', 'status']); return job && validId(job.jobId) && ['prepared', 'skipped'].includes(String(job.status)) ? { jobId: job.jobId, status: job.status as 'prepared' | 'skipped' } : null })
+  const materials = rawMaterials.map(value => { const item = exactRecord(value, ['jobId', 'kind', 'artifactRef']), ref = parseArtifactRef(item?.artifactRef); return item && validId(item.jobId) && (item.kind === 'resume' || item.kind === 'cover_letter') && ref ? { jobId: item.jobId as string, kind: item.kind, artifactRef: ref } : null })
   if (jobs.some(value => !value) || materials.some(value => !value) || new Set(jobs.map(value => value?.jobId)).size !== jobs.length || new Set(materials.map(value => `${value?.jobId}\u0000${value?.kind}`)).size !== materials.length) return null
-  return { ...row, jobs: jobs as Record<string, unknown>[], materials: materials as Array<{ jobId: string; kind: string; artifactRef: ScheduledTaskGraphArtifactReference }> }
+  return { raw: row, taskId: row.taskId as string, attemptCount: row.attemptCount as number, snapshotDigest: row.snapshotDigest as string,
+    checkpointDigest: row.checkpointDigest as string, jobs: jobs as Array<{ jobId: string; status: 'prepared' | 'skipped' }>,
+    materials: materials as Array<{ jobId: string; kind: 'resume' | 'cover_letter'; artifactRef: ScheduledTaskGraphArtifactReference }> }
 }
 function prepareResultMatches(result: Record<string, unknown>, prepareNode: Record<string, unknown>, eligible: readonly ScoredJob[], digest: string, snapshotDigest: unknown): boolean {
   const jobs = denseArray(result.jobs), materials = denseArray(result.materials), expected = eligible.map(item => item.job.id)
-  if (result.taskId !== prepareNode.taskId || result.attemptCount !== prepareNode.attemptCount || scheduledPrepareResultDigest(result) !== prepareNode.resultDigest
+  if (result.taskId !== prepareNode.taskId || result.attemptCount !== prepareNode.attemptCount || scheduledTaskGraphPrepareResultDigest(result) !== prepareNode.resultDigest
     || result.checkpointDigest !== digest || result.snapshotDigest !== snapshotDigest || !jobs || !materials) return false
   const preparedJobs = jobs.map(record)
   if (preparedJobs.length !== expected.length || preparedJobs.some(job => !job) || new Set(preparedJobs.map(job => job?.jobId)).size !== expected.length || !sameIds(preparedJobs.map(job => String(job?.jobId)), expected)) return false
@@ -169,11 +179,6 @@ function prepareResultMatches(result: Record<string, unknown>, prepareNode: Reco
     if (material.kind === 'resume') resumeCounts.set(String(material.jobId), (resumeCounts.get(String(material.jobId)) ?? 0) + 1)
   }
   return preparedIds.every(id => resumeCounts.get(id) === 1)
-}
-function scheduledPrepareResultDigest(result: Record<string, unknown>): string {
-  const projection = { schemaVersion: result.schemaVersion, role: result.role, status: result.status, snapshotDigest: result.snapshotDigest,
-    checkpointDigest: result.checkpointDigest, jobs: result.jobs, materials: result.materials }
-  return createHash('sha256').update(canonicalJson(projection), 'utf8').digest('hex')
 }
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
@@ -271,12 +276,9 @@ function sameLineageOwner(a: ScheduledTaskGraphPipelineOwner, b: ScheduledTaskGr
 function sameIds(a: readonly string[], b: readonly string[]): boolean { return a.length === b.length && a.every(id => b.includes(id)) }
 function sameStringArray(a: unknown, b: unknown): boolean { return denseStringArray(a) && denseStringArray(b) && a.length === b.length && a.every((value, index) => value === (b as string[])[index]) }
 function sameArtifactRef(a: ScheduledTaskGraphArtifactReference, b: ScheduledTaskGraphArtifactReference): boolean { return a.artifactId === b.artifactId && a.version === b.version && a.contentHash === b.contentHash && a.sourceDigest === b.sourceDigest }
-function validContinuationKey(value: unknown): boolean { return typeof value === 'string' && /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/.test(value) }
-function validId(value: unknown): value is string { return typeof value === 'string' && ID.test(value) && value.trim() === value }
-function isSnapshotDigest(value: unknown): boolean { return typeof value === 'string' && SHA256.test(value) }
-function isSha256(value: unknown): value is string { return typeof value === 'string' && SHA256.test(value) }
-function isHex(value: unknown): value is string { return typeof value === 'string' && HEX.test(value) }
-function isPositiveInteger(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
+function validContinuationKey(value: unknown): boolean { return typeof value === 'string' && /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/.test(value) } function validId(value: unknown): value is string { return typeof value === 'string' && ID.test(value) && value.trim() === value }
+function isSnapshotDigest(value: unknown): boolean { return typeof value === 'string' && SHA256.test(value) } function isSha256(value: unknown): value is string { return typeof value === 'string' && SHA256.test(value) }
+function isHex(value: unknown): value is string { return typeof value === 'string' && HEX.test(value) } function isPositiveInteger(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 function safeCount(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function validIsoTimestamp(value: unknown): boolean { return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
 function record(value: unknown): Record<string, unknown> | null {

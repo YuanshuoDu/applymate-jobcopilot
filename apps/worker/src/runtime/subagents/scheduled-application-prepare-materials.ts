@@ -182,7 +182,7 @@ export async function persistScheduledPrepareMaterial(pool: pg.Pool, input: Sche
 export function scheduledPrepareArtifactIdentity(binding: ScheduledPrepareArtifactWriteBinding, rootAttemptCount: number,
   usedRefs: readonly string[] = binding.evidenceRefs) {
   const sourceIdentity = { schemaVersion: "agent-harness.v2.scheduled-prepare-source-artifact.v1", kind: binding.kind,
-    userId: binding.userId, jobId: binding.jobId, sourceDigest: binding.sourceDigest, evidenceRefs: binding.evidenceRefs }
+    userId: binding.userId, jobId: binding.jobId, sourceDigest: binding.sourceDigest, evidenceRefs: usedRefs }
   const baseDigest = hashArtifactContent(sourceIdentity)
   const executionDigest = hashArtifactContent({ schemaVersion: "agent-harness.v2.scheduled-prepare-material.v1",
     userId: binding.userId, sessionId: binding.sessionId, turnId: binding.turnId, rootTaskId: binding.rootTaskId, rootAttemptCount,

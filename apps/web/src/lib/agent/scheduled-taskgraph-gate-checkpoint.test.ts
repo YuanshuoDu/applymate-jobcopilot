@@ -5,6 +5,7 @@ import { hashArtifactContent } from './artifacts/hash'
 import {
   buildScheduledTaskGraphGateCheckpoint,
   scheduledTaskGraphAnalyzeCheckpointDigest,
+  scheduledTaskGraphPrepareResultDigest,
   type ScheduledTaskGraphGateCheckpointInput,
 } from './scheduled-taskgraph-gate-checkpoint'
 import {
@@ -41,15 +42,8 @@ function scored(row: Job, score: number): ScoredJob {
   return { job: row, score, matchedKeywords: ['TypeScript'], missingKeywords: ['Kubernetes'],
     recommendation: 'Tailor the CV.', analysisFenceAt: '2026-10-19T12:00:00.123Z' }
 }
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(',')}}`
-  return JSON.stringify(value) ?? 'null'
-}
 function prepareResultDigest(result: Record<string, unknown>): string {
-  const projection = { schemaVersion: result.schemaVersion, role: result.role, status: result.status, snapshotDigest: result.snapshotDigest,
-    checkpointDigest: result.checkpointDigest, jobs: result.jobs, materials: result.materials }
-  return createHash('sha256').update(canonicalJson(projection), 'utf8').digest('hex')
+  return scheduledTaskGraphPrepareResultDigest(result)
 }
 function analyzeResult(rows: readonly Job[]): StageResult<AnalyzeOutput> {
   return { stage: 'analyze', ok: true, data: { scoredJobs: rows.map((row, index) => scored(row, index ? 73 : 87)), failed: 0 },
@@ -88,10 +82,10 @@ function prepared(overrides: Partial<typeof snapshot> = {}, liveOwner: Scheduled
       snapshotDigest: policyDigest, evidenceDigest: policyAttestation.evidenceDigest, checkpointDigest, analyzeGraphRevision: 9, prepareScheduleRevision: 10 },
     completion: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-prepare-completion.v1', graphRevision: 11,
       nodes: [
-        { taskId: 'scout-task', attemptCount: 2, role: 'scout', taskType: 'job_discovery', status: 'completed', verification: 'passed', dependencies: [] },
-        { taskId: 'analyst-task', attemptCount: 1, role: 'analyst', taskType: 'job_analysis', status: 'completed', verification: 'passed', dependencies: ['scout-task'] },
+        { taskId: 'scout-task', attemptCount: 2, role: 'scout', taskType: 'job_discovery', status: 'completed', verification: 'passed', dependsOnTaskIds: [] },
+        { taskId: 'analyst-task', attemptCount: 1, role: 'analyst', taskType: 'job_analysis', status: 'completed', verification: 'passed', dependsOnTaskIds: ['scout-task'] },
         { taskId: 'prepare-task', attemptCount: 1, role: 'prepare', taskType: 'scheduled_application_prepare', tool: 'scheduled.application.prepare@1',
-          status: 'completed', verification: 'passed', resultDigest, dependencies: ['analyst-task'] },
+          status: 'completed', verification: 'passed', resultDigest, dependsOnTaskIds: ['analyst-task'] },
       ], wait: { waitId: 'wait-prepare', status: 'ready', mode: 'all', targetTaskIds: ['prepare-task'], matchedTaskIds: ['prepare-task'] } },
     result,
   }
@@ -293,7 +287,7 @@ describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
     ['empty package provenance', (value: ReturnType<typeof prepared>) => { (value.packages[0]!.package.tailoredResumeArtifact as unknown as Record<string, unknown>).provenance = [] }],
     ['package provenance with an invalid hash', (value: ReturnType<typeof prepared>) => { const summary = value.packages[0]!.package.tailoredResumeArtifact as unknown as Record<string, unknown>; (summary.provenance as Array<Record<string, unknown>>)[0]!.evidenceHash = 'invalid' }],
     ['package source digest differs from immutable artifact version', (value: ReturnType<typeof prepared>) => { (value.packages[0]!.package.tailoredResumeArtifact as unknown as Record<string, unknown>).sourceDigest = 'sha256:' + '9'.repeat(64) }],
-    ['wrong dependency', (value: ReturnType<typeof prepared>) => { value.proof.completion.nodes[2]!.dependencies = ['scout-task'] }],
+    ['wrong dependency', (value: ReturnType<typeof prepared>) => { value.proof.completion.nodes[2]!.dependsOnTaskIds = ['scout-task'] }],
   ])('rejects %s', (_name, mutate) => {
     const value = prepared()
     mutate(value)
