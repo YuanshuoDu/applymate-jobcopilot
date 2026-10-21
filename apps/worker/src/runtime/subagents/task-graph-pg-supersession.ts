@@ -126,7 +126,7 @@ export function taskGraphWaitConditionEvidenceSql(): string {
 
 export async function scheduleTaskGraphSupersession(client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent,
   loaded: LoadedGraph, operation: SteeringReconciliationOperation | undefined, key: string, findReplay: PlanReplayLookup,
-  pinnedCriteria?: readonly string[]): Promise<TaskGraphScheduleReceipt> {
+  checkBudget: () => Promise<void>, pinnedCriteria?: readonly string[]): Promise<TaskGraphScheduleReceipt> {
   const current = loaded.state, revision = current?.revision ?? 0, sourceKey = input.replaceUnstarted!.nodeKey
   if (!operation || operation.replaceUnstartedNodeKey !== sourceKey || input.proposal.nodes.length !== 1
     || input.scope.parentTaskId !== input.scope.rootTaskId || !input.scope.stepId) throw new TaskGraphCommandError("task_graph_supersession_invalid", "TaskGraph supersession request is invalid")
@@ -178,6 +178,7 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   if (await findReplay(input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId), { operationKey: prepared.idempotencyKey, observedRevision: input.proposal.expectedRevision })) {
     throw new TaskGraphCommandError("idempotency_conflict", "A supersession plan event exists without its validated relation")
   }
+  await checkBudget()
   const cancelKey = taskGraphLifecycleKey(input.scope.rootTaskId, sourceKey, 0, "task.cancelled")
   const cancelEvent = { type: "task.cancelled" as const, idempotencyKey: cancelKey, expectedRevision: revision, nodeKey: sourceKey }
   const cancelled = reduceTaskGraphEvent(current, cancelEvent)

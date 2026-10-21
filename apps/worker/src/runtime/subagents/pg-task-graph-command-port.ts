@@ -116,7 +116,8 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   let pinnedCriteria = loaded.snapshot?.rootSuccessCriteria
   if (rootSuccessCriteria !== undefined || pinnedCriteria !== undefined) pinnedCriteria = await requireOwnedRootPlanCriteria(client, input.scope, parent, pinnedCriteria, rootSuccessCriteria)
   if (input.replaceUnstarted) return scheduleTaskGraphSupersession(client, input, parent, loaded, operation, key,
-    (request, requestKey, digest, itemId, binding) => findPlanReplay(client, request, requestKey, digest, itemId, binding), pinnedCriteria)
+    (request, requestKey, digest, itemId, binding) => findPlanReplay(client, request, requestKey, digest, itemId, binding),
+    () => requireTaskGraphContinuationBudget(client, input.scope), pinnedCriteria)
   const fingerprint = taskGraphFingerprint(rootSuccessCriteria === undefined ? input.proposal : { proposal: input.proposal, rootSuccessCriteria })
   const prepared = operation ? await prepareSteeringReconciliation(client, operation) : null
   if (!loaded.item && await hasPersistedPlanReceipt(client, input.scope)) throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
@@ -125,17 +126,7 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   }
   if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
   if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
-  try {
-    await enforceRootStepBudget(client, {
-      kind: "turn", taskId: input.scope.rootTaskId, rootTaskId: input.scope.rootTaskId,
-      userId: input.scope.userId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
-    }, 2)
-  } catch (error) {
-    if (error instanceof BudgetExceededError && error.metric === "steps") {
-      throw new TaskGraphCommandError("task_graph_continuation_budget_required", "The Turn needs two remaining steps to supervise a TaskGraph plan")
-    }
-    throw error
-  }
+  await requireTaskGraphContinuationBudget(client, input.scope)
   const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] },
     new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []), loaded)
   const stamped = stampCreatedScoutEnvelopes(created.snapshot, created.created, input.templates), snapshot = pinnedCriteria ? parseTaskGraphSnapshot({ ...stamped, rootSuccessCriteria: pinnedCriteria }) : stamped
@@ -144,6 +135,15 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
     now: new Date(), idempotencyKey: key, fingerprint, receipt })
   if (prepared) await writeSteeringReconciliationReceipt(client, prepared, created.state.revision)
   return receipt
+}
+async function requireTaskGraphContinuationBudget(client: Queryable, scope: TaskGraphScheduleInput["scope"]): Promise<void> {
+  try {
+    await enforceRootStepBudget(client, { kind: "turn", taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId,
+      userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId }, 2)
+  } catch (error) {
+    if (error instanceof BudgetExceededError && error.metric === "steps") throw new TaskGraphCommandError("task_graph_continuation_budget_required", "The Turn needs two remaining steps to supervise a TaskGraph plan")
+    throw error
+  }
 }
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
   const loaded = await loadCurrentWithClient(client, scope)
