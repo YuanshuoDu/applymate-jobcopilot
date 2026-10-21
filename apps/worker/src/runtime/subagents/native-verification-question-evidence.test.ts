@@ -211,14 +211,19 @@ describe("native question self-attestation evidence", () => {
   })
 
   it("rejects an extant ask-user call misbound to a question's tool-call ID", async () => {
-    const source = lineage(1, "dublin", { content: { toolCallId: "different-call" } })
+    const originalCallContent = lineage().call.content as Row
+    const source = lineage(1, "dublin", { call: { content: { ...originalCallContent, toolCallId: "different-call" } } })
     const f = mockClient([source], { exposeMisboundCall: true })
     const question = source.item.content as Row
 
     expect(source.item.id).toBe(source.itemId)
     expect(question.questionId).toBe(source.questionId)
     expect(question.question).toBe(questionText)
-    expect(question.toolCallId).toBe("different-call")
+    expect(question.toolCallId).toBe(source.toolCallId)
+    expect((source.start.payload as Row).toolCallId).toBe(source.toolCallId)
+    expect((source.answered.payload as Row).toolCallId).toBe(source.toolCallId)
+    expect((source.result!.content as Row).toolCallId).toBe(source.toolCallId)
+    expect((source.call.content as Row).toolCallId).toBe("different-call")
     expect(await appendNativeQuestionSelfAttestations(f.client, scope, packet())).toBeNull()
     expect(f.exposedMisboundRecords.calls).toEqual([source.call])
   })
