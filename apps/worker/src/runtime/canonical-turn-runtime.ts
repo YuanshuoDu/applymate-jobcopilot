@@ -24,7 +24,7 @@ import { isSelectedJobRootTool } from "./canonical-turn-task-graph-context.js"
 import { createCanonicalTurnCoordination } from "./canonical-turn-coordination.js"
 import { loadSelectedJobPreparation } from "./selected-job-preparation.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
-import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
+import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
 import { readSelectedJobSourceDigestWithClient } from "./subagents/selected-job-artifact-context.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
@@ -180,6 +180,9 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities); if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
     const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool).filter(value => verificationRequirements.status !== "valid" || !["agent.spawn", "spawn_subagent", "agent.followup"].includes(String(record(value).name ?? "")))
     const allowedActions = rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, taskGraphPlanningEnabled)
+    if (state.source === "automation" && state.automationRunMode === "scheduled" && taskGraphPlanningEnabled) {
+      allowedActions.push(...TASK_GRAPH_TEMPLATES.prepare.allowedActions.filter(action => !allowedActions.includes(action)))
+    }
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
     taskGraphParentAttemptCount = root.attemptCount; turnCoordination.bindRoot(root); let acceptedGraphWitness: Extract<Awaited<ReturnType<typeof selectedJobArtifactCompletionGateWithWitness>>, { ok: true }>["witness"] | undefined
     const nativeVerification = createCanonicalNativeVerificationRuntime({

@@ -754,6 +754,13 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       "Scheduled automation pipeline integration", "Keep Prepare bound to verified Analyze evidence",
     ] })
     await seedGraph(pool!, value, snapshot)
+    const scheduledRootActions = [...new Set([
+      ...TASK_GRAPH_TEMPLATES.scout.allowedActions,
+      ...TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+      ...TASK_GRAPH_TEMPLATES.prepare.allowedActions,
+    ])]
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`,
+      [value.rootTaskId, JSON.stringify(scheduledRootActions)])
     const baseResumeId = `scheduled-pipeline-resume-${value.turnId}`
     const baseResumeContent = { basics: { name: "Scheduled Fixture Candidate" }, sections: [] }
     const preparedLetter = "Fixture cover letter prepared only for the scheduled Prepare integration test."

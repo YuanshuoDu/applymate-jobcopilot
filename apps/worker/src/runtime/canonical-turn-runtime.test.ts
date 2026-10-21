@@ -250,7 +250,7 @@ function model(script: () => ModelStreamEvent[]): ModelAdapter {
 }
 
 function rootStore() {
-  return { ensure: vi.fn(async () => ({ id: "root-1", attemptCount: 1 } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
+  return { ensure: vi.fn(async (_input: { allowedActions?: readonly string[] }) => ({ id: "root-1", attemptCount: 1 } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
 }
 
 /** Gives planning-enabled runtime fakes a valid, empty reconciliation ledger instead of bypassing its SQL guard. */
@@ -4916,8 +4916,19 @@ describe("createCanonicalTurnRuntime", () => {
     try {
       const fixture = scheduledPipelineRuntimeFixture({ stateLoader: async () => state({ source: "automation", automationRunMode: "manual", turnInput: { automationRunMode: "manual" } }) })
       await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+      expect(fixture.roots.ensure.mock.calls[0]?.[0]?.allowedActions).not.toContain("scheduled.application.prepare")
       expect(fixture.bridge).not.toHaveBeenCalled()
       expect(fixture.fetcher).not.toHaveBeenCalled()
+    } finally { run.mockRestore() }
+  })
+
+  it("grants the deferred Prepare action only to scheduled root delegation policy", async () => {
+    const run = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({ status: "waiting_for_dependency", stepCount: 1, toolCallCount: 0, waitId: "wait-1" })
+    try {
+      const fixture = scheduledPipelineRuntimeFixture()
+      await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+      expect(fixture.roots.ensure.mock.calls[0]?.[0]?.allowedActions).toContain("scheduled.application.prepare")
+      expect(fixture.bridge).not.toHaveBeenCalled()
     } finally { run.mockRestore() }
   })
 
