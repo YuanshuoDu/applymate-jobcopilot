@@ -694,6 +694,7 @@ describe("TaskGraph turn observation", () => {
     const counts = {
       discoveredJobs: { knownCount: 12, coverage: "partial" },
       analyzedJobs: { knownCount: 7, coverage: "complete" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "unavailable" },
     }
@@ -712,18 +713,21 @@ describe("TaskGraph turn observation", () => {
     ["stale revision", { graphRevision: 2, counts: {
       discoveredJobs: { knownCount: 1, coverage: "complete" },
       analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     } }],
     ["augmented facts", { graphRevision: 3, taskIds: ["private-task"], counts: {
       discoveredJobs: { knownCount: 1, coverage: "complete" },
       analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     } }],
     ["invalid count combination", { graphRevision: 3, counts: {
       discoveredJobs: { knownCount: 0, coverage: "unavailable" },
       analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     } }],
@@ -778,6 +782,7 @@ describe("TaskGraph turn observation", () => {
       counts: {
         discoveredJobs: { knownCount: 12, coverage: "partial" },
         analyzedJobs: { knownCount: 7, coverage: "complete" },
+        prepareJobs: { knownCount: null, coverage: "not_requested" },
         artifactReferences: { knownCount: null, coverage: "not_requested" },
         reviewOutcomes: { knownCount: null, coverage: "unavailable" },
       },
@@ -812,6 +817,7 @@ describe("TaskGraph turn observation", () => {
     const counts = {
       discoveredJobs: { knownCount: 27, coverage: "complete" },
       analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     }
