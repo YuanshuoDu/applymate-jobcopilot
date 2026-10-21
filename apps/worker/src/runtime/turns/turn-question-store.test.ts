@@ -52,6 +52,7 @@ function scheduledChoiceFixture(options: { turnStatus?: string; stepStatus?: str
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   let sequence = 0
   const candidateUsage = options.candidateUsage === undefined ? { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 } : options.candidateUsage
+  const persistedStepUsage = options.stepStatus === "waiting_for_user" || options.itemStatus === "completed"
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
     if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
@@ -72,9 +73,9 @@ function scheduledChoiceFixture(options: { turnStatus?: string; stepStatus?: str
         status: options.itemStatus, content: options.itemContent }], rowCount: 1 }
       : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_steps"') && sql.includes('WHERE "id" = $1')) return { rows: [{ id: scheduledFinalStepId, status: options.stepStatus ?? "streaming",
-      taskId: owner.taskId, attempt: 1, finishReason: options.stepStatus === "waiting_for_user" ? "stop" : null, errorCode: null,
-      inputTokens: options.stepStatus === "waiting_for_user" ? 7 : 0, outputTokens: options.stepStatus === "waiting_for_user" ? 3 : 0,
-      estimatedCostUsd: options.stepStatus === "waiting_for_user" ? 0.02 : 0 }], rowCount: 1 }
+      taskId: owner.taskId, attempt: 1, finishReason: persistedStepUsage ? "stop" : null, errorCode: null,
+      inputTokens: persistedStepUsage ? 7 : 0, outputTokens: persistedStepUsage ? 3 : 0,
+      estimatedCostUsd: persistedStepUsage ? 0.02 : 0 }], rowCount: 1 }
     if (sql.includes('FROM "agent_events"') && sql.includes('ORDER BY "sequence" DESC LIMIT 1')) return { rows: [{ id: "previous-event" }], rowCount: 1 }
     if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = $2')) return { rows: [], rowCount: 0 }
     if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: String(++sequence) }], rowCount: 1 }
@@ -441,6 +442,10 @@ describe("PostgreSQL scheduled Prepare choice", () => {
       answeredAt: now.toISOString() }
     const f = scheduledChoiceFixture({ turnStatus: "in_progress", stepStatus: "waiting_for_user", itemStatus: "completed", itemContent: content })
     await expect(f.store.readScheduledPrepareChoice({ owner, receipt: scheduledReceipt, now })).resolves.toEqual({ status: "answered", waitId: scheduledWaitId,
+      itemId: `agent-wait:question:${scheduledWaitId}`, answer: "keep_resume", binding: scheduledBinding })
+
+    const resumed = scheduledChoiceFixture({ turnStatus: "in_progress", stepStatus: "streaming", itemStatus: "completed", itemContent: content })
+    await expect(resumed.store.readScheduledPrepareChoice({ owner, receipt: scheduledReceipt, now })).resolves.toEqual({ status: "answered", waitId: scheduledWaitId,
       itemId: `agent-wait:question:${scheduledWaitId}`, answer: "keep_resume", binding: scheduledBinding })
 
     const forged = scheduledChoiceFixture({ turnStatus: "in_progress", stepStatus: "waiting_for_user", itemStatus: "completed", itemContent: { ...content, toolCallId: "ask_user" } })

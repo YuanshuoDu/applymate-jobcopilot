@@ -107,7 +107,8 @@ async function readScheduledPrepareChoice(pool: TurnQuestionPool, input: TurnQue
     if (!found.rows.length) return { status: "none" }
     const row = found.rows[0], answer = parseTurnScheduledPrepareChoiceItem(row?.content, row?.status, stored.binding)
     if (found.rows.length !== 1 || row?.stepId !== stored.stepId || row.taskId !== input.owner.taskId || row.type !== "question" || answer === undefined) throw questionConflict(`scheduled choice answer ${itemId}`)
-    await usageFromStep(client, input.owner, stored.stepId, ["waiting_for_user"])
+    const stepStatuses = answer === null ? ["waiting_for_user"] : ["waiting_for_user", "streaming"]
+    await usageFromStep(client, input.owner, stored.stepId, stepStatuses)
     if (answer === null && (turn.status !== "waiting_for_user" || row.status !== "started")) throw questionConflict(`scheduled choice ${stored.waitId} waiting state`)
     if (answer !== null && (turn.status !== "in_progress" || row.status !== "completed")) throw questionConflict(`scheduled choice ${stored.waitId} answer state`)
     return answer === null ? { status: "waiting", waitId: stored.waitId, itemId, binding: stored.binding }
