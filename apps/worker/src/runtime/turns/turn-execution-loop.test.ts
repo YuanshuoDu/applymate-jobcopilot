@@ -2192,9 +2192,12 @@ describe("owner-agnostic turn execution loop", () => {
     const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
     Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
     const baseModel = root.options.model
+    const providerCallsWithSteeringInput: boolean[] = []
     root.options = { ...root.options, completionGate, budget: { maxSteps: 4 }, maxSteps: 4,
       model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
         root.requests.push(request)
+        providerCallsWithSteeringInput.push(request.messages.some(message =>
+          message.content.some(part => part.type === "text" && part.text.includes('"inputId":"steer-1"'))))
         const candidate = `Candidate wording ${root.requests.length} still lacks the required proof.`
         yield { type: "text_delta", text: candidate }
         yield { type: "completed", finishReason: "stop" }
@@ -2202,12 +2205,10 @@ describe("owner-agnostic turn execution loop", () => {
     }
 
     const result = await runTurnExecutionLoop(root.options)
-    const capturedMessages = root.requests.map(request => JSON.stringify(request.messages))
 
     expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 3 })
     expect(root.requests).toHaveLength(2)
-    expect(capturedMessages).toHaveLength(2)
-    expect(capturedMessages.every(messages => messages.includes('"inputId":"steer-1"'))).toBe(true)
+    expect(providerCallsWithSteeringInput).toEqual([true, true])
     expect(builtInputFences.slice(0, 3)).toEqual([["steer-1"], ["steer-1"], ["steer-1"]])
     expect(completionGate).toHaveBeenCalledTimes(2)
     expect(read).toHaveBeenCalledOnce()
