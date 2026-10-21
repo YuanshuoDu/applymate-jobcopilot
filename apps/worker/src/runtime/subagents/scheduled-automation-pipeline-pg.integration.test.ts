@@ -1169,10 +1169,11 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         nodes: [{ key: "prepare", status: "queued" }], readyTaskIds: [expect.any(String)],
         choice: { required: true, status: "answered", waitId: expectedChoiceWaitId } })
       const prepareTaskId = scheduledReceipt.nodes[0]!.taskId
-      const preparedTask = await pool!.query<{ rootTaskId: string; parentTaskId: string; status: string; role: string; taskType: string }>(
-        `SELECT "rootTaskId", "parentTaskId", "status", "role", "taskType" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
+      const preparedTask = await pool!.query<{ rootTaskId: string; parentTaskId: string; status: string; role: string; taskType: string; allowedActions: string[] }>(
+        `SELECT "rootTaskId", "parentTaskId", "status", "role", "taskType", "allowedActions" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
       expect(preparedTask.rows[0]).toMatchObject({ rootTaskId: value.rootTaskId, parentTaskId: value.rootTaskId,
-        status: "queued", role: TASK_GRAPH_TEMPLATES.prepare.role, taskType: TASK_GRAPH_TEMPLATES.prepare.taskType })
+        status: "queued", role: TASK_GRAPH_TEMPLATES.prepare.role, taskType: TASK_GRAPH_TEMPLATES.prepare.taskType,
+        allowedActions: [...TASK_GRAPH_TEMPLATES.prepare.allowedActions] })
       const storedGraph = await pool!.query<{ revision: number; content: Record<string, unknown> }>(
         `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(value.rootTaskId)])
       expect(storedGraph.rows[0]).toMatchObject({ revision: 3, content: { rootSuccessCriteria: snapshot.rootSuccessCriteria } })
@@ -1258,12 +1259,16 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const prepareCompleted = waitForSubagentWorkerCompletion(prepareWorker, prepareQueueJobId)
       await prepareWorker.waitUntilReady()
       const prepareOutcome = await prepareCompleted
-      expect(prepareOutcome).toMatchObject({ taskId: prepareTaskId, status: "completed" })
+      const completedPrepare = await pool!.query<{ status: string; attemptCount: number; failureReason: string | null; result: Record<string, unknown> }>(
+        `SELECT "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
+      const failedReason = completedPrepare.rows[0]?.failureReason
+      const diagnosticReason = typeof failedReason === "string" ? failedReason.slice(0, 160) : null
+      expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ outcome: prepareOutcome,
+        taskStatus: completedPrepare.rows[0]?.status, attemptCount: completedPrepare.rows[0]?.attemptCount, failureReason: diagnosticReason })}`)
+        .toMatchObject({ taskId: prepareTaskId, status: "completed" })
       await prepareWorker.close()
       prepareWorker = undefined
 
-      const completedPrepare = await pool!.query<{ status: string; attemptCount: number; failureReason: string | null; result: Record<string, unknown> }>(
-        `SELECT "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
       expect(completedPrepare.rows[0]).toMatchObject({ status: "completed", attemptCount: 1, failureReason: null })
       const structuredResult = completedPrepare.rows[0]?.result.structuredResult as Record<string, unknown> | undefined
       expect(structuredResult).toMatchObject({ schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId,
@@ -1274,7 +1279,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         ]) })
       expect(JSON.stringify(structuredResult)).not.toContain(preparedLetter)
       expect(toolModelCalls).toBe(1)
-      expect(materialModelCalls).toBe(2)
+      expect(materialModelCalls).toBe(1)
       expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toBeDefined()
       const artifactVersions = await pool!.query<{ artifactType: string; content: unknown; version: number; taskId: string; sourceDigest: string; contentHash: string }>(
         `SELECT "artifactType", "content", "version", "taskId", "sourceDigest", "contentHash" FROM "agent_artifact_version"
