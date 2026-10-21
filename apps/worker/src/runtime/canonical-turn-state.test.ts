@@ -615,7 +615,7 @@ describe("loadCanonicalTurnState", () => {
         events: [agendaEvent, started, completed, usage, summaryStart, summaryDelta, summaryCompleted, checkpoint, rejected, closed],
       }
     }
-    const first = makeDenial("step-1", 0, 0), second = makeDenial("step-2", 1, 10, [])
+    const first = makeDenial("step-1", 0, 0), second = makeDenial("step-2", 1, 10, ["input-3"])
     const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: scope.rootTaskId, contextSnapshotId: null,
       modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [first.step, second.step], events: [...first.events, ...second.events] })
 
