@@ -10,6 +10,11 @@ import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 import { appendNativeQuestionSelfAttestations } from "./native-verification-question-evidence.js"
 
 type Row = Record<string, unknown>
+type MockOptions = {
+  unrelatedCalls?: number; unrelatedSteps?: number; linkedCallOverflow?: boolean; queryError?: Error; ownerLive?: boolean
+  currentOwnerId?: string; currentLeaseVersion?: number; currentLeaseExpiresAt?: Date
+  exposeMisboundCall?: boolean; exposeMisboundResult?: boolean
+}
 const identity = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" }
 const scope: TaskGraphReadScope = {
   ...identity, parentTaskId: identity.rootTaskId, turnLeaseOwner: "turn-worker", turnLeaseVersion: 3,
@@ -73,13 +78,11 @@ function lineage(index = 1, answer = "dublin", patch: {
   }
 }
 
-function mockClient(rows: readonly ReturnType<typeof lineage>[], options: {
-  unrelatedCalls?: number; unrelatedSteps?: number; linkedCallOverflow?: boolean; queryError?: Error; ownerLive?: boolean
-  currentOwnerId?: string; currentLeaseVersion?: number; currentLeaseExpiresAt?: Date
-} = {}) {
+function mockClient(rows: readonly ReturnType<typeof lineage>[], options: MockOptions = {}) {
   const calls = rows.map(row => row.call), results = rows.map(row => row.result).filter((row): row is Row => row !== null), steps = rows.map(row => row.step)
   const questions = rows.map(row => row.item)
   const events = rows.flatMap(row => [row.start, row.answered])
+  const exposedMisboundRecords = { calls: [] as Row[], results: [] as Row[] }
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     if (options.queryError) throw options.queryError
     if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('"leaseOwnerId"')) {
@@ -111,6 +114,10 @@ function mockClient(rows: readonly ReturnType<typeof lineage>[], options: {
           content: { toolCallId: `call-${index}` },
         })) }
         const callIds = Array.isArray(values?.[3]) ? values[3] : []
+        if (options.exposeMisboundCall) {
+          exposedMisboundRecords.calls.push(...calls.filter(row => !callIds.includes((row.content as Row).toolCallId)))
+          return { rows: calls }
+        }
         return { rows: calls.filter(row => callIds.includes((row.content as Row).toolCallId)) }
       }
       if (values?.length === 4) return { rows: Array.from({ length: options.unrelatedCalls ?? 0 }, (_, index) => ({
@@ -120,14 +127,19 @@ function mockClient(rows: readonly ReturnType<typeof lineage>[], options: {
       return { rows: calls.filter(row => row.stepId === values?.[2] && (row.content as Row).toolCallId === values?.[4]) }
     }
     if (sql.includes('FROM "agent_items"') && sql.includes("'tool_result'")) {
-      return { rows: results.filter(row => row.stepId === values?.[2] && (row.content as Row).toolCallId === values?.[4]) }
+      const stepResults = results.filter(row => row.stepId === values?.[2])
+      if (options.exposeMisboundResult) {
+        exposedMisboundRecords.results.push(...stepResults.filter(row => (row.content as Row).toolCallId !== values?.[4]))
+        return { rows: stepResults }
+      }
+      return { rows: stepResults.filter(row => (row.content as Row).toolCallId === values?.[4]) }
     }
     if (sql.includes('FROM "agent_steps"')) return { rows: steps.filter(row => row.id === values?.[0]) }
     if (sql.includes('FROM "agent_events" AS event')) return { rows: events }
     if (sql.includes('FROM "agent_events"')) return { rows: [] }
     return { rows: [] }
   })
-  return { client: { query } as unknown as Pick<pg.PoolClient, "query">, query }
+  return { client: { query } as unknown as Pick<pg.PoolClient, "query">, query, exposedMisboundRecords }
 }
 
 function packet(evidence: NativeVerificationPacketContent["evidence"] = []): NativeVerificationPacketContent {
@@ -198,6 +210,38 @@ describe("native question self-attestation evidence", () => {
     expect(await appendNativeQuestionSelfAttestations(f.client, scope, packet())).toBeNull()
   })
 
+  it("rejects an extant ask-user call misbound to a question's tool-call ID", async () => {
+    const originalCallContent = lineage().call.content as Row
+    const source = lineage(1, "dublin", { call: { content: { ...originalCallContent, toolCallId: "different-call" } } })
+    const f = mockClient([source], { exposeMisboundCall: true })
+    const question = source.item.content as Row
+
+    expect(source.item.id).toBe(source.itemId)
+    expect(question.questionId).toBe(source.questionId)
+    expect(question.question).toBe(questionText)
+    expect(question.toolCallId).toBe(source.toolCallId)
+    expect((source.start.payload as Row).toolCallId).toBe(source.toolCallId)
+    expect((source.answered.payload as Row).toolCallId).toBe(source.toolCallId)
+    expect((source.result!.content as Row).toolCallId).toBe(source.toolCallId)
+    expect((source.call.content as Row).toolCallId).toBe("different-call")
+    expect(await appendNativeQuestionSelfAttestations(f.client, scope, packet())).toBeNull()
+    expect(f.exposedMisboundRecords.calls).toEqual([source.call])
+  })
+
+  it("rejects an extant result misbound to the original ask-user call", async () => {
+    const originalResult = lineage().result!.content as Row
+    const source = lineage(1, "dublin", { result: { content: { ...originalResult, toolCallId: "different-call" } } })
+    const f = mockClient([source], { exposeMisboundResult: true })
+    const question = source.item.content as Row
+
+    expect(source.item.id).toBe(source.itemId)
+    expect(question.questionId).toBe(source.questionId)
+    expect(question.question).toBe(questionText)
+    expect((source.result!.content as Row).toolCallId).toBe("different-call")
+    expect(await appendNativeQuestionSelfAttestations(f.client, scope, packet())).toBeNull()
+    expect(f.exposedMisboundRecords.results).toEqual([source.result])
+  })
+
   it("does not project child or broker-scoped questions as root self-attestation", async () => {
     for (const taskId of ["child-task", null]) {
       const content = packet()
@@ -222,6 +266,7 @@ describe("native question self-attestation evidence", () => {
     ["step not waiting for user", { step: { status: "completed" } }],
     ["step without durable usage", { step: { finishReason: null } }],
     ["uncompleted tool call", { call: { status: "started" } }],
+    ["wrong ask-user tool name", { call: { content: { ...lineage().call.content as Row, toolName: "agent.search" } } }],
     ["malformed original call arguments", { call: { content: { ...lineage().call.content as Row, input: { question: " " } } } }],
     ["result intent differs from original arguments", { result: { content: { ...lineage().result!.content as Row,
       output: { ...lineage().intent, question: "Different question" } } } }],
