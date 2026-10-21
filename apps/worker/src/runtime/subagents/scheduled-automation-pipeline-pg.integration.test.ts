@@ -1263,8 +1263,16 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         `SELECT "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
       const failedReason = completedPrepare.rows[0]?.failureReason
       const diagnosticReason = typeof failedReason === "string" ? failedReason.slice(0, 160) : null
+      const prepareToolEvent = await pool!.query<{ type: string; payload: Record<string, unknown> }>(
+        `SELECT "type", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "correlationId" = $4 AND "type" IN ('tool_call.failed', 'tool_call.completed') ORDER BY "sequence" DESC LIMIT 1`,
+        [value.sessionId, value.turnId, prepareTaskId, `scheduled-prepare-tool-${prepareTaskId}`])
+      const toolEvent = prepareToolEvent.rows[0]
+      const toolDiagnostic = toolEvent ? { type: toolEvent.type, toolName: toolEvent.payload.toolName,
+        errorCode: toolEvent.payload.errorCode } : null
       expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ outcome: prepareOutcome,
-        taskStatus: completedPrepare.rows[0]?.status, attemptCount: completedPrepare.rows[0]?.attemptCount, failureReason: diagnosticReason })}`)
+        taskStatus: completedPrepare.rows[0]?.status, attemptCount: completedPrepare.rows[0]?.attemptCount,
+        failureReason: diagnosticReason, toolEvent: toolDiagnostic })}`)
         .toMatchObject({ taskId: prepareTaskId, status: "completed" })
       await prepareWorker.close()
       prepareWorker = undefined
