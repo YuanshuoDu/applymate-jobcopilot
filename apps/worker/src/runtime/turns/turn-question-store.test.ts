@@ -42,7 +42,7 @@ const scheduledCheckpointState = { nextStage: "prepare", scoutedJobs: [{ id: "jo
   scheduledTaskGraphContinuation: scheduledContinuation }
 const scheduledCheckpointEvidence = scheduledAnalyzeCheckpointEvidence(scheduledCheckpointState)!
 const scheduledReceipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1", owner: scheduledOwner,
-  continuationKey: scheduledContinuation.key, snapshotDigest: scheduledContinuation.snapshotDigest, evidenceDigest: scheduledContinuation.evidenceDigest,
+  continuationKey: scheduledCheckpointEvidence.continuationKey, snapshotDigest: scheduledContinuation.snapshotDigest, evidenceDigest: scheduledContinuation.evidenceDigest,
   checkpointDigest: scheduledCheckpointEvidence.checkpointDigest, analyzeGraphRevision: 2, prepareScheduleRevision: 3 }
 const scheduledFinalStepId = "final-step-1", scheduledFinalStepOrdinal = 4
 const scheduledBinding = buildTurnQuestionScheduledChoiceBinding({ receipt: scheduledReceipt, finalStepId: scheduledFinalStepId, finalStepOrdinal: scheduledFinalStepOrdinal })!

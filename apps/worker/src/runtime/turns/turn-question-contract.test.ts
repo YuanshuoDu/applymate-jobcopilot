@@ -5,6 +5,7 @@ import { buildTurnQuestionScheduledChoiceBinding, buildTurnQuestionScheduledChoi
   parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, scheduledAnalyzeCheckpointEvidence,
   parseTurnQuestionScheduledChoiceBinding, parseTurnScheduledPrepareChoiceItem, scheduledPrepareChoiceWaitId,
   turnScheduledPrepareChoiceWaitId, TURN_QUESTION_INTENT_SCHEMA } from "./turn-question-contract.js"
+import { scheduledTaskGraphStableContinuationKey } from "../subagents/scheduled-taskgraph-continuation-receipt.js"
 
 const scheduledReceipt = {
   schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1",
@@ -79,16 +80,18 @@ describe("native user question contract", () => {
         key: scheduledReceipt.continuationKey, owner: scheduledReceipt.owner, snapshotDigest: scheduledReceipt.snapshotDigest,
         graphRevision: scheduledReceipt.analyzeGraphRevision, evidenceDigest: scheduledReceipt.evidenceDigest } }
     const evidence = scheduledAnalyzeCheckpointEvidence(state)!
-    const binding = buildTurnQuestionScheduledChoiceBindingFromAnalyzeEvidence({ ...evidence,
+    const stableKey = scheduledTaskGraphStableContinuationKey({ owner: scheduledReceipt.owner,
       continuationKey: scheduledReceipt.continuationKey, snapshotDigest: scheduledReceipt.snapshotDigest,
-      evidenceDigest: scheduledReceipt.evidenceDigest, analyzeGraphRevision: scheduledReceipt.analyzeGraphRevision,
+      evidenceDigest: scheduledReceipt.evidenceDigest, checkpointDigest: evidence.checkpointDigest,
+      analyzeGraphRevision: scheduledReceipt.analyzeGraphRevision, prepareScheduleRevision: scheduledReceipt.prepareScheduleRevision })
+    expect(evidence.continuationKey).toBe(stableKey)
+    expect(evidence.continuationKey).not.toBe(state.scheduledTaskGraphContinuation.key)
+    const binding = buildTurnQuestionScheduledChoiceBindingFromAnalyzeEvidence({ ...evidence,
       finalStepId: "step-final-9", finalStepOrdinal: 9 })!
     const rotated = { ...state, scheduledTaskGraphContinuation: { ...state.scheduledTaskGraphContinuation,
       owner: { ...scheduledReceipt.owner, turnLeaseOwnerId: "lease-2", turnLeaseVersion: 5 } } }
     const rotatedEvidence = scheduledAnalyzeCheckpointEvidence(rotated)!
     const rotatedBinding = buildTurnQuestionScheduledChoiceBindingFromAnalyzeEvidence({ ...rotatedEvidence,
-      continuationKey: scheduledReceipt.continuationKey, snapshotDigest: scheduledReceipt.snapshotDigest,
-      evidenceDigest: scheduledReceipt.evidenceDigest, analyzeGraphRevision: scheduledReceipt.analyzeGraphRevision,
       finalStepId: "step-final-9", finalStepOrdinal: 9 })
     const projection = { owner: ["user-1", "session-1", "turn-1", "root-1", 2, "execution-1", 3],
       snapshotDigest: scheduledReceipt.snapshotDigest, evidenceDigest: scheduledReceipt.evidenceDigest, analyzeGraphRevision: 7,

@@ -70,7 +70,7 @@ const scheduledAnalyzeCheckpoint = { nextStage: "prepare", scoutedJobs: [{ id: "
     owner: scheduledContinuationOwner, snapshotDigest: scheduledSnapshotDigest, graphRevision: 3, evidenceDigest: "b".repeat(64) } }
 const scheduledAnalyzeEvidence = scheduledAnalyzeCheckpointEvidence(scheduledAnalyzeCheckpoint)!
 const scheduledReceipt = buildScheduledTaskGraphContinuationReceipt({ owner: scheduledContinuationOwner,
-  continuationKey: scheduledContinuationKey, snapshotDigest: scheduledSnapshotDigest,
+  continuationKey: scheduledAnalyzeEvidence.continuationKey, snapshotDigest: scheduledSnapshotDigest,
   evidenceDigest: "b".repeat(64), checkpointDigest: scheduledAnalyzeEvidence.checkpointDigest, analyzeGraphRevision: 3, prepareScheduleRevision: 4 })!
 const scheduledWaitBinding = { schemaVersion: "agent-harness.v2.scheduled-prepare-choice-wait.v1", owner: {
   userId: ids.user, sessionId: scheduledIds.session, turnId: scheduledIds.turn, rootTaskId: scheduledIds.root,

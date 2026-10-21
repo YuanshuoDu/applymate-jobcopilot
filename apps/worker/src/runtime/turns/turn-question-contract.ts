@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
-import { parseScheduledTaskGraphContinuationReceipt } from "../subagents/scheduled-taskgraph-continuation-receipt.js"
+import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "../subagents/scheduled-taskgraph-continuation-receipt.js"
 
 export const TURN_QUESTION_INTENT_SCHEMA = "agent-harness.v2.ask-user-intent.v1" as const
 export const TURN_QUESTION_MAX_CHOICES = 6
@@ -173,16 +173,14 @@ export function buildTurnQuestionScheduledChoiceBinding(input: Readonly<{
 }
 
 /** Recomputes the Web Analyze checkpoint digest from persisted, server-owned execution state. */
-export function scheduledAnalyzeCheckpointEvidence(value: unknown): Readonly<{ checkpointDigest: string; owner: TurnQuestionScheduledChoiceOwner;
-  continuationKey: string; snapshotDigest: string; evidenceDigest: string; analyzeGraphRevision: number }> | null {
+export function scheduledAnalyzeCheckpointEvidence(value: unknown): Readonly<{ checkpointDigest: string; owner: TurnQuestionScheduledChoiceOwner; continuationKey: string; snapshotDigest: string; evidenceDigest: string; analyzeGraphRevision: number }> | null {
   const state = record(value), marker = record(state?.scheduledTaskGraphContinuation), owner = record(marker?.owner)
   const ownerKeys = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion", "executionId", "executionAttemptCount"]
   const scouted = dense(state?.scoutedJobs), scored = dense(state?.scoredJobs)
   if (!state || state.nextStage !== "prepare" || !marker || !owner || !exactKeys(owner, ownerKeys)
     || ![owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.turnLeaseOwnerId, owner.executionId].every(validId)
-    || !positive(owner.rootAttemptCount) || !positive(owner.turnLeaseVersion)
-    || !Number.isSafeInteger(owner.executionAttemptCount) || Number(owner.executionAttemptCount) < 0
-    || !exactKeys(marker, ["schemaVersion", "key", "owner", "snapshotDigest", "graphRevision", "evidenceDigest"])
+    || !positive(owner.rootAttemptCount) || !positive(owner.turnLeaseVersion) || !Number.isSafeInteger(owner.executionAttemptCount)
+    || Number(owner.executionAttemptCount) < 0 || !exactKeys(marker, ["schemaVersion", "key", "owner", "snapshotDigest", "graphRevision", "evidenceDigest"])
     || marker.schemaVersion !== "agent-harness.v2.scheduled-pipeline-continuation.v1" || typeof marker.key !== "string"
     || !/^scheduled-taskgraph:sha256:[a-f0-9]{64}$/.test(marker.key) || typeof marker.snapshotDigest !== "string"
     || !/^sha256:[a-f0-9]{64}$/.test(marker.snapshotDigest) || typeof marker.evidenceDigest !== "string"
@@ -195,14 +193,16 @@ export function scheduledAnalyzeCheckpointEvidence(value: unknown): Readonly<{ c
   for (const raw of scored) {
     const row = record(raw), job = record(row?.job), hasFence = !!row && Object.hasOwn(row, "analysisFenceAt")
     if (!row || !job || !validId(job.id) || job.userId !== owner.userId || !ids.has(job.id) || seen.has(job.id)
-      || !Number.isSafeInteger(row.score) || Number(row.score) < 0 || Number(row.score) > 100 || !stringArray(row.matchedKeywords)
-      || !stringArray(row.missingKeywords) || typeof row.recommendation !== "string" || row.recommendation.length > 8192
+      || !Number.isSafeInteger(row.score) || Number(row.score) < 0 || Number(row.score) > 100 || !stringArray(row.matchedKeywords) || !stringArray(row.missingKeywords)
+      || typeof row.recommendation !== "string" || row.recommendation.length > 8192
       || !exactKeys(row, hasFence ? ["job", "score", "matchedKeywords", "missingKeywords", "recommendation", "analysisFenceAt"] : ["job", "score", "matchedKeywords", "missingKeywords", "recommendation"]) || hasFence && !validIso(row.analysisFenceAt)) return null
     seen.add(job.id); rows.push({ jobId: job.id, score: row.score, matchedKeywords: [...row.matchedKeywords as string[]], missingKeywords: [...row.missingKeywords as string[]], recommendation: row.recommendation, ...(hasFence ? { analysisFenceAt: row.analysisFenceAt } : {}) })
   }
   const projection = { owner: [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount], snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest, analyzeGraphRevision: marker.graphRevision, analysisFailed: state.analysisFailed, scoredJobs: rows }
-  try { return { checkpointDigest: createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex"), owner: stableChoiceOwner(owner),
-    continuationKey: marker.key, snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest, analyzeGraphRevision: marker.graphRevision } } catch { return null }
+  try { const checkpointDigest = createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
+    const continuationKey = scheduledTaskGraphStableContinuationKey({ owner, continuationKey: marker.key, snapshotDigest: marker.snapshotDigest,
+      evidenceDigest: marker.evidenceDigest, checkpointDigest, analyzeGraphRevision: marker.graphRevision, prepareScheduleRevision: Number(marker.graphRevision) + 1 })
+    return continuationKey ? { checkpointDigest, owner: stableChoiceOwner(owner), continuationKey, snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest, analyzeGraphRevision: marker.graphRevision } : null } catch { return null }
 }
 /** Builds the wait binding directly from a persisted Analyze checkpoint, before Prepare has a receipt. */
 export function buildTurnQuestionScheduledChoiceBindingFromAnalyzeEvidence(input: Readonly<{
