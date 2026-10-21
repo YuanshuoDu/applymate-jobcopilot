@@ -226,6 +226,63 @@ function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template"
 
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it("refuses supersession below two remaining Turn steps after replay and before writes", async () => {
+    const fixture = supersessionFixture(), { input, operation } = fixture
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: fixture.graphContent,
+      taskRows: fixture.taskRows, sourceEvidence: fixture.sourceEvidence, budgetSnapshot: { maxSteps: 2 }, usedSteps: 1 })
+    reconciliationMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, operation)).rejects.toMatchObject({
+      name: "TaskGraphCommandError", code: "task_graph_continuation_budget_required",
+      message: "The Turn needs two remaining steps to supervise a TaskGraph plan",
+    })
+
+    const turnLock = fake.calls.findIndex(call => call.sql.startsWith('SELECT "id" FROM "agent_turns"'))
+    const parentLock = fake.calls.findIndex(call => call.sql.startsWith('SELECT task.*, session."userId"'))
+    const replay = fake.calls.findIndex(call => call.sql.startsWith('SELECT event."payload"'))
+    const budget = fake.calls.findIndex(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))
+    const used = fake.calls.findIndex(call => call.sql.startsWith('SELECT COUNT(*)::bigint AS "used"') && call.sql.includes('FROM "agent_steps"'))
+    expect(turnLock).toBeGreaterThanOrEqual(0)
+    expect(parentLock).toBeGreaterThan(turnLock)
+    expect(replay).toBeGreaterThan(parentLock)
+    expect(budget).toBeGreaterThan(replay)
+    expect(used).toBeGreaterThan(budget)
+    expect(fake.calls[budget]?.values).toEqual([input.scope.rootTaskId, input.scope.sessionId, input.scope.turnId, input.scope.userId])
+    expect(fake.calls[used]?.values).toEqual([input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.userId])
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writeLifecycleIdentity).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlanIdentity).not.toHaveBeenCalled()
+    expect(reconciliationMocks.write).not.toHaveBeenCalled()
+  })
+
+  it("admits supersession with exactly two shared Turn steps before cancellation", async () => {
+    const fixture = supersessionFixture(), { input, operation } = fixture
+    const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: fixture.graphContent,
+      taskRows: fixture.taskRows, sourceEvidence: fixture.sourceEvidence, budgetSnapshot: { maxSteps: 4 }, usedSteps: 2 })
+    const finalNode = { ...fixture.replacementNode, depth: 1, taskId: "replacement-task", verificationDisposition: "typed" }
+    reconciliationMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+    reconciliationMocks.writeLifecycleIdentity.mockResolvedValueOnce({ id: "cancel-event", sequence: "11", revision: 2 })
+    reconciliationMocks.create.mockResolvedValueOnce({ state: { revision: 3, nodes: [{ ...finalNode, status: "queued" }], appliedEvents: [] },
+      snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [finalNode] },
+      created: [{ key: finalNode.key, taskId: finalNode.taskId, status: "queued" as const }], readyTaskIds: [finalNode.taskId] })
+    reconciliationMocks.writePlanIdentity.mockResolvedValueOnce({ id: "plan-event", sequence: "12" })
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, operation)).resolves.toMatchObject({
+      status: "accepted", revision: 3,
+    })
+
+    const budget = fake.calls.findIndex(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))
+    const used = fake.calls.findIndex(call => call.sql.startsWith('SELECT COUNT(*)::bigint AS "used"') && call.sql.includes('FROM "agent_steps"'))
+    const update = fake.calls.findIndex(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))
+    expect(fake.calls[used]?.values).toEqual([input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.userId])
+    expect(used).toBeGreaterThan(budget)
+    expect(update).toBeGreaterThan(used)
+    expect(reconciliationMocks.create.mock.invocationCallOrder[0]).toBeGreaterThan(fake.client.query.mock.invocationCallOrder[used] ?? 0)
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
+  })
+
   it("cancels a typed never-started leaf at R+1, writes one replacement at R+2, then reconciles", async () => {
     const fixture = supersessionFixture(), { input, operation, sourceNode, replacementNode, prepared } = fixture
     const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: fixture.graphContent,
@@ -480,6 +537,7 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(reconciliationMocks.prepare).toHaveBeenCalledOnce()
     expect(fake.calls.some(call => call.sql.includes('AS "hasChildren"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))).toBe(false)
     expect(reconciliationMocks.create).not.toHaveBeenCalled()
     expect(reconciliationMocks.writePlanIdentity).not.toHaveBeenCalled()
     expect(reconciliationMocks.write).not.toHaveBeenCalled()
