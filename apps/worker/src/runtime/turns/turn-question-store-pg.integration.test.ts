@@ -8,7 +8,7 @@ import { TurnEngine } from "./turn-engine.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { claimTurnLease } from "./lease.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
-import { createTurnScheduledPrepareChoiceContent, turnScheduledPrepareChoiceWaitId } from "./turn-question-contract.js"
+import { createTurnScheduledPrepareChoiceContent, scheduledAnalyzeCheckpointEvidence, turnScheduledPrepareChoiceWaitId } from "./turn-question-contract.js"
 import { buildScheduledTaskGraphContinuationReceipt } from "../subagents/scheduled-taskgraph-continuation-receipt.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnQuestionPool } from "./turn-question-store-guards.js"
@@ -62,9 +62,16 @@ const scheduledSnapshotDigest = `sha256:${createHash("sha256").update(JSON.strin
 const scheduledContinuationOwner = { userId: ids.user, sessionId: scheduledIds.session, turnId: scheduledIds.turn, rootTaskId: scheduledIds.root,
   rootAttemptCount: 1, turnLeaseOwnerId: scheduledTurnOwner.ownerId, turnLeaseVersion: scheduledTurnOwner.leaseVersion,
   executionId: scheduledIds.execution, executionAttemptCount: 1 }
+const scheduledContinuationKey = `scheduled-taskgraph:sha256:${"a".repeat(64)}`
+const scheduledAnalyzeCheckpoint = { nextStage: "prepare", scoutedJobs: [{ id: "scheduled-job-1", userId: ids.user }],
+  scoredJobs: [{ job: { id: "scheduled-job-1", userId: ids.user }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
+    recommendation: "Apply after tailoring." }], analysisFailed: 0,
+  scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: scheduledContinuationKey,
+    owner: scheduledContinuationOwner, snapshotDigest: scheduledSnapshotDigest, graphRevision: 3, evidenceDigest: "b".repeat(64) } }
+const scheduledAnalyzeEvidence = scheduledAnalyzeCheckpointEvidence(scheduledAnalyzeCheckpoint)!
 const scheduledReceipt = buildScheduledTaskGraphContinuationReceipt({ owner: scheduledContinuationOwner,
-  continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`, snapshotDigest: scheduledSnapshotDigest,
-  evidenceDigest: "b".repeat(64), checkpointDigest: "c".repeat(64), analyzeGraphRevision: 3, prepareScheduleRevision: 4 })!
+  continuationKey: scheduledContinuationKey, snapshotDigest: scheduledSnapshotDigest,
+  evidenceDigest: "b".repeat(64), checkpointDigest: scheduledAnalyzeEvidence.checkpointDigest, analyzeGraphRevision: 3, prepareScheduleRevision: 4 })!
 const scheduledWaitBinding = { schemaVersion: "agent-harness.v2.scheduled-prepare-choice-wait.v1", owner: {
   userId: ids.user, sessionId: scheduledIds.session, turnId: scheduledIds.turn, rootTaskId: scheduledIds.root,
   rootAttemptCount: 1, executionId: scheduledIds.execution, executionAttemptCount: 1 }, continuationKey: scheduledReceipt.continuationKey,
@@ -126,12 +133,9 @@ async function seedScheduledChoice(pool: PgPool): Promise<void> {
      "modelProfileSnapshot", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "startedAt")
     VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, NULL, 0, 0, 0, CURRENT_TIMESTAMP)`,
   [scheduledIds.step, scheduledIds.session, scheduledIds.turn, scheduledIds.root])
-  const continuation = { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: scheduledReceipt.continuationKey,
-    snapshotDigest: scheduledReceipt.snapshotDigest, evidenceDigest: scheduledReceipt.evidenceDigest, graphRevision: scheduledReceipt.analyzeGraphRevision,
-    owner: scheduledContinuationOwner }
   await pool.query(`INSERT INTO "agent_executions" ("id", "userId", "sessionId", "status", "checkpoint", "state", "attemptCount", "startedAt", "createdAt", "updatedAt")
     VALUES ($1, $2, $3, 'running', 'execute', $4::jsonb, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-  [scheduledIds.execution, ids.user, scheduledIds.session, JSON.stringify({ scheduledTaskGraphContinuation: continuation })])
+  [scheduledIds.execution, ids.user, scheduledIds.session, JSON.stringify(scheduledAnalyzeCheckpoint)])
   const candidate = { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v2", sessionId: scheduledIds.session, turnId: scheduledIds.turn,
     rootTaskId: scheduledIds.root, rootAttemptCount: 1, finalStepId: scheduledIds.step, finalStepOrdinal: 1, stepAttempt: 1, candidateText: "verified candidate",
     finishReason: "stop", usage: { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 } }
