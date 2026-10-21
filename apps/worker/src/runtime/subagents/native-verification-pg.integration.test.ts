@@ -654,7 +654,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
       proofTransactionOpen = true
       await client.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
       const accepted = await readNativeVerificationTerminalProofWithClient(client, {
-        scope, candidateText, witness,
+        scope, candidateText, witness, stepId: ids.rootStep,
       })
       await client.query("ROLLBACK")
       proofTransactionOpen = false
@@ -670,13 +670,13 @@ describePg("native verification PostgreSQL producer and readback", () => {
         await client.query("BEGIN")
         transactionOpen = true
         await client.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
-        const before = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness })
+        const before = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness, stepId: ids.rootStep })
         expect(before).toBe(true)
         await client.query("SAVEPOINT native_evidence_mutation")
         await mutate(client)
-        const accepted = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness })
+        const accepted = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness, stepId: ids.rootStep })
         await client.query("ROLLBACK TO SAVEPOINT native_evidence_mutation")
-        const restored = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness })
+        const restored = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness, stepId: ids.rootStep })
         await client.query("ROLLBACK")
         transactionOpen = false
         expect(accepted).toBe(false)
@@ -693,7 +693,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
         await client.query("BEGIN")
         transactionOpen = true
         await client.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
-        const accepted = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness })
+        const accepted = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness, stepId: ids.rootStep })
         await client.query("ROLLBACK")
         transactionOpen = false
         expect(accepted).toBe(false)
@@ -739,7 +739,9 @@ describePg("native verification PostgreSQL producer and readback", () => {
     try {
       await answerBaselineClient.query("BEGIN")
       await answerBaselineClient.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
-      await expect(readNativeVerificationTerminalProofWithClient(answerBaselineClient, { scope, candidateText, witness })).resolves.toBe(true)
+      await expect(readNativeVerificationTerminalProofWithClient(answerBaselineClient, {
+        scope, candidateText, witness, stepId: ids.rootStep,
+      })).resolves.toBe(true)
       await answerBaselineClient.query("ROLLBACK")
     } catch (error) {
       await answerBaselineClient.query("ROLLBACK").catch(() => undefined)
