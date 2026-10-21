@@ -1072,7 +1072,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const resumedLease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId,
         ownerId: `${value.leaseOwnerId}-resumed` })
       expect(resumedLease.leaseVersion).toBe(turnLease.leaseVersion + 1)
-      const resumedRoot = await rootStore.ensure({ lease: resumedLease, goal: "Resume scheduled automation after the user's choice" })
+      const resumedRoot = await rootStore.ensure({ lease: resumedLease, goal: "Resume scheduled automation after the user's choice",
+        allowedActions: scheduledRootActions })
       expect(resumedRoot).toMatchObject({ id: value.rootTaskId, status: "running", leaseOwner: resumedLease.ownerId })
       await createCanonicalExecutionProjection(pool!).start({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId })
       const resumedOwner = { ...owner, turnLeaseOwnerId: resumedLease.ownerId, turnLeaseVersion: resumedLease.leaseVersion }
