@@ -1265,7 +1265,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const diagnosticReason = typeof failedReason === "string" ? failedReason.slice(0, 160) : null
       const prepareToolEvent = await pool!.query<{ type: string; payload: Record<string, unknown> }>(
         `SELECT "type", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
-          AND "correlationId" = $4 AND "type" IN ('tool_call.failed', 'tool_call.completed') ORDER BY "sequence" DESC LIMIT 1`,
+          AND "correlationId" = $4 AND "type" IN ('tool_call.failed', 'tool_call.completed')
+          ORDER BY ("payload"->'output'->>'message' IS NOT NULL) DESC, "sequence" DESC LIMIT 1`,
         [value.sessionId, value.turnId, prepareTaskId, `scheduled-prepare-tool-${prepareTaskId}`])
       const toolEvent = prepareToolEvent.rows[0]
       const toolOutput = toolEvent?.payload.output

@@ -101,7 +101,7 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
     }
     await client.query("COMMIT")
     return { invocation: { source: "automation", runMode: "scheduled", templateId: "prepare", role: "prepare",
-      taskType: "scheduled_application_prepare", owner: persisted.owner, taskFence: persisted.taskFence,
+      taskType: "scheduled_application_prepare", owner: liveBinding.owner, taskFence: persisted.taskFence,
       snapshot: automation, receipt, checkpointJobs }, details }
   } catch (error: unknown) { await client.query("ROLLBACK").catch(() => undefined); throw error }
   finally { client.release() }
