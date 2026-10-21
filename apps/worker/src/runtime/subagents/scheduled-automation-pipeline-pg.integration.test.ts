@@ -327,8 +327,10 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       taskId: value.rootTaskId, rootTaskId: value.rootTaskId, ownerId: turn.leaseOwnerId, leaseVersion: turn.leaseVersion,
       leaseExpiresAt: new Date(turn.leaseExpiresAt) }
     const store = createScheduledPipelineCandidateStore(pool!, createPgTurnEngineStore(pool!))
-    await store.stage({ owner: writer, rootAttemptCount: 1, finalStepId: stepId, finalStepOrdinal: 7,
-      candidateText: "Exact durable scheduled final candidate." })
+    const candidateText = "Exact durable scheduled final candidate."
+    await withScheduledPipelineCandidateModelOutput({ owner: writer, finalStepId: stepId, finalStepOrdinal: 7,
+      candidateText, finishReason: "stop", usage: null }, () => store.stage({ owner: writer, rootAttemptCount: 1,
+      finalStepId: stepId, finalStepOrdinal: 7, candidateText }))
     const saved = await pool!.query<{ id: string; idempotencyKey: string; type: string; taskId: string; correlationId: string; payload: Record<string, unknown> }>(
       `SELECT "id", "idempotencyKey", "type", "taskId", "correlationId", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3`,
       [value.sessionId, value.turnId, SCHEDULED_PIPELINE_CANDIDATE_EVENT])
@@ -343,16 +345,18 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       WHERE "id" = $2 RETURNING "leaseVersion", "leaseExpiresAt"`, [`recovered-${value.leaseOwnerId}`, value.turnId])
     const current: TurnExecutionOwnerFence = { ...writer, ownerId: `recovered-${value.leaseOwnerId}`,
       leaseVersion: Number(recovery.rows[0]!.leaseVersion), leaseExpiresAt: new Date(recovery.rows[0]!.leaseExpiresAt) }
-    await store.stage({ owner: current, rootAttemptCount: 1, finalStepId: stepId, finalStepOrdinal: 7,
-      candidateText: "Exact durable scheduled final candidate." })
+    await withScheduledPipelineCandidateModelOutput({ owner: current, finalStepId: stepId, finalStepOrdinal: 7,
+      candidateText, finishReason: "stop", usage: null }, () => store.stage({ owner: current, rootAttemptCount: 1,
+      finalStepId: stepId, finalStepOrdinal: 7, candidateText }))
     const replayed = await pool!.query<{ id: string; idempotencyKey: string; payload: Record<string, unknown> }>(
       `SELECT "id", "idempotencyKey", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3`,
       [value.sessionId, value.turnId, SCHEDULED_PIPELINE_CANDIDATE_EVENT])
     expect(replayed.rows).toHaveLength(1)
     expect(replayed.rows[0]).toEqual({ id: saved.rows[0]!.id,
       idempotencyKey: `scheduled-candidate:${value.rootTaskId}:1:${stepId}`, payload: saved.rows[0]!.payload })
-    await expect(store.read({ owner: current, rootAttemptCount: 1 }))
-      .resolves.toBe("Exact durable scheduled final candidate.")
+    await expect(store.read({ owner: current, rootAttemptCount: 1 })).resolves.toMatchObject({
+      candidateText, finalStepId: stepId, finalStepOrdinal: 7, finishReason: "stop", usage: null,
+    })
     await expect(store.read({ owner: current, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_root_attempt_changed")
     const laterStep = `scheduled-later-step-${value.turnId}`
     await pool!.query(`INSERT INTO "agent_steps"
@@ -487,6 +491,14 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           errorCode: null,
         }), completionGate,
         ...(recoveredCandidate ? { recoveredFinalCandidate: recoveredCandidate.candidateText } : {}),
+        ...(recoveredCandidate ? { resume: {
+          nextOrdinal: recoveredCandidate.finalStepOrdinal + 1,
+          stepCount: recoveredCandidate.finalStepOrdinal + 1,
+          toolCallCount: 0,
+          inputThroughSequence: 0n,
+          consumedInputIds: [],
+          usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+        } } : {}),
         idFactory: prefix => recoveredCandidate && prefix === `turn:${value.turnId}:step:0` ? `${prefix}:restarted` : prefix,
       }
       return new TurnEngine(options).run()
@@ -585,9 +597,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         payload: initialCandidate.rows[0]!.payload })
       expect(candidateStageCalls).toBe(2)
       expect(staged).toHaveLength(2)
-      expect(executionStepIds).toHaveLength(2)
-      expect(executionStepIds[0]).toBe(initialCandidate.rows[0]!.correlationId)
-      expect(executionStepIds[1]).not.toBe(initialCandidate.rows[0]!.correlationId)
+      expect(executionStepIds).toEqual([initialCandidate.rows[0]!.correlationId])
       expect(staged[1]).toEqual({
         finalStepId: initialCandidate.rows[0]!.correlationId,
         finalStepOrdinal: Number(initialCandidate.rows[0]!.payload.finalStepOrdinal),
@@ -794,10 +804,11 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       dependencyBindings: dependencyProof!.bindings, toolCallCount: 1,
     })
 
+    await pool!.query(`UPDATE "agent_items" SET "revision" = 2 WHERE "id" = $1`, [taskGraphItemId(value.rootTaskId)])
     let graphScope = { ...scope, turnLeaseOwner: value.leaseOwnerId, turnLeaseVersion: 4, parentLeaseOwner: value.leaseOwnerId, parentAttemptCount: 1 }
     const loaded = await loadTaskGraph(pool!, graphScope, false)
     const persistedGraph = currentTaskGraph(loaded)
-    expect(loaded.item?.revision).toBe(1)
+    expect(loaded.item?.revision).toBe(2)
     expect(persistedGraph.nodes.map(node => [node.key, node.status])).toEqual([
       ["scheduled-scout", "completed"], ["scheduled-analyst", "completed"],
     ])
@@ -981,7 +992,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
 
       const analyzeOnlyGraph = await pool!.query<{ revision: number; content: Record<string, unknown> }>(
         `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(value.rootTaskId)])
-      expect(analyzeOnlyGraph.rows[0]?.revision).toBe(1)
+      expect(analyzeOnlyGraph.rows[0]?.revision).toBe(2)
       expect((analyzeOnlyGraph.rows[0]!.content.nodes as Array<{ key: string; status: string }>).map(node => [node.key, node.status])).toEqual([
         ["scheduled-scout", "completed"], ["scheduled-analyst", "completed"],
       ])
@@ -1145,7 +1156,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const resumedPrepare = await restartedContinuation(continuationInput)
       expect(resumedPrepare).toMatchObject({ status: "waiting_for_dependency" })
       const scheduledReceipt = await appendRestartedPrepare(reboundPrepareInput)
-      expect(scheduledReceipt).toMatchObject({ status: "duplicate", revision: 2,
+      expect(scheduledReceipt).toMatchObject({ status: "duplicate", revision: 3,
         nodes: [{ key: "prepare", status: "queued" }], readyTaskIds: [expect.any(String)],
         choice: { required: true, status: "answered", waitId: expectedChoiceWaitId } })
       const prepareTaskId = scheduledReceipt.nodes[0]!.taskId
@@ -1155,7 +1166,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         status: "queued", role: TASK_GRAPH_TEMPLATES.prepare.role, taskType: TASK_GRAPH_TEMPLATES.prepare.taskType })
       const storedGraph = await pool!.query<{ revision: number; content: Record<string, unknown> }>(
         `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(value.rootTaskId)])
-      expect(storedGraph.rows[0]).toMatchObject({ revision: 2, content: { rootSuccessCriteria: snapshot.rootSuccessCriteria } })
+      expect(storedGraph.rows[0]).toMatchObject({ revision: 3, content: { rootSuccessCriteria: snapshot.rootSuccessCriteria } })
       expect((storedGraph.rows[0]!.content.nodes as Array<{ key: string; taskId: string }>)[2]).toMatchObject({ key: "prepare", taskId: prepareTaskId })
 
       const privateReceipts = await pool!.query<{ id: string; itemId: string | null; taskId: string | null; actor: string; payload: Record<string, unknown> }>(
@@ -1167,7 +1178,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(privateReceipt.payload).not.toHaveProperty("claimToken")
       expect(privateReceipt.payload).not.toHaveProperty("claimTokenDigest")
       expect(JSON.stringify(privateReceipt.payload)).not.toContain(claimToken)
-      expect(privateReceipt.payload).toMatchObject({ continuationKey, analyzeGraphRevision: 1, prepareScheduleRevision: 2,
+      expect(privateReceipt.payload).toMatchObject({ continuationKey, analyzeGraphRevision: 2, prepareScheduleRevision: 3,
         owner: { turnLeaseOwnerId: resumedLease.ownerId, turnLeaseVersion: resumedLease.leaseVersion } })
       await expect(questionStore.readScheduledPrepareChoice({ owner: resumedTurnExecutionOwner, receipt: privateReceipt.payload, now: new Date() }))
         .resolves.toMatchObject({ status: "answered", waitId: expectedChoiceWaitId, itemId: choiceWait.itemId, answer: "keep_resume" })
