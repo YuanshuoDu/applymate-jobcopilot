@@ -131,15 +131,13 @@ function projectNode(value: unknown): Omit<SafeNode, "lesson" | "reportedOutput"
   return { taskKind, status: node.status as SubagentTaskStatus, ...(hints ? { negativeReasonHints: hints } : {}) }
 }
 function candidate(value: unknown, crossSession: boolean): Candidate | null {
-  const item = record(value)
-  const hasSourceSessionDiffers = !!item && Object.hasOwn(item, "sourceSessionDiffers")
+  const item = record(value), hasSourceSessionDiffers = !!item && Object.hasOwn(item, "sourceSessionDiffers")
   if (!item || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
     || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n
     || (crossSession && ((hasSourceSessionDiffers && typeof item.sourceSessionDiffers !== "boolean")
       || !(item.terminalAt instanceof Date) || !Number.isFinite(item.terminalAt.getTime())))) return null
   const hasOrdinals = Object.hasOwn(item, "sourceNodeOrdinals"), hasLessons = Object.hasOwn(item, "nodeLessons"), hasOutputs = Object.hasOwn(item, "reportedOutputs")
-  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence",
-    ...(crossSession ? [...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []), "terminalAt"] : []),
+  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(crossSession ? [...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []), "terminalAt"] : []),
     ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : [])].sort().join(",")
   if (!exact(item, keys)) return null
   const graph = record(item.taskGraph)
