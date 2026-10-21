@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto"
+import { createHash, createHmac, randomUUID } from "node:crypto"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import { Queue, Worker } from "bullmq"
 import Redis from "ioredis"
@@ -7,26 +7,38 @@ import type { ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 
-import { releaseTurnLease, type TurnLease } from "../turns/lease.js"
+import { claimTurnLease, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { reclaimExpiredTurns } from "../turns/recovery-scanner-storage.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { createPgTurnQuestionStore } from "../turns/turn-question-store.js"
+import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
 import { TurnEngine } from "../turns/turn-engine.js"
 import { TurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
 import type { TurnEngineOptions, TurnEngineResult, TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { drainAgentWakeups } from "../wakeup/consumer.js"
 import { AGENT_TURN_WAKEUP_TOPIC } from "../wakeup/types.js"
+import { createCanonicalExecutionProjection } from "../canonical-execution-projection.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { createScheduledAutomationPrepareContinuation } from "./scheduled-automation-prepare-bridge.js"
+import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { createScheduledAutomationPipelineBridge, type ScheduledAutomationPipelineBridgeScope, type ScheduledAutomationPipelineBridgeState } from "./scheduled-automation-pipeline-bridge.js"
+import { postScheduledPipelineContinuation, scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
+import { createPgDurableWaitPort } from "./durable-wait-store.js"
+import type { TaskGraphScheduledPrepareInput } from "./task-graph-command-port.js"
+import type { PgSubagentPool, SubagentJobPayload } from "./types.js"
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attempt.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
-import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT } from "./scheduled-pipeline-candidate-store.js"
+import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT, withScheduledPipelineCandidateModelOutput } from "./scheduled-pipeline-candidate-store.js"
 import { attachScheduledPipelineCompletion } from "./scheduled-pipeline-completion.js"
+import { createScheduledTaskGraphContinuationContract } from "./scheduled-taskgraph-continuation-receipt.js"
+import { createPgRootTaskStore } from "./root-task-store.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const SCOUT_VERIFICATION: TaskGraphVerificationContract = {
@@ -63,10 +75,24 @@ let disconnectWebDatabase: (() => Promise<void>) | undefined
 let priorDatabaseUrl: string | undefined
 const prismaApplicationName = `scheduled-analysis-${randomUUID()}`
 const analyzeModulePath = "@/lib/agent/stages/analyze"
+const scheduledRouteRunServicePath = "@/lib/agent/run-service"
+const scheduledRouteModelRouterPath = "@/lib/model-router"
+const scheduledRouteEntitlementsPath = "@/lib/entitlements"
+const scheduledPipelineRoutePath: string = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 
 afterEach(() => {
   vi.doUnmock(analyzeModulePath)
+  vi.doUnmock(scheduledRouteRunServicePath)
+  vi.doUnmock(scheduledRouteModelRouterPath)
+  vi.doUnmock(scheduledRouteEntitlementsPath)
   vi.resetModules()
+})
+
+describe("scheduled pipeline route test importer", () => {
+  it("loads the Web route through the Worker Vitest alias", async () => {
+    const route = await vi.importActual<{ POST(request: Request): Promise<Response> }>(scheduledPipelineRoutePath)
+    expect(typeof route.POST).toBe("function")
+  }, 30_000)
 })
 
 describeWithServices("scheduled automation TaskGraph continuation on disposable PostgreSQL and Redis", () => {
@@ -410,8 +436,10 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       system: [], profile: [], steerHistory: [], toolObservations: [],
       businessRefs: [{ id: value.jobId, kind: "job" as const, ownerId: value.userId }],
     }
+    const executionStepIds: string[] = []
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
       async build(request) {
+        executionStepIds.push(request.stepId)
         return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId,
           stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" }
       },
@@ -440,8 +468,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         turnId: lease.turnId, taskId: value.rootTaskId, rootTaskId: value.rootTaskId,
         ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt }
       const recoveredFinalCandidate = await candidateStore.read({ owner: executionOwner, rootAttemptCount: 1 })
+      const recoveredCandidate = recoveredFinalCandidate ?? undefined
       const completionGate = attachScheduledPipelineCompletion({
-        gate: baseCompletionGate, owner, bridge, fetcher,
+        gate: baseCompletionGate, owner, bridge, fetcher, recoveredCandidate,
         onWebAccepted: () => { acceptedHandoffs += 1; completionOrder.push("handoff-accepted") }, rootAttemptCount: 1,
         stageCandidate: async input => {
           candidateStageCalls += 1
@@ -458,8 +487,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         snapshot, contextBuilder, store, model, tools: [], executeTool: async ({ call }) => ({
           id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const,
           errorCode: null,
-        }), completionGate, ...(typeof recoveredFinalCandidate === "string" ? { recoveredFinalCandidate } : {}),
-        idFactory: prefix => prefix,
+        }), completionGate,
+        ...(recoveredCandidate ? { recoveredFinalCandidate: recoveredCandidate.candidateText } : {}),
+        idFactory: prefix => recoveredCandidate && prefix === `turn:${value.turnId}:step:0` ? `${prefix}:restarted` : prefix,
       }
       return new TurnEngine(options).run()
     }
@@ -487,7 +517,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(initialCandidate.rows).toHaveLength(1)
       expect(initialCandidate.rows[0]).toMatchObject({
         idempotencyKey: `scheduled-candidate:${value.rootTaskId}:1:turn:${value.turnId}:step:0`,
-        correlationId: `turn:${value.turnId}:step:0`, payload: { candidateText: sentinel, rootAttemptCount: 1, finalStepOrdinal: 0 },
+        correlationId: `turn:${value.turnId}:step:0`, payload: {
+          candidateText: sentinel, rootAttemptCount: 1, finalStepId: `turn:${value.turnId}:step:0`, finalStepOrdinal: 0,
+        },
       })
       expect(candidateStageCalls).toBe(1)
       expect(terminalCommitCalls).toBe(0)
@@ -555,7 +587,14 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         payload: initialCandidate.rows[0]!.payload })
       expect(candidateStageCalls).toBe(2)
       expect(staged).toHaveLength(2)
-      expect(staged[1]).toEqual(staged[0])
+      expect(executionStepIds).toHaveLength(2)
+      expect(executionStepIds[0]).toBe(initialCandidate.rows[0]!.correlationId)
+      expect(executionStepIds[1]).not.toBe(initialCandidate.rows[0]!.correlationId)
+      expect(staged[1]).toEqual({
+        finalStepId: initialCandidate.rows[0]!.correlationId,
+        finalStepOrdinal: Number(initialCandidate.rows[0]!.payload.finalStepOrdinal),
+        candidateText: sentinel,
+      })
       expect(modelCalls).toBe(1)
       expect(terminalCommitCalls).toBe(1)
       expect(acceptedHandoffs).toBe(1)
@@ -700,11 +739,24 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     expect(dispatchAfterResume.rows[0]?.publishedAt).toBeNull()
   })
 
-  it("rechecks persisted Scout → Analyst evidence on duplicate continuation after a Worker restart", async () => {
+  it("replays the persisted Prepare choice and resumes without duplicate material after a Worker restart", async () => {
     const value = fixture()
     fixtureUserIds.push(value.userId)
-    const snapshot = graphSnapshot(value)
+    const snapshot = parseTaskGraphSnapshot({ ...graphSnapshot(value), rootSuccessCriteria: [
+      "Scheduled automation pipeline integration", "Keep Prepare bound to verified Analyze evidence",
+    ] })
     await seedGraph(pool!, value, snapshot)
+    const baseResumeId = `scheduled-pipeline-resume-${value.turnId}`
+    const baseResumeContent = { basics: { name: "Scheduled Fixture Candidate" }, sections: [] }
+    const preparedLetter = "Fixture cover letter prepared only for the scheduled Prepare integration test."
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseOwner" = $2 WHERE "id" = $1`, [value.rootTaskId, value.leaseOwnerId])
+    await pool!.query(`INSERT INTO "Job"
+      ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "keywords", "updatedAt")
+      VALUES ($1, $2, 'Fixture Systems', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/fixture',
+        'Build reliable TypeScript services for European customers.', 'fixture', 'TypeScript', CURRENT_TIMESTAMP)`, [value.jobId, value.userId])
+    await pool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
+      VALUES ($1, $2, 'Fixture Base Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [baseResumeId, value.userId, JSON.stringify(baseResumeContent)])
     await persistToolReceipt(pool!, value, value.scoutTaskId, "scout-step", "jobs.discover", "discover-call", {
       query: "Software Engineer Dublin",
     }, discoveryOutput(value), 1)
@@ -744,7 +796,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       dependencyBindings: dependencyProof!.bindings, toolCallCount: 1,
     })
 
-    const graphScope = { ...scope, turnLeaseOwner: value.leaseOwnerId, turnLeaseVersion: 4, parentLeaseOwner: "root-lease-owner", parentAttemptCount: 1 }
+    let graphScope = { ...scope, turnLeaseOwner: value.leaseOwnerId, turnLeaseVersion: 4, parentLeaseOwner: value.leaseOwnerId, parentAttemptCount: 1 }
     const loaded = await loadTaskGraph(pool!, graphScope, false)
     const persistedGraph = currentTaskGraph(loaded)
     expect(loaded.item?.revision).toBe(1)
@@ -790,9 +842,14 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     const queue = new Queue<ScheduledContinuationPayload, Awaited<ReturnType<typeof bridge>>>(queueName, {
       connection: queueRedis, skipVersionCheck: true,
     })
+    const prepareQueueName = `scheduled-prepare-child-${randomUUID()}`
+    const prepareQueueRedis = redis.duplicate()
+    const prepareQueue = new Queue<SubagentJobPayload>(prepareQueueName, { connection: prepareQueueRedis, skipVersionCheck: true })
     const deliveries: Array<Awaited<ReturnType<typeof bridge>>> = []
     let firstWorker: Worker<ScheduledContinuationPayload, Awaited<ReturnType<typeof bridge>>> | undefined
     let restartedWorker: Worker<ScheduledContinuationPayload, Awaited<ReturnType<typeof bridge>>> | undefined
+    let prepareWorker: Worker<SubagentJobPayload, unknown> | undefined
+    let restartedPrepareWorker: Worker<SubagentJobPayload, unknown> | undefined
     const jobId = `scheduled-pipeline-${value.turnId}`
     try {
       await redis.ping()
@@ -830,17 +887,442 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(result.status).toBe("ready")
       expect(deliveries).toHaveLength(2)
       expect(deliveries[0]).toEqual(deliveries[1])
-      if (result.status === "ready") {
-        expect(result.attestation.owner).toEqual(owner)
-        expect(result.attestation.scout.candidateJobIds).toEqual([value.jobId])
-        expect(result.attestation.scout.discoveryReceipt).toMatchObject({
-          status: "complete", taskId: value.scoutTaskId, attemptCount: 1, candidateCount: 1,
-          providerFailures: 0, materializationFailures: 0, hasMore: false,
-        })
-        expect(result.attestation.analyst).toMatchObject({
-          taskId: value.analystTaskId, status: "completed", verification: "passed", jobIds: [value.jobId],
-        })
+      if (result.status !== "ready") throw new Error("Scheduled pipeline fixture did not return Analyze evidence")
+      expect(result.attestation.owner).toEqual(owner)
+      expect(result.attestation.scout.candidateJobIds).toEqual([value.jobId])
+      expect(result.attestation.scout.discoveryReceipt).toMatchObject({
+        status: "complete", taskId: value.scoutTaskId, attemptCount: 1, candidateCount: 1,
+        providerFailures: 0, materializationFailures: 0, hasMore: false,
+      })
+      expect(result.attestation.analyst).toMatchObject({
+        taskId: value.analystTaskId, status: "completed", verification: "passed", jobIds: [value.jobId],
+      })
+
+      const executionOwner = { executionId: value.executionId, executionAttemptCount: 1 }
+      const claimOwner = { ...owner, ...executionOwner }, claimToken = `scheduled-prepare-claim-${randomUUID()}`
+      const continuationKey = scheduledTaskGraphContinuationKey(owner, result.attestation, executionOwner.executionId, executionOwner.executionAttemptCount)
+      const turnLeaseRow = (await pool!.query<{ userId: string; leaseOwnerId: string; leaseVersion: number; leaseStartedAt: Date | string; leaseExpiresAt: Date | string }>(
+        `SELECT "userId", "leaseOwnerId", "leaseVersion", "leaseStartedAt", "leaseExpiresAt" FROM "agent_turns" WHERE "id" = $1`, [value.turnId])).rows[0]!
+      const turnLease: TurnLease = { turnId: value.turnId, sessionId: value.sessionId, userId: turnLeaseRow.userId,
+        ownerId: turnLeaseRow.leaseOwnerId, leaseVersion: turnLeaseRow.leaseVersion,
+        leaseStartedAt: new Date(turnLeaseRow.leaseStartedAt), leaseExpiresAt: new Date(turnLeaseRow.leaseExpiresAt) }
+      const turnExecutionOwner = {
+        kind: "turn" as const, userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        taskId: value.rootTaskId, rootTaskId: value.rootTaskId, ownerId: turnLease.ownerId, leaseVersion: turnLease.leaseVersion,
+        leaseExpiresAt: turnLease.leaseExpiresAt,
       }
+      const claim = {
+        schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey, claimToken, owner: claimOwner,
+        claimedAt: turnLease.leaseStartedAt.toISOString(), leaseExpiresAt: turnLease.leaseExpiresAt.toISOString(),
+      }
+      const scheduledSnapshot = scheduledAutomationSnapshot()
+      const jobRecord = {
+        id: value.jobId, userId: value.userId, company: "Fixture Systems", role: "Software Engineer", location: "Dublin",
+        status: "saved", score: null, url: "https://jobs.example.invalid/fixture", source: "fixture", salary: null,
+        description: "Build reliable TypeScript services for European customers.", keywords: "TypeScript",
+      }
+      const checkpointState = {
+        nextStage: "prepare", scheduledTaskGraphClaim: claim,
+        scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: continuationKey,
+          owner: claimOwner, snapshotDigest: result.attestation.snapshotDigest, graphRevision: result.attestation.graphRevision,
+          evidenceDigest: result.attestation.evidenceDigest },
+        scoutedJobs: [jobRecord],
+        scoredJobs: [{ job: { ...jobRecord, coverLetter: null }, score: 82, matchedKeywords: ["TypeScript"],
+          missingKeywords: ["PostgreSQL"], recommendation: "Apply after tailoring.", analysisFenceAt: new Date().toISOString() }],
+        analysisFailed: 0,
+      }
+      const checkpointPath = "@/lib/agent/scheduled-taskgraph-gate-checkpoint"
+      const checkpointModule = await import(checkpointPath) as unknown as {
+        scheduledTaskGraphAnalyzeCheckpointDigest: (value: unknown) => string | null
+      }
+      const checkpointDigest = checkpointModule.scheduledTaskGraphAnalyzeCheckpointDigest(checkpointState)
+      if (!checkpointDigest) throw new Error("Scheduled Analyze fixture checkpoint was invalid")
+      await seedScheduledExecution(pool!, value, checkpointState)
+      await pool!.query(`UPDATE "agent_executions" SET "checkpoint" = 'prepare' WHERE "id" = $1`, [value.executionId])
+      const stepId = `scheduled-prepare-step-${value.turnId}`
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt")
+        VALUES ($1, $2, $3, $4, 8, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+      [stepId, value.sessionId, value.turnId, value.rootTaskId])
+      let prepareInput: TaskGraphScheduledPrepareInput = {
+        scope: { ...graphScope, stepId }, executionOwner,
+        handoff: { status: "analyze_checkpointed", continuationKey, checkpointDigest,
+          claimTokenDigest: `sha256:${createHash("sha256").update(claimToken, "utf8").digest("hex")}`,
+          executionId: executionOwner.executionId, executionAttemptCount: executionOwner.executionAttemptCount },
+        attestation: result.attestation,
+        proposal: { expectedRevision: result.attestation.graphRevision, nodes: [{ key: "prepare", templateId: "prepare",
+          goal: "Prepare application materials using the persisted scheduled Analyze checkpoint.", successCriteria: [
+            "Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.",
+            "Persist immutable owner-fenced material references and return no resume or letter bodies.",
+          ],
+          dependsOn: ["scheduled-analyst"] }] },
+      }
+      const candidateText = "Scheduled Prepare integration candidate."
+      const candidateUsage = { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 }
+      const candidateStore = createScheduledPipelineCandidateStore(pool!, createPgTurnEngineStore(pool!))
+      await withScheduledPipelineCandidateModelOutput({ owner: turnExecutionOwner, finalStepId: stepId, finalStepOrdinal: 8,
+        candidateText, finishReason: "stop", usage: candidateUsage }, () => candidateStore.stage({ owner: turnExecutionOwner,
+        rootAttemptCount: 1, finalStepId: stepId, finalStepOrdinal: 8, candidateText }))
+      const command = createPgTaskGraphCommandPort(pool as unknown as PgSubagentPool)
+      const appendScheduledPrepare = command.appendScheduledPrepare
+      if (!appendScheduledPrepare) throw new Error("PG command port omitted scheduled Prepare")
+      const choiceContract = createScheduledTaskGraphContinuationContract(prepareInput)
+      if (!choiceContract) throw new Error("Scheduled Prepare fixture could not bind its Analyze checkpoint")
+      const expectedChoiceWaitId = scheduledPrepareChoiceWaitId({ receipt: choiceContract.receipt, finalStepId: stepId, finalStepOrdinal: 8 })
+      if (expectedChoiceWaitId === null) throw new Error("Scheduled Prepare fixture did not derive its choice wait")
+      const durableWait = createPgDurableWaitPort(pool!)
+      const initialContinuation = createScheduledAutomationPrepareContinuation({ commandPort: command, waitPort: durableWait })
+      const initialContinuationInput = {
+        owner, executionOwner: turnExecutionOwner, attestation: result.attestation,
+        proof: prepareInput.handoff, candidateText, finalStepId: stepId, finalStepOrdinal: 8,
+        signal: new AbortController().signal,
+      }
+      await expect(initialContinuation(initialContinuationInput)).resolves.toEqual({
+        status: "waiting_for_choice", waitId: expectedChoiceWaitId,
+      })
+
+      const analyzeOnlyGraph = await pool!.query<{ revision: number; content: Record<string, unknown> }>(
+        `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(value.rootTaskId)])
+      expect(analyzeOnlyGraph.rows[0]?.revision).toBe(1)
+      expect((analyzeOnlyGraph.rows[0]!.content.nodes as Array<{ key: string; status: string }>).map(node => [node.key, node.status])).toEqual([
+        ["scheduled-scout", "completed"], ["scheduled-analyst", "completed"],
+      ])
+      const waitingExecution = await pool!.query<{ status: string; state: Record<string, unknown> }>(
+        `SELECT "status", "state" FROM "agent_executions" WHERE "id" = $1`, [value.executionId])
+      expect(waitingExecution.rows[0]?.status).toBe("running")
+      expect(waitingExecution.rows[0]?.state).toMatchObject({
+        nextStage: "prepare",
+        scheduledTaskGraphClaim: { key: continuationKey, claimToken, owner: claimOwner },
+        scheduledTaskGraphContinuation: { key: continuationKey, owner: claimOwner },
+      })
+      expect(waitingExecution.rows[0]?.state.scheduledTaskGraphWait).toBeUndefined()
+      const prematurePrepare = await pool!.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "rootTaskId" = $1 AND "role" = $2`,
+        [value.rootTaskId, TASK_GRAPH_TEMPLATES.prepare.role])
+      expect(prematurePrepare.rows).toHaveLength(0)
+      const prematureReceipt = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+        AND "type" = 'agent.plan.scheduled_prepare_binding'`, [value.sessionId, value.turnId])
+      expect(prematureReceipt.rows).toHaveLength(0)
+      const prematureDispatch = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1`,
+        [value.sessionId])
+      expect(prematureDispatch.rows).toHaveLength(0)
+
+      const questionStore = createPgTurnQuestionStore(pool!)
+      const choiceWait = await questionStore.waitForQuestion({ owner: turnExecutionOwner, stepId, toolCallId: null,
+        expectedWaitId: expectedChoiceWaitId, finishReason: "stop", usage: candidateUsage, now: new Date() })
+      expect(choiceWait).toMatchObject({ status: "waiting_for_user", disposition: "created", waitId: expectedChoiceWaitId, toolCallId: null })
+      const webDbPath = "@/lib/db"
+      const webDatabase = await import(webDbPath) as unknown as {
+        db: { $disconnect(): Promise<void> }
+      }
+      disconnectWebDatabase = () => webDatabase.db.$disconnect()
+      const questionBrokerPath = "@/lib/agent/broker/store"
+      const questionBroker = await import(questionBrokerPath) as unknown as {
+        answerQuestion(db: unknown, input: { sessionId: string; userId: string; waitId: string; clientMessageId: string;
+          expectedTurnId: string; expectedRevision: number; answer: string; now: Date }): Promise<{
+            disposition: string; status: string; waitId: string; turnId: string; nextTurnRevision: number
+          }>
+      }
+      const answerResult = await questionBroker.answerQuestion(webDatabase.db, {
+        sessionId: value.sessionId, userId: value.userId, waitId: expectedChoiceWaitId,
+        clientMessageId: `scheduled-prepare-answer-${value.turnId}`, expectedTurnId: value.turnId,
+        expectedRevision: choiceWait.nextTurnRevision, answer: "keep_resume", now: new Date(),
+      })
+      expect(answerResult).toMatchObject({ disposition: "resolved", status: "answered", waitId: expectedChoiceWaitId,
+        turnId: value.turnId, nextTurnRevision: choiceWait.nextTurnRevision + 1 })
+
+      const rootStore = createPgRootTaskStore(pool as unknown as PgSubagentPool)
+      await rootStore.finish({ lease: turnLease, rootTaskId: value.rootTaskId, result: {
+        status: "waiting_for_user", stepCount: 1, toolCallCount: 0, waitId: expectedChoiceWaitId,
+      } })
+      const executionProjection = createCanonicalExecutionProjection(pool!)
+      await executionProjection.finish({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        result: { status: "waiting_for_user" } })
+      await releaseTurnLease(pool!, turnLease, "waiting_for_user")
+      const wakeupIdempotencyKey = `agent-wait-command:scheduled-prepare-answer-${value.turnId}:wakeup`
+      const pendingWakeup = await pool!.query<{ id: string; publishedAt: Date | null }>(
+        `SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "topic" = $1 AND "idempotencyKey" = $2`,
+        [AGENT_TURN_WAKEUP_TOPIC, wakeupIdempotencyKey])
+      expect(pendingWakeup.rows).toHaveLength(1)
+      expect(pendingWakeup.rows[0]?.publishedAt).toBeNull()
+      expect(await drainAgentWakeups(pool!, 10)).toBeGreaterThanOrEqual(1)
+      const publishedWakeup = await pool!.query<{ publishedAt: Date | null }>(
+        `SELECT "publishedAt" FROM "agent_outbox" WHERE "id" = $1`, [pendingWakeup.rows[0]!.id])
+      expect(publishedWakeup.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      const queuedTurn = await pool!.query<{ status: string; leaseVersion: number; leaseOwnerId: string | null }>(
+        `SELECT "status", "leaseVersion", "leaseOwnerId" FROM "agent_turns" WHERE "id" = $1`, [value.turnId])
+      expect(queuedTurn.rows[0]).toMatchObject({ status: "queued", leaseVersion: turnLease.leaseVersion, leaseOwnerId: null })
+
+      const resumedLease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId,
+        ownerId: `${value.leaseOwnerId}-resumed` })
+      expect(resumedLease.leaseVersion).toBe(turnLease.leaseVersion + 1)
+      const resumedRoot = await rootStore.ensure({ lease: resumedLease, goal: "Resume scheduled automation after the user's choice" })
+      expect(resumedRoot).toMatchObject({ id: value.rootTaskId, status: "running", leaseOwner: resumedLease.ownerId })
+      await createCanonicalExecutionProjection(pool!).start({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId })
+      const resumedOwner = { ...owner, turnLeaseOwnerId: resumedLease.ownerId, turnLeaseVersion: resumedLease.leaseVersion }
+      const resumedTurnExecutionOwner = {
+        kind: "turn" as const, userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        taskId: value.rootTaskId, rootTaskId: value.rootTaskId, ownerId: resumedLease.ownerId,
+        leaseVersion: resumedLease.leaseVersion, leaseExpiresAt: resumedLease.leaseExpiresAt,
+      }
+      graphScope = { ...graphScope, turnLeaseOwner: resumedLease.ownerId, turnLeaseVersion: resumedLease.leaseVersion,
+        parentLeaseOwner: resumedLease.ownerId, parentAttemptCount: 1 }
+      const resumedBridge = await bridge(resumedOwner)
+      expect(resumedBridge.status).toBe("ready")
+      if (resumedBridge.status !== "ready") throw new Error("Resumed scheduled pipeline did not rebind Analyze evidence")
+      expect(resumedBridge.attestation.owner).toEqual(resumedOwner)
+      expect(scheduledTaskGraphContinuationKey(resumedOwner, resumedBridge.attestation, executionOwner.executionId,
+        executionOwner.executionAttemptCount)).toBe(continuationKey)
+
+      const priorAgentWebUrl = process.env.AGENT_WEB_URL
+      const priorWorkerSecret = process.env.AGENT_WORKER_SECRET
+      process.env.AGENT_WEB_URL = "http://scheduled-pipeline.integration.invalid"
+      process.env.AGENT_WORKER_SECRET = `scheduled-pipeline-secret-${randomUUID()}`
+      const routePipelineCalls: Array<{ owner: IntegrationScheduledOwner; continuationKey: string; claimToken: string }> = []
+      let reboundHandoff: Awaited<ReturnType<typeof postScheduledPipelineContinuation>>
+      try {
+        vi.doMock(scheduledRouteRunServicePath, () => ({
+          runAgentPipeline: vi.fn(async (value: unknown) => {
+            const input = value as { scheduledTaskGraph: { owner: IntegrationScheduledOwner; continuationKey: string; claimToken: string } }
+            const scheduled = input.scheduledTaskGraph
+            routePipelineCalls.push({ owner: scheduled.owner, continuationKey: scheduled.continuationKey, claimToken: scheduled.claimToken })
+            const saved = await pool!.query<{ state: Record<string, unknown> }>(`SELECT "state" FROM "agent_executions" WHERE "id" = $1`, [scheduled.owner.executionId])
+            const reboundDigest = checkpointModule.scheduledTaskGraphAnalyzeCheckpointDigest(saved.rows[0]?.state)
+            if (!reboundDigest) throw new Error("Scheduled route did not persist a valid Analyze checkpoint")
+            return { status: "analyze_checkpointed", continuationKey: scheduled.continuationKey, checkpointDigest: reboundDigest,
+              claimTokenDigest: `sha256:${createHash("sha256").update(scheduled.claimToken, "utf8").digest("hex")}`,
+              executionId: scheduled.owner.executionId, executionAttemptCount: scheduled.owner.executionAttemptCount }
+          }),
+        }))
+        vi.doMock(scheduledRouteModelRouterPath, () => ({ APPLYMATE_BACKING: "fixture", loadUserAiConfig: vi.fn(async () => ({
+          resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-pipeline-route",
+        })), resolveConfig: vi.fn(() => ({ resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-pipeline-route" })) }))
+        vi.doMock(scheduledRouteEntitlementsPath, () => ({ isFeatureAllowed: vi.fn(async () => true),
+          hasEffectiveEntitlement: vi.fn(async () => true), resolveAiAccess: vi.fn(async () => "available") }))
+        const scheduledPipelineRoute = await vi.importActual<{ POST(request: Request): Promise<Response> }>(scheduledPipelineRoutePath)
+        const routeFetcher: typeof fetch = async (input, init) => scheduledPipelineRoute.POST(new Request(input, init))
+        reboundHandoff = await postScheduledPipelineContinuation({ owner: resumedOwner, attestation: resumedBridge.attestation },
+          new AbortController().signal, routeFetcher)
+      } finally {
+        if (priorAgentWebUrl === undefined) delete process.env.AGENT_WEB_URL
+        else process.env.AGENT_WEB_URL = priorAgentWebUrl
+        if (priorWorkerSecret === undefined) delete process.env.AGENT_WORKER_SECRET
+        else process.env.AGENT_WORKER_SECRET = priorWorkerSecret
+      }
+      expect(reboundHandoff.status).toBe("analyze_checkpointed")
+      if (reboundHandoff.status !== "analyze_checkpointed") throw new Error("Scheduled route did not return a rebound Analyze proof")
+      expect(routePipelineCalls).toHaveLength(1)
+      expect(routePipelineCalls[0]).toMatchObject({ owner: resumedOwner, continuationKey })
+      const reboundExecution = await pool!.query<{ status: string; state: Record<string, unknown> }>(
+        `SELECT "status", "state" FROM "agent_executions" WHERE "id" = $1`, [value.executionId])
+      expect(reboundExecution.rows[0]?.status).toBe("running")
+      expect((reboundExecution.rows[0]?.state.scheduledTaskGraphClaim as { owner: IntegrationScheduledOwner }).owner).toMatchObject(resumedOwner)
+      expect((reboundExecution.rows[0]?.state.scheduledTaskGraphContinuation as { owner: IntegrationScheduledOwner }).owner).toMatchObject(resumedOwner)
+      const reboundPrepareInput: TaskGraphScheduledPrepareInput = {
+        ...prepareInput, scope: { ...graphScope, stepId },
+        handoff: reboundHandoff.proof,
+        attestation: resumedBridge.attestation,
+      }
+      await expect(appendScheduledPrepare(prepareInput)).rejects.toMatchObject({ code: "scheduled_prepare_choice_binding_stale" })
+
+      const restartedCommand = createPgTaskGraphCommandPort(pool as unknown as PgSubagentPool)
+      const appendRestartedPrepare = restartedCommand.appendScheduledPrepare
+      if (!appendRestartedPrepare) throw new Error("Restarted PG command port omitted scheduled Prepare")
+      const restartedContinuation = createScheduledAutomationPrepareContinuation({
+        commandPort: restartedCommand, waitPort: durableWait,
+        async verifyReadyPrepare({ scope: verifyScope, prepareTaskId: verifyTaskId }) {
+          const graph = await loadTaskGraph(pool!, verifyScope, false)
+          const current = currentTaskGraph(graph)
+          const task = graph.tasks.get(verifyTaskId)
+          if (!graph.snapshot || !task || !Number.isSafeInteger(task.attemptCount)) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
+          return verifyScheduledPrepareTaskGraphEvidence(pool!, { scope: { ...verifyScope, taskId: verifyTaskId, attemptCount: task.attemptCount! },
+            snapshot: graph.snapshot, current, tasks: graph.tasks,
+            structuredResult: (task.result as Record<string, unknown> | null)?.structuredResult, completionGraphRevision: current.revision })
+        },
+      })
+      const continuationInput = {
+        owner: resumedOwner, executionOwner: resumedTurnExecutionOwner, attestation: resumedBridge.attestation,
+        proof: reboundHandoff.proof,
+        candidateText, finalStepId: stepId, finalStepOrdinal: 8, signal: new AbortController().signal,
+      }
+      const resumedPrepare = await restartedContinuation(continuationInput)
+      expect(resumedPrepare).toMatchObject({ status: "waiting_for_dependency" })
+      const scheduledReceipt = await appendRestartedPrepare(reboundPrepareInput)
+      expect(scheduledReceipt).toMatchObject({ status: "duplicate", revision: 2,
+        nodes: [{ key: "prepare", status: "queued" }], readyTaskIds: [expect.any(String)],
+        choice: { required: true, status: "answered", waitId: expectedChoiceWaitId } })
+      const prepareTaskId = scheduledReceipt.nodes[0]!.taskId
+      const preparedTask = await pool!.query<{ rootTaskId: string; parentTaskId: string; status: string; role: string; taskType: string }>(
+        `SELECT "rootTaskId", "parentTaskId", "status", "role", "taskType" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
+      expect(preparedTask.rows[0]).toMatchObject({ rootTaskId: value.rootTaskId, parentTaskId: value.rootTaskId,
+        status: "queued", role: TASK_GRAPH_TEMPLATES.prepare.role, taskType: TASK_GRAPH_TEMPLATES.prepare.taskType })
+      const storedGraph = await pool!.query<{ revision: number; content: Record<string, unknown> }>(
+        `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(value.rootTaskId)])
+      expect(storedGraph.rows[0]).toMatchObject({ revision: 2, content: { rootSuccessCriteria: snapshot.rootSuccessCriteria } })
+      expect((storedGraph.rows[0]!.content.nodes as Array<{ key: string; taskId: string }>)[2]).toMatchObject({ key: "prepare", taskId: prepareTaskId })
+
+      const privateReceipts = await pool!.query<{ id: string; itemId: string | null; taskId: string | null; actor: string; payload: Record<string, unknown> }>(
+        `SELECT "id", "itemId", "taskId", "actor", "payload" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'agent.plan.scheduled_prepare_binding'`, [value.sessionId, value.turnId])
+      expect(privateReceipts.rows).toHaveLength(1)
+      const privateReceipt = privateReceipts.rows[0]!
+      expect(privateReceipt).toMatchObject({ itemId: null, taskId: null, actor: "system" })
+      expect(privateReceipt.payload).not.toHaveProperty("claimToken")
+      expect(privateReceipt.payload).not.toHaveProperty("claimTokenDigest")
+      expect(JSON.stringify(privateReceipt.payload)).not.toContain(claimToken)
+      expect(privateReceipt.payload).toMatchObject({ continuationKey, analyzeGraphRevision: 1, prepareScheduleRevision: 2,
+        owner: { turnLeaseOwnerId: resumedLease.ownerId, turnLeaseVersion: resumedLease.leaseVersion } })
+      await expect(questionStore.readScheduledPrepareChoice({ owner: resumedTurnExecutionOwner, receipt: privateReceipt.payload, now: new Date() }))
+        .resolves.toMatchObject({ status: "answered", waitId: expectedChoiceWaitId, itemId: choiceWait.itemId, answer: "keep_resume" })
+      const receiptOutbox = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "idempotencyKey" = $1 OR "payload"->>'eventId' = $2`,
+        [`agent-event:${privateReceipt.id}`, privateReceipt.id])
+      expect(receiptOutbox.rows).toHaveLength(0)
+      const dispatch = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1`,
+        [`subagent-dispatch:${prepareTaskId}`])
+      expect(dispatch.rows).toHaveLength(1)
+      await expect(appendRestartedPrepare({ ...reboundPrepareInput,
+        handoff: { ...reboundPrepareInput.handoff, checkpointDigest: "f".repeat(64) } }))
+        .rejects.toMatchObject({ code: "scheduled_prepare_graph_mismatch" })
+
+      const [childRuntime, childStore, childManager, childRunner, childQueue, dispatchIdentity] = await Promise.all([
+        import("./production-child-runtime.js"), import("./pg-store.js"), import("./manager.js"),
+        import("../../queue/subagent-pause-dispatch.js"), import("../../queue/subagent-queue.js"), import("./dispatch-identity.js"),
+      ])
+      const profile: ModelAdapter["profile"] = {
+        provider: "fixture", model: "scheduled-prepare-integration", nativeTools: true, structuredOutput: true, streaming: true,
+        continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
+        supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false,
+        maxContextTokens: null, maxOutputTokens: 2200, costClass: "low",
+      }
+      let toolModelCalls = 0
+      let materialModelCalls = 0
+      const modelRuntimeFactory = (): ModelAdapter => ({
+        id: "scheduled-prepare-fixture", profile,
+        async *stream(request) {
+          const parts = request.messages.flatMap(message => message.content)
+          const toolResult = parts.find(part => part.type === "tool_result")
+          if (request.tools.some(tool => (tool as { name?: unknown }).name === "scheduled.application.prepare")) {
+            if (!toolResult || toolResult.type !== "tool_result") {
+              toolModelCalls += 1
+              yield { type: "tool_call_completed", callId: `scheduled-prepare-tool-${prepareTaskId}`, name: "scheduled.application.prepare", arguments: {} }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (toolResult.isError) throw new Error("scheduled Prepare tool returned an error")
+            yield { type: "text_delta", text: toolResult.content }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          const prompt = parts.filter(part => part.type === "text").map(part => part.text).join("\n")
+          materialModelCalls += 1
+          yield { type: "text_delta", text: prompt.includes("Tailor this resume")
+            ? JSON.stringify(baseResumeContent)
+            : prompt.includes("Write a concise, professional European application cover letter")
+              ? preparedLetter : (() => { throw new Error("unexpected scheduled Prepare model prompt") })() }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      })
+      const authorizeUsage = async () => ({ settle: async () => undefined })
+      const executor = childRuntime.createProductionChildExecutor({ pool: pool!, authorizeUsage, modelRuntimeFactory })
+      const manager = new childManager.AgentTreeManager(new childStore.PgSubagentTaskStore(pool!))
+      await prepareQueue.waitUntilReady()
+      expect(await childQueue.dispatchPendingSubagentOutbox(pool as never, prepareQueue, 10)).toBe(1)
+      const prepareQueueJobId = childQueue.subagentJobId(prepareTaskId)
+      const queuedPrepare = await prepareQueue.getJob(prepareQueueJobId)
+      expect(queuedPrepare?.data).toEqual({ taskId: prepareTaskId, sessionId: value.sessionId, rootTaskId: value.rootTaskId, ownerId: expect.any(String) })
+      prepareWorker = new Worker<SubagentJobPayload, unknown>(prepareQueueName, async job => {
+        const identity = dispatchIdentity.parseSubagentDispatchJobId(job.id, job.data.taskId)
+        if (!identity) throw new Error("scheduled Prepare dispatch identity was invalid")
+        return childRunner.runSubagentQueueJob(pool as never, manager, executor, job.data, identity)
+      }, { connection: redis.duplicate(), skipVersionCheck: true, concurrency: 1 })
+      const prepareCompleted = waitForSubagentWorkerCompletion(prepareWorker, prepareQueueJobId)
+      await prepareWorker.waitUntilReady()
+      const prepareOutcome = await prepareCompleted
+      expect(prepareOutcome).toMatchObject({ taskId: prepareTaskId, status: "completed" })
+      await prepareWorker.close()
+      prepareWorker = undefined
+
+      const completedPrepare = await pool!.query<{ status: string; attemptCount: number; failureReason: string | null; result: Record<string, unknown> }>(
+        `SELECT "status", "attemptCount", "failureReason", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepareTaskId])
+      expect(completedPrepare.rows[0]).toMatchObject({ status: "completed", attemptCount: 1, failureReason: null })
+      const structuredResult = completedPrepare.rows[0]?.result.structuredResult as Record<string, unknown> | undefined
+      expect(structuredResult).toMatchObject({ schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId,
+        attemptCount: 1, snapshotDigest: result.attestation.snapshotDigest, checkpointDigest,
+        jobs: [{ jobId: value.jobId, status: "prepared" }], materials: expect.arrayContaining([
+          expect.objectContaining({ jobId: value.jobId, kind: "resume" }),
+          expect.objectContaining({ jobId: value.jobId, kind: "cover_letter" }),
+        ]) })
+      expect(JSON.stringify(structuredResult)).not.toContain(preparedLetter)
+      expect(toolModelCalls).toBe(1)
+      expect(materialModelCalls).toBe(2)
+      expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toBeDefined()
+      const artifactVersions = await pool!.query<{ artifactType: string; content: unknown; version: number; taskId: string; sourceDigest: string; contentHash: string }>(
+        `SELECT "artifactType", "content", "version", "taskId", "sourceDigest", "contentHash" FROM "agent_artifact_version"
+          WHERE "taskId" = $1 ORDER BY "artifactType"`, [prepareTaskId])
+      expect(artifactVersions.rows).toHaveLength(2)
+      expect(artifactVersions.rows.map(row => row.artifactType)).toEqual(["cover_letter", "resume"])
+      expect(artifactVersions.rows[0]).toMatchObject({ artifactType: "cover_letter", content: preparedLetter, version: 1, taskId: prepareTaskId })
+      expect(artifactVersions.rows[1]).toMatchObject({ artifactType: "resume", content: baseResumeContent, version: 1, taskId: prepareTaskId })
+
+      const completedDuplicate = await appendRestartedPrepare(reboundPrepareInput)
+      expect(completedDuplicate).toMatchObject({ status: "duplicate", nodes: [{ key: "prepare", taskId: prepareTaskId, status: "waiting" }], readyTaskIds: [] })
+      if (resumedPrepare.status !== "waiting_for_dependency") throw new Error("Scheduled Prepare did not persist its dependency wait")
+      const resolvedPrepareWait = await durableWait.resolve({ userId: value.userId, sessionId: value.sessionId, waitId: resumedPrepare.waitId })
+      expect(resolvedPrepareWait).toMatchObject({ status: "ready", matchedTaskIds: [prepareTaskId] })
+      const readyPrepare = await restartedContinuation(continuationInput)
+      expect(readyPrepare.status).toBe("ready")
+      if (readyPrepare.status !== "ready") throw new Error("Scheduled Prepare fixture did not produce a verified proof")
+      const gateDatabase = await import(webDbPath) as unknown as {
+        db: { job: { findMany(input: unknown): Promise<unknown[]> }; $disconnect(): Promise<void> }
+      }
+      const gatePath = "@/lib/agent/scheduled-taskgraph-run-service"
+      const gateService = await import(gatePath) as unknown as {
+        buildScheduledTaskGraphGateResumeState(input: { owner: IntegrationScheduledOwner; snapshot: unknown; attestation: unknown; continuationKey: string;
+          claimToken: string; ownedJobs: readonly unknown[]; persistedCheckpoint: unknown; prepareProof: unknown }): Promise<Record<string, unknown>>
+      }
+      const ownedJobs = await gateDatabase.db.job.findMany({ where: { id: value.jobId, userId: value.userId } })
+      expect(ownedJobs).toHaveLength(1)
+      const resumedClaimOwner = { ...resumedOwner, ...executionOwner }
+      const resumedClaimToken = routePipelineCalls[0]!.claimToken
+      const currentExecutionState = (await pool!.query<{ state: Record<string, unknown> }>(
+        `SELECT "state" FROM "agent_executions" WHERE "id" = $1`, [value.executionId])).rows[0]?.state
+      expect(currentExecutionState).toBeDefined()
+      const gateState = await gateService.buildScheduledTaskGraphGateResumeState({ owner: resumedClaimOwner, snapshot: scheduledSnapshot,
+        attestation: resumedBridge.attestation, continuationKey, claimToken: resumedClaimToken, ownedJobs,
+        persistedCheckpoint: currentExecutionState, prepareProof: readyPrepare.prepareProof })
+      expect(gateState.nextStage).toBe("gate")
+      expect(gateState.scheduledTaskGraphPreparedArtifacts).toHaveLength(2)
+      expect(gateState.preparedPackages).toMatchObject([{ job: { id: value.jobId }, score: 82,
+        matchedKeywords: ["TypeScript"], missingKeywords: ["PostgreSQL"], coverLetter: preparedLetter,
+        tailoredResumeArtifact: { kind: "resume", version: 1 }, coverLetterArtifact: { kind: "cover_letter", version: 1 } }])
+
+      const duplicateQueueJob = await prepareQueue.getJob(prepareQueueJobId)
+      expect(await duplicateQueueJob?.getState()).toBe("completed")
+      await duplicateQueueJob?.remove()
+      await childQueue.enqueueSubagentTask(prepareQueue, { taskId: prepareTaskId, sessionId: value.sessionId,
+        rootTaskId: value.rootTaskId, ownerId: queuedPrepare!.data.ownerId }, 3, 0)
+      const restartedManager = new childManager.AgentTreeManager(new childStore.PgSubagentTaskStore(pool!))
+      const restartedExecutor = childRuntime.createProductionChildExecutor({ pool: pool!, authorizeUsage, modelRuntimeFactory })
+      restartedPrepareWorker = new Worker<SubagentJobPayload, unknown>(prepareQueueName, async job => {
+        const identity = dispatchIdentity.parseSubagentDispatchJobId(job.id, job.data.taskId)
+        if (!identity) throw new Error("replayed scheduled Prepare dispatch identity was invalid")
+        return childRunner.runSubagentQueueJob(pool as never, restartedManager, restartedExecutor, job.data, identity)
+      }, { connection: redis.duplicate(), skipVersionCheck: true, concurrency: 1 })
+      const duplicateCompletion = waitForSubagentWorkerCompletion(restartedPrepareWorker, prepareQueueJobId)
+      await restartedPrepareWorker.waitUntilReady()
+      expect(await duplicateCompletion).toMatchObject({ taskId: prepareTaskId, status: "skipped", reason: "not_available" })
+      await restartedPrepareWorker.close()
+      restartedPrepareWorker = undefined
+      expect(toolModelCalls).toBe(1)
+      expect(materialModelCalls).toBe(2)
+      const versionsAfterReplay = await pool!.query(`SELECT "id" FROM "agent_artifact_version" WHERE "taskId" = $1`, [prepareTaskId])
+      expect(versionsAfterReplay.rows).toHaveLength(2)
+
+      const finalReceiptCount = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'agent.plan.scheduled_prepare_binding'`,
+        [value.sessionId, value.turnId])
+      const finalDispatchCount = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1`,
+        [`subagent-dispatch:${prepareTaskId}`])
+      expect(finalReceiptCount.rows).toHaveLength(1)
+      expect(finalDispatchCount.rows).toHaveLength(1)
 
       const redelivery = await queue.add("continue-scheduled-taskgraph", payload, {
         jobId, attempts: 2, backoff: { type: "fixed", delay: 250 }, removeOnComplete: false,
@@ -851,10 +1333,15 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     } finally {
       await firstWorker?.close().catch(() => undefined)
       await restartedWorker?.close().catch(() => undefined)
+      await prepareWorker?.close().catch(() => undefined)
+      await restartedPrepareWorker?.close().catch(() => undefined)
       const job = await queue.getJob(jobId).catch(() => undefined)
       if (job) await job.remove().catch(() => undefined)
-      await queue.close().catch(() => undefined)
-      await Promise.all([queueRedis.quit().catch(() => queueRedis.disconnect()), redis.quit().catch(() => redis.disconnect())])
+      try { await queue.close() } catch { /* Continue cleanup for the isolated Prepare queue. */ }
+      // The UUID-scoped Prepare queue belongs only to this test.
+      await prepareQueue.obliterate({ force: true }).catch(() => undefined)
+      await prepareQueue.close().catch(() => undefined)
+      await Promise.all([queueRedis.quit().catch(() => queueRedis.disconnect()), prepareQueueRedis.quit().catch(() => prepareQueueRedis.disconnect()), redis.quit().catch(() => redis.disconnect())])
     }
   })
 
@@ -941,6 +1428,22 @@ function waitForWorkerJobEvent<Result>(worker: Worker<ScheduledContinuationPaylo
         resolve(result)
       })
     }
+  })
+}
+
+function waitForSubagentWorkerCompletion(worker: Worker<SubagentJobPayload, unknown>, jobId: string): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Scheduled Prepare child timed out: ${jobId}`)), 30_000)
+    worker.on("completed", (job, result) => {
+      if (job.id !== jobId) return
+      clearTimeout(timer)
+      resolve(result)
+    })
+    worker.on("failed", (job, error) => {
+      if (job?.id !== jobId) return
+      clearTimeout(timer)
+      reject(error)
+    })
   })
 }
 

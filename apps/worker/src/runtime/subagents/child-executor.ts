@@ -7,7 +7,8 @@ import { executionOwnerFence } from "../execution-owner.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
-import { ROLE_RESULT_SCHEMA, roleResultOutputSchema, type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
+import { roleResultOutputSchema, type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
+import { expectedStructuredRole } from "./production-child-policy.js"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
 import { TaskGraphWriterReviewFeedbackError } from "./task-graph-writer-review-feedback.js"
 import type { TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
@@ -66,19 +67,6 @@ function projectChildFinalText(value: string): string {
   if (Buffer.byteLength(redacted, "utf8") <= MAX_CHILD_FINAL_TEXT_BYTES) return redacted
   const markerBytes = Buffer.byteLength(CHILD_FINAL_TEXT_TRUNCATION_MARKER, "utf8")
   return `${utf8Prefix(redacted, MAX_CHILD_FINAL_TEXT_BYTES - markerBytes)}${CHILD_FINAL_TEXT_TRUNCATION_MARKER}`
-}
-
-function expectedStructuredRole(value: unknown, leasedRole: string): StructuredRole | undefined {
-  if (leasedRole !== "scout" && leasedRole !== "analyst" && leasedRole !== "writer" && leasedRole !== "reviewer" || !value || typeof value !== "object" || Array.isArray(value)) return undefined
-  try {
-    const marker = value as Record<string, unknown>
-    const prototype = Object.getPrototypeOf(value)
-    if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length > 0) return undefined
-    if (Object.keys(marker).length !== 2 || marker.schemaVersion !== ROLE_RESULT_SCHEMA || marker.role !== leasedRole) return undefined
-    return leasedRole
-  } catch {
-    return undefined
-  }
 }
 
 export type ChildExecutorOptions = {
@@ -189,7 +177,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
         const restored = await options.resumeLoader(lease)
         if (restored) {
           if (!selectedEvidenceTask) {
-            try { hydrateObservedEvidence(observedEvidence, restored.observations) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
+            try { hydrateObservedEvidence(observedEvidence, restored.observations, { taskId: lease.id, attemptCount: lease.attemptCount }) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
             snapshot = { ...snapshot, toolObservations: [...restored.observations] }
           }
           resume = restored.resume
@@ -228,7 +216,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const executeTool: typeof routedTool = async input => {
       if (selectedJobPreparation && isSelectedJobReadTool(input.call.toolName)) privateCallIds.add(input.call.id)
       const toolResult = await dispatchTool(input)
-      if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
+      if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output,
+        undefined, input.call.toolName === "scheduled.application.prepare" ? { toolCallId: input.call.id, taskId: lease.id, attemptCount: lease.attemptCount } : undefined)
       return toolResult
     }
     const contextBuilder = createChildContextBuilder(

@@ -5,6 +5,7 @@ import {
   evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery,
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
   TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  validateScheduledPrepareDependencyEvidence,
   validateTaskGraphVerificationContract,
   type TaskGraphVerificationDependencyEvidence,
   type TaskGraphVerificationContract,
@@ -20,6 +21,32 @@ function validatedContract(role: "scout" | "analyst", criteria: unknown[]): Task
   if (!result.ok) throw new Error("test_contract_invalid")
   return result.contract
 }
+
+describe("Scheduled Prepare dependency evidence", () => {
+  const valid = {
+    analyst: { key: "analyst-1", status: "completed", templateId: "analyst" },
+    prepare: { dependsOn: ["analyst-1"], key: "prepare-1", templateId: "prepare" },
+  }
+
+  it("requires one distinct Prepare node to depend directly on a completed Analyst", () => {
+    expect(validateScheduledPrepareDependencyEvidence(valid)).toBe(true)
+  })
+
+  it.each([
+    [{ prepare: valid.prepare }],
+    [{ analyst: valid.analyst }],
+    [{ ...valid, analyst: { ...valid.analyst, status: "running" } }],
+    [{ ...valid, analyst: { ...valid.analyst, templateId: "scout" } }],
+    [{ ...valid, prepare: { ...valid.prepare, dependsOn: ["other"] } }],
+    [{ ...valid, prepare: { ...valid.prepare, dependsOn: ["analyst-1", "other"] } }],
+    [{ ...valid, prepare: { ...valid.prepare, key: "analyst-1" } }],
+    [{ ...valid, prepare: { ...valid.prepare, extra: true } }],
+    [{ ...valid, extra: true }],
+    [{ ...valid, analyst: { ...valid.analyst, key: " analyst-1" } }],
+  ])("rejects missing, ambiguous, or malformed Analyst dependency evidence", evidence => {
+    expect(validateScheduledPrepareDependencyEvidence(evidence)).toBe(false)
+  })
+})
 
 describe("TaskGraph typed verification contract", () => {
   it.each([

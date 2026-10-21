@@ -201,6 +201,19 @@ export function validateTaskGraphVerificationContract(value: unknown, templateId
 export function taskGraphVerificationRole(templateId: string): TaskGraphVerificationRole | undefined {
   return Object.hasOwn(TEMPLATE_ROLES, templateId) ? TEMPLATE_ROLES[templateId] : undefined
 }
+
+/** The scheduled continuation may bind Prepare only to its completed, sole direct Analyst dependency. */
+export function validateScheduledPrepareDependencyEvidence(value: unknown): boolean {
+  const row = exactRecord(value, "analyst,prepare")
+  const prepare = row && exactRecord(row.prepare, "dependsOn,key,templateId")
+  const analyst = row && exactRecord(row.analyst, "key,status,templateId")
+  const dependsOn = prepare && denseArray(prepare.dependsOn, 1)
+  const validKey = (key: unknown) => typeof key === "string" && key.length > 0 && key.length <= 128 && key.trim() === key
+  return Boolean(prepare && analyst && dependsOn && prepare.templateId === "prepare" && analyst.templateId === "analyst"
+    && validKey(prepare.key) && validKey(analyst.key) && prepare.key !== analyst.key && analyst.status === "completed"
+    && dependsOn.length === 1 && dependsOn[0] === analyst.key)
+}
+
 function unverifiedEvaluation(contract: TaskGraphVerificationContract, reasonCode: TaskGraphVerificationReasonCode): TaskGraphVerificationEvaluation {
   return { status: "unverified", reasonCode, criteria: contract.criteria.map(c => ({ criterionId: c.id, status: "unverified", reasonCode })) }
 }

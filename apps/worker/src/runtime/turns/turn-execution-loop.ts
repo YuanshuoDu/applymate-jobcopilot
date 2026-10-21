@@ -9,7 +9,7 @@ import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, SCHEDULED_PIPELINE_COMPLETION, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
@@ -19,6 +19,7 @@ import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuest
 import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
 import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
+import { takeRecoveredScheduledPipelineCandidate, withScheduledPipelineCandidateModelOutput } from "../subagents/scheduled-pipeline-candidate-store.js"
 const DEFAULT_MAX_STEPS = 32
 
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
@@ -36,6 +37,10 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let toolCalls = options.resume?.toolCallCount ?? 0
   let continuation: ModelContinuation | undefined
   let recoveredCandidate = options.recoveredFinalCandidate
+  let recoveredScheduledCandidate: ReturnType<typeof takeRecoveredScheduledPipelineCandidate> = undefined
+  if (options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId && recoveredCandidate !== undefined) {
+    recoveredScheduledCandidate = takeRecoveredScheduledPipelineCandidate({ owner: options.identity, candidateText: recoveredCandidate })
+  }
   let steeringMarkerState = options.steeringMarkerState
   const seenCallIds = new Set<string>()
   let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>(), receiptClosedSteps = new Set<string>()
@@ -53,20 +58,47 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
     const recoveredQuestion = await recoverPendingNativeQuestion(executionOptions, now, steps, toolCalls)
     if (recoveredQuestion) return recoveredQuestion
+    if (recoveredScheduledCandidate && (!options.resume || options.resume.nextOrdinal !== recoveredScheduledCandidate.finalStepOrdinal + 1)) {
+      throw new TurnEngineError("persistence_conflict", "Scheduled candidate recovery does not match the next durable step")
+    }
     for (let ordinal = options.resume?.nextOrdinal ?? 0; ; ordinal += 1) {
       assertExecutionAlive(options, signal)
-      budget.reserveStep()
-      steps += 1
-      const stepId = makeExecutionId(options, `step:${ordinal}`)
-      const attempt = options.identity.kind === "task" ? options.identity.attemptCount ?? 1 : 1
-      const step = await options.store.startStep({
-        identity: options.identity, stepId, ordinal, attempt, inputThroughSequence, consumedInputIds: [],
-        modelProfileSnapshot: toRepositoryJson(options.model.profile), now: now(),
+      const replayCandidate = recoveredScheduledCandidate && ordinal === options.resume?.nextOrdinal ? recoveredScheduledCandidate : undefined
+      const replayScheduled = replayCandidate !== undefined
+      if (!replayScheduled) { budget.reserveStep(); steps += 1 }
+      const stepId = replayCandidate?.finalStepId ?? makeExecutionId(options, `step:${ordinal}`)
+      const stepOrdinal = replayCandidate?.finalStepOrdinal ?? ordinal
+      const step = replayScheduled ? { id: stepId, ordinal: stepOrdinal } : await options.store.startStep({
+        identity: options.identity, stepId, ordinal, attempt: options.identity.kind === "task" ? options.identity.attemptCount ?? 1 : 1,
+        inputThroughSequence, consumedInputIds: [], modelProfileSnapshot: toRepositoryJson(options.model.profile), now: now(),
       })
       lastStep = step
       let stepOutput: ModelStepResult | null = null
       let questionIntentCallId: string | null = null
       try {
+        if (replayCandidate) {
+          if (!isModelFinishReason(replayCandidate.finishReason)) throw new TurnEngineError("persistence_conflict", "Scheduled candidate finish reason is invalid")
+          const owner = options.identity
+          if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId) throw new TurnEngineError("persistence_conflict", "Scheduled candidate owner is invalid")
+          if (options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
+          const output: ModelStepResult = { text: replayCandidate.candidateText, reasoningSummary: "", toolCalls: [],
+            provider: "recovered", model: "recovered", finishReason: replayCandidate.finishReason,
+            usage: replayCandidate.usage, continuation: null }
+          stepOutput = output
+          const replayContext = { taskGraphRevision: snapshot.taskGraphRevision, inputThroughSequence, consumedInputIds }
+          const complete = () => completeTurnCandidate({ options, writer, step, output, snapshot, stepCount: steps, toolCallCount: toolCalls,
+            usage: budget.usage(), signal, now, onStepClosed: kind => {
+              closedSteps.add(step.id)
+              if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
+            } })
+          const outcome = await withScheduledPipelineCandidateModelOutput({ owner, finalStepId: step.id,
+            finalStepOrdinal: step.ordinal, candidateText: output.text, finishReason: output.finishReason, usage: output.usage }, complete)
+          if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
+          snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, replayContext,
+            options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId)
+          continuation = undefined
+          continue
+        }
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
         if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
         const context = await options.contextBuilder.build({
@@ -164,11 +196,17 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           }
           continue
         }
-        const outcome = await completeTurnCandidate({ options, writer, step, output, snapshot, stepCount: steps, toolCallCount: toolCalls,
+        const complete = () => completeTurnCandidate({ options, writer, step, output, snapshot, stepCount: steps, toolCallCount: toolCalls,
           usage: budget.usage(), signal, now, onStepClosed: kind => {
             closedSteps.add(step.id)
             if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
           } })
+        const scheduledFinal = options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId
+          && Boolean(options.completionGate?.[SCHEDULED_PIPELINE_COMPLETION])
+        const outcome = scheduledFinal
+          ? await withScheduledPipelineCandidateModelOutput({ owner: options.identity, finalStepId: step.id, finalStepOrdinal: step.ordinal,
+            candidateText: output.text, finishReason: output.finishReason, usage: output.usage ?? null }, complete)
+          : await complete()
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
         snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, context, options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId); continuation = undefined; continue
       } catch (error: unknown) {
@@ -247,4 +285,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     ).catch(() => undefined)
     return { status: "failed", stepCount: steps, toolCallCount: toolCalls, errorCode: code, ...(finalItem ? { finalItemId: finalItem.id } : {}) }
   }
+}
+
+function isModelFinishReason(value: string): value is ModelStepResult["finishReason"] {
+  return value === "length" || value === "error" || value === "stop" || value === "tool_calls" || value === "content_filter"
 }

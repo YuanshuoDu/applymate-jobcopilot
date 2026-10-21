@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { SessionPauseRequestedError, OPEN_SESSION, SESSION_WORK_ADMISSION } from "../session-gate.js"
-import { TurnQuestionStoreError, type TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
+import { buildTurnQuestionScheduledChoiceBinding, createTurnScheduledPrepareChoiceContent, scheduledAnalyzeCheckpointEvidence, TurnQuestionStoreError,
+  turnScheduledPrepareChoiceWaitId, type TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
 import { questionId, questionItemId, type TurnQuestionPool } from "./turn-question-store-guards.js"
 import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
@@ -24,6 +26,65 @@ const intent: TurnQuestionIntentEnvelope = {
 const callContent = { toolCallId, toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null,
   input: { question: intent.question, choices: intent.options } }
 const resultContent = { toolCallId, output: intent, errorCode: null }
+
+const scheduledSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"], targetLocations: ["Dublin"],
+  minScore: 70, dailyCap: 10, requireApproval: true, autoApply: false }
+const scheduledOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+  rootAttemptCount: 1, turnLeaseOwnerId: owner.ownerId, turnLeaseVersion: owner.leaseVersion, executionId: "execution-1", executionAttemptCount: 2 }
+const scheduledContinuation = { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
+  key: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
+  snapshotDigest: `sha256:${createHash("sha256").update(JSON.stringify([scheduledSnapshot.schemaVersion, scheduledSnapshot.targetRoles, scheduledSnapshot.targetLocations,
+    scheduledSnapshot.minScore, scheduledSnapshot.dailyCap, scheduledSnapshot.requireApproval, scheduledSnapshot.autoApply]), "utf8").digest("hex")}`,
+  evidenceDigest: "b".repeat(64), graphRevision: 2, owner: scheduledOwner }
+const scheduledCheckpointState = { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: owner.userId }],
+  scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 82, matchedKeywords: ["TypeScript"], missingKeywords: ["PostgreSQL"],
+    recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }], analysisFailed: 0,
+  scheduledTaskGraphContinuation: scheduledContinuation }
+const scheduledCheckpointEvidence = scheduledAnalyzeCheckpointEvidence(scheduledCheckpointState)!
+const scheduledReceipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1", owner: scheduledOwner,
+  continuationKey: scheduledContinuation.key, snapshotDigest: scheduledContinuation.snapshotDigest, evidenceDigest: scheduledContinuation.evidenceDigest,
+  checkpointDigest: scheduledCheckpointEvidence.checkpointDigest, analyzeGraphRevision: 2, prepareScheduleRevision: 3 }
+const scheduledFinalStepId = "final-step-1", scheduledFinalStepOrdinal = 4
+const scheduledBinding = buildTurnQuestionScheduledChoiceBinding({ receipt: scheduledReceipt, finalStepId: scheduledFinalStepId, finalStepOrdinal: scheduledFinalStepOrdinal })!
+const scheduledWaitId = turnScheduledPrepareChoiceWaitId(scheduledBinding)!
+
+function scheduledChoiceFixture(options: { turnStatus?: string; stepStatus?: string; itemStatus?: string; itemContent?: unknown; candidateUsage?: unknown } = {}) {
+  const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+  let sequence = 0
+  const candidateUsage = options.candidateUsage === undefined ? { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 } : options.candidateUsage
+  const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+    calls.push({ sql, values })
+    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.includes(SESSION_WORK_ADMISSION)) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+    if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+    if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId, status: options.turnStatus ?? "in_progress", revision: 4 }], rowCount: 1 }
+    if (sql.includes('event."type" = $4') && sql.includes('root."attemptCount"')) return { rows: [{ itemId: null, taskId: owner.rootTaskId, actor: "orchestrator",
+      correlationId: scheduledFinalStepId, idempotencyKey: `scheduled-candidate:${owner.rootTaskId}:1:${scheduledFinalStepId}`,
+      payload: { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v2", sessionId: owner.sessionId, turnId: owner.turnId,
+        rootTaskId: owner.rootTaskId, rootAttemptCount: 1, finalStepId: scheduledFinalStepId, finalStepOrdinal: scheduledFinalStepOrdinal, stepAttempt: 1, candidateText: "final",
+        finishReason: "stop", usage: candidateUsage },
+      stepTaskId: owner.rootTaskId, ordinal: scheduledFinalStepOrdinal, attempt: 1, stepStatus: options.stepStatus ?? "streaming", attemptCount: 1, rootStatus: "running" }], rowCount: 1 }
+    if (sql.includes('execution."attemptCount"')) return { rows: [{ source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: scheduledSnapshot }, id: "execution-1", attemptCount: 2,
+      status: "running", state: scheduledCheckpointState }], rowCount: 1 }
+    if (sql.includes('FROM "agent_items"') && sql.includes('WHERE "id" = $1')) return options.itemStatus
+      ? { rows: [{ id: `agent-wait:question:${scheduledWaitId}`, stepId: scheduledFinalStepId, taskId: owner.taskId, type: "question",
+        status: options.itemStatus, content: options.itemContent }], rowCount: 1 }
+      : { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_steps"') && sql.includes('WHERE "id" = $1')) return { rows: [{ id: scheduledFinalStepId, status: options.stepStatus ?? "streaming",
+      taskId: owner.taskId, attempt: 1, finishReason: options.stepStatus === "waiting_for_user" ? "stop" : null, errorCode: null,
+      inputTokens: options.stepStatus === "waiting_for_user" ? 7 : 0, outputTokens: options.stepStatus === "waiting_for_user" ? 3 : 0,
+      estimatedCostUsd: options.stepStatus === "waiting_for_user" ? 0.02 : 0 }], rowCount: 1 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('ORDER BY "sequence" DESC LIMIT 1')) return { rows: [{ id: "previous-event" }], rowCount: 1 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = $2')) return { rows: [], rowCount: 0 }
+    if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: String(++sequence) }], rowCount: 1 }
+    if (sql.includes('UPDATE "agent_steps"')) return { rows: [], rowCount: 1 }
+    if (sql.includes('UPDATE "agent_turns" SET "status"')) return { rows: [{ revision: 5 }], rowCount: 1 }
+    if (sql.includes('INSERT INTO "agent_items"') || sql.includes('INSERT INTO "agent_events"') || sql.includes('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 1 }
+    throw new Error(`unexpected_scheduled_choice_query:${sql}`)
+  }), release: vi.fn() }
+  return { calls, store: createPgTurnQuestionStore({ connect: vi.fn(async () => client) } as unknown as TurnQuestionPool) }
+}
 
 type Fixture = {
   readonly calls: Array<{ sql: string; values?: readonly unknown[] }>
@@ -326,5 +387,62 @@ describe("PostgreSQL native question store", () => {
     await expect(failed.store.waitForQuestion({ owner, stepId, toolCallId, now })).rejects.toBe(dbError)
     expect(failed.calls.filter(call => call.sql === "ROLLBACK")).toHaveLength(1)
     expect(failed.calls.filter(call => call.sql === "COMMIT")).toHaveLength(0)
+  })
+})
+
+describe("PostgreSQL scheduled Prepare choice", () => {
+  it("derives the wait ID and atomically stores the null-tool-call question with final model usage", async () => {
+    const f = scheduledChoiceFixture()
+    const receipt = await f.store.waitForQuestion({ owner, stepId: "current-resumed-step", toolCallId: null, expectedWaitId: scheduledWaitId,
+      finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, now })
+    expect(receipt).toEqual({ status: "waiting_for_user", disposition: "created", waitId: scheduledWaitId,
+      itemId: `agent-wait:question:${scheduledWaitId}`, turnId: owner.turnId, toolCallId: null, nextTurnRevision: 5 })
+    const item = f.calls.find(call => call.sql.includes('INSERT INTO "agent_items"'))
+    expect(JSON.parse(String(item?.values?.[5]))).toEqual(createTurnScheduledPrepareChoiceContent(scheduledWaitId, scheduledBinding))
+    const step = f.calls.find(call => call.sql.includes('UPDATE "agent_steps" SET "status"'))
+    expect(step?.values).toEqual(["stop", 7, 3, 0.02, now, scheduledFinalStepId, owner.sessionId, owner.turnId, owner.taskId])
+    expect(f.calls.find(call => call.sql.includes('UPDATE "agent_turns" SET "status"'))?.sql).toContain('"leaseOwnerId" = $5 AND "leaseVersion" = $6')
+    const events = f.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))
+    expect(events).toHaveLength(2)
+    expect(JSON.parse(String(events[1]?.values?.[10]))).toEqual({ itemId: receipt.itemId, waitKind: "question", questionId: scheduledWaitId, toolCallId: null })
+    expect(f.calls.some(call => call.sql.includes("agent.ask_user"))).toBe(false)
+    expect(f.calls.findIndex(call => call.sql === "COMMIT")).toBeGreaterThan(f.calls.findIndex(call => call.sql.includes('INSERT INTO "agent_outbox"')))
+  })
+
+  it("creates and replays the deterministic choice wait when the candidate receipt has null usage", async () => {
+    const f = scheduledChoiceFixture({ candidateUsage: null })
+    const input = { owner, stepId: scheduledFinalStepId, toolCallId: null, expectedWaitId: scheduledWaitId,
+      finishReason: "stop", usage: null, now }
+    await expect(f.store.waitForQuestion(input)).resolves.toMatchObject({ status: "waiting_for_user", disposition: "created", waitId: scheduledWaitId })
+    const stepUpdate = f.calls.find(call => call.sql.includes('UPDATE "agent_steps" SET "status"'))
+    expect(stepUpdate?.values?.slice(0, 4)).toEqual(["stop", 0, 0, 0])
+
+    const replay = scheduledChoiceFixture({ candidateUsage: null, turnStatus: "waiting_for_user", stepStatus: "waiting_for_user",
+      itemStatus: "started", itemContent: createTurnScheduledPrepareChoiceContent(scheduledWaitId, scheduledBinding) })
+    await expect(replay.store.waitForQuestion(input)).resolves.toMatchObject({ status: "waiting_for_user", disposition: "replayed", waitId: scheduledWaitId })
+    expect(replay.calls.some(call => call.sql.includes('INSERT INTO "agent_items"') || call.sql.includes('UPDATE "agent_turns" SET "status"')
+      || call.sql.includes('INSERT INTO "agent_events"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("fails closed when the Web/API expected ID or current continuation receipt differs", async () => {
+    const wrongId = scheduledChoiceFixture()
+    await expect(wrongId.store.waitForQuestion({ owner, stepId: scheduledFinalStepId, toolCallId: null, expectedWaitId: "web-wait",
+      finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, now })).rejects.toMatchObject({ code: "question_conflict" })
+    expect(wrongId.calls.some(call => call.sql.includes('INSERT INTO "agent_items"') || call.sql.includes('UPDATE "agent_steps"'))).toBe(false)
+
+    const staleReceipt = scheduledChoiceFixture()
+    await expect(staleReceipt.store.readScheduledPrepareChoice({ owner, receipt: { ...scheduledReceipt,
+      owner: { ...scheduledOwner, executionAttemptCount: 3 } }, now })).rejects.toMatchObject({ code: "question_conflict" })
+    expect(staleReceipt.calls.some(call => call.sql.includes('FROM "agent_items"'))).toBe(false)
+  })
+
+  it("reloads only the exact private answered item bound to the current receipt", async () => {
+    const content = { ...createTurnScheduledPrepareChoiceContent(scheduledWaitId, scheduledBinding), answer: "keep_resume", answerAvailable: true }
+    const f = scheduledChoiceFixture({ turnStatus: "in_progress", stepStatus: "waiting_for_user", itemStatus: "completed", itemContent: content })
+    await expect(f.store.readScheduledPrepareChoice({ owner, receipt: scheduledReceipt, now })).resolves.toEqual({ status: "answered", waitId: scheduledWaitId,
+      itemId: `agent-wait:question:${scheduledWaitId}`, answer: "keep_resume", binding: scheduledBinding })
+
+    const forged = scheduledChoiceFixture({ turnStatus: "in_progress", stepStatus: "waiting_for_user", itemStatus: "completed", itemContent: { ...content, toolCallId: "ask_user" } })
+    await expect(forged.store.readScheduledPrepareChoice({ owner, receipt: scheduledReceipt, now })).rejects.toMatchObject({ code: "question_conflict" })
   })
 })

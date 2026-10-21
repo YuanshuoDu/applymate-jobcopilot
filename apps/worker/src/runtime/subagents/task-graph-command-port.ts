@@ -19,6 +19,7 @@ import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-cat
 import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-structured-failure-category.js"
 import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
+import type { ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
 export type {
   TaskGraphNativeChildReceipt,
@@ -38,6 +39,7 @@ export type {
   TaskGraphScoutProjectionItem,
   TaskGraphAnalystProjectionItem,
   TaskGraphArtifactProjectionReference,
+  TaskGraphPrepareProjectionJob,
   TaskGraphResultProjection,
 } from "./task-graph-result-projection-contract.js"
 export const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION = "agent-harness.v2.task-graph-repair-receipt.v1" as const
@@ -133,6 +135,13 @@ export type TaskGraphScheduleReceipt = Readonly<{
   readyTaskIds: readonly string[]
 }>
 
+/** A choice wait has no scheduled node; accepted receipts describe the later atomic append. */
+export type TaskGraphScheduledPrepareReceipt =
+  | Readonly<{ status: "waiting_for_choice"; revision: number; nodes: readonly []; readyTaskIds: readonly [];
+      choice: Readonly<{ required: true; status: "waiting"; waitId: string }> }>
+  | (TaskGraphScheduleReceipt & Readonly<{ choice: Readonly<{ required: true; status: "answered"; waitId: string }>
+      | Readonly<{ required: false }> }>)
+
 export type TaskGraphScheduleInput = Readonly<{
   scope: TaskGraphExecutionScope
   proposal: TaskGraphProposal
@@ -144,6 +153,39 @@ export type TaskGraphScheduleInput = Readonly<{
   /** Server-resolved from the persisted Turn objective; never populated from model tool input. */
   verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>
+
+export type ScheduledAnalyzeCheckpointHandoff = Readonly<{
+  status: "analyze_checkpointed"
+  continuationKey: string
+  checkpointDigest: string
+  claimTokenDigest: string
+  executionId: string
+  executionAttemptCount: number
+}>
+export type ScheduledTaskGraphExecutionOwner = Readonly<{ executionId: string; executionAttemptCount: number }>
+export type TaskGraphScheduledPrepareInput = Readonly<{
+  scope: TaskGraphExecutionScope
+  /** Independently sourced from the leased scheduled execution claim. */
+  executionOwner: ScheduledTaskGraphExecutionOwner
+  /** Authenticated Analyze-only Web response; the digest is opaque to Worker. */
+  handoff: ScheduledAnalyzeCheckpointHandoff
+  attestation: ScheduledAutomationPipelineAttestation
+  /** Server-produced one-node proposal; continuation binding is never proposal content. */
+  proposal: TaskGraphProposal
+}>
+
+/** Exact proposal shape accepted by the scheduled-only Prepare command. */
+export function parseScheduledPrepareProposal(value: unknown, analystKey: string, analyzeRevision: number): TaskGraphProposal | undefined {
+  if (!boundedString(analystKey, 128) || !Number.isSafeInteger(analyzeRevision) || analyzeRevision < 1
+    || !exactRecord(value, "expectedRevision,nodes") || value.expectedRevision !== analyzeRevision
+    || !denseArray(value.nodes, 1) || value.nodes.length !== 1) return undefined
+  const node = value.nodes[0]
+  if (!exactRecord(node, "dependsOn,goal,key,successCriteria,templateId") || node.key !== "prepare" || node.templateId !== "prepare"
+    || !boundedString(node.goal, 1200) || !denseArray(node.successCriteria, 8) || node.successCriteria.length === 0
+    || node.successCriteria.some(item => !boundedString(item, 320)) || !denseArray(node.dependsOn, 1)
+    || node.dependsOn.length !== 1 || node.dependsOn[0] !== analystKey) return undefined
+  return value as TaskGraphProposal
+}
 
 export type RegisteredScoutEnvelope = Readonly<{
   role: "scout"
@@ -224,6 +266,8 @@ export class TaskGraphCommandError extends Error {
 export type TaskGraphKeepReconciliationReceipt = Readonly<{ decision: "keep"; revision: number; reconciledInputCount: number }>
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
+  /** Scheduled-only same-root append; production callers must fail closed if absent. */
+  appendScheduledPrepare?(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt>
   appendAndScheduleWithReconciliation?(input: TaskGraphScheduleInput, operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt>
   reconcileSteering?(operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphKeepReconciliationReceipt>
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */

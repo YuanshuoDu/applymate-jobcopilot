@@ -3,6 +3,7 @@ import { Prisma, type Job } from "@prisma/client";
 import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig } from "@/lib/model-router";
 import { db } from "@/lib/db";
 import { runAgentPipeline, type ScheduledTaskGraphWaitResult } from "@/lib/agent/run-service";
+import { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity } from "@/lib/agent/scheduled-taskgraph-run-service";
 import { parseScheduledAutomationSnapshot } from "@/lib/agent/scheduled-automation-snapshot";
 import { completedScheduledTaskGraphReport, rebindScheduledTaskGraphAnalysisStateForLease } from "@/lib/agent/scheduled-taskgraph-analysis-journal";
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
@@ -13,7 +14,7 @@ export const maxDuration = 300;
 const CLAIM_SCHEMA = "agent-harness.v2.scheduled-pipeline-claim.v1";
 const OWNER_KEYS = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion"];
 type RequestOwner = Pick<ScheduledTaskGraphPipelineOwner, "userId" | "sessionId" | "turnId" | "rootTaskId" | "rootAttemptCount" | "turnLeaseOwnerId" | "turnLeaseVersion">;
-type ParsedBody = { owner: RequestOwner; attestation: unknown };
+type ParsedBody = { owner: RequestOwner; attestation: unknown; prepareProof?: unknown; scheduledWaitId?: string };
 type StoredExecution = { id: string; status: string; attemptCount: number; state: unknown };
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -26,26 +27,22 @@ function parseOwner(value: unknown): RequestOwner | null {
     || ![row.userId, row.sessionId, row.turnId, row.rootTaskId, row.turnLeaseOwnerId].every(validId)
     || !Number.isSafeInteger(row.rootAttemptCount) || Number(row.rootAttemptCount) < 1
     || !Number.isSafeInteger(row.turnLeaseVersion) || Number(row.turnLeaseVersion) < 1) return null;
-  return { userId: row.userId as string, sessionId: row.sessionId as string, turnId: row.turnId as string,
-    rootTaskId: row.rootTaskId as string, rootAttemptCount: Number(row.rootAttemptCount),
-    turnLeaseOwnerId: row.turnLeaseOwnerId as string, turnLeaseVersion: Number(row.turnLeaseVersion) };
+  return { userId: row.userId as string, sessionId: row.sessionId as string, turnId: row.turnId as string, rootTaskId: row.rootTaskId as string, rootAttemptCount: Number(row.rootAttemptCount), turnLeaseOwnerId: row.turnLeaseOwnerId as string, turnLeaseVersion: Number(row.turnLeaseVersion) };
 }
 function parseBody(value: unknown): ParsedBody | null {
-  const row = record(value);
-  if (!row || Object.keys(row).sort().join(",") !== "attestation,owner" || !Object.hasOwn(row, "attestation")) return null;
+  const row = record(value), keys = Object.keys(row ?? {}).sort().join(",");
+  if (!row || !["attestation,owner", "attestation,owner,prepareProof", "attestation,owner,prepareProof,scheduledWaitId"].includes(keys) || !Object.hasOwn(row, "attestation") || Object.hasOwn(row, "scheduledWaitId") && (!Object.hasOwn(row, "prepareProof") || !isScheduledPrepareChoiceWaitId(String(record(row.owner)?.turnId ?? ""), row.scheduledWaitId))) return null;
   const owner = parseOwner(row.owner);
-  return owner ? { owner, attestation: row.attestation } : null;
+  return owner ? { owner, attestation: row.attestation, ...(Object.hasOwn(row, "prepareProof") ? { prepareProof: row.prepareProof, ...(typeof row.scheduledWaitId === "string" ? { scheduledWaitId: row.scheduledWaitId } : {}) } : {}) } : null;
 }
-function json(status: number, value: unknown): Response { return Response.json(value, { status }); }
+function json(status: number, value: unknown, scheduledWaitId?: string): Response { const row = record(value); return Response.json(scheduledWaitId && row ? { ...row, scheduledWaitId } : value, { status }); }
 function blocked(status: number, errorCode: string): Response { return json(status, { status: "blocked", errorCode }); }
 function candidates(value: unknown): string[] | null {
   const scout = record(record(value)?.scout), ids = scout?.candidateJobIds;
   return Array.isArray(ids) && ids.every(validId) && new Set(ids).size === ids.length ? [...ids] : null;
 }
 function isJsonObject(value: unknown): value is Record<string, unknown> { return Boolean(record(value)); }
-function sameClaim(state: unknown, key: string, owner: ScheduledTaskGraphPipelineOwner): boolean {
-  return scheduledTaskGraphClaimMatches(state, key, owner);
-}
+function sameClaim(state: unknown, key: string, owner: ScheduledTaskGraphPipelineOwner): boolean { return scheduledTaskGraphClaimMatches(state, key, owner); }
 function matchingTurnSnapshot(value: unknown) {
   const input = record(value);
   if (input?.automationRunMode !== "scheduled") return null;
@@ -162,18 +159,23 @@ export async function POST(request: Request): Promise<Response> {
   if (!ids) return blocked(409, "scheduled_pipeline_attestation_invalid");
   const jobs = await db.job.findMany({ where: { userId: owner.userId, id: { in: ids } } }) as Job[];
   if (jobs.length !== ids.length || new Set(jobs.map(job => job.id)).size !== ids.length) return blocked(409, "scheduled_pipeline_jobs_mismatch");
+  const state = record(execution.state), storedWaitId = state?.scheduledTaskGraphScheduledWaitId,
+    responseWaitId = typeof storedWaitId === "string" ? storedWaitId : body.scheduledWaitId;
+  if (!snapshot.requireApproval && (storedWaitId !== undefined || body.scheduledWaitId !== undefined)
+    || snapshot.requireApproval && body.prepareProof !== undefined && body.scheduledWaitId === undefined
+    || storedWaitId !== undefined && (!isScheduledPrepareChoiceWaitId(owner.turnId, storedWaitId) || body.scheduledWaitId !== undefined && body.scheduledWaitId !== storedWaitId) || snapshot.requireApproval && body.prepareProof !== undefined && execution.status === "completed" && storedWaitId === undefined) return blocked(409, "scheduled_pipeline_claim_conflict");
+  if (body.prepareProof !== undefined && !await validateScheduledPrepareWaitIdentity({ owner: executionOwner, snapshot, proof: body.prepareProof, ...(body.scheduledWaitId ? { scheduledWaitId: body.scheduledWaitId } : {}) }).catch(() => false)) return blocked(409, "scheduled_pipeline_claim_conflict");
   const report = completedScheduledTaskGraphReport({ execution, key, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
   if (report) return await completedReportLeaseIsCurrent(owner)
-    ? json(200, { status: "completed", report }) : blocked(409, "scheduled_pipeline_turn_stale");
+    ? json(200, { status: "completed", report }, responseWaitId) : blocked(409, "scheduled_pipeline_turn_stale");
   if (execution.status === "completed") {
     const prior = priorScheduledTaskGraphContinuation({ state: execution.state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
     const replay = prior && completedScheduledTaskGraphReport({ execution, key: prior.key, owner: prior.owner, snapshot, attestation,
       ownedJobs: jobs, checkpointValidatedByPrior: true });
     const currentTurn = replay ? await readTurnLease(owner) : null;
-    if (replay && currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: replay });
+    if (replay && currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: replay }, responseWaitId);
     return blocked(409, "scheduled_pipeline_execution_mismatch");
   }
-  const state = record(execution.state);
   const wait = readScheduledTaskGraphWaitMarker(state);
   let waitQuestion: Awaited<ReturnType<typeof loadScheduledTaskGraphWaitQuestion>> = null;
   if (state?.scheduledTaskGraphWait !== undefined && !wait) return blocked(409, "scheduled_pipeline_claim_conflict");
@@ -193,12 +195,12 @@ export async function POST(request: Request): Promise<Response> {
     waitQuestion = await loadScheduledTaskGraphWaitQuestion(executionOwner, wait.waitId, wait.stage);
     if (!waitQuestion && currentWaitOwner && turn.status === "in_progress" && leaseIsCurrent(turn, owner)
       && await canonicalQuestionItemMissing(owner, wait.waitId)) {
-      return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage });
+      return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
     }
     if (!waitQuestion) return blocked(409, "scheduled_pipeline_claim_conflict");
     const resumable = waitQuestion.answered && ["running", "waiting_for_user"].includes(execution.status)
       && turn.status === "in_progress" && leaseIsCurrent(turn, owner);
-    if (!resumable) return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage });
+    if (!resumable) return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
   } else if (!rootIsCurrent(root, owner) || !leaseIsCurrent(turn, owner)) {
     return blocked(409, "scheduled_pipeline_turn_stale");
   }
@@ -219,7 +221,7 @@ export async function POST(request: Request): Promise<Response> {
   const existingClaim = record(state.scheduledTaskGraphClaim);
   let claimedState: Record<string, unknown>;
   let resumeQuestionId: string | undefined;
-  const claimToken = randomUUID();
+  let claimToken: string = randomUUID();
   if (wait) {
     if (!waitQuestion?.answered) return blocked(409, "scheduled_pipeline_analysis_interrupted");
     const rebind = rebindScheduledTaskGraphWaitState({ state, owner: executionOwner, key, claimToken,
@@ -231,15 +233,15 @@ export async function POST(request: Request): Promise<Response> {
     claimedState = { ...rebind.state, scheduledTaskGraphClaim: { ...reboundClaim,
       claimToken, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } };
   } else if (existingClaim && sameClaim(state, key, executionOwner)) {
-    if (claimLeaseIsActive(state)) return json(202, { status: "accepted", duplicate: true });
-    if (!claimLeaseIsValidAndExpired(existingClaim, key, executionOwner)) {
-      return blocked(409, "scheduled_pipeline_claim_conflict");
+    if (claimLeaseIsActive(state) && body.prepareProof === undefined) return json(202, { status: "accepted", duplicate: true }, responseWaitId);
+    if (claimLeaseIsActive(state) && !validId(existingClaim.claimToken)) return blocked(409, "scheduled_pipeline_claim_conflict");
+    if (claimLeaseIsActive(state)) { claimToken = existingClaim.claimToken as string; claimedState = { ...state, scheduledTaskGraphClaim: { ...existingClaim, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } }; }
+    else {
+      if (!claimLeaseIsValidAndExpired(existingClaim, key, executionOwner)) return blocked(409, "scheduled_pipeline_claim_conflict");
+      const markerlessScout = hasMarkerlessScoutState(state);
+      if (!hasPrepareCheckpoint(state, key, executionOwner) && !markerlessScout) return blocked(409, "scheduled_pipeline_analysis_interrupted");
+      claimedState = { ...state, scheduledTaskGraphClaim: { ...existingClaim, claimToken, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } };
     }
-    const markerlessScout = hasMarkerlessScoutState(state);
-    if (!hasPrepareCheckpoint(state, key, executionOwner) && !markerlessScout) {
-      return blocked(409, "scheduled_pipeline_analysis_interrupted");
-    }
-    claimedState = { ...state, scheduledTaskGraphClaim: { ...existingClaim, claimToken, claimedAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 600_000).toISOString() } };
   } else if (existingClaim) {
     const claimedAt = new Date().toISOString(), leaseExpiresAt = new Date(Date.now() + 600_000).toISOString();
     const rebound = rebindScheduledTaskGraphAnalysisStateForLease({ state, owner: executionOwner, key, claimToken, snapshot, attestation, ownedJobs: jobs, claimedAt, leaseExpiresAt });
@@ -260,33 +262,35 @@ export async function POST(request: Request): Promise<Response> {
   if (claimed.count !== 1) {
     const latest = await loadExecution(owner);
     const exactReport = latest && completedScheduledTaskGraphReport({ execution: latest, key, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
-    if (exactReport && await completedReportLeaseIsCurrent(owner)) return json(200, { status: "completed", report: exactReport });
+    if (exactReport && await completedReportLeaseIsCurrent(owner)) return json(200, { status: "completed", report: exactReport }, responseWaitId);
     const prior = latest && priorScheduledTaskGraphContinuation({ state: latest.state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
     const priorReport = latest && prior && completedScheduledTaskGraphReport({ execution: latest, key: prior.key, owner: prior.owner,
       snapshot, attestation, ownedJobs: jobs, checkpointValidatedByPrior: true });
     if (priorReport) {
       const currentTurn = await readTurnLease(owner).catch(() => null);
-      if (currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: priorReport });
+      if (currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: priorReport }, responseWaitId);
     }
-    if (latest && sameClaim(latest.state, key, executionOwner)) return json(202, { status: "accepted", duplicate: true });
+    if (latest && sameClaim(latest.state, key, executionOwner)) { const latestWaitId = record(latest.state)?.scheduledTaskGraphScheduledWaitId; return latestWaitId !== undefined && (!isScheduledPrepareChoiceWaitId(owner.turnId, latestWaitId) || body.scheduledWaitId !== undefined && body.scheduledWaitId !== latestWaitId) ? blocked(409, "scheduled_pipeline_claim_conflict") : json(202, { status: "accepted", duplicate: true }, typeof latestWaitId === "string" ? latestWaitId : body.scheduledWaitId); }
     return blocked(409, "scheduled_pipeline_claim_conflict");
   }
   try {
     const result = await runAgentPipeline({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
       executionId: execution.id, source: "automation", aiConfig, autonomous: snapshot.autoApply,
       ...(resumeQuestionId ? { questionId: resumeQuestionId } : {}),
-      scheduledTaskGraph: { owner: executionOwner, snapshot, attestation, continuationKey: key, claimToken, ownedJobs: jobs }, signal: request.signal });
+      scheduledTaskGraph: { owner: executionOwner, snapshot, attestation, continuationKey: key, claimToken, ownedJobs: jobs,
+        ...(body.prepareProof !== undefined ? { prepareProof: body.prepareProof, ...(body.scheduledWaitId ? { scheduledWaitId: body.scheduledWaitId } : {}) } : {}) }, signal: request.signal });
     if (!result) {
       const wakeWait = await loadDurableScheduledTaskGraphWait({ owner: executionOwner, key, claimToken, answeredOnly: true });
-      return wakeWait ? json(202, { status: "waiting_for_user", ...wakeWait })
+      return wakeWait ? json(202, { status: "waiting_for_user", ...wakeWait }, responseWaitId)
         : blocked(500, "scheduled_pipeline_execution_failed");
     }
     if (isWaitResult(result)) {
       const durableWait = await loadDurableScheduledTaskGraphWait({ owner: executionOwner, key, claimToken });
       return durableWait?.waitId === result.waitId && durableWait.stage === result.stage
-        ? json(202, { status: "waiting_for_user", ...durableWait }) : blocked(500, "scheduled_pipeline_execution_failed");
+        ? json(202, { status: "waiting_for_user", ...durableWait }, responseWaitId) : blocked(500, "scheduled_pipeline_execution_failed");
     }
-    return json(200, { status: "completed", report: result });
+    if ("status" in result && result.status === "analyze_checkpointed") return json(200, result, responseWaitId);
+    return json(200, { status: "completed", report: result }, responseWaitId);
   } catch { return blocked(500, "scheduled_pipeline_execution_failed"); }
 }
 

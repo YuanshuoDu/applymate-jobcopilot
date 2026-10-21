@@ -23,8 +23,14 @@ const mocks = vi.hoisted(() => ({
   pause: vi.fn(),
   runPipeline: vi.fn(),
   runAnalyze: vi.fn(),
-  runScheduledTaskGraphAnalyze: vi.fn(),
-  scoreOwnerFence: vi.fn(),
+  runScheduledTaskGraphAnalyzeOnly: vi.fn(),
+  buildScheduledTaskGraphGateResumeState: vi.fn(),
+  serializeScheduledTaskGraphCheckpoint: vi.fn(),
+  isScheduledOwnerCurrent: vi.fn(),
+  saveScheduledCheckpoint: vi.fn(),
+  finishScheduledExecution: vi.fn(),
+  ownerFenceCheck: vi.fn(),
+  gateProofCurrent: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -40,17 +46,36 @@ vi.mock("@/lib/db", () => ({
     user: { findUnique: mocks.findUser },
   },
 }));
-vi.mock("@/lib/agent/pipeline", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/agent/pipeline")>();
-  return { ...actual, runPipeline: mocks.runPipeline };
-});
-vi.mock("@/lib/agent/stages/analyze", () => ({ runAnalyze: mocks.runAnalyze }));
-vi.mock("@/lib/agent/scheduled-taskgraph-analysis-journal", () => ({
-  runScheduledTaskGraphAnalyze: mocks.runScheduledTaskGraphAnalyze,
-  scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwnerFence,
-  createScheduledTaskGraphOwnerFence: (scheduled: { owner: unknown; key: string; claimToken: string } | undefined) => scheduled
-    ? (tx: unknown) => mocks.scoreOwnerFence({ tx, ...scheduled }) : async () => false,
+vi.mock("@/lib/agent/pipeline", () => ({
+  runPipeline: mocks.runPipeline,
+  PipelineInterruptedError: class PipelineInterruptedError extends Error {},
 }));
+vi.mock("@/lib/agent/orchestrator", () => ({
+  AgentPauseError: class AgentPauseError extends Error {
+    constructor(readonly questionId: string, readonly stage: string) {
+      super(`Agent is waiting for a user answer at ${stage}`);
+      this.name = "AgentPauseError";
+    }
+  },
+}));
+vi.mock("@/lib/agent/stages/analyze", () => ({ runAnalyze: mocks.runAnalyze }));
+vi.mock("@/lib/agent/scheduled-taskgraph-analysis-journal", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/agent/scheduled-taskgraph-analysis-journal")>();
+  return { ...actual, createScheduledTaskGraphOwnerFence: () => mocks.ownerFenceCheck };
+});
+vi.mock("@/lib/agent/scheduled-taskgraph-gate-input", () => ({
+  isScheduledTaskGraphGateProofCurrent: mocks.gateProofCurrent,
+}));
+vi.mock("@/lib/agent/scheduled-taskgraph-run-service", () => ({
+  runScheduledTaskGraphAnalyzeOnly: mocks.runScheduledTaskGraphAnalyzeOnly,
+  buildScheduledTaskGraphGateResumeState: mocks.buildScheduledTaskGraphGateResumeState,
+  serializeScheduledTaskGraphCheckpoint: mocks.serializeScheduledTaskGraphCheckpoint,
+}));
+vi.mock("@/lib/agent/scheduled-taskgraph-pipeline-fence", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/agent/scheduled-taskgraph-pipeline-fence")>();
+  return { ...actual, isScheduledTaskGraphOwnerCurrent: mocks.isScheduledOwnerCurrent,
+    saveScheduledTaskGraphCheckpoint: mocks.saveScheduledCheckpoint, finishScheduledTaskGraphExecution: mocks.finishScheduledExecution };
+});
 vi.mock("@/lib/runtime-feature-flags", () => ({
   isRuntimeAgentHarnessFeatureEnabled: vi.fn(async () => false),
 }));
@@ -74,6 +99,9 @@ const scheduledSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automatio
 const scheduledOwner = { userId: "user_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_1",
   rootAttemptCount: 2, turnLeaseOwnerId: "worker_1", turnLeaseVersion: 4, executionId: "execution_1", executionAttemptCount: 0 };
 const scheduledClaimToken = "claim-token-1";
+const scheduledProof = { status: "analyze_checkpointed" as const, continuationKey: "scheduled-taskgraph:sha256:proof",
+  checkpointDigest: "a".repeat(64), executionId: scheduledOwner.executionId,
+  executionAttemptCount: scheduledOwner.executionAttemptCount };
 const scheduledAttestation = {
   schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1",
   owner: { userId: scheduledOwner.userId, sessionId: scheduledOwner.sessionId, turnId: scheduledOwner.turnId,
@@ -88,8 +116,8 @@ const scheduledAttestation = {
 };
 const emptyAnalysis = { stage: "analyze", ok: true as const, data: { scoredJobs: [], failed: 0 }, metrics: { durationMs: 1, count: 0 } };
 
-function scheduledRunInput(state: unknown) {
-  const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation);
+function scheduledRunInput(state: unknown, snapshot = scheduledSnapshot, attestation = scheduledAttestation, prepareProof?: unknown) {
+  const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, attestation);
   mocks.executionFindFirst.mockResolvedValue({ id: scheduledOwner.executionId, sessionId: scheduledOwner.sessionId,
     status: "running", attemptCount: 0, state });
   mocks.turnFindFirst.mockResolvedValue({ status: "in_progress", leaseOwnerId: scheduledOwner.turnLeaseOwnerId,
@@ -101,8 +129,8 @@ function scheduledRunInput(state: unknown) {
   return { userId: scheduledOwner.userId, sessionId: scheduledOwner.sessionId, turnId: scheduledOwner.turnId,
     executionId: scheduledOwner.executionId, autonomous: false,
     aiConfig: { provider: "minimax" as const, model: "MiniMax-M3", apiKey: "key" },
-    scheduledTaskGraph: { owner: scheduledOwner, snapshot: scheduledSnapshot, attestation: scheduledAttestation,
-      continuationKey, claimToken: scheduledClaimToken, ownedJobs: [] } };
+    scheduledTaskGraph: { owner: scheduledOwner, snapshot, attestation,
+      continuationKey, claimToken: scheduledClaimToken, ownedJobs: [], ...(prepareProof !== undefined ? { prepareProof } : {}) } };
 }
 
 describe("runAgentPipeline", () => {
@@ -118,7 +146,14 @@ describe("runAgentPipeline", () => {
     mocks.executionTransaction.mockImplementation((work: (tx: unknown) => Promise<unknown>) => work({
       agentExecution: { updateMany: mocks.executionUpdateMany, findUnique: mocks.executionFindUnique },
     }));
-    mocks.scoreOwnerFence.mockResolvedValue(true);
+    mocks.runScheduledTaskGraphAnalyzeOnly.mockResolvedValue(scheduledProof);
+    mocks.buildScheduledTaskGraphGateResumeState.mockResolvedValue({ nextStage: "gate" });
+    mocks.serializeScheduledTaskGraphCheckpoint.mockImplementation(state => state);
+    mocks.isScheduledOwnerCurrent.mockResolvedValue(true);
+    mocks.saveScheduledCheckpoint.mockResolvedValue(true);
+    mocks.ownerFenceCheck.mockResolvedValue(true);
+    mocks.gateProofCurrent.mockResolvedValue(true);
+    mocks.finishScheduledExecution.mockResolvedValue(true);
     mocks.record.mockResolvedValue({});
     mocks.activate.mockResolvedValue(true);
     mocks.createRecorder.mockResolvedValue({ sessionId: "session_1", activate: mocks.activate, getTurnId: vi.fn(() => undefined), record: mocks.record, finalize: mocks.finalize, pause: mocks.pause });
@@ -167,41 +202,27 @@ describe("runAgentPipeline", () => {
     }));
   }, 30_000);
 
-  it("persists the wait marker before exposing the question and returns the exact scheduled wait", async () => {
+  it("returns only the scheduled Analyze proof without running Prepare, Gate, or finalization", async () => {
     const { runAgentPipeline } = await import("./run-service");
-    const { AgentPauseError } = await import("./orchestrator");
     const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation);
     const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
       schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey, claimToken: scheduledClaimToken, owner: scheduledOwner,
     } };
-    const timeline: string[] = [];
-    mocks.runScheduledTaskGraphAnalyze.mockResolvedValue({ analysis: emptyAnalysis, checkpoint: buildScheduledTaskGraphPrepareCheckpoint({
-      owner: scheduledOwner, snapshot: scheduledSnapshot, attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState,
-    }).checkpoint });
-    mocks.executionUpdateMany.mockImplementation(async (input: { data?: { state?: Record<string, unknown> } }) => {
-      if (input.data?.state?.scheduledTaskGraphWait) timeline.push("wait_marker");
-      return { count: 1 };
-    });
-    mocks.record.mockImplementation(async (event: string) => {
-      if (event === "orchestrator_question") timeline.push("question");
-      return {};
-    });
-    mocks.runPipeline.mockImplementationOnce(async (rawContext: unknown) => {
-      (rawContext as { emit: (event: string, data: unknown) => void }).emit("orchestrator_question", {
-        id: "agent-question:turn_1:canonical:q1", stage: "writer", question: "Continue?", options: [],
-      });
-      throw new AgentPauseError("agent-question:turn_1:canonical:q1", "writer");
-    });
-
-    await expect(runAgentPipeline(scheduledRunInput(initialState))).resolves.toEqual({
-      status: "waiting_for_user", waitId: "agent-question:turn_1:canonical:q1", stage: "writer",
-    });
-    expect(mocks.runScheduledTaskGraphAnalyze).toHaveBeenCalledTimes(1);
-    expect(timeline).toEqual(["wait_marker", "question"]);
-    expect(mocks.pause).toHaveBeenCalledTimes(1);
+    await expect(runAgentPipeline(scheduledRunInput(initialState))).resolves.toEqual(scheduledProof);
+    expect(mocks.runScheduledTaskGraphAnalyzeOnly).toHaveBeenCalledWith(expect.objectContaining({
+      owner: scheduledOwner, continuationKey, claimToken: scheduledClaimToken, state: initialState,
+      context: expect.objectContaining({ executionAttempt: { id: "execution_1", attemptCount: 0 } }),
+      onStateChange: expect.any(Function),
+    }));
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    expect(mocks.finalize).not.toHaveBeenCalled();
+    expect(mocks.pause).not.toHaveBeenCalled();
+    expect(mocks.executionUpdateMany).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: "completed" }),
+    }));
   });
 
-  it("persists the Analyze journal through the score transaction and carries it into Prepare", async () => {
+  it("routes a persisted Analyze checkpoint through the Web proof service without rescoring", async () => {
     const { runAgentPipeline } = await import("./run-service");
     const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation);
     const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
@@ -209,74 +230,69 @@ describe("runAgentPipeline", () => {
     } };
     const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot: scheduledSnapshot,
       attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState }).checkpoint;
-    const journalState = { ...initialState, scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
-      scheduledTaskGraphAnalyzeJournal: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-analysis-journal.v1",
-        key: continuationKey, owner: scheduledOwner, attemptsByJob: {}, failedJobIds: [] } };
-    const tx = { marker: "score-transaction", agentExecution: { updateMany: mocks.executionUpdateMany } };
-    mocks.scoreOwnerFence.mockResolvedValue(true);
-    mocks.runScheduledTaskGraphAnalyze.mockImplementationOnce(async rawInput => {
-      const input = rawInput as {
-        assertScoreOwnerCurrent: (tx: unknown) => Promise<boolean>;
-        persist: (state: unknown, expectedState: unknown, tx: unknown) => Promise<void>;
-      };
-      const assertCurrent = input.assertScoreOwnerCurrent;
-      await expect(assertCurrent(tx)).resolves.toBe(true);
-      await input.persist(journalState, initialState, tx);
-      return { analysis: emptyAnalysis, checkpoint, persistedState: journalState };
-    });
-
-    await runAgentPipeline(scheduledRunInput(initialState));
-
-    expect(mocks.scoreOwnerFence).toHaveBeenCalledWith(expect.objectContaining({
-      tx, owner: scheduledOwner, key: continuationKey, claimToken: scheduledClaimToken,
-    }));
-    expect(mocks.executionUpdateMany).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      where: expect.objectContaining({ state: { equals: initialState }, attemptCount: scheduledOwner.executionAttemptCount }),
-      data: { checkpoint: "scout", state: journalState },
-    }));
-    expect(mocks.executionUpdateMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      where: expect.objectContaining({ state: { equals: journalState }, attemptCount: scheduledOwner.executionAttemptCount }),
-      data: expect.objectContaining({ checkpoint: "prepare" }),
-    }));
+    await expect(runAgentPipeline(scheduledRunInput(checkpoint))).resolves.toEqual(scheduledProof);
+    expect(mocks.runScheduledTaskGraphAnalyzeOnly).toHaveBeenCalledWith(expect.objectContaining({ state: checkpoint }));
+    expect(mocks.runAnalyze).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 
-  it("resumes a persisted Prepare checkpoint without invoking the legacy scorer again", async () => {
+  it("continues an approval-free Prepare proof through Gate without a scheduled choice ID", async () => {
+    const { runAgentPipeline } = await import("./run-service");
+    const snapshot = { ...scheduledSnapshot, requireApproval: false };
+    const attestation = { ...scheduledAttestation, snapshotDigest: scheduledAutomationSnapshotDigest(snapshot) };
+    const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, attestation);
+    const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
+      schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey, claimToken: scheduledClaimToken, owner: scheduledOwner,
+    } };
+    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot, attestation,
+      ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState }).checkpoint;
+    const proof = { receipt: {}, completion: {}, result: {} };
+    await expect(runAgentPipeline(scheduledRunInput(checkpoint, snapshot, attestation, proof))).resolves.toMatchObject({ processed: 1 });
+    const gateInput = mocks.buildScheduledTaskGraphGateResumeState.mock.calls[0]?.[0];
+    expect(gateInput).toMatchObject({ owner: scheduledOwner, snapshot, attestation, continuationKey, prepareProof: proof });
+    expect(gateInput).not.toHaveProperty("scheduledWaitId");
+    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({ resumeState: { nextStage: "gate" } }));
+  });
+
+  it("rejects a TaskGraph revision change between package loading and the Gate checkpoint CAS", async () => {
     const { runAgentPipeline } = await import("./run-service");
     const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation);
     const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
       schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey, claimToken: scheduledClaimToken, owner: scheduledOwner,
     } };
-    const prepared = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot: scheduledSnapshot,
-      attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState });
-    mocks.runPipeline.mockResolvedValueOnce({ processed: 0, queued: 0, applied: 0, pending: 0,
-      skipped: 0, failed: 0, durationMs: 1 });
+    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot: scheduledSnapshot,
+      attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState }).checkpoint;
+    const prepareProof = { receipt: {}, completion: { graphRevision: 11 }, result: {} };
+    let liveGraphRevision = 11;
+    mocks.buildScheduledTaskGraphGateResumeState.mockResolvedValueOnce({ nextStage: "gate" });
+    mocks.gateProofCurrent.mockImplementationOnce(async (raw: unknown) => {
+      const input = raw as { prepareProof: typeof prepareProof };
+      return input.prepareProof.completion.graphRevision === liveGraphRevision;
+    });
+    mocks.saveScheduledCheckpoint.mockImplementationOnce(async (raw: unknown) => {
+      const save = raw as { assertOwnerCurrent: (tx: unknown) => Promise<boolean> };
+      liveGraphRevision += 1;
+      return save.assertOwnerCurrent({});
+    });
 
-    await expect(runAgentPipeline(scheduledRunInput(prepared.checkpoint))).resolves.toMatchObject({ processed: 0 });
-    expect(mocks.runAnalyze).not.toHaveBeenCalled();
-    expect(mocks.runScheduledTaskGraphAnalyze).not.toHaveBeenCalled();
-    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
-      resumeState: expect.objectContaining({ nextStage: "prepare", scoredJobs: [],
-        scheduledTaskGraphContinuation: expect.objectContaining({ key: continuationKey }) }),
-    }));
+    await expect(runAgentPipeline(scheduledRunInput(checkpoint, scheduledSnapshot, scheduledAttestation, prepareProof))).resolves.toBeNull();
+    expect(mocks.gateProofCurrent).toHaveBeenCalledWith(expect.objectContaining({
+      owner: scheduledOwner, snapshot: scheduledSnapshot, analyzeCheckpoint: checkpoint,
+      analyzeAttestation: scheduledAttestation, prepareProof,
+    }), {});
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    expect(mocks.finishScheduledExecution).not.toHaveBeenCalled();
   });
 
-  it("does not complete or publish a scheduled execution after Turn ownership is taken over", async () => {
+  it("does not complete or publish when the scheduled Analyze owner fence is lost", async () => {
     const { runAgentPipeline } = await import("./run-service");
     const initialState = { nextStage: "scout", scheduledTaskGraphClaim: {
       schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation),
       claimToken: scheduledClaimToken, owner: scheduledOwner,
     } };
-    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot: scheduledSnapshot,
-      attestation: scheduledAttestation, ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState }).checkpoint;
-    mocks.scoreOwnerFence.mockResolvedValueOnce(false);
-
-    await expect(runAgentPipeline(scheduledRunInput(checkpoint))).resolves.toBeNull();
-
-    expect(mocks.scoreOwnerFence).toHaveBeenCalledWith(expect.objectContaining({
-      owner: scheduledOwner, key: scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation), claimToken: scheduledClaimToken,
-      tx: expect.objectContaining({ agentExecution: expect.objectContaining({ updateMany: mocks.executionUpdateMany }) }),
-    }));
-    expect(mocks.executionUpdateMany).not.toHaveBeenCalled();
+    mocks.runScheduledTaskGraphAnalyzeOnly.mockResolvedValueOnce(null as never);
+    await expect(runAgentPipeline(scheduledRunInput(initialState))).resolves.toBeNull();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
     expect(mocks.finalize).not.toHaveBeenCalled();
   });
 

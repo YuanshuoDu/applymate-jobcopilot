@@ -105,6 +105,28 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     expect(fence.priorScheduledTaskGraphContinuation({ ...input, ownedJobs: [] })).toBeNull();
     expect(fence.priorScheduledTaskGraphContinuation({ ...input,
       state: { ...prepared.checkpoint, scoutedJobs: [], scoredJobs: [] } })).toBeNull();
+    expect(fence.priorScheduledTaskGraphContinuation({ ...input, attestation: proofFor({ ...owner, userId: "foreign-user" }) })).toBeNull();
+  });
+
+  it("rebinds a reclaimed claim with the same continuation key and a fresh live claim token", async () => {
+    const fence = await import("./scheduled-taskgraph-pipeline-fence");
+    const priorOwner = { ...owner, turnLeaseOwnerId: "worker-old", turnLeaseVersion: 3 };
+    const priorAttestation = proofFor(priorOwner), currentAttestation = proofFor(owner);
+    const stableKey = scheduledTaskGraphContinuationKey(priorOwner, priorAttestation);
+    const row = { id: "job-1", userId: owner.userId } as Job;
+    const prepared = buildScheduledTaskGraphPrepareCheckpoint({ owner: priorOwner, snapshot, attestation: priorAttestation,
+      ownedJobs: [row], analyzeResult: { stage: "analyze", ok: true, data: { scoredJobs: [{ job: row, score: 80,
+        matchedKeywords: ["TypeScript"], missingKeywords: [], recommendation: "Apply.", analysisFenceAt: "2026-10-19T12:00:00.123Z" }], failed: 0 },
+        metrics: { durationMs: 1, count: 1 } } });
+    const state = { ...prepared.checkpoint, scheduledTaskGraphClaim: { ...claim, key: stableKey, owner: priorOwner } };
+    const input = { state, owner, key: stableKey, claimToken: "claim-token-b", snapshot, attestation: currentAttestation,
+      ownedJobs: [row], claimedAt: "2026-10-20T11:55:00.000Z", leaseExpiresAt: "2026-10-20T12:15:00.000Z" };
+
+    expect(fence.rebindScheduledTaskGraphClaimForLease(input)).toMatchObject({
+      scheduledTaskGraphClaim: { key: stableKey, claimToken: "claim-token-b", owner },
+      scheduledTaskGraphContinuation: { key: stableKey, owner },
+    });
+    expect(fence.rebindScheduledTaskGraphClaimForLease({ ...input, key: "rotated-continuation" })).toBeNull();
   });
 
   it("accepts only a live Turn lease, active root attempt, and matching running execution claim", async () => {
@@ -213,17 +235,19 @@ describe("scheduled TaskGraph pipeline owner fence", () => {
     });
 
     const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
-    const rebound = rebindScheduledTaskGraphWaitState({ state: waiting, owner: nextOwner, key: "continuation-key-2", claimToken: "claim-token-b",
+    const rebound = rebindScheduledTaskGraphWaitState({ state: waiting, owner: nextOwner, key, claimToken: "claim-token-b",
       snapshotDigest, graphRevision, evidenceDigest });
     expect(rebound).toMatchObject({ waitId: "agent-question:turn-1:canonical:q1", stage: "writer" });
     expect(rebound?.state).toMatchObject({ nextStage: "prepare", scoutedJobs: [], scoredJobs: [], analysisFailed: 0,
-      scheduledTaskGraphClaim: { key: "continuation-key-2", claimToken: "claim-token-b", owner: nextOwner },
-      scheduledTaskGraphContinuation: { key: "continuation-key-2", owner: nextOwner, snapshotDigest, graphRevision, evidenceDigest },
+      scheduledTaskGraphClaim: { key, claimToken: "claim-token-b", owner: nextOwner },
+      scheduledTaskGraphContinuation: { key, owner: nextOwner, snapshotDigest, graphRevision, evidenceDigest },
     });
     expect(rebound?.state).not.toHaveProperty("scheduledTaskGraphWait");
     expect(rebindScheduledTaskGraphWaitState({ state: waiting, owner: nextOwner, key: "continuation-key-2", claimToken: "claim-token-b",
+      snapshotDigest, graphRevision, evidenceDigest })).toBeNull();
+    expect(rebindScheduledTaskGraphWaitState({ state: waiting, owner: nextOwner, key, claimToken: "claim-token-b",
       snapshotDigest, graphRevision: graphRevision + 1, evidenceDigest })).toBeNull();
-    expect(rebindScheduledTaskGraphWaitState({ state: waiting, owner: { ...nextOwner, rootAttemptCount: 3 }, key: "continuation-key-2", claimToken: "claim-token-b",
+    expect(rebindScheduledTaskGraphWaitState({ state: waiting, owner: { ...nextOwner, rootAttemptCount: 3 }, key, claimToken: "claim-token-b",
       snapshotDigest, graphRevision, evidenceDigest })).toBeNull();
   });
 

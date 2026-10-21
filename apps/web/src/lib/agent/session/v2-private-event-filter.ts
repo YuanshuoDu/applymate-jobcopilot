@@ -4,6 +4,7 @@ const PRIVATE_EVENT_TYPES = new Set([
   "agent.plan.reconciliation",
   "agent.plan.clarification",
   "agent.plan.denial_checkpoint",
+  "agent.plan.scheduled_prepare_binding",
 ])
 
 export function isPrivateV2EventType(type: string): boolean {

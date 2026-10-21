@@ -35,7 +35,11 @@ export const SCHEDULED_PIPELINE_COMPLETION: unique symbol = Symbol("scheduled-pi
 
 export type ScheduledPipelineCompletionDisposition =
   | Readonly<{ status: "completed"; candidateText: string }>
+  | Readonly<{ status: "waiting_for_dependency"; waitId: string; candidateText: string }>
+  /** Worker-owned deterministic Prepare choice wait. */
   | Readonly<{ status: "waiting_for_user"; waitId: string; candidateText: string }>
+  /** A Web-owned question; its ID is never the Worker-owned Prepare choice ID. */
+  | Readonly<{ status: "waiting_for_external_user"; externalWaitId: string; scheduledWaitId?: string; candidateText: string }>
   | Readonly<{ status: "blocked"; errorCode: string }>
 
 export function parseScheduledPipelineCompletionDisposition(value: unknown): ScheduledPipelineCompletionDisposition | null {
@@ -53,10 +57,27 @@ export function parseScheduledPipelineCompletionDisposition(value: unknown): Sch
       && typeof record.candidateText === "string" && record.candidateText.trim().length > 0) {
       return { status: "completed", candidateText: record.candidateText }
     }
+    if (record.status === "waiting_for_dependency" && keys.length === 3 && keys.includes("status") && keys.includes("candidateText") && keys.includes("waitId")
+      && typeof record.candidateText === "string" && record.candidateText.trim().length > 0
+      && typeof record.waitId === "string" && record.waitId.trim() === record.waitId && record.waitId.length > 0 && record.waitId.length <= 128) {
+      return { status: "waiting_for_dependency", waitId: record.waitId, candidateText: record.candidateText }
+    }
     if (record.status === "waiting_for_user" && keys.length === 3 && keys.includes("status") && keys.includes("candidateText") && keys.includes("waitId")
       && typeof record.candidateText === "string" && record.candidateText.trim().length > 0
       && typeof record.waitId === "string" && record.waitId.trim() === record.waitId && record.waitId.length > 0 && record.waitId.length <= 256) {
       return { status: "waiting_for_user", waitId: record.waitId, candidateText: record.candidateText }
+    }
+    if (record.status === "waiting_for_external_user"
+      && (keys.length === 3 && keys.includes("status") && keys.includes("candidateText") && keys.includes("externalWaitId")
+        || keys.length === 4 && keys.includes("status") && keys.includes("candidateText") && keys.includes("externalWaitId") && keys.includes("scheduledWaitId"))
+      && typeof record.candidateText === "string" && record.candidateText.trim().length > 0
+      && typeof record.externalWaitId === "string" && record.externalWaitId.trim() === record.externalWaitId
+      && record.externalWaitId.length > 0 && record.externalWaitId.length <= 256
+      && (record.scheduledWaitId === undefined || typeof record.scheduledWaitId === "string"
+        && record.scheduledWaitId.trim() === record.scheduledWaitId && record.scheduledWaitId.length > 0 && record.scheduledWaitId.length <= 256
+        && record.scheduledWaitId !== record.externalWaitId)) {
+      return { status: "waiting_for_external_user", externalWaitId: record.externalWaitId,
+        ...(typeof record.scheduledWaitId === "string" ? { scheduledWaitId: record.scheduledWaitId } : {}), candidateText: record.candidateText }
     }
     if (record.status === "blocked" && keys.length === 2 && keys.includes("status") && keys.includes("errorCode")
       && typeof record.errorCode === "string" && /^[a-z][a-z0-9_]{0,127}$/.test(record.errorCode)) {

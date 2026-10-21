@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
-import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput, TaskGraphScheduledPrepareInput, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
@@ -16,6 +16,7 @@ import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 
 const reconciliationMocks = vi.hoisted(() => ({
   prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), writePlanIdentity: vi.fn(), writeLifecycleIdentity: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
+  scheduledPrepare: vi.fn(),
 }))
 vi.mock("./steering-reconciliation-ledger.js", () => ({
   prepareSteeringReconciliation: reconciliationMocks.prepare,
@@ -23,6 +24,7 @@ vi.mock("./steering-reconciliation-ledger.js", () => ({
   assertNoUnresolvedSteering: reconciliationMocks.assertNoUnresolvedSteering,
 }))
 vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: reconciliationMocks.create }))
+vi.mock("./pg-scheduled-task-graph-prepare-command.js", () => ({ appendScheduledPrepare: reconciliationMocks.scheduledPrepare }))
 vi.mock("./task-graph-pg-events.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./task-graph-pg-events.js")>()
   return { ...actual, appendTaskGraphReceipt: vi.fn(async () => undefined), writeTaskGraphSnapshot: vi.fn(async () => undefined),
@@ -226,6 +228,20 @@ function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template"
 
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it("preserves the specialized scheduled Prepare choice receipt through the PostgreSQL transaction port", async () => {
+    const fake = fakePool(scheduleInput())
+    const input = {} as unknown as TaskGraphScheduledPrepareInput
+    const receipt: TaskGraphScheduledPrepareReceipt = {
+      status: "waiting_for_choice", revision: 7, nodes: [], readyTaskIds: [],
+      choice: { required: true, status: "waiting", waitId: "agent-question:turn:canonical:wait" },
+    }
+    reconciliationMocks.scheduledPrepare.mockResolvedValue(receipt)
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendScheduledPrepare!(input)).resolves.toEqual(receipt)
+    expect(reconciliationMocks.scheduledPrepare).toHaveBeenCalledWith(fake.client, input)
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
+  })
+
   it("refuses supersession below two remaining Turn steps after replay and before writes", async () => {
     const fixture = supersessionFixture(), { input, operation } = fixture
     const fake = fakePool(input, { includeReplay: false, graphRevision: 1, graphContent: fixture.graphContent,
@@ -835,6 +851,7 @@ describe("createPgTaskGraphCommandPort", () => {
         discoveredJobs: { knownCount: 6, coverage: "complete" },
         analyzedJobs: { knownCount: 6, coverage: "complete" },
         artifactReferences: { knownCount: null, coverage: "not_requested" },
+        prepareJobs: { knownCount: null, coverage: "not_requested" },
         reviewOutcomes: { knownCount: null, coverage: "not_requested" },
       },
     })

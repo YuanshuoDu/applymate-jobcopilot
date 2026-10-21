@@ -117,23 +117,34 @@ export async function completeTurnCandidate(input: Readonly<{
     input.onStepClosed()
     return { kind: "wait", result: { status: "waiting_for_dependency", errorCode: gate.scheduledBlocker, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
   }
-  if (gate && "scheduledWaitId" in gate) {
+  if (gate && "scheduledWaitId" in gate && !("externalWaitId" in gate)) {
     if (gate.candidateText !== output.text) throw new TurnEngineError("invalid_output", "Scheduled wait changed the final candidate")
-    await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_user", finishReason: output.finishReason, errorCode: null,
-      inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
-      estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now() })
-    await writer.append("step.completed", step.id, null,
-      { stepId: step.id, status: "waiting_for_user", taskId: options.identity.taskId }, `step-completed:${step.id}`)
     try {
-      if (!options.store.waitForUser) throw new Error("scheduled_wait_store_unavailable")
-      await options.store.waitForUser({ identity: options.identity, now: now() })
+      if (!options.store.waitForQuestion) throw new Error("scheduled_choice_wait_store_unavailable")
+      const receipt = await options.store.waitForQuestion({ identity: options.identity, stepId: step.id, toolCallId: null,
+        expectedWaitId: gate.scheduledWaitId, finishReason: output.finishReason, usage: output.usage, now: now() })
+      if (receipt.waitId !== gate.scheduledWaitId) throw new TurnEngineError("persistence_conflict", "Worker scheduled wait ID did not match the expected receipt")
+      if (receipt.status === "answered") throw new TurnEngineError("persistence_conflict", "Scheduled choice is answered; Prepare must resume from its private answer item")
     } catch (error: unknown) {
+      if (error instanceof TurnEngineError && error.code === "persistence_conflict") throw error
       if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(signal)
         || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
       throw new TurnStateRefreshRetryError()
     }
     input.onStepClosed()
     return { kind: "wait", result: { status: "waiting_for_user", waitId: gate.scheduledWaitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
+  }
+  if (gate && "externalWaitId" in gate) {
+    if (!gate.externalWaitId.trim() || gate.externalWaitId === gate.scheduledWaitId) {
+      throw new TurnEngineError("invalid_output", "Scheduled Web wait identity is invalid")
+    }
+    await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_user", finishReason: output.finishReason, errorCode: null,
+      inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+      estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now() })
+    await writer.append("step.completed", step.id, null,
+      { stepId: step.id, status: "waiting_for_user", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+    input.onStepClosed()
+    return { kind: "wait", result: { status: "waiting_for_user", waitId: gate.externalWaitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
   }
   if (gate && "waitId" in gate) {
     await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason, errorCode: null,

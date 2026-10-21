@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
+import { createHash } from "node:crypto"
 
-import { validateRoleResult, RoleResultValidationError, type ArtifactVersionReference, type RoleEvidence, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
+import { validateRoleResult, RoleResultValidationError, type ArtifactVersionReference, type PrepareResult, type RoleEvidence, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
 import type { ObservedEvidenceIndex } from "./child-evidence.js"
 
 export const MAX_EVIDENCE_BYTES = 8 * 1024
@@ -35,8 +36,16 @@ export function artifactReferenceKey(value: ArtifactVersionReference): string {
 export function artifactResultKey(value: StructuredRoleResult): string {
   if (value.role === "writer") return `writer:${value.artifactRef.artifactId}:${value.artifactRef.version}:${value.artifactRef.contentHash}:${value.artifactRef.sourceDigest}`
   if (value.role === "reviewer") return `reviewer:${value.artifactRef.artifactId}:${value.artifactRef.version}:${value.artifactRef.contentHash}:${value.artifactRef.sourceDigest}:${value.reviewStatus}:${value.reviewHash}`
+  if (value.role === "prepare") return scheduledPrepareToolReceiptKey(value)
   return ""
 }
+
+/** Stable lookup key for the exact successful registered Prepare tool output. */
+export function scheduledPrepareToolReceiptKey(value: PrepareResult): string {
+  return `scheduled.application.prepare:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`
+}
+
+export function scheduledPrepareIdentityKey(taskId: string, attemptCount: number): string { return `${taskId}\u0000${attemptCount}` }
 
 function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedEvidenceIndex): StructuredRoleResult | undefined {
   if (value.role === "writer") {
@@ -57,6 +66,12 @@ function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedE
   if (value.role === "reviewer") {
     if (!index.artifactReads.has(artifactReferenceKey(value.artifactRef))) return undefined
     return index.artifactResults.get(artifactResultKey(value))
+  }
+  if (value.role === "prepare") {
+    const identity = scheduledPrepareIdentityKey(value.taskId, value.attemptCount)
+    const receipt = index.scheduledPrepareResults.get(identity)
+    return !index.scheduledPrepareResultConflicts.has(identity) && receipt?.toolCallId
+      && JSON.stringify(receipt.result) === JSON.stringify(value) ? receipt.result : undefined
   }
   const canonicalByModelId = new Map<string, string>()
   const seenCanonical = new Set<string>()

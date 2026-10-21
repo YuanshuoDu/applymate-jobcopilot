@@ -30,6 +30,7 @@ export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph): TaskGrap
       taskId: task.id,
       role: task.role,
       taskStatus: task.status,
+      ...(Number.isSafeInteger(task.attemptCount) && task.attemptCount! > 0 ? { attemptCount: task.attemptCount } : {}),
       ...(nested.present ? { structuredResult: nested.value } : {}),
     }
   })

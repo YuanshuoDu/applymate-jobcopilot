@@ -1,5 +1,5 @@
 import type { PoolClient } from "pg"
-import { TaskGraphCommandError, parseRegisteredScoutEnvelope, type RegisteredScoutEnvelope, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphExecutionScope, type TaskGraphCurrentState, type TaskGraphPlanningCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
+import { TaskGraphCommandError, parseRegisteredScoutEnvelope, type RegisteredScoutEnvelope, type TaskGraphCommandPort, type TaskGraphScheduleInput, type TaskGraphScheduledPrepareInput, type TaskGraphScheduledPrepareReceipt, type TaskGraphScheduleReceipt, type TaskGraphReadScope, type TaskGraphExecutionScope, type TaskGraphCurrentState, type TaskGraphPlanningCurrentState, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 import { actionList, transaction, type Queryable } from "./pg-store-persistence.js"
 import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph } from "./task-graph-pg-state.js"
@@ -10,6 +10,8 @@ import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGrap
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
 import { replaceUnstartedNativeFollowup } from "./task-graph-native-pending-replacement.js"
+import { BudgetExceededError } from "../budget.js"
+import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 import { assertPlanningRootHasNoUnresolvedSteering } from "./pg-store-create.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
@@ -19,10 +21,9 @@ import type { TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discove
 import { projectTaskGraphDiscoveryRecoveryPage } from "./task-graph-discovery-recovery-page.js"
 import { projectTaskGraphResultPage } from "./task-graph-result-page.js"
 import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-history-result-page-store.js"
-import { BudgetExceededError } from "../budget.js"
-import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 import { scheduleTaskGraphSupersession, stampCreatedScoutEnvelopes, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { requireNormalizedRootPlanCriteria, requireOwnedRootPlanCriteria, requireRootPlanCriteriaReadback } from "./root-plan-criteria.js"
+import { appendScheduledPrepare as appendScheduledPrepareCommand } from "./pg-scheduled-task-graph-prepare-command.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -32,6 +33,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
   return {
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
       return transaction(pool, client => schedule(client, input))
+    },
+    async appendScheduledPrepare(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt> {
+      return transaction(pool, client => appendScheduledPrepareCommand(client, input))
     },
     async appendAndScheduleWithReconciliation(input, operation) {
       if (operation.decision !== "revise" || operation.expectedRevision !== input.proposal.expectedRevision
@@ -90,10 +94,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
   }
 }
 function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: SteeringReconciliationOperation["scope"]): boolean {
-  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
-    && left.stepId === right.stepId && left.rootTaskId === right.rootTaskId && left.parentTaskId === right.parentTaskId
-    && left.turnLeaseOwner === right.turnLeaseOwner && left.turnLeaseVersion === right.turnLeaseVersion
-    && left.parentLeaseOwner === right.parentLeaseOwner && left.parentAttemptCount === right.parentAttemptCount
+  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId && left.stepId === right.stepId
+    && left.rootTaskId === right.rootTaskId && left.parentTaskId === right.parentTaskId && left.turnLeaseOwner === right.turnLeaseOwner
+    && left.turnLeaseVersion === right.turnLeaseVersion && left.parentLeaseOwner === right.parentLeaseOwner && left.parentAttemptCount === right.parentAttemptCount
 }
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
   const rootSuccessCriteria = requireNormalizedRootPlanCriteria(input.rootSuccessCriteria)

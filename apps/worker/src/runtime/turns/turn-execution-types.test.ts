@@ -30,8 +30,14 @@ describe("scheduled pipeline completion disposition", () => {
     const candidateText = "  Exact candidate with its spacing.  "
     expect(parseScheduledPipelineCompletionDisposition({ status: "completed", candidateText }))
       .toEqual({ status: "completed", candidateText })
+    expect(parseScheduledPipelineCompletionDisposition({ status: "waiting_for_dependency", waitId: "dependency-123", candidateText }))
+      .toEqual({ status: "waiting_for_dependency", waitId: "dependency-123", candidateText })
     expect(parseScheduledPipelineCompletionDisposition({ status: "waiting_for_user", waitId: "question-123", candidateText }))
       .toEqual({ status: "waiting_for_user", waitId: "question-123", candidateText })
+    expect(parseScheduledPipelineCompletionDisposition({ status: "waiting_for_external_user", externalWaitId: "web-question-123", scheduledWaitId: "worker-choice-123", candidateText }))
+      .toEqual({ status: "waiting_for_external_user", externalWaitId: "web-question-123", scheduledWaitId: "worker-choice-123", candidateText })
+    expect(parseScheduledPipelineCompletionDisposition({ status: "waiting_for_external_user", externalWaitId: "web-question-123", candidateText }))
+      .toEqual({ status: "waiting_for_external_user", externalWaitId: "web-question-123", candidateText })
     expect(parseScheduledPipelineCompletionDisposition({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" }))
       .toEqual({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" })
   })
@@ -41,8 +47,17 @@ describe("scheduled pipeline completion disposition", () => {
     { status: "blocked", candidateText: "candidate" },
     { status: "completed", candidateText: " " },
     { status: "completed", candidateText: "candidate", waitId: "question-123" },
+    { status: "waiting_for_dependency", candidateText: "candidate" },
+    { status: "waiting_for_dependency", waitId: " dependency-123", candidateText: "candidate" },
+    { status: "waiting_for_dependency", waitId: "dependency-123", candidateText: " " },
+    { status: "waiting_for_dependency", waitId: "d".repeat(129), candidateText: "candidate" },
+    { status: "waiting_for_dependency", waitId: "dependency-123", candidateText: "candidate", errorCode: "ignored" },
     { status: "waiting_for_user", waitId: " question-123", candidateText: "candidate" },
     { status: "waiting_for_user", waitId: "question-123", candidateText: "candidate", errorCode: "ignored" },
+    { status: "waiting_for_external_user", externalWaitId: "web-question-123", scheduledWaitId: "web-question-123", candidateText: "candidate" },
+    { status: "waiting_for_external_user", externalWaitId: " web-question-123", candidateText: "candidate" },
+    { status: "waiting_for_external_user", externalWaitId: "web-question-123", scheduledWaitId: "worker-choice-123", candidateText: " " },
+    { status: "waiting_for_external_user", externalWaitId: "web-question-123", scheduledWaitId: "worker-choice-123", candidateText: "candidate", errorCode: "ignored" },
     { status: "blocked", errorCode: "Not safe" },
   ])("rejects malformed or non-durable scheduled dispositions", value => {
     expect(parseScheduledPipelineCompletionDisposition(value)).toBeNull()
@@ -51,7 +66,11 @@ describe("scheduled pipeline completion disposition", () => {
   it("rejects accessors and symbol properties instead of evaluating or ignoring them", () => {
     const accessor = Object.defineProperty({ status: "completed" }, "candidateText", { enumerable: true, get: () => "candidate" })
     const symbol = { status: "completed", candidateText: "candidate", [Symbol("extra")]: true }
+    const dependencyAccessor = Object.defineProperty({ status: "waiting_for_dependency", waitId: "dependency-123" }, "candidateText", { enumerable: true, get: () => "candidate" })
+    const dependencySymbol = { status: "waiting_for_dependency", waitId: "dependency-123", candidateText: "candidate", [Symbol("extra")]: true }
     expect(parseScheduledPipelineCompletionDisposition(accessor)).toBeNull()
     expect(parseScheduledPipelineCompletionDisposition(symbol)).toBeNull()
+    expect(parseScheduledPipelineCompletionDisposition(dependencyAccessor)).toBeNull()
+    expect(parseScheduledPipelineCompletionDisposition(dependencySymbol)).toBeNull()
   })
 })

@@ -583,6 +583,36 @@ describe("child executor composition", () => {
     expect(requests[0]?.outputSchema).toMatchObject({ properties: { schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: "analyst" }, status: { enum: ["completed", "partial"] }, findings: { items: { properties: { evidenceIds: { minItems: 1 } }, additionalProperties: false } }, evidence: { items: { additionalProperties: false } } }, additionalProperties: false })
   })
 
+  it("selects the strict Prepare result schema for typed Prepare children", async () => {
+    const child: SubagentLease = {
+      ...lease(), role: "prepare", taskType: "scheduled_application_prepare", allowedActions: [],
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" },
+    }
+    const requests: HarnessModelRequest[] = []
+    const model = textOnlyModel(JSON.stringify({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed",
+      snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64),
+      jobs: [{ jobId: "job-1", status: "prepared" }], materials: [],
+    }), request => requests.push(request))
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => childToolRuntime([]),
+    })
+
+    await executor({ lease: child })
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.outputSchema).toBeDefined()
+    expect(requests[0]?.outputSchema).toMatchObject({
+      properties: {
+        schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: "prepare" }, status: { enum: ["completed", "partial"] },
+        snapshotDigest: { pattern: "^sha256:[a-f0-9]{64}$" }, checkpointDigest: { pattern: "^[a-f0-9]{64}$" },
+        jobs: { maxItems: 50, items: { properties: { jobId: { maxLength: 256 }, status: { enum: ["prepared", "skipped", "failed"] } }, additionalProperties: false } },
+        materials: { maxItems: 100, items: { properties: { jobId: { maxLength: 256 }, kind: { enum: ["resume", "cover_letter"] } }, additionalProperties: false } },
+      }, additionalProperties: false,
+    })
+  })
+
   it.each([
     ["marker mismatch", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, profile }],
     ["unsupported structured output", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, profile: { ...profile, structuredOutput: false } }],

@@ -29,6 +29,8 @@ import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admissi
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tools.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
+import { SCHEDULED_PIPELINE_COMPLETION } from "./turn-execution-types.js"
+import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA } from "../subagents/scheduled-pipeline-candidate-store.js"
 import type { SteeringMarkerContext, SteeringMarkerWrite } from "../context/steering-marker-store.js"
 import type { HydrationScope } from "../context/steering-reconciliation-context.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
@@ -149,7 +151,7 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
   const baseStore = root.options.store
   const usage = { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }
   const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [] }
-  const waitForQuestion = vi.fn(async (input: { toolCallId: string }) => ({ status: "waiting_for_user" as const, disposition: "created" as const, waitId: "question-1", itemId: "agent-wait:question:question-1", turnId: "turn-1", toolCallId: input.toolCallId, nextTurnRevision: 2 }))
+  const waitForQuestion = vi.fn(async (input: { toolCallId: string | null }) => ({ status: "waiting_for_user" as const, disposition: "created" as const, waitId: "question-1", itemId: "agent-wait:question:question-1", turnId: "turn-1", toolCallId: input.toolCallId, nextTurnRevision: 2 }))
   const stageQuestionUsage = vi.fn(async () => { timeline.push("stage") })
   const cancelPausedQuestion = vi.fn(async () => "cancelled" as const)
   const readPendingQuestion = vi.fn(async () => recovery as never)
@@ -999,6 +1001,54 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(0)
     const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { usage: unknown }
     expect(saved.usage).toEqual(resume.usage)
+  })
+
+  it("replays a scheduled final candidate on its original step with exact finish reason and usage", async () => {
+    const candidateText = "done:root-1", finalStepId = "step:1", finalStepOrdinal = 1
+    const owner = identity("turn", "root-1")
+    if (owner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
+    const payload = { schemaVersion: SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, sessionId: owner.sessionId, turnId: owner.turnId,
+      rootTaskId: owner.rootTaskId, rootAttemptCount: 2, finalStepId, finalStepOrdinal, stepAttempt: 1, candidateText,
+      finishReason: "stop", usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 } }
+    const event = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
+      type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: finalStepId, payload, stepId: finalStepId, stepTaskId: owner.rootTaskId,
+      stepAttempt: 1, stepOrdinal: finalStepOrdinal, stepStatus: "streaming", stepInputThroughSequence: "10", stepFinishReason: null }
+    const client = { query: vi.fn(async (sql: string) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('SELECT "id" FROM "agent_sessions"') || sql.includes('SELECT turn."id" FROM "agent_turns"')) return { rows: [{ id: "owned" }], rowCount: 1 }
+      if (sql.includes('SELECT task."attemptCount"')) return { rows: [{ attemptCount: 2 }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events" AS event')) return { rows: [event], rowCount: 1 }
+      if (sql.includes('SELECT "id", "ordinal", "attempt" FROM "agent_steps"')) return { rows: [{ id: finalStepId, ordinal: finalStepOrdinal, attempt: 1 }], rowCount: 1 }
+      if (sql.includes('FROM "agent_inputs"')) return { rows: [], rowCount: 0 }
+      return { rows: [], rowCount: 0 }
+    }), release: vi.fn() }
+    const candidateStore = createScheduledPipelineCandidateStore({ connect: vi.fn(async () => client) } as never,
+      { appendEvent: vi.fn(async () => ({ id: "staged" })) } as never)
+    await expect(candidateStore.read({ owner, rootAttemptCount: 2 })).resolves.toMatchObject({ finalStepId, finalStepOrdinal, finishReason: "stop" })
+    const root = fixture(owner, undefined, [{ id: "resume-evidence", content: { toolCallId: "resume-evidence", status: "completed" } }])
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`
+    const waitForQuestion = vi.fn(async () => ({ status: "waiting_for_user" as const, disposition: "created" as const, waitId: scheduledWaitId,
+      itemId: `agent-wait:question:${scheduledWaitId}`, turnId: owner.turnId, toolCallId: null, nextTurnRevision: 2 }))
+    const scheduled = Object.assign(vi.fn(async () => ({ ok: true as const })), {
+      [SCHEDULED_PIPELINE_COMPLETION]: vi.fn(async input => {
+        if (input.identity.kind !== "turn") throw new Error("Fixture received a non-Turn owner")
+        await candidateStore.stage({ owner: input.identity, rootAttemptCount: 2, finalStepId: input.stepId,
+          finalStepOrdinal: input.stepOrdinal, candidateText: input.candidateText })
+        return { status: "waiting_for_user" as const, waitId: scheduledWaitId, candidateText: input.candidateText }
+      }),
+    })
+    const resume = { nextOrdinal: finalStepOrdinal + 1, stepCount: 2, toolCallCount: 0, inputThroughSequence: 10n,
+      consumedInputIds: [], usage: payload.usage }
+    root.options = { ...root.options, resume, expectedEvidence: ["resume-evidence"], recoveredFinalCandidate: candidateText,
+      completionGate: scheduled as TurnExecutionOptions["completionGate"],
+      store: { ...root.options.store, waitForQuestion } }
+
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId: scheduledWaitId, stepCount: 2 })
+    expect(root.requests).toHaveLength(0)
+    expect(root.stepTasks).toHaveLength(0)
+    expect(scheduled[SCHEDULED_PIPELINE_COMPLETION]).toHaveBeenCalledWith(expect.objectContaining({ stepId: finalStepId, stepOrdinal: finalStepOrdinal, candidateText }))
+    expect(waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: finalStepId, toolCallId: null, expectedWaitId: scheduledWaitId,
+      finishReason: "stop", usage: payload.usage }))
   })
 
   it("fails once when the full resumed Turn request outgrows every route after an earlier provider attempt", async () => {

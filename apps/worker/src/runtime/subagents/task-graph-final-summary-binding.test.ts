@@ -17,8 +17,9 @@ const scoutResult = (jobId: string) => ({
   summary: "PRIVATE_ROLE_NARRATIVE",
 })
 
-function row(id: string, role: string, taskType: string, result: unknown): GraphTaskRow {
-  return { id, role, taskType, status: "completed", failureReason: null, result }
+function row(id: string, role: string, taskType: string, result: unknown, attemptCount?: number): GraphTaskRow {
+  return { id, role, taskType, status: "completed", failureReason: null, result,
+    ...(attemptCount === undefined ? {} : { attemptCount }) }
 }
 
 function graph(revision: number, nodeIds: readonly string[], rows: readonly GraphTaskRow[], stateRevision = revision): LoadedGraph {
@@ -80,6 +81,28 @@ describe("current TaskGraph final-summary binding", () => {
     expect(sameTaskGraphFinalSummaryBinding(first, sameFacts)).toBe(true)
     expect(sameTaskGraphFinalSummaryBinding(first, sameCountDifferentFact)).toBe(false)
     expect(sameTaskGraphFinalSummaryBinding(first, changedRevision)).toBe(false)
+  })
+
+  it("binds Prepare results to the persisted task attempt", () => {
+    const result = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed",
+      taskId: "prepare-task", attemptCount: 2, snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64),
+      jobs: [{ jobId: "job-a", status: "prepared" }],
+      materials: [{ jobId: "job-a", kind: "resume", artifactRef: {
+        artifactId: "resume-a", version: 1, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+      } }],
+    }
+    const matching = buildTaskGraphFinalSummaryBinding(graph(6, ["prepare-task"], [
+      row("prepare-task", "prepare", "scheduled_application_prepare", { status: "completed", structuredResult: result }, 2),
+    ]))
+    const stale = buildTaskGraphFinalSummaryBinding(graph(6, ["prepare-task"], [
+      row("prepare-task", "prepare", "scheduled_application_prepare", { status: "completed", structuredResult: { ...result, attemptCount: 1 } }, 2),
+    ]))
+
+    expect(matching?.summary.prepareResults[0]?.attemptCount).toBe(2)
+    expect(matching?.summary.taskOutcomes[0]?.resultState).toBe("valid")
+    expect(stale?.summary.prepareResults).toEqual([])
+    expect(stale?.summary.taskOutcomes[0]?.resultState).toBe("invalid")
   })
 
   it("uses an enumerable private symbol that survives spread but not JSON serialization", () => {

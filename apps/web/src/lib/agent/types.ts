@@ -77,10 +77,37 @@ export interface PipelineCheckpointState {
   analysisFailed?: number
   report?: RunReport
   customAgentResults?: CustomAgentRunResult[]
+  /** Safe immutable material references retained across scheduled Gate/Execute recovery. */
+  scheduledTaskGraphPreparedArtifacts?: readonly Readonly<{
+    jobId: string
+    kind: 'resume' | 'cover_letter'
+    artifactRef: Readonly<{ artifactId: string; version: number; contentHash: string; sourceDigest: string }>
+  }>[]
+  /** Safe job-ID decisions; package bodies are rebuilt from immutable artifact versions. */
+  scheduledTaskGraphGateDecisions?: Readonly<{
+    approvedJobIds: readonly string[]
+    pendingJobIds: readonly string[]
+    skippedJobIds: readonly string[]
+  }>
+  /** Opaque Worker-owned scheduled Prepare choice reference; the question itself stays in Worker storage. */
+  scheduledTaskGraphScheduledWaitId?: string
   autonomous?: boolean
   startedAt?: string
   /** Number of canonical pipeline events durably emitted before this checkpoint. */
   eventIndex?: number
+  /** Private scheduled-run ownership claim retained across the Analyze → Gate handoff. */
+  scheduledTaskGraphClaim?: {
+    schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1'
+    key: string
+    claimToken: string
+    owner: {
+      userId: string; sessionId: string; turnId: string; rootTaskId: string
+      rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number
+      executionId: string; executionAttemptCount: number
+    }
+    claimedAt?: string
+    leaseExpiresAt?: string
+  }
 }
 
 export type CustomAgentObservation = {

@@ -58,30 +58,61 @@ describe("atomic TaskGraph finalization recovery", () => {
   })
 
   it("persists an exact scheduled durable wait without terminal completion", async () => {
-    const waitForUser = vi.fn(async () => undefined), recordFinalResponse = vi.fn()
+    const waitForQuestion = vi.fn(async (input: { expectedWaitId: string }) => ({ status: "waiting_for_user" as const, disposition: "created" as const,
+      waitId: input.expectedWaitId, itemId: `agent-wait:question:${input.expectedWaitId}`, turnId: "turn-1", toolCallId: null, nextTurnRevision: 5 })), recordFinalResponse = vi.fn()
     const candidateText = "  Hold this exact answer.  "
     const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
     completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "waiting_for_user", waitId: "wait-456", candidateText: input.candidateText })
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
-    const updateStep = vi.fn(async () => undefined)
+    const updateStep = vi.fn(async () => undefined), append = vi.fn(async () => ({ id: "event-1" }))
     const options = {
       identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
       scope: { userId: "user-1" }, goal: "Find a role", snapshot, completionGate,
-      store: { updateStep, waitForUser, recordFinalResponse },
+      store: { updateStep, waitForQuestion, waitForUser: vi.fn(), recordFinalResponse },
     } as unknown as TurnExecutionOptions
     const onStepClosed = vi.fn()
 
-    const outcome = await completeTurnCandidate({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
+    const outcome = await completeTurnCandidate({ options, writer: { append } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 },
-      output: { text: candidateText, reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
-      snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      output: { text: candidateText, reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, continuation: null } satisfies ModelStepResult,
+      snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 },
       signal: new AbortController().signal, now: () => new Date(), onStepClosed })
 
     expect(outcome).toEqual({ kind: "wait", result: { status: "waiting_for_user", waitId: "wait-456", stepCount: 1, toolCallCount: 0 } })
-    expect(updateStep).toHaveBeenCalledWith(expect.objectContaining({ status: "waiting_for_user" }))
-    expect(waitForUser).toHaveBeenCalledOnce()
+    expect(updateStep).not.toHaveBeenCalled()
+    expect(waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: null, expectedWaitId: "wait-456", finishReason: "stop",
+      usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 } }))
+    expect(options.store.waitForUser).not.toHaveBeenCalled()
+    expect(append).not.toHaveBeenCalledWith("step.completed", expect.anything(), expect.anything(), expect.anything(), expect.anything())
     expect(recordFinalResponse).not.toHaveBeenCalled()
     expect(onStepClosed).toHaveBeenCalledOnce()
+  })
+
+  it("suspends on the Web Gate question without passing its ID to the Worker choice store", async () => {
+    const updateStep = vi.fn(async () => undefined), waitForQuestion = vi.fn(), append = vi.fn(async () => ({ id: "event-1" }))
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "waiting_for_external_user",
+      externalWaitId: "web-gate-question", scheduledWaitId: "worker-choice-question", candidateText: input.candidateText })
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
+    const options = {
+      identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
+      scope: { userId: "user-1" }, goal: "Find a role", snapshot, completionGate,
+      store: { updateStep, waitForQuestion, recordFinalResponse: vi.fn() },
+    } as unknown as TurnExecutionOptions
+
+    const outcome = await completeTurnCandidate({ options, writer: { append } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-1", ordinal: 0 },
+      output: { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop",
+        usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, continuation: null } satisfies ModelStepResult,
+      snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 },
+      signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn() })
+
+    expect(outcome).toEqual({ kind: "wait", result: { status: "waiting_for_user", waitId: "web-gate-question", stepCount: 1, toolCallCount: 0 } })
+    expect(updateStep).toHaveBeenCalledWith(expect.objectContaining({ status: "waiting_for_user", finishReason: "stop", errorCode: null,
+      inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }))
+    expect(waitForQuestion).not.toHaveBeenCalled()
+    expect(append).toHaveBeenCalledWith("step.completed", "step-1", null,
+      { stepId: "step-1", status: "waiting_for_user", taskId: "root-1" }, "step-completed:step-1")
   })
 
   it("keeps scheduled blockers waiting for dependency without inventing a user wait", async () => {

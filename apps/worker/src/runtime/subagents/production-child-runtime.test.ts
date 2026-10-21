@@ -381,7 +381,7 @@ function policySnapshot(outcome: "allow" | "deny", tools?: string[]) {
 
 describe("production child runtime", () => {
   it("composes the exact generic-Scout discovery exception without widening internal writes", () => {
-    const scout = createProductionChildPolicy({ role: "scout", toolPolicySnapshot: policySnapshot("deny") }, false)
+    const scout = createProductionChildPolicy({ role: "scout", taskType: "discovery", toolPolicySnapshot: policySnapshot("deny") }, false)
     expect(discoveryDecision(scout)).toMatchObject({ outcome: "allow", reasonCode: "server_scout_job_discovery_write" })
     expect(discoveryDecision(scout, { ...discoveryPolicyTool, name: "application.prepare" }).outcome).toBe("deny")
     expect(discoveryDecision(scout, { ...discoveryPolicyTool, version: "2" }).outcome).toBe("deny")
@@ -389,22 +389,22 @@ describe("production child runtime", () => {
     expect(discoveryDecision(scout, { ...discoveryPolicyTool, risk: "draft_write" }).outcome).toBe("deny")
 
     const configuredAllow = policySnapshot("allow")
-    const configuredAllowScout = createProductionChildPolicy({ role: "scout", toolPolicySnapshot: configuredAllow }, false)
+    const configuredAllowScout = createProductionChildPolicy({ role: "scout", taskType: "discovery", toolPolicySnapshot: configuredAllow }, false)
     expect(discoveryDecision(configuredAllowScout, { ...discoveryPolicyTool, name: "application.prepare" })).toMatchObject({
       outcome: "deny",
       reasonCode: "server_subagent_internal_write_denied",
     })
     for (const role of ["analyst", "writer", "reviewer", "auditor", "executor"]) {
-      const otherRole = createProductionChildPolicy({ role, toolPolicySnapshot: configuredAllow }, false)
+      const otherRole = createProductionChildPolicy({ role, taskType: "test", toolPolicySnapshot: configuredAllow }, false)
       expect(discoveryDecision(otherRole).outcome).toBe("deny")
     }
-    const selectedScout = createProductionChildPolicy({ role: "scout", toolPolicySnapshot: configuredAllow }, true)
+    const selectedScout = createProductionChildPolicy({ role: "scout", taskType: "discovery", toolPolicySnapshot: configuredAllow }, true)
     expect(discoveryDecision(selectedScout).outcome).toBe("deny")
     expect(discoveryDecision(scout, { ...discoveryPolicyTool, name: "jobs.search" }).outcome).toBe("deny")
   })
 
   it("preserves a tool-specific discovery denial ahead of the server exception", () => {
-    const policy = createProductionChildPolicy({ role: "scout", toolPolicySnapshot: policySnapshot("deny", ["jobs.discover"]) }, false)
+    const policy = createProductionChildPolicy({ role: "scout", taskType: "discovery", toolPolicySnapshot: policySnapshot("deny", ["jobs.discover"]) }, false)
     expect(discoveryDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "configured_internal_write_deny" })
   })
 
@@ -836,6 +836,39 @@ describe("production child runtime", () => {
     expect(toolFactory).toHaveBeenCalledOnce()
     expect(requests[0]?.metadata).toMatchObject({ taskId: child.id, turnId: child.turnId })
     expect(requests[0]?.tools.map(tool => (tool as { name: string }).name)).toEqual(["jobs.search"])
+  })
+
+  it("registers scheduled Prepare only for its exact persisted task and supplies no selected-job context", async () => {
+    const child: SubagentLease = {
+      ...lease(), role: "prepare", taskType: "scheduled_application_prepare",
+      allowedActions: ["scheduled.application.prepare"],
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" }, context: {},
+    }
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: child.id,
+          attemptCount: child.attemptCount, snapshotDigest: "sha256:" + "a".repeat(64), checkpointDigest: "b".repeat(64), jobs: [], materials: [],
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const executor = createOptionalProductionChildExecutor({
+      enabled: true, pool: {} as never, turnStore: store(), treeBudget: budget(),
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
+    })
+    if (!executor) throw new Error("scheduled Prepare executor was not created")
+
+    await executor({ lease: child })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.tools.map(tool => (tool as { name: string }).name)).toContain("scheduled.application.prepare")
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain("selectedJobPreparation")
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain("coverLetterBase")
   })
 
   it("uses the server-owned default resume loader for a recovered attempt", async () => {

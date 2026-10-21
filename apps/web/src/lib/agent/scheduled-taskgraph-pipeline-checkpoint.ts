@@ -87,8 +87,8 @@ export function buildScheduledTaskGraphPrepareCheckpoint(
       ? { eventIndex: previous.eventIndex } : {}),
     ...(typeof previous?.autonomous === "boolean" ? { autonomous: previous.autonomous } : {}),
     nextStage: "prepare",
-    scoutedJobs: ownedJobs,
-    scoredJobs,
+    scoutedJobs: ownedJobs.map(job => ({ ...job, coverLetter: null })),
+    scoredJobs: scoredJobs.map(row => ({ ...row, job: { ...row.job, coverLetter: null } })),
     analysisFailed: input.analyzeResult?.data?.failed ?? 0,
     scheduledTaskGraphContinuation: {
       schemaVersion: CONTINUATION_SCHEMA,
@@ -159,8 +159,7 @@ function assertDiscoveryReceipt(scout: ScheduledPipelineAttestation["scout"]): v
 }
 function assertAttestationOwner(actual: AttestationOwner, expected: ScheduledTaskGraphPipelineOwner): void {
   if (actual.userId !== expected.userId || actual.sessionId !== expected.sessionId || actual.turnId !== expected.turnId
-    || actual.rootTaskId !== expected.rootTaskId || actual.rootAttemptCount !== expected.rootAttemptCount
-    || actual.turnLeaseOwnerId !== expected.turnLeaseOwnerId || actual.turnLeaseVersion !== expected.turnLeaseVersion) fail("owner_mismatch")
+    || actual.rootTaskId !== expected.rootTaskId || actual.rootAttemptCount !== expected.rootAttemptCount) fail("owner_mismatch")
 }
 function validateOwnedJobs(rows: readonly Job[] | undefined, candidateIds: readonly string[], userId: string): Job[] {
   if (!Array.isArray(rows) || rows.length !== candidateIds.length) fail("jobs_mismatch")
@@ -191,8 +190,8 @@ function validatePersistedCheckpoint(state: Record<string, unknown>, ownedJobs: 
       recommendation: row.recommendation, analysisFenceAt: row.analysisFenceAt } as unknown as ScoredJob
   })
   const result: StageResult<AnalyzeOutput> = { stage: "analyze", ok: true, data: { scoredJobs, failed }, metrics: { durationMs: 0, count: scoredJobs.length } }
-  return { scoutedJobs: [...ownedJobs], scoredJobs: candidateIds.length === 0 ? validateZeroCandidateAnalysis(result)
-    : validateAnalysis(result, ownedJobs, candidateIds, analystJobIds), analysisFailed: failed }
+  const safeScores = (candidateIds.length === 0 ? validateZeroCandidateAnalysis(result) : validateAnalysis(result, ownedJobs, candidateIds, analystJobIds)).map(row => ({ ...row, job: { ...row.job, coverLetter: null } }))
+  return { scoutedJobs: ownedJobs.map(job => ({ ...job, coverLetter: null })), scoredJobs: safeScores, analysisFailed: failed }
 }
 function validateAnalysis(
   result: StageResult<AnalyzeOutput> | undefined,
@@ -246,7 +245,7 @@ function parseExecutionOwner(value: unknown): ScheduledTaskGraphPipelineOwner | 
 function createContinuationKey(owner: ScheduledTaskGraphPipelineOwner, attestation: ScheduledPipelineAttestation): string {
   const receipt = attestation.scout.discoveryReceipt
   const evidence = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
-    owner.turnLeaseOwnerId, owner.turnLeaseVersion, owner.executionId, owner.executionAttemptCount, attestation.snapshotDigest, attestation.graphRevision,
+    owner.executionId, owner.executionAttemptCount, attestation.snapshotDigest, attestation.graphRevision,
     attestation.scout.taskId, attestation.scout.attemptCount, attestation.scout.resultDigest,
     attestation.analyst.taskId, attestation.analyst.attemptCount, attestation.analyst.resultDigest,
     attestation.evidenceDigest, receipt.receiptDigest]
@@ -255,7 +254,6 @@ function createContinuationKey(owner: ScheduledTaskGraphPipelineOwner, attestati
 function sameOwner(left: ScheduledTaskGraphPipelineOwner, right: ScheduledTaskGraphPipelineOwner): boolean {
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
     && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
-    && left.turnLeaseOwnerId === right.turnLeaseOwnerId && left.turnLeaseVersion === right.turnLeaseVersion
     && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
 }
 function record(value: unknown): Record<string, unknown> | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null }

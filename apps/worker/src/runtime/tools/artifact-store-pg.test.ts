@@ -328,7 +328,7 @@ class FakeArtifactPool {
         && !this.fence.parentInterrupted && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(this.fence.parentStatus)
       return this.one(valid ? { id: values[0] } : undefined)
     }
-    if (sql.includes('SELECT "leaseExpiresAt" > clock_timestamp() AS "live"')) {
+    if (sql.includes('SELECT "leaseExpiresAt" > clock_timestamp() AS "live"') || sql.includes('SELECT task."leaseExpiresAt" > clock_timestamp()')) {
       const live = (values[0] === "task-a" || values[0] === "review-task") && values[1] === "session-a" && values[2] === this.fence.leaseOwner
         && values[3] === this.fence.attemptCount && this.fence.leaseExpiresAt.getTime() > Date.now()
       return this.one({ live })

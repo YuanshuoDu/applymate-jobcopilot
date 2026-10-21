@@ -27,7 +27,7 @@ function scheduledRuntimeInput(overrides: Record<string, unknown> = {}) {
 }
 
 describe("TaskGraph server-owned templates", () => {
-  it("registers structured read-only Scout and Analyst roles for evidence chaining", () => {
+  it("registers Scout and Analyst, while keeping the scheduled Prepare role out of initial planning", () => {
     expect(TASK_GRAPH_TEMPLATES.scout).toMatchObject({
       role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"],
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
@@ -37,6 +37,14 @@ describe("TaskGraph server-owned templates", () => {
       allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
     })
+    expect(TASK_GRAPH_TEMPLATES.prepare).toMatchObject({
+      role: "prepare", taskType: "scheduled_application_prepare",
+      allowedActions: ["scheduled.application.prepare"],
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" },
+    })
+    expect(TASK_GRAPH_TEMPLATES.prepare.constraints?.join(" ")).toContain("specialized scheduled continuation")
+    expect(Object.keys(TASK_GRAPH_TEMPLATES)).toEqual(["scout", "analyst", "prepare"])
+    expect(Object.keys(taskGraphTemplatesForSelectedJob(undefined))).toEqual(["scout", "analyst"])
     for (const template of Object.values(TASK_GRAPH_TEMPLATES)) {
       expect(template.allowedActions).not.toContain("agent.plan")
       expect(template.allowedActions.some(action => /submit|send|publish|delete|mutate|execute/i.test(action))).toBe(false)
@@ -52,6 +60,9 @@ describe("TaskGraph server-owned templates", () => {
     })
     expect(runtimeOptions.taskGraphTemplates.analyst.expectedOutputSchema).toEqual({
       schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst",
+    })
+    expect(runtimeOptions.taskGraphTemplates.prepare.expectedOutputSchema).toEqual({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare",
     })
   })
 
@@ -206,9 +217,11 @@ describe("TaskGraph server-owned templates", () => {
       templates: { scout: expect.any(Object), analyst: expect.any(Object) },
     })
     expect(manual.scheduledDraftMode).toBe(false)
-    expect(manual.templates).toBe(TASK_GRAPH_TEMPLATES)
+    expect(manual.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
+    expect(manual.templates).not.toHaveProperty("prepare")
     expect(userTurn.scheduledDraftMode).toBe(false)
-    expect(userTurn.templates).toBe(TASK_GRAPH_TEMPLATES)
+    expect(userTurn.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
+    expect(userTurn.templates).not.toHaveProperty("prepare")
   })
 
   it("propagates invalid bound-fill or loader failures before runtime root creation", async () => {
@@ -341,7 +354,8 @@ describe("TaskGraph server-owned templates", () => {
       turnInput: { scheduledAutomationSnapshot: { schemaVersion: "wrong", autoApply: "private" } },
     }))
 
-    expect(result.templates).toBe(TASK_GRAPH_TEMPLATES)
+    expect(result.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
+    expect(result.templates).not.toHaveProperty("prepare")
     expect(result.templates?.scout.context).toBeUndefined()
   })
 
@@ -352,7 +366,8 @@ describe("TaskGraph server-owned templates", () => {
       turnInput: { scheduledAutomationSnapshot: { schemaVersion: "wrong" } },
     }))
 
-    expect(result.templates).toBe(TASK_GRAPH_TEMPLATES)
+    expect(result.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
+    expect(result.templates).not.toHaveProperty("prepare")
     expect(result.templates?.scout.context).toBeUndefined()
   })
 
@@ -365,7 +380,8 @@ describe("TaskGraph server-owned templates", () => {
     }))
 
     expect(result).toMatchObject({ enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode: false })
-    expect(result.templates).toBe(TASK_GRAPH_TEMPLATES)
+    expect(result.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
+    expect(result.templates).not.toHaveProperty("prepare")
     expect(selectedJobLoader).not.toHaveBeenCalled()
   })
 

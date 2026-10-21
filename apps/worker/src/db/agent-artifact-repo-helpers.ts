@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg"
+import { randomUUID } from "node:crypto"
 import type { AgentArtifactDraftHead, AgentArtifactDraftHeadScope, AgentArtifactReviewReceipt, AgentArtifactReviewReceiptScope } from "./agent-artifact-repo.js"
 import { RUNNABLE_SESSION } from "../runtime/session-gate.js"
 
@@ -11,6 +12,9 @@ export type AgentArtifactTaskFence = {
   readonly parentTaskId: string | null
   readonly leaseOwner: string
   readonly attemptCount: number
+  readonly taskFenceMode?: "selected_job" | "scheduled_prepare"
+  readonly turnLeaseOwnerId?: string
+  readonly turnLeaseVersion?: number
 }
 
 export type AgentArtifactLifecycle = "base" | "draft"
@@ -32,6 +36,7 @@ export type AgentArtifactReviewRow = {
 export type AgentArtifactBaseInsert = { readonly id: string; readonly userId: string; readonly jobId: string; readonly artifactType: string; readonly content: unknown; readonly hash: string; readonly constraintHash: string; readonly provenanceRefs: readonly string[]; readonly evidenceRefs: readonly string[] }
 
 export type AgentArtifactDraftWrite = AgentArtifactBaseInsert & { readonly sessionId: string; readonly baseId: string; readonly baseHash: string; readonly previousHash: string | null; readonly sourceDigest: string; readonly taskId: string; readonly toolCallId: string; readonly requestHash: string; readonly taskFence: AgentArtifactTaskFence; readonly expectedPreviousHash?: string | null }
+export type AgentArtifactDraftTransactionWrite = AgentArtifactDraftWrite & { readonly expectedPreviousVersion?: number }
 
 export type AgentArtifactReviewWrite = { readonly userId: string; readonly sessionId: string; readonly jobId: string; readonly artifactId: string; readonly version: number; readonly contentHash: string; readonly sourceDigest: string; readonly currentSourceDigest: string; readonly status: AgentArtifactReviewRow["status"]; readonly findings: unknown; readonly evidenceRefs: readonly string[]; readonly taskId: string; readonly toolCallId: string; readonly requestHash: string; readonly reviewHash: string; readonly taskFence: AgentArtifactTaskFence }
 
@@ -40,6 +45,77 @@ export class AgentArtifactRepositoryError extends Error {
     super(message)
     this.name = "AgentArtifactRepositoryError"
   }
+}
+
+const DRAFT_ARTIFACT_COLUMNS = `"id", "userId", "jobId", "artifactType", "lifecycle", "baseId", "baseHash", "content", "hash", "constraintHash", "provenanceRefs", "evidenceRefs", "previousHash", "version", "createdAt", "updatedAt"`
+const DRAFT_VERSION_COLUMNS = `"id", "artifactId", "version", "userId", "sessionId", "jobId", "artifactType", "content", "contentHash", "sourceDigest", "constraintHash", "provenanceRefs", "evidenceRefs", "baseId", "baseHash", "previousHash", "taskId", "toolCallId", "requestHash", "createdAt"`
+
+function draftParentContent(input: AgentArtifactDraftTransactionWrite, version: number): unknown {
+  return input.artifactType === "cover_letter" ? { kind: "agent_artifact_version", artifactId: input.id, version, contentHash: input.hash } : input.content
+}
+
+async function selectDraftArtifact(client: Pick<PoolClient, "query">, userId: string, artifactId: string, lock = false): Promise<AgentArtifactRow | null> {
+  const result = await client.query<Record<string, unknown>>(`SELECT ${DRAFT_ARTIFACT_COLUMNS} FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2${lock ? " FOR UPDATE" : ""}`, [artifactId, userId])
+  return result.rows[0] ? toAgentArtifactRow(result.rows[0]) : null
+}
+
+async function findDraftTaskVersion(client: Pick<PoolClient, "query">, taskId: string, toolCallId: string): Promise<AgentArtifactVersionRow | null> {
+  const result = await client.query<Record<string, unknown>>(`SELECT ${DRAFT_VERSION_COLUMNS} FROM "agent_artifact_version" WHERE "taskId" = $1 AND "toolCallId" = $2 FOR UPDATE`, [taskId, toolCallId])
+  return result.rows[0] ? toAgentArtifactVersionRow(result.rows[0]) : null
+}
+
+function assertDraftReplay(existing: AgentArtifactVersionRow, input: AgentArtifactDraftTransactionWrite): AgentArtifactVersionRow {
+  if (existing.requestHash !== input.requestHash || existing.userId !== input.userId || existing.sessionId !== input.sessionId || existing.jobId !== input.jobId) {
+    throw new AgentArtifactRepositoryError("receipt_conflict", "Task tool receipt was replayed with different artifact input or scope.")
+  }
+  return existing
+}
+
+/** Writes a draft and its immutable version through a transaction owned by the caller. */
+export async function saveAgentArtifactDraftWithClient(client: Pick<PoolClient, "query">, input: AgentArtifactDraftTransactionWrite): Promise<AgentArtifactVersionRow> {
+  if (!input.sessionId.trim() || !input.taskId.trim() || !input.toolCallId.trim()) throw new AgentArtifactRepositoryError("precondition_failed", "Artifact Task receipt scope is required.")
+  if (input.taskFence.taskId !== input.taskId || input.taskFence.userId !== input.userId || input.taskFence.sessionId !== input.sessionId) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task fence does not match its receipt scope.")
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [input.userId, input.jobId])
+  if (!await artifactTaskFenceIsCurrent(client, input.taskFence, input.jobId)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease or lineage is stale, stopped, expired, or mismatched.")
+  const earlyReceipt = await findDraftTaskVersion(client, input.taskId, input.toolCallId)
+  if (earlyReceipt) {
+    const replay = assertDraftReplay(earlyReceipt, input)
+    if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
+    return replay
+  }
+  const base = await selectDraftArtifact(client, input.userId, input.baseId, true)
+  if (!base) throw new AgentArtifactRepositoryError("not_found", "Artifact is not available in the current tenant.")
+  if (base.lifecycle !== "base" || base.hash !== input.baseHash || base.artifactType !== input.artifactType || base.jobId !== input.jobId) throw new AgentArtifactRepositoryError("stale_hash", "Draft base hash is stale or unavailable.")
+  if (input.evidenceRefs.length === 0) throw new AgentArtifactRepositoryError("invalid_provenance", "Draft requires evidence.")
+  const previous = await selectDraftArtifact(client, input.userId, input.id, true)
+  if (previous?.lifecycle === "base") throw new AgentArtifactRepositoryError("precondition_failed", "A base artifact cannot be replaced by a draft.")
+  if (previous && (previous.jobId !== base.jobId || previous.baseId !== input.baseId || previous.artifactType !== input.artifactType)) throw new AgentArtifactRepositoryError("precondition_failed", "Draft identity does not match its base artifact.")
+  if (input.expectedPreviousVersion !== undefined && (!previous || input.expectedPreviousVersion !== previous.version)) throw new AgentArtifactRepositoryError("precondition_failed", "Draft update has a stale previous version.")
+  if (input.expectedPreviousHash !== undefined && (previous ? input.expectedPreviousHash !== previous.hash : input.expectedPreviousHash !== null)) throw new AgentArtifactRepositoryError("precondition_failed", "Draft update has a stale previous hash.")
+  const previousHash = previous?.hash ?? input.previousHash
+  const nextVersion = (previous?.version ?? 0) + 1
+  if (!previous) await client.query(
+    `INSERT INTO "agent_artifact" (${DRAFT_ARTIFACT_COLUMNS}) VALUES ($1,$2,$3,$4,'draft',$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+    [input.id, input.userId, input.jobId, input.artifactType, input.baseId, input.baseHash, JSON.stringify(draftParentContent(input, nextVersion)), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs], previousHash, nextVersion],
+  )
+  const inserted = await client.query<Record<string, unknown>>(
+    `INSERT INTO "agent_artifact_version" (${DRAFT_VERSION_COLUMNS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,CURRENT_TIMESTAMP) ON CONFLICT ("taskId", "toolCallId") DO NOTHING RETURNING ${DRAFT_VERSION_COLUMNS}`,
+    [randomUUID(), input.id, nextVersion, input.userId, input.sessionId, input.jobId, input.artifactType, JSON.stringify(input.content), input.hash, input.sourceDigest, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs], input.baseId, input.baseHash, previousHash, input.taskId, input.toolCallId, input.requestHash],
+  )
+  if (!inserted.rows[0]) {
+    const winner = await findDraftTaskVersion(client, input.taskId, input.toolCallId)
+    if (!winner) throw new AgentArtifactRepositoryError("receipt_conflict", "Task tool receipt could not be resolved.")
+    const replay = assertDraftReplay(winner, input)
+    if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
+    return replay
+  }
+  const version = toAgentArtifactVersionRow(inserted.rows[0])
+  if (previous) await client.query(
+    `UPDATE "agent_artifact" SET "content" = $1::jsonb, "hash" = $2, "constraintHash" = $3, "provenanceRefs" = $4, "evidenceRefs" = $5, "previousHash" = $6, "version" = $7, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $8 AND "userId" = $9 AND "lifecycle" = 'draft'`,
+    [JSON.stringify(draftParentContent(input, nextVersion)), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs], previousHash, nextVersion, input.id, input.userId],
+  )
+  if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
+  return version
 }
 
 function strings(value: unknown): string[] { return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [] }
@@ -96,10 +172,13 @@ const CURRENT_TASK = `SELECT task."id" FROM "sub_agent_tasks" AS task
     AND task."rootTaskId" = $5 AND task."parentTaskId" IS NOT DISTINCT FROM $6
     AND task."status" = 'running' AND task."leaseOwner" = $7 AND task."attemptCount" = $8
     AND task."leaseExpiresAt" > clock_timestamp() AND task."interruptRequestedAt" IS NULL
+    AND ($10 = 'scheduled_prepare' OR task."context"->'selectedJobPreparation'->>'jobId' = $9)
     AND ${RUNNABLE_SESSION} AND turn."status" NOT IN ${TERMINAL_TURN}
+    AND ($10 <> 'scheduled_prepare' OR (task."role" = 'prepare' AND task."taskType" = 'scheduled_application_prepare'
+      AND turn."status" = 'in_progress' AND turn."leaseOwnerId" = $11 AND turn."leaseVersion" = $12
+      AND turn."leaseExpiresAt" > clock_timestamp()))
     AND turn."rootTaskId" = root."id" AND root."rootTaskId" = root."id"
     AND root."status" NOT IN ${TERMINAL_TASK} AND root."interruptRequestedAt" IS NULL
-    AND task."context"->'selectedJobPreparation'->>'jobId' = $9
   FOR UPDATE OF session, turn, root, task`
 
 type QueryClient = Pick<Pool, "query">
@@ -160,8 +239,14 @@ export async function findReviewReceiptWithClient(client: Pick<PoolClient, "quer
 export async function artifactTaskFenceIsCurrent(client: QueryClient, fence: AgentArtifactTaskFence, jobId: string): Promise<boolean> {
   if (![fence.taskId, fence.userId, fence.sessionId, fence.turnId, fence.rootTaskId, fence.leaseOwner, jobId].every(value => typeof value === "string" && value.trim().length > 0)
     || !Number.isSafeInteger(fence.attemptCount) || fence.attemptCount < 1
+    || (fence.taskFenceMode !== undefined && fence.taskFenceMode !== "selected_job" && fence.taskFenceMode !== "scheduled_prepare")
     || (fence.parentTaskId !== null && (typeof fence.parentTaskId !== "string" || !fence.parentTaskId.trim()))) return false
-  const current = await client.query(CURRENT_TASK, [fence.taskId, fence.userId, fence.sessionId, fence.turnId, fence.rootTaskId, fence.parentTaskId, fence.leaseOwner, fence.attemptCount, jobId])
+  const scheduledPrepare = fence.taskFenceMode === "scheduled_prepare"
+  if (scheduledPrepare && (typeof fence.turnLeaseOwnerId !== "string" || !fence.turnLeaseOwnerId.trim()
+    || !Number.isSafeInteger(fence.turnLeaseVersion) || (fence.turnLeaseVersion ?? 0) < 1)) return false
+  const current = await client.query(CURRENT_TASK, [fence.taskId, fence.userId, fence.sessionId, fence.turnId, fence.rootTaskId, fence.parentTaskId,
+    fence.leaseOwner, fence.attemptCount, jobId, scheduledPrepare ? "scheduled_prepare" : "selected_job",
+    scheduledPrepare ? fence.turnLeaseOwnerId : null, scheduledPrepare ? fence.turnLeaseVersion : null])
   if (current.rows.length !== 1) return false
   if (fence.parentTaskId === null) return fence.taskId === fence.rootTaskId
   const parent = await client.query(
@@ -175,10 +260,20 @@ export async function artifactTaskFenceIsCurrent(client: QueryClient, fence: Age
 
 /** Rechecks wall-clock expiry immediately before the surrounding transaction commits. */
 export async function artifactTaskLeaseIsLive(client: QueryClient, fence: AgentArtifactTaskFence): Promise<boolean> {
+  const scheduledPrepare = fence.taskFenceMode === "scheduled_prepare"
+  if (scheduledPrepare && (typeof fence.turnLeaseOwnerId !== "string" || !fence.turnLeaseOwnerId.trim()
+    || !Number.isSafeInteger(fence.turnLeaseVersion) || (fence.turnLeaseVersion ?? 0) < 1)) return false
+  const turnLeaseCheck = scheduledPrepare
+    ? `AND EXISTS (SELECT 1 FROM "agent_turns" AS turn WHERE turn."id" = $5 AND turn."sessionId" = $2
+        AND turn."userId" = $6 AND turn."status" = 'in_progress' AND turn."leaseOwnerId" = $7
+        AND turn."leaseVersion" = $8 AND turn."leaseExpiresAt" > clock_timestamp())`
+    : ""
   const result = await client.query<{ live: boolean }>(
-    `SELECT "leaseExpiresAt" > clock_timestamp() AS "live" FROM "sub_agent_tasks"
-      WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4`,
-    [fence.taskId, fence.sessionId, fence.leaseOwner, fence.attemptCount],
+    `SELECT task."leaseExpiresAt" > clock_timestamp() ${turnLeaseCheck} AS "live" FROM "sub_agent_tasks" task
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."leaseOwner" = $3 AND task."attemptCount" = $4`,
+    scheduledPrepare
+      ? [fence.taskId, fence.sessionId, fence.leaseOwner, fence.attemptCount, fence.turnId, fence.userId, fence.turnLeaseOwnerId, fence.turnLeaseVersion]
+      : [fence.taskId, fence.sessionId, fence.leaseOwner, fence.attemptCount],
   )
   return result.rows[0]?.live === true
 }

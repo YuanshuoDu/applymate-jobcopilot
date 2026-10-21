@@ -100,8 +100,27 @@ describe("selected-job artifact task fence helpers", () => {
     expect(taskSql).toContain("FOR UPDATE OF session, turn, root, task")
     expect(taskSql).toContain('task."context"->\'selectedJobPreparation\'->>\'jobId\' = $9')
     expect(taskSql).toContain('root."interruptRequestedAt" IS NULL')
-    expect(taskValues).toEqual(["task-a", "user-a", "session-a", "turn-a", "root-a", "parent-a", "worker-a", 2, "job-a"])
+    expect(taskValues).toEqual(["task-a", "user-a", "session-a", "turn-a", "root-a", "parent-a", "worker-a", 2, "job-a", "selected_job", null, null])
     expect(client.query.mock.calls[1]?.[0]).toContain('parent."interruptRequestedAt" IS NULL FOR UPDATE')
+  })
+
+  it("requires the captured live Turn lease for scheduled Prepare artifact writes", async () => {
+    const scheduledFence: AgentArtifactTaskFence = {
+      ...fence, taskFenceMode: "scheduled_prepare", turnLeaseOwnerId: "turn-worker-a", turnLeaseVersion: 6,
+    }
+    const current = clientWith([{ id: "task-a" }, { id: "parent-a" }])
+    await expect(artifactTaskFenceIsCurrent(current as unknown as Pick<Pool, "query">, scheduledFence, "job-a")).resolves.toBe(true)
+    const [taskSql, taskValues] = current.query.mock.calls[0] as unknown as [string, unknown[]]
+    expect(taskSql).toContain('turn."leaseOwnerId" = $11')
+    expect(taskSql).toContain('turn."leaseVersion" = $12')
+    expect(taskSql).toContain('turn."leaseExpiresAt" > clock_timestamp()')
+    expect(taskValues).toEqual(["task-a", "user-a", "session-a", "turn-a", "root-a", "parent-a", "worker-a", 2, "job-a",
+      "scheduled_prepare", "turn-worker-a", 6])
+
+    const missingLease = clientWith([])
+    await expect(artifactTaskFenceIsCurrent(missingLease as unknown as Pick<Pool, "query">,
+      { ...scheduledFence, turnLeaseVersion: 0 }, "job-a")).resolves.toBe(false)
+    expect(missingLease.query).not.toHaveBeenCalled()
   })
 
   it("fails closed for invalid fences and missing or interrupted parent lineage", async () => {

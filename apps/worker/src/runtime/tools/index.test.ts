@@ -51,6 +51,26 @@ describe("worker tool runtime entry point", () => {
     expect(enabled.registry.validateArguments("jobs.discover", { targetRoles: ["Engineer"], targetLocations: [], userId: "forged" })).not.toBe(true)
   })
 
+  it("registers scheduled Prepare only when its server-owned provider is explicitly supplied", () => {
+    const disabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink() })
+    expect(() => disabled.registry.resolve("scheduled.application.prepare", "1")).toThrow("not registered")
+
+    const scheduledPrepare = {
+      loadVerifiedInvocation: async () => { throw new Error("fixture_not_executed") },
+      resolveResumeTailoringChoice: async () => { throw new Error("fixture_not_executed") },
+      prepareJob: async () => { throw new Error("fixture_not_executed") },
+    }
+    const enabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink() }, undefined, undefined, undefined, undefined, undefined, undefined,
+      scheduledPrepare,
+    )
+    expect(enabled.registry.resolve("scheduled.application.prepare", "1")).toMatchObject({
+      risk: "draft_write", domain: "resume", capabilities: ["read", "write"], requiredCapabilities: [],
+    })
+    expect(enabled.registry.validateArguments("scheduled.application.prepare", {})).toBe(true)
+    expect(enabled.registry.validateArguments("scheduled.application.prepare", { jobIds: ["model-selected-job"] })).not.toBe(true)
+  })
+
   it("registers the durable private-result read tool with the runtime owner resolver", () => {
     const runtime = createWorkerToolRuntime(
       {} as never,

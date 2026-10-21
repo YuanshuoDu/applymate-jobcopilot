@@ -3,9 +3,11 @@ import type pg from "pg"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { interruptSubtree, interruptTree, interruptTurn, prepareTaskGraphFinish, recoverExpired } from "./pg-store-lifecycle.js"
 import * as taskGraphLifecycle from "./task-graph-pg-lifecycle.js"
+import * as taskGraphState from "./task-graph-pg-state.js"
 import * as taskGraphVerification from "./task-graph-pg-verification.js"
+import * as scheduledPrepareVerification from "./scheduled-prepare-task-graph-verification.js"
 import type { PgSubagentPool } from "./types.js"
-import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 
@@ -201,6 +203,53 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
 }
 
 describe("subagent PostgreSQL lifecycle helpers", () => {
+  it("stores only verifier-issued Prepare proof facts at the completed lifecycle revision", async () => {
+    const snapshot = { nodes: [{ key: "prepare", templateId: "prepare", taskId: "prepare-1" }] }
+    const graph = { scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+      itemId: "item-1", taskId: "prepare-1", expectedRevision: 13, snapshot,
+      event: { type: "task.completed", nodeKey: "prepare", expectedRevision: 13,
+        idempotencyKey: taskGraphLifecycleKey("root-1", "prepare", 3, "task.completed") },
+      state: { revision: 14, nodes: [{ key: "prepare", taskId: "prepare-1", templateId: "prepare", status: "completed", failureReason: null }] }, duplicate: false }
+    const proofFacts = { schemaVersion: "server-owned-facts" }
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValueOnce(graph as never)
+    const persistedPrepareTask = { id: "prepare-1", status: "running", role: "prepare", taskType: "scheduled_application_prepare",
+      attemptCount: 3, failureReason: null, result: null }
+    const persistedState = { revision: 13, nodes: [{ key: "prepare", taskId: "prepare-1", templateId: "prepare", status: "running", failureReason: null }] }
+    const load = vi.spyOn(taskGraphState, "loadTaskGraph").mockResolvedValueOnce({
+      item: { id: "item-1", revision: 13 }, snapshot, state: persistedState, tasks: new Map([["prepare-1", persistedPrepareTask]]),
+    } as never)
+    const current = vi.spyOn(taskGraphState, "currentTaskGraph").mockImplementation(loaded => ({
+      revision: loaded.state?.revision ?? 0,
+      nodes: [{ key: "prepare", taskId: "prepare-1", templateId: "prepare",
+        status: loaded.state?.revision === 14 ? "completed" : "running", failureReason: null }],
+    } as never))
+    const verify = vi.spyOn(scheduledPrepareVerification, "verifyScheduledPrepareTaskGraphEvidence")
+      .mockResolvedValueOnce({ verified: true, facts: proofFacts } as never)
+    try {
+      const result = await prepareTaskGraphFinish({} as never, {
+        taskId: "prepare-1", sessionId: "session-1", attemptCount: 3, status: "completed", retry: false,
+        result: { structuredResult: { toolResult: true }, taskGraphScheduledPrepareProofFacts: { forged: true } },
+      })
+      expect(result.status).toBe("completed")
+      expect(result.graph).toBe(graph)
+      expect(result.reconcileDependents).toBe(true)
+      expect(result.result).toMatchObject({ taskGraphScheduledPrepareProofFacts: proofFacts })
+      expect((result.result as Record<string, unknown>).taskGraphScheduledPrepareProofFacts).not.toEqual({ forged: true })
+      expect(prepare).toHaveBeenCalledTimes(1)
+      expect(load).toHaveBeenCalledTimes(1)
+      expect(current).toHaveBeenCalledTimes(2)
+      expect(current).toHaveBeenNthCalledWith(1, expect.objectContaining({ state: persistedState,
+        tasks: expect.any(Map) }))
+      expect(verify).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ completionGraphRevision: 14,
+        scope: expect.objectContaining({ taskId: "prepare-1", attemptCount: 3 }), current: expect.objectContaining({ revision: 14,
+          nodes: expect.arrayContaining([expect.objectContaining({ key: "prepare", taskId: "prepare-1", status: "completed" })]) }),
+        tasks: expect.any(Map) }))
+      const verifiedTasks = verify.mock.calls[0]?.[1].tasks
+      expect(verifiedTasks.get("prepare-1")).toMatchObject({ status: "completed", attemptCount: 3 })
+      expect(persistedPrepareTask.status).toBe("running")
+    } finally { prepare.mockRestore(); load.mockRestore(); current.mockRestore(); verify.mockRestore() }
+  })
+
   it("persists discovery recovery only for the terminal failed status", async () => {
     const discoveryRecovery = {
       schemaVersion: "agent-harness.v2.task-graph.discovery-recovery.v1", attemptCount: 3,

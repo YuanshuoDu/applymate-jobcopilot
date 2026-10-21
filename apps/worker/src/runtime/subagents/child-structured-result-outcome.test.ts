@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer"
 import { describe, expect, it, vi } from "vitest"
 
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
-import { MAX_EVIDENCE_BYTES, parseAndBindStructuredResultOutcome } from "./child-structured-result-outcome.js"
+import { MAX_EVIDENCE_BYTES, parseAndBindStructuredResultOutcome, scheduledPrepareToolReceiptKey } from "./child-structured-result-outcome.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 function emptyScoutResult(overrides: Record<string, unknown> = {}) {
@@ -14,6 +14,18 @@ function scoutWithEvidence(ref = "job-1", source = "model") {
     schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
     candidates: [{ jobId: ref, source: "greenhouse", url: null, evidenceIds: ["model-job"] }],
     evidence: [{ id: "model-job", kind: "job", ref, source }], summary: "one job",
+  }
+}
+
+function scheduledPrepareResult(snapshotDigest = `sha256:${"a".repeat(64)}`) {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" as const, status: "completed" as const,
+    taskId: "prepare-task-1", attemptCount: 2,
+    snapshotDigest, checkpointDigest: "b".repeat(64),
+    jobs: [{ jobId: "job-1", status: "prepared" as const }],
+    materials: [{ jobId: "job-1", kind: "resume" as const, artifactRef: {
+      artifactId: "resume-1", version: 2, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+    } }],
   }
 }
 
@@ -108,6 +120,39 @@ describe("single-pass structured result outcomes", () => {
     expect(parseAndBindStructuredResultOutcome(JSON.stringify(missingEvidence), "scout", createObservedEvidenceIndex()))
       .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
     expect(parseAndBindStructuredResultOutcome(JSON.stringify(scoutWithEvidence()), "scout", createObservedEvidenceIndex()))
+      .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
+  })
+
+  it("requires the successful registered Prepare tool receipt instead of generic Analyst evidence", () => {
+    const index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "jobs.get", { job: { id: "job-1", source: "greenhouse" } })
+    const result = scheduledPrepareResult()
+
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(result), "prepare", index))
+      .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
+  })
+
+  it("accepts only the Prepare result that exactly matches its successful registered tool receipt", () => {
+    const receipt = scheduledPrepareResult()
+    const index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "scheduled.application.prepare", receipt, {}, {
+      toolCallId: "prepare-call-1", taskId: "prepare-task-1", attemptCount: 2,
+    })
+
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(receipt), "prepare", index))
+      .toEqual({ kind: "valid", result: receipt })
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(scheduledPrepareResult(`sha256:${"e".repeat(64)}`)), "prepare", index))
+      .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
+    expect(index.scheduledPrepareResults.get("prepare-task-1\u00002")?.toolCallId).toBe("prepare-call-1")
+    expect(index.artifactResults.has(scheduledPrepareToolReceiptKey(receipt))).toBe(false)
+  })
+
+  it("fails closed when the registered call identity does not match its tool output", () => {
+    const receipt = scheduledPrepareResult(), index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "scheduled.application.prepare", receipt, {}, {
+      toolCallId: "prepare-call-1", taskId: "prepare-task-1", attemptCount: 1,
+    })
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(receipt), "prepare", index))
       .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
   })
 

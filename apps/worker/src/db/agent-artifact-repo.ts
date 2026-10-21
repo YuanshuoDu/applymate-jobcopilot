@@ -1,8 +1,8 @@
 import type { Pool, PoolClient } from "pg"
 import { randomUUID } from "node:crypto"
 import {
-  AgentArtifactRepositoryError, artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive,
-  findCurrentDraftHeadWithClient, findReviewReceiptWithClient, toAgentArtifactReviewRow, toAgentArtifactRow, toAgentArtifactVersionRow, withArtifactTransaction,
+  AgentArtifactRepositoryError, artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive, findCurrentDraftHeadWithClient, findReviewReceiptWithClient,
+  saveAgentArtifactDraftWithClient, toAgentArtifactReviewRow, toAgentArtifactRow, toAgentArtifactVersionRow, withArtifactTransaction,
   type AgentArtifactBaseInsert, type AgentArtifactDraftWrite as HelperAgentArtifactDraftWrite, type AgentArtifactReviewRow, type AgentArtifactReviewWrite,
   type AgentArtifactRow, type AgentArtifactTaskFence, type AgentArtifactVersionRow,
 } from "./agent-artifact-repo-helpers.js"
@@ -40,25 +40,9 @@ const columns = `"id", "userId", "jobId", "artifactType", "lifecycle", "baseId",
 const versionColumns = `"id", "artifactId", "version", "userId", "sessionId", "jobId", "artifactType", "content", "contentHash", "sourceDigest", "constraintHash", "provenanceRefs", "evidenceRefs", "baseId", "baseHash", "previousHash", "taskId", "toolCallId", "requestHash", "createdAt"`
 const reviewColumns = `"id", "artifactVersionId", "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "findings", "evidenceRefs", "taskId", "toolCallId", "requestHash", "reviewHash", "createdAt"`
 const reviewReceiptColumns = `"userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "taskId", "toolCallId", "reviewHash"`
-function draftParentContent(input: AgentArtifactDraftWrite, version: number): unknown {
-  return input.artifactType === "cover_letter" ? { kind: "agent_artifact_version", artifactId: input.id, version, contentHash: input.hash } : input.content
-}
-
 async function selectOne(client: Pick<Pool, "query">, userId: string, artifactId: string, lock = false): Promise<AgentArtifactRow | null> {
   const result = await client.query<Record<string, unknown>>(`SELECT ${columns} FROM "agent_artifact" WHERE "id" = $1 AND "userId" = $2${lock ? " FOR UPDATE" : ""}`, [artifactId, userId])
   return result.rows[0] ? toAgentArtifactRow(result.rows[0]) : null
-}
-
-async function findTaskVersion(client: Pick<Pool, "query">, taskId: string, toolCallId: string): Promise<AgentArtifactVersionRow | null> {
-  const result = await client.query<Record<string, unknown>>(`SELECT ${versionColumns} FROM "agent_artifact_version" WHERE "taskId" = $1 AND "toolCallId" = $2 FOR UPDATE`, [taskId, toolCallId])
-  return result.rows[0] ? toAgentArtifactVersionRow(result.rows[0]) : null
-}
-
-function assertVersionReplay(existing: AgentArtifactVersionRow, input: AgentArtifactDraftWrite): AgentArtifactVersionRow {
-  if (existing.requestHash !== input.requestHash || existing.userId !== input.userId || existing.sessionId !== input.sessionId || existing.jobId !== input.jobId) {
-    throw new AgentArtifactRepositoryError("receipt_conflict", "Task tool receipt was replayed with different artifact input or scope.")
-  }
-  return existing
 }
 
 async function findTaskReview(client: Pick<Pool, "query">, taskId: string, toolCallId: string): Promise<AgentArtifactReviewRow | null> {
@@ -81,12 +65,20 @@ function assertReviewSourceBinding(input: AgentArtifactReviewWrite): void {
   }
 }
 
-export async function insertAgentArtifactBaseWithClient(client: Pick<PoolClient, "query">, input: AgentArtifactBaseInsert): Promise<AgentArtifactRow> {
+export async function insertAgentArtifactBaseWithClient(client: Pick<PoolClient, "query">, input: AgentArtifactBaseInsert,
+  taskFence?: AgentArtifactTaskFence): Promise<AgentArtifactRow> {
+  if (taskFence && (taskFence.userId !== input.userId || !await artifactTaskFenceIsCurrent(client, taskFence, input.jobId))) {
+    throw new AgentArtifactRepositoryError("task_fence_denied", "The artifact base task or Turn lease is stale, stopped, expired, or mismatched.")
+  }
   const inserted = await client.query<Record<string, unknown>>(
     `INSERT INTO "agent_artifact" (${columns}) VALUES ($1, $2, $3, $4, 'base', $1, $5, $6::jsonb, $7, $8, $9, $10, NULL, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT DO NOTHING RETURNING ${columns}`,
     [input.id, input.userId, input.jobId, input.artifactType, input.hash, JSON.stringify(input.content), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs]],
   )
-  if (inserted.rows[0]) return toAgentArtifactRow(inserted.rows[0])
+  if (inserted.rows[0]) {
+    const row = toAgentArtifactRow(inserted.rows[0])
+    if (taskFence && !await artifactTaskLeaseIsLive(client, taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The artifact base task or Turn lease expired before commit.")
+    return row
+  }
   const existing = await selectOne(client, input.userId, input.id)
   const sameRefs = (left: readonly string[], right: readonly string[]) => left.length === right.length && left.every((value, index) => value === right[index])
   if (!existing || existing.jobId !== input.jobId || existing.artifactType !== input.artifactType || existing.lifecycle !== "base"
@@ -94,6 +86,7 @@ export async function insertAgentArtifactBaseWithClient(client: Pick<PoolClient,
     || !sameRefs(existing.provenanceRefs, input.provenanceRefs) || !sameRefs(existing.evidenceRefs, input.evidenceRefs)) {
     throw new AgentArtifactRepositoryError("receipt_conflict", "An immutable artifact with this identity has different content or scope.")
   }
+  if (taskFence && !await artifactTaskLeaseIsLive(client, taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The artifact base task or Turn lease expired before commit.")
   return existing
 }
 
@@ -114,65 +107,11 @@ export function createAgentArtifactRepository(pool: Pool) {
 
     insertBaseWithClient: insertAgentArtifactBaseWithClient,
 
-    async saveDraft(input: AgentArtifactDraftWrite): Promise<AgentArtifactVersionRow> {
-      return withArtifactTransaction(pool, input.userId, async client => {
-        if (!input.sessionId.trim() || !input.taskId.trim() || !input.toolCallId.trim()) throw new AgentArtifactRepositoryError("precondition_failed", "Artifact Task receipt scope is required.")
-        if (input.taskFence.taskId !== input.taskId || input.taskFence.userId !== input.userId || input.taskFence.sessionId !== input.sessionId) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task fence does not match its receipt scope.")
-        await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [input.userId, input.jobId])
-        if (!await artifactTaskFenceIsCurrent(client, input.taskFence, input.jobId)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease or lineage is stale, stopped, expired, or mismatched.")
-        const earlyReceipt = await findTaskVersion(client, input.taskId, input.toolCallId)
-        if (earlyReceipt) {
-          const replay = assertVersionReplay(earlyReceipt, input)
-          if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
-          return replay
-        }
-        const base = await selectOne(client, input.userId, input.baseId, true)
-        if (!base) throw new AgentArtifactRepositoryError("not_found", "Artifact is not available in the current tenant.")
-        if (base.lifecycle !== "base" || base.hash !== input.baseHash || base.artifactType !== input.artifactType || base.jobId !== input.jobId) {
-          throw new AgentArtifactRepositoryError("stale_hash", "Draft base hash is stale or unavailable.")
-        }
-        if (input.evidenceRefs.length === 0) throw new AgentArtifactRepositoryError("invalid_provenance", "Draft requires evidence.")
-
-        const previous = await selectOne(client, input.userId, input.id, true)
-        if (previous?.lifecycle === "base") throw new AgentArtifactRepositoryError("precondition_failed", "A base artifact cannot be replaced by a draft.")
-        if (previous && (previous.jobId !== base.jobId || previous.baseId !== input.baseId || previous.artifactType !== input.artifactType)) {
-          throw new AgentArtifactRepositoryError("precondition_failed", "Draft identity does not match its base artifact.")
-        }
-        if (input.expectedPreviousVersion !== undefined && (!previous || input.expectedPreviousVersion !== previous.version)) {
-          throw new AgentArtifactRepositoryError("precondition_failed", "Draft update has a stale previous version.")
-        }
-        if (input.expectedPreviousHash !== undefined && (previous ? input.expectedPreviousHash !== previous.hash : input.expectedPreviousHash !== null)) {
-          throw new AgentArtifactRepositoryError("precondition_failed", "Draft update has a stale previous hash.")
-        }
-        const previousHash = previous?.hash ?? input.previousHash
-        const nextVersion = (previous?.version ?? 0) + 1
-        if (!previous) {
-          await client.query(
-            `INSERT INTO "agent_artifact" (${columns}) VALUES ($1,$2,$3,$4,'draft',$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
-            [input.id, input.userId, input.jobId, input.artifactType, input.baseId, input.baseHash, JSON.stringify(draftParentContent(input, nextVersion)), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs], previousHash, nextVersion],
-          )
-        }
-        const inserted = await client.query<Record<string, unknown>>(
-          `INSERT INTO "agent_artifact_version" (${versionColumns}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,CURRENT_TIMESTAMP) ON CONFLICT ("taskId", "toolCallId") DO NOTHING RETURNING ${versionColumns}`,
-          [randomUUID(), input.id, nextVersion, input.userId, input.sessionId, input.jobId, input.artifactType, JSON.stringify(input.content), input.hash, input.sourceDigest, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs], input.baseId, input.baseHash, previousHash, input.taskId, input.toolCallId, input.requestHash],
-        )
-        if (!inserted.rows[0]) {
-          const winner = await findTaskVersion(client, input.taskId, input.toolCallId)
-          if (!winner) throw new AgentArtifactRepositoryError("receipt_conflict", "Task tool receipt could not be resolved.")
-          const replay = assertVersionReplay(winner, input)
-          if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
-          return replay
-        }
-        const version = toAgentArtifactVersionRow(inserted.rows[0])
-        if (previous) {
-          await client.query(
-            `UPDATE "agent_artifact" SET "content" = $1::jsonb, "hash" = $2, "constraintHash" = $3, "provenanceRefs" = $4, "evidenceRefs" = $5, "previousHash" = $6, "version" = $7, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $8 AND "userId" = $9 AND "lifecycle" = 'draft'`,
-            [JSON.stringify(draftParentContent(input, nextVersion)), input.hash, input.constraintHash, [...input.provenanceRefs], [...input.evidenceRefs], previousHash, nextVersion, input.id, input.userId],
-          )
-        }
-        if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
-        return version
-      })
+    /** A supplied client must already be in a transaction scoped to input.userId. */
+    async saveDraft(input: AgentArtifactDraftWrite, client?: Pick<PoolClient, "query">): Promise<AgentArtifactVersionRow> {
+      return client
+        ? saveAgentArtifactDraftWithClient(client, input)
+        : withArtifactTransaction(pool, input.userId, transaction => saveAgentArtifactDraftWithClient(transaction, input))
     },
 
     async findVersion(scope: { userId: string; sessionId: string; jobId: string; artifactId: string; version: number }): Promise<AgentArtifactVersionRow | null> {

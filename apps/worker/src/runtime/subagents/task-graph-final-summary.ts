@@ -8,6 +8,7 @@ export type TaskGraphFinalSummaryNode = Readonly<{
   taskId: string
   role: string
   taskStatus: SubagentTaskStatus
+  attemptCount?: number
   /** Full role result extracted from the persisted task result, not the bounded context projection. */
   structuredResult?: unknown
 }>
@@ -24,11 +25,24 @@ export type TaskGraphFinalSummary = Readonly<{
   counts: Readonly<{
     discoveredJobs: TaskGraphSummaryCount
     analyzedJobs: TaskGraphSummaryCount
+    prepareJobs: TaskGraphSummaryCount
     artifactReferences: TaskGraphSummaryCount
     reviewOutcomes: TaskGraphSummaryCount
   }>
   discoveredJobs: readonly Readonly<{ jobId: string; taskIds: readonly string[] }>[]
   analyzedJobs: readonly Readonly<{ jobId: string; findings: readonly Readonly<{ taskId: string; score: number }>[] }>[]
+  prepareResults: readonly Readonly<{
+    taskId: string
+    attemptCount: number
+    resultStatus: "completed" | "partial"
+    snapshotDigest: string
+    checkpointDigest: string
+    jobs: readonly Readonly<{
+      jobId: string
+      status: "prepared" | "skipped" | "failed"
+      materials: readonly Readonly<{ kind: "resume" | "cover_letter"; artifactRef: ArtifactVersionReference }>[]
+    }>[]
+  }>[]
   artifactReferences: readonly Readonly<{ artifactRef: ArtifactVersionReference; taskIds: readonly string[] }>[]
   reviewOutcomes: readonly Readonly<{ artifactRef: ArtifactVersionReference; reviewStatus: "passed" | "needs_revision" | "rejected" | "stale"; taskIds: readonly string[] }>[]
   taskOutcomes: readonly Readonly<{
@@ -71,16 +85,32 @@ export function reduceTaskGraphFinalSummary(input: TaskGraphFinalSummaryInput): 
       scores.add(finding.score)
     }
     if (result.role === "writer" || result.role === "reviewer") addArtifact(artifacts, result.artifactRef, node.taskId)
+    if (result.role === "prepare") for (const material of result.materials) addArtifact(artifacts, material.artifactRef, node.taskId)
     if (result.role === "reviewer") addReview(reviews, result.artifactRef, result.reviewStatus, node.taskId)
   }
   const scouts = tasks.filter(task => task.node.role === "scout")
   const analysts = tasks.filter(task => task.node.role === "analyst")
-  const artifactTasks = tasks.filter(task => task.node.role === "writer" || task.node.role === "reviewer")
+  const prepares = tasks.filter(task => task.node.role === "prepare")
+  const artifactTasks = tasks.filter(task => task.node.role === "writer" || task.node.role === "reviewer" || task.node.role === "prepare")
   const reviewerTasks = tasks.filter(task => task.node.role === "reviewer")
+  const prepareResults = prepares.flatMap(task => {
+    const result = task.result
+    if (result?.role !== "prepare") return []
+    return [{
+      taskId: task.node.taskId, attemptCount: result.attemptCount, resultStatus: result.status, snapshotDigest: result.snapshotDigest, checkpointDigest: result.checkpointDigest,
+      jobs: [...result.jobs].sort((left, right) => compareText(left.jobId, right.jobId)).map(job => ({
+        jobId: job.jobId, status: job.status,
+        materials: result.materials.filter(material => material.jobId === job.jobId)
+          .sort((left, right) => compareText(left.kind, right.kind) || compareArtifact(left.artifactRef, right.artifactRef))
+          .map(material => ({ kind: material.kind, artifactRef: material.artifactRef })),
+      })),
+    }]
+  }).sort((left, right) => compareText(left.taskId, right.taskId))
   return {
     graphRevision,
     counts: {
       discoveredJobs: count(scouts, discovered.size), analyzedJobs: count(analysts, analyzed.size),
+      prepareJobs: count(prepares, prepares.reduce((total, task) => total + (task.result?.role === "prepare" ? task.result.jobs.length : 0), 0)),
       artifactReferences: count(artifactTasks, artifacts.size), reviewOutcomes: count(reviewerTasks, reviews.size),
     },
     discoveredJobs: [...discovered].sort(([left], [right]) => compareText(left, right))
@@ -89,6 +119,7 @@ export function reduceTaskGraphFinalSummary(input: TaskGraphFinalSummaryInput): 
       jobId, findings: [...findings].flatMap(([taskId, scores]) => [...scores].map(score => ({ taskId, score })))
         .sort((left, right) => compareText(left.taskId, right.taskId) || left.score - right.score),
     })),
+    prepareResults,
     artifactReferences: [...artifacts.values()].sort((left, right) => compareArtifact(left.artifactRef, right.artifactRef))
       .map(item => ({ artifactRef: item.artifactRef, taskIds: sorted(item.taskIds) })),
     reviewOutcomes: [...reviews.values()].sort((left, right) => compareArtifact(left.artifactRef, right.artifactRef) || compareText(left.reviewStatus, right.reviewStatus))
@@ -109,6 +140,7 @@ function summarizeTask(node: SummaryNode): SummaryTask {
   try {
     if (!hasDenseJsonArrays(node.structuredResult)) return { node, resultState: "invalid" }
     const result = validateRoleResult(node.structuredResult, node.role)
+    if (result.role === "prepare" && (result.taskId !== node.taskId || result.attemptCount !== node.attemptCount)) return { node, resultState: "invalid" }
     return safeResultIdentifiers(result) ? { node, result, resultState: "valid" } : { node, resultState: "invalid" }
   }
   catch { return { node, resultState: "invalid" } }
@@ -124,6 +156,8 @@ function hasDenseJsonArrays(value: unknown, seen = new WeakSet<object>()): boole
 function safeResultIdentifiers(result: StructuredRoleResult): boolean {
   if (result.role === "scout") return result.candidates.every(candidate => SAFE_IDENTIFIER.test(candidate.jobId))
   if (result.role === "analyst") return result.findings.every(finding => SAFE_IDENTIFIER.test(finding.jobId))
+  if (result.role === "prepare") return SAFE_IDENTIFIER.test(result.taskId) && result.jobs.every(job => SAFE_IDENTIFIER.test(job.jobId))
+    && result.materials.every(material => SAFE_IDENTIFIER.test(material.jobId) && SAFE_IDENTIFIER.test(material.artifactRef.artifactId))
   return SAFE_IDENTIFIER.test(result.artifactRef.artifactId)
 }
 
@@ -141,11 +175,14 @@ function validateEnvelope(input: unknown): { graphRevision: number; nodes: Summa
     || row.graphRevision === 0 && row.nodes.length > 0) throw new Error("task_graph_final_summary_envelope_invalid")
   const nodes = row.nodes.map(value => {
     const node = record(value), hasResult = !!node && Object.hasOwn(node, "structuredResult")
-    const keys = hasResult ? "kind,role,structuredResult,taskId,taskStatus" : "kind,role,taskId,taskStatus"
+    const hasAttempt = !!node && Object.hasOwn(node, "attemptCount")
+    const keys = (hasResult ? "kind,role,structuredResult,taskId,taskStatus" : "kind,role,taskId,taskStatus")
+      .split(",").concat(hasAttempt ? ["attemptCount"] : []).sort().join(",")
     if (!node || !exactKeys(node, keys) || (node.kind !== "business" && node.kind !== "internal_control")
       || typeof node.taskId !== "string" || !node.taskId.trim() || node.taskId.length > TASK_GRAPH_LIMITS.maxKeyLength
       || !SAFE_IDENTIFIER.test(node.taskId)
-      || typeof node.role !== "string" || !node.role.trim() || node.role.length > 64 || !STATUSES.has(node.taskStatus as SubagentTaskStatus)) {
+      || typeof node.role !== "string" || !node.role.trim() || node.role.length > 64 || !STATUSES.has(node.taskStatus as SubagentTaskStatus)
+      || hasAttempt && (!Number.isSafeInteger(node.attemptCount) || Number(node.attemptCount) < 1)) {
       throw new Error("task_graph_final_summary_node_invalid")
     }
     return node as unknown as SummaryNode
@@ -172,7 +209,7 @@ function compareArtifact(left: ArtifactVersionReference, right: ArtifactVersionR
 }
 function sorted(values: ReadonlySet<string>): string[] { return [...values].sort(compareText) }
 function compareText(left: string, right: string): number { return left < right ? -1 : left > right ? 1 : 0 }
-function isRole(value: string): value is StructuredRole { return value === "scout" || value === "analyst" || value === "writer" || value === "reviewer" }
+function isRole(value: string): value is StructuredRole { return value === "scout" || value === "analyst" || value === "writer" || value === "reviewer" || value === "prepare" }
 function record(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   try { return (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null) && Object.getOwnPropertySymbols(value).length === 0 ? value as Record<string, unknown> : null }

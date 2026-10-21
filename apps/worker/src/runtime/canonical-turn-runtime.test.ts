@@ -466,10 +466,14 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
   const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
   const bridge = vi.fn(async (owner: ScheduledAutomationPipelineBridgeScope) => ({ status: "ready" as const, attestation: scheduledPipelineAttestation(owner) }))
   const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ status: "completed", report: scheduledPipelineReport }), { status: 200 }))
-  const stagedCandidates: Array<{ candidateText: string }> = []
+  const stagedCandidates: Array<Parameters<ScheduledPipelineCandidateStore["stage"]>[0]> = []
   const candidateStore = {
     stage: vi.fn<ScheduledPipelineCandidateStore["stage"]>(async input => { stagedCandidates.push(input) }),
-    read: vi.fn<ScheduledPipelineCandidateStore["read"]>(async () => stagedCandidates.at(-1)?.candidateText),
+    read: vi.fn<ScheduledPipelineCandidateStore["read"]>(async () => {
+      const candidate = stagedCandidates.at(-1)
+      return candidate ? { candidateText: candidate.candidateText, finalStepId: candidate.finalStepId, finalStepOrdinal: candidate.finalStepOrdinal,
+        finishReason: "stop", usage: null } : undefined
+    }),
   } satisfies ScheduledPipelineCandidateStore
   let modelCalls = 0
   const commandPort: TaskGraphCommandPort = {
@@ -488,7 +492,10 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
     taskGraphCommandPort: commandPort, taskGraphTemplates: TASK_GRAPH_TEMPLATES,
     selectedJobPreparationLoader: async () => undefined, applicationFillPreparationLoader: async () => undefined,
     rootTaskStore: roots as never, nativeVerificationFactory: () => nativeVerificationRuntime(),
-    turnEngineStoreFactory: () => ({ ...store(), waitForUser: async () => undefined }), contextBuilderFactory: () => contextBuilder(),
+    turnEngineStoreFactory: () => ({ ...store(), waitForUser: async () => undefined,
+      waitForQuestion: async input => ({ status: "waiting_for_user" as const, disposition: "created" as const,
+        waitId: input.expectedWaitId ?? "scheduled-question-fixture", itemId: `agent-wait:question:${input.expectedWaitId ?? "scheduled-question-fixture"}`,
+        turnId: input.owner.turnId, toolCallId: input.toolCallId, nextTurnRevision: 2 }) }), contextBuilderFactory: () => contextBuilder(),
     modelRuntimeFactory: async () => ({ adapter: model(() => { modelCalls++; return [
       { type: "text_delta", text: "The scheduled task graph is complete using the reviewed role evidence." },
       { type: "completed", finishReason: "stop" },
@@ -4729,6 +4736,10 @@ describe("createCanonicalTurnRuntime", () => {
       ownerId: "worker-recovered", leaseVersion: recoveredLease.leaseVersion,
     }) }))
     expect(fixture.candidateStore.stage.mock.calls.map(([input]) => input.candidateText)).toEqual([candidateText, candidateText])
+    expect(fixture.stagedCandidates[1]).toMatchObject({
+      finalStepId: fixture.stagedCandidates[0]?.finalStepId,
+      finalStepOrdinal: fixture.stagedCandidates[0]?.finalStepOrdinal,
+    })
     expect(fixture.fetcher).toHaveBeenCalledTimes(2)
     expect(fixture.getModelCalls()).toBe(1)
     expect(compaction).toHaveBeenCalledOnce()
@@ -4751,7 +4762,7 @@ describe("createCanonicalTurnRuntime", () => {
     const readRecoverableGoal: NativeVerificationPort["readRecoverableGoal"] = vi.fn(async () => ({
       controlTaskId: "goal-review-1", candidateText: staleText, status: "pending" as const, feedback: null,
     }))
-    const staged: Array<{ candidateText: string }> = []
+    const staged: Array<Parameters<ScheduledPipelineCandidateStore["stage"]>[0]> = []
     const candidateStore: ScheduledPipelineCandidateStore = {
       stage: vi.fn(async input => { staged.push(input) }), read: vi.fn(async () => null),
     }
@@ -4791,11 +4802,15 @@ describe("createCanonicalTurnRuntime", () => {
   it("continues a deferred scheduled answer from newly accepted steering when its staged candidate is stale", async () => {
     vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret-canary")
-    const staged: Array<{ candidateText: string }> = [], requests: HarnessModelRequest[] = []
+    const staged: Array<Parameters<ScheduledPipelineCandidateStore["stage"]>[0]> = [], requests: HarnessModelRequest[] = []
     let stateLoads = 0, steeringAccepted = false, modelCalls = 0, fetchCalls = 0
     const candidateStore: ScheduledPipelineCandidateStore = {
       stage: vi.fn(async input => { staged.push(input) }),
-      read: vi.fn(async () => steeringAccepted ? null : staged.at(-1)?.candidateText),
+      read: vi.fn(async () => {
+        const candidate = staged.at(-1)
+        return steeringAccepted ? null : candidate ? { candidateText: candidate.candidateText, finalStepId: candidate.finalStepId,
+          finalStepOrdinal: candidate.finalStepOrdinal, finishReason: "stop", usage: null } : undefined
+      }),
     }
     const fixture = scheduledPipelineRuntimeFixture({
       scheduledPipelineCandidateStoreFactory: () => candidateStore,
