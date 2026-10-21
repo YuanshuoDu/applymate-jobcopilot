@@ -301,6 +301,7 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
     await admin.query(`GRANT USAGE ON SCHEMA public TO "${role}"`)
     await admin.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "agent_executions", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("id") ON "sub_agent_tasks" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("id") ON "agent_executions" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "revision", "completedAt", "updatedAt") ON "agent_turns" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "errorCode", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "completedAt") ON "agent_steps" TO "${role}"`)
