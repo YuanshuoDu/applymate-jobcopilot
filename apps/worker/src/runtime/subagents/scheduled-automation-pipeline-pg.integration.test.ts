@@ -1268,8 +1268,13 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           AND "correlationId" = $4 AND "type" IN ('tool_call.failed', 'tool_call.completed') ORDER BY "sequence" DESC LIMIT 1`,
         [value.sessionId, value.turnId, prepareTaskId, `scheduled-prepare-tool-${prepareTaskId}`])
       const toolEvent = prepareToolEvent.rows[0]
+      const toolOutput = toolEvent?.payload.output
+      const toolOutputRecord = toolOutput && typeof toolOutput === "object" && !Array.isArray(toolOutput)
+        ? toolOutput as Record<string, unknown> : undefined
+      const safeToolMessage = toolEvent?.payload.errorCode === "scheduled_prepare_unavailable"
+        && typeof toolOutputRecord?.message === "string" ? toolOutputRecord.message.slice(0, 120) : null
       const toolDiagnostic = toolEvent ? { type: toolEvent.type, toolName: toolEvent.payload.toolName,
-        errorCode: toolEvent.payload.errorCode } : null
+        errorCode: toolEvent.payload.errorCode, message: safeToolMessage } : null
       expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ outcome: prepareOutcome,
         taskStatus: completedPrepare.rows[0]?.status, attemptCount: completedPrepare.rows[0]?.attemptCount,
         failureReason: diagnosticReason, toolEvent: toolDiagnostic })}`)
