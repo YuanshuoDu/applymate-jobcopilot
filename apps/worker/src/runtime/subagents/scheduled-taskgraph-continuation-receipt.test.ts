@@ -9,6 +9,7 @@ import {
   scheduledTaskGraphStableContinuationKey,
   scheduledTaskGraphContinuationReceiptMatches,
   scheduledTaskGraphClaimMatches,
+  scheduledSnapshotMatches,
   SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
   SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA,
 } from "./scheduled-taskgraph-continuation-receipt.js"
@@ -244,5 +245,23 @@ describe("scheduled TaskGraph continuation receipt", () => {
     expect(scheduledPrepareReplayReceipt(snapshot, current("queued", 14), 13)).toBeNull()
     expect(scheduledPrepareReplayReceipt(snapshot, current("running", 12), 13)).toBeNull()
     expect(scheduledPrepareReplayReceipt(snapshot, { revision: 13, nodes: [{ key: "prepare", taskId: "different-task", status: "running", readiness: "active" }] } as unknown as TaskGraphCurrentState, 13)).toBeNull()
+  })
+
+  it("matches the persisted snapshot when the live Turn row includes additional columns", () => {
+    const snapshot = {
+      schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+      targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], minScore: 70,
+      dailyCap: 10, requireApproval: true, autoApply: false,
+    }
+    const digest = `sha256:${createHash("sha256").update(JSON.stringify([
+      snapshot.schemaVersion, snapshot.targetRoles, snapshot.targetLocations, snapshot.minScore, snapshot.dailyCap,
+      snapshot.requireApproval, snapshot.autoApply,
+    ]), "utf8").digest("hex")}`
+
+    expect(scheduledSnapshotMatches({ source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot },
+      status: "in_progress", leaseOwnerId: "worker-1", leaseVersion: 4, leaseExpiresAt: new Date() }, digest)).toBe(true)
+    expect(scheduledSnapshotMatches({ source: "interactive", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }, status: "in_progress" }, digest)).toBe(false)
   })
 })

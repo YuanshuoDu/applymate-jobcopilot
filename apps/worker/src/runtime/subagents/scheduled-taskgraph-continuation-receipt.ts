@@ -70,7 +70,7 @@ export function scheduledTaskGraphClaimMatches(state: unknown, binding: Schedule
 
 /** Rebinds scheduled mode and criteria to the live persisted Turn snapshot. */
 export function scheduledSnapshotMatches(turnValue: unknown, digest: string): boolean {
-  const turn = exactRecord(turnValue, ["source", "executionMode", "input"]), input = objectRecord(turn?.input)
+  const turn = objectRecord(turnValue), input = objectRecord(turn?.input)
   const snapshot = parseScheduledAutomationSnapshot(input?.scheduledAutomationSnapshot)
   if (!turn || turn.source !== "automation" || turn.executionMode !== "canonical_task_graph" || input?.automationRunMode !== "scheduled" || !snapshot) return false
   const expected = `sha256:${createHash("sha256").update(JSON.stringify([snapshot.schemaVersion, snapshot.targetRoles,
