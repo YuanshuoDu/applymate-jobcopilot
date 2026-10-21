@@ -136,6 +136,15 @@ describe("scheduled.application.prepare tool", () => {
     expect(JSON.stringify(output)).not.toMatch(/"score"|userId|sessionId|turnId|continuationKey|resumeBody|coverLetterBody|authorization|accessToken|apply_ai_changes/i)
   })
 
+  it("accepts its server-bound execution context when the optional delegate schema marker is absent", async () => {
+    const deps = dependencies()
+    const output = await createScheduledApplicationPrepareTool(deps).execute(context({ delegateOutputSchemaMarker: undefined }), {})
+
+    expect(deps.loadVerifiedInvocation).toHaveBeenCalledOnce()
+    expect(deps.prepareJob).toHaveBeenCalledOnce()
+    expect(output).toMatchObject({ role: "prepare", status: "completed", taskId: "prepare-task-1", attemptCount: 1 })
+  })
+
   it("completes with empty arrays when the persisted score checkpoint has no eligible jobs", async () => {
     const deps = dependencies({
       invocation: invocation({ checkpointJobs: [{ jobId: "job-low", score: 69, sourceDigest: digest("a"), evidenceRefs: ["job:job-low"] }] }),

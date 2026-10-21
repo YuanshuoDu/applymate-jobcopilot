@@ -101,10 +101,10 @@ function assertEmptyInput(value: unknown): void {
   } catch { throw new ToolExecutionError("invalid_input", "Scheduled Prepare accepts no model-supplied arguments.") }
 }
 function assertToolContext(context: ToolExecutionContext): void {
-  const marker = context.delegateOutputSchemaMarker
   if (context.signal.aborted || context.actorRole !== "subagent" || !context.scope.userId?.trim() || !context.sessionId.trim() || !context.turnId.trim()
-    || !context.stepId.trim() || !context.taskId?.trim() || !context.rootTaskId?.trim() || !context.toolCallId?.trim()
-    || !marker || marker.schemaVersion !== ROLE_RESULT_SCHEMA || marker.role !== "prepare") throw unavailable("Scheduled Prepare is unavailable outside its registered TaskGraph task.")
+    || !context.stepId.trim() || !context.taskId?.trim() || !context.rootTaskId?.trim() || !context.toolCallId?.trim()) {
+    throw unavailable("Scheduled Prepare is unavailable outside its registered TaskGraph task.")
+  }
 }
 function parseInvocation(value: unknown, context: ToolExecutionContext): VerifiedScheduledPrepareInvocation {
   const row = exactRecord(value, INVOCATION_KEYS) ?? exactRecord(value, [...INVOCATION_KEYS, "resumeTailoringChoice"])
