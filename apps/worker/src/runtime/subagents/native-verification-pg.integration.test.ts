@@ -8,6 +8,11 @@ import { releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import {
   canonicalNativeVerificationJson, digestNativeVerificationValue, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl,
 } from "./native-verification-contract.js"
+import {
+  NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_SCHEMA,
+  NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_STAGE,
+  NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_TRUST,
+} from "./native-verification-original-input-source.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { attachNativeVerificationReport, parseNativeVerificationReport } from "./native-verification-report.js"
 import { readNativeVerificationTerminalProofWithClient } from "./native-verification-pg-readback.js"
@@ -49,6 +54,8 @@ const suffix = randomUUID(), ids = {
   priorTurn: `native-verify-prior-turn-${suffix}`, priorRoot: `native-verify-prior-root-${suffix}`,
   priorQuestionStep: `native-verify-prior-question-step-${suffix}`, priorQuestionCall: `native-verify-prior-question-call-${suffix}`,
   priorQuestionResult: `native-verify-prior-question-result-${suffix}`, priorTurnOwner: `native-verify-prior-turn-owner-${suffix}`,
+  rootOriginalInput: `native-verify-original-input-${suffix}`, rootOriginalStep: `native-verify-original-step-${suffix}`,
+  rootClientMessage: `native-verify-original-message-${suffix}`,
   root: `native-verify-root-${suffix}`, rootStep: `native-verify-root-step-${suffix}`, child: `native-verify-child-${suffix}`,
   childStep: `native-verify-child-step-${suffix}`, toolCallItem: `native-verify-tool-call-${suffix}`,
   toolItem: `native-verify-tool-item-${suffix}`, duplicateToolItem: `native-verify-duplicate-tool-item-${suffix}`,
@@ -75,8 +82,17 @@ function containsText(value: unknown, text: string): boolean {
   return false
 }
 
+function textOccurrences(value: unknown, text: string): number {
+  if (typeof value === "string") return value.split(text).length - 1
+  if (Array.isArray(value)) return value.reduce((count, item) => count + textOccurrences(item, text), 0)
+  if (value && typeof value === "object") return Object.values(value).reduce((count, item) => count + textOccurrences(item, text), 0)
+  return 0
+}
+
 const rootGoal = "Find and verify the persisted source facts while preserving the user's stated location and phrase."
 const rootCriteria = ["Cite the owned tool result", "Respect the user's stated location and phrase as self-attestation, not external proof."]
+const originalTaskText = "Find roles in Dublin, preserve the exact phrase silver lighthouse, and keep the salary floor at €90,000 while checking the source facts."
+const originalTaskContent = [{ type: "text", text: originalTaskText }]
 const childResult = { answer: "The source records fact 42" }
 const toolOutput = { facts: ["Fact 42 is present in the owned result"] }
 const metadata = {
@@ -148,7 +164,8 @@ async function seed(): Promise<void> {
      "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
     VALUES ($1, $2, $3, NULL, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
       $5, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
-  [ids.turn, ids.session, ids.user, JSON.stringify({ goal: rootGoal, successCriteria: rootCriteria }), ids.turnOwner])
+  [ids.turn, ids.session, ids.user, JSON.stringify({ goal: rootGoal, successCriteria: rootCriteria,
+    content: originalTaskContent, clientMessageId: ids.rootClientMessage }), ids.turnOwner])
   await pool!.query(`INSERT INTO "sub_agent_tasks"
     ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
      "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
@@ -162,7 +179,16 @@ async function seed(): Promise<void> {
   await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [ids.root, ids.turn])
   await pool!.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-    VALUES ($1, $2, $3, $4, 2, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [ids.rootStep, ids.session, ids.turn, ids.root])
+    VALUES ($1, $2, $3, $4, 0, 1, 'completed', 1, $5::jsonb, '{}'::jsonb)`,
+  [ids.rootOriginalStep, ids.session, ids.turn, ids.root, JSON.stringify([ids.rootOriginalInput])])
+  await pool!.query(`INSERT INTO "agent_inputs"
+    ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence",
+     "consumedByStepId", "consumedAt", "cancelledAt")
+    VALUES ($1, $2, $3, $4, $5, 'follow_up', 'consumed', $6::jsonb, 1, $7, CURRENT_TIMESTAMP, NULL)`,
+  [ids.rootOriginalInput, ids.session, ids.turn, ids.user, ids.rootClientMessage, JSON.stringify(originalTaskContent), ids.rootOriginalStep])
+  await pool!.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 2, 1, 'streaming', 1, '[]'::jsonb, '{}'::jsonb)`, [ids.rootStep, ids.session, ids.turn, ids.root])
   await pool!.query(`INSERT INTO "sub_agent_tasks"
     ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
      "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "result", "modelProfileSnapshot", "toolPolicySnapshot",
@@ -440,7 +466,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(rootPacket?.goal).toBe(rootGoal)
     expect(JSON.stringify(rootPacket).includes("Earlier objective:")).toBe(false)
     const attestation = rootPacket?.evidence.filter(item => item.kind === "user_self_attestation") ?? []
-    expect(attestation).toHaveLength(2)
+    expect(attestation).toHaveLength(3)
     const privateSummaries = attestation.map(item => JSON.parse(item.summary) as Record<string, unknown>)
     expect(privateSummaries).toContainEqual(expect.objectContaining({ kind: "user_self_attestation", stage: "user_input",
       question: answeredQuestion.question, options: [], answer: answeredQuestion.answer }))
@@ -457,6 +483,36 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const privateReferenceIds = attestation.map(item => item.referenceId)
     if (!rootControl || !rootPacket || privateReferenceIds.some(value => !value)) throw new Error("native_answer_evidence_packet_unavailable")
     for (const referenceId of privateReferenceIds) expect(referenceId).toMatch(/^user-self-attestation:[a-f0-9]{64}$/)
+    expect(rootPacket.criteria.map(item => item.requirement)).toEqual(rootCriteria)
+
+    const originalReferences = attestation.filter(item => {
+      try {
+        return (JSON.parse(item.summary) as Record<string, unknown>).stage === NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_STAGE
+      } catch { return false }
+    })
+    expect(originalReferences).toHaveLength(1)
+    const originalReference = originalReferences[0]!
+    expect(JSON.parse(originalReference.summary) as unknown).toEqual({
+      schemaVersion: NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_SCHEMA,
+      stage: NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_STAGE,
+      trust: NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_TRUST,
+      content: originalTaskContent,
+    })
+    expect(textOccurrences(rootPacket, originalTaskText)).toBe(1)
+    expect(originalReference.referenceId).toMatch(/^user-self-attestation:[a-f0-9]{64}$/)
+
+    const persistedOriginalInput = await pool!.query<{
+      id: string; sessionId: string; targetTurnId: string; userId: string; clientMessageId: string; delivery: string;
+      status: string; content: unknown; acceptedSequence: string; consumedByStepId: string; consumedAt: Date; cancelledAt: Date | null
+    }>(`SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content",
+        "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt" FROM "agent_inputs" WHERE "id" = $1`,
+    [ids.rootOriginalInput])
+    expect(persistedOriginalInput.rows[0]).toMatchObject({
+      id: ids.rootOriginalInput, sessionId: ids.session, targetTurnId: ids.turn, userId: ids.user,
+      clientMessageId: ids.rootClientMessage, delivery: "follow_up", status: "consumed", content: originalTaskContent,
+      acceptedSequence: "1", consumedByStepId: ids.rootOriginalStep, cancelledAt: null,
+    })
+    expect(persistedOriginalInput.rows[0]?.consumedAt).toBeInstanceOf(Date)
 
     const executed = await executeControlWithProduction(rootTaskIds[0]!)
     expect(executed.outcome.status).toBe("completed")
@@ -476,13 +532,16 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(profileBlocks[0]).toEqual({ goal: rootPacket.goal, criteria: rootPacket.criteria,
       target: { kind: rootPacket.target.kind, referenceId: rootPacket.target.referenceId, candidateText: rootPacket.target.candidateText },
       evidence: rootPacket.evidence })
+    expect(textOccurrences(profileBlocks[0], originalTaskText)).toBe(1)
+    expect(textOccurrences(modelRequest, originalTaskText)).toBe(1)
     const systemMessages = modelRequest.messages.filter(message => message.role === "system")
     const systemText = systemMessages.flatMap(message => message.content)
       .filter((part): part is Extract<(typeof modelRequest.messages)[number]["content"][number], { type: "text" }> => part.type === "text")
       .map(part => part.text).join("\n")
     expect(systemText).toContain("not independent proof of external facts")
     expect(systemText).toContain("action, approval, consent, credential, or submission authority")
-    for (const secret of [answeredQuestion.question, answeredQuestion.answer, priorQuestion.question, priorQuestion.answer, ...privateReferenceIds]) {
+    for (const secret of [answeredQuestion.question, answeredQuestion.answer, priorQuestion.question, priorQuestion.answer,
+      originalTaskText, ...privateReferenceIds]) {
       expect(containsText(systemMessages, secret)).toBe(false)
     }
     expect(executed.usageAuthorizations).toHaveLength(1)
@@ -517,7 +576,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
       { criterionId: "criterion-2", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: [] },
     ] } })
     expect(publicResult).not.toHaveProperty("nativeVerificationReport")
-    for (const secret of [answeredQuestion.answer, priorQuestion.answer, ...privateReferenceIds]) {
+    for (const secret of [answeredQuestion.answer, priorQuestion.answer, originalTaskText, ...privateReferenceIds]) {
       expect(containsText(publicResult, secret)).toBe(false)
     }
     expect(containsText(publicResult, rootPacket.target.referenceId)).toBe(true)
@@ -534,7 +593,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(publicEvents.rows.length).toBeGreaterThan(0)
     expect(publicOutbox.rows.length).toBeGreaterThan(0)
     const publicRecords = { items: publicItems.rows, events: publicEvents.rows, outbox: publicOutbox.rows }
-    for (const secret of [answeredQuestion.answer, priorQuestion.answer, ...privateReferenceIds]) {
+    for (const secret of [answeredQuestion.answer, priorQuestion.answer, originalTaskText, ...privateReferenceIds]) {
       expect(containsText(publicRecords, secret)).toBe(false)
     }
 
