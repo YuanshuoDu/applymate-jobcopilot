@@ -2,10 +2,15 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 import {
-  NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA,
+  NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA_V2,
+  NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, NATIVE_VERIFICATION_USER_SELF_ATTESTATION_REFERENCE_PREFIX,
   canonicalNativeVerificationJson, digestNativeVerificationValue,
   type NativeVerificationControl, type NativeVerificationPacket,
 } from "./native-verification-contract.js"
+import {
+  NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_SCHEMA, NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_STAGE,
+  NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_TRUST,
+} from "./native-verification-original-input-source.js"
 import { createNativeVerificationContext } from "./native-verification-packet.js"
 import { attachNativeVerificationReport } from "./native-verification-report.js"
 import { nativeVerificationControlContentMatches } from "./native-verification-pg-request.js"
@@ -62,6 +67,78 @@ describe("native verification durable report readback", () => {
     const changedToolEvidence = reviewed.evidence.map(item => ({ ...item, summary: "{\"fact\":\"changed persisted tool output\"}" }))
     expect(nativeVerificationControlContentMatches(reviewed, { goal: reviewed.goal, criteria: reviewed.criteria,
       target: reviewed.target, evidence: changedToolEvidence })).toBe(false)
+  })
+
+  it("invalidates an accepted root report when the original task reference changes", async () => {
+    const originalTaskText = "Find roles in Dublin and preserve the salary floor from my full request."
+    const inputId = "original-input-1", clientMessageId = "original-message-1", consumerStepId = "original-consumer-step"
+    const consumedAt = "2026-10-06T12:00:00.000Z"
+    const originalReferenceFor = (text: string) => {
+      const content = [{ type: "text" as const, text }]
+      const identity = {
+        owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
+        input: { id: inputId, clientMessageId, acceptedSequence: "0", consumedByStepId: consumerStepId, consumedAt, content },
+        consumingStep: { id: consumerStepId, ordinal: 0, attempt: 1, inputThroughSequence: "0", consumedInputIds: [inputId] },
+      }
+      return {
+        referenceId: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_REFERENCE_PREFIX + digestNativeVerificationValue(identity),
+        summary: canonicalNativeVerificationJson({ schemaVersion: NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_SCHEMA,
+          stage: NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_STAGE, trust: NATIVE_VERIFICATION_ORIGINAL_TASK_REFERENCE_TRUST, content }),
+      }
+    }
+    const originalReference = originalReferenceFor(originalTaskText)
+    const candidateText = "The response covers Dublin roles and the saved salary floor."
+    const candidateDigest = digestNativeVerificationValue(candidateText)
+    const rootPacket: NativeVerificationPacket = {
+      schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA_V2, controlOperationId: control.controlOperationId,
+      controlTaskId: control.controlTaskId, goal: "Assess the response against the saved requirements.",
+      criteria: [{ criterionId: "criterion-1", requirement: "Preserve the user's original job constraints." }],
+      target: { kind: "root_goal", candidateDigest, referenceId: "candidate:root", candidateText },
+      evidence: [packet.evidence[0]!, { referenceId: originalReference.referenceId,
+        kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: originalReference.summary }],
+    }
+    const rootControl: NativeVerificationControl = {
+      ...control, target: { kind: "root_goal", candidateDigest, childBindingSetDigest: "c".repeat(64) },
+      goalDigest: digestNativeVerificationValue(rootPacket.goal),
+      criteriaDigest: digestNativeVerificationValue(rootPacket.criteria),
+      evidencePacketDigest: digestNativeVerificationValue(rootPacket),
+    }
+    const rootReport = attachNativeVerificationReport(rootControl, 1, {
+      schemaVersion: "agent-harness.v2.native-verifier-model-report.v1",
+      criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion",
+        evidenceReferenceIds: [rootPacket.target.referenceId] }],
+    })
+    if (!rootReport) throw new Error("native_original_reference_report_invalid")
+    const persistedRow = row({ expectedOutputSchema: rootControl, context: createNativeVerificationContext(rootPacket),
+      result: { nativeVerificationReport: rootReport } })
+    const acceptedProofs = await read([persistedRow])
+    expect(acceptedProofs).toHaveLength(1)
+    const acceptedProof = acceptedProofs[0]
+    if (!acceptedProof) throw new Error("native_original_reference_proof_missing")
+    expect(acceptedProof).toMatchObject({ report: rootReport, disposition: "passed" })
+    const acceptedOriginalEvidence = acceptedProof.task.packet.evidence.filter(item => item.referenceId === originalReference.referenceId)
+    expect(acceptedOriginalEvidence).toHaveLength(1)
+    expect(acceptedOriginalEvidence[0]).toMatchObject({ kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
+      referenceId: originalReference.referenceId, summary: originalReference.summary })
+
+    const changedOriginalText = `${originalTaskText} Exclude contract roles.`
+    const changedReference = originalReferenceFor(changedOriginalText)
+    expect(changedReference.referenceId).not.toBe(originalReference.referenceId)
+    const changedEvidence = acceptedProof.task.packet.evidence.map(item => item.referenceId === originalReference.referenceId
+      ? { ...item, referenceId: changedReference.referenceId, summary: changedReference.summary }
+      : item)
+    const changedPacket: NativeVerificationPacket = { ...acceptedProof.task.packet, evidence: changedEvidence }
+    const changedControl: NativeVerificationControl = { ...rootControl,
+      evidencePacketDigest: digestNativeVerificationValue(changedPacket) }
+
+    expect(digestNativeVerificationValue(changedPacket)).not.toBe(rootControl.evidencePacketDigest)
+    expect(nativeVerificationControlContentMatches(acceptedProof.task.packet, {
+      goal: changedPacket.goal, criteria: changedPacket.criteria, target: changedPacket.target, evidence: changedPacket.evidence,
+    })).toBe(false)
+    const staleProofs = await read([row({ expectedOutputSchema: changedControl,
+      context: createNativeVerificationContext(changedPacket), result: { nativeVerificationReport: rootReport } })])
+    expect(staleProofs).toHaveLength(1)
+    expect(staleProofs[0]).toMatchObject({ report: null, reportDigest: null, disposition: "uncertain" })
   })
 
   it("does not accept report bytes from failed, stale-attempt, malformed or oversized completed control rows", async () => {
