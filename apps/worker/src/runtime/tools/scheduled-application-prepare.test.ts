@@ -84,11 +84,12 @@ function ref(artifactId: string, sourceDigest: string) {
 
 function dependencies(options: {
   invocation?: unknown
+  loadVerifiedInvocation?: () => Promise<unknown>
   prepareJob?: (input: ScheduledPrepareJobInput, signal: AbortSignal) => Promise<unknown>
   resolveResumeTailoringChoice?: (input: { invocation: VerifiedScheduledPrepareInvocation; context: ToolExecutionContext }) => Promise<ScheduledPrepareChoiceResolution>
 } = {}) {
   return {
-    loadVerifiedInvocation: vi.fn(async () => options.invocation ?? invocation()),
+    loadVerifiedInvocation: vi.fn(async () => options.loadVerifiedInvocation ? options.loadVerifiedInvocation() : options.invocation ?? invocation()),
     resolveResumeTailoringChoice: vi.fn(async (input: { invocation: VerifiedScheduledPrepareInvocation; context: ToolExecutionContext }) => options.resolveResumeTailoringChoice
       ? options.resolveResumeTailoringChoice(input)
       : { status: "waiting_for_user" as const, owner: input.invocation.owner, snapshotDigest: input.invocation.receipt.snapshotDigest,
@@ -143,6 +144,26 @@ describe("scheduled.application.prepare tool", () => {
     expect(deps.loadVerifiedInvocation).toHaveBeenCalledOnce()
     expect(deps.prepareJob).toHaveBeenCalledOnce()
     expect(output).toMatchObject({ role: "prepare", status: "completed", taskId: "prepare-task-1", attemptCount: 1 })
+  })
+
+  it("exposes only allowlisted loader reason codes and never leaks raw errors or malformed invocation data", async () => {
+    const message = "Scheduled Prepare could not verify its persisted inputs."
+    const allowlisted = dependencies({ loadVerifiedInvocation: async () => { throw new Error("scheduled_prepare_checkpoint_invalid") } })
+    const allowlistedError = await createScheduledApplicationPrepareTool(allowlisted).execute(context(), {}).catch(error => error)
+    expect(allowlistedError).toMatchObject({ code: "scheduled_prepare_unavailable", message,
+      safeOutput: { message, reasonCode: "scheduled_prepare_checkpoint_invalid" } })
+
+    const canary = "postgres://private-user:private-password@db.internal/secret"
+    const unknownLoaderError = dependencies({ loadVerifiedInvocation: async () => { throw new Error(`scheduled_prepare_unrecognized: ${canary}`) } })
+    const loadError = await createScheduledApplicationPrepareTool(unknownLoaderError).execute(context(), {}).catch(error => error)
+    expect(loadError).toMatchObject({ code: "scheduled_prepare_unavailable", message, safeOutput: { message, reasonCode: "load_failed" } })
+    expect(JSON.stringify(loadError)).not.toContain(canary)
+
+    const malformed = dependencies({ invocation: { privatePayload: canary } })
+    const parseError = await createScheduledApplicationPrepareTool(malformed).execute(context(), {}).catch(error => error)
+    expect(parseError).toMatchObject({ code: "scheduled_prepare_unavailable", message,
+      safeOutput: { message, reasonCode: "invocation_invalid" } })
+    expect(JSON.stringify(parseError)).not.toContain(canary)
   })
 
   it("completes with empty arrays when the persisted score checkpoint has no eligible jobs", async () => {

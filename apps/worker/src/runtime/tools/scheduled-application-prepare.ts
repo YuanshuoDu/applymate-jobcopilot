@@ -48,6 +48,14 @@ const TASK_FENCE_KEYS = ["attemptCount", "leaseOwner", "parentTaskId", "rootTask
 const JOB_KEYS = ["evidenceRefs", "jobId", "score", "sourceDigest"], OUTPUT_KEYS = ["materials", "status"]
 const MATERIAL_KEYS = ["artifactRef", "kind"], ARTIFACT_KEYS = ["artifactId", "contentHash", "sourceDigest", "version"]
 const SAFE_ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const LOAD_FAILURE_REASON_CODES = [
+  "scheduled_prepare_analyze_unverified", "scheduled_prepare_checkpoint_invalid", "scheduled_prepare_claim_invalid",
+  "scheduled_prepare_evidence_missing", "scheduled_prepare_evidence_scope_invalid", "scheduled_prepare_graph_binding_invalid",
+  "scheduled_prepare_graph_invalid", "scheduled_prepare_owner_invalid", "scheduled_prepare_owner_stale",
+  "scheduled_prepare_receipt_invalid", "scheduled_prepare_task_invalid",
+] as const
+type ScheduledPrepareLoadFailureReasonCode = typeof LOAD_FAILURE_REASON_CODES[number]
+type ScheduledPrepareUnavailableReasonCode = ScheduledPrepareLoadFailureReasonCode | "load_failed" | "invocation_invalid"
 
 export function createScheduledApplicationPrepareTool(dependencies: ScheduledApplicationPrepareDependencies): RuntimeToolDefinition<unknown, ScheduledPrepareOutput> {
   return {
@@ -57,9 +65,12 @@ export function createScheduledApplicationPrepareTool(dependencies: ScheduledApp
     risk: "draft_write", domain: "resume", idempotency: "requires_key", timeoutMs: 300_000, requiredCapabilities: [],
     execute: async (context, input) => {
       assertEmptyInput(input); assertToolContext(context)
+      let loadedInvocation: unknown
+      try { loadedInvocation = await dependencies.loadVerifiedInvocation(context) }
+      catch (error: unknown) { throw unavailable(undefined, loadFailureReasonCode(error)) }
       let invocation: VerifiedScheduledPrepareInvocation
-      try { invocation = parseInvocation(await dependencies.loadVerifiedInvocation(context), context) }
-      catch { throw unavailable() }
+      try { invocation = parseInvocation(loadedInvocation, context) }
+      catch { throw unavailable(undefined, "invocation_invalid") }
       if (invocation.snapshot.requireApproval && !invocation.resumeTailoringChoice) {
         let resolution: ScheduledPrepareChoiceResolution
         try { resolution = parseChoiceResolution(await dependencies.resolveResumeTailoringChoice({ invocation, context }), invocation) }
@@ -90,8 +101,17 @@ export function createScheduledApplicationPrepareTool(dependencies: ScheduledApp
   }
 }
 
-function unavailable(message = "Scheduled Prepare could not verify its persisted inputs."): ToolExecutionError {
-  return new ToolExecutionError("scheduled_prepare_unavailable", message)
+function unavailable(
+  message = "Scheduled Prepare could not verify its persisted inputs.",
+  reasonCode?: ScheduledPrepareUnavailableReasonCode,
+): ToolExecutionError {
+  return new ToolExecutionError("scheduled_prepare_unavailable", message, reasonCode ? { message, reasonCode } : undefined)
+}
+function loadFailureReasonCode(error: unknown): ScheduledPrepareUnavailableReasonCode {
+  if (error instanceof Error && LOAD_FAILURE_REASON_CODES.includes(error.message as ScheduledPrepareLoadFailureReasonCode)) {
+    return error.message as ScheduledPrepareLoadFailureReasonCode
+  }
+  return "load_failed"
 }
 function assertEmptyInput(value: unknown): void {
   try {

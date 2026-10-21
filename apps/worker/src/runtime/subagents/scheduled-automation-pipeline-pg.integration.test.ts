@@ -1266,16 +1266,19 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const prepareToolEvent = await pool!.query<{ type: string; payload: Record<string, unknown> }>(
         `SELECT "type", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
           AND "correlationId" = $4 AND "type" IN ('tool_call.failed', 'tool_call.completed')
-          ORDER BY ("payload"->'output'->>'message' IS NOT NULL) DESC, "sequence" DESC LIMIT 1`,
+          ORDER BY ("payload"->'output'->>'reasonCode' IS NOT NULL) DESC,
+            ("payload"->'output'->>'message' IS NOT NULL) DESC, "sequence" DESC LIMIT 1`,
         [value.sessionId, value.turnId, prepareTaskId, `scheduled-prepare-tool-${prepareTaskId}`])
       const toolEvent = prepareToolEvent.rows[0]
       const toolOutput = toolEvent?.payload.output
       const toolOutputRecord = toolOutput && typeof toolOutput === "object" && !Array.isArray(toolOutput)
         ? toolOutput as Record<string, unknown> : undefined
+      const safeToolReasonCode = toolEvent?.payload.errorCode === "scheduled_prepare_unavailable"
+        && typeof toolOutputRecord?.reasonCode === "string" ? toolOutputRecord.reasonCode : null
       const safeToolMessage = toolEvent?.payload.errorCode === "scheduled_prepare_unavailable"
         && typeof toolOutputRecord?.message === "string" ? toolOutputRecord.message.slice(0, 120) : null
       const toolDiagnostic = toolEvent ? { type: toolEvent.type, toolName: toolEvent.payload.toolName,
-        errorCode: toolEvent.payload.errorCode, message: safeToolMessage } : null
+        errorCode: toolEvent.payload.errorCode, reasonCode: safeToolReasonCode, message: safeToolMessage } : null
       expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ outcome: prepareOutcome,
         taskStatus: completedPrepare.rows[0]?.status, attemptCount: completedPrepare.rows[0]?.attemptCount,
         failureReason: diagnosticReason, toolEvent: toolDiagnostic })}`)
