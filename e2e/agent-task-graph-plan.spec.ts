@@ -827,6 +827,86 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
   return fixture
 }
 
+async function installObjectiveReplacementFixture(page: Page) {
+  const sessionId = 'objective-replacement-session'
+  const sessionGoal = 'Compare engineering teams in Amsterdam'
+  const oldTurnId = 'objective-replacement-turn-old'
+  const oldTurnGoal = 'Find backend engineering roles in Dublin'
+  const successorTurnId = 'objective-replacement-turn-successor'
+  const successorGoal = 'Compare senior engineering teams in Amsterdam'
+  let replaced = false
+  const turnPageResponses: Array<{ turns: Array<{ id: string; sessionId: string; goal: string; status: string; revision: number }>; projection: { activeTurnId: string; activeTurn: { id: string; status: string; revision: number; goal: string }; queuedInputCount: number } }> = []
+  const turnPageLimits: Array<string | null> = []
+  const replacementRequests: unknown[] = []
+  const externalRequests: string[] = []
+  const localOrigin = new URL(process.env.E2E_BASE_URL ?? 'http://127.0.0.1:3100').origin
+
+  await page.route('**/*', async route => {
+    const url = new URL(route.request().url())
+    if (url.origin !== localOrigin) {
+      externalRequests.push(url.origin)
+      return route.abort()
+    }
+    return route.fallback()
+  })
+  await page.route('**/api/**', async route => {
+    const request = route.request()
+    const url = new URL(request.url())
+    const { pathname } = url
+    const method = request.method()
+
+    if (pathname === '/api/auth/session') return json(route, {
+      user: { id: 'objective-fixture-user', email: 'objective@applymate.local', name: 'Objective Fixture' },
+      expires: '2099-01-01T00:00:00.000Z',
+    })
+    if (pathname === '/api/me') return json(route, { id: 'objective-fixture-user', email: 'objective@applymate.local', plan: 'pro', onboardedAt: TIME })
+    if (pathname.startsWith('/api/jobs')) return json(route, { jobs: [], total: 0, page: 1, pageSize: 100, statusCounts: {} })
+    if (pathname.startsWith('/api/resume')) return json(route, [])
+    if (pathname === '/api/agent') return json(route, { autoApply: false, requireApproval: true, isRunning: false })
+    if (pathname === '/api/agent/roles' || pathname === '/api/agent/roles/custom') return json(route, [])
+    if (pathname === '/api/agent/automations') return json(route, { automations: [] })
+    if (pathname === '/api/agent/health') return json(route, { successRate: 100, captchaRate: 0, avgDurationMs: 100, patternCacheRate: 100, last24hRuns: 0 })
+    if (pathname.startsWith('/api/notifications')) return json(route, { notifications: [], unreadCount: 0 })
+    if (pathname === '/api/gmail/unread') return json(route, { hasGmail: false, unread: 0 })
+    if (pathname === '/api/agent/sessions') return json(route, {
+      sessions: [{ id: sessionId, goal: sessionGoal, status: 'running', updatedAt: TIME, memorySummary: 'Original conversation metadata.' }],
+      lastOpenedSessionId: sessionId,
+    })
+
+    const parts = pathname.split('/').filter(Boolean)
+    if (parts[0] !== 'api' || parts[1] !== 'agent' || parts[2] !== 'sessions' || parts[3] !== sessionId) return json(route, {})
+    const resource = parts[4] ?? ''
+    if (resource === 'turns' && method === 'GET') {
+      const activeTurnId = replaced ? successorTurnId : oldTurnId
+      const activeGoal = replaced ? successorGoal : oldTurnGoal
+      const turnResponse = {
+        // The chronological limit=1 page still contains the replaced Turn.
+        turns: [{ id: oldTurnId, sessionId, goal: oldTurnGoal, status: 'in_progress', revision: 4 }],
+        // The owner-scoped active projection identifies the successor outside that page.
+        projection: { activeTurnId, activeTurn: { id: activeTurnId, status: 'in_progress', revision: replaced ? 1 : 4, goal: activeGoal }, queuedInputCount: 0 },
+      }
+      if (url.searchParams.get('limit') === '1') {
+        turnPageLimits.push(url.searchParams.get('limit'))
+        turnPageResponses.push(turnResponse)
+      }
+      return json(route, turnResponse)
+    }
+    if (resource === 'replace-objective' && method === 'POST') {
+      replacementRequests.push(await request.postDataJSON())
+      replaced = true
+      return json(route, { inputId: 'objective-fixture-input', turnId: successorTurnId, disposition: 'started', sequence: '2' }, 202)
+    }
+    if (resource === 'timeline') return json(route, { items: [], page: { hasMore: false, nextCursor: null }, agenda: null })
+    if (resource === 'events') return json(route, { events: [] })
+    if (resource === 'tasks') return json(route, { tasks: [], page: { hasMore: false, nextCursor: null } })
+    if (!resource && method === 'PATCH') return json(route, {})
+    if (!resource) return json(route, { session: { id: sessionId, goal: sessionGoal, status: 'running', updatedAt: TIME, tasks: [], approvals: [], applicationTasks: [], questions: [], artifacts: [], qualityScore: 100 } })
+    return json(route, {})
+  })
+
+  return { sessionId, sessionGoal, oldTurnId, oldTurnGoal, successorTurnId, successorGoal, turnPageResponses, turnPageLimits, replacementRequests, externalRequests }
+}
+
 function isPlanLedgerResponseFor(response: Response, identity: TaskGraphIdentity): boolean {
   const request = response.request()
   if (request.method() !== 'GET') return false
@@ -1283,5 +1363,54 @@ test('persisted Plan Ledger and discovery shortlist survive SSE disconnect, reco
   await assertPersistedShortlist()
   expect(fixture.discoveryShortlistResponses.every(response => JSON.stringify(response) === JSON.stringify(expectedShortlist))).toBe(true)
   expect(fixture.forbiddenApiRequests).toEqual([])
+  expect(fixture.externalRequests).toEqual([])
+})
+
+test('mounted Workbench shows the successor objective after replacement and reload while the limit-one Turn page stays old', async ({ page }) => {
+  const fixture = await installObjectiveReplacementFixture(page)
+  await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${encodeURIComponent(fixture.sessionId)}`)
+
+  const objective = page.getByRole('region', { name: 'Current objective' })
+  await expect(objective).toContainText(fixture.oldTurnGoal)
+  await expect(page.locator('.agent-session-console')).toContainText(fixture.sessionGoal)
+  const beforeReplacement = fixture.turnPageResponses.length
+  await page.getByTestId('open-objective-replacement').click()
+  await page.getByRole('textbox', { name: 'New objective' }).fill(fixture.successorGoal)
+  const submitReplacement = page.getByTestId('submit-objective-replacement')
+  await expect(submitReplacement).toBeEnabled()
+  const replacementResponse = page.waitForResponse(response => response.request().method() === 'POST'
+    && new URL(response.url()).pathname.endsWith('/replace-objective'), { timeout: 10_000 })
+  await submitReplacement.click()
+  expect((await replacementResponse).status()).toBe(202)
+
+  await expect(objective).toContainText(fixture.successorGoal)
+  await expect.poll(() => fixture.turnPageResponses.length).toBeGreaterThan(beforeReplacement)
+  expect(fixture.replacementRequests).toHaveLength(1)
+  expect(fixture.replacementRequests[0]).toMatchObject({
+    expectedTurnId: fixture.oldTurnId,
+    expectedRevision: 4,
+    content: [{ type: 'text', text: fixture.successorGoal }],
+  })
+  const replacedPage = fixture.turnPageResponses.at(-1)
+  expect(fixture.turnPageLimits.at(-1)).toBe('1')
+  expect(replacedPage?.turns.map(turn => turn.id)).toEqual([fixture.oldTurnId])
+  expect(replacedPage?.projection).toMatchObject({
+    activeTurnId: fixture.successorTurnId,
+    activeTurn: { id: fixture.successorTurnId, goal: fixture.successorGoal },
+  })
+
+  const beforeReload = fixture.turnPageResponses.length
+  await page.reload()
+  const restoredObjective = page.getByRole('region', { name: 'Current objective' })
+  await expect(restoredObjective).toContainText(fixture.successorGoal)
+  await expect.poll(() => fixture.turnPageResponses.length).toBeGreaterThan(beforeReload)
+  const restoredPage = fixture.turnPageResponses.at(-1)
+  expect(fixture.turnPageLimits.at(-1)).toBe('1')
+  expect(restoredPage?.turns.map(turn => turn.id)).toEqual([fixture.oldTurnId])
+  expect(restoredPage?.projection).toMatchObject({
+    activeTurnId: fixture.successorTurnId,
+    activeTurn: { id: fixture.successorTurnId, goal: fixture.successorGoal },
+  })
+  await expect(page.locator('.agent-session-console')).toContainText(fixture.sessionGoal)
   expect(fixture.externalRequests).toEqual([])
 })
