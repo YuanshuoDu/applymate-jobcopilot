@@ -2133,11 +2133,12 @@ describe("owner-agnostic turn execution loop", () => {
     addSteeringInput(root)
     root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
     const inputBuilder = root.options.contextBuilder
+    let inputBuilds = 0
     const builtInputFences: string[][] = []
     const builtInputSequences: bigint[] = []
     root.options = { ...root.options, contextBuilder: { build: async request => {
       const built = await inputBuilder.build(request)
-      const context = { ...built, inputThroughSequence: 1n, consumedInputIds: ["steer-1"] }
+      const context = { ...built, inputThroughSequence: 1n, consumedInputIds: inputBuilds++ === 0 ? ["steer-1"] : [] }
       builtInputFences.push([...context.consumedInputIds])
       builtInputSequences.push(context.inputThroughSequence)
       return { ...context, taskGraphRevision: 4 }
@@ -2167,7 +2168,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(new Set(candidateBodies).size).toBe(2)
     expect(completionGate).toHaveBeenCalledTimes(2)
     expect(read).toHaveBeenCalledOnce()
-    expect(builtInputFences.slice(0, 3)).toEqual([["steer-1"], ["steer-1"], ["steer-1"]])
+    expect(builtInputFences.slice(0, 3)).toEqual([["steer-1"], [], []])
     expect(builtInputSequences.slice(0, 3)).toEqual([1n, 1n, 1n])
     expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(2)
     expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(2)
@@ -2182,12 +2183,12 @@ describe("owner-agnostic turn execution loop", () => {
     const capturedContexts: Array<Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">> = []
     const inputStates: Array<{ sequence: bigint; consumed: string[]; id?: string; text?: string }> = [
       { sequence: 1n, consumed: ["steer-before"], id: "steer-before", text: "Initial accepted instruction" },
-      { sequence: 1n, consumed: ["steer-before"], id: "steer-before", text: "Initial accepted instruction" },
+      { sequence: 1n, consumed: [] },
       { sequence: 2n, consumed: ["steer-after"], id: "steer-after", text: "New accepted instruction changes the cursor" },
-      { sequence: 2n, consumed: ["steer-after"], id: "steer-after", text: "New accepted instruction changes the cursor" },
-      { sequence: 2n, consumed: ["steer-after"], id: "steer-after", text: "New accepted instruction changes the cursor" },
-      { sequence: 2n, consumed: ["steer-after"], id: "steer-after", text: "New accepted instruction changes the cursor" },
-      { sequence: 2n, consumed: ["steer-after"], id: "steer-after", text: "New accepted instruction changes the cursor" },
+      { sequence: 2n, consumed: [] },
+      { sequence: 2n, consumed: [] },
+      { sequence: 2n, consumed: [] },
+      { sequence: 2n, consumed: [] },
     ]
     const read = vi.fn(async () => taskGraphCheckpoint(graphRevision, graphRevision === 4 ? "a" : "b"))
     const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => {
@@ -2238,8 +2239,8 @@ describe("owner-agnostic turn execution loop", () => {
     expect(completionGate).toHaveBeenCalledTimes(6)
     expect(read).toHaveBeenCalledTimes(2)
     expect(capturedContexts.map(context => [context.taskGraphRevision, context.inputThroughSequence, context.consumedInputIds])).toEqual([
-      [4, 1n, ["steer-before"]], [4, 1n, ["steer-before"]], [4, 2n, ["steer-after"]], [4, 2n, ["steer-after"]],
-      [5, 2n, ["steer-after"]], [5, 2n, ["steer-after"]], [5, 2n, ["steer-after"]],
+      [4, 1n, ["steer-before"]], [4, 1n, []], [4, 2n, ["steer-after"]], [4, 2n, []],
+      [5, 2n, []], [5, 2n, []], [5, 2n, []],
     ])
     expect(requestText(0)).toContain("Initial accepted instruction")
     expect(requestText(1)).not.toContain("New accepted instruction changes the cursor")

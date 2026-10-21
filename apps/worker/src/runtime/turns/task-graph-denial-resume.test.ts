@@ -47,7 +47,7 @@ function closedDenial(stepId: string, ordinal: number, offset: number, options: 
 
 describe("TaskGraph denial resume", () => {
   it("restores two exact modern zero-tool denials with a closed Step and persisted input fence", () => {
-    const first = closedDenial("step-1", 1, 0), second = closedDenial("step-2", 2, 10)
+    const first = closedDenial("step-1", 1, 0), second = closedDenial("step-2", 2, 10, { consumedInputIds: [] })
     expect(restoreTaskGraphDenialProgress({ scope, items: [], steps: [first.step, second.step], events: [...first.events, ...second.events] }))
       .toEqual({ taskId: scope.rootTaskId, graphRevision: 4, verificationDigest: "a".repeat(64), inputThroughSequence: 3n, consumedInputIds: ["input-3"], count: 2 })
   })

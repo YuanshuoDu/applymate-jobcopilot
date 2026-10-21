@@ -11,12 +11,14 @@ export function taskGraphDenialProgressFor(
   if (context.taskGraphRevision !== checkpoint.graphRevision || !validCheckpoint(context)) return undefined
   const priorInputEpoch = prior?.taskId === checkpoint.taskId
     && prior.inputThroughSequence === context.inputThroughSequence && validIds(prior.consumedInputIds) ? prior : undefined
-  const sameFence = !!priorInputEpoch && sameIds(priorInputEpoch.consumedInputIds, context.consumedInputIds)
+  const sameFence = !!priorInputEpoch && sameAcceptedInputFence(priorInputEpoch.consumedInputIds, context.consumedInputIds)
   const same = sameFence && priorInputEpoch.graphRevision === checkpoint.graphRevision
     && priorInputEpoch.verificationDigest === checkpoint.verificationDigest
+  const consumedInputIds = priorInputEpoch && context.consumedInputIds.length === 0
+    ? [...priorInputEpoch.consumedInputIds] : [...context.consumedInputIds]
   return {
     taskId: checkpoint.taskId, graphRevision: checkpoint.graphRevision, verificationDigest: checkpoint.verificationDigest,
-    inputThroughSequence: context.inputThroughSequence, consumedInputIds: [...context.consumedInputIds],
+    inputThroughSequence: context.inputThroughSequence, consumedInputIds,
     count: same ? 2 : 1,
   }
 }
@@ -33,7 +35,7 @@ export function taskGraphDenialProgressMatches(
     && progress.verificationDigest === checkpoint.verificationDigest
     && progress.inputThroughSequence === context.inputThroughSequence
     && validCheckpoint(context) && validIds(progress.consumedInputIds)
-    && sameIds(progress.consumedInputIds, context.consumedInputIds)
+    && sameAcceptedInputFence(progress.consumedInputIds, context.consumedInputIds)
 }
 
 export function createTaskGraphDenialProgressTracker(initial?: TaskGraphDenialProgress): {
@@ -77,4 +79,9 @@ function validIds(ids: readonly string[]): boolean {
 
 function sameIds(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((id, index) => id === right[index])
+}
+
+function sameAcceptedInputFence(previousIds: readonly string[], currentIds: readonly string[]): boolean {
+  // With the cursor fixed by the caller, an empty Step claim adds no accepted input.
+  return currentIds.length === 0 || sameIds(previousIds, currentIds)
 }

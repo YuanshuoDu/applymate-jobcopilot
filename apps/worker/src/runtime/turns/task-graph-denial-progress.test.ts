@@ -15,6 +15,14 @@ describe("TaskGraph denial progress", () => {
     expect(taskGraphDenialProgressMatches(second, checkpoint, { ...context, consumedInputIds: ["input-1"] }, "root-1")).toBe(false)
   })
 
+  it("carries the accepted-input witness when the next Step claims no new IDs at the same cursor", () => {
+    const first = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-3"] })
+    const second = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: [] }, first)
+
+    expect(second).toMatchObject({ count: 2, inputThroughSequence: 12n, consumedInputIds: ["input-3"] })
+    expect(taskGraphDenialProgressMatches(second, checkpoint, { ...context, consumedInputIds: [] }, "root-1")).toBe(true)
+  })
+
   it("rebaselines when accepted input IDs or their cursor change", () => {
     const first = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-3"] })
     const changedIds = taskGraphDenialProgressFor(checkpoint, { ...context, consumedInputIds: ["input-4"] }, first)

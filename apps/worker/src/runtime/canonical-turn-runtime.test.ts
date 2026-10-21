@@ -3907,7 +3907,7 @@ describe("createCanonicalTurnRuntime", () => {
       }),
       contextBuilderFactory: () => ({ build: async (request: Parameters<ReturnType<typeof contextBuilder>["build"]>[0]) => ({
         schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
-        inputThroughSequence: 3n, consumedInputIds: ["input-3"], blocks: [], canonicalJson: "{}", taskGraphRevision: 4,
+        inputThroughSequence: 3n, consumedInputIds: [], blocks: [], canonicalJson: "{}", taskGraphRevision: 4,
       }) }) as never,
       toolRuntimeFactory: () => ({
         registry: { ...runtimeTools.registry, list: () => registeredTools,
