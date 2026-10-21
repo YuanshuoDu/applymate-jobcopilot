@@ -37,7 +37,7 @@ import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT, withScheduledPipelineCandidateModelOutput } from "./scheduled-pipeline-candidate-store.js"
 import { attachScheduledPipelineCompletion } from "./scheduled-pipeline-completion.js"
-import { createScheduledTaskGraphContinuationContract } from "./scheduled-taskgraph-continuation-receipt.js"
+import { createScheduledTaskGraphContinuationContract, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -1187,7 +1187,10 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(privateReceipt.payload).not.toHaveProperty("claimToken")
       expect(privateReceipt.payload).not.toHaveProperty("claimTokenDigest")
       expect(JSON.stringify(privateReceipt.payload)).not.toContain(claimToken)
-      expect(privateReceipt.payload).toMatchObject({ continuationKey, analyzeGraphRevision: 2, prepareScheduleRevision: 3,
+      const persistedContinuationKey = scheduledTaskGraphStableContinuationKey(privateReceipt.payload)
+      expect(persistedContinuationKey).not.toBeNull()
+      expect(persistedContinuationKey).not.toBe(continuationKey)
+      expect(privateReceipt.payload).toMatchObject({ continuationKey: persistedContinuationKey, analyzeGraphRevision: 2, prepareScheduleRevision: 3,
         owner: { turnLeaseOwnerId: resumedLease.ownerId, turnLeaseVersion: resumedLease.leaseVersion } })
       await expect(questionStore.readScheduledPrepareChoice({ owner: resumedTurnExecutionOwner, receipt: privateReceipt.payload, now: new Date() }))
         .resolves.toMatchObject({ status: "answered", waitId: expectedChoiceWaitId, itemId: choiceWait.itemId, answer: "keep_resume" })
