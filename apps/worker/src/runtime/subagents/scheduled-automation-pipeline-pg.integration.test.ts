@@ -990,10 +990,9 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         status: "waiting_for_choice", waitId: expectedChoiceWaitId,
       })
 
-      const analyzeOnlyGraph = await pool!.query<{ revision: number; content: Record<string, unknown> }>(
-        `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(value.rootTaskId)])
-      expect(analyzeOnlyGraph.rows[0]?.revision).toBe(2)
-      expect((analyzeOnlyGraph.rows[0]!.content.nodes as Array<{ key: string; status: string }>).map(node => [node.key, node.status])).toEqual([
+      const analyzeOnlyGraph = await loadTaskGraph(pool!, graphScope, false)
+      expect(analyzeOnlyGraph.item?.revision).toBe(2)
+      expect(currentTaskGraph(analyzeOnlyGraph).nodes.map(node => [node.key, node.status])).toEqual([
         ["scheduled-scout", "completed"], ["scheduled-analyst", "completed"],
       ])
       const waitingExecution = await pool!.query<{ status: string; state: Record<string, unknown> }>(
