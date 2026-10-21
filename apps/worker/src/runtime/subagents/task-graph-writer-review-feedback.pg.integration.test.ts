@@ -168,7 +168,10 @@ describeWithPostgres("Writer review feedback persistence on disposable PostgreSQ
         "updated_at" timestamptz NOT NULL DEFAULT now()
       )`,
       `CREATE TABLE "agent_sessions" ("id" text PRIMARY KEY, "userId" text NOT NULL, "status" text NOT NULL, UNIQUE ("id", "userId"))`,
-      `CREATE TABLE "agent_turns" ("id" text PRIMARY KEY, "sessionId" text NOT NULL, "userId" text NOT NULL, "rootTaskId" text NOT NULL, "status" text NOT NULL)`,
+      `CREATE TABLE "agent_turns" (
+        "id" text PRIMARY KEY, "sessionId" text NOT NULL, "userId" text NOT NULL, "rootTaskId" text NOT NULL,
+        "status" text NOT NULL, "leaseOwnerId" text, "leaseVersion" integer NOT NULL DEFAULT 0, "leaseExpiresAt" timestamptz
+      )`,
       `CREATE TABLE "sub_agent_tasks" (
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "rootTaskId" text NOT NULL,
         "parentTaskId" text, "role" text NOT NULL, "taskType" text NOT NULL, "status" text NOT NULL,
