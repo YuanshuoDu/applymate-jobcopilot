@@ -1331,7 +1331,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         } while (true)
         expect(prepareOutcome).toMatchObject({ taskId: prepareTaskId, status: "interrupted" })
         expect(completedPrepare.rows[0]).toMatchObject({ status: "interrupted", attemptCount: 1, interruptRequestedAt: expect.any(Date) })
-        expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toBeUndefined()
+        expect(completedPrepare.rows[0]?.result?.taskGraphScheduledPrepareProofFacts).toBeUndefined()
         if (!acceptedInterrupt) throw new Error("Scheduled Prepare cancellation was not durably accepted")
         const artifacts = await pool!.query(`SELECT "id" FROM "agent_artifact_version" WHERE "taskId" = $1`, [prepareTaskId])
         expect(artifacts.rows).toHaveLength(0)

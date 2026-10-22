@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { appendScheduledPrepare } from "./pg-scheduled-task-graph-prepare-command.js"
+import { taskGraphProposalKey } from "./task-graph-snapshot.js"
 import type { TaskGraphScheduledPrepareInput } from "./task-graph-command-port.js"
 
 const mocks = vi.hoisted(() => ({
   continuation: vi.fn(), claim: vi.fn(), snapshot: vi.fn(), analyze: vi.fn(), replay: vi.fn(), receiptMatches: vi.fn(), readReceipt: vi.fn(),
-  lock: vi.fn(), load: vi.fn(), current: vi.fn(), budget: vi.fn(), create: vi.fn(), writeSnapshot: vi.fn(), appendReceipt: vi.fn(),
-  choiceBinding: vi.fn(), choiceItem: vi.fn(), enqueue: vi.fn(),
+  lock: vi.fn(), load: vi.fn(), current: vi.fn(), budget: vi.fn(), create: vi.fn(), appendReceipt: vi.fn(),
+  writePlanReceipt: vi.fn(), choiceBinding: vi.fn(), choiceItem: vi.fn(), enqueue: vi.fn(),
 }))
 vi.mock("./scheduled-taskgraph-continuation-receipt.js", () => ({
   createScheduledTaskGraphContinuationContract: mocks.continuation,
@@ -20,7 +21,7 @@ vi.mock("./scheduled-taskgraph-continuation-receipt.js", () => ({
 vi.mock("./task-graph-pg-state.js", () => ({ lockTaskGraphScope: mocks.lock, loadTaskGraph: mocks.load, currentTaskGraph: mocks.current }))
 vi.mock("../turns/turn-engine-root-budget.js", () => ({ enforceRootStepBudget: mocks.budget }))
 vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: mocks.create, enqueueGraphTask: mocks.enqueue }))
-vi.mock("./task-graph-pg-events.js", () => ({ writeTaskGraphSnapshot: mocks.writeSnapshot, appendTaskGraphReceipt: mocks.appendReceipt }))
+vi.mock("./task-graph-pg-events.js", () => ({ appendTaskGraphReceipt: mocks.appendReceipt, writePlanReceipt: mocks.writePlanReceipt }))
 vi.mock("../turns/turn-question-store-events.js", () => ({ loadScheduledChoiceBinding: mocks.choiceBinding }))
 vi.mock("../turns/turn-question-contract.js", () => ({ parseTurnScheduledPrepareChoiceItem: mocks.choiceItem }))
 vi.mock("../turns/turn-question-store-guards.js", () => ({ questionItemId: (waitId: string) => `agent-wait:question:${waitId}` }))
@@ -83,8 +84,8 @@ describe("appendScheduledPrepare", () => {
     mocks.current.mockReturnValue(current)
     mocks.budget.mockResolvedValue(undefined)
     mocks.create.mockResolvedValue(scheduled)
-    mocks.writeSnapshot.mockResolvedValue(undefined)
     mocks.appendReceipt.mockResolvedValue(undefined)
+    mocks.writePlanReceipt.mockResolvedValue(undefined)
     candidateStepStatus = "streaming"
     turnLeaseOwner = scope.turnLeaseOwner
     mocks.choiceBinding.mockResolvedValue({ binding: choiceBinding, receipt, waitId: choiceWaitId, stepId: "final-step",
@@ -105,7 +106,7 @@ describe("appendScheduledPrepare", () => {
     expect(mocks.analyze).toHaveBeenCalledWith(input, loaded.snapshot, current, loaded.tasks, false)
     expect(mocks.budget).not.toHaveBeenCalled()
     expect(mocks.create).not.toHaveBeenCalled()
-    expect(mocks.writeSnapshot).not.toHaveBeenCalled()
+    expect(mocks.writePlanReceipt).not.toHaveBeenCalled()
     expect(mocks.appendReceipt).not.toHaveBeenCalled()
     expect(client.query.mock.calls.some(([sql]) => sql.includes('DELETE FROM "agent_outbox"'))).toBe(false)
     expect(mocks.enqueue).not.toHaveBeenCalled()
@@ -123,7 +124,16 @@ describe("appendScheduledPrepare", () => {
     expect(mocks.budget).toHaveBeenCalledWith(client, expect.objectContaining({ turnId: owner.turnId }), 2)
     expect(mocks.create).toHaveBeenCalledWith(client, expect.objectContaining({ scope, proposal,
       templates: { prepare: expect.objectContaining({ role: expect.any(String) }) } }), parent, loaded.state, expect.any(Map), loaded)
-    expect(mocks.writeSnapshot.mock.invocationCallOrder[0]).toBeLessThan(mocks.appendReceipt.mock.invocationCallOrder[0] ?? 0)
+    expect(mocks.writePlanReceipt).toHaveBeenCalledWith(client, expect.objectContaining({
+      scope,
+      state: scheduled.state,
+      snapshot: scheduled.snapshot,
+      expectedRevision: binding.analyzeGraphRevision,
+      idempotencyKey: taskGraphProposalKey(scope.parentTaskId, binding.analyzeGraphRevision),
+      fingerprint: contract.proposalFingerprint,
+      receipt: { status: "accepted", revision: scheduled.state.revision, nodes: scheduled.created, readyTaskIds: ["prepare-task"] },
+    }))
+    expect(mocks.writePlanReceipt.mock.invocationCallOrder[0]).toBeLessThan(mocks.appendReceipt.mock.invocationCallOrder[0] ?? 0)
     expect(mocks.appendReceipt).toHaveBeenCalledWith(client, expect.objectContaining({ itemId: null, taskId: null,
       type: "agent.plan.scheduled_prepare_binding", idempotencyKey: `scheduled-prepare:${contract.proposalFingerprint}`,
       payload: receipt, actor: "system", outbox: false }))
@@ -282,7 +292,7 @@ describe("appendScheduledPrepare", () => {
     })
     expect(mocks.analyze).toHaveBeenCalledWith(input, loaded.snapshot, current, loaded.tasks, true)
     expect(mocks.create).not.toHaveBeenCalled()
-    expect(mocks.writeSnapshot).not.toHaveBeenCalled()
+    expect(mocks.writePlanReceipt).not.toHaveBeenCalled()
     expect(mocks.appendReceipt).not.toHaveBeenCalled()
 
     mocks.receiptMatches.mockReturnValue(false)
@@ -294,7 +304,7 @@ describe("appendScheduledPrepare", () => {
     await expect(appendScheduledPrepare(client as never, input)).rejects.toMatchObject({ code: "scheduled_prepare_claim_stale" })
     expect(mocks.load).not.toHaveBeenCalled()
     expect(mocks.create).not.toHaveBeenCalled()
-    expect(mocks.writeSnapshot).not.toHaveBeenCalled()
+    expect(mocks.writePlanReceipt).not.toHaveBeenCalled()
     expect(mocks.appendReceipt).not.toHaveBeenCalled()
   })
 })

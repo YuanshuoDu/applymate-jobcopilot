@@ -4,10 +4,10 @@ import { enforceRootStepBudget } from "../turns/turn-engine-root-budget.js"
 import { loadScheduledChoiceBinding } from "../turns/turn-question-store-events.js"
 import { parseTurnScheduledPrepareChoiceItem } from "../turns/turn-question-contract.js"
 import { questionItemId } from "../turns/turn-question-store-guards.js"
-import { appendTaskGraphReceipt, writeTaskGraphSnapshot } from "./task-graph-pg-events.js"
+import { appendTaskGraphReceipt, writePlanReceipt } from "./task-graph-pg-events.js"
 import { createGraphTasks, enqueueGraphTask } from "./task-graph-pg-create.js"
 import { currentTaskGraph, loadTaskGraph, lockTaskGraphScope } from "./task-graph-pg-state.js"
-import { parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
@@ -80,10 +80,13 @@ export async function appendScheduledPrepare(client: Queryable, input: TaskGraph
   if (scheduleSnapshot.requireApproval) await suppressScheduledPrepareDispatch(client, input.scope.sessionId, created.created[0].taskId)
   const snapshot = loaded.snapshot.rootSuccessCriteria
     ? parseTaskGraphSnapshot({ ...created.snapshot, rootSuccessCriteria: loaded.snapshot.rootSuccessCriteria }) : created.snapshot
-  await writeTaskGraphSnapshot(client, input.scope, snapshot, contract.binding.analyzeGraphRevision, new Date())
+  const scheduleReceipt = { status: "accepted" as const, revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
+  await writePlanReceipt(client, { scope: input.scope, state: created.state, snapshot,
+    expectedRevision: contract.binding.analyzeGraphRevision, now: new Date(),
+    idempotencyKey: taskGraphProposalKey(input.scope.parentTaskId, contract.binding.analyzeGraphRevision),
+    fingerprint: contract.proposalFingerprint, receipt: scheduleReceipt })
   await appendTaskGraphReceipt(client, { scope: input.scope, itemId: null, taskId: null,
     type: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT, idempotencyKey: key, payload: contract.receipt, actor: "system", outbox: false })
-  const scheduleReceipt = { status: "accepted" as const, revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
   if (!scheduleSnapshot.requireApproval) return { ...scheduleReceipt, choice: { required: false } }
   const choice = inspectedChoice?.choice
   if (choice?.status === "answered" && created.readyTaskIds.includes(created.created[0].taskId)) {
