@@ -228,6 +228,9 @@ describe("native prior question evidence", () => {
     expect(result?.evidence).toHaveLength(32)
     expect(attestedAnswers(result!)).toHaveLength(1)
     expect(attestedAnswers(result!)[0]).toBe("Answer prior-turn-1-2")
+    const priorSourceReads = f.query.mock.calls.filter(([sql]) => sql.includes('FROM "agent_items" AS item')
+      && sql.includes('AS "toolCallId"'))
+    expect(priorSourceReads).toHaveLength(1)
 
     const rootBound = await appendNativePriorQuestionSelfAttestations(mockClient(turns, turns.map(turn => sourceFor(turn, 1))).client,
       current, currentPacket())
