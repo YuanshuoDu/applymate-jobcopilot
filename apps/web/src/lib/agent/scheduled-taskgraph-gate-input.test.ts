@@ -104,8 +104,13 @@ function artifactRows(kind: 'resume' | 'cover_letter', ref = reference(kind === 
     jobId: jobRow.id, artifactType: kind, content, contentHash: ref.contentHash, sourceDigest: ref.sourceDigest,
     constraintHash: sha('b'), provenanceRefs: refs, evidenceRefs: refs, baseId: 'base-artifact', baseHash: sha('c'), taskId: 'prepare-task',
     toolCallId: `call-${kind}`, requestHash: sha('d') }
+  const headContent = kind === 'cover_letter'
+    ? {
+        kind: 'agent_artifact_version', artifactId: ref.artifactId, version: ref.version, contentHash: ref.contentHash,
+      }
+    : content
   const head = { id: ref.artifactId, userId: owner.userId, jobId: jobRow.id, artifactType: kind, lifecycle: 'draft', baseId: version.baseId,
-    baseHash: version.baseHash, content, hash: ref.contentHash, constraintHash: version.constraintHash, provenanceRefs: refs,
+    baseHash: version.baseHash, content: headContent, hash: ref.contentHash, constraintHash: version.constraintHash, provenanceRefs: refs,
     evidenceRefs: refs, version: ref.version }
   return { version, head, ref }
 }
