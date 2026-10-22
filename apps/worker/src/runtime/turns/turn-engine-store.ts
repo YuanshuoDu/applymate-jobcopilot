@@ -2,7 +2,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import { assertCurrentItemLineage, assertCurrentStepLineage, lockTurnEngineOpenSession as lockOpenSession, lockTurnEngineOwnedTurn as lockOwnedTurn, ownerFenceSql, turnEngineTenantTransaction as tenantTransaction, type TurnEnginePool, type TurnEngineQueryClient as QueryClient, type TurnEngineRow as Row } from "./turn-engine-owner-sql.js"
 import { enforceRootStepAndUsageBudgets, enforceRootToolCallBudget } from "./turn-engine-root-budget.js"
-import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
+import { toRepositoryJson, type AtomicTurnNoProgressInput, type AtomicTurnNoProgressResult, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
@@ -13,20 +13,10 @@ import { completeNativeSemanticRejectionStepWithClient } from "./native-semantic
 import { nativeSemanticSchemaConflict, readNativeSemanticRejectionsWithClient } from "./native-semantic-rejection-ledger.js"
 import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
-function conflict(resource: string): Error {
-  const error = new Error(`TurnEngine persistence conflict: ${resource}`)
-  error.name = "TurnEnginePersistenceConflict"
-  return error
-}
+function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
 function sameJson(left: unknown, right: unknown): boolean { return JSON.stringify(toRepositoryJson(left)) === JSON.stringify(toRepositoryJson(right)) }
-function markerIdentity(value: SteeringMarkerPayload): string {
-  return JSON.stringify({ schemaVersion: value.schemaVersion, kind: value.kind, status: value.status, sessionId: value.sessionId, turnId: value.turnId, taskId: value.taskId, inputId: value.inputId, idempotencyKey: value.idempotencyKey, obligationId: value.obligationId, goalRevision: value.goalRevision, planRevision: value.planRevision, acceptedSequence: value.acceptedSequence })
-}
-function sameEventPayload(type: unknown, left: unknown, right: unknown): boolean {
-  if (type !== STEERING_MARKER_EVENT_TYPE) return sameJson(left, right)
-  const leftMarker = parseSteeringMarkerPayload(left), rightMarker = parseSteeringMarkerPayload(right)
-  return leftMarker !== null && rightMarker !== null && markerIdentity(leftMarker) === markerIdentity(rightMarker)
-}
+function markerIdentity(value: SteeringMarkerPayload): string { return JSON.stringify({ schemaVersion: value.schemaVersion, kind: value.kind, status: value.status, sessionId: value.sessionId, turnId: value.turnId, taskId: value.taskId, inputId: value.inputId, idempotencyKey: value.idempotencyKey, obligationId: value.obligationId, goalRevision: value.goalRevision, planRevision: value.planRevision, acceptedSequence: value.acceptedSequence }) }
+function sameEventPayload(type: unknown, left: unknown, right: unknown): boolean { if (type !== STEERING_MARKER_EVENT_TYPE) return sameJson(left, right); const a = parseSteeringMarkerPayload(left), b = parseSteeringMarkerPayload(right); return a !== null && b !== null && markerIdentity(a) === markerIdentity(b) }
 function ownedTurn(owner: ExecutionOwnerFence, base: number, turnIdParameter: number, sessionParameter: number, allowWaiting = false): { sql: string; values: unknown[] } {
   const fence = ownerFenceSql(owner, base, allowWaiting)
   return {
@@ -46,9 +36,9 @@ async function repairEventOutbox(client: QueryClient, expected: AgentOutboxIdent
 }
 async function projectRootTerminalEvent(client: QueryClient, owner: ExecutionOwnerFence, type: string, eventId: string): Promise<void> {
   if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId || !["turn.failed", "turn.interrupted"].includes(type)) return
-  if (!(await updateRootObjectiveHistoryProjection(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }, { terminalEventId: eventId }))) throw conflict(`terminal objective history ${eventId}`)
+  if (!await updateRootObjectiveHistoryProjection(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }, { terminalEventId: eventId })) throw conflict(`terminal objective history ${eventId}`)
 }
-async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngineEventInput[]): Promise<readonly { id: string }[]> {
+async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngineEventInput[], transactionClient?: QueryClient): Promise<readonly { id: string }[]> {
   if (inputs.length === 0) return []
   const owner = inputs[0]!.owner
   if (inputs.some(input => input.owner.kind !== owner.kind || input.owner.userId !== owner.userId || input.owner.sessionId !== owner.sessionId
@@ -56,7 +46,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
     || input.owner.ownerId !== owner.ownerId || input.owner.leaseExpiresAt.getTime() !== owner.leaseExpiresAt.getTime()
     || (owner.kind === "task" ? input.owner.attemptCount !== owner.attemptCount : input.owner.leaseVersion !== owner.leaseVersion))) throw conflict("event batch owner")
   for (const input of inputs) if (input.owner.kind === "task" && ["turn.completed", "turn.failed", "turn.interrupted"].includes(input.type)) throw conflict(`child root lifecycle ${input.type}`)
-  return tenantTransaction(pool, owner.userId, async client => {
+  const append = async (client: QueryClient) => {
     if (!await lockOpenSession(client, owner)) throw conflict(`session ${owner.sessionId}`)
     if (!await lockOwnedTurn(client, owner, true)) throw conflict(`turn ${owner.turnId}`)
     if (inputs.some(input => ["step.started", "tool_call.started", "model.started"].includes(input.type))) await assertSessionWorkAdmission(client, owner)
@@ -92,6 +82,38 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
       result.push({ id: input.id }); previousId = input.id
     }
     return result
+  }
+  return transactionClient ? append(transactionClient) : tenantTransaction(pool, owner.userId, append)
+}
+async function commitTaskGraphNoProgress(pool: TurnEnginePool, owner: ExecutionOwnerFence, response: string, now: Date, denial: AtomicTurnNoProgressInput): Promise<AtomicTurnNoProgressResult> {
+  if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId || denial.reasonCode !== "repeated_signature" || denial.signature !== "task_graph_terminal_denial" || denial.stateFingerprint !== denial.signature) throw conflict("TaskGraph no-progress identity")
+  return tenantTransaction(pool, owner.userId, async client => {
+    if (!await lockOpenSession(client, owner) || !await lockOwnedTurn(client, owner)) throw conflict(`turn ${owner.turnId}`)
+    await assertSessionWorkAdmission(client, owner)
+    const step = await client.query<Row>(`SELECT "status", "inputThroughSequence", "consumedInputIds" FROM "agent_steps" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "taskId"=$4 AND "attempt"=1 FOR UPDATE`, [denial.stepId, owner.sessionId, owner.turnId, owner.taskId])
+    if (!step.rows[0] || step.rows[0].status !== "streaming" || String(step.rows[0].inputThroughSequence) !== denial.inputThroughSequence.toString() || !sameJson(step.rows[0].consumedInputIds, denial.consumedInputIds)) throw conflict(`no-progress Step ${denial.stepId} fence`)
+    const pending = await client.query<Row>(`SELECT "id" FROM "agent_inputs" WHERE "sessionId"=$1 AND "userId"=$2 AND "targetTurnId"=$3 AND "delivery"='steer' AND "status" IN ('accepted','queued','consumed') AND "cancelledAt" IS NULL AND "acceptedSequence">$4 FOR UPDATE`, [owner.sessionId, owner.userId, owner.turnId, denial.inputThroughSequence.toString()])
+    if (pending.rows.length) return { status: "input_changed" }
+    const start = await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId"=$1 AND "turnId"=$2 AND "idempotencyKey"=$3`, [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-started:${denial.stepId}`])
+    if (!start.rows[0]) throw conflict(`no-progress Step start ${denial.stepId}`)
+    const item = await client.query(`INSERT INTO "agent_items" ("id","sessionId","turnId","stepId","taskId","type","status","phase","revision","content","startedAt","completedAt","updatedAt") VALUES ($1,$2,$3,$4,$5,'agent_message','completed','final_answer',1,$6::jsonb,$7,$7,$7) ON CONFLICT ("id") DO NOTHING RETURNING "id"`, [denial.finalItemId, owner.sessionId, owner.turnId, denial.stepId, owner.taskId, json(denial.finalContent), now])
+    if (item.rowCount !== 1) throw conflict(`no-progress final item ${denial.finalItemId}`)
+    const closed = await client.query(`UPDATE "agent_steps" SET "status"='failed',"finishReason"=NULL,"errorCode"='no_progress',"inputTokens"=0,"outputTokens"=0,"estimatedCostUsd"=0,"completedAt"=$1 WHERE "id"=$2 AND "sessionId"=$3 AND "turnId"=$4 AND "taskId"=$5 AND "status"='streaming'`, [now, denial.stepId, owner.sessionId, owner.turnId, owner.taskId])
+    if (closed.rowCount !== 1) throw conflict(`no-progress Step ${denial.stepId} close`)
+    const guard = ownerFenceSql(owner, 3)
+    const turn = await client.query(`UPDATE "agent_turns" AS turn SET "finalResponse"=$7,"error"='no_progress',"revision"="revision"+1,"updatedAt"=$8 ${guard.joins} WHERE turn."id"=$1 AND turn."sessionId"=$2 AND ${guard.where}`, [owner.turnId, owner.sessionId, ...guard.values, response, now])
+    if (turn.rowCount !== 1) throw conflict(`no-progress Turn ${owner.turnId}`)
+    const prefix = `turn:${owner.turnId}:event:`, final = JSON.parse(response) as RepositoryJsonValue
+    const entries = [
+      { suffix: `step-failed:${denial.stepId}`, type: "step.completed", itemId: null, correlationId: denial.stepId, payload: { stepId: denial.stepId, status: "failed", errorCode: "no_progress", taskId: owner.taskId } },
+      { suffix: "turn-no-progress", type: "turn.no_progress", itemId: null, correlationId: owner.turnId, payload: { reasonCode: denial.reasonCode, signature: denial.signature, stateFingerprint: denial.stateFingerprint, taskId: owner.taskId } },
+      { suffix: `item-started:${denial.finalItemId}`, type: "item.started", itemId: denial.finalItemId, correlationId: denial.stepId, payload: { itemId: denial.finalItemId, type: "agent_message", phase: "final_answer" } },
+      { suffix: `final-completed:${denial.finalItemId}:1`, type: "item.completed", itemId: denial.finalItemId, correlationId: denial.finalItemId, payload: { itemId: denial.finalItemId, status: "completed", content: denial.finalContent } },
+      { suffix: "turn-failed:no_progress", type: "turn.failed", itemId: denial.finalItemId, correlationId: owner.turnId, payload: { turnId: owner.turnId, taskId: owner.taskId, errorCode: "no_progress", finalItemId: denial.finalItemId, final } },
+    ]
+    const inputs = entries.map((entry, index): TurnEngineEventInput => ({ owner, id: `${prefix}${entry.suffix}`, itemId: entry.itemId, type: entry.type, correlationId: entry.correlationId, causationId: index ? null : String(start.rows[0]!.id), idempotencyKey: `${prefix}${entry.suffix}`, payload: toRepositoryJson(entry.payload) }))
+    const saved = await appendEventBatch(pool, inputs, client)
+    return { status: "no_progress", finalItemId: denial.finalItemId, events: entries.map((entry, index) => ({ id: saved[index]!.id, type: entry.type, itemId: entry.itemId, correlationId: entry.correlationId, causationId: index ? saved[index - 1]!.id : String(start.rows[0]!.id), payload: toRepositoryJson(entry.payload) })) }
   })
 }
 export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: TurnEngineTerminalGuard): TurnEngineStore {
@@ -252,6 +274,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: Tu
     async recordFinalResponse(input) {
       if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
       if (input.terminal) return commitTurnTerminal(pool, { ...input.terminal, owner: input.owner, response: input.response, now: input.now }, terminalGuard)
+      if (input.noProgress) return commitTaskGraphNoProgress(pool, input.owner, input.response, input.now, input.noProgress)
       return tenantTransaction(pool, input.owner.userId, async (client: QueryClient) => {
         if (!await lockOpenSession(client, input.owner)) throw conflict(`turn ${input.owner.turnId}`)
         const guard = ownerFenceSql(input.owner, 5, true)

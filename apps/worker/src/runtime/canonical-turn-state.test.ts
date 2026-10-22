@@ -62,7 +62,14 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
       const result = values?.[1] === "prior-turn" ? rows.priorQuestionEvents ?? [] : rows.questionEvents ?? []
       return { rows: result, rowCount: result.length }
     }
-    if (sql.includes('FROM "agent_events"')) return { rows: (rows.events ?? []).filter(event => event.taskId === undefined || event.taskId === null || event.taskId === values?.[2]), rowCount: rows.events?.length ?? 0 }
+    if (sql.includes('FROM "agent_events"')) {
+      const readsToolStarts = sql.includes("'tool_call.started'")
+      const nullsToolStartPayload = sql.includes("'tool_call.started') THEN NULL")
+      const projected = (rows.events ?? []).filter(event => (event.type !== "tool_call.started" || readsToolStarts)
+        && (event.taskId === undefined || event.taskId === null || event.taskId === values?.[2]))
+        .map(event => event.type === "tool_call.started" && nullsToolStartPayload ? { ...event, payload: null } : event)
+      return { rows: projected, rowCount: projected.length }
+    }
     if (sql.includes('FROM "agent_items"')) {
       if (sql.includes('item."type" = \'question\'')) return { rows: rows.questionItems ?? [], rowCount: rows.questionItems?.length ?? 0 }
       const filtered = sql.includes('item_task') ? (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === "root-1") : (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === values?.[2])
@@ -629,9 +636,20 @@ describe("loadCanonicalTurnState", () => {
     expect(query).toContain('event_session."userId" AS "userId"')
     expect(query).toContain('(event."taskId" IS NULL OR event."taskId" = $3)')
     expect(query).toContain('LEFT JOIN "agent_items" AS event_item')
-    expect(query).toContain('CASE WHEN event."type" IN (\'item.started\', \'item.delta\', \'item.completed\') THEN NULL')
+    expect(query).toContain('CASE WHEN event."type" IN (\'item.started\', \'item.delta\', \'item.completed\', \'tool_call.started\') THEN NULL')
     expect(query).not.toContain('event_item."content"')
     expect(query).toContain(`'${COGNITIVE_AGENDA_EVENT_TYPE}'`)
+    expect(query).toContain("'tool_call.started'")
+
+    const shiftedSecond = second.events.map(event => Number(event.sequence) >= 15
+      ? { ...event, sequence: String(Number(event.sequence) + 1) } : event)
+    const orphanToolStart = { ...second.events[0]!, id: "orphan-tool-start", type: "tool_call.started",
+      correlationId: "missing-call", itemId: "missing-call-item", causationId: "missing-item-start",
+      idempotencyKey: `turn:${scope.turnId}:event:tool-started:missing-call`, sequence: "15", payload: { taskId: scope.rootTaskId } }
+    const interruptedStreak = await loadCanonicalTurnState(pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: scope.rootTaskId,
+      contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [first.step, second.step],
+      items: [], events: [...first.events, ...shiftedSecond.slice(0, 4), orphanToolStart, ...shiftedSecond.slice(4)] }), lease)
+    expect(interruptedStreak.resume?.taskGraphDenialProgress).toBeUndefined()
   })
 
   it("loads the durable final-evidence recovery marker into Root resume state", async () => {

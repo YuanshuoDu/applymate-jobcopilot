@@ -11,6 +11,7 @@ type QualifyingDenial = Omit<TaskGraphDenialProgress, "count"> & { firstSequence
 export const TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE = "agent.plan.denial_checkpoint"
 const CHECKPOINT_EVENT = TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE
 const FEEDBACK_PREFIX = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
+const TOOL_EVENTS = new Set(["tool_call.started", "tool_call.completed", "tool_call.failed"])
 
 function object(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -67,12 +68,38 @@ function checkpointPayload(marker: Row, stepId: string, scope: Scope): { graphRe
   return { graphRevision: Number(value.graphRevision), verificationDigest: value.verificationDigest }
 }
 
+function hasToolEventInStep(input: ResumeInput, stepId: string, first: bigint, last: bigint): boolean {
+  return input.events.some(event => {
+    if (!TOOL_EVENTS.has(String(event.type))) return false
+    if (event.correlationId === stepId) return true
+    if (event.sessionId !== input.scope.sessionId || event.turnId !== input.scope.turnId
+      || (event.taskId != null && event.taskId !== input.scope.rootTaskId)) return false
+    const eventSequence = sequence(event.sequence)
+    if (eventSequence === null) return true
+    if (eventSequence < first || eventSequence > last) return false
+    // The canonical query supplies the session owner as userId; any in-window event makes this non-zero-tool.
+    return true
+  })
+}
+
+function hasAmbiguousStepEvents(input: ResumeInput, stepId: string): boolean {
+  const related = input.events.filter(event => event.correlationId === stepId || event.eventItemStepId === stepId)
+  const ids = new Set<string>(), sequences = new Set<bigint>()
+  for (const event of related) {
+    const eventSequence = sequence(event.sequence)
+    if (!safeId(event.id) || eventSequence === null || ids.has(event.id) || sequences.has(eventSequence)) return true
+    ids.add(event.id); sequences.add(eventSequence)
+  }
+  return false
+}
+
 function qualifyingStep(input: ResumeInput, step: Row): QualifyingDenial | null {
   const stepId = step.id
   if (!safeId(stepId) || !Number.isSafeInteger(step.ordinal) || Number(step.ordinal) < 0
     || !Number.isSafeInteger(step.attempt) || Number(step.attempt) < 1
     || step.status !== "completed" || step.taskId !== input.scope.rootTaskId || step.errorCode !== null) return null
   if (input.items.some(item => item.stepId === stepId && (item.type === "tool_call" || item.type === "tool_result"))) return null
+  if (hasAmbiguousStepEvents(input, stepId)) return null
   const events = input.events.filter(event => event.correlationId === stepId)
   if (events.some(event => event.type === "tool_call.started" || event.type === "tool_call.completed" || event.type === "tool_call.failed")) return null
   const matching = (type: string) => events.filter(event => event.type === type)
@@ -150,6 +177,7 @@ function qualifyingStep(input: ResumeInput, step: Row): QualifyingDenial | null 
   if ([startSeq, agendaSeq, modelSeq, usageSequence, markerSeq, rejectSeq, closeSeq].some(value => value === null)
     || predecessorSeq === null || !(agendaSeq! < startSeq! && startSeq! < modelSeq! && modelSeq! < usageSequence!
       && predecessorSeq < markerSeq! && markerSeq! < rejectSeq! && rejectSeq! < closeSeq!)) return null
+  if (hasToolEventInStep(input, stepId, agendaSeq!, closeSeq!)) return null
   if (started.causationId !== agendaEvent.id || completed.causationId !== started.id || usageEvent.causationId !== completed.id
     || rejected.causationId !== marker.id || closed.causationId !== rejected.id) return null
   return { taskId: input.scope.rootTaskId, graphRevision: markerInfo.graphRevision, verificationDigest: markerInfo.verificationDigest,

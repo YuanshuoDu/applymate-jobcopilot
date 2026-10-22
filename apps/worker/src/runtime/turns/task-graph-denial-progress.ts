@@ -1,15 +1,17 @@
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
-import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import { parseTaskGraphDenialCheckpoint, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import type { TaskGraphDenialProgress } from "./turn-execution-types.js"
 import { completionRecoverySnapshot } from "./turn-execution-completion-gate.js"
 
 export function taskGraphDenialProgressFor(
-  checkpoint: TaskGraphDenialCheckpoint,
+  checkpointInput: TaskGraphDenialCheckpoint,
   context: Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">,
   prior?: TaskGraphDenialProgress,
 ): TaskGraphDenialProgress | undefined {
+  const checkpoint = parseCheckpoint(checkpointInput, checkpointInput?.taskId)
+  if (!checkpoint) return undefined
   if (context.taskGraphRevision !== checkpoint.graphRevision || !validCheckpoint(context)) return undefined
-  const priorInputEpoch = prior?.taskId === checkpoint.taskId
+  const priorInputEpoch = isTaskGraphDenialProgressValid(prior, checkpoint.taskId)
     && prior.inputThroughSequence === context.inputThroughSequence && validIds(prior.consumedInputIds) ? prior : undefined
   const sameFence = !!priorInputEpoch && sameAcceptedInputFence(priorInputEpoch.consumedInputIds, context.consumedInputIds)
   const same = sameFence && priorInputEpoch.graphRevision === checkpoint.graphRevision
@@ -25,11 +27,12 @@ export function taskGraphDenialProgressFor(
 
 export function taskGraphDenialProgressMatches(
   progress: TaskGraphDenialProgress | undefined,
-  checkpoint: TaskGraphDenialCheckpoint | null,
+  checkpointInput: TaskGraphDenialCheckpoint | null,
   context: Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">,
   expectedTaskId: string,
 ): boolean {
-  return !!progress && !!checkpoint && progress.count === 2
+  const checkpoint = checkpointInput && parseCheckpoint(checkpointInput, expectedTaskId)
+  return isTaskGraphDenialProgressValid(progress, expectedTaskId) && !!checkpoint && progress.count === 2
     && progress.taskId === expectedTaskId && checkpoint.taskId === expectedTaskId
     && progress.graphRevision === checkpoint.graphRevision && progress.graphRevision === context.taskGraphRevision
     && progress.verificationDigest === checkpoint.verificationDigest
@@ -38,20 +41,47 @@ export function taskGraphDenialProgressMatches(
     && sameAcceptedInputFence(progress.consumedInputIds, context.consumedInputIds)
 }
 
+export function isTaskGraphDenialProgressValid(
+  progress: TaskGraphDenialProgress | undefined,
+  expectedTaskId: string,
+): progress is TaskGraphDenialProgress {
+  if (!progress || !exactProgress(progress) || progress.taskId !== expectedTaskId
+    || (progress.count !== 1 && progress.count !== 2) || !Number.isSafeInteger(progress.graphRevision)
+    || progress.graphRevision < 1 || typeof progress.verificationDigest !== "string"
+    || !/^[a-f0-9]{64}$/.test(progress.verificationDigest) || typeof progress.inputThroughSequence !== "bigint"
+    || progress.inputThroughSequence < 0n || !validIds(progress.consumedInputIds)) return false
+  return !!parseCheckpoint({ schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: progress.taskId,
+    graphRevision: progress.graphRevision, verificationDigest: progress.verificationDigest }, expectedTaskId)
+}
+
+function parseCheckpoint(value: unknown, expectedTaskId: string) {
+  try { return parseTaskGraphDenialCheckpoint(value, expectedTaskId) } catch { return null }
+}
+
+function exactProgress(value: TaskGraphDenialProgress): boolean {
+  try {
+    const keys = Reflect.ownKeys(value)
+    const expected = ["taskId", "graphRevision", "verificationDigest", "inputThroughSequence", "consumedInputIds", "count"]
+    return (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+      && keys.length === expected.length && keys.every(key => typeof key === "string" && expected.includes(key))
+      && expected.every(key => { const descriptor = Object.getOwnPropertyDescriptor(value, key); return !!descriptor?.enumerable && "value" in descriptor })
+  } catch { return false }
+}
+
 export function createTaskGraphDenialProgressTracker(initial?: TaskGraphDenialProgress): {
   clear(): void
-  record(checkpoint: TaskGraphDenialCheckpoint | undefined, context: Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">, eligible: boolean): void
-  replan(snapshot: StepContextSnapshot, stepId: string, feedback: string, checkpoint: TaskGraphDenialCheckpoint | undefined, context: Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">, eligible: boolean): StepContextSnapshot
+  record(checkpoint: TaskGraphDenialCheckpoint | null | undefined, context: Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">): void
+  replan(snapshot: StepContextSnapshot, stepId: string, feedback: string, checkpoint: TaskGraphDenialCheckpoint | null | undefined, context: Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">): StepContextSnapshot
   shouldStop(context: Pick<StepContext, "taskGraphRevision" | "inputThroughSequence" | "consumedInputIds">, expectedTaskId: string, read?: () => Promise<TaskGraphDenialCheckpoint | null>): Promise<boolean>
 } {
   let current = initial
   return {
     clear() { current = undefined },
-    record(checkpoint, context, eligible) {
-      current = eligible && checkpoint ? taskGraphDenialProgressFor(checkpoint, context, current) : undefined
+    record(checkpoint, context) {
+      current = checkpoint ? taskGraphDenialProgressFor(checkpoint, context, current) : undefined
     },
-    replan(snapshot, stepId, feedback, checkpoint, context, eligible) {
-      current = eligible && checkpoint ? taskGraphDenialProgressFor(checkpoint, context, current) : undefined
+    replan(snapshot, stepId, feedback, checkpoint, context) {
+      current = checkpoint ? taskGraphDenialProgressFor(checkpoint, context, current) : undefined
       return completionRecoverySnapshot(snapshot, stepId, feedback)
     },
     async shouldStop(context, expectedTaskId, read) {
@@ -73,7 +103,7 @@ function validCheckpoint(context: Pick<StepContext, "inputThroughSequence" | "co
 }
 
 function validIds(ids: readonly string[]): boolean {
-  return Array.isArray(ids) && ids.every(id => typeof id === "string" && id.length > 0)
+  return Array.isArray(ids) && ids.every(id => typeof id === "string" && id.trim() === id && id.length > 0 && id.length <= 96 && !/[\u0000-\u001f\u007f]/.test(id))
     && new Set(ids).size === ids.length
 }
 

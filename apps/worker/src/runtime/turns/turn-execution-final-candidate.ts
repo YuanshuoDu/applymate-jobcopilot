@@ -5,10 +5,10 @@ import { assertCompletionAllowed, steeringReconciliationGateRecovery, taskGraphG
 import { canEmitTurnCompleted, canPersistFinalResponse, totalTurnUsage, updateExecutionStep } from "./turn-engine-helpers.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
 import { verifyCandidateFinal, snapshotEvidence } from "../verifier.js"
-import { TurnEngineError, toRepositoryJson, type AtomicTurnCompletionResult, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
+import { TurnEngineError, toRepositoryJson, type AtomicTurnCompletionResult, type AtomicTurnNoProgressResult, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { publishFinalResponse } from "./turn-execution-events.js"
-import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
 import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
 import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
@@ -170,7 +170,7 @@ export async function completeTurnCandidate(input: Readonly<{
   if (canPersistFinalResponse(options)) {
     if (!options.store.recordFinalResponse) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion is unavailable")
     const finalItemId = options.idFactory?.(executionId(options.identity, `item:final:${step.id}`)) ?? executionId(options.identity, `item:final:${step.id}`)
-    let terminal: void | AtomicTurnCompletionResult
+    let terminal: void | AtomicTurnCompletionResult | AtomicTurnNoProgressResult
     try {
       terminal = await options.store.recordFinalResponse({ identity: options.identity, response: serializeFinalResponse(finalResponse), now: now(),
         terminal: { stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse) }),
@@ -194,7 +194,7 @@ export async function completeTurnCandidate(input: Readonly<{
       await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback: recovery.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}:task-graph-race`)
       return { kind: "replan", feedback: recoveryFeedback }
     }
-    if (!terminal) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned no receipt")
+    if (!terminal || terminal.status !== "completed") throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned an invalid receipt")
     for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)
     return { kind: "completed", result: { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: terminal.finalItemId, finalText: output.text } }
   }
@@ -202,6 +202,26 @@ export async function completeTurnCandidate(input: Readonly<{
   if (canEmitTurnCompleted(options)) await writer.append("turn.completed", step.id, finalItem.id,
     { turnId: options.identity.turnId, taskId: options.identity.taskId, finalItemId: finalItem.id, usage: finalResponse.usage }, "turn-completed")
   return { kind: "completed", result: { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: finalItem.id, finalText: output.text } }
+}
+
+export async function stopForRepeatedTaskGraphDenial(input: Readonly<{
+  options: TurnExecutionOptions; writer: TurnExecutionEventWriter; step: TurnEngineStep; context: StepContext
+  stepCount: number; toolCallCount: number; usage: TurnUsage; now: () => Date
+}>): Promise<TurnEngineResult> {
+  const { options, step, context } = input
+  if (options.identity.kind !== "turn" || options.identity.taskId !== options.identity.rootTaskId || !options.store.recordFinalResponse) throw new TurnEngineError("persistence_conflict", "Atomic TaskGraph no-progress completion is unavailable")
+  const final = finalizeTurn({ goal: options.goal, terminalReason: "no_progress", blocker: "Repeated TaskGraph verification denials made no progress.",
+    next: ["Provide missing evidence or revise the TaskGraph."], usage: totalTurnUsage(options.resume?.usage, input.usage), stepCount: input.stepCount, toolCallCount: input.toolCallCount })
+  const finalItemId = options.idFactory?.(executionId(options.identity, `item:final:${step.id}`)) ?? executionId(options.identity, `item:final:${step.id}`)
+  const terminal = await options.store.recordFinalResponse({ identity: options.identity, response: serializeFinalResponse(final), now: input.now(), noProgress: {
+    stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: final.response, final: toRepositoryJson(final) }), stepCount: input.stepCount,
+    toolCallCount: input.toolCallCount, usage: final.usage, inputThroughSequence: context.inputThroughSequence, consumedInputIds: context.consumedInputIds,
+    reasonCode: "repeated_signature", signature: "task_graph_terminal_denial", stateFingerprint: "task_graph_terminal_denial",
+  } })
+  if (!terminal || terminal.status === "input_changed") throw new TurnStateRefreshRetryError()
+  if (terminal.status !== "no_progress") throw new TurnEngineError("persistence_conflict", "Atomic TaskGraph no-progress completion returned an invalid receipt")
+  for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)
+  return { status: "failed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, errorCode: "no_progress", finalItemId: terminal.finalItemId }
 }
 
 function record(value: unknown): Record<string, unknown> | null { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null }

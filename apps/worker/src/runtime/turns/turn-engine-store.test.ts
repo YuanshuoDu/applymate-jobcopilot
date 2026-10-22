@@ -773,6 +773,68 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(calls[0]).toBe("BEGIN")
   })
 
+  it("linearizes repeated-denial terminalization against accepted steer input", async () => {
+    async function run(pendingInput: boolean) {
+      const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+      let stepStatus = "streaming"
+      const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ sql, values })
+        if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+        if (sql.includes(SESSION_WORK_ADMISSION)) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+        if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+        if (sql.includes('FROM "agent_steps"')) return { rows: [{ status: stepStatus, inputThroughSequence: "8", consumedInputIds: ["accepted-8"] }], rowCount: 1 }
+        if (sql.includes('FROM "agent_inputs"')) return pendingInput ? { rows: [{ id: "accepted-9" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_events"')) return values?.[2] === `turn:${owner.turnId}:event:step-started:step-denial-3`
+          ? { rows: [{ id: "step-started-event" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('INSERT INTO "agent_items"')) return { rows: [{ id: "final-item" }], rowCount: 1 }
+        if (sql.includes('SELECT "id" FROM "agent_items"')) return { rows: [{ id: "final-item" }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_steps"')) { stepStatus = "failed"; return { rows: [], rowCount: 1 } }
+        if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
+        if (sql.includes('SELECT item."id"')) return { rows: [{ id: "final-item" }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: 20n }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }), release: vi.fn() }
+      const pool = { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">
+      const store = createPgTurnEngineStore(pool)
+      const input = { owner, response: JSON.stringify({ response: "safe no-progress" }), now, noProgress: {
+        stepId: "step-denial-3", finalItemId: "final-item", finalContent: { text: "safe no-progress" }, stepCount: 3, toolCallCount: 0,
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, inputThroughSequence: 8n, consumedInputIds: ["accepted-8"],
+        reasonCode: "repeated_signature", signature: "task_graph_terminal_denial", stateFingerprint: "task_graph_terminal_denial",
+      } }
+      const result = await store.recordFinalResponse(input)
+      return { result, calls, client, store, input }
+    }
+
+    const inputWins = await run(true)
+    expect(inputWins.result).toEqual({ status: "input_changed" })
+    expect(inputWins.calls.findIndex(call => call.sql.includes('FROM "agent_sessions"'))).toBeLessThan(inputWins.calls.findIndex(call => call.sql.includes('SELECT turn."id"')))
+    expect(inputWins.calls.find(call => call.sql.includes('FROM "agent_inputs"'))?.sql).toContain('"acceptedSequence">$4 FOR UPDATE')
+    expect(inputWins.calls.some(call => /^(INSERT|UPDATE) "agent_(items|steps|turns|events|outbox)"/.test(call.sql))).toBe(false)
+
+    const terminalWins = await run(false)
+    expect(terminalWins.result).toMatchObject({ status: "no_progress", finalItemId: "final-item" })
+    const indexOf = (needle: string) => terminalWins.calls.findIndex(call => call.sql.includes(needle))
+    expect(indexOf('FROM "agent_sessions"')).toBeLessThan(indexOf('SELECT turn."id"'))
+    expect(indexOf('FROM "agent_inputs"')).toBeLessThan(indexOf('INSERT INTO "agent_items"'))
+    expect(terminalWins.calls.find(call => call.sql.includes('UPDATE "agent_turns"'))?.sql).toContain('"revision"="revision"+1')
+    expect(terminalWins.calls.find(call => call.sql.includes('UPDATE "agent_steps"'))?.sql).toContain('SET "status"=\'failed\'')
+    const terminalEvents = terminalWins.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))
+    expect(terminalEvents.map(call => call.values?.[6])).toEqual(["step.completed", "turn.no_progress", "item.started", "item.completed", "turn.failed"])
+    expect(JSON.parse(String(terminalEvents[0]?.values?.[11]))).toMatchObject({ status: "failed", errorCode: "no_progress" })
+    expect(terminalEvents[0]?.values?.[9]).toBe("step-started-event")
+    for (let index = 1; index < terminalEvents.length; index += 1) expect(terminalEvents[index]?.values?.[9]).toBe(terminalEvents[index - 1]?.values?.[0])
+    expect(terminalEvents.at(-1)?.values?.[10]).toBe(`turn:${owner.turnId}:event:turn-failed:no_progress`)
+    expect(terminalWins.calls.at(-1)?.sql).toBe("COMMIT")
+    expect(terminalWins.client.release).toHaveBeenCalledOnce()
+    await expect(terminalWins.store.recordFinalResponse(terminalWins.input)).rejects.toThrow(/no-progress Step .* fence/)
+    expect(terminalWins.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(5)
+    expect(terminalWins.calls.filter(call => call.sql.includes('INSERT INTO "agent_items"'))).toHaveLength(1)
+    expect(terminalWins.calls.filter(call => call.sql.includes('UPDATE "agent_steps"'))).toHaveLength(1)
+    expect(terminalWins.calls.filter(call => call.sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)
+    assertDenseBindings(terminalWins.calls)
+  })
+
   it("locks the owner before updating a Step or Item", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {

@@ -11,6 +11,7 @@ import type {
   TurnEngineItemType,
   TurnEngineItem,
   AtomicTurnCompletionResult,
+  AtomicTurnNoProgressResult,
   TurnEngineResult,
   TurnEngineStep,
   TurnEngineStore,
@@ -149,7 +150,7 @@ export type TurnExecutionStore = {
   updateItem(input: StoreInput<"updateItem">): Promise<TurnEngineItem>
   appendEvent(input: StoreInput<"appendEvent">): Promise<{ id: string }>
   appendEvents?(inputs: readonly StoreInput<"appendEvent">[]): Promise<readonly { id: string }[]>
-  recordFinalResponse?(input: StoreInput<"recordFinalResponse">): Promise<void | AtomicTurnCompletionResult>
+  recordFinalResponse?(input: StoreInput<"recordFinalResponse">): Promise<void | AtomicTurnCompletionResult | AtomicTurnNoProgressResult>
 }
 
 export type TurnExecutionContextBuilder = {

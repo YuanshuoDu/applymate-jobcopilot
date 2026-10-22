@@ -138,12 +138,12 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC, "id" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-       `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."correlationId", event."causationId", event."itemId", event."idempotencyKey", event_item."type" AS "eventItemType", event_item."stepId" AS "eventItemStepId", event_item."taskId" AS "eventItemTaskId", CASE WHEN event."type" IN ('item.started', 'item.delta', 'item.completed') THEN NULL ELSE event."payload" END AS "payload"
+       `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."correlationId", event."causationId", event."itemId", event."idempotencyKey", event_item."type" AS "eventItemType", event_item."stepId" AS "eventItemStepId", event_item."taskId" AS "eventItemTaskId", CASE WHEN event."type" IN ('item.started', 'item.delta', 'item.completed', 'tool_call.started') THEN NULL ELSE event."payload" END AS "payload"
        FROM "agent_events" AS event
        JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4
        JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 LEFT JOIN "agent_items" AS event_item ON event_item."id" = event."itemId" AND event_item."sessionId" = event."sessionId" AND event_item."turnId" = event."turnId" AND event_item."taskId" = $3
        WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3)
-          AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.completed', 'tool_call.failed', 'step.completed', 'final.rejected', 'item.started', 'item.delta', 'item.completed', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}', '${TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE}')
+          AND event."type" IN ('model.started', 'model.completed', 'model.usage', 'tool_call.started', 'tool_call.completed', 'tool_call.failed', 'step.completed', 'final.rejected', 'item.started', 'item.delta', 'item.completed', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}', '${TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE}')
        ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
