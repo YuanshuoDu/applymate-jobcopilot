@@ -1497,7 +1497,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const gatePath = "@/lib/agent/scheduled-taskgraph-run-service"
       const gateService = await import(gatePath) as unknown as {
         buildScheduledTaskGraphGateResumeState(input: { owner: IntegrationScheduledOwner; snapshot: unknown; attestation: unknown; continuationKey: string;
-          claimToken: string; ownedJobs: readonly unknown[]; persistedCheckpoint: unknown; prepareProof: unknown }): Promise<Record<string, unknown>>
+          claimToken: string; ownedJobs: readonly unknown[]; persistedCheckpoint: unknown; prepareProof: unknown; scheduledWaitId?: string }): Promise<Record<string, unknown>>
       }
       const ownedJobs = await gateDatabase.db.job.findMany({ where: { id: value.jobId, userId: value.userId } })
       expect(ownedJobs).toHaveLength(1)
@@ -1508,7 +1508,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(currentExecutionState).toBeDefined()
       const gateState = await gateService.buildScheduledTaskGraphGateResumeState({ owner: resumedClaimOwner, snapshot: scheduledSnapshot,
         attestation: resumedBridge.attestation, continuationKey, claimToken: resumedClaimToken, ownedJobs,
-        persistedCheckpoint: currentExecutionState, prepareProof: readyPrepare.prepareProof })
+        persistedCheckpoint: currentExecutionState, prepareProof: readyPrepare.prepareProof, scheduledWaitId: expectedChoiceWaitId })
       expect(gateState.nextStage).toBe("gate")
       if (scenario.mode === "zero-eligible") {
         expect(gateState.scheduledTaskGraphPreparedArtifacts).toEqual([])
