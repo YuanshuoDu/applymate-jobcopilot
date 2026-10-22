@@ -1433,7 +1433,11 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(usageSettlements).toHaveLength(2 + (scenario.mode === "zero-eligible" ? 0 : 1))
       expect(usageSettlements.every(row => row.settlement.status === "success")).toBe(true)
       expect(usageSettlements.map(row => row.stepId).sort()).toEqual(ledger.steps.map(row => row.id).sort())
-      expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toBeDefined()
+      expect(completedPrepare.rows[0]?.result.taskGraphScheduledPrepareProofFacts).toMatchObject({
+        completion: { nodes: expect.arrayContaining([expect.objectContaining({ taskId: prepareTaskId, attemptCount: 1,
+          role: "prepare", status: "completed", verification: "passed" })]) },
+        result: expect.objectContaining({ taskId: prepareTaskId, attemptCount: 1, status: "completed" }),
+      })
       const verificationGraph = await loadTaskGraph(pool!, graphScope, false)
       const verificationCurrent = currentTaskGraph(verificationGraph)
       const verificationAttempt = verificationGraph.tasks.get(prepareTaskId)?.attemptCount

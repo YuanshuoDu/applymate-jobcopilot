@@ -225,9 +225,12 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     } as never))
     const verify = vi.spyOn(scheduledPrepareVerification, "verifyScheduledPrepareTaskGraphEvidence")
       .mockResolvedValueOnce({ verified: true, facts: proofFacts } as never)
+    const checkedAt = new Date("2026-09-23T12:00:00.000Z")
+    const client = { query: vi.fn().mockResolvedValue({ rows: [{ leaseOwner: "worker-owner-1", attemptCount: 3,
+      leaseExpiresAt: new Date("2026-09-23T12:01:00.000Z"), checkedAt }], rowCount: 1 }) }
     try {
-      const result = await prepareTaskGraphFinish({} as never, {
-        taskId: "prepare-1", sessionId: "session-1", ownerId: "worker-owner-1", attemptCount: 3, status: "completed", retry: false,
+      const result = await prepareTaskGraphFinish(client as never, {
+        taskId: "prepare-1", sessionId: "session-1", attemptCount: 3, status: "completed", retry: false,
         result: { structuredResult: { toolResult: true }, taskGraphScheduledPrepareProofFacts: { forged: true } },
       })
       expect(result.status).toBe("completed")
@@ -245,9 +248,53 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
           nodes: expect.arrayContaining([expect.objectContaining({ key: "prepare", taskId: "prepare-1", status: "completed" })]) }),
         referenceVerificationMode: { phase: "finish", ownerId: "worker-owner-1" },
         tasks: expect.any(Map) }))
+      expect(client.query).toHaveBeenCalledWith(expect.stringContaining('"attemptCount" = $3'), ["prepare-1", "session-1", 3])
+      expect(client.query.mock.calls[0]?.[0]).toContain('"leaseExpiresAt" > clock_timestamp() FOR UPDATE')
       const verifiedTasks = verify.mock.calls[0]?.[1].tasks
       expect(verifiedTasks.get("prepare-1")).toMatchObject({ status: "completed", attemptCount: 3 })
       expect(persistedPrepareTask.status).toBe("running")
+    } finally { prepare.mockRestore(); load.mockRestore(); current.mockRestore(); verify.mockRestore() }
+  })
+
+  it.each([
+    { name: "a missing lease row", rows: [] },
+    { name: "an expired lease", rows: [{ leaseOwner: "worker-owner-1", attemptCount: 3,
+      leaseExpiresAt: new Date("2026-09-23T11:59:59.000Z"), checkedAt: new Date("2026-09-23T12:00:00.000Z") }] },
+    { name: "a different attempt", rows: [{ leaseOwner: "worker-owner-1", attemptCount: 2,
+      leaseExpiresAt: new Date("2026-09-23T12:01:00.000Z"), checkedAt: new Date("2026-09-23T12:00:00.000Z") }] },
+  ])("fails closed for Prepare proof when $name", async ({ rows }) => {
+    const snapshot = { nodes: [{ key: "prepare", templateId: "prepare", taskId: "prepare-1" }] }
+    const graph = { scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+      itemId: "item-1", taskId: "prepare-1", expectedRevision: 13, snapshot,
+      event: { type: "task.completed", nodeKey: "prepare", expectedRevision: 13,
+        idempotencyKey: taskGraphLifecycleKey("root-1", "prepare", 3, "task.completed") },
+      state: { revision: 14, nodes: [{ key: "prepare", taskId: "prepare-1", templateId: "prepare", status: "completed", failureReason: null }] }, duplicate: false }
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValueOnce(graph as never).mockResolvedValueOnce(null)
+    const persistedPrepareTask = { id: "prepare-1", status: "running", role: "prepare", taskType: "scheduled_application_prepare",
+      attemptCount: 3, failureReason: null, result: null }
+    const persistedState = { revision: 13, nodes: [{ key: "prepare", taskId: "prepare-1", templateId: "prepare", status: "running", failureReason: null }] }
+    const load = vi.spyOn(taskGraphState, "loadTaskGraph").mockResolvedValueOnce({
+      item: { id: "item-1", revision: 13 }, snapshot, state: persistedState, tasks: new Map([["prepare-1", persistedPrepareTask]]),
+    } as never)
+    const current = vi.spyOn(taskGraphState, "currentTaskGraph").mockImplementation(loaded => ({
+      revision: loaded.state?.revision ?? 0,
+      nodes: [{ key: "prepare", taskId: "prepare-1", templateId: "prepare",
+        status: loaded.state?.revision === 14 ? "completed" : "running", failureReason: null }],
+    } as never))
+    const verify = vi.spyOn(scheduledPrepareVerification, "verifyScheduledPrepareTaskGraphEvidence")
+      .mockResolvedValue({ verified: true, facts: {} } as never)
+    const client = { query: vi.fn().mockResolvedValue({ rows, rowCount: rows.length }) }
+    try {
+      const result = await prepareTaskGraphFinish(client as never, {
+        taskId: "prepare-1", sessionId: "session-1", attemptCount: 3, status: "completed", retry: false,
+        result: { structuredResult: { toolResult: true } },
+      })
+      expect(result).toMatchObject({ status: "failed", failureReason: "scheduled_prepare_owner_invalid" })
+      expect(verify).not.toHaveBeenCalled()
+      expect(prepare).toHaveBeenNthCalledWith(2, expect.anything(), expect.objectContaining({
+        taskId: "prepare-1", sessionId: "session-1", type: "task.failed", failureReason: "scheduled_prepare_owner_invalid",
+      }))
+      expect(client.query).toHaveBeenCalledWith(expect.stringContaining('"attemptCount" = $3'), ["prepare-1", "session-1", 3])
     } finally { prepare.mockRestore(); load.mockRestore(); current.mockRestore(); verify.mockRestore() }
   })
 

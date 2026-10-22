@@ -8,13 +8,13 @@ import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-tas
 import { taskGraphVerificationDependencyNodeKeys } from "../planning/task-graph-verification.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
 import { canonicalTaskGraphJson, taskGraphLifecycleKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
-import { json, transaction } from "./pg-store-persistence.js"
+import { dateValue, json, transaction } from "./pg-store-persistence.js"
 import type { PgSubagentPool, SubagentTaskRecord } from "./types.js"
 import { recoverExpired as recoverExpiredImpl } from "./pg-store-expiry-recovery.js"
 import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
-export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; ownerId?: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
+export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
   const safeInputResult = stripTaskGraphMetadata(input.result)
   const finalizedResult = (value: unknown, status: string): unknown => stripNonterminalDiscoveryRecovery(value, status, input.retry)
   const graphType = taskGraphEventType(input.status, input.retry)
@@ -43,10 +43,21 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
     if (exactCompletion && prepareTask) completionTasks.set(input.taskId, { ...prepareTask, status: "completed",
       attemptCount: input.attemptCount, failureReason: null, result: finalizedResult(safeInputResult, "completed") })
     const completionGraph = exactCompletion ? { ...loaded, state: graph.state, tasks: completionTasks } : null
-    const verification = completionGraph && input.ownerId ? await verifyScheduledPrepareTaskGraphEvidence(client, {
+    // finish() already authenticated the caller's owner and attempt while holding the session lock.
+    // Lock the same live task row so reference verification uses the current lease owner; claim and recovery
+    // take that session lock too, so a concurrent reclaim cannot replace it before this transaction commits.
+    const lease = completionGraph ? (await client.query<{ leaseOwner: unknown; attemptCount: unknown; leaseExpiresAt: unknown; checkedAt: unknown }>(`SELECT "leaseOwner", "attemptCount", "leaseExpiresAt", clock_timestamp() AS "checkedAt"
+      FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = $3
+        AND "leaseOwner" IS NOT NULL AND btrim("leaseOwner") <> '' AND "leaseExpiresAt" > clock_timestamp() FOR UPDATE`,
+    [input.taskId, input.sessionId, input.attemptCount])).rows[0] : undefined
+    const leaseOwner = typeof lease?.leaseOwner === "string" ? lease.leaseOwner : null
+    const leaseExpiry = dateValue(lease?.leaseExpiresAt), checkedAt = dateValue(lease?.checkedAt)
+    const ownerId = leaseOwner && leaseOwner.trim().length > 0 && Number(lease?.attemptCount) === input.attemptCount
+      && leaseExpiry && checkedAt && leaseExpiry > checkedAt ? leaseOwner : null
+    const verification = completionGraph && ownerId ? await verifyScheduledPrepareTaskGraphEvidence(client, {
       scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot,
       current: currentTaskGraph(completionGraph), tasks: completionTasks, structuredResult: plainObject(safeInputResult)?.structuredResult,
-      referenceVerificationMode: { phase: "finish", ownerId: input.ownerId },
+      referenceVerificationMode: { phase: "finish", ownerId },
       completionGraphRevision: graph.state.revision,
     }) : { verified: false as const, reasonCode: completionGraph ? "scheduled_prepare_owner_invalid" : "scheduled_prepare_graph_invalid" }
     if (verification.verified) return { graph, status: "completed", failureReason: input.failureReason,
