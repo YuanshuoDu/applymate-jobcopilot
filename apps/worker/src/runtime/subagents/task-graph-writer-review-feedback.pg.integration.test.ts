@@ -102,11 +102,15 @@ async function createFixture(): Promise<Fixture> {
 
   await testPool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "status") VALUES ($1, $2, 'running')`, [sessionId, userId])
   await testPool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "rootTaskId", "status") VALUES ($1, $2, $3, $4, 'waiting')`, [turnId, sessionId, userId, rootTaskId])
-  await testPool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "status", "context")
-    VALUES ($1, $2, $3, $1, NULL, 'running', $4::jsonb)`, [rootTaskId, sessionId, turnId, context])
-  for (const [taskId, leaseOwner] of [[writerTaskId, `owner-${writerTaskId}`], [reviewerTaskId, `owner-${reviewerTaskId}`]]) {
-    await testPool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "status", "leaseOwner", "leaseExpiresAt", "attemptCount", "interruptRequestedAt", "context")
-      VALUES ($1, $2, $3, $4, $4, 'running', $5, $6, 1, NULL, $7::jsonb)`, [taskId, sessionId, turnId, rootTaskId, leaseOwner, leaseExpiresAt, context])
+  await testPool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "role", "taskType", "status", "context")
+    VALUES ($1, $2, $3, $1, NULL, 'orchestrator', 'root', 'running', $4::jsonb)`, [rootTaskId, sessionId, turnId, context])
+  for (const [taskId, role, taskType] of [
+    [writerTaskId, "writer", "cover_letter_draft"],
+    [reviewerTaskId, "reviewer", "cover_letter_review"],
+  ] as const) {
+    const leaseOwner = `owner-${taskId}`
+    await testPool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "role", "taskType", "status", "leaseOwner", "leaseExpiresAt", "attemptCount", "interruptRequestedAt", "context")
+      VALUES ($1, $2, $3, $4, $4, $5, $6, 'running', $7, $8, 1, NULL, $9::jsonb)`, [taskId, sessionId, turnId, rootTaskId, role, taskType, leaseOwner, leaseExpiresAt, context])
   }
 
   const writerFence: AgentArtifactTaskFence = { taskId: writerTaskId, userId, sessionId, turnId, rootTaskId, parentTaskId: rootTaskId, leaseOwner: `owner-${writerTaskId}`, attemptCount: 1 }
@@ -164,10 +168,14 @@ describeWithPostgres("Writer review feedback persistence on disposable PostgreSQ
         "updated_at" timestamptz NOT NULL DEFAULT now()
       )`,
       `CREATE TABLE "agent_sessions" ("id" text PRIMARY KEY, "userId" text NOT NULL, "status" text NOT NULL, UNIQUE ("id", "userId"))`,
-      `CREATE TABLE "agent_turns" ("id" text PRIMARY KEY, "sessionId" text NOT NULL, "userId" text NOT NULL, "rootTaskId" text NOT NULL, "status" text NOT NULL)`,
+      `CREATE TABLE "agent_turns" (
+        "id" text PRIMARY KEY, "sessionId" text NOT NULL, "userId" text NOT NULL, "rootTaskId" text NOT NULL,
+        "status" text NOT NULL, "leaseOwnerId" text, "leaseVersion" integer NOT NULL DEFAULT 0, "leaseExpiresAt" timestamptz
+      )`,
       `CREATE TABLE "sub_agent_tasks" (
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "rootTaskId" text NOT NULL,
-        "parentTaskId" text, "status" text NOT NULL, "leaseOwner" text, "leaseExpiresAt" timestamptz,
+        "parentTaskId" text, "role" text NOT NULL, "taskType" text NOT NULL, "status" text NOT NULL,
+        "leaseOwner" text, "leaseExpiresAt" timestamptz,
         "attemptCount" integer NOT NULL DEFAULT 1, "interruptRequestedAt" timestamptz, "context" jsonb NOT NULL
       )`,
       `CREATE TABLE "agent_artifact" (

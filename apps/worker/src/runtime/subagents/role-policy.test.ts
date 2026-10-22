@@ -39,7 +39,7 @@ describe("subagent role policy", () => {
     expect(preflightSubagentTool("executor", mislabeled)).toMatchObject({ allowed: false, execute: false, externalWriteBlocked: true, reasonCode: "external_write_disabled" })
   })
 
-  it.each(["scout", "analyst", "writer", "reviewer", "auditor", "executor"] as const)("denies outcome summaries to the %s role", role => {
+  it.each(["scout", "analyst", "prepare", "writer", "reviewer", "auditor", "executor"] as const)("denies outcome summaries to the %s role", role => {
     const outcomes = tool("application.outcomes_summary", "read", "application")
     expect(visibleToolPolicy(role, outcomes)).toEqual({ visible: false, reason: "root_only_tool" })
     expect(visibleSubagentTools(role, [outcomes])).toEqual([])
@@ -130,6 +130,39 @@ describe("subagent role policy", () => {
       expect(visibleToolPolicy("reviewer", other).visible).toBe(false)
     }
     expect(visibleToolPolicy("writer", review).visible).toBe(false)
+  })
+
+  it("allows the exact scheduled application preparation write only to Prepare", () => {
+    const prepare = {
+      ...tool("scheduled.application.prepare", "draft_write", "resume"),
+      version: "1", capabilities: ["read", "write"] as const, idempotency: "requires_key" as const, requiredCapabilities: [],
+    }
+    expect(getSubagentRolePolicy("prepare")).toMatchObject({
+      role: "prepare", capabilities: ["read"], allowedRisks: [], allowedDomains: ["resume"], externalWritesEnabled: false,
+    })
+    expect(isHarnessSubagentRole("prepare")).toBe(true)
+    expect(visibleToolPolicy("prepare", prepare)).toEqual({ visible: true, reason: "role_allowed" })
+    expect(preflightSubagentTool("prepare", prepare)).toMatchObject({ allowed: true, execute: false, externalWriteBlocked: false })
+
+    for (const role of ["scout", "analyst", "writer", "reviewer", "auditor", "executor"] as const) {
+      expect(visibleToolPolicy(role, prepare).visible).toBe(false)
+    }
+    for (const invalid of [
+      { ...prepare, version: "2" },
+      { ...prepare, risk: "read" as const },
+      { ...prepare, domain: "application" as const },
+      { ...prepare, capabilities: ["read"] as const },
+      { ...prepare, capabilities: ["read", "write", "external_write"] as const },
+      { ...prepare, requiredCapabilities: ["read"] },
+    ]) {
+      expect(visibleToolPolicy("prepare", invalid).visible).toBe(false)
+    }
+    expect(visibleSubagentTools("prepare", [
+      prepare,
+      { ...prepare, name: "cover_letter.draft" },
+      { ...prepare, name: "artifact.review" },
+      tool("application.get_state", "read", "application"),
+    ]).map(item => item.name)).toEqual(["scheduled.application.prepare"])
   })
 
   it("keeps Reviewer actions limited to reads and the internal review receipt", () => {

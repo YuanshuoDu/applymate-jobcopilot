@@ -1,7 +1,9 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
-import { parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, TurnQuestionStoreError, type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionStore, type TurnQuestionUsageInput, type TurnQuestionWaitInput, type TurnQuestionWaitReceipt } from "./turn-question-contract.js"
+import { createTurnScheduledPrepareChoiceContent, isTurnQuestionUsage, parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, parseTurnScheduledPrepareChoiceItem, TurnQuestionStoreError,
+  type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionScheduledChoiceReadInput, type TurnQuestionScheduledChoiceRecovery,
+  type TurnQuestionStore, type TurnQuestionUsageInput, type TurnQuestionWaitInput, type TurnQuestionWaitReceipt } from "./turn-question-contract.js"
 import { admitQuestionWork, assertQuestionOwner, assertQuestionUsage, completedQuestionResult, lockQuestionStep, persistedUsage, questionConflict, questionId, questionItemId, recoverIncompleteQuestionCall, withQuestionTransaction, type TurnQuestionPool, type TurnQuestionQueryClient, type TurnQuestionStepRow } from "./turn-question-store-guards.js"
-import { appendQuestionStartedEvents, OrphanPauseUsageRecoveredError, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
+import { appendQuestionStartedEvents, appendScheduledChoiceWaitEvents, loadScheduledChoiceBinding, OrphanPauseUsageRecoveredError, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
 import { cancelPausedQuestion, hasQuestionPauseEvents, recoverPausedPartialQuestion } from "./turn-question-store-cancellation.js"
 import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
@@ -58,9 +60,66 @@ async function usageFromStep(client: TurnQuestionQueryClient, owner: TurnQuestio
   return { step, usage }
 }
 
+async function waitForScheduledChoice(pool: TurnQuestionPool, input: TurnQuestionWaitInput): Promise<TurnQuestionWaitReceipt> {
+  assertQuestionOwner(input.owner)
+  if (!input.expectedWaitId?.trim() || !Number.isFinite(input.now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Scheduled choice wait scope is invalid")
+  const usage = input.usage
+  return withQuestionTransaction(pool, input.owner, async (client, turn) => {
+    const stored = await loadScheduledChoiceBinding(client, { owner: input.owner })
+    if (stored.waitId !== input.expectedWaitId || stored.candidateFinishReason !== input.finishReason || usage === undefined || !isTurnQuestionUsage(usage) || !same(stored.candidateUsage, usage)) throw questionConflict("Worker-derived scheduled wait receipt")
+    const id = stored.waitId, itemId = questionItemId(id)
+    const found = await client.query<Row>(`SELECT "id", "stepId", "taskId", "type", "status", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [itemId, input.owner.sessionId, input.owner.turnId])
+    const row = found.rows[0]
+    if (row) {
+      const answer = parseTurnScheduledPrepareChoiceItem(row.content, row.status, stored.binding)
+      if (found.rows.length !== 1 || row.stepId !== stored.stepId || row.taskId !== input.owner.taskId || row.type !== "question" || answer === undefined) throw questionConflict(`scheduled choice item ${itemId}`)
+      await usageFromStep(client, input.owner, stored.stepId, ["waiting_for_user"])
+      if (answer === null && (turn.status !== "waiting_for_user" || row.status !== "started")
+        || answer !== null && (turn.status !== "in_progress" || row.status !== "completed")) throw questionConflict(`scheduled choice wait ${id} state`)
+      return waitReceipt(answer === null ? "waiting_for_user" : "answered", "replayed", { ...input, stepId: stored.stepId, toolCallId: null }, id, Number(turn.revision))
+    }
+    if (turn.status !== "in_progress" || stored.stepStatus !== "streaming" || !input.finishReason?.trim() || input.finishReason.length > 128) throw new TurnQuestionStoreError("question_usage_unavailable", "Scheduled choice needs the exact final model usage")
+    const inputTokens = usage?.inputTokens ?? 0, outputTokens = usage?.outputTokens ?? 0, estimatedCostUsd = usage?.estimatedCostUsd ?? 0
+    const step = await lockQuestionStep(client, input.owner, stored.stepId)
+    if (step.status !== "streaming" || step.finishReason !== null && (step.finishReason !== input.finishReason
+      || numeric(step.inputTokens) !== inputTokens || numeric(step.outputTokens) !== outputTokens
+      || numeric(step.estimatedCostUsd) !== estimatedCostUsd)) throw questionConflict(`scheduled final step ${stored.stepId} state`)
+    await admitQuestionWork(client, input.owner)
+    await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "updatedAt") VALUES ($1, $2, $3, $4, $5, 'question', 'started', 'commentary', $6::jsonb, $7, $7)`,
+    [itemId, input.owner.sessionId, input.owner.turnId, stored.stepId, input.owner.taskId, json(createTurnScheduledPrepareChoiceContent(id, stored.binding)), input.now])
+    const closed = await client.query(`UPDATE "agent_steps" SET "status" = 'waiting_for_user', "finishReason" = $1, "errorCode" = NULL, "inputTokens" = $2, "outputTokens" = $3, "estimatedCostUsd" = $4, "completedAt" = $5 WHERE "id" = $6 AND "sessionId" = $7 AND "turnId" = $8 AND "taskId" = $9 AND "attempt" = 1 AND "status" = 'streaming'`,
+    [input.finishReason, inputTokens, outputTokens, estimatedCostUsd, input.now, stored.stepId, input.owner.sessionId, input.owner.turnId, input.owner.taskId])
+    if (closed.rowCount !== 1) throw questionConflict(`scheduled final step ${stored.stepId} close`)
+    const updated = await client.query<{ revision: number | string }>(`UPDATE "agent_turns" SET "status" = 'waiting_for_user', "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = $1 WHERE "id" = $2 AND "sessionId" = $3 AND "userId" = $4 AND "leaseOwnerId" = $5 AND "leaseVersion" = $6 AND "leaseExpiresAt" > CURRENT_TIMESTAMP AND "status" = 'in_progress' RETURNING "revision"`,
+    [input.now, input.owner.turnId, input.owner.sessionId, input.owner.userId, input.owner.ownerId, input.owner.leaseVersion])
+    if (updated.rowCount !== 1 || !updated.rows[0]) throw questionConflict(`Turn ${input.owner.turnId} scheduled choice wait`)
+    await appendScheduledChoiceWaitEvents(client, { owner: input.owner, stepId: stored.stepId, itemId, waitId: id })
+    return waitReceipt("waiting_for_user", "created", { ...input, stepId: stored.stepId, toolCallId: null }, id, Number(updated.rows[0].revision))
+  })
+}
+
+async function readScheduledPrepareChoice(pool: TurnQuestionPool, input: TurnQuestionScheduledChoiceReadInput): Promise<TurnQuestionScheduledChoiceRecovery> {
+  assertQuestionOwner(input.owner)
+  if (!Number.isFinite(input.now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Scheduled choice recovery time is invalid")
+  return withQuestionTransaction(pool, input.owner, async (client, turn) => {
+    const stored = await loadScheduledChoiceBinding(client, { owner: input.owner, expectedReceipt: input.receipt }), itemId = questionItemId(stored.waitId)
+    const found = await client.query<Row>(`SELECT "id", "stepId", "taskId", "type", "status", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR SHARE`, [itemId, input.owner.sessionId, input.owner.turnId])
+    if (!found.rows.length) return { status: "none" }
+    const row = found.rows[0], answer = parseTurnScheduledPrepareChoiceItem(row?.content, row?.status, stored.binding)
+    if (found.rows.length !== 1 || row?.stepId !== stored.stepId || row.taskId !== input.owner.taskId || row.type !== "question" || answer === undefined) throw questionConflict(`scheduled choice answer ${itemId}`)
+    const stepStatuses = answer === null ? ["waiting_for_user"] : ["waiting_for_user", "streaming"]
+    await usageFromStep(client, input.owner, stored.stepId, stepStatuses)
+    if (answer === null && (turn.status !== "waiting_for_user" || row.status !== "started")) throw questionConflict(`scheduled choice ${stored.waitId} waiting state`)
+    if (answer !== null && (turn.status !== "in_progress" || row.status !== "completed")) throw questionConflict(`scheduled choice ${stored.waitId} answer state`)
+    return answer === null ? { status: "waiting", waitId: stored.waitId, itemId, binding: stored.binding }
+      : { status: "answered", waitId: stored.waitId, itemId, answer, binding: stored.binding }
+  })
+}
+
 export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionStore {
   return {
     cancelPausedQuestion: input => cancelPausedQuestion(pool, input),
+    readScheduledPrepareChoice: input => readScheduledPrepareChoice(pool, input),
     async stageQuestionUsage(input: TurnQuestionUsageInput): Promise<void> {
       validUsage(input)
       await withQuestionTransaction(pool, input.owner, async (client, turn) => {
@@ -88,13 +147,16 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
     },
     async waitForQuestion(input: TurnQuestionWaitInput): Promise<TurnQuestionWaitReceipt> {
       assertQuestionOwner(input.owner)
-      if (!input.stepId.trim() || !input.toolCallId.trim() || !Number.isFinite(input.now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Question call scope is invalid")
+      const toolCallId = input.toolCallId
+      if (toolCallId === null) return waitForScheduledChoice(pool, input)
+      if (!input.stepId.trim() || !toolCallId.trim() || !Number.isFinite(input.now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Question call scope is invalid")
+      const questionInput = { ...input, toolCallId }
       return withQuestionTransaction(pool, input.owner, async (client, turn) => {
-        const receipt = await completedQuestionResult(client, input.owner, input.stepId, input.toolCallId)
-        const id = questionId(input.owner, input.stepId, input.toolCallId)
-        const existing = await readQuestionItem(client, input, id, receipt.intent)
+        const receipt = await completedQuestionResult(client, input.owner, input.stepId, toolCallId)
+        const id = questionId(input.owner, input.stepId, toolCallId)
+        const existing = await readQuestionItem(client, questionInput, id, receipt.intent)
         const planningOwner = { userId: input.owner.userId, sessionId: input.owner.sessionId, turnId: input.owner.turnId, rootTaskId: input.owner.rootTaskId }
-        const planningWait = { stepId: input.stepId, toolCallId: input.toolCallId, waitId: id, questionItemId: questionItemId(id) }
+        const planningWait = { stepId: input.stepId, toolCallId, waitId: id, questionItemId: questionItemId(id) }
         if (existing) await readTurnQuestionPlanningWait(client, planningOwner, planningWait)
         if (existing?.status === "closed") {
           await usageFromStep(client, input.owner, input.stepId, ["waiting_for_user", "failed", "interrupted"])
@@ -118,7 +180,7 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
         const itemId = questionItemId(id)
         await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "updatedAt")
           VALUES ($1, $2, $3, $4, $5, 'question', 'started', 'commentary', $6::jsonb, $7, $7)`,
-        [itemId, input.owner.sessionId, input.owner.turnId, input.stepId, input.owner.taskId, json(waitContent(id, input.toolCallId, receipt.intent)), input.now])
+        [itemId, input.owner.sessionId, input.owner.turnId, input.stepId, input.owner.taskId, json(waitContent(id, toolCallId, receipt.intent)), input.now])
         const closed = await client.query(`UPDATE "agent_steps" SET "status" = 'waiting_for_user', "finishReason" = $1, "inputTokens" = $2,
           "outputTokens" = $3, "estimatedCostUsd" = $4, "completedAt" = $5 WHERE "id" = $6 AND "sessionId" = $7 AND "turnId" = $8 AND "taskId" = $9 AND "attempt" = 1 AND "status" = 'streaming'`,
         [step.finishReason, usage.inputTokens, usage.outputTokens, usage.estimatedCostUsd, input.now, input.stepId, input.owner.sessionId, input.owner.turnId, input.owner.taskId])
@@ -130,9 +192,9 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
         if (updated.rowCount !== 1 || !updated.rows[0]) throw questionConflict(`Turn ${input.owner.turnId} wait state`)
         const calls = await client.query<{ count: string | number }>(`SELECT COUNT(*) AS "count" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "stepId" = $3 AND "taskId" = $4 AND "type" = 'tool_call'`,
           [input.owner.sessionId, input.owner.turnId, input.stepId, input.owner.taskId])
-        await appendQuestionStartedEvents(client, { owner: input.owner, stepId: input.stepId, itemId, questionId: id, toolCallId: input.toolCallId, toolCallCount: Number(calls.rows[0]?.count ?? 0) })
+        await appendQuestionStartedEvents(client, { owner: input.owner, stepId: input.stepId, itemId, questionId: id, toolCallId, toolCallCount: Number(calls.rows[0]?.count ?? 0) })
         if (planningObservation) await appendTurnQuestionPlanningObservation(client, planningObservation, input.owner.userId)
-        return waitReceipt("waiting_for_user", "created", input, id, Number(updated.rows[0].revision))
+        return waitReceipt("waiting_for_user", "created", questionInput, id, Number(updated.rows[0].revision))
       })
     },
     async readPendingQuestion(input): Promise<TurnQuestionRecovery> {

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 
@@ -8,6 +8,8 @@ import { TurnEngine } from "./turn-engine.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { claimTurnLease } from "./lease.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
+import { createTurnScheduledPrepareChoiceContent, scheduledAnalyzeCheckpointEvidence, turnScheduledPrepareChoiceWaitId } from "./turn-question-contract.js"
+import { buildScheduledTaskGraphContinuationReceipt } from "../subagents/scheduled-taskgraph-continuation-receipt.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnQuestionPool } from "./turn-question-store-guards.js"
 import type { TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
@@ -35,6 +37,8 @@ const ids = { user: `question-user-${suffix}`, session: `question-session-${suff
 const pausedIds = { session: `question-paused-session-${suffix}`, turn: `question-paused-turn-${suffix}`, root: `question-paused-root-${suffix}`, step: `question-paused-step-${suffix}`, call: `question-paused-call-${suffix}`, item: `question-paused-item-${suffix}` }
 const orphanIds = { session: `question-orphan-session-${suffix}`, turn: `question-orphan-turn-${suffix}`, root: `question-orphan-root-${suffix}`, step: `question-orphan-step-${suffix}` }
 const recoveryIds = { session: `question-recovery-session-${suffix}`, turn: `question-recovery-turn-${suffix}`, root: `question-recovery-root-${suffix}`, step: `question-recovery-step-${suffix}`, call: `question-recovery-call-${suffix}`, item: `question-recovery-item-${suffix}` }
+const scheduledIds = { session: `question-scheduled-session-${suffix}`, turn: `question-scheduled-turn-${suffix}`, root: `question-scheduled-root-${suffix}`,
+  step: `question-scheduled-step-${suffix}`, execution: `question-scheduled-execution-${suffix}` }
 const owner: TurnExecutionOwnerFence = {
   kind: "turn", userId: ids.user, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, rootTaskId: ids.root,
   ownerId: `question-lease-${suffix}`, leaseVersion: 1, leaseExpiresAt: new Date(Date.now() + 5 * 60_000),
@@ -45,10 +49,36 @@ const orphanOwner: TurnExecutionOwnerFence = { ...owner, sessionId: orphanIds.se
   ownerId: `question-orphan-lease-${suffix}` }
 const recoveryOwner: TurnExecutionOwnerFence = { ...owner, sessionId: recoveryIds.session, turnId: recoveryIds.turn, taskId: recoveryIds.root, rootTaskId: recoveryIds.root,
   ownerId: `question-recovery-lease-${suffix}` }
+const scheduledTurnOwner: TurnExecutionOwnerFence = { ...owner, sessionId: scheduledIds.session, turnId: scheduledIds.turn,
+  taskId: scheduledIds.root, rootTaskId: scheduledIds.root, ownerId: `question-scheduled-lease-${suffix}` }
 const intent: TurnQuestionIntentEnvelope = {
   schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
   question: "Which region should I prioritize?", options: [{ label: "Berlin", value: "berlin" }],
 }
+const scheduledSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"], targetLocations: ["Dublin"],
+  minScore: 70, dailyCap: 10, requireApproval: true, autoApply: false }
+const scheduledSnapshotDigest = `sha256:${createHash("sha256").update(JSON.stringify([scheduledSnapshot.schemaVersion, scheduledSnapshot.targetRoles,
+  scheduledSnapshot.targetLocations, scheduledSnapshot.minScore, scheduledSnapshot.dailyCap, scheduledSnapshot.requireApproval, scheduledSnapshot.autoApply]), "utf8").digest("hex")}`
+const scheduledContinuationOwner = { userId: ids.user, sessionId: scheduledIds.session, turnId: scheduledIds.turn, rootTaskId: scheduledIds.root,
+  rootAttemptCount: 1, turnLeaseOwnerId: scheduledTurnOwner.ownerId, turnLeaseVersion: scheduledTurnOwner.leaseVersion,
+  executionId: scheduledIds.execution, executionAttemptCount: 1 }
+const scheduledContinuationKey = `scheduled-taskgraph:sha256:${"a".repeat(64)}`
+const scheduledAnalyzeCheckpoint = { nextStage: "prepare", scoutedJobs: [{ id: "scheduled-job-1", userId: ids.user }],
+  scoredJobs: [{ job: { id: "scheduled-job-1", userId: ids.user }, score: 80, matchedKeywords: ["TypeScript"], missingKeywords: [],
+    recommendation: "Apply after tailoring." }], analysisFailed: 0,
+  scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: scheduledContinuationKey,
+    owner: scheduledContinuationOwner, snapshotDigest: scheduledSnapshotDigest, graphRevision: 3, evidenceDigest: "b".repeat(64) } }
+const scheduledAnalyzeEvidence = scheduledAnalyzeCheckpointEvidence(scheduledAnalyzeCheckpoint)!
+const scheduledReceipt = buildScheduledTaskGraphContinuationReceipt({ owner: scheduledContinuationOwner,
+  continuationKey: scheduledAnalyzeEvidence.continuationKey, snapshotDigest: scheduledSnapshotDigest,
+  evidenceDigest: "b".repeat(64), checkpointDigest: scheduledAnalyzeEvidence.checkpointDigest, analyzeGraphRevision: 3, prepareScheduleRevision: 4 })!
+const scheduledWaitBinding = { schemaVersion: "agent-harness.v2.scheduled-prepare-choice-wait.v1", owner: {
+  userId: ids.user, sessionId: scheduledIds.session, turnId: scheduledIds.turn, rootTaskId: scheduledIds.root,
+  rootAttemptCount: 1, executionId: scheduledIds.execution, executionAttemptCount: 1 }, continuationKey: scheduledReceipt.continuationKey,
+  snapshotDigest: scheduledReceipt.snapshotDigest, evidenceDigest: scheduledReceipt.evidenceDigest, checkpointDigest: scheduledReceipt.checkpointDigest,
+  analyzeGraphRevision: scheduledReceipt.analyzeGraphRevision, prepareScheduleRevision: scheduledReceipt.prepareScheduleRevision,
+  finalStepId: scheduledIds.step, finalStepOrdinal: 1, finalStepAttempt: 1 } as const
+const scheduledWaitId = turnScheduledPrepareChoiceWaitId(scheduledWaitBinding)!
 
 async function seed(pool: PgPool): Promise<void> {
   await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.user, `${ids.user}@example.invalid`])
@@ -76,6 +106,48 @@ async function seed(pool: PgPool): Promise<void> {
   await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', 'commentary', $6::jsonb, CURRENT_TIMESTAMP, NULL, CURRENT_TIMESTAMP)` ,
   [`question-call-item-${suffix}`, ids.session, ids.turn, ids.step, ids.root, JSON.stringify({ toolCallId: callId, toolName: "agent.ask_user", toolVersion: "1", input: { question: intent.question, choices: intent.options } })])
+}
+
+async function seedScheduledChoice(pool: PgPool): Promise<void> {
+  const leaseExpiresAt = new Date(Date.now() + 5 * 60_000)
+  await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+    VALUES ($1, $2, 'scheduled Prepare choice integration', 'running', 'automation', CURRENT_TIMESTAMP)`, [scheduledIds.session, ids.user])
+  await pool.query(`INSERT INTO "agent_turns"
+    ("id", "sessionId", "userId", "status", "source", "executionMode", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+     "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+    VALUES ($1, $2, $3, 'in_progress', 'automation', 'canonical_task_graph', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, NULL,
+      $5, $6, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
+  [scheduledIds.turn, scheduledIds.session, ids.user, JSON.stringify({ automationRunMode: "scheduled", scheduledAutomationSnapshot: scheduledSnapshot }),
+    scheduledTurnOwner.ownerId, leaseExpiresAt])
+  await pool.query(`INSERT INTO "sub_agent_tasks"
+    ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+     "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+    VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'scheduled Prepare choice integration',
+      '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+      1, 1, $4, $5, CURRENT_TIMESTAMP)`, [scheduledIds.root, scheduledIds.session, scheduledIds.turn, scheduledTurnOwner.ownerId, leaseExpiresAt])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [scheduledIds.root])
+  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [scheduledIds.root, scheduledIds.turn])
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds",
+     "modelProfileSnapshot", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "startedAt")
+    VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, NULL, 0, 0, 0, CURRENT_TIMESTAMP)`,
+  [scheduledIds.step, scheduledIds.session, scheduledIds.turn, scheduledIds.root])
+  await pool.query(`INSERT INTO "agent_executions" ("id", "userId", "sessionId", "status", "checkpoint", "state", "attemptCount", "startedAt", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, 'running', 'execute', $4::jsonb, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [scheduledIds.execution, ids.user, scheduledIds.session, JSON.stringify(scheduledAnalyzeCheckpoint)])
+  const candidate = { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v2", sessionId: scheduledIds.session, turnId: scheduledIds.turn,
+    rootTaskId: scheduledIds.root, rootAttemptCount: 1, finalStepId: scheduledIds.step, finalStepOrdinal: 1, stepAttempt: 1, candidateText: "verified candidate",
+    finishReason: "stop", usage: { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 } }
+  await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+    VALUES ($1, $2, $3, NULL, $4, 1, 'native_verification.scheduled_candidate_staged', 'orchestrator', $5, NULL, $6, $7::jsonb)`,
+  [`scheduled-candidate-event-${suffix}`, scheduledIds.session, scheduledIds.turn, scheduledIds.root, scheduledIds.step,
+    `scheduled-candidate:${scheduledIds.root}:1:${scheduledIds.step}`, JSON.stringify(candidate)])
+  await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+    VALUES ($1, $2, $3, NULL, NULL, 2, 'agent.plan.scheduled_prepare_binding', 'system', $4, NULL, $5, $6::jsonb)`,
+  [`scheduled-prepare-event-${suffix}`, scheduledIds.session, scheduledIds.turn, scheduledIds.step,
+    `scheduled-prepare:${"d".repeat(64)}`, JSON.stringify(scheduledReceipt)])
+  await pool.query(`UPDATE "agent_sessions" SET "eventSequence" = 2 WHERE "id" = $1`, [scheduledIds.session])
 }
 
 async function seedPausedCase(pool: PgPool): Promise<void> {
@@ -231,7 +303,9 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
     admin = new PgPool({ connectionString: databaseUrl!, max: 2 })
     await admin.query(`CREATE ROLE "${role}" NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS`)
     await admin.query(`GRANT USAGE ON SCHEMA public TO "${role}"`)
-    await admin.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox" TO "${role}"`)
+    await admin.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "agent_executions", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("id") ON "sub_agent_tasks" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("id") ON "agent_executions" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "revision", "completedAt", "updatedAt") ON "agent_turns" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "errorCode", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "completedAt") ON "agent_steps" TO "${role}"`)
@@ -246,7 +320,7 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
   afterAll(async () => {
     await writer?.end()
     if (!admin) return
-    await admin.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [[ids.session, pausedIds.session, orphanIds.session, recoveryIds.session]])
+    await admin.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [[ids.session, pausedIds.session, orphanIds.session, recoveryIds.session, scheduledIds.session]])
     await admin.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.user])
     await admin.query(`DROP OWNED BY "${role}"`)
     await admin.query(`DROP ROLE "${role}"`)
@@ -446,5 +520,73 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
           { id: `agent-question:${question.rows[0]!.id}:answer`, content: { role: "user", type: "answer", questionId: receipts[0]!.waitId, text: "berlin" } },
         ])
     } finally { historyClient.release() }
+  }, 30_000)
+
+  it("persists and replays a scheduled Prepare fixed-choice wait only for its exact owner and continuation", async () => {
+    await seedScheduledChoice(admin!)
+    const now = new Date()
+    const input = { owner: scheduledTurnOwner, stepId: scheduledIds.step, toolCallId: null, expectedWaitId: scheduledWaitId,
+      finishReason: "stop", usage: { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 }, now }
+    const receipts = await Promise.all([store.waitForQuestion(input), store.waitForQuestion(input)])
+    expect(receipts.map(value => value.disposition).sort()).toEqual(["created", "replayed"])
+    expect(receipts[0]?.waitId).toBe(receipts[1]?.waitId)
+    const created = receipts.find(value => value.disposition === "created")!
+    const replayed = receipts.find(value => value.disposition === "replayed")!
+    expect(created).toMatchObject({ status: "waiting_for_user", disposition: "created", waitId: scheduledWaitId,
+      itemId: `agent-wait:question:${scheduledWaitId}`, turnId: scheduledIds.turn, toolCallId: null, nextTurnRevision: 1 })
+    expect(replayed).toEqual({ ...created, disposition: "replayed" })
+    const persisted = await admin!.query<{ turnStatus: string; revision: number; stepStatus: string; finishReason: string;
+      inputTokens: number; outputTokens: number; cost: string; questionCount: string; eventTypes: string[];
+      content: Record<string, unknown> }>(
+      `SELECT turn."status" AS "turnStatus", turn."revision", step."status" AS "stepStatus", step."finishReason",
+        step."inputTokens", step."outputTokens", step."estimatedCostUsd" AS "cost",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question') AS "questionCount",
+        ARRAY(SELECT "type" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence") AS "eventTypes",
+        question."content"
+       FROM "agent_turns" AS turn JOIN "agent_steps" AS step ON step."turnId" = turn."id"
+       JOIN "agent_items" AS question ON question."turnId" = turn."id" AND question."stepId" = step."id" AND question."type" = 'question'
+       WHERE turn."id" = $2 AND step."id" = $3 AND question."id" = $4`,
+      [scheduledIds.session, scheduledIds.turn, scheduledIds.step, created.itemId])
+    expect(persisted.rows).toHaveLength(1)
+    expect(persisted.rows[0]).toMatchObject({ turnStatus: "waiting_for_user", revision: 1, stepStatus: "waiting_for_user",
+      finishReason: "stop", inputTokens: 37, outputTokens: 9, questionCount: "1",
+      eventTypes: ["native_verification.scheduled_candidate_staged", "agent.plan.scheduled_prepare_binding", "step.completed", "item.started"],
+      content: createTurnScheduledPrepareChoiceContent(scheduledWaitId, scheduledWaitBinding) })
+    expect(Number(persisted.rows[0]?.cost)).toBeCloseTo(0.018)
+
+    await expect(store.readScheduledPrepareChoice({ owner: scheduledTurnOwner, receipt: scheduledReceipt, now: new Date() }))
+      .resolves.toEqual({ status: "waiting", waitId: scheduledWaitId, itemId: created.itemId, binding: scheduledWaitBinding })
+    await expect(store.readScheduledPrepareChoice({ owner: scheduledTurnOwner,
+      receipt: { ...scheduledReceipt, checkpointDigest: "e".repeat(64) }, now: new Date() }))
+      .rejects.toMatchObject({ code: "question_conflict" })
+    await expect(store.readScheduledPrepareChoice({ owner: { ...scheduledTurnOwner, sessionId: `foreign-${scheduledIds.session}` },
+      receipt: scheduledReceipt, now: new Date() })).rejects.toMatchObject({ code: "question_not_current" })
+
+    const answerClient = await admin!.connect()
+    try {
+      await answerClient.query("BEGIN")
+      const answeredItem = await answerClient.query(`UPDATE "agent_items" SET "status" = 'completed',
+        "content" = jsonb_set(jsonb_set(jsonb_set("content", '{answer}', '"keep_resume"'::jsonb), '{answerAvailable}', 'true'::jsonb),
+          '{answeredAt}', to_jsonb($2::text)),
+        "revision" = "revision" + 1, "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $1 AND "status" = 'started'`, [created.itemId, "2026-10-21T10:00:00.000Z"])
+      expect(answeredItem.rowCount).toBe(1)
+      const answeredTurn = await answerClient.query(`UPDATE "agent_turns" SET "status" = 'in_progress', "revision" = "revision" + 1,
+        "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "status" = 'waiting_for_user' AND "revision" = $2`,
+      [scheduledIds.turn, created.nextTurnRevision])
+      expect(answeredTurn.rowCount).toBe(1)
+      await answerClient.query("COMMIT")
+    } catch (error) {
+      await answerClient.query("ROLLBACK").catch(() => undefined)
+      throw error
+    } finally { answerClient.release() }
+    await expect(store.readScheduledPrepareChoice({ owner: scheduledTurnOwner, receipt: scheduledReceipt, now: new Date() }))
+      .resolves.toEqual({ status: "answered", waitId: scheduledWaitId, itemId: created.itemId,
+        answer: "keep_resume", binding: scheduledWaitBinding })
+
+    await admin!.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{scheduledPrepareChoiceBinding,continuationKey}', to_jsonb($2::text))
+      WHERE "id" = $1`, [created.itemId, `scheduled-taskgraph:sha256:${"f".repeat(64)}`])
+    await expect(store.readScheduledPrepareChoice({ owner: scheduledTurnOwner, receipt: scheduledReceipt, now: new Date() }))
+      .rejects.toMatchObject({ code: "question_conflict" })
   }, 30_000)
 })

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { postScheduledPipelineContinuation } from "./scheduled-pipeline-handoff.js"
+import { postScheduledPipelineContinuation, scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 
 const owner: ScheduledAutomationPipelineBridgeScope = {
@@ -18,6 +18,11 @@ const attestation: ScheduledAutomationPipelineAttestation = {
 const input = { owner, attestation }
 const report = { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 7 }
 const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status })
+const analyzeProof = (handoffOwner = owner) => {
+  const executionId = "execution-1", executionAttemptCount = 4
+  return { status: "analyze_checkpointed", continuationKey: scheduledTaskGraphContinuationKey(handoffOwner, attestation, executionId, executionAttemptCount),
+    checkpointDigest: "b".repeat(64), claimTokenDigest: `sha256:${"c".repeat(64)}`, executionId, executionAttemptCount }
+}
 
 beforeEach(() => {
   vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
@@ -35,6 +40,57 @@ describe("scheduled pipeline HTTP handoff", () => {
     expect(new Headers(init?.headers).get("x-agent-worker-secret")).toBe("worker-secret-canary")
     expect(JSON.parse(String(init?.body))).toEqual(input)
     expect(String(init?.body)).not.toContain("worker-secret-canary")
+  })
+
+  it("supports configured non-loopback HTTP handoffs", async () => {
+    vi.stubEnv("AGENT_WEB_URL", "http://applymate.example")
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report }))
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal, fetcher)).resolves.toEqual({ status: "completed" })
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("x-agent-worker-secret")).toBe("worker-secret-canary")
+  })
+
+  it.each(["localhost", "127.0.0.1", "[::1]"])("allows explicit loopback HTTP development host %s", async host => {
+    vi.stubEnv("AGENT_WEB_URL", `http://${host}`)
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report }))
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal, fetcher)).resolves.toEqual({ status: "completed" })
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("x-agent-worker-secret")).toBe("worker-secret-canary")
+  })
+
+  it("returns an owner-bound Analyze checkpoint proof exactly on repeated handoffs", async () => {
+    const proof = analyzeProof()
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, proof))
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal, fetcher))
+      .resolves.toEqual({ status: "analyze_checkpointed", proof })
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal, fetcher))
+      .resolves.toEqual({ status: "analyze_checkpointed", proof })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it("preserves the Analyze continuation identity when a new Worker lease reclaims the Turn", async () => {
+    const reboundOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: owner.turnLeaseVersion + 1 }
+    const proof = analyzeProof(reboundOwner)
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, proof))
+    expect(scheduledTaskGraphContinuationKey(owner, attestation, proof.executionId, proof.executionAttemptCount))
+      .toBe(scheduledTaskGraphContinuationKey(reboundOwner, attestation, proof.executionId, proof.executionAttemptCount))
+    await expect(postScheduledPipelineContinuation({ owner: reboundOwner, attestation }, new AbortController().signal, fetcher))
+      .resolves.toEqual({ status: "analyze_checkpointed", proof })
+  })
+
+  it.each([
+    (proof: ReturnType<typeof analyzeProof>) => ({ ...proof, continuationKey: `scheduled-taskgraph:sha256:${"c".repeat(64)}` }),
+    (proof: ReturnType<typeof analyzeProof>) => ({ ...proof, checkpointDigest: "not-a-digest" }),
+    (proof: ReturnType<typeof analyzeProof>) => ({ ...proof, claimTokenDigest: "not-a-digest" }),
+    (proof: ReturnType<typeof analyzeProof>) => ({ ...proof, executionAttemptCount: -1 }),
+    (proof: ReturnType<typeof analyzeProof>) => ({ ...proof, extra: true }),
+    (proof: ReturnType<typeof analyzeProof>) => { const { claimTokenDigest: _ignored, ...rest } = proof; return rest },
+    (proof: ReturnType<typeof analyzeProof>) => { const { executionId: _ignored, ...rest } = proof; return rest },
+  ])("blocks an invalid Analyze checkpoint proof", async mutate => {
+    const proof = mutate(analyzeProof())
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(200, proof))))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_analyze_checkpoint_invalid" })
   })
 
   it.each([
@@ -62,12 +118,38 @@ describe("scheduled pipeline HTTP handoff", () => {
   it("returns a typed durable wait only for a valid waiting receipt", async () => {
     await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
       vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "question-123", stage: "analysis" }))))
-      .resolves.toEqual({ status: "waiting_for_user", waitId: "question-123" })
+      .resolves.toEqual({ status: "waiting_for_user", waitId: "question-123", waitKind: "external" })
     for (const waitId of ["", " question-123", "x".repeat(257), 42]) {
       await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
         vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId }))))
         .rejects.toThrow("scheduled_pipeline_handoff_in_progress")
     }
+  })
+
+  it("keeps the Web wait ID distinct from the echoed scheduled Prepare wait ID", async () => {
+    const scheduledWaitId = "scheduled-choice-456"
+    const preparedInput = { ...input, prepareProof: { proof: "opaque" }, scheduledWaitId }
+    await expect(postScheduledPipelineContinuation(preparedInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "web-gate-wait-123", scheduledWaitId }))))
+      .resolves.toEqual({ status: "waiting_for_user", waitId: "web-gate-wait-123", waitKind: "scheduled_prepare", scheduledWaitId })
+  })
+
+  it("allows a Gate wait without a Worker choice ID when the scheduled snapshot disables the choice", async () => {
+    const preparedInput = { ...input, prepareProof: { proof: "opaque" } }
+    await expect(postScheduledPipelineContinuation(preparedInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "web-gate-wait-123" }))))
+      .resolves.toEqual({ status: "waiting_for_user", waitId: "web-gate-wait-123", waitKind: "external" })
+    await expect(postScheduledPipelineContinuation(preparedInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "web-gate-wait-123", scheduledWaitId: "unexpected" }))))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_wait_identity_mismatch" })
+  })
+
+  it.each(["different-scheduled-choice", undefined])("rejects a missing or mismatched scheduled wait echo (%s)", async echoedScheduledWaitId => {
+    const scheduledWaitId = "scheduled-choice-456"
+    const preparedInput = { ...input, prepareProof: { proof: "opaque" }, scheduledWaitId }
+    await expect(postScheduledPipelineContinuation(preparedInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "web-gate-wait-123", scheduledWaitId: echoedScheduledWaitId }))))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_wait_identity_mismatch" })
   })
 
   it("keeps malformed responses and network errors retryable", async () => {

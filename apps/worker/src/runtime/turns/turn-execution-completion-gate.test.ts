@@ -51,6 +51,33 @@ describe("assertCompletionAllowed", () => {
     expect(continuation).toHaveBeenCalledWith(expect.objectContaining({ candidateText: " exact answer ", stepId: step.id }))
   })
 
+  it("maps a scheduled dependency wait to the existing TurnEngine wait receipt", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    const continuation = vi.fn(async input => ({ status: "waiting_for_dependency" as const, waitId: "dependency-123", candidateText: input.candidateText }))
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = continuation
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, " exact answer "))
+      .resolves.toEqual({ waitId: "dependency-123" })
+    expect(continuation).toHaveBeenCalledWith(expect.objectContaining({ candidateText: " exact answer ", stepId: step.id }))
+  })
+
+  it("keeps a Web gate wait distinct from the Worker scheduled choice ID", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "waiting_for_external_user",
+      externalWaitId: "web-gate-question", scheduledWaitId: "worker-choice-question", candidateText: input.candidateText })
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "exact answer"))
+      .resolves.toEqual({ externalWaitId: "web-gate-question", scheduledWaitId: "worker-choice-question" })
+  })
+
+  it("rejects a scheduled dependency wait that changes the final candidate", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async () => ({ status: "waiting_for_dependency", waitId: "dependency-123", candidateText: "changed answer" })
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "exact answer"))
+      .rejects.toMatchObject({ code: "invalid_output", message: "Scheduled pipeline completion changed the final candidate" })
+  })
+
   it("does not invoke scheduled continuation after an ordinary denial", async () => {
     const completionGate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Children still run" })
     const continuation = vi.fn(async () => ({ status: "completed" as const, candidateText: "answer" }))

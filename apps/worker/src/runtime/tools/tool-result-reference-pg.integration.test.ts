@@ -1,10 +1,14 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
+import { canonicalJson } from "@jobcopilot/shared"
 
 import type { TurnLease } from "../turns/lease.js"
-import { createToolResultReferenceRepository } from "./tool-result-reference-repo.js"
-import type { PutToolResultInput, ToolResultReferenceRepository } from "./tool-result-reference-types.js"
+import type { SubagentLease } from "../subagents/types.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { verifyScheduledPrepareToolResultReference } from "../subagents/scheduled-prepare-tool-result-verification.js"
+import { createToolResultReferenceRepository, isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
+import { MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES, prepareToolResultJson, type CanonicalToolSourceName, type PutToolResultInput, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RUNTIME_ROLE = "agent_runtime_p1_test"
@@ -64,6 +68,40 @@ function fixture(label: string): OwnerFixture {
   return { userId, sessionId, turnId, rootTaskId, stepId, owner: { kind: "turn", taskId: rootTaskId, lease } }
 }
 
+type ScheduledPrepareFixture = {
+  readonly root: OwnerFixture
+  readonly taskId: string
+  readonly stepId: string
+  readonly attemptCount: number
+  readonly owner: { readonly kind: "task"; readonly lease: SubagentLease }
+}
+
+function scheduledPrepareFixture(root: OwnerFixture): ScheduledPrepareFixture {
+  const taskId = `subagent-${randomUUID()}`, stepId = `p1-prepare-step-${randomUUID()}`, attemptCount = 2
+  const ownerId = root.owner.lease.ownerId
+  const lease: SubagentLease = {
+    id: taskId, userId: root.userId, sessionId: root.sessionId, turnId: root.turnId, rootTaskId: root.rootTaskId,
+    parentTaskId: root.rootTaskId, path: `/root/${taskId}`, depth: 1, role: "prepare", taskType: "scheduled_application_prepare",
+    status: "running", goal: "Prepare scheduled materials", constraints: [], successCriteria: [], allowedActions: ["scheduled.application.prepare"],
+    context: {}, expectedOutputSchema: {}, result: null, failureReason: null, attemptCount, maxAttempts: 3, leaseOwner: ownerId,
+    leaseExpiresAt: root.owner.lease.leaseExpiresAt, interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId,
+    signal: new AbortController().signal,
+  }
+  return { root, taskId, stepId, attemptCount, owner: { kind: "task", lease } }
+}
+
+function largePrepareReceipt(taskId: string, attemptCount: number) {
+  const jobs = Array.from({ length: 50 }, (_, index) => ({ jobId: `c${index.toString(36).padStart(24, "0")}`, status: "prepared" as const }))
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" as const, status: "completed" as const, taskId, attemptCount,
+    snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs,
+    materials: jobs.map((job, index) => ({ jobId: job.jobId, kind: "resume" as const, artifactRef: {
+      artifactId: `scheduled-draft:${index.toString(16).padStart(64, "0")}`, version: 1,
+      contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+    } })),
+  }
+}
+
 async function seedOwner(pool: PgPool, value: OwnerFixture): Promise<void> {
   await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [
     value.userId, `${value.userId}@example.invalid`,
@@ -100,6 +138,29 @@ async function seedToolCall(pool: PgPool, owner: OwnerFixture, toolCallId: strin
   ])
 }
 
+async function seedScheduledPrepareTask(pool: PgPool, value: ScheduledPrepareFixture): Promise<void> {
+  const lease = value.owner.lease
+  await pool.query(`INSERT INTO "sub_agent_tasks"
+    ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+     "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, $4, $5, 1, 'prepare', 'scheduled_application_prepare', 'running', 'Prepare fixture',
+      '[]'::jsonb, '[]'::jsonb, $6::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+      $7, 3, $8, $9, CURRENT_TIMESTAMP)`, [value.taskId, value.root.sessionId, value.root.turnId,
+    value.root.rootTaskId, lease.path, JSON.stringify(lease.allowedActions), value.attemptCount, lease.ownerId, lease.leaseExpiresAt])
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 1, $5, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [value.stepId, value.root.sessionId, value.root.turnId, value.taskId, value.attemptCount])
+}
+
+async function seedScheduledPrepareToolCall(pool: PgPool, value: ScheduledPrepareFixture, toolCallId: string): Promise<void> {
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', $6::jsonb, CURRENT_TIMESTAMP)`, [
+    `p1-prepare-call-${randomUUID()}`, value.root.sessionId, value.root.turnId, value.stepId, value.taskId,
+    JSON.stringify({ toolCallId, toolName: "scheduled.application.prepare", toolVersion: "1", status: "completed", errorCode: null, input: {} }),
+  ])
+}
+
 async function setRuntimeRole(client: PoolClient): Promise<void> {
   await client.query(`SET ROLE "${RUNTIME_ROLE}"`)
 }
@@ -124,6 +185,8 @@ function runtimePool(adminPool: PgPool, backendPids: number[]): Pick<PgPool, "co
 describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", () => {
   const ownerA = fixture("owner-a")
   const ownerB = fixture("owner-b")
+  const ownerC = fixture("prepare-restart")
+  const scheduledPrepare = scheduledPrepareFixture(ownerC)
   let adminPool: PgPool | undefined
   let writerPool: PgPool | undefined
   let readerPool: PgPool | undefined
@@ -158,7 +221,7 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
     await writerPool?.end()
     await readerPool?.end()
     if (adminPool) {
-      await adminPool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[ownerA.userId, ownerB.userId]])
+      await adminPool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[ownerA.userId, ownerB.userId, ownerC.userId]])
       await adminPool.end()
     }
   })
@@ -232,5 +295,146 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
     expect(writerBackendPids[0]).toBeDefined()
     expect(readerBackendPids[0]).toBeDefined()
     expect(readerBackendPids[0]).not.toBe(writerBackendPids[0])
+  })
+
+  it("persists a large Prepare receipt across a Worker restart with the exact attempt and tool-call binding", async () => {
+    await seedOwner(adminPool!, ownerC)
+    await seedScheduledPrepareTask(adminPool!, scheduledPrepare)
+    const toolCallId = `prepare-${randomUUID()}`
+    await seedScheduledPrepareToolCall(adminPool!, scheduledPrepare, toolCallId)
+    const source = "scheduled.application.prepare" as CanonicalToolSourceName
+    const value = largePrepareReceipt(scheduledPrepare.taskId, scheduledPrepare.attemptCount)
+    const prepared = prepareToolResultJson(value, source, scheduledPrepare.taskId, scheduledPrepare.attemptCount)
+    const readerCallId = `prepare-read-${randomUUID()}`
+    expect(prepared.bytes).toBeGreaterThan(8 * 1024)
+    expect(prepared.bytes).toBeLessThanOrEqual(MAX_TOOL_RESULT_BYTES)
+
+    const writerBackend: number[] = [], readerBackend: number[] = []
+    let beforeRestartPool: PgPool | undefined = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    let afterRestartPool: PgPool | undefined = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    try {
+      const beforeRestart = createToolResultReferenceRepository(runtimePool(beforeRestartPool, writerBackend))
+      const stored = await beforeRestart.put(scheduledPrepare.owner, {
+        stepId: scheduledPrepare.stepId, toolCallId, value,
+      })
+      expect(stored.sanitizedJson).toEqual(prepared.value)
+      expect(stored.taskId).toBe(scheduledPrepare.taskId)
+      expect(stored.toolCallId).toBe(toolCallId)
+      expect(stored.byteCount).toBe(prepared.bytes)
+      expect(stored.sha256).toBe(prepared.sha256)
+      expect(stored.sha256).toBe(createHash("sha256").update(canonicalJson(stored.sanitizedJson), "utf8").digest("hex"))
+
+      await beforeRestartPool.end()
+      beforeRestartPool = undefined
+      const restartedOwnerId = `${scheduledPrepare.owner.lease.ownerId}-restarted`
+      const restartedOwner = {
+        kind: "task" as const,
+        lease: { ...scheduledPrepare.owner.lease, ownerId: restartedOwnerId, leaseOwner: restartedOwnerId },
+      }
+      const rollover = await adminPool!.query<{ attemptCount: number; status: string }>(`UPDATE "sub_agent_tasks"
+        SET "leaseOwner" = $2 WHERE "id" = $1 AND "status" = 'running' AND "attemptCount" = $3
+        RETURNING "attemptCount", "status"`, [scheduledPrepare.taskId, restartedOwnerId, scheduledPrepare.attemptCount])
+      expect(rollover.rows).toEqual([{ attemptCount: scheduledPrepare.attemptCount, status: "running" }])
+
+      const afterRestart = createToolResultReferenceRepository(runtimePool(afterRestartPool, readerBackend))
+      await expect(afterRestart.read(ownerC.owner, { referenceId: stored.id }, readerCallId))
+        .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+      await expect(afterRestart.read(scheduledPrepare.owner, { referenceId: stored.id }, readerCallId))
+        .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+      const retried = await afterRestart.put(restartedOwner, {
+        stepId: scheduledPrepare.stepId, toolCallId, value,
+      })
+      expect(retried.id).toBe(stored.id)
+      expect(retried.taskId).toBe(stored.taskId)
+      expect(retried.sha256).toBe(stored.sha256)
+      expect(retried.byteCount).toBe(stored.byteCount)
+      const identityCount = await adminPool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count"
+        FROM "agent_tool_result_references" WHERE "stepId" = $1 AND "toolCallId" = $2`, [scheduledPrepare.stepId, toolCallId])
+      expect(identityCount.rows[0]?.count).toBe(1)
+
+      const chunks: string[] = []
+      let cursor: string | undefined
+      let last: Awaited<ReturnType<typeof afterRestart.read>> = null
+      for (let index = 0; index < Math.ceil(stored.byteCount / 2_048) + 2; index += 1) {
+        last = await afterRestart.read(restartedOwner, {
+          referenceId: stored.id, ...(cursor === undefined ? {} : { cursor }),
+        }, readerCallId)
+        expect(last).not.toBeNull()
+        const encodedChunk = JSON.stringify(last)
+        expect(encodedChunk).toBeTypeOf("string")
+        expect(Buffer.byteLength(encodedChunk!, "utf8")).toBeLessThanOrEqual(MAX_TOOL_RESULT_READ_BYTES)
+        expect(isVerifiedToolResultChunk(last, restartedOwner, readerCallId)).toBe(true)
+        chunks.push(last!.chunk)
+        if (last!.nextCursor === null) break
+        cursor = last!.nextCursor
+      }
+      const encoded = chunks.join("")
+      expect(last?.nextCursor).toBeNull()
+      expect(encoded).toBe(prepared.encoded)
+      expect(Buffer.byteLength(encoded, "utf8")).toBe(stored.byteCount)
+      expect(createHash("sha256").update(encoded, "utf8").digest("hex")).toBe(stored.sha256)
+      expect(writerBackend[0]).toBeDefined()
+      expect(readerBackend[0]).toBeDefined()
+      expect(readerBackend[0]).not.toBe(writerBackend[0])
+
+      const reference = { $ref: stored.id, sizeBytes: stored.byteCount, sha256: stored.sha256 }
+      const verificationScope = { userId: ownerC.userId, sessionId: ownerC.sessionId, turnId: ownerC.turnId,
+        rootTaskId: ownerC.rootTaskId, taskId: scheduledPrepare.taskId, attemptCount: scheduledPrepare.attemptCount }
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = $2 WHERE "id" = $1`, [
+        scheduledPrepare.taskId, scheduledPrepare.attemptCount + 1,
+      ])
+      await expect(afterRestart.read(restartedOwner, { referenceId: stored.id }, readerCallId))
+        .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+      const staleVerificationClient = await afterRestartPool.connect()
+      try {
+        await setRuntimeRole(staleVerificationClient)
+        await staleVerificationClient.query("BEGIN")
+        await staleVerificationClient.query("SELECT set_config('app.user_id', $1, true)", [ownerC.userId])
+        await expect(verifyScheduledPrepareToolResultReference(staleVerificationClient, {
+          reference, scope: verificationScope, mode: { phase: "finish", ownerId: restartedOwner.lease.ownerId },
+          stepId: scheduledPrepare.stepId, toolCallId, expectedResult: value,
+        })).resolves.toBeNull()
+        await staleVerificationClient.query("COMMIT")
+      } catch (error) {
+        await staleVerificationClient.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally {
+        staleVerificationClient.release()
+      }
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = $2 WHERE "id" = $1`, [
+        scheduledPrepare.taskId, scheduledPrepare.attemptCount,
+      ])
+
+      await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed' WHERE "id" = $1`, [scheduledPrepare.stepId])
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'completed', "failureReason" = NULL,
+        "leaseOwner" = NULL, "leaseExpiresAt" = NULL WHERE "id" = $1`, [scheduledPrepare.taskId])
+      const verificationClient = await afterRestartPool.connect()
+      try {
+        await setRuntimeRole(verificationClient)
+        await verificationClient.query("BEGIN")
+        await verificationClient.query("SELECT set_config('app.user_id', $1, true)", [ownerC.userId])
+        const verificationInput = { reference, scope: verificationScope, mode: { phase: "persisted_gate" as const },
+          stepId: scheduledPrepare.stepId, toolCallId, expectedResult: value }
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, verificationInput)).resolves.toEqual(value)
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, {
+          ...verificationInput, toolCallId: `wrong-${toolCallId}`,
+        })).resolves.toBeNull()
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, {
+          ...verificationInput, reference: { ...reference, sha256: "e".repeat(64) },
+        })).resolves.toBeNull()
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, {
+          ...verificationInput, scope: { ...verificationScope, attemptCount: scheduledPrepare.attemptCount + 1 },
+        })).resolves.toBeNull()
+        await verificationClient.query("COMMIT")
+      } catch (error) {
+        await verificationClient.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally {
+        verificationClient.release()
+      }
+    } finally {
+      await beforeRestartPool?.end()
+      await afterRestartPool?.end()
+    }
   })
 })

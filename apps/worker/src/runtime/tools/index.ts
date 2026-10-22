@@ -20,6 +20,7 @@ import type { RuntimeToolDefinition } from "./types.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import { createAskUserTool } from "./ask-user.js"
 import { createJobsDiscoverTool, type JobDiscoverToolOptions } from "./job-discover-tool.js"
+import { createScheduledApplicationPrepareTool, type ScheduledApplicationPrepareDependencies } from "./scheduled-application-prepare.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -58,6 +59,7 @@ export type WorkerCoordinationOptions = {
 export type WorkerGmailOptions = GmailToolOptions
 export type WorkerArtifactOptions = { readonly store: ArtifactToolStore }
 export type WorkerWriteOptions = Omit<WriteToolOptions, "pool">
+export type WorkerScheduledPrepareOptions = ScheduledApplicationPrepareDependencies
 
 export function createWorkerToolRuntime(
   pool: pg.Pool,
@@ -68,7 +70,8 @@ export function createWorkerToolRuntime(
   artifacts?: WorkerArtifactOptions,
   write?: WorkerWriteOptions,
   jobDiscovery?: JobDiscoverToolOptions,
-): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
+  scheduledPrepare?: WorkerScheduledPrepareOptions,
+): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"]; durableResults: NonNullable<ToolLifecycleOptions["durableResults"]> } {
   const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
   definitions.push(createToolResultsReadTool(durableResults, context => {
@@ -90,7 +93,8 @@ export function createWorkerToolRuntime(
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   if (write) definitions.push(...createWriteTools({ pool, ...write }))
   if (jobDiscovery) definitions.push(createJobsDiscoverTool(jobDiscovery) as RuntimeToolDefinition)
+  if (scheduledPrepare) definitions.push(createScheduledApplicationPrepareTool(scheduledPrepare))
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
-  return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }
+  return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references, durableResults }
 }

@@ -4,6 +4,7 @@ const MAX_SUMMARY_CHARS = 1_000
 const METRICS = [
   ["discovered jobs", "discoveredJobs"],
   ["analyzed jobs", "analyzedJobs"],
+  ["prepared jobs", "prepareJobs"],
   ["artifact references", "artifactReferences"],
   ["review outcomes", "reviewOutcomes"],
 ] as const

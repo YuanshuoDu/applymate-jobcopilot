@@ -3,11 +3,12 @@ import { appendInternalAcceptedInterrupt } from "./task-interrupt-outbox.js"
 import { verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
-import { loadTaskGraph } from "./task-graph-pg-state.js"
+import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
+import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { taskGraphVerificationDependencyNodeKeys } from "../planning/task-graph-verification.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
-import { canonicalTaskGraphJson, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
-import { json, transaction } from "./pg-store-persistence.js"
+import { canonicalTaskGraphJson, taskGraphLifecycleKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import { dateValue, json, transaction } from "./pg-store-persistence.js"
 import type { PgSubagentPool, SubagentTaskRecord } from "./types.js"
 import { recoverExpired as recoverExpiredImpl } from "./pg-store-expiry-recovery.js"
 import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
@@ -20,7 +21,51 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   let graph = graphType ? await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: graphType, attemptCount: input.attemptCount, failureReason: input.failureReason }) : null
   if (!graph || "blocked" in graph) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
   const node = graph.snapshot.nodes.find(candidate => candidate.taskId === input.taskId)
-  if (!node || (node.templateId !== "scout" && node.templateId !== "analyst")) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
+  if (!node || (node.templateId !== "scout" && node.templateId !== "analyst" && node.templateId !== "prepare")) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
+  if (node.templateId === "prepare") {
+    if (input.status !== "completed") return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
+    const loaded = await loadTaskGraph(client, graph.scope, true)
+    const sameGraph = loaded.item && loaded.snapshot && loaded.state && loaded.state.revision === graph.expectedRevision
+      && canonicalTaskGraphJson(loaded.snapshot) === canonicalTaskGraphJson(graph.snapshot)
+    const prepareTask = loaded.tasks.get(input.taskId), persistedCurrent = sameGraph ? currentTaskGraph(loaded) : null
+    const persistedNode = persistedCurrent?.nodes.find(candidate => candidate.key === node.key)
+    const completedNode = graph.state.nodes.find(candidate => candidate.key === node.key)
+    const exactCompletion = Boolean(sameGraph && prepareTask && persistedNode && completedNode && !graph.duplicate
+      && graph.itemId === loaded.item?.id && graph.taskId === input.taskId
+      && graph.event.type === "task.completed" && graph.event.nodeKey === node.key
+      && graph.event.expectedRevision === graph.expectedRevision
+      && graph.event.idempotencyKey === taskGraphLifecycleKey(graph.scope.parentTaskId, node.key, input.attemptCount, "task.completed")
+      && graph.expectedRevision === loaded.state?.revision && graph.state.revision === graph.expectedRevision + 1
+      && input.failureReason === undefined && prepareTask.status === "running" && prepareTask.attemptCount === input.attemptCount
+      && prepareTask.failureReason === null && persistedNode.taskId === input.taskId && persistedNode.status === "running" && persistedNode.failureReason === null
+      && completedNode.taskId === input.taskId && completedNode.status === "completed" && completedNode.failureReason == null)
+    const completionTasks = new Map(loaded.tasks)
+    if (exactCompletion && prepareTask) completionTasks.set(input.taskId, { ...prepareTask, status: "completed",
+      attemptCount: input.attemptCount, failureReason: null, result: finalizedResult(safeInputResult, "completed") })
+    const completionGraph = exactCompletion ? { ...loaded, state: graph.state, tasks: completionTasks } : null
+    // finish() already authenticated the caller's owner and attempt while holding the session lock.
+    // Lock the same live task row so reference verification uses the current lease owner; claim and recovery
+    // take that session lock too, so a concurrent reclaim cannot replace it before this transaction commits.
+    const lease = completionGraph ? (await client.query<{ leaseOwner: unknown; attemptCount: unknown; leaseExpiresAt: unknown; checkedAt: unknown }>(`SELECT "leaseOwner", "attemptCount", "leaseExpiresAt", clock_timestamp() AS "checkedAt"
+      FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = $3
+        AND "leaseOwner" IS NOT NULL AND btrim("leaseOwner") <> '' AND "leaseExpiresAt" > clock_timestamp() FOR UPDATE`,
+    [input.taskId, input.sessionId, input.attemptCount])).rows[0] : undefined
+    const leaseOwner = typeof lease?.leaseOwner === "string" ? lease.leaseOwner : null
+    const leaseExpiry = dateValue(lease?.leaseExpiresAt), checkedAt = dateValue(lease?.checkedAt)
+    const ownerId = leaseOwner && leaseOwner.trim().length > 0 && Number(lease?.attemptCount) === input.attemptCount
+      && leaseExpiry && checkedAt && leaseExpiry > checkedAt ? leaseOwner : null
+    const verification = completionGraph && ownerId ? await verifyScheduledPrepareTaskGraphEvidence(client, {
+      scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot,
+      current: currentTaskGraph(completionGraph), tasks: completionTasks, structuredResult: plainObject(safeInputResult)?.structuredResult,
+      referenceVerificationMode: { phase: "finish", ownerId },
+      completionGraphRevision: graph.state.revision,
+    }) : { verified: false as const, reasonCode: completionGraph ? "scheduled_prepare_owner_invalid" : "scheduled_prepare_graph_invalid" }
+    if (verification.verified) return { graph, status: "completed", failureReason: input.failureReason,
+      result: finalizedResult({ ...(plainObject(safeInputResult) ?? {}), taskGraphScheduledPrepareProofFacts: verification.facts }, "completed"), reconcileDependents: true }
+    const failureReason = verification.reasonCode
+    graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.failed", attemptCount: input.attemptCount, failureReason })
+    return { graph, status: "failed", failureReason, result: finalizedResult(safeInputResult, "failed") }
+  }
   if (input.status !== "completed") {
     if (input.status === "failed") {
       const report = unverifiedFailureReport(node)
@@ -58,7 +103,7 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.failed", attemptCount: input.attemptCount, failureReason })
   return { graph, status: "failed", failureReason, result: finalizedResult(safeResult, "failed") }
 }
-const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1" as const; const RESERVED_RESULT_KEYS = new Set(["taskGraphVerificationReport", "verificationReport", "taskGraphRepairReceipt"])
+const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1" as const; const RESERVED_RESULT_KEYS = new Set(["taskGraphVerificationReport", "verificationReport", "taskGraphRepairReceipt", "taskGraphScheduledPrepareProofFacts"])
 function unverifiedFailureReport(node: StoredTaskGraphNode): TaskGraphVerificationReport {
   const reasonCode = node.verificationDisposition === "typed" && node.verification ? "result_invalid" : "contract_invalid"
   return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode, criteria: node.verification?.criteria.map(item => ({ criterionId: item.id, status: "unverified", reasonCode })) ?? [], evidenceDigest: null, resultDigest: null }

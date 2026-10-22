@@ -1,6 +1,6 @@
 import type pg from "pg"
-import type { PolicyRule, PolicySnapshot } from "@jobcopilot/agent-protocol"
-import { PolicyEngine } from "@jobcopilot/agent-policy"
+import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 
 import { createWorkerUsageAuthorizer } from "../../queue/ai-usage-bridge.js"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
@@ -24,6 +24,11 @@ import { createJobDiscoveryClient, type JobDiscoveryClient } from "../tools/job-
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 import { childDiscoveryExecutionFence, createChildDiscoveryObservers } from "./child-discovery-observers.js"
+import { createProductionChildPolicy } from "./production-child-policy.js"
+import { createHarnessModelRuntime } from "../harness-model.js"
+import { createScheduledApplicationPrepareRuntime } from "./scheduled-application-prepare-runtime.js"
+import { createScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
+export { createProductionChildPolicy } from "./production-child-policy.js"
 
 export type ProductionChildRuntimeOptions = {
   readonly pool: pg.Pool
@@ -43,6 +48,27 @@ type WriterReviewRevision = Readonly<{
   feedback: TaskGraphWriterReviewFeedbackFrame
 }>
 
+type ScheduledPrepareRuntimeOptions = Readonly<{
+  authorizeUsage: ChildExecutorOptions["authorizeUsage"]
+  treeBudget: TreeBudgetReservationStore
+  modelRuntimeFactory?: ChildExecutorOptions["modelRuntimeFactory"]
+}>
+
+function configWithSnapshot(config: AiConfig, snapshot: unknown): AiConfig {
+  const value = record(snapshot)
+  return {
+    ...config,
+    ...(typeof value.provider === "string" ? { provider: value.provider as AiConfig["provider"] } : {}),
+    ...(typeof value.model === "string" && value.model.trim() ? { model: value.model } : {}),
+  }
+}
+
+async function resolveScheduledPrepareModel(task: SubagentTaskRecord, factory: ChildExecutorOptions["modelRuntimeFactory"]): Promise<ModelAdapter> {
+  if (factory) return factory({ task })
+  const primary = configWithSnapshot(await loadWorkerAiConfig(task.userId), task.modelProfileSnapshot)
+  return (await createHarnessModelRuntime({ primary, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
+}
+
 function artifactTaskFence(lease: SubagentLease): AgentArtifactTaskFence {
   if (!lease.turnId || lease.status !== "running" || lease.interruptRequestedAt !== null
     || !lease.ownerId.trim() || lease.leaseOwner !== lease.ownerId || !Number.isSafeInteger(lease.attemptCount) || lease.attemptCount < 1
@@ -55,58 +81,12 @@ function artifactTaskFence(lease: SubagentLease): AgentArtifactTaskFence {
   }
 }
 
-const SUBAGENT_READ_RULE = {
-  id: "canonical-subagent-read",
-  roles: ["subagent"], risks: ["read"], requiredCapabilities: ["read"],
-  outcome: "allow", reasonCode: "server_subagent_read_gate", reason: "The server enabled scoped child read tools",
-} satisfies PolicyRule
-const SUBAGENT_INTERNAL_WRITE_DENY = {
-  id: "canonical-subagent-internal-write-deny", roles: ["subagent"], risks: ["internal_write"], outcome: "deny",
-  reasonCode: "server_subagent_internal_write_denied", reason: "Subagents may use only the exact server-enabled discovery write",
-} satisfies PolicyRule
-const SCOUT_DISCOVERY_WRITE_RULE = {
-  id: "canonical-scout-job-discovery-write", roles: ["subagent"], tools: ["jobs.discover"], toolVersions: ["1"],
-  risks: ["internal_write"], domains: ["jobs"], requiredCapabilities: ["read"], outcome: "allow",
-  reasonCode: "server_scout_job_discovery_write", reason: "The server enabled bounded provider discovery for a generic Scout",
-} satisfies PolicyRule
-
 function selectedJobId(task: SubagentTaskRecord): string | undefined {
   const selection = record(record(task.context).selectedJobPreparation)
   return Object.keys(selection).sort().join(",") === "jobId"
     && typeof selection.jobId === "string" && selection.jobId.trim().length > 0 && selection.jobId.length <= 256
     ? selection.jobId
     : undefined
-}
-
-function selectedJobPolicyRule(role: string, selectedJob: boolean): PolicyRule | undefined {
-  if (!selectedJob) return undefined
-  if (role === "writer") return {
-    id: "canonical-selected-job-cover-letter-draft",
-    roles: ["subagent"], tools: ["cover_letter.draft"], toolVersions: ["1"], risks: ["draft_write"], domains: ["resume"], requiredCapabilities: ["draft"],
-    outcome: "allow", reasonCode: "server_selected_job_draft_gate", reason: "The server enabled the selected-job cover-letter draft tool",
-  }
-  if (role === "reviewer") return {
-    id: "canonical-selected-job-artifact-review",
-    roles: ["subagent"], tools: ["artifact.review"], toolVersions: ["1"], risks: ["draft_write"], domains: ["resume"], requiredCapabilities: ["review"],
-    outcome: "allow", reasonCode: "server_selected_job_review_gate", reason: "The server enabled the bounded selected-job review receipt",
-  }
-  return undefined
-}
-
-export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role" | "toolPolicySnapshot">, selectedJob: boolean): PolicyEngine {
-  const snapshot = record(task.toolPolicySnapshot)
-  const hasMatrixField = Object.prototype.hasOwnProperty.call(snapshot, "version") || Object.prototype.hasOwnProperty.call(snapshot, "rules")
-  const configured = typeof snapshot.version === "string" && Array.isArray(snapshot.rules)
-    ? snapshot as unknown as PolicySnapshot
-    : undefined
-  if (hasMatrixField && !configured) return new PolicyEngine()
-  const configuredRules = configured?.rules ?? []
-  const explicitDiscoveryDenies = configuredRules.filter(rule => rule.outcome === "deny" && rule.roles.includes("subagent") && rule.tools?.includes("jobs.discover"))
-  const remainingConfiguredRules = configuredRules.filter(rule => !explicitDiscoveryDenies.includes(rule))
-  const discoveryRule = task.role === "scout" && !selectedJob ? [SCOUT_DISCOVERY_WRITE_RULE] : []
-  const taskRule = selectedJobPolicyRule(task.role, selectedJob)
-  const rules: PolicyRule[] = [...explicitDiscoveryDenies, ...discoveryRule, SUBAGENT_INTERNAL_WRITE_DENY, ...remainingConfiguredRules, SUBAGENT_READ_RULE, ...(taskRule ? [taskRule] : [])]
-  return new PolicyEngine({ snapshot: { version: configured?.version ?? "policy.v1", rules } })
 }
 
 function bindStore(store: TurnEngineStore): TurnExecutionStore {
@@ -125,7 +105,7 @@ function withoutIdentity<T extends { identity: ExecutionOwnerFence }>(input: T):
   return rest
 }
 
-async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence, discoveryClient?: JobDiscoveryClient): Promise<ChildToolRuntime> {
+async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence, discoveryClient?: JobDiscoveryClient, prepareOptions?: ScheduledPrepareRuntimeOptions): Promise<ChildToolRuntime> {
   const executionOwner: ExecutionOwner = { kind: "task", lease }
   const selectedJobRole = task.role === "scout" || task.role === "analyst" || task.role === "writer" || task.role === "reviewer"
   const selectedJob = selectedJobRole ? selectedJobId(lease) : undefined
@@ -177,14 +157,19 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
   const toolPolicy = createProductionChildPolicy(task, Boolean(selectedJob || selectedJobPreparation))
   const discoveryFence = childDiscoveryExecutionFence(task, lease, selectedJob, selectedJobPreparation)
   const discoveryObservers = discoveryFence ? await createChildDiscoveryObservers(pool, lease, discoveryFence) : undefined
+  const scheduledPrepare = task.role === "prepare" && task.taskType === "scheduled_application_prepare" && prepareOptions
+    ? createScheduledApplicationPrepareRuntime({ pool, task, lease, owner, authorize: prepareOptions.authorizeUsage,
+      treeBudget: prepareOptions.treeBudget, resolveModel: () => resolveScheduledPrepareModel(task, prepareOptions.modelRuntimeFactory) })
+    : undefined
   const runtime = createWorkerToolRuntime(pool, {
     sink: durableLifecycleSink(store, owner),
     resolveOwner: () => executionOwner,
     ...(discoveryObservers ? { onDiscoveryAttemptLifecycleEvent: discoveryObservers.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
-  discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined)
+  discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined, scheduledPrepare)
   return {
     definitions: runtime.registry.list(), router: runtime.router,
+    ...(scheduledPrepare ? { resolveScheduledPrepareReference: createScheduledPrepareReferenceResolver(pool, runtime.durableResults, executionOwner) } : {}),
     ...(discoveryObservers ? {
       discoveryAttemptSidecar: () => discoveryObservers.discoveryAttemptSidecar(),
       discoveryRecoverySidecar: () => discoveryObservers.discoveryRecoverySidecar(),
@@ -278,11 +263,14 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
     }
     if (!genericExecutor) {
       const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
+      const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
+      const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
       genericExecutor = createChildExecutor({
-        store: bindStore(engineStore), treeBudget: options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool),
-        authorizeUsage: options.authorizeUsage ?? createWorkerUsageAuthorizer(),
+        store: bindStore(engineStore), treeBudget, authorizeUsage,
         modelRuntimeFactory: options.modelRuntimeFactory,
-        toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner, options.jobDiscoveryClient)),
+        toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner, options.jobDiscoveryClient, {
+          authorizeUsage, treeBudget, modelRuntimeFactory: options.modelRuntimeFactory,
+        })),
         mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? defaultResumeLoader(options.pool),
       })
     }

@@ -29,9 +29,27 @@ function reviewerResult(reviewStatus: "passed" | "needs_revision" | "rejected" |
   return { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus, reviewHash }
 }
 
+function prepareResult() {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" as const, status: "partial" as const,
+    taskId: "prepare-task", attemptCount: 1,
+    snapshotDigest: hash("a"), checkpointDigest: "b".repeat(64),
+    jobs: [
+      { jobId: "job-2", status: "skipped" as const },
+      { jobId: "job-1", status: "prepared" as const },
+      { jobId: "job-3", status: "failed" as const },
+    ],
+    materials: [
+      { jobId: "job-1", kind: "cover_letter" as const, artifactRef: { ...artifactRef, artifactId: "letter-1" } },
+      { jobId: "job-1", kind: "resume" as const, artifactRef: { ...artifactRef, artifactId: "resume-1" } },
+    ],
+  }
+}
+
 function node(taskId: string, role: string, taskStatus: string, structuredResult?: unknown, kind: "business" | "internal_control" = "business"): TaskGraphFinalSummaryNode {
-  return structuredResult === undefined ? { kind, taskId, role, taskStatus } as TaskGraphFinalSummaryNode
-    : { kind, taskId, role, taskStatus, structuredResult } as TaskGraphFinalSummaryNode
+  const attemptCount = role === "prepare" ? 1 : undefined
+  return structuredResult === undefined ? { kind, taskId, role, taskStatus, ...(attemptCount ? { attemptCount } : {}) } as TaskGraphFinalSummaryNode
+    : { kind, taskId, role, taskStatus, ...(attemptCount ? { attemptCount } : {}), structuredResult } as TaskGraphFinalSummaryNode
 }
 
 async function mapPersistedRowsToSummaryNodes(taskId: string, role: "scout" | "analyst", structuredResult: unknown): Promise<TaskGraphFinalSummaryNode[]> {
@@ -122,10 +140,35 @@ describe("TaskGraph final-summary reducer", () => {
 
   it("distinguishes not-requested counts from a validated empty result", () => {
     const empty = reduceTaskGraphFinalSummary({ graphRevision: 0, nodes: [] })
-    expect(Object.values(empty.counts)).toEqual(Array(4).fill({ knownCount: null, coverage: "not_requested" }))
+    expect(Object.values(empty.counts)).toEqual(Array(5).fill({ knownCount: null, coverage: "not_requested" }))
     const requested = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [node("empty-scout", "scout", "completed", scoutResult([]))] })
     expect(requested.counts.discoveredJobs).toEqual({ knownCount: 0, coverage: "complete" })
     expect(requested.counts.analyzedJobs).toEqual({ knownCount: null, coverage: "not_requested" })
+  })
+
+  it("summarizes strict Prepare statuses and safe immutable material references", () => {
+    const result = prepareResult()
+    const summary = reduceTaskGraphFinalSummary({ graphRevision: 3, nodes: [node("prepare-task", "prepare", "completed", result)] })
+
+    expect(summary.counts.prepareJobs).toEqual({ knownCount: 3, coverage: "partial" })
+    expect(summary.counts.artifactReferences).toEqual({ knownCount: 2, coverage: "partial" })
+    expect(summary.prepareResults).toEqual([{
+      taskId: "prepare-task", attemptCount: 1, resultStatus: "partial", snapshotDigest: hash("a"), checkpointDigest: "b".repeat(64),
+      jobs: [
+        { jobId: "job-1", status: "prepared", materials: [
+          { kind: "cover_letter", artifactRef: { ...artifactRef, artifactId: "letter-1" } },
+          { kind: "resume", artifactRef: { ...artifactRef, artifactId: "resume-1" } },
+        ] },
+        { jobId: "job-2", status: "skipped", materials: [] },
+        { jobId: "job-3", status: "failed", materials: [] },
+      ],
+    }])
+    expect(summary.taskOutcomes).toEqual([{
+      taskId: "prepare-task", role: "prepare", taskStatus: "completed", resultState: "valid", roleResultStatus: "partial",
+    }])
+    expect(summary.artifactReferences.map(item => item.artifactRef.artifactId)).toEqual(["letter-1", "resume-1"])
+    expect(JSON.stringify(summary)).not.toContain("resume body")
+    expect(JSON.stringify(summary)).not.toContain("cover letter body")
   })
 
   it("keeps valid facts from unsuccessful terminal tasks partial and ignores in-flight results", () => {

@@ -755,6 +755,23 @@ describe("child evidence binding", () => {
     expect(entry(index, "job", "job-1")).toBeDefined()
   })
 
+  it("does not let a stale Prepare attempt poison a fresh registered receipt", () => {
+    const index = createObservedEvidenceIndex()
+    const prior = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-task", attemptCount: 1,
+      snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs: [], materials: [] }
+    hydrateObservedEvidence(index, [restored("old-prepare", "scheduled.application.prepare", {
+      $ref: "tool-result-00000000-0000-4000-8000-000000000001", sizeBytes: 9000, sha256: "c".repeat(64),
+    })], { taskId: "prepare-task", attemptCount: 2 })
+    expect(index.scheduledPrepareResultConflicts.size).toBe(0)
+    expect(index.scheduledPrepareResults.size).toBe(0)
+
+    const current = { ...prior, attemptCount: 2 }
+    recordReadToolOutput(index, "scheduled.application.prepare", current, {}, {
+      toolCallId: "fresh-call", taskId: "prepare-task", attemptCount: 2,
+    })
+    expect(parseAndBindStructuredResult(JSON.stringify(current), "prepare", index)).toEqual(current)
+  })
+
   it("accepts restored non-evidence read observations without projecting evidence", () => {
     const index = createObservedEvidenceIndex()
     hydrateObservedEvidence(index, [

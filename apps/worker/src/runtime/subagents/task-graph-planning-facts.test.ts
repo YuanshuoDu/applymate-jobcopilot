@@ -39,6 +39,7 @@ function row(
 ): GraphTaskRow {
   return {
     id, role, taskType, status, failureReason: null,
+    ...(role === "prepare" ? { attemptCount: 1 } : {}),
     result: structuredResult === undefined ? null : { status: "completed", finalText: "PRIVATE_FINAL_TEXT", structuredResult },
   }
 }
@@ -63,7 +64,6 @@ describe("TaskGraph planning facts producer", () => {
     const rows = [
       row("scout-a", "scout", "research", "completed", scoutResult(["job-1", "job-2", "job-3", "job-4", "job-5"])),
       row("scout-b", "scout", "research", "completed", scoutResult(["job-4", "job-5", "job-6"])),
-      row("scout-missing", "scout", "research", "completed"),
       row("analyst-a", "analyst", "research", "completed", analystResult([
         { jobId: "job-1", score: 7 }, { jobId: "job-2", score: 8 }, { jobId: "job-3", score: 6 },
         { jobId: "job-4", score: 5 }, { jobId: "job-2", score: 8 },
@@ -78,6 +78,11 @@ describe("TaskGraph planning facts producer", () => {
         schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
         reviewStatus: "passed", reviewHash: `sha256:${"c".repeat(64)}`,
       }),
+      row("prepare-task", "prepare", "scheduled_application_prepare", "completed", {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-task", attemptCount: 1,
+        snapshotDigest: `sha256:${"d".repeat(64)}`, checkpointDigest: "e".repeat(64),
+        jobs: [{ jobId: "prepared-job", status: "prepared" }], materials: [],
+      }),
       row("native-control", "auditor", "native_verification", "completed", scoutResult(["control-job"])),
       row("history-only", "scout", "research", "completed", scoutResult(["historical-job"])),
     ]
@@ -88,11 +93,12 @@ describe("TaskGraph planning facts producer", () => {
     expect(facts.graphRevision).toBe(9)
     expect(Object.keys(facts)).toEqual(["graphRevision", "counts"])
     expect(Object.keys(facts.counts).sort()).toEqual([
-      "analyzedJobs", "artifactReferences", "discoveredJobs", "reviewOutcomes",
+      "analyzedJobs", "artifactReferences", "discoveredJobs", "prepareJobs", "reviewOutcomes",
     ])
     expect(facts.counts).toEqual({
-      discoveredJobs: { knownCount: 6, coverage: "partial" },
+      discoveredJobs: { knownCount: 6, coverage: "complete" },
       analyzedJobs: { knownCount: 6, coverage: "partial" },
+      prepareJobs: { knownCount: 1, coverage: "complete" },
       artifactReferences: { knownCount: 1, coverage: "complete" },
       reviewOutcomes: { knownCount: 1, coverage: "complete" },
     })

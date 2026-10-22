@@ -493,6 +493,7 @@ describe("canonical Turn context builder", () => {
     const currentCounts = {
       discoveredJobs: { knownCount: 23, coverage: "partial" as const },
       analyzedJobs: { knownCount: 11, coverage: "complete" as const },
+      prepareJobs: { knownCount: null, coverage: "not_requested" as const },
       artifactReferences: { knownCount: null, coverage: "not_requested" as const },
       reviewOutcomes: { knownCount: null, coverage: "unavailable" as const },
     }

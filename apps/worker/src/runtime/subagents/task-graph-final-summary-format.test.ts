@@ -8,11 +8,13 @@ function summary(): TaskGraphFinalSummary {
     counts: {
       discoveredJobs: { knownCount: 0, coverage: "complete" },
       analyzedJobs: { knownCount: 2, coverage: "partial" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "unavailable" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     },
     discoveredJobs: [{ jobId: "PRIVATE_JOB_ID", taskIds: ["PRIVATE_TASK_ID"] }],
     analyzedJobs: [],
+    prepareResults: [],
     artifactReferences: [],
     reviewOutcomes: [],
     taskOutcomes: [{ taskId: "PRIVATE_TASK_ID", role: "scout", taskStatus: "completed", resultState: "valid" }],
@@ -22,7 +24,7 @@ function summary(): TaskGraphFinalSummary {
 describe("TaskGraph final-summary formatter", () => {
   it("renders only known counts and honest coverage, including a complete empty result", () => {
     const formatted = formatTaskGraphFinalSummary(summary())
-    expect(formatted).toBe("Task-reported results: discovered jobs: 0 (complete); analyzed jobs: 2 observed (partial); artifact references: unavailable; review outcomes: not requested.")
+    expect(formatted).toBe("Task-reported results: discovered jobs: 0 (complete); analyzed jobs: 2 observed (partial); prepared jobs: not requested; artifact references: unavailable; review outcomes: not requested.")
     expect(formatted.length).toBeLessThanOrEqual(1_000)
     expect(formatted).not.toContain("PRIVATE")
     expect(formatted).not.toContain("17")

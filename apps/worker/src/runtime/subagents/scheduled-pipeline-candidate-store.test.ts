@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
-import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT } from "./scheduled-pipeline-candidate-store.js"
+import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA,
+  takeRecoveredScheduledPipelineCandidate, withScheduledPipelineCandidateModelOutput } from "./scheduled-pipeline-candidate-store.js"
 
 const oldOwner: TurnExecutionOwnerFence = {
   kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
@@ -13,13 +14,20 @@ const newOwner: TurnExecutionOwnerFence = { ...oldOwner, ownerId: "worker-recove
 const identity = { owner: oldOwner, rootAttemptCount: 2, finalStepId: "step-final-4", finalStepOrdinal: 4 }
 
 function candidateEvent(owner = oldOwner, overrides: Record<string, unknown> = {}) {
-  const payload = { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v1", sessionId: owner.sessionId,
+  const payload = { schemaVersion: SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, sessionId: owner.sessionId,
     turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: 2,
-    finalStepId: "step-final-4", finalStepOrdinal: 4, stepAttempt: 1, candidateText: "Exact final answer.",
+    finalStepId: "step-final-4", finalStepOrdinal: 4, stepAttempt: 1, candidateText: "Exact final answer.", finishReason: "stop",
+    usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
     ...overrides }
   return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
     type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: "step-final-4", payload, stepId: "step-final-4",
-    stepTaskId: owner.rootTaskId, stepAttempt: 1, stepOrdinal: 4, stepStatus: "streaming", stepInputThroughSequence: "10" }
+    stepTaskId: owner.rootTaskId, stepAttempt: 1, stepOrdinal: 4, stepStatus: "streaming", stepInputThroughSequence: "10",
+    stepFinishReason: null, stepInputTokens: 0, stepOutputTokens: 0, stepEstimatedCostUsd: 0 }
+}
+
+function withModelOutput<T>(owner: TurnExecutionOwnerFence, work: () => Promise<T>): Promise<T> {
+  return withScheduledPipelineCandidateModelOutput({ owner, finalStepId: identity.finalStepId, finalStepOrdinal: identity.finalStepOrdinal,
+    candidateText: "Exact final answer.", finishReason: "stop", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 } }, work)
 }
 
 function poolFor(event: Record<string, unknown> | null, options: { rootAttempt?: number; latestStep?: Record<string, unknown>; unconsumedInput?: boolean } = {}) {
@@ -56,21 +64,26 @@ describe("scheduled pipeline durable candidate", () => {
     }) } as unknown as Pick<TurnEngineStore, "appendEvent">
     const fixture = poolFor(candidateEvent())
     const store = createScheduledPipelineCandidateStore(fixture.pool, eventStore)
-    await store.stage({ ...identity, candidateText: "Exact final answer." })
-    await store.stage({ ...identity, owner: newOwner, candidateText: "Exact final answer." })
+    await withModelOutput(oldOwner, () => store.stage({ ...identity, candidateText: "Exact final answer." }))
+    await withModelOutput(newOwner, () => store.stage({ ...identity, owner: newOwner, candidateText: "Exact final answer." }))
 
     const staged = appended[0]!
     expect(staged).toMatchObject({ owner: oldOwner, type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: "step-final-4",
       idempotencyKey: "scheduled-candidate:root-1:2:step-final-4",
       payload: { rootAttemptCount: 2, finalStepId: "step-final-4", finalStepOrdinal: 4, stepAttempt: 1,
-        candidateText: "Exact final answer." } })
+        candidateText: "Exact final answer.", finishReason: "stop", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 } } })
     expect(appended).toHaveLength(2)
     expect(appended[1]).toMatchObject({ owner: newOwner, idempotencyKey: staged.idempotencyKey, payload: staged.payload })
     expect((staged.payload as Record<string, unknown>).writerLeaseOwnerId).toBeUndefined()
     expect((staged.payload as Record<string, unknown>).writerLeaseVersion).toBeUndefined()
     expect(accepted).toHaveProperty("size", 1)
 
-    await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toBe("Exact final answer.")
+    await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toEqual({
+      candidateText: "Exact final answer.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop",
+      usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
+    })
+    expect(takeRecoveredScheduledPipelineCandidate({ owner: newOwner, candidateText: "Exact final answer." })).toMatchObject({ finishReason: "stop", usage: { inputTokens: 12 } })
+    expect(takeRecoveredScheduledPipelineCandidate({ owner: newOwner, candidateText: "Exact final answer." })).toBeUndefined()
     const turnLock = fixture.calls.find(call => call.sql.includes('SELECT turn."id" FROM "agent_turns"'))
     expect(turnLock?.values).toContain("worker-recovered")
     expect(turnLock?.values).toContain(9)
@@ -99,6 +112,14 @@ describe("scheduled pipeline durable candidate", () => {
     const store = createScheduledPipelineCandidateStore(fixture.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
     await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toBeUndefined()
     expect(fixture.calls.some(call => call.sql.includes('FROM "agent_steps"'))).toBe(false)
+  })
+
+  it("requires the exact finish receipt when staging and rejects an invalid recovered usage payload", async () => {
+    const store = createScheduledPipelineCandidateStore(poolFor(null).pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(store.stage({ ...identity, candidateText: "Exact final answer." })).rejects.toThrow("scheduled_candidate_model_receipt_missing")
+    const invalid = poolFor(candidateEvent(newOwner, { usage: { inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0, extra: true } }))
+    const reader = createScheduledPipelineCandidateStore(invalid.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(reader.read({ owner: newOwner, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_identity_mismatch")
   })
 
   it("marks a staged candidate invalid after a later root step or new unconsumed input", async () => {

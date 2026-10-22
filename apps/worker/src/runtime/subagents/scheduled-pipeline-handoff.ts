@@ -1,14 +1,34 @@
+import { createHash } from "node:crypto"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 
 const path = "/api/internal/agent-runtime/scheduled-pipeline"
 const blockedErrors = new Set(["scheduled_pipeline_owner_mismatch", "scheduled_pipeline_turn_stale", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_root_mismatch", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_attestation_invalid", "scheduled_pipeline_snapshot_mismatch", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid", "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required", "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted"])
 
-export type ScheduledPipelineHandoff = { status: "completed" } | { status: "waiting_for_user"; waitId: string } | { status: "blocked"; errorCode: string }
-type HandoffInput = { owner: ScheduledAutomationPipelineBridgeScope; attestation: ScheduledAutomationPipelineAttestation }
+export type ScheduledPipelineAnalyzeCheckpointProof = Readonly<{
+  status: "analyze_checkpointed"
+  continuationKey: string
+  checkpointDigest: string
+  claimTokenDigest: string
+  executionId: string
+  executionAttemptCount: number
+}>
+export type ScheduledPipelineHandoff =
+  | { status: "completed" }
+  | { status: "waiting_for_user"; waitId: string; waitKind: "external" }
+  | { status: "waiting_for_user"; waitId: string; waitKind: "scheduled_prepare"; scheduledWaitId: string }
+  | { status: "analyze_checkpointed"; proof: ScheduledPipelineAnalyzeCheckpointProof }
+  | { status: "blocked"; errorCode: string }
+type AnalyzeHandoffInput = { owner: ScheduledAutomationPipelineBridgeScope; attestation: ScheduledAutomationPipelineAttestation }
+type PrepareHandoffInput = AnalyzeHandoffInput & { prepareProof: unknown; scheduledWaitId?: string }
+type HandoffInput = AnalyzeHandoffInput | PrepareHandoffInput
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 
 /** Authenticated server-to-server continuation; secrets remain in the header and are never serialized. */
 export async function postScheduledPipelineContinuation(input: HandoffInput, signal: AbortSignal, fetcher: typeof fetch = globalThis.fetch): Promise<ScheduledPipelineHandoff> {
+  if ("prepareProof" in input && Object.hasOwn(input, "scheduledWaitId") && (typeof input.scheduledWaitId !== "string"
+    || input.scheduledWaitId.trim() !== input.scheduledWaitId || input.scheduledWaitId.length < 1 || input.scheduledWaitId.length > 256)) {
+    throw new Error("scheduled_pipeline_handoff_input_invalid")
+  }
   const base = process.env.AGENT_WEB_URL?.trim() || process.env.WEB_APP_URL?.trim() || process.env.APPLYMATE_WEB_URL?.trim(), secret = process.env.AGENT_WORKER_SECRET?.trim()
   if (!base || !secret || typeof fetcher !== "function") throw new Error("scheduled_pipeline_handoff_unavailable")
   const url = new URL(`${base.replace(/\/$/, "")}${path}`)
@@ -16,11 +36,31 @@ export async function postScheduledPipelineContinuation(input: HandoffInput, sig
   const response = await fetcher(url.toString(), { method: "POST", headers: { "content-type": "application/json", "x-agent-worker-secret": secret }, body: JSON.stringify(input), cache: "no-store", redirect: "error", signal })
   let payload: Record<string, unknown>
   try { payload = record(await response.json()) } catch { throw new Error("scheduled_pipeline_handoff_response_invalid") }
-  if (response.status === 200 && payload.status === "completed" && validReport(payload.report)) return { status: "completed" }
-  if (response.status === 202 && payload.status === "waiting_for_user" && validWaitId(payload.waitId)) return { status: "waiting_for_user", waitId: payload.waitId }
+  if (response.status === 200 && payload.status === "completed" && validReport(payload.report)) {
+    if (!scheduledWaitEchoMatches(input, payload)) return { status: "blocked", errorCode: "scheduled_pipeline_wait_identity_mismatch" }
+    return { status: "completed" }
+  }
+  if (response.status === 200 && payload.status === "analyze_checkpointed" && !("prepareProof" in input)) {
+    const proof = parseAnalyzeCheckpointProof(payload, input)
+    return proof ? { status: "analyze_checkpointed", proof }
+      : { status: "blocked", errorCode: "scheduled_pipeline_analyze_checkpoint_invalid" }
+  }
+  if (response.status === 202 && payload.status === "waiting_for_user" && validWaitId(payload.waitId)) {
+    if (!scheduledWaitEchoMatches(input, payload)) {
+      return { status: "blocked", errorCode: "scheduled_pipeline_wait_identity_mismatch" }
+    }
+    return "prepareProof" in input && input.scheduledWaitId !== undefined
+      ? { status: "waiting_for_user", waitId: payload.waitId, waitKind: "scheduled_prepare", scheduledWaitId: input.scheduledWaitId }
+      : { status: "waiting_for_user", waitId: payload.waitId, waitKind: "external" }
+  }
   const errorCode = payload.errorCode
   if (response.status >= 400 && response.status < 500 && payload.status === "blocked" && typeof errorCode === "string" && blockedErrors.has(errorCode)) return { status: "blocked", errorCode }
   throw new Error(response.status === 202 ? "scheduled_pipeline_handoff_in_progress" : "scheduled_pipeline_handoff_retryable")
+}
+
+function scheduledWaitEchoMatches(input: HandoffInput, payload: Record<string, unknown>): boolean {
+  if (!("prepareProof" in input)) return true
+  return input.scheduledWaitId === undefined ? !Object.hasOwn(payload, "scheduledWaitId") : payload.scheduledWaitId === input.scheduledWaitId
 }
 
 function validReport(value: unknown): boolean {
@@ -30,4 +70,64 @@ function validReport(value: unknown): boolean {
 
 function validWaitId(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256
+}
+
+function parseAnalyzeCheckpointProof(value: unknown, input: HandoffInput): ScheduledPipelineAnalyzeCheckpointProof | null {
+  const proof = record(value)
+  if (Object.keys(proof).length !== 6 || !["status", "continuationKey", "checkpointDigest", "claimTokenDigest", "executionId", "executionAttemptCount"].every(key => Object.hasOwn(proof, key))
+    || proof.status !== "analyze_checkpointed" || !validId(proof.executionId)
+    || !Number.isSafeInteger(proof.executionAttemptCount) || Number(proof.executionAttemptCount) < 0
+    || typeof proof.checkpointDigest !== "string" || !/^[a-f0-9]{64}$/.test(proof.checkpointDigest)
+    || typeof proof.claimTokenDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(proof.claimTokenDigest)
+    || typeof proof.continuationKey !== "string" || !/^scheduled-taskgraph:sha256:[a-f0-9]{64}$/.test(proof.continuationKey)
+    || !validAttestationBinding(input)) return null
+
+  const expectedKey = scheduledTaskGraphContinuationKey(input.owner, input.attestation, proof.executionId, Number(proof.executionAttemptCount))
+  if (proof.continuationKey !== expectedKey) return null
+  return {
+    status: "analyze_checkpointed",
+    continuationKey: proof.continuationKey,
+    checkpointDigest: proof.checkpointDigest,
+    claimTokenDigest: proof.claimTokenDigest,
+    executionId: proof.executionId,
+    executionAttemptCount: Number(proof.executionAttemptCount),
+  }
+}
+
+function validAttestationBinding(input: HandoffInput): boolean {
+  const { owner, attestation } = input
+  return attestation.schemaVersion === "agent-harness.v2.scheduled-pipeline-attestation.v1"
+    && sameOwner(owner, attestation.owner)
+    && validId(attestation.scout.taskId) && validId(attestation.analyst.taskId)
+    && Number.isSafeInteger(attestation.scout.attemptCount) && attestation.scout.attemptCount > 0
+    && Number.isSafeInteger(attestation.analyst.attemptCount) && attestation.analyst.attemptCount > 0
+    && Number.isSafeInteger(attestation.graphRevision) && attestation.graphRevision > 0
+    && validId(attestation.scout.discoveryReceipt.taskId)
+    && Number.isSafeInteger(attestation.scout.discoveryReceipt.attemptCount) && attestation.scout.discoveryReceipt.attemptCount > 0
+    && [attestation.snapshotDigest, attestation.scout.resultDigest, attestation.analyst.resultDigest,
+      attestation.evidenceDigest, attestation.scout.discoveryReceipt.receiptDigest].every(value => typeof value === "string" && value.length > 0)
+}
+
+function sameOwner(left: ScheduledAutomationPipelineBridgeScope, right: ScheduledAutomationPipelineAttestation["owner"]): boolean {
+  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
+    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
+}
+
+export function scheduledTaskGraphContinuationKey(
+  owner: ScheduledAutomationPipelineBridgeScope,
+  attestation: ScheduledAutomationPipelineAttestation,
+  executionId: string,
+  executionAttemptCount: number,
+): string {
+  const receipt = attestation.scout.discoveryReceipt
+  const evidence = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
+    executionId, executionAttemptCount, attestation.snapshotDigest, attestation.graphRevision,
+    attestation.scout.taskId, attestation.scout.attemptCount, attestation.scout.resultDigest,
+    attestation.analyst.taskId, attestation.analyst.attemptCount, attestation.analyst.resultDigest,
+    attestation.evidenceDigest, receipt.receiptDigest]
+  return `scheduled-taskgraph:sha256:${createHash("sha256").update(JSON.stringify(evidence), "utf8").digest("hex")}`
+}
+
+function validId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value)
 }

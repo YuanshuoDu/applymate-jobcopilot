@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { adaptLegacyRoleResult } from "./legacy-adapter.js"
-import { ROLE_RESULT_SCHEMA, validateRoleResult, RoleResultValidationError } from "./role-results.js"
+import { ROLE_RESULT_SCHEMA, roleResultOutputSchema, structuredRoleOutputGuidance, validateRoleResult, RoleResultValidationError } from "./role-results.js"
 
 const evidence = [{ id: "ev-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }]
 
@@ -139,4 +139,70 @@ describe("structured cover letter artifact results", () => {
     { name: "unbounded review findings", value: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "passed", reviewHash: `sha256:${"c".repeat(64)}`, findings: ["details"] } },
     { name: "unknown review status", value: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "invented", reviewHash: `sha256:${"c".repeat(64)}` } },
   ])("rejects $name", ({ value }) => expectInvalidShape(value))
+})
+
+describe("structured scheduled Prepare results", () => {
+  const artifactRef = { artifactId: "artifact-resume-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+  const validPrepareResult = () => ({
+    schemaVersion: ROLE_RESULT_SCHEMA,
+    role: "prepare",
+    status: "completed",
+    taskId: "prepare-task-1",
+    attemptCount: 2,
+    snapshotDigest: `sha256:${"c".repeat(64)}`,
+    checkpointDigest: "d".repeat(64),
+    jobs: [{ jobId: "job-1", status: "prepared" }, { jobId: "job-2", status: "skipped" }],
+    materials: [{ jobId: "job-1", kind: "resume", artifactRef }],
+  })
+
+  it("accepts only status, binding digests, and immutable material references", () => {
+    expect(validateRoleResult(validPrepareResult(), "prepare")).toEqual(validPrepareResult())
+    expect(roleResultOutputSchema("prepare")).toMatchObject({
+      properties: {
+        role: { const: "prepare" }, taskId: { type: "string" }, attemptCount: { minimum: 1 }, jobs: { maxItems: 50 },
+        materials: { maxItems: 100, items: { properties: { artifactRef: { properties: { artifactId: { maxLength: 128 } } } } } },
+      },
+      additionalProperties: false,
+    })
+    const guidance = structuredRoleOutputGuidance("prepare", { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" })
+    expect(guidance).toContain("scheduled.application.prepare")
+    expect(guidance).toContain("server independently rebinds task, attempt, job IDs")
+    expect(guidance).toContain("Never include scores")
+  })
+
+  it("accepts the completed zero-eligible-jobs result", () => {
+    expect(validateRoleResult({
+      ...validPrepareResult(), jobs: [], materials: [],
+    }, "prepare")).toMatchObject({ role: "prepare", status: "completed", taskId: "prepare-task-1", attemptCount: 2, jobs: [], materials: [] })
+  })
+
+  it("rejects sparse job arrays and enumerable array extras", () => {
+    const sparse = new Array<unknown>(2)
+    sparse[1] = { jobId: "job-1", status: "prepared" }
+    const withExtra: unknown[] = [{ jobId: "job-1", status: "prepared" }]
+    Object.assign(withExtra, { status: "failed" })
+    expectInvalidShape({ ...validPrepareResult(), jobs: sparse })
+    expectInvalidShape({ ...validPrepareResult(), jobs: withExtra })
+  })
+
+  it.each([
+    ["model score", { ...validPrepareResult(), jobs: [{ jobId: "job-1", status: "prepared", score: 95 }] }],
+    ["missing task binding", (() => { const { taskId: _taskId, ...value } = validPrepareResult(); return value })()],
+    ["missing attempt binding", (() => { const { attemptCount: _attemptCount, ...value } = validPrepareResult(); return value })()],
+    ["invalid attempt binding", { ...validPrepareResult(), attemptCount: 0 }],
+    ["user identity", { ...validPrepareResult(), userId: "user-1" }],
+    ["schedule configuration", { ...validPrepareResult(), config: { minScore: 70 } }],
+    ["resume body", { ...validPrepareResult(), materials: [{ jobId: "job-1", kind: "resume", artifactRef, content: "private resume" }] }],
+    ["letter body", { ...validPrepareResult(), letter: "private letter" }],
+    ["unknown job binding", { ...validPrepareResult(), materials: [{ jobId: "job-3", kind: "resume", artifactRef }] }],
+    ["material for skipped job", { ...validPrepareResult(), materials: [{ jobId: "job-2", kind: "resume", artifactRef }] }],
+    ["duplicate job", { ...validPrepareResult(), jobs: [{ jobId: "job-1", status: "prepared" }, { jobId: "job-1", status: "skipped" }] }],
+    ["duplicate artifact kind", { ...validPrepareResult(), materials: [{ jobId: "job-1", kind: "resume", artifactRef }, { jobId: "job-1", kind: "resume", artifactRef }] }],
+    ["invalid job status", { ...validPrepareResult(), jobs: [{ jobId: "job-1", status: "ready" }] }],
+    ["failed result marked completed", { ...validPrepareResult(), jobs: [{ jobId: "job-1", status: "failed" }] }],
+    ["partial result without failed job", { ...validPrepareResult(), status: "partial" }],
+    ["malformed checkpoint digest", { ...validPrepareResult(), checkpointDigest: `sha256:${"d".repeat(64)}` }],
+    ["malformed snapshot digest", { ...validPrepareResult(), snapshotDigest: "c".repeat(64) }],
+    ["malformed material reference", { ...validPrepareResult(), materials: [{ jobId: "job-1", kind: "resume", artifactRef: { ...artifactRef, sourceDigest: "arbitrary" } }] }],
+  ])("rejects %s", (_name, value) => expectInvalidShape(value))
 })

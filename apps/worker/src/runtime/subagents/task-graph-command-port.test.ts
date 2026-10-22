@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { TaskGraphCommandError, parseRegisteredScoutEnvelope, parseTaskGraphVerificationReport, taskGraphNodeKeysMatch } from "./task-graph-command-port.js"
-import type { TaskGraphCommandPort, TaskGraphExecutionScope } from "./task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphExecutionScope, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
 import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
 
@@ -24,6 +24,21 @@ describe("TaskGraphCommandError", () => {
     expect(error.name).toBe("TaskGraphCommandError")
     expect(error.code).toBe("idempotency_conflict")
     expect(error.currentRevision).toBeUndefined()
+  })
+})
+
+describe("scheduled Prepare receipt", () => {
+  it("distinguishes required choice waits from the persisted no-choice path", () => {
+    const waiting: TaskGraphScheduledPrepareReceipt = {
+      status: "waiting_for_choice", revision: 7, nodes: [], readyTaskIds: [],
+      choice: { required: true, status: "waiting", waitId: "agent-question:turn:canonical:wait" },
+    }
+    const noChoice: TaskGraphScheduledPrepareReceipt = {
+      status: "accepted", revision: 8, nodes: [], readyTaskIds: [], choice: { required: false },
+    }
+
+    expect(waiting.choice).toEqual({ required: true, status: "waiting", waitId: "agent-question:turn:canonical:wait" })
+    expect(noChoice.choice).toEqual({ required: false })
   })
 })
 

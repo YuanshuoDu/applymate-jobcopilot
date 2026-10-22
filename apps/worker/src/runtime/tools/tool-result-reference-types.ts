@@ -1,12 +1,17 @@
 import { createHash } from "node:crypto"
-import { canonicalJson, redactSensitiveValue } from "@jobcopilot/shared"
+import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobcopilot/shared"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
+import { validateRoleResult, type PrepareResult } from "../subagents/role-results.js"
 import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 
 export const MAX_TOOL_RESULT_BYTES = 1024 * 1024
 export const MAX_TOOL_RESULT_READ_BYTES = 4096
+const SCHEDULED_PREPARE_TOOL = "scheduled.application.prepare"
+const PREPARE_TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const PREPARE_JOB_ID = /^c[a-z0-9]{24}$/
+const PREPARE_ARTIFACT_ID = /^scheduled-draft:[a-f0-9]{64}$/
 declare const canonicalSource: unique symbol
 export type CanonicalToolSourceName = string & { readonly [canonicalSource]: true }
 
@@ -62,7 +67,8 @@ export class ToolResultSanitizationError extends Error {
   constructor(readonly code: "tool_result_invalid_json" | "tool_result_corrupt") { super(code) }
 }
 
-function sanitizeSource(value: unknown, toolName: CanonicalToolSourceName): RepositoryJsonValue {
+function sanitizeSource(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number): RepositoryJsonValue {
+  if (toolName === SCHEDULED_PREPARE_TOOL) return projectScheduledPrepareLifecycleOutput(value, expectedTaskId, expectedAttemptCount)
   if (toolName === "agent.wait" || toolName === "wait_subagents") return redactDurableWaitOutput(value)
   if (toolName === "jobs.search" || toolName === "jobs.get" || toolName === "jobs.discover") return redactJobReadOutput(toolName, value)
   return redactSensitiveValue(value)
@@ -75,16 +81,82 @@ function prepareJson(value: RepositoryJsonValue): PreparedToolResult {
   } catch { throw new ToolResultSanitizationError("tool_result_invalid_json") }
 }
 
-export function prepareToolResultJson(value: unknown, toolName: CanonicalToolSourceName): PreparedToolResult {
-  try { return prepareJson(sanitizeSource(value, toolName)) }
+export function prepareToolResultJson(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number): PreparedToolResult {
+  try { return prepareJson(sanitizeSource(value, toolName, expectedTaskId, expectedAttemptCount)) }
   catch { throw new ToolResultSanitizationError("tool_result_invalid_json") }
+}
+
+/** Rebuilds only the verified scheduled Prepare receipt, preserving its safe artifact digests. */
+export function projectScheduledPrepareLifecycleOutput(value: unknown, expectedTaskId?: string, expectedAttemptCount?: number): RepositoryJsonValue {
+  if (!isPlainScheduledPrepareData(value)) throw invalidScheduledPrepareOutput()
+  let result: PrepareResult
+  try { result = validateRoleResult(value, "prepare") }
+  catch { throw invalidScheduledPrepareOutput() }
+  const taskIdFence = expectedTaskId === undefined ? result.taskId : expectedTaskId
+  const safeIdentifier = (identifier: string) => identifier.trim() === identifier && redactSensitiveText(identifier) === identifier
+  if (typeof taskIdFence !== "string" || result.taskId !== taskIdFence
+    || expectedAttemptCount !== undefined && (!Number.isSafeInteger(expectedAttemptCount) || expectedAttemptCount < 1 || result.attemptCount !== expectedAttemptCount)
+    || !safePrepareTaskId(result.taskId)
+    || result.jobs.some(job => !PREPARE_JOB_ID.test(job.jobId) || !safeIdentifier(job.jobId))
+    || result.materials.some(material => !PREPARE_JOB_ID.test(material.jobId) || !safeIdentifier(material.jobId)
+      || !safeScheduledDraftArtifactId(material.artifactRef.artifactId))) throw invalidScheduledPrepareOutput()
+  return {
+    schemaVersion: result.schemaVersion, role: result.role, status: result.status, taskId: result.taskId,
+    attemptCount: result.attemptCount, snapshotDigest: result.snapshotDigest, checkpointDigest: result.checkpointDigest,
+    jobs: result.jobs.map(job => ({ jobId: job.jobId, status: job.status })),
+    materials: result.materials.map(material => ({
+      jobId: material.jobId, kind: material.kind,
+      artifactRef: { artifactId: material.artifactRef.artifactId, version: material.artifactRef.version,
+        contentHash: material.artifactRef.contentHash, sourceDigest: material.artifactRef.sourceDigest },
+    })),
+  }
+}
+
+function safePrepareTaskId(value: string): boolean {
+  // Only a valid generated subagent UUID may bypass the text redactor's phone false positive.
+  const stable = PREPARE_TASK_ID.test(value) ? value.replace(PREPARE_TASK_ID, "subagent-opaque") : ""
+  return stable !== "" && redactSensitiveText(stable) === stable
+}
+
+function safeScheduledDraftArtifactId(value: string): boolean {
+  // Only the exact generated artifact digest format may bypass numeric redaction false positives.
+  const stable = PREPARE_ARTIFACT_ID.test(value) ? value.replace(PREPARE_ARTIFACT_ID, "scheduled-draft:opaque") : ""
+  return stable !== "" && redactSensitiveText(stable) === stable
+}
+
+function invalidScheduledPrepareOutput(): Error { return new Error("scheduled_prepare_lifecycle_output_invalid") }
+
+function isPlainScheduledPrepareData(value: unknown, active = new Set<object>(), depth = 0): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number" && Number.isFinite(value)) return true
+  if (typeof value !== "object" || depth > 16 || active.has(value)) return false
+  active.add(value); try {
+    const array = Array.isArray(value), prototype = Object.getPrototypeOf(value)
+    if (array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) return false
+    const keys = Reflect.ownKeys(value), stringKeys = keys as string[]
+    if (keys.some(key => typeof key !== "string") || array && (keys.length !== (value as unknown[]).length + 1
+      || stringKeys.some(key => key !== "length" && !/^(0|[1-9]\d*)$/.test(key)))) return false
+    for (const key of stringKeys) {
+      if (array && key === "length") continue
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor?.enumerable || !("value" in descriptor) || !isPlainScheduledPrepareData(descriptor.value, active, depth + 1)) return false
+    }
+    return true
+  } catch { return false } finally { active.delete(value) }
 }
 
 function matchesStored(value: ToolResultReferenceRecord, safe: PreparedToolResult): boolean {
   return safe.sha256 === value.sha256 && safe.bytes === value.byteCount && safe.encoded === canonicalJson(value.sanitizedJson)
 }
 
-export function verifyToolResultSanitization(value: ToolResultReferenceRecord, toolName: CanonicalToolSourceName): RepositoryJsonValue {
+export function verifyToolResultSanitization(value: ToolResultReferenceRecord, toolName: CanonicalToolSourceName, expectedAttemptCount?: number): RepositoryJsonValue {
+  if (toolName === SCHEDULED_PREPARE_TOOL) {
+    try {
+      if (typeof value.taskId !== "string") throw new Error("scheduled_prepare_task_fence_missing")
+      const safe = prepareToolResultJson(value.sanitizedJson, toolName, value.taskId, expectedAttemptCount)
+      if (safe.bytes <= MAX_TOOL_RESULT_BYTES && matchesStored(value, safe)) return safe.value
+    } catch { /* Prepare references must be valid under their stored task fence. */ }
+    throw new ToolResultSanitizationError("tool_result_corrupt")
+  }
   try {
     const safe = prepareToolResultJson(value.sanitizedJson, toolName)
     if (matchesStored(value, safe)) return safe.value
@@ -101,9 +173,14 @@ export function matchesVerifiedToolResultRetry(
   sourcePrepared: PreparedToolResult,
   retryInput: unknown,
   toolName: CanonicalToolSourceName,
+  expectedAttemptCount?: number,
 ): boolean {
-  try { verifyToolResultSanitization(value, toolName) } catch { return false }
+  try { verifyToolResultSanitization(value, toolName, expectedAttemptCount) } catch { return false }
   if (matchesStored(value, sourcePrepared)) return true
+  if (toolName === SCHEDULED_PREPARE_TOOL) {
+    try { return matchesStored(value, prepareToolResultJson(retryInput, toolName, value.taskId, expectedAttemptCount)) }
+    catch { return false }
+  }
   try { return matchesStored(value, prepareJson(redactSensitiveValue(retryInput))) }
   catch { return false }
 }

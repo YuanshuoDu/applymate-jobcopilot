@@ -8,6 +8,7 @@ import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type StoredTaskGraphNod
 import { parseStoredTaskGraphVerificationReport, publicTaskGraphVerificationReport, type TaskGraphStoredVerificationReport } from "./task-graph-verification-report.js"
 import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "./task-graph-command-port.js"
 import type { TaskGraphPgVerificationResult, TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
+import { projectScheduledAnalyzePrefix } from "./scheduled-automation-prepare-bridge.js"
 
 export const SCHEDULED_PIPELINE_ATTESTATION_SCHEMA = "agent-harness.v2.scheduled-pipeline-attestation.v1" as const
 export type ScheduledAutomationPipelineOwner = Readonly<{
@@ -41,8 +42,7 @@ export type ScheduledAutomationPipelineBlockReason =
 export type ScheduledAutomationPipelineBridgeResult =
   | Readonly<{ status: "blocked"; reasonCode: ScheduledAutomationPipelineBlockReason }>
   | Readonly<{ status: "ready"; attestation: ScheduledAutomationPipelineAttestation }>
-export type ScheduledAutomationPipelineBridgeScope = ScheduledAutomationPipelineOwner
-type ScheduledAutomationPipelineScope = ScheduledAutomationPipelineBridgeScope
+export type ScheduledAutomationPipelineBridgeScope = ScheduledAutomationPipelineOwner; type ScheduledAutomationPipelineScope = ScheduledAutomationPipelineBridgeScope
 
 export type ScheduledAutomationPersistedTurn = Readonly<{
   userId: string; sessionId: string; turnId: string; rootTaskId: string; source: unknown; executionMode: unknown; input: unknown
@@ -75,8 +75,7 @@ export type ScheduledAutomationPipelineBridgeDependencies = Readonly<{
   }>): Promise<TaskGraphPgVerificationResult>
 }>
 
-type Row = Record<string, unknown>
-type NodeEvidence = { node: StoredTaskGraphNode; current: TaskGraphCurrentNode; task: ScheduledAutomationPersistedTask; envelope: Row; report: TaskGraphStoredVerificationReport }
+type Row = Record<string, unknown>; type NodeEvidence = { node: StoredTaskGraphNode; current: TaskGraphCurrentNode; task: ScheduledAutomationPersistedTask; envelope: Row; report: TaskGraphStoredVerificationReport }
 
 /** Builds the JSON-safe bridge for the Web continuation; no model-supplied Job objects or legacy scores cross this boundary. */
 export function createScheduledAutomationPipelineBridge(dependencies: ScheduledAutomationPipelineBridgeDependencies) {
@@ -89,7 +88,9 @@ export function createScheduledAutomationPipelineBridge(dependencies: ScheduledA
       if (!scheduledSnapshot) return blocked("scheduled_canonical_turn_required")
       const snapshot = parseSnapshot(state.snapshot)
       if (!snapshot) return blocked("scheduled_snapshot_invalid")
-      const graph = graphNodes(snapshot, state.current, state.tasks, scope)
+      const prefix = projectScheduledAnalyzePrefix(snapshot, state.current, state.tasks)
+      if (!prefix) return blocked("task_graph_incomplete")
+      const graph = graphNodes(prefix.snapshot, prefix.current, prefix.tasks, scope)
       if (!graph) return blocked("task_graph_incomplete")
       const scout = graph.find(item => item.node.templateId === "scout")
       const analyst = graph.find(item => item.node.templateId === "analyst")
@@ -117,11 +118,11 @@ export function createScheduledAutomationPipelineBridge(dependencies: ScheduledA
       const graphDigest = digest(snapshot)
       const stable = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount }
       const publicScout = publicTaskGraphVerificationReport(scout.report), publicAnalyst = publicTaskGraphVerificationReport(analyst.report)
-      const evidenceDigest = digest({ owner: stable, snapshotDigest, graphDigest, graphRevision: state.current.revision, receipt: receipt.receiptDigest,
+      const evidenceDigest = digest({ owner: stable, snapshotDigest, graphDigest, graphRevision: prefix.current.revision, receipt: receipt.receiptDigest,
         scout: { taskId: scout.task.id, attemptCount: scout.task.attemptCount, report: publicScout },
         analyst: { taskId: analyst.task.id, attemptCount: analyst.task.attemptCount, report: publicAnalyst, bindings: analyst.report.dependencyBindings } })
       return { status: "ready", attestation: {
-        schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_SCHEMA, owner, snapshotDigest, graphRevision: state.current.revision,
+        schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_SCHEMA, owner, snapshotDigest, graphRevision: prefix.current.revision,
         scout: { taskId: scout.task.id, attemptCount: scout.task.attemptCount, status: "completed", verification: "passed",
           resultDigest: scout.report.resultDigest!, candidateJobIds, discoveryReceipt: receipt },
         analyst: { taskId: analyst.task.id, attemptCount: analyst.task.attemptCount, status: "completed", verification: "passed",

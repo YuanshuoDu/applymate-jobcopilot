@@ -7,6 +7,7 @@ import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
 import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
+import type { ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
@@ -51,6 +52,26 @@ describe("worker tool runtime entry point", () => {
     expect(enabled.registry.validateArguments("jobs.discover", { targetRoles: ["Engineer"], targetLocations: [], userId: "forged" })).not.toBe(true)
   })
 
+  it("registers scheduled Prepare only when its server-owned provider is explicitly supplied", () => {
+    const disabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink() })
+    expect(() => disabled.registry.resolve("scheduled.application.prepare", "1")).toThrow("not registered")
+
+    const scheduledPrepare = {
+      loadVerifiedInvocation: async () => { throw new Error("fixture_not_executed") },
+      resolveResumeTailoringChoice: async () => { throw new Error("fixture_not_executed") },
+      prepareJob: async () => { throw new Error("fixture_not_executed") },
+    }
+    const enabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink() }, undefined, undefined, undefined, undefined, undefined, undefined,
+      scheduledPrepare,
+    )
+    expect(enabled.registry.resolve("scheduled.application.prepare", "1")).toMatchObject({
+      risk: "draft_write", domain: "resume", capabilities: ["read", "write"], requiredCapabilities: [],
+    })
+    expect(enabled.registry.validateArguments("scheduled.application.prepare", {})).toBe(true)
+    expect(enabled.registry.validateArguments("scheduled.application.prepare", { jobIds: ["model-selected-job"] })).not.toBe(true)
+  })
+
   it("registers the durable private-result read tool with the runtime owner resolver", () => {
     const runtime = createWorkerToolRuntime(
       {} as never,
@@ -58,6 +79,13 @@ describe("worker tool runtime entry point", () => {
     )
 
     expect(runtime.registry.resolve("tool_results.read", "1")).toMatchObject({ risk: "read", domain: "coordination" })
+  })
+
+  it("exposes the same durable result repository used by lifecycle and private reads", () => {
+    const durableResults = { put: vi.fn(), read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const runtime = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), durableResults })
+
+    expect(runtime.durableResults).toBe(durableResults)
   })
 
   it("keeps all coordination definitions out of the registry unless the trusted gate supplies them", () => {

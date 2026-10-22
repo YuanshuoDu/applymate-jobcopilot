@@ -7,13 +7,16 @@ import { executionOwnerFence } from "../execution-owner.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
-import { ROLE_RESULT_SCHEMA, roleResultOutputSchema, type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
+import { type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
+import { expectedStructuredRole } from "./production-child-policy.js"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
 import { TaskGraphWriterReviewFeedbackError } from "./task-graph-writer-review-feedback.js"
 import type { TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, recordReadToolOutput } from "./child-evidence.js"
 import { parseAndBindStructuredResultOutcome } from "./child-structured-result-outcome.js"
+import { structuredResultOutputSchema } from "./child-structured-result-outcome.js"
+import { parseScheduledPrepareReference, resolveScheduledPrepareResumeEvidence, type ScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
 import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, type PrivateArtifactToolContext } from "./child-private-artifact.js"
 import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, selectedJobToolAllowed, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
 import { dispatchNativeVerificationTask } from "./native-verification-executor.js"
@@ -41,6 +44,7 @@ export type ChildToolRuntime = {
   readonly serverContext?: unknown
   readonly discoveryAttemptSidecar?: () => DiscoveryAttemptSidecar | undefined
   readonly discoveryRecoverySidecar?: () => DiscoveryRecoverySnapshot | undefined
+  readonly resolveScheduledPrepareReference?: ScheduledPrepareReferenceResolver
   /** Private scoped tools bypass normal lifecycle persistence; only their ref receipt is persisted. */
   readonly executePrivateTool?: (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
   readonly validateArguments?: (name: string, input: unknown, version?: string) => true | string
@@ -66,19 +70,6 @@ function projectChildFinalText(value: string): string {
   if (Buffer.byteLength(redacted, "utf8") <= MAX_CHILD_FINAL_TEXT_BYTES) return redacted
   const markerBytes = Buffer.byteLength(CHILD_FINAL_TEXT_TRUNCATION_MARKER, "utf8")
   return `${utf8Prefix(redacted, MAX_CHILD_FINAL_TEXT_BYTES - markerBytes)}${CHILD_FINAL_TEXT_TRUNCATION_MARKER}`
-}
-
-function expectedStructuredRole(value: unknown, leasedRole: string): StructuredRole | undefined {
-  if (leasedRole !== "scout" && leasedRole !== "analyst" && leasedRole !== "writer" && leasedRole !== "reviewer" || !value || typeof value !== "object" || Array.isArray(value)) return undefined
-  try {
-    const marker = value as Record<string, unknown>
-    const prototype = Object.getPrototypeOf(value)
-    if ((prototype !== Object.prototype && prototype !== null) || Object.getOwnPropertySymbols(value).length > 0) return undefined
-    if (Object.keys(marker).length !== 2 || marker.schemaVersion !== ROLE_RESULT_SCHEMA || marker.role !== leasedRole) return undefined
-    return leasedRole
-  } catch {
-    return undefined
-  }
 }
 
 export type ChildExecutorOptions = {
@@ -189,7 +180,13 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
         const restored = await options.resumeLoader(lease)
         if (restored) {
           if (!selectedEvidenceTask) {
-            try { hydrateObservedEvidence(observedEvidence, restored.observations) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
+            try {
+              const prepare = await resolveScheduledPrepareResumeEvidence(restored.observations, runtime.resolveScheduledPrepareReference, lease.id, lease.attemptCount)
+              const evidence = restored.observations.filter(item => record(item.content).toolName !== "scheduled.application.prepare")
+              hydrateObservedEvidence(observedEvidence, evidence, { taskId: lease.id, attemptCount: lease.attemptCount })
+              for (const item of prepare) recordReadToolOutput(observedEvidence, "scheduled.application.prepare", item.result, undefined,
+                { toolCallId: item.toolCallId, taskId: lease.id, attemptCount: lease.attemptCount, ...(item.reference ? { reference: item.reference } : {}) })
+            } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
             snapshot = { ...snapshot, toolObservations: [...restored.observations] }
           }
           resume = restored.resume
@@ -228,7 +225,19 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const executeTool: typeof routedTool = async input => {
       if (selectedJobPreparation && isSelectedJobReadTool(input.call.toolName)) privateCallIds.add(input.call.id)
       const toolResult = await dispatchTool(input)
-      if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
+      if (toolResult.status === "completed" && toolResult.errorCode === null) {
+        let output = toolResult.output, reference: import("./child-scheduled-prepare-reference.js").ScheduledPrepareReference | undefined
+        const prepare = input.call.toolName === "scheduled.application.prepare"
+        if (prepare && Object.hasOwn(record(output), "$ref")) {
+          try {
+            const resolved = await runtime.resolveScheduledPrepareReference?.({ output, originalToolCallId: input.call.id, expectedTaskId: lease.id, expectedAttemptCount: lease.attemptCount })
+            if (!resolved) return toolResult
+            output = resolved.result; reference = resolved.reference
+          } catch { return toolResult }
+        }
+        recordReadToolOutput(observedEvidence, input.call.toolName, output, undefined,
+          prepare ? { toolCallId: input.call.id, taskId: lease.id, attemptCount: lease.attemptCount, ...(reference ? { reference } : {}) } : undefined)
+      }
       return toolResult
     }
     const contextBuilder = createChildContextBuilder(
@@ -248,7 +257,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       resume,
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
-      ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: roleResultOutputSchema(structuredRole) } : {}),
+      ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: structuredResultOutputSchema(structuredRole) } : {}),
     })
     const childResult = {
       status: result.status,
@@ -266,12 +275,15 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     if (result.status === "completed" && structuredRole) {
       const finalText = result.finalText, outcome = parseAndBindStructuredResultOutcome(finalText, structuredRole, observedEvidence)
-      if (outcome.kind === "invalid") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), status: "failed" as const, ...((structuredRole === "scout" || structuredRole === "analyst") && outcome.category ? { structuredOutputFailureCategory: outcome.category } : {}) }, failureReason: "invalid_structured_result" }
+      if (outcome.kind === "invalid") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), status: "failed" as const, ...((structuredRole === "scout" || structuredRole === "analyst" || structuredRole === "prepare") && outcome.category ? { structuredOutputFailureCategory: outcome.category } : {}) }, failureReason: "invalid_structured_result" }
       if (typeof finalText !== "string") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), status: "failed" as const }, failureReason: "invalid_structured_result" }; const structuredResult = outcome.result
       const selectedEvidenceRole = Boolean(selectedJobPreparation && (structuredRole === "scout" || structuredRole === "analyst"))
       const safeStructuredResult = selectedEvidenceRole ? redactSelectedEvidenceResult(structuredResult, runtime.selectedJobArtifactContext!) : structuredResult
-      const safeFinalText = selectedJobPreparation ? JSON.stringify(safeStructuredResult) : finalText
-      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), finalText: projectChildFinalText(safeFinalText), structuredResult: safeStructuredResult }, failureReason: result.errorCode }
+      let safeFinalText = projectChildFinalText(selectedJobPreparation ? JSON.stringify(safeStructuredResult) : finalText)
+      if (structuredRole === "prepare") {
+        try { safeFinalText = JSON.stringify(parseScheduledPrepareReference(JSON.parse(finalText))) } catch { /* Inline Prepare text uses the generic redactor. */ }
+      }
+      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), finalText: safeFinalText, structuredResult: safeStructuredResult }, failureReason: result.errorCode }
     }
     const status = resultStatus(result.status)
     return {

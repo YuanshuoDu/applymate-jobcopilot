@@ -65,7 +65,7 @@ export function rebindScheduledTaskGraphClaimForLease(input: {
   let priorKey: string;
   try { priorKey = scheduledTaskGraphContinuationKey(priorOwner, attestationForOwner(input.attestation, priorOwner)); }
   catch { return null; }
-  if (claim.key !== priorKey) return null;
+  if (claim.key !== priorKey || input.key !== priorKey) return null;
   const marker = objectRow(state.scheduledTaskGraphContinuation);
   if (state.scheduledTaskGraphContinuation !== undefined) {
     const prior = priorScheduledTaskGraphContinuation(input);
@@ -80,10 +80,10 @@ export function rebindScheduledTaskGraphClaimForLease(input: {
 }
 
 function attestationForOwner(value: unknown, owner: ScheduledTaskGraphPipelineOwner): unknown {
-  const attestation = objectRow(value);
-  if (!attestation) return value;
-  const { userId, sessionId, turnId, rootTaskId, rootAttemptCount, turnLeaseOwnerId, turnLeaseVersion } = owner;
-  return { ...attestation, owner: { userId, sessionId, turnId, rootTaskId, rootAttemptCount, turnLeaseOwnerId, turnLeaseVersion } };
+  const attestation = objectRow(value), prior = objectRow(attestation?.owner);
+  if (!attestation || !prior || prior.userId !== owner.userId || prior.sessionId !== owner.sessionId || prior.turnId !== owner.turnId
+    || prior.rootTaskId !== owner.rootTaskId || prior.rootAttemptCount !== owner.rootAttemptCount) return value;
+  return { ...attestation, owner: { ...prior, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion } };
 }
 function validPersistedClaim(claim: Record<string, unknown>): boolean {
   return Object.keys(claim).length === 6 && ["schemaVersion", "key", "claimToken", "owner", "claimedAt", "leaseExpiresAt"].every(key => Object.hasOwn(claim, key))
@@ -242,7 +242,7 @@ export function rebindScheduledTaskGraphWaitState(input: {
   if (!state || !marker || !claim || !priorOwner || !sameStableOwner(priorOwner, input.owner)
     || !PIPELINE_STAGES.has(String(state.nextStage)) || !Array.isArray(state.scoutedJobs) || !Array.isArray(state.scoredJobs)
     || !Number.isSafeInteger(state.analysisFailed) || Number(state.analysisFailed) < 0
-    || marker.schemaVersion !== CONTINUATION_SCHEMA || !validId(marker.key)
+    || marker.schemaVersion !== CONTINUATION_SCHEMA || !validId(marker.key) || input.key !== marker.key
     || !scheduledTaskGraphOwnerMatches(claim.owner, priorOwner) || claim.key !== marker.key || claim.schemaVersion !== CLAIM_SCHEMA
     || !isSnapshotDigest(marker.snapshotDigest) || !isDigest(marker.evidenceDigest) || !positiveInteger(marker.graphRevision)
     || marker.snapshotDigest !== input.snapshotDigest || marker.evidenceDigest !== input.evidenceDigest

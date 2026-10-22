@@ -6,7 +6,7 @@ import {
 
 import type { ExecutionOwner } from "../execution-owner.js"
 import { MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES, type ToolResultChunk, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
-import { prepareDurableWaitOutput, prepareLifecycleValue, prepareSafeValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type PreparedLifecycleValue, type ToolResultReferenceStore } from "./redaction.js"
+import { prepareDurableWaitOutput, prepareLifecycleValue, prepareSafeValue, prepareScheduledPrepareLifecycleOutput, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type PreparedLifecycleValue, type ToolResultReferenceStore } from "./redaction.js"
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
@@ -56,7 +56,6 @@ export interface ToolLifecycleOptions {
   readonly maxEventBytes?: number
   readonly now?: () => string
 }
-
 export class ToolLifecycle {
   private readonly now: () => string
   private readonly maxEventBytes: number
@@ -178,6 +177,13 @@ export class ToolLifecycle {
       } catch {
         throw new ToolExecutionError("durable_wait_receipt_invalid", "Durable wait receipt is invalid")
       }
+    } else if (call.toolName === "scheduled.application.prepare") {
+      try {
+        if (!call.taskId) throw new Error("scheduled_prepare_task_id_missing")
+        prepared = prepareScheduledPrepareLifecycleOutput(output, call.taskId)
+      } catch {
+        throw new ToolExecutionError("scheduled_prepare_lifecycle_output_invalid", "Scheduled Prepare output is invalid")
+      }
     } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get" || call.toolName === "jobs.discover") {
       prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
     } else if (call.toolName === "tool_results.read") {
@@ -209,7 +215,8 @@ export class ToolLifecycle {
         toolCallId: call.id,
         value: prepared.safe,
       })
-      return { $ref: record.id, sizeBytes: record.byteCount, sha256: record.sha256 }
+      const reference = { $ref: record.id, sizeBytes: record.byteCount, sha256: record.sha256 }
+      return reference
     } catch (error: unknown) {
       if (error instanceof ToolExecutionError) throw error
       const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"

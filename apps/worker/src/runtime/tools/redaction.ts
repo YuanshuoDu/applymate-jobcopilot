@@ -4,6 +4,7 @@ import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobco
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
 import { nativeCoordinationLifecycleOutput } from "./task-graph-coordination-bridge.js"
+import { projectScheduledPrepareLifecycleOutput } from "./tool-result-reference-types.js"
 export const DEFAULT_MAX_LIFECYCLE_BYTES = 8 * 1024
 
 export interface ToolResultReference {
@@ -44,6 +45,12 @@ export type PreparedLifecycleValue = {
 export function prepareLifecycleValue(value: unknown): PreparedLifecycleValue {
   const safe = redactSensitiveValue(value)
   return prepareSafeValue(safe)
+}
+
+/** Preserves only the validated, server-generated Prepare receipt fields needed by its caller. */
+export function prepareScheduledPrepareLifecycleOutput(value: unknown, expectedTaskId: string): PreparedLifecycleValue {
+  try { return prepareSafeValue(projectScheduledPrepareLifecycleOutput(value, expectedTaskId)) }
+  catch { throw invalidScheduledPrepareLifecycleOutput() }
 }
 
 const PLAN_RECEIPT_FIELDS = ["status", "revision", "nodes", "readyTaskIds"] as const
@@ -236,3 +243,5 @@ function invalidSpawnReceipt(): Error {
 function invalidPlanReceipt(): Error {
   return new Error("task_graph_receipt_invalid")
 }
+
+function invalidScheduledPrepareLifecycleOutput(): Error { return new Error("scheduled_prepare_lifecycle_output_invalid") }

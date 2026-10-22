@@ -4,8 +4,9 @@ import { canonicalJson, redactSensitiveValue } from "@jobcopilot/shared"
 
 import type { SubagentLease } from "../subagents/types.js"
 import type { TurnLease } from "../turns/lease.js"
-import { MAX_TOOL_RESULT_BYTES } from "./tool-result-reference-types.js"
+import { MAX_TOOL_RESULT_BYTES, prepareToolResultJson, type CanonicalToolSourceName } from "./tool-result-reference-types.js"
 import { createToolResultReferenceRepository, isVerifiedToolResultChunk, ToolResultRepositoryError } from "./tool-result-reference-repo.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 const now = new Date("2026-09-08T03:00:00.000Z")
 const turn: TurnLease = {
@@ -36,6 +37,9 @@ function fakePool(options: {
   sessionStatus?: string
   sessionUserId?: string
   sourceToolNames?: string[]
+  sourceAttemptCount?: number
+  sourceRole?: string
+  sourceTaskType?: string
 } = {}) {
   let stored: StoredRow | undefined = options.historical
   const queries: Array<{ text: string; values: readonly unknown[] }> = []
@@ -46,7 +50,8 @@ function fakePool(options: {
       if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("set_config")) return { rows: [], rowCount: 0 } as { rows: T[]; rowCount: number }
       if (text.includes('FROM "agent_items" AS item')) {
         const scoped = values[0] === "session-1" && values[5] === "user-1"
-        const rows = scoped ? (options.sourceToolNames ?? ["test.tool"]).slice(0, 2).map(toolName => ({ toolName })) : []
+        const rows = scoped ? (options.sourceToolNames ?? ["test.tool"]).slice(0, 2).map(toolName => ({ toolName,
+          taskAttemptCount: options.sourceAttemptCount ?? 1, role: options.sourceRole ?? "reader", taskType: options.sourceTaskType ?? "read" })) : []
         return { rows, rowCount: rows.length } as { rows: T[]; rowCount: number }
       }
       if (text.includes('FROM "agent_sessions"')) {
@@ -60,7 +65,8 @@ function fakePool(options: {
         return { rows: matches ? [{ id: "step-1" }] : [], rowCount: matches ? 1 : 0 } as { rows: T[]; rowCount: number }
       }
       if (text.includes('FROM "sub_agent_tasks" task')) {
-        const allowed = options.childRootTurnStatus === undefined || ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"].includes(options.childRootTurnStatus)
+        const currentAttempt = options.sourceAttemptCount === undefined || values[5] === options.sourceAttemptCount
+        const allowed = currentAttempt && (options.childRootTurnStatus === undefined || ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"].includes(options.childRootTurnStatus))
         return { rows: allowed ? [{ id: String(values[0]) }] : [], rowCount: allowed ? 1 : 0 } as { rows: T[]; rowCount: number }
       }
       if (text.includes('FROM "sub_agent_tasks" root')) return { rows: [{ id: "root-current" }], rowCount: 1 } as { rows: T[]; rowCount: number }
@@ -90,6 +96,33 @@ function fakePool(options: {
 
 const JOB_ID = "00000000-0000-4000-8000-000000000001"
 const NESTED_ID = "00000000-0000-4000-8000-000000000002"
+const PREPARE_TASK_ID = "subagent-00000000-0000-4000-8000-000000000003"
+const PREPARE_TOOL = "scheduled.application.prepare" as CanonicalToolSourceName
+
+function prepareLease(attemptCount: number): SubagentLease {
+  return { id: PREPARE_TASK_ID, userId: "user-1", sessionId: "session-1", turnId: "turn-current", rootTaskId: "root-current",
+    parentTaskId: "root-current", path: `/root-current/${PREPARE_TASK_ID}`, depth: 1, role: "prepare", taskType: "scheduled_application_prepare",
+    status: "running", goal: "Prepare materials", constraints: [], successCriteria: [], allowedActions: [PREPARE_TOOL], context: {}, expectedOutputSchema: {},
+    result: null, failureReason: null, attemptCount, maxAttempts: 3, leaseOwner: "worker-1", leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"),
+    interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId: "worker-1", signal: new AbortController().signal }
+}
+
+function prepareTasks(taskId = PREPARE_TASK_ID): TaskRow[] {
+  return [
+    { id: "root-current", rootTaskId: "root-current", turnId: "turn-current", sessionId: "session-1", path: "/root-current" },
+    { id: taskId, rootTaskId: "root-current", turnId: "turn-current", sessionId: "session-1", path: `/root-current/${taskId}` },
+  ]
+}
+
+function largePrepareReceipt(taskId: string, attemptCount: number) {
+  const jobs = Array.from({ length: 50 }, (_, index) => ({ jobId: `c${index.toString(36).padStart(24, "0")}`, status: "prepared" as const }))
+  return { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" as const, status: "completed" as const, taskId, attemptCount,
+    snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs,
+    materials: jobs.map((job, index) => ({ jobId: job.jobId, kind: "resume" as const, artifactRef: {
+      artifactId: `scheduled-draft:${index.toString(16).padStart(64, "0")}`, version: 1,
+      contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+    } })) }
+}
 
 function largeSearchOutput() {
   return { jobs: [{ id: JOB_ID, title: "Engineer", description: `Contact private@example.com or +353 85 123 4567 ${"x".repeat(9_000)}`, metadata: { id: NESTED_ID } }], page: 1, hasMore: false }
@@ -307,6 +340,99 @@ describe("tool result reference repository", () => {
       .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
     const stepQuery = fake.queries.find(query => query.text.includes('FROM "agent_steps"'))
     expect(stepQuery?.values).toEqual(["step-1", "session-1", "turn-current", "child-current", 2])
+  })
+
+  it("rejects a stale Prepare attempt before storage and accepts the exact current attempt", async () => {
+    const lease = prepareLease(2), owner = { kind: "task" as const, lease }
+    const fake = fakePool({ sourceToolNames: [PREPARE_TOOL], sourceAttemptCount: 2, sourceRole: "prepare",
+      sourceTaskType: "scheduled_application_prepare", stepTaskId: lease.id, stepAttempt: lease.attemptCount, tasks: prepareTasks(lease.id) })
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+    const stale = largePrepareReceipt(lease.id, 1)
+    await expect(repository.put(owner, { stepId: "step-1", toolCallId: "prepare-call", value: stale, now }))
+      .rejects.toMatchObject({ code: "tool_result_invalid_json" })
+    expect(fake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(false)
+
+    const current = largePrepareReceipt(lease.id, lease.attemptCount)
+    const prepared = prepareToolResultJson(current, PREPARE_TOOL, lease.id, lease.attemptCount)
+    const stored = await repository.put(owner, { stepId: "step-1", toolCallId: "prepare-call", value: current, now })
+    expect(stored.sanitizedJson).toEqual(prepared.value)
+    expect(stored.byteCount).toBeGreaterThan(8 * 1024)
+    expect(stored.byteCount).toBe(prepared.bytes)
+    expect(stored.sha256).toBe(prepared.sha256)
+    expect(fake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(true)
+
+    const readerCallId = "prepare-read-call"
+    const chunks: string[] = []
+    let cursor: string | undefined
+    for (let index = 0; index < 10; index += 1) {
+      const chunk = await repository.read(owner, {
+        referenceId: stored.id, ...(cursor === undefined ? {} : { cursor }),
+      }, readerCallId)
+      expect(chunk).not.toBeNull()
+      expect(isVerifiedToolResultChunk(chunk, owner, readerCallId)).toBe(true)
+      chunks.push(chunk!.chunk)
+      if (chunk!.nextCursor === null) break
+      cursor = chunk!.nextCursor
+    }
+    expect(chunks.join("")).toBe(prepared.encoded)
+    expect(Buffer.byteLength(chunks.join(""), "utf8")).toBe(prepared.bytes)
+    expect(createHash("sha256").update(chunks.join(""), "utf8").digest("hex")).toBe(prepared.sha256)
+  })
+
+  it("rejects Prepare receipts bound to another task or attempt", async () => {
+    const lease = prepareLease(2), owner = { kind: "task" as const, lease }
+    const source = { sourceToolNames: [PREPARE_TOOL], sourceAttemptCount: 2, sourceRole: "prepare",
+      sourceTaskType: "scheduled_application_prepare", stepTaskId: lease.id, stepAttempt: lease.attemptCount }
+    const fake = fakePool(source)
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+    const wrongTask = largePrepareReceipt("subagent-00000000-0000-4000-8000-000000000004", lease.attemptCount)
+    await expect(repository.put(owner, { stepId: "step-1", toolCallId: "wrong-task", value: wrongTask, now }))
+      .rejects.toMatchObject({ code: "tool_result_invalid_json" })
+    const staleAttempt = largePrepareReceipt(lease.id, lease.attemptCount - 1)
+    await expect(repository.put(owner, { stepId: "step-1", toolCallId: "stale-attempt", value: staleAttempt, now }))
+      .rejects.toMatchObject({ code: "tool_result_invalid_json" })
+    expect(fake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(false)
+
+    const staleOwnerFake = fakePool({ ...source, sourceAttemptCount: lease.attemptCount + 1 })
+    const staleOwnerRepository = createToolResultReferenceRepository(staleOwnerFake.pool as never)
+    await expect(staleOwnerRepository.put(owner, {
+      stepId: "step-1", toolCallId: "stale-owner-attempt", value: largePrepareReceipt(lease.id, lease.attemptCount), now,
+    })).rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+    expect(staleOwnerFake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(false)
+
+    const wrongOwnerTaskRepository = createToolResultReferenceRepository(fakePool(source).pool as never)
+    await expect(wrongOwnerTaskRepository.put(rootOwner, {
+      stepId: "step-1", toolCallId: "wrong-owner-kind", value: largePrepareReceipt(PREPARE_TASK_ID, 2), now,
+    })).rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+  })
+
+  it("rejects persisted Prepare receipts with a mismatched task or current attempt", async () => {
+    const lease = prepareLease(2), owner = { kind: "task" as const, lease }
+    const validReceipt = row("ref-prepare-parent", PREPARE_TASK_ID, largePrepareReceipt(PREPARE_TASK_ID, 2))
+    const parentRepository = createToolResultReferenceRepository(fakePool({ historical: validReceipt,
+      sourceToolNames: [PREPARE_TOOL], sourceAttemptCount: 2, sourceRole: "prepare", sourceTaskType: "scheduled_application_prepare" }).pool as never)
+    await expect(parentRepository.read(rootOwner, { referenceId: "ref-prepare-parent" }))
+      .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+
+    const taskMismatch = row("ref-prepare-task", PREPARE_TASK_ID,
+      largePrepareReceipt("subagent-00000000-0000-4000-8000-000000000004", 2))
+    const taskMismatchRepository = createToolResultReferenceRepository(fakePool({ historical: taskMismatch,
+      sourceToolNames: [PREPARE_TOOL], sourceAttemptCount: 2, sourceRole: "prepare", sourceTaskType: "scheduled_application_prepare", tasks: prepareTasks(lease.id) }).pool as never)
+    await expect(taskMismatchRepository.read(owner, { referenceId: "ref-prepare-task" }))
+      .rejects.toMatchObject({ code: "tool_result_corrupt" })
+
+    const attemptMismatch = row("ref-prepare-attempt", PREPARE_TASK_ID, largePrepareReceipt(PREPARE_TASK_ID, 1))
+    const attemptMismatchRepository = createToolResultReferenceRepository(fakePool({ historical: attemptMismatch,
+      sourceToolNames: [PREPARE_TOOL], sourceAttemptCount: 2, sourceRole: "prepare", sourceTaskType: "scheduled_application_prepare", tasks: prepareTasks(lease.id) }).pool as never)
+    await expect(attemptMismatchRepository.read(owner, { referenceId: "ref-prepare-attempt" }))
+      .rejects.toMatchObject({ code: "tool_result_corrupt" })
+
+    const staleOwner = { kind: "task" as const, lease: prepareLease(1) }
+    const staleOwnerRepository = createToolResultReferenceRepository(fakePool({ historical: row("ref-prepare-stale-owner", PREPARE_TASK_ID,
+      largePrepareReceipt(PREPARE_TASK_ID, 2)), sourceToolNames: [PREPARE_TOOL], sourceAttemptCount: 2,
+      sourceRole: "prepare", sourceTaskType: "scheduled_application_prepare", tasks: prepareTasks(staleOwner.lease.id) }).pool as never)
+    await expect(staleOwnerRepository.read(staleOwner, { referenceId: "ref-prepare-stale-owner" }))
+      .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
   })
 
   it("allows child read and write while the parent turn is queued for wakeup", async () => {

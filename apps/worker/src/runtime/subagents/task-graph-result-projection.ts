@@ -1,11 +1,12 @@
 import { Buffer } from "node:buffer"
-import { validateRoleResult, type AnalystResult, type ReviewerResult, type ScoutResult, type StructuredRoleResult, type WriterResult } from "./role-results.js"
+import { validateRoleResult, type AnalystResult, type PrepareResult, type ReviewerResult, type ScoutResult, type StructuredRoleResult, type WriterResult } from "./role-results.js"
 import {
   TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
   type TaskGraphAnalystProjectionItem,
   type TaskGraphArtifactProjectionReference,
   type TaskGraphProjectionEvidenceKind,
   type TaskGraphProjectionSource,
+  type TaskGraphPrepareProjectionJob,
   type TaskGraphResultProjection,
   type TaskGraphScoutProjectionItem,
 } from "./task-graph-command-port.js"
@@ -46,7 +47,8 @@ export function projectValidatedRoleResult(value: StructuredRoleResult): TaskGra
   try {
     const projection = value.role === "scout" ? projectScout(value)
       : value.role === "analyst" ? projectAnalyst(value)
-        : value.role === "writer" ? projectWriter(value) : projectReviewer(value)
+        : value.role === "prepare" ? projectPrepare(value)
+          : value.role === "writer" ? projectWriter(value) : projectReviewer(value)
     return encodedBytes(projection) <= TASK_GRAPH_RESULT_PROJECTION_NODE_BYTE_LIMIT ? projection : UNAVAILABLE
   } catch {
     return UNAVAILABLE
@@ -57,6 +59,7 @@ export function taskGraphResultProjectionItemCount(value: TaskGraphResultProject
   if (value.availability !== "available") return 0
   if (value.role === "scout") return value.candidates.length
   if (value.role === "analyst") return value.findings.length
+  if (value.role === "prepare") return Math.min(value.jobs.length, TASK_GRAPH_RESULT_PROJECTION_ITEMS_PER_NODE)
   return 1
 }
 
@@ -113,13 +116,31 @@ function projectReviewer(value: ReviewerResult): Extract<TaskGraphResultProjecti
   }
 }
 
+function projectPrepare(value: PrepareResult): Extract<TaskGraphResultProjection, { availability: "available"; role: "prepare" }> {
+  const jobs: TaskGraphPrepareProjectionJob[] = value.jobs.slice(0, TASK_GRAPH_RESULT_PROJECTION_ITEMS_PER_NODE).map(job => {
+    const jobId = safeJobId(job.jobId)
+    if (!jobId) throw new Error("task_graph_result_projection_job_id_invalid")
+    return {
+      jobId, status: job.status,
+      materials: value.materials.filter(material => material.jobId === job.jobId)
+        .map(material => ({ kind: material.kind, artifactRef: projectArtifactReference(material.artifactRef) })),
+    }
+  })
+  return {
+    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "prepare",
+    status: value.status, taskId: value.taskId, attemptCount: value.attemptCount,
+    snapshotDigest: value.snapshotDigest, checkpointDigest: value.checkpointDigest,
+    jobCount: value.jobs.length, materialCount: value.materials.length, jobs,
+  }
+}
+
 function projectArtifactReference(value: WriterResult["artifactRef"]): TaskGraphArtifactProjectionReference {
   if (!SAFE_JOB_ID.test(value.artifactId)) throw new Error("task_graph_result_projection_artifact_id_invalid")
   return { artifactId: value.artifactId, version: value.version, contentHash: value.contentHash, sourceDigest: value.sourceDigest }
 }
 
 function isProjectedRole(value: string): value is StructuredRoleResult["role"] {
-  return value === "scout" || value === "analyst" || value === "writer" || value === "reviewer"
+  return value === "scout" || value === "analyst" || value === "prepare" || value === "writer" || value === "reviewer"
 }
 
 function linkedEvidenceKinds(ids: readonly string[], result: ScoutResult | AnalystResult): TaskGraphProjectionEvidenceKind[] {

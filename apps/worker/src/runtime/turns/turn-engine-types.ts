@@ -4,7 +4,7 @@ import type { StepContext, StepContextSnapshot } from "../context/step-context-b
 import type { TurnBudgetLimits } from "../budget.js"
 import type { TurnUsage } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
-import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
+import type { ExecutionOwnerFence, TaskExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
 import type { TaskGraphDenialProgress, TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
@@ -84,6 +84,15 @@ export type TurnEngineStore = {
     status: "completed" | "failed" | "interrupted" | "waiting_for_tool" | "waiting_for_approval" | "waiting_for_user"
     finishReason: string | null
     errorCode: string | null
+    inputTokens: number
+    outputTokens: number
+    estimatedCostUsd: number
+    now: Date
+  }): Promise<void>
+  /** Cancellation-only finalizer; the store requires a current task lease with an accepted interrupt marker. */
+  finalizeScheduledPrepareCancellationStep?(input: {
+    owner: TaskExecutionOwnerFence
+    stepId: string
     inputTokens: number
     outputTokens: number
     estimatedCostUsd: number

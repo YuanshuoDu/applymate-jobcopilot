@@ -141,7 +141,12 @@ export async function runPrepareGateStages(
         reason: `all ${gateOutput.skipped.length} positions are below the threshold ${ctx.agentCfg.minMatchScore}%.It is recommended to lower the threshold or improve the resume.`,
       })
     }
-    await runtime.persist('execute', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput })
+    await runtime.persist('execute', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput,
+      ...(pipelineCtx.scheduledTaskGraphOwnerFence ? { scheduledTaskGraphGateDecisions: {
+        approvedJobIds: gateOutput.approved.map(pkg => pkg.job.id),
+        pendingJobIds: gateOutput.pending.map(pkg => pkg.job.id),
+        skippedJobIds: gateOutput.skipped.map(pkg => pkg.job.id),
+      } } : {}) })
   } else {
     emit('info', { message: `Resuming from ${runtime.getState().nextStage}; review routing restored.` })
   }

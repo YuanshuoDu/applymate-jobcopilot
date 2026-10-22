@@ -17,6 +17,7 @@ export function buildTaskGraphPlanningFacts(loaded: LoadedGraph): TaskGraphPlann
     counts: {
       discoveredJobs: copyCount(counts.discoveredJobs),
       analyzedJobs: copyCount(counts.analyzedJobs),
+      prepareJobs: copyCount(counts.prepareJobs),
       artifactReferences: copyCount(counts.artifactReferences),
       reviewOutcomes: copyCount(counts.reviewOutcomes),
     },

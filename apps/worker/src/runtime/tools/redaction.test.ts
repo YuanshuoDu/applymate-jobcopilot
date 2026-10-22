@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest"
+import { redactSensitiveText } from "@jobcopilot/shared"
 
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
-import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
+import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareScheduledPrepareLifecycleOutput, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
 import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
 import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 const turnId = "c123456789012345678901234"
 const rootTaskId = `root-${turnId}`
@@ -36,6 +38,25 @@ const nativeFollowupReceipt = {
   sourceTaskId: nativeSourceTaskId,
 }
 
+const prepareTaskId = "subagent-0e34de21-c5e7-4db7-8e75-904732813337"
+const prepareJobId = "c123456789012345678901234"
+const prepareOutput = {
+  schemaVersion: ROLE_RESULT_SCHEMA,
+  role: "prepare",
+  status: "completed",
+  taskId: prepareTaskId,
+  attemptCount: 1,
+  snapshotDigest: `sha256:${"a".repeat(64)}`,
+  checkpointDigest: "b".repeat(64),
+  jobs: [{ jobId: prepareJobId, status: "prepared" }],
+  materials: [{ jobId: prepareJobId, kind: "resume", artifactRef: {
+    artifactId: `scheduled-draft:${"e".repeat(64)}`,
+    version: 1,
+    contentHash: `sha256:${"c".repeat(64)}`,
+    sourceDigest: `sha256:${"d".repeat(64)}`,
+  } }],
+} as const
+
 const durableWaitId = "wait-12345678-1234-4234-9234-123456789012"
 const durableWaitTaskId = "subagent-12345678-1234-4234-9234-123456789012"
 
@@ -60,6 +81,103 @@ function durableWaitOutput() {
 }
 
 describe("tool lifecycle redaction", () => {
+  it("preserves only a valid scheduled Prepare receipt and its artifact digests", () => {
+    expect(redactSensitiveText(prepareTaskId)).not.toBe(prepareTaskId)
+    const prepared = prepareScheduledPrepareLifecycleOutput(prepareOutput, prepareTaskId)
+    expect(prepared.safe).toEqual(prepareOutput)
+    expect(prepared.safe).toHaveProperty("materials.0.artifactRef.contentHash", prepareOutput.materials[0]!.artifactRef.contentHash)
+    expect(Object.keys(prepared.safe as Record<string, unknown>).sort()).toEqual([
+      "attemptCount", "checkpointDigest", "jobs", "materials", "role", "schemaVersion", "snapshotDigest", "status", "taskId",
+    ])
+  })
+
+  it("rejects a mismatched task, extra private body, and malformed Prepare shape or digest", () => {
+    expect(() => prepareScheduledPrepareLifecycleOutput(prepareOutput, "another-task"))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({ ...prepareOutput, coverLetterBody: "private letter" }, prepareTaskId))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({
+      ...prepareOutput, materials: [{ ...prepareOutput.materials[0]!, artifactRef: {
+        ...prepareOutput.materials[0]!.artifactRef, contentHash: "redacted",
+      } }],
+    }, prepareTaskId)).toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({ ...prepareOutput, jobs: "malformed" }, prepareTaskId))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+  })
+
+  it("rejects task, job, and artifact identifiers that the text redactor would alter", () => {
+    const emailTaskId = "candidate@example.com"
+    expect(() => prepareScheduledPrepareLifecycleOutput({ ...prepareOutput, taskId: emailTaskId }, emailTaskId))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({
+      ...prepareOutput, jobs: [{ jobId: "candidate 555 010 1234", status: "prepared" }],
+      materials: [{ ...prepareOutput.materials[0]!, jobId: "candidate 555 010 1234" }],
+    }, prepareTaskId)).toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({
+      ...prepareOutput, materials: [{ ...prepareOutput.materials[0]!, artifactRef: {
+        ...prepareOutput.materials[0]!.artifactRef, artifactId: "sk-supersecret123",
+      } }],
+    }, prepareTaskId)).toThrow("scheduled_prepare_lifecycle_output_invalid")
+  })
+
+  it("requires opaque subagent task IDs and Prisma CUID job IDs", () => {
+    expect(redactSensitiveText(prepareJobId)).toBe(prepareJobId)
+    expect(() => prepareScheduledPrepareLifecycleOutput(prepareOutput, prepareTaskId)).not.toThrow()
+    expect(() => prepareScheduledPrepareLifecycleOutput({ ...prepareOutput, taskId: "candidate" }, "candidate"))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({ ...prepareOutput, taskId: "sk-supersecret123" }, "sk-supersecret123"))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({
+      ...prepareOutput, jobs: [{ jobId: "candidate", status: "prepared" }],
+      materials: [{ ...prepareOutput.materials[0]!, jobId: "candidate" }],
+    }, prepareTaskId)).toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(() => prepareScheduledPrepareLifecycleOutput({
+      ...prepareOutput, jobs: [{ jobId: "sk-supersecret123", status: "prepared" }],
+      materials: [{ ...prepareOutput.materials[0]!, jobId: "sk-supersecret123" }],
+    }, prepareTaskId)).toThrow("scheduled_prepare_lifecycle_output_invalid")
+    const malformedJobId = `c${"1".repeat(23)}`
+    expect(() => prepareScheduledPrepareLifecycleOutput({
+      ...prepareOutput, jobs: [{ jobId: malformedJobId, status: "prepared" }],
+      materials: [{ ...prepareOutput.materials[0]!, jobId: malformedJobId }],
+    }, prepareTaskId)).toThrow("scheduled_prepare_lifecycle_output_invalid")
+  })
+
+  it("requires the generated scheduled-draft digest format for artifact identifiers", () => {
+    const numericDigestArtifactId = `scheduled-draft:${"1".repeat(64)}`
+    expect(redactSensitiveText(numericDigestArtifactId)).not.toBe(numericDigestArtifactId)
+    const numericDigestOutput = {
+      ...prepareOutput,
+      materials: [{ ...prepareOutput.materials[0]!, artifactRef: {
+        ...prepareOutput.materials[0]!.artifactRef, artifactId: numericDigestArtifactId,
+      } }],
+    }
+    expect(() => prepareScheduledPrepareLifecycleOutput(numericDigestOutput, prepareTaskId)).not.toThrow()
+    expect(() => prepareScheduledPrepareLifecycleOutput({
+      ...prepareOutput, materials: [{ ...prepareOutput.materials[0]!, artifactRef: {
+        ...prepareOutput.materials[0]!.artifactRef, artifactId: "Jane-Doe",
+      } }],
+    }, prepareTaskId)).toThrow("scheduled_prepare_lifecycle_output_invalid")
+  })
+
+  it("rejects accessors at the Prepare receipt and nested material levels without invoking them", () => {
+    let getterInvoked = false
+    const topLevel = { ...prepareOutput }
+    Object.defineProperty(topLevel, "taskId", { enumerable: true, get: () => { getterInvoked = true; return prepareTaskId } })
+    expect(() => prepareScheduledPrepareLifecycleOutput(topLevel, prepareTaskId))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(getterInvoked).toBe(false)
+
+    const nested = { ...prepareOutput, materials: [{
+      ...prepareOutput.materials[0]!, artifactRef: { ...prepareOutput.materials[0]!.artifactRef },
+    }] }
+    Object.defineProperty(nested.materials[0]!.artifactRef, "contentHash", {
+      enumerable: true, get: () => { getterInvoked = true; return prepareOutput.materials[0]!.artifactRef.contentHash },
+    })
+    expect(() => prepareScheduledPrepareLifecycleOutput(nested, prepareTaskId))
+      .toThrow("scheduled_prepare_lifecycle_output_invalid")
+    expect(getterInvoked).toBe(false)
+  })
+
   it("uses the shared TaskGraph limits for plan receipts", () => {
     const node = (index: number, key: string) => ({
       key,

@@ -147,7 +147,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
   } catch { graphRevision = null; denialCheckpoint = null; return deny() }
 }
 
-export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string, allowTaskGraphDenialCheckpoint = false): Promise<TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity; readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint } | { waitId: string } | { scheduledWaitId: string; candidateText: string } | { scheduledBlocker: string } | undefined> {
+export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string, allowTaskGraphDenialCheckpoint = false): Promise<TaskGraphFinalSummaryBinding | { feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true; readonly [NATIVE_SEMANTIC_REJECTION]?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity; readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint } | { waitId: string } | { scheduledWaitId: string; candidateText: string } | { externalWaitId: string; scheduledWaitId?: string } | { scheduledBlocker: string } | undefined> {
   if (!options.completionGate) return undefined
   let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
   try {
@@ -176,7 +176,10 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
       if (!parsed) throw new TurnEngineError("invalid_output", "Scheduled pipeline completion returned an invalid disposition")
       if (parsed.status === "blocked") return { scheduledBlocker: parsed.errorCode }
       if (parsed.candidateText !== candidateText) throw new TurnEngineError("invalid_output", "Scheduled pipeline completion changed the final candidate")
+      if (parsed.status === "waiting_for_dependency") return { waitId: parsed.waitId }
       if (parsed.status === "waiting_for_user") return { scheduledWaitId: parsed.waitId, candidateText: parsed.candidateText }
+      if (parsed.status === "waiting_for_external_user") return { externalWaitId: parsed.externalWaitId,
+        ...(parsed.scheduledWaitId ? { scheduledWaitId: parsed.scheduledWaitId } : {}) }
     }
     return binding
   }

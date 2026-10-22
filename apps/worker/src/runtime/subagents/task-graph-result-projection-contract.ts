@@ -17,6 +17,11 @@ export type TaskGraphArtifactProjectionReference = Readonly<{
   contentHash: string
   sourceDigest: string
 }>
+export type TaskGraphPrepareProjectionJob = Readonly<{
+  jobId: string
+  status: "prepared" | "skipped" | "failed"
+  materials: readonly Readonly<{ kind: "resume" | "cover_letter"; artifactRef: TaskGraphArtifactProjectionReference }>[]
+}>
 export type TaskGraphResultProjection =
   | Readonly<{ schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA; trust: "untrusted"; availability: "unavailable" }>
   | Readonly<{
@@ -38,6 +43,20 @@ export type TaskGraphResultProjection =
     findingCount: number
     evidenceCount: number
     findings: readonly TaskGraphAnalystProjectionItem[]
+  }>
+  | Readonly<{
+    schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA
+    trust: "untrusted"
+    availability: "available"
+    role: "prepare"
+    status: "completed" | "partial"
+    taskId: string
+    attemptCount: number
+    snapshotDigest: string
+    checkpointDigest: string
+    jobCount: number
+    materialCount: number
+    jobs: readonly TaskGraphPrepareProjectionJob[]
   }>
   | Readonly<{
     schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA

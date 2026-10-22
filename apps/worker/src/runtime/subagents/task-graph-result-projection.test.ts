@@ -60,6 +60,17 @@ function reviewerResult(): Record<string, unknown> {
   }
 }
 
+function prepareResult(): Record<string, unknown> {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "partial", taskId: "prepare-task-1", attemptCount: 2,
+    snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64),
+    jobs: [{ jobId: "job-42", status: "prepared" }, { jobId: "job-43", status: "failed" }],
+    materials: [{ jobId: "job-42", kind: "resume", artifactRef: {
+      artifactId: "resume-42", version: 3, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+    } }],
+  }
+}
+
 function completedEnvelope(structuredResult: unknown, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     finalItemId: "internal-final-item-id",
@@ -149,6 +160,23 @@ describe("task graph result projection", () => {
       reviewStatus: "passed",
       reviewHash: `sha256:${"c".repeat(64)}`,
     })
+  })
+
+  it("projects only task-bound Prepare status and immutable material facts", () => {
+    const projection = projectTaskGraphResult("prepare", "completed", completedEnvelope(prepareResult()))
+    expect(projection).toEqual({
+      schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+      role: "prepare", status: "partial", taskId: "prepare-task-1", attemptCount: 2,
+      snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobCount: 2, materialCount: 1,
+      jobs: [
+        { jobId: "job-42", status: "prepared", materials: [{ kind: "resume", artifactRef: {
+          artifactId: "resume-42", version: 3, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+        } }] },
+        { jobId: "job-43", status: "failed", materials: [] },
+      ],
+    })
+    expect(JSON.stringify(projection)).not.toContain("finalText")
+    expect(JSON.stringify(projection)).not.toContain("evidenceRefs")
   })
 
   it.each([

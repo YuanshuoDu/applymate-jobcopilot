@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { TurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
 import { completeScheduledPipelineBeforeTerminal } from "./scheduled-pipeline-completion.js"
+import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
+import { SCHEDULED_PREPARE_COMPLETION_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
+import { SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeResult, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 
@@ -14,6 +18,40 @@ const executionOwner: TurnExecutionOwnerFence = { kind: "turn", userId: owner.us
   turnId: owner.turnId, taskId: owner.rootTaskId, rootTaskId: owner.rootTaskId, ownerId: owner.turnLeaseOwnerId,
   leaseVersion: owner.turnLeaseVersion, leaseExpiresAt: new Date("2026-10-20T12:00:00.000Z") }
 const response = (status: number, body: unknown) => new Response(JSON.stringify(body), { status })
+const analyzeAttestation: ScheduledAutomationPipelineAttestation = {
+  schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner,
+  snapshotDigest: `sha256:${"1".repeat(64)}`, graphRevision: 3,
+  scout: { taskId: "scout-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: `sha256:${"2".repeat(64)}`,
+    candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete", taskId: "scout-1", attemptCount: 1,
+      completedCalls: 1, candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: `sha256:${"3".repeat(64)}` } },
+  analyst: { taskId: "analyst-1", attemptCount: 1, status: "completed", verification: "passed",
+    resultDigest: `sha256:${"4".repeat(64)}`, dependsOnTaskIds: ["scout-1"], jobIds: ["job-1"] },
+  evidenceDigest: "5".repeat(64),
+}
+const analyzeProof = () => {
+  const executionId = "execution-1", executionAttemptCount = 4
+  return { status: "analyze_checkpointed", continuationKey: scheduledTaskGraphContinuationKey(owner, analyzeAttestation, executionId, executionAttemptCount),
+    checkpointDigest: "b".repeat(64), claimTokenDigest: `sha256:${"c".repeat(64)}`, executionId, executionAttemptCount }
+}
+const readyPrepare = (choiceRequired = true) => {
+  const handoff = analyzeProof()
+  const baseReceipt = { schemaVersion: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA,
+    owner: { ...owner, executionId: handoff.executionId, executionAttemptCount: handoff.executionAttemptCount },
+    continuationKey: handoff.continuationKey, snapshotDigest: analyzeAttestation.snapshotDigest,
+    evidenceDigest: analyzeAttestation.evidenceDigest, checkpointDigest: handoff.checkpointDigest,
+    analyzeGraphRevision: analyzeAttestation.graphRevision, prepareScheduleRevision: analyzeAttestation.graphRevision + 1 }
+  const receipt = { ...baseReceipt, continuationKey: scheduledTaskGraphStableContinuationKey(baseReceipt)! }
+  const scheduledWaitId = scheduledPrepareChoiceWaitId({ receipt, finalStepId: "step-final", finalStepOrdinal: 3 })!
+  const nodes = [
+    { taskId: "scout-1", role: "scout", status: "completed" },
+    { taskId: "analyst-1", role: "analyst", status: "completed" },
+    { taskId: "prepare-1", role: "prepare", status: "completed" },
+  ]
+  return { status: "ready" as const, choice: choiceRequired ? { required: true as const, status: "answered" as const, scheduledWaitId } : { required: false as const }, prepareProof: { receipt,
+    completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 4, nodes,
+      wait: { status: "ready", mode: "all", waitId: "graph-wait-1", targetTaskIds: ["prepare-1"], matchedTaskIds: ["prepare-1"] } },
+    result: { role: "prepare", status: "completed" } } }
+}
 const base = () => ({ executionOwner, rootAttemptCount: owner.rootAttemptCount,
   finalStepId: "step-final", finalStepOrdinal: 3, stageCandidate: vi.fn(async () => undefined) })
 
@@ -43,7 +81,108 @@ describe("scheduled pipeline pre-terminal completion", () => {
   it("returns only an exact durable user wait", async () => {
     const fetcher = vi.fn<typeof fetch>(async () => response(202, { status: "waiting_for_user", waitId: "wait-123" }))
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
-      bridge: async () => ready, fetcher })).resolves.toEqual({ status: "waiting_for_user", waitId: "wait-123", candidateText: "Final." })
+      bridge: async () => ready, fetcher })).resolves.toEqual({ status: "waiting_for_external_user", externalWaitId: "wait-123", candidateText: "Final." })
+  })
+
+  it("continues an Analyze checkpoint into the exact durable dependency wait", async () => {
+    const proof = analyzeProof(), candidateText = "Final candidate"
+    const signal = new AbortController().signal
+    const continueAfterAnalyze = vi.fn(async input => {
+      expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, proof, candidateText,
+        finalStepId: "step-final", finalStepOrdinal: 3, signal })
+      return { status: "waiting_for_dependency" as const, waitId: "agent-wait:prepare:exact" }
+    })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }),
+      fetcher: vi.fn<typeof fetch>(async () => response(200, proof)), continueAfterAnalyze }))
+      .resolves.toEqual({ status: "waiting_for_dependency", waitId: "agent-wait:prepare:exact", candidateText })
+    expect(continueAfterAnalyze).toHaveBeenCalledOnce()
+  })
+
+  it("waits for the first Worker-owned choice before handing Prepare to Web", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => response(200, analyzeProof()))
+    const continueAfterAnalyze = vi.fn(async () => ({ status: "waiting_for_choice" as const, waitId: "worker-choice-1" }))
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher, continueAfterAnalyze }))
+      .resolves.toEqual({ status: "waiting_for_user", waitId: "worker-choice-1", candidateText: "Final." })
+    expect(fetcher).toHaveBeenCalledOnce()
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({ owner, attestation: analyzeAttestation })
+  })
+
+  it("replays the exact Analyze binding and dependency wait without rewriting the wait id", async () => {
+    const proof = analyzeProof(), candidateText = "Final candidate", signal = new AbortController().signal
+    const continueAfterAnalyze = vi.fn(async (_input: Parameters<NonNullable<Parameters<typeof completeScheduledPipelineBeforeTerminal>[0]["continueAfterAnalyze"]>>[0]) => ({ status: "waiting_for_dependency" as const, waitId: "agent-wait:prepare:replayed" }))
+    const input = { ...base(), owner, candidateText, signal, bridge: async () => ({ status: "ready" as const, attestation: analyzeAttestation }),
+      fetcher: vi.fn<typeof fetch>(async () => response(200, proof)), continueAfterAnalyze }
+    const first = await completeScheduledPipelineBeforeTerminal(input)
+    const replay = await completeScheduledPipelineBeforeTerminal(input)
+    expect(first).toEqual({ status: "waiting_for_dependency", waitId: "agent-wait:prepare:replayed", candidateText })
+    expect(replay).toEqual(first)
+    expect(continueAfterAnalyze).toHaveBeenCalledTimes(2)
+    expect(continueAfterAnalyze.mock.calls[1]?.[0]).toEqual(continueAfterAnalyze.mock.calls[0]?.[0])
+  })
+
+  it("hands verified Prepare proof to Web and keeps its choice wait separate from the Gate wait", async () => {
+    const prepared = readyPrepare(), candidateText = "Final candidate", signal = new AbortController().signal
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) => JSON.parse(String(init?.body)).prepareProof
+      ? response(202, { status: "waiting_for_user", waitId: "web-gate-wait", scheduledWaitId: prepared.choice.required ? prepared.choice.scheduledWaitId : undefined })
+      : response(200, analyzeProof()))
+    const result = await completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
+      continueAfterAnalyze: async () => prepared })
+    expect(result).toEqual({ status: "waiting_for_external_user", externalWaitId: "web-gate-wait",
+      scheduledWaitId: prepared.choice.required ? prepared.choice.scheduledWaitId : undefined, candidateText })
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toMatchObject({
+      owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof,
+      ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
+    })
+  })
+
+  it("continues approval-disabled snapshots without a Worker choice ID", async () => {
+    const prepared = readyPrepare(false), candidateText = "Final candidate", signal = new AbortController().signal
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) => JSON.parse(String(init?.body)).prepareProof
+      ? response(202, { status: "waiting_for_user", waitId: "web-gate-wait" }) : response(200, analyzeProof()))
+    const result = await completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
+      continueAfterAnalyze: async () => prepared })
+    expect(result).toEqual({ status: "waiting_for_external_user", externalWaitId: "web-gate-wait", candidateText })
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof })
+  })
+
+  it("rejects a Web response that echoes a different scheduled choice wait", async () => {
+    const prepared = readyPrepare()
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) => JSON.parse(String(init?.body)).prepareProof
+      ? response(202, { status: "waiting_for_user", waitId: "web-gate-wait", scheduledWaitId: "stale-choice-wait" })
+      : response(200, analyzeProof()))
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
+      continueAfterAnalyze: async () => prepared }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_wait_identity_mismatch" })
+  })
+
+  it("fails closed when an Analyze checkpoint has no Prepare continuation", async () => {
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }),
+      fetcher: vi.fn<typeof fetch>(async () => response(200, analyzeProof())) }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_prepare_continuation_unavailable" })
+  })
+
+  it("does not call Prepare for an invalid Analyze checkpoint proof", async () => {
+    const continueAfterAnalyze = vi.fn(async () => ({ status: "waiting_for_dependency" as const, waitId: "wait-1" }))
+    const proof = { ...analyzeProof(), continuationKey: `scheduled-taskgraph:sha256:${"c".repeat(64)}` }
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }),
+      fetcher: vi.fn<typeof fetch>(async () => response(200, proof)), continueAfterAnalyze }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_analyze_checkpoint_invalid" })
+    expect(continueAfterAnalyze).not.toHaveBeenCalled()
+  })
+
+  it("blocks an invalid dependency wait returned by the injected continuation", async () => {
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }),
+      fetcher: vi.fn<typeof fetch>(async () => response(200, analyzeProof())),
+      continueAfterAnalyze: async () => ({ status: "waiting_for_dependency", waitId: "bad", extra: true } as never) }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_prepare_proof_invalid" })
   })
 
   it("keeps a local bridge blocker distinct and does not call Web without an attestation", async () => {

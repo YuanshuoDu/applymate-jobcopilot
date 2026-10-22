@@ -279,7 +279,7 @@ describe("parseTaskGraphSnapshot", () => {
       .toThrow("task_graph_snapshot_template_unsupported")
   })
 
-  it("keeps new Writer and Reviewer snapshots on their specialized verification paths", () => {
+  it("keeps Writer, Reviewer, and the fixed Prepare template on specialized verification paths", () => {
     const state: TaskGraphState = {
       revision: 1,
       nodes: [{
@@ -288,18 +288,24 @@ describe("parseTaskGraphSnapshot", () => {
       }, {
         key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the draft",
         successCriteria: ["Persist review"], dependsOn: ["writer"], depth: 2, status: "queued",
+      }, {
+        key: "prepare", templateId: "prepare", goal: "Prepare scheduled materials",
+        successCriteria: ["Persist safe artifact references"], dependsOn: [], depth: 1, status: "queued",
       }],
       appliedEvents: [],
     }
-    const snapshot = taskGraphSnapshot(state, new Map([["writer", "task-writer"], ["reviewer", "task-reviewer"]]))
+    const snapshot = taskGraphSnapshot(state, new Map([["writer", "task-writer"], ["reviewer", "task-reviewer"], ["prepare", "task-prepare"]]))
 
     expect(snapshot.nodes).toMatchObject([
       { key: "writer", verificationDisposition: "specialized" },
       { key: "reviewer", verificationDisposition: "specialized" },
+      { key: "prepare", verificationDisposition: "specialized" },
     ])
-    expect(snapshot.nodes[0]).not.toHaveProperty("verification")
-    expect(snapshot.nodes[1]).not.toHaveProperty("verification")
+    expect(snapshot.nodes.every(node => !Object.hasOwn(node, "verification"))).toBe(true)
     expect(parseTaskGraphSnapshot(snapshot)).toEqual(snapshot)
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{
+      ...storedNode("invalid-prepare"), templateId: "prepare", verification: analystVerification, verificationDisposition: "typed",
+    }]))).toThrow("task_graph_snapshot_verification_invalid")
   })
 
   it("round-trips repair lineage without rewriting its target or marking it passed", () => {

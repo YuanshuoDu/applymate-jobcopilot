@@ -694,6 +694,7 @@ describe("TaskGraph turn observation", () => {
     const counts = {
       discoveredJobs: { knownCount: 12, coverage: "partial" },
       analyzedJobs: { knownCount: 7, coverage: "complete" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "unavailable" },
     }
@@ -812,6 +813,7 @@ describe("TaskGraph turn observation", () => {
     const counts = {
       discoveredJobs: { knownCount: 27, coverage: "complete" },
       analyzedJobs: { knownCount: null, coverage: "not_requested" },
+      prepareJobs: { knownCount: null, coverage: "not_requested" },
       artifactReferences: { knownCount: null, coverage: "not_requested" },
       reviewOutcomes: { knownCount: null, coverage: "not_requested" },
     }

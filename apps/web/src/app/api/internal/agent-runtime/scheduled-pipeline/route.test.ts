@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   turn: vi.fn(), root: vi.fn(), session: vi.fn(), user: vi.fn(), execution: vi.fn(), claim: vi.fn(), jobs: vi.fn(),
-  question: vi.fn(), runPipeline: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
+  question: vi.fn(), runPipeline: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
 }));
 vi.mock("@/lib/db", () => ({ db: {
   agentTurn: { findFirst: mocks.turn }, subAgentTask: { findFirst: mocks.root },
@@ -11,16 +11,17 @@ vi.mock("@/lib/db", () => ({ db: {
   agentItem: { findFirst: mocks.question },
 } }));
 vi.mock("@/lib/agent/run-service", () => ({ runAgentPipeline: mocks.runPipeline }));
+vi.mock("@/lib/agent/scheduled-taskgraph-run-service", () => ({
+  isScheduledPrepareChoiceWaitId: (turnId: string, value: unknown) => typeof value === "string" && value.startsWith(`agent-question:${turnId}:canonical:`) && /^[a-f0-9]{64}$/.test(value.slice(`agent-question:${turnId}:canonical:`.length)),
+  validateScheduledPrepareWaitIdentity: mocks.validatePrepareWait,
+}));
 vi.mock("@/lib/model-router", () => ({
   APPLYMATE_BACKING: "platform", loadUserAiConfig: mocks.loadAi, resolveConfig: mocks.resolveConfig,
 }));
-vi.mock("@/lib/agent/scheduled-automation-snapshot", () => ({ parseScheduledAutomationSnapshot: () => ({
-  schemaVersion: "scheduled-automation.v1", targetRoles: ["Engineer"], targetLocations: ["Dublin"],
-  minScore: 80, dailyCap: 5, requireApproval: true, autoApply: false,
-}) }));
+vi.mock("@/lib/agent/scheduled-automation-snapshot", () => ({ parseScheduledAutomationSnapshot: mocks.snapshot }));
 vi.mock("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint", () => ({
   scheduledAutomationSnapshotDigest: () => "sha256:" + "a".repeat(64),
-  scheduledTaskGraphContinuationKey: (owner: { turnLeaseVersion: number }) => `continuation-${owner.turnLeaseVersion}`,
+  scheduledTaskGraphContinuationKey: () => "continuation-4",
   buildScheduledTaskGraphPrepareCheckpoint: (input: { owner: Record<string, unknown>; attestation: Record<string, unknown>; ownedJobs: Array<{ id: string }>;
     existingCheckpoint: Record<string, unknown> }) => {
     const marker = input.existingCheckpoint.scheduledTaskGraphContinuation as Record<string, unknown> | undefined;
@@ -38,10 +39,10 @@ vi.mock("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint", () => ({
         && typeof savedScores[index]?.analysisFenceAt === "string" && Number.isFinite(Date.parse(savedScores[index]!.analysisFenceAt!)));
     const alreadyPersisted = Boolean(marker && markerOwner && markerOwner.turnLeaseVersion === input.owner.turnLeaseVersion
       && markerOwner.executionId === input.owner.executionId && markerOwner.executionAttemptCount === input.owner.executionAttemptCount
-      && marker.key === `continuation-${input.owner.turnLeaseVersion}` && marker.snapshotDigest === input.attestation.snapshotDigest
+      && marker.key === "continuation-4" && marker.snapshotDigest === input.attestation.snapshotDigest
       && marker.graphRevision === input.attestation.graphRevision && marker.evidenceDigest === evidence && jobsMatch
       && savedRowsMatch && savedScoresMatch && input.existingCheckpoint.analysisFailed === 0);
-    return { checkpoint: input.existingCheckpoint, continuationKey: `continuation-${input.owner.turnLeaseVersion}`, alreadyPersisted };
+    return { checkpoint: input.existingCheckpoint, continuationKey: "continuation-4", alreadyPersisted };
   },
 }));
 vi.mock("@/lib/entitlements", () => ({
@@ -57,6 +58,10 @@ const key = "continuation-4";
 const claimToken = "claim-token-4";
 const attestation = { owner, snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 9, evidenceDigest: "b".repeat(64), scout: { candidateJobIds: ["job-1"] } };
 const report = { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 9 };
+const scheduledSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"],
+  targetLocations: ["Dublin"], minScore: 80, dailyCap: 5, requireApproval: true, autoApply: false };
+const analyzeProof = { status: "analyze_checkpointed", continuationKey: "continuation-4", checkpointDigest: "c".repeat(64),
+  executionId: "execution-1", executionAttemptCount: 0 };
 const initialExecution = { id: "execution-1", status: "running", attemptCount: 0, state: { nextStage: "scout" } };
 const analysisFenceAt = new Date().toISOString();
 
@@ -105,6 +110,7 @@ describe("scheduled pipeline continuation route", () => {
     vi.resetModules();
     Object.values(mocks).forEach(mock => mock.mockReset());
     process.env.AGENT_WORKER_SECRET = "worker-secret";
+    mocks.snapshot.mockReturnValue(scheduledSnapshot);
     mocks.turn.mockResolvedValue({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
       status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
       input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
@@ -120,6 +126,7 @@ describe("scheduled pipeline continuation route", () => {
     mocks.jobs.mockResolvedValue([{ id: "job-1", userId: owner.userId }]);
     mocks.question.mockResolvedValue(null);
     mocks.runPipeline.mockResolvedValue(report);
+    mocks.validatePrepareWait.mockResolvedValue(true);
     mocks.loadAi.mockResolvedValue({ resolvedKey: "api-key", provider: "openai", model: "test-model" });
     mocks.resolveConfig.mockReturnValue({ provider: "minimax", model: "MiniMax-M3", apiKey: "platform-key" });
     mocks.featureAllowed.mockResolvedValue(true);
@@ -133,13 +140,17 @@ describe("scheduled pipeline continuation route", () => {
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ status: "blocked", errorCode: "scheduled_pipeline_unauthorized" });
     expect(mocks.turn).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 
-  it("claims once and passes the persisted owner, snapshot, attestation, and database Jobs to the pipeline", async () => {
+  it("returns only the opaque Analyze proof after one owner-scoped claim", async () => {
+    mocks.runPipeline.mockResolvedValueOnce(analyzeProof);
     const { POST } = await import("./route");
     const response = await POST(request());
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: "completed", report });
+    const body = await response.json();
+    expect(body).toEqual(analyzeProof);
+    expect(Object.keys(body as Record<string, unknown>).sort())
+      .toEqual(["checkpointDigest", "continuationKey", "executionAttemptCount", "executionId", "status"]);
     expect(mocks.claim).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ id: "execution-1", status: "running", attemptCount: 0,
         state: { equals: initialExecution.state } }),
@@ -149,6 +160,97 @@ describe("scheduled pipeline continuation route", () => {
       scheduledTaskGraph: expect.objectContaining({ owner: fullOwner, continuationKey: key, attestation, ownedJobs: [{ id: "job-1", userId: owner.userId }] }),
     }));
     expect(mocks.jobs).toHaveBeenCalledWith({ where: { userId: owner.userId, id: { in: ["job-1"] } } });
+  });
+
+  it("passes a Worker-verified Prepare proof through the existing internal route", async () => {
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: { nextStage: "prepare", scheduledTaskGraphClaim: ownerClaim(),
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner: fullOwner,
+        snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision, evidenceDigest: attestation.evidenceDigest } } });
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation, prepareProof, scheduledWaitId }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "completed", report, scheduledWaitId });
+    expect(mocks.validatePrepareWait).toHaveBeenCalledWith({ owner: fullOwner, snapshot: scheduledSnapshot, proof: prepareProof, scheduledWaitId });
+    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      scheduledTaskGraph: expect.objectContaining({ prepareProof, scheduledWaitId, claimToken }),
+    }));
+  });
+
+  it("rejects a changed choice ID after it has been saved in the scheduled checkpoint", async () => {
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: { ...initialExecution.state, scheduledTaskGraphScheduledWaitId: scheduledWaitId } });
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation, prepareProof,
+      scheduledWaitId: `agent-question:${owner.turnId}:canonical:${"b".repeat(64)}` }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.validatePrepareWait).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("requires a scheduled wait identity whenever a Prepare proof is submitted", async () => {
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation, prepareProof: { receipt: {}, completion: {}, result: {} } }));
+    expect(response.status).toBe(409);
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("continues an approval-free Prepare proof without a scheduled choice ID", async () => {
+    const snapshot = { ...scheduledSnapshot, requireApproval: false };
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    mocks.snapshot.mockReturnValue(snapshot);
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: { nextStage: "prepare", scheduledTaskGraphClaim: ownerClaim(),
+      scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner: fullOwner,
+        snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision, evidenceDigest: attestation.evidenceDigest } } });
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation, prepareProof }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "completed", report });
+    expect(mocks.validatePrepareWait).toHaveBeenCalledWith({ owner: fullOwner, snapshot, proof: prepareProof });
+    expect(mocks.runPipeline.mock.calls[0]?.[0]?.scheduledTaskGraph).not.toHaveProperty("scheduledWaitId");
+  });
+
+  it("replays a completed approval-free Prepare proof without a saved choice ID", async () => {
+    const snapshot = { ...scheduledSnapshot, requireApproval: false };
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    mocks.snapshot.mockReturnValue(snapshot);
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "completed", attemptCount: 0,
+      state: completedState() });
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation, prepareProof }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "completed", report });
+    expect(mocks.validatePrepareWait).toHaveBeenCalledWith({ owner: fullOwner, snapshot, proof: prepareProof });
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("rejects a completed approval-required Prepare proof without a saved choice ID", async () => {
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "completed", attemptCount: 0,
+      state: completedState() });
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation, prepareProof, scheduledWaitId }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.validatePrepareWait).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("rejects a scheduled choice ID when the persisted snapshot disables approval", async () => {
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    mocks.snapshot.mockReturnValue({ ...scheduledSnapshot, requireApproval: false });
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation, prepareProof, scheduledWaitId }));
+    expect(response.status).toBe(409);
+    expect(mocks.validatePrepareWait).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 
   it("returns retryable accepted for a concurrent same-key claim without running the scorer", async () => {
@@ -163,11 +265,13 @@ describe("scheduled pipeline continuation route", () => {
   });
 
   it("replays a persisted wait while its question is publishing under the exact current Turn lease", async () => {
-    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state: waitingState() });
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"c".repeat(64)}`;
+    const state = { ...waitingState(), scheduledTaskGraphScheduledWaitId: scheduledWaitId };
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "running", attemptCount: 0, state });
     const { POST } = await import("./route");
     const response = await POST(request());
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ status: "waiting_for_user", waitId: "agent-question:turn-1:canonical:q1", stage: "writer" });
+    expect(await response.json()).toEqual({ status: "waiting_for_user", waitId: "agent-question:turn-1:canonical:q1", stage: "writer", scheduledWaitId });
     expect(mocks.claim).not.toHaveBeenCalled();
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
@@ -237,10 +341,10 @@ describe("scheduled pipeline continuation route", () => {
     const nextClaim = nextState.scheduledTaskGraphClaim as Record<string, unknown>;
     const journal = nextState.scheduledTaskGraphAnalyzeJournal as Record<string, unknown>;
     expect(update?.where.state.equals).toBe(priorState);
-    expect(nextClaim).toMatchObject({ key: "continuation-5", owner: nextFullOwner });
-    expect(journal).toMatchObject({ key: "continuation-5", owner: nextFullOwner, attemptsByJob: { "job-1": 1 } });
+    expect(nextClaim).toMatchObject({ key, owner: nextFullOwner });
+    expect(journal).toMatchObject({ key, owner: nextFullOwner, attemptsByJob: { "job-1": 1 } });
     expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
-      scheduledTaskGraph: expect.objectContaining({ owner: nextFullOwner, continuationKey: "continuation-5", claimToken: nextClaim.claimToken }),
+      scheduledTaskGraph: expect.objectContaining({ owner: nextFullOwner, continuationKey: key, claimToken: nextClaim.claimToken }),
     }));
   });
 
@@ -332,12 +436,14 @@ describe("scheduled pipeline continuation route", () => {
   });
 
   it("replays a completed report for the same persisted continuation without claiming or rerunning", async () => {
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"d".repeat(64)}`;
+    const state = { ...completedState(), scheduledTaskGraphScheduledWaitId: scheduledWaitId };
     mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "completed", attemptCount: 0,
-      state: completedState() });
+      state });
     const { POST } = await import("./route");
     const response = await POST(request());
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: "completed", report });
+    expect(await response.json()).toEqual({ status: "completed", report, scheduledWaitId });
     expect(mocks.claim).not.toHaveBeenCalled();
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
@@ -460,12 +566,12 @@ describe("scheduled pipeline continuation route", () => {
     expect(response.status).toBe(200);
     const rebound = mocks.claim.mock.calls[0]?.[0]?.data?.state as Record<string, unknown>;
     expect(rebound).toMatchObject({ nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs: [scoredJobRow()], analysisFailed: 0,
-      scheduledTaskGraphClaim: { key: "continuation-5", claimToken: expect.any(String), owner: { ...fullOwner, ...nextOwner } },
-      scheduledTaskGraphContinuation: { key: "continuation-5", owner: { ...fullOwner, ...nextOwner }, evidenceDigest: attestation.evidenceDigest },
+      scheduledTaskGraphClaim: { key, claimToken: expect.any(String), owner: { ...fullOwner, ...nextOwner } },
+      scheduledTaskGraphContinuation: { key, owner: { ...fullOwner, ...nextOwner }, evidenceDigest: attestation.evidenceDigest },
     });
     expect((rebound.scheduledTaskGraphClaim as Record<string, unknown>).claimToken).not.toBe(claimToken);
     expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
-      scheduledTaskGraph: expect.objectContaining({ continuationKey: "continuation-5", owner: { ...fullOwner, ...nextOwner } }),
+      scheduledTaskGraph: expect.objectContaining({ continuationKey: key, owner: { ...fullOwner, ...nextOwner } }),
     }));
   });
 
@@ -513,7 +619,7 @@ describe("scheduled pipeline continuation route", () => {
     expect(response.status).toBe(200);
     const rebound = mocks.claim.mock.calls[0]?.[0]?.data?.state as Record<string, unknown>;
     expect(rebound).toMatchObject({ nextStage: "scout", scheduledTaskGraphClaim: {
-      key: "continuation-5", claimToken: expect.any(String), owner: { ...fullOwner, ...nextOwner },
+      key, claimToken: expect.any(String), owner: { ...fullOwner, ...nextOwner },
     } });
     expect(rebound).not.toHaveProperty("scheduledTaskGraphContinuation");
   });
@@ -661,7 +767,7 @@ describe("scheduled pipeline continuation route", () => {
   it("rebinds an answered wait to the fresh lease and resumes the saved checkpoint with its exact questionId", async () => {
     const nextOwner = { ...owner, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 5 };
     const nextFullOwner = { ...nextOwner, executionId: fullOwner.executionId, executionAttemptCount: fullOwner.executionAttemptCount };
-    const priorKey = key, nextKey = "continuation-5", prior = waitingState();
+    const priorKey = key, nextKey = key, prior = waitingState();
     mocks.turn.mockResolvedValueOnce({ id: nextOwner.turnId, userId: nextOwner.userId, sessionId: nextOwner.sessionId,
       status: "in_progress", source: "automation", executionMode: "canonical_task_graph",
       input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: nextOwner.rootTaskId,

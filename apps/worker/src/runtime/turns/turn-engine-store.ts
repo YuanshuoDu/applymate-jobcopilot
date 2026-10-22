@@ -157,6 +157,42 @@ export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: Tu
         if (result.rowCount !== 1) throw conflict(`step ${input.stepId}`)
       })
     },
+    async finalizeScheduledPrepareCancellationStep(input): Promise<void> {
+      if (!Number.isSafeInteger(input.inputTokens) || input.inputTokens < 0 || input.inputTokens > 2_147_483_647
+        || !Number.isSafeInteger(input.outputTokens) || input.outputTokens < 0 || input.outputTokens > 2_147_483_647
+        || !Number.isFinite(input.estimatedCostUsd) || input.estimatedCostUsd < 0 || input.estimatedCostUsd >= 10_000) {
+        throw conflict(`step ${input.stepId} usage`)
+      }
+      const owner = input.owner
+      const ownerKind: unknown = owner.kind
+      if (ownerKind !== "task") throw conflict(`interrupted step ${input.stepId} owner kind`)
+      if (!input.stepId.startsWith("scheduled-prepare-model:")) throw conflict(`interrupted step ${input.stepId} namespace`)
+      return tenantTransaction(pool, owner.userId, async client => {
+        if (!await lockOpenSession(client, owner)) throw conflict(`interrupted step ${input.stepId} session`)
+        // Cancellation can clear this task's lease before the exact Scheduled Prepare model step unwinds.
+        const authorized = await client.query<Row>(`SELECT turn."id" FROM "agent_turns" AS turn
+          JOIN "sub_agent_tasks" AS owner_task ON owner_task."id" = $4 AND owner_task."sessionId" = turn."sessionId"
+            AND owner_task."turnId" = turn."id" AND owner_task."rootTaskId" = $5
+          JOIN "sub_agent_tasks" AS root_task ON root_task."id" = $5 AND root_task."sessionId" = turn."sessionId"
+            AND root_task."turnId" = turn."id" AND root_task."rootTaskId" = root_task."id"
+          WHERE turn."userId" = $1 AND turn."sessionId" = $2 AND turn."id" = $3 AND turn."rootTaskId" = $5
+            AND owner_task."attemptCount" = $7 AND owner_task."interruptRequestedAt" IS NOT NULL
+            AND ((owner_task."status" = 'running' AND owner_task."leaseOwner" = $6
+                AND date_trunc('milliseconds', owner_task."leaseExpiresAt") = date_trunc('milliseconds', $8::timestamptz)
+                AND owner_task."leaseExpiresAt" > clock_timestamp())
+              OR (owner_task."status" = 'interrupted' AND owner_task."leaseOwner" IS NULL AND owner_task."leaseExpiresAt" IS NULL))
+          FOR UPDATE OF turn, owner_task`, [owner.userId, owner.sessionId, owner.turnId, owner.taskId, owner.rootTaskId,
+          owner.ownerId, owner.attemptCount, owner.leaseExpiresAt])
+        if (!authorized.rows[0]) throw conflict(`interrupted step ${input.stepId} owner`)
+        const updated = await client.query(`UPDATE "agent_steps" AS step SET "status" = 'interrupted',
+          "finishReason" = 'cancelled', "errorCode" = 'scheduled_prepare_cancelled', "inputTokens" = $1,
+          "outputTokens" = $2, "estimatedCostUsd" = $3, "completedAt" = $4::timestamp(3)
+          WHERE step."id" = $5 AND step."sessionId" = $6 AND step."turnId" = $7 AND step."taskId" = $8
+            AND step."attempt" = $9 AND step."status" = 'streaming' AND step."id" LIKE 'scheduled-prepare-model:%'`, [input.inputTokens, input.outputTokens,
+          input.estimatedCostUsd, input.now, input.stepId, owner.sessionId, owner.turnId, owner.taskId, owner.attemptCount])
+        if (updated.rowCount !== 1) throw conflict(`interrupted step ${input.stepId} lineage`)
+      })
+    },
     async waitForUser(input): Promise<void> {
       if (input.owner.kind !== "turn") throw conflict(`child wait ${input.owner.taskId}`)
       return tenantTransaction(pool, input.owner.userId, async client => {
