@@ -584,6 +584,18 @@ describePg("native verification PostgreSQL producer and readback", () => {
     await expectStaleEvidenceRejected(client => client.query(`UPDATE "agent_items"
       SET "content" = jsonb_set("content", '{answer}', $2::jsonb, false) WHERE "id" = $1`,
     [priorQuestion.itemId, JSON.stringify("Changed historical user answer without changing its item revision.")]))
+    await expectStaleEvidenceRejected(async client => {
+      const before = await client.query<{ revision: number | string }>(`SELECT "revision" FROM "agent_items" WHERE "id" = $1`,
+        [priorQuestion.callItemId])
+      expect(before.rows).toHaveLength(1)
+      await client.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{input,question}', $2::jsonb, false)
+        WHERE "id" = $1`, [priorQuestion.callItemId, JSON.stringify("Changed historical ask_user input without changing its revision.")])
+      const after = await client.query<{ revision: number | string }>(`SELECT "revision" FROM "agent_items" WHERE "id" = $1`,
+        [priorQuestion.callItemId])
+      expect(after.rows).toHaveLength(1)
+      expect(after.rows[0]?.revision).toBe(before.rows[0]?.revision)
+    })
+    await expectStaleEvidenceRejected(client => client.query(`DELETE FROM "agent_items" WHERE "id" = $1`, [priorQuestion.callItemId]))
     await expectStaleEvidenceRejected(client => client.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "itemId" = $2`,
     [priorQuestion.answerEventId, priorQuestion.itemId]))
     await expectStaleEvidenceRejected(client => client.query(`DELETE FROM "agent_items" WHERE "id" = $1`, [priorQuestion.resultItemId]))
