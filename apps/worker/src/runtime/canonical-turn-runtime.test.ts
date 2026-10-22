@@ -1443,13 +1443,13 @@ describe("createCanonicalTurnRuntime", () => {
     const planningSummary = { observedPlanRevision: 0, graphRevisionAtAsk: 1, pendingSteerCount: 1,
       unconsumedSteerCount: 1, inputThroughSequence: "3" }
     const priorInputHistory = priorConversation([
-      { id: "prior-accepted-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_ACCEPTED_STEER" }, acceptedSequence: "10", historyRole: "user", historySequence: "10", delivery: "steer", status: "accepted" },
-      { id: "prior-queued-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_QUEUED_STEER" }, acceptedSequence: "11", historyRole: "user", historySequence: "11", delivery: "steer", status: "queued" },
-      { id: "prior-cancelled-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CANCELLED_FOLLOW_UP" }, acceptedSequence: "12", historyRole: "user", historySequence: "12", delivery: "follow_up", status: "cancelled" },
-      { id: "prior-rejected-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_REJECTED_FOLLOW_UP" }, acceptedSequence: "13", historyRole: "user", historySequence: "13", delivery: "follow_up", status: "rejected" },
-      { id: "prior-consumed-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CONSUMED_FOLLOW_UP" }, acceptedSequence: "14", historyRole: "user", historySequence: "14", delivery: "follow_up", status: "consumed" },
-      { id: "prior-pending-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_PENDING_FOLLOW_UP" }, acceptedSequence: "15", historyRole: "user", historySequence: "15", delivery: "follow_up", status: "accepted" },
-      { id: "prior-missing-status", targetTurnId: "prior-turn", content: { text: "PRIOR_MISSING_STATUS" }, acceptedSequence: "16", historyRole: "user", historySequence: "16", delivery: "steer" },
+      { id: "prior-accepted-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_ACCEPTED_STEER" }, acceptedSequence: "10", historyRole: "user", historySequence: "10", delivery: "steer", status: "accepted", consumedByStepId: null, consumedAt: null, cancelledAt: null },
+      { id: "prior-queued-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_QUEUED_STEER" }, acceptedSequence: "11", historyRole: "user", historySequence: "11", delivery: "steer", status: "queued", consumedByStepId: null, consumedAt: null, cancelledAt: null },
+      { id: "prior-cancelled-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CANCELLED_FOLLOW_UP" }, acceptedSequence: "12", historyRole: "user", historySequence: "12", delivery: "follow_up", status: "cancelled", consumedByStepId: null, consumedAt: null, cancelledAt: new Date("2026-09-07T00:00:00.000Z") },
+      { id: "prior-rejected-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_REJECTED_FOLLOW_UP" }, acceptedSequence: "13", historyRole: "user", historySequence: "13", delivery: "follow_up", status: "rejected", consumedByStepId: null, consumedAt: null, cancelledAt: null },
+      { id: "prior-consumed-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CONSUMED_FOLLOW_UP" }, acceptedSequence: "14", historyRole: "user", historySequence: "14", delivery: "follow_up", status: "consumed", consumedByStepId: "step-prior-consumed", consumedAt: new Date("2026-09-07T00:00:00.000Z"), cancelledAt: null },
+      { id: "prior-pending-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_PENDING_FOLLOW_UP" }, acceptedSequence: "15", historyRole: "user", historySequence: "15", delivery: "follow_up", status: "accepted", consumedByStepId: null, consumedAt: null, cancelledAt: null },
+      { id: "prior-missing-status", targetTurnId: "prior-turn", content: { text: "PRIOR_MISSING_STATUS" }, acceptedSequence: "16", historyRole: "user", historySequence: "16", delivery: "steer", consumedByStepId: null, consumedAt: null, cancelledAt: null },
       { id: "prior-assistant-reply", turnId: "prior-turn", content: { text: "PRIOR_ASSISTANT_REPLY" }, historyRole: "assistant", historySequence: "17" },
     ], lease.turnId, null)
     const questionStore = {

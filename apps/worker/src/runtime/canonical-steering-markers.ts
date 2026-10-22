@@ -39,11 +39,27 @@ export function textContent(value: unknown): string | null {
   return parts.length > 0 ? parts.join("\n").trim() : null
 }
 
-function ownString(row: Row, key: string): string | null {
+function ownValue(row: Row, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(row, key)
-  return descriptor && descriptor.enumerable && "value" in descriptor && typeof descriptor.value === "string"
-    ? descriptor.value
-    : null
+  return descriptor && descriptor.enumerable && "value" in descriptor ? descriptor.value : undefined
+}
+
+function ownString(row: Row, key: string): string | null {
+  const value = ownValue(row, key)
+  return typeof value === "string" ? value : null
+}
+
+function ownConsumedStepId(row: Row): string | null {
+  const value = ownValue(row, "consumedByStepId")
+  return typeof value === "string" && value.length > 0 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) ? value : null
+}
+
+function ownNull(row: Row, key: string): boolean { return ownValue(row, key) === null }
+
+function ownDate(row: Row, key: string): Date | null {
+  const value = ownValue(row, key)
+  return value instanceof Date && Number.isFinite(value.getTime()) ? value : null
 }
 
 function priorInputDisposition(row: Row): { readonly valid: boolean; readonly value?: PriorInputDisposition } {
@@ -52,10 +68,24 @@ function priorInputDisposition(row: Row): { readonly valid: boolean; readonly va
   if ((delivery !== "steer" && delivery !== "follow_up") || !status) return { valid: false }
   if (status === "accepted" || status === "queued") {
     if (delivery === "follow_up") return { valid: false }
+    if (!["consumedByStepId", "consumedAt", "cancelledAt"].every(key => ownNull(row, key))) return { valid: false }
     return { valid: true, value: "not_consumed" }
   }
-  if (status === "consumed") return { valid: true }
-  if (status === "cancelled" || status === "rejected") return { valid: true, value: status }
+  if (status === "consumed") {
+    if (!ownConsumedStepId(row) || !ownDate(row, "consumedAt") || !ownNull(row, "cancelledAt")) return { valid: false }
+    return { valid: true }
+  }
+  if (status === "cancelled") {
+    const consumedByStepId = ownConsumedStepId(row)
+    const consumedAt = ownDate(row, "consumedAt")
+    const unconsumed = ownNull(row, "consumedByStepId") && ownNull(row, "consumedAt")
+    if (delivery !== "follow_up" || !ownDate(row, "cancelledAt") || !(unconsumed || consumedByStepId && consumedAt)) return { valid: false }
+    return { valid: true, value: "cancelled" }
+  }
+  if (status === "rejected") {
+    if (!["consumedByStepId", "consumedAt", "cancelledAt"].every(key => ownNull(row, key))) return { valid: false }
+    return { valid: true, value: "rejected" }
+  }
   return { valid: false }
 }
 
