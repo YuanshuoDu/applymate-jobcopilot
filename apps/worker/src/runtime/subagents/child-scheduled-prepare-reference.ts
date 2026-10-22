@@ -128,7 +128,7 @@ function parseCompletePrepare(bytes: Buffer, reference: ScheduledPrepareReferenc
   try { value = JSON.parse(text) } catch { return invalid() }
   try {
     if (canonicalJson(value) !== text) return invalid()
-    const prepared = prepareToolResultJson(value, PREPARE_TOOL, taskId)
+    const prepared = prepareToolResultJson(value, PREPARE_TOOL, taskId, attemptCount)
     if (prepared.encoded !== text || prepared.bytes !== reference.sizeBytes || prepared.sha256 !== reference.sha256) return invalid()
     const result = validateRoleResult(prepared.value, "prepare")
     if (result.taskId !== taskId || result.attemptCount !== attemptCount) return invalid()

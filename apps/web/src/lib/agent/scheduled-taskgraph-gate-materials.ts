@@ -180,9 +180,18 @@ function verifyArtifact(versionValue: unknown, headValue: unknown, owner: Schedu
     && sameOrderedStrings(version.evidenceRefs, provenanceRefs)
     && head.id === ref.artifactId && head.userId === owner.userId && head.jobId === jobId && head.artifactType === kind
     && head.lifecycle === 'draft' && head.version === ref.version && head.hash === ref.contentHash
-    && safeHash(head.content) === ref.contentHash && head.baseId === version.baseId && head.baseHash === version.baseHash
+    && (kind === 'cover_letter' ? isRedactedCoverLetterHead(head.content, ref) : safeHash(head.content) === ref.contentHash)
+    && head.baseId === version.baseId && head.baseHash === version.baseHash
     && head.constraintHash === version.constraintHash && sameOrderedStrings(head.provenanceRefs, provenanceRefs)
     && sameOrderedStrings(head.evidenceRefs, provenanceRefs)
+}
+
+function isRedactedCoverLetterHead(value: unknown, ref: ScheduledTaskGraphArtifactReference): boolean {
+  const marker = record(value), keys = ['kind', 'artifactId', 'version', 'contentHash']
+  return Boolean(marker && Reflect.ownKeys(marker).length === keys.length
+    && Reflect.ownKeys(marker).every(key => typeof key === 'string' && keys.includes(key))
+    && marker.kind === 'agent_artifact_version' && marker.artifactId === ref.artifactId
+    && marker.version === ref.version && marker.contentHash === ref.contentHash)
 }
 
 function parseMaterialSourceRefs(value: unknown, source: SourceDigestBundle, jobId: string): string[] | null {

@@ -67,8 +67,8 @@ export class ToolResultSanitizationError extends Error {
   constructor(readonly code: "tool_result_invalid_json" | "tool_result_corrupt") { super(code) }
 }
 
-function sanitizeSource(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string): RepositoryJsonValue {
-  if (toolName === SCHEDULED_PREPARE_TOOL) return projectScheduledPrepareLifecycleOutput(value, expectedTaskId)
+function sanitizeSource(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number): RepositoryJsonValue {
+  if (toolName === SCHEDULED_PREPARE_TOOL) return projectScheduledPrepareLifecycleOutput(value, expectedTaskId, expectedAttemptCount)
   if (toolName === "agent.wait" || toolName === "wait_subagents") return redactDurableWaitOutput(value)
   if (toolName === "jobs.search" || toolName === "jobs.get" || toolName === "jobs.discover") return redactJobReadOutput(toolName, value)
   return redactSensitiveValue(value)
@@ -81,20 +81,22 @@ function prepareJson(value: RepositoryJsonValue): PreparedToolResult {
   } catch { throw new ToolResultSanitizationError("tool_result_invalid_json") }
 }
 
-export function prepareToolResultJson(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string): PreparedToolResult {
-  try { return prepareJson(sanitizeSource(value, toolName, expectedTaskId)) }
+export function prepareToolResultJson(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number): PreparedToolResult {
+  try { return prepareJson(sanitizeSource(value, toolName, expectedTaskId, expectedAttemptCount)) }
   catch { throw new ToolResultSanitizationError("tool_result_invalid_json") }
 }
 
 /** Rebuilds only the verified scheduled Prepare receipt, preserving its safe artifact digests. */
-export function projectScheduledPrepareLifecycleOutput(value: unknown, expectedTaskId?: string): RepositoryJsonValue {
+export function projectScheduledPrepareLifecycleOutput(value: unknown, expectedTaskId?: string, expectedAttemptCount?: number): RepositoryJsonValue {
   if (!isPlainScheduledPrepareData(value)) throw invalidScheduledPrepareOutput()
   let result: PrepareResult
   try { result = validateRoleResult(value, "prepare") }
   catch { throw invalidScheduledPrepareOutput() }
   const taskIdFence = expectedTaskId === undefined ? result.taskId : expectedTaskId
   const safeIdentifier = (identifier: string) => identifier.trim() === identifier && redactSensitiveText(identifier) === identifier
-  if (typeof taskIdFence !== "string" || result.taskId !== taskIdFence || !safePrepareTaskId(result.taskId)
+  if (typeof taskIdFence !== "string" || result.taskId !== taskIdFence
+    || expectedAttemptCount !== undefined && (!Number.isSafeInteger(expectedAttemptCount) || expectedAttemptCount < 1 || result.attemptCount !== expectedAttemptCount)
+    || !safePrepareTaskId(result.taskId)
     || result.jobs.some(job => !PREPARE_JOB_ID.test(job.jobId) || !safeIdentifier(job.jobId))
     || result.materials.some(material => !PREPARE_JOB_ID.test(material.jobId) || !safeIdentifier(material.jobId)
       || !safeScheduledDraftArtifactId(material.artifactRef.artifactId))) throw invalidScheduledPrepareOutput()
@@ -146,11 +148,11 @@ function matchesStored(value: ToolResultReferenceRecord, safe: PreparedToolResul
   return safe.sha256 === value.sha256 && safe.bytes === value.byteCount && safe.encoded === canonicalJson(value.sanitizedJson)
 }
 
-export function verifyToolResultSanitization(value: ToolResultReferenceRecord, toolName: CanonicalToolSourceName): RepositoryJsonValue {
+export function verifyToolResultSanitization(value: ToolResultReferenceRecord, toolName: CanonicalToolSourceName, expectedAttemptCount?: number): RepositoryJsonValue {
   if (toolName === SCHEDULED_PREPARE_TOOL) {
     try {
       if (typeof value.taskId !== "string") throw new Error("scheduled_prepare_task_fence_missing")
-      const safe = prepareToolResultJson(value.sanitizedJson, toolName, value.taskId)
+      const safe = prepareToolResultJson(value.sanitizedJson, toolName, value.taskId, expectedAttemptCount)
       if (matchesStored(value, safe)) return safe.value
     } catch { /* Prepare references must be valid under their stored task fence. */ }
     throw new ToolResultSanitizationError("tool_result_corrupt")
@@ -171,11 +173,12 @@ export function matchesVerifiedToolResultRetry(
   sourcePrepared: PreparedToolResult,
   retryInput: unknown,
   toolName: CanonicalToolSourceName,
+  expectedAttemptCount?: number,
 ): boolean {
-  try { verifyToolResultSanitization(value, toolName) } catch { return false }
+  try { verifyToolResultSanitization(value, toolName, expectedAttemptCount) } catch { return false }
   if (matchesStored(value, sourcePrepared)) return true
   if (toolName === SCHEDULED_PREPARE_TOOL) {
-    try { return matchesStored(value, prepareToolResultJson(retryInput, toolName, value.taskId)) }
+    try { return matchesStored(value, prepareToolResultJson(retryInput, toolName, value.taskId, expectedAttemptCount)) }
     catch { return false }
   }
   try { return matchesStored(value, prepareJson(redactSensitiveValue(retryInput))) }

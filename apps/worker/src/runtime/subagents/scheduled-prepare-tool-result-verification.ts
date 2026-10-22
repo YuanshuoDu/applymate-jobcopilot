@@ -108,7 +108,7 @@ export async function verifyScheduledPrepareToolResultReference(
       || sha256 !== reference.sha256 || sha256 !== row.sha256) return null
 
     const stored = toReferenceRecord(row)
-    const verified = validateRoleResult(verifyToolResultSanitization(stored, PREPARE_TOOL), "prepare")
+    const verified = validateRoleResult(verifyToolResultSanitization(stored, PREPARE_TOOL, scope.attemptCount), "prepare")
     if (verified.taskId !== scope.taskId || verified.attemptCount !== scope.attemptCount
       || canonicalJson(verified) !== canonicalJson(expected)) return null
     return verified

@@ -56,7 +56,23 @@ function installGateRows(provenanceRefs: readonly string[], artifactSourceDigest
   mocks.facts.mockResolvedValue(facts)
   mocks.versions.mockResolvedValue([version])
   mocks.heads.mockResolvedValue([head])
-  return { artifactRef }
+  return { artifactRef, version, head }
+}
+
+function installCoverLetterRows(markerOverrides: Record<string, unknown> = {}) {
+  const refs = [`job:${job.id}`, `resume:${resume.id}`]
+  const resumeRows = installGateRows(refs)
+  const content = 'Dear Example, I build reliable systems.'
+  const contentHash = hashArtifactContent(content), digest = sourceDigest()
+  const artifactRef = { artifactId: 'artifact-letter-1', version: 1, contentHash, sourceDigest: digest }
+  const version = { ...resumeRows.version, id: 'version-letter-1', artifactId: artifactRef.artifactId, artifactType: 'cover_letter',
+    content, contentHash, sourceDigest: digest, baseId: 'base-letter-1' }
+  const head = { ...resumeRows.head, id: artifactRef.artifactId, artifactType: 'cover_letter', baseId: version.baseId,
+    content: { kind: 'agent_artifact_version', artifactId: artifactRef.artifactId, version: artifactRef.version, contentHash, ...markerOverrides },
+    hash: contentHash }
+  mocks.versions.mockResolvedValue([resumeRows.version, version])
+  mocks.heads.mockResolvedValue([resumeRows.head, head])
+  return { resumeRef: resumeRows.artifactRef, artifactRef, content }
 }
 
 describe('scheduled TaskGraph Gate materials', () => {
@@ -93,6 +109,29 @@ describe('scheduled TaskGraph Gate materials', () => {
       jobs: [{ jobId: 'job-1', status: 'prepared' }], materials: [{ jobId: 'job-1', kind: 'resume', artifactRef }] }))
       .resolves.toMatchObject({ packages: [{ jobId: 'job-1' }] })
     expect(mocks.facts).toHaveBeenCalledOnce()
+  })
+
+  it('loads a cover letter from its immutable body while validating the content-free head marker', async () => {
+    const rows = installCoverLetterRows()
+
+    await expect(loadScheduledTaskGraphGateMaterials({ owner, scoredJobs, minScore: 70, dailyCap: 5, taskId: 'prepare-1',
+      jobs: [{ jobId: 'job-1', status: 'prepared' }], materials: [
+        { jobId: 'job-1', kind: 'resume', artifactRef: rows.resumeRef },
+        { jobId: 'job-1', kind: 'cover_letter', artifactRef: rows.artifactRef },
+      ] })).resolves.toMatchObject({
+        packages: [{ package: { coverLetter: rows.content, coverLetterId: rows.artifactRef.artifactId } }],
+        materials: [{ kind: 'resume' }, { kind: 'cover_letter' }],
+      })
+  })
+
+  it('rejects a cover-letter head marker that does not match its immutable artifact reference', async () => {
+    const rows = installCoverLetterRows({ artifactId: 'foreign-artifact' })
+
+    await expect(loadScheduledTaskGraphGateMaterials({ owner, scoredJobs, minScore: 70, dailyCap: 5, taskId: 'prepare-1',
+      jobs: [{ jobId: 'job-1', status: 'prepared' }], materials: [
+        { jobId: 'job-1', kind: 'resume', artifactRef: rows.resumeRef },
+        { jobId: 'job-1', kind: 'cover_letter', artifactRef: rows.artifactRef },
+      ] })).resolves.toBeNull()
   })
 
   it.each([

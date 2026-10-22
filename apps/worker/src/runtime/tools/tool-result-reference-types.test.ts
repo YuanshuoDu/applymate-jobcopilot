@@ -153,7 +153,7 @@ describe("tool result reference runtime contract", () => {
 
   it("round-trips a scheduled Prepare receipt larger than the inline 8 KiB limit", () => {
     const input = largeScheduledPrepareReceipt()
-    const prepared = prepareToolResultJson(input, scheduledPrepareSource)
+    const prepared = prepareToolResultJson(input, scheduledPrepareSource, scheduledPrepareTaskId, 1)
     expect(prepared.bytes).toBeGreaterThan(8 * 1024)
     expect(prepared.bytes).toBeLessThan(1024 * 1024)
     expect(prepared.value).toEqual(input)
@@ -162,8 +162,13 @@ describe("tool result reference runtime contract", () => {
     const row = toolResultRow(persisted)
     expect(row.sha256).toBe(createHash("sha256").update(canonicalJson(persisted), "utf8").digest("hex"))
     expect(row.byteCount).toBe(Buffer.byteLength(canonicalJson(persisted), "utf8"))
-    expect(verifyToolResultSanitization(row, scheduledPrepareSource)).toEqual(prepared.value)
-    expect(matchesVerifiedToolResultRetry(row, prepared, input, scheduledPrepareSource)).toBe(true)
+    expect(verifyToolResultSanitization(row, scheduledPrepareSource, 1)).toEqual(prepared.value)
+    expect(matchesVerifiedToolResultRetry(row, prepared, input, scheduledPrepareSource, 1)).toBe(true)
+    expect(() => prepareToolResultJson(input, scheduledPrepareSource, scheduledPrepareTaskId, 2))
+      .toThrowError(expect.objectContaining({ code: "tool_result_invalid_json" }))
+    expect(() => verifyToolResultSanitization(row, scheduledPrepareSource, 2))
+      .toThrowError(expect.objectContaining({ code: "tool_result_corrupt" }))
+    expect(matchesVerifiedToolResultRetry(row, prepared, input, scheduledPrepareSource, 2)).toBe(false)
   })
 
   it("fails closed for malformed, redacted, or tampered scheduled Prepare references", () => {
