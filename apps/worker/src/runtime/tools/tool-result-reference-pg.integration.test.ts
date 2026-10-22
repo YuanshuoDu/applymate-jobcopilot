@@ -325,19 +325,42 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
 
       await beforeRestartPool.end()
       beforeRestartPool = undefined
+      const restartedOwnerId = `${scheduledPrepare.owner.lease.ownerId}-restarted`
+      const restartedOwner = {
+        kind: "task" as const,
+        lease: { ...scheduledPrepare.owner.lease, ownerId: restartedOwnerId, leaseOwner: restartedOwnerId },
+      }
+      const rollover = await adminPool!.query<{ attemptCount: number; status: string }>(`UPDATE "sub_agent_tasks"
+        SET "leaseOwner" = $2 WHERE "id" = $1 AND "status" = 'running' AND "attemptCount" = $3
+        RETURNING "attemptCount", "status"`, [scheduledPrepare.taskId, restartedOwnerId, scheduledPrepare.attemptCount])
+      expect(rollover.rows).toEqual([{ attemptCount: scheduledPrepare.attemptCount, status: "running" }])
+
       const afterRestart = createToolResultReferenceRepository(runtimePool(afterRestartPool, readerBackend))
+      await expect(afterRestart.read(scheduledPrepare.owner, { referenceId: stored.id }, toolCallId))
+        .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+      const retried = await afterRestart.put(restartedOwner, {
+        stepId: scheduledPrepare.stepId, toolCallId, value,
+      })
+      expect(retried.id).toBe(stored.id)
+      expect(retried.taskId).toBe(stored.taskId)
+      expect(retried.sha256).toBe(stored.sha256)
+      expect(retried.byteCount).toBe(stored.byteCount)
+      const identityCount = await adminPool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count"
+        FROM "agent_tool_result_references" WHERE "stepId" = $1 AND "toolCallId" = $2`, [scheduledPrepare.stepId, toolCallId])
+      expect(identityCount.rows[0]?.count).toBe(1)
+
       const chunks: string[] = []
       let cursor: string | undefined
       let last: Awaited<ReturnType<typeof afterRestart.read>> = null
       for (let index = 0; index < Math.ceil(stored.byteCount / 2_048) + 2; index += 1) {
-        last = await afterRestart.read(scheduledPrepare.owner, {
+        last = await afterRestart.read(restartedOwner, {
           referenceId: stored.id, ...(cursor === undefined ? {} : { cursor }),
         }, toolCallId)
         expect(last).not.toBeNull()
         const encodedChunk = JSON.stringify(last)
         expect(encodedChunk).toBeTypeOf("string")
         expect(Buffer.byteLength(encodedChunk!, "utf8")).toBeLessThanOrEqual(MAX_TOOL_RESULT_READ_BYTES)
-        expect(isVerifiedToolResultChunk(last, scheduledPrepare.owner, toolCallId)).toBe(true)
+        expect(isVerifiedToolResultChunk(last, restartedOwner, toolCallId)).toBe(true)
         chunks.push(last!.chunk)
         if (last!.nextCursor === null) break
         cursor = last!.nextCursor
@@ -357,7 +380,7 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
       await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = $2 WHERE "id" = $1`, [
         scheduledPrepare.taskId, scheduledPrepare.attemptCount + 1,
       ])
-      await expect(afterRestart.read(scheduledPrepare.owner, { referenceId: stored.id }, toolCallId))
+      await expect(afterRestart.read(restartedOwner, { referenceId: stored.id }, toolCallId))
         .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
       const staleVerificationClient = await afterRestartPool.connect()
       try {
@@ -365,7 +388,7 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
         await staleVerificationClient.query("BEGIN")
         await staleVerificationClient.query("SELECT set_config('app.user_id', $1, true)", [ownerC.userId])
         await expect(verifyScheduledPrepareToolResultReference(staleVerificationClient, {
-          reference, scope: verificationScope, mode: { phase: "finish", ownerId: scheduledPrepare.owner.lease.ownerId },
+          reference, scope: verificationScope, mode: { phase: "finish", ownerId: restartedOwner.lease.ownerId },
           stepId: scheduledPrepare.stepId, toolCallId, expectedResult: value,
         })).resolves.toBeNull()
         await staleVerificationClient.query("COMMIT")
