@@ -5,6 +5,7 @@ import { useToast } from '@/components/ui'
 import { useApi }   from '@/lib/hooks'
 import type { AgentConfig } from '@/lib/types'
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
+import { AgentCurrentObjective } from '@/components/agent-workspace/AgentCurrentObjective'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
 import { AgentPlaygroundWorkspace } from './AgentPlaygroundWorkspace'
@@ -208,6 +209,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
           t={t}
         />
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <AgentCurrentObjective goal={activeTurn?.goal} />
           <AgentSessionPauseResumeControl sessionId={selectedSessionId ?? ''} sessionStatus={controlStatus} activeTurn={activeTurn} onPause={command => sendSessionControl('pause', command)} onResume={command => sendSessionControl('resume', command)} />
           <AgentTurnComposerProvider value={turnComposer}>
             <AgentUnifiedStream

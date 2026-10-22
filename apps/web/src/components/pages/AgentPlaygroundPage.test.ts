@@ -57,6 +57,12 @@ describe('Agent workspace responsive layout', () => {
     expect(source).not.toContain('liveSessionId')
   })
 
+  it('shows only the canonical active Turn goal while preserving the conversation title', () => {
+    expect(source).toContain('<AgentCurrentObjective goal={activeTurn?.goal} />')
+    expect(source).toContain('conversationTitle={conversationTitle}')
+    expect(source).not.toContain('conversationTitle={activeTurn?.goal')
+  })
+
   it('mounts the discovery trigger on the live Agent page without wiring it to legacy execution', () => {
     expect(appShellSource).toMatch(/agent:\s*AgentPlaygroundPage/)
     expect(source).toContain('<AgentDiscoveryLauncher')
