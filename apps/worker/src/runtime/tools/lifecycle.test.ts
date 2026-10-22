@@ -160,7 +160,7 @@ async function verifiedReadOutput(toolCallId: string) {
         : query.includes("SELECT ref.*")
           ? [stored]
           : query.includes('FROM "agent_items" AS item')
-            ? [{ toolName: "jobs.search" }]
+            ? [{ toolName: "jobs.search", taskAttemptCount: 1, role: "orchestrator", taskType: "root" }]
             : []
       return { rows: rows as T[], rowCount: rows.length }
     },
@@ -191,7 +191,7 @@ function durableLifecyclePool(sourceCallId: string) {
       else if (query.includes('FROM "agent_steps"')) rows = [{ id: values[0] }]
       else if (query.includes('FROM "sub_agent_tasks" root')) rows = [{ id: "root-1" }]
       else if (query.includes('FROM "agent_items" AS item')) {
-        if (values[4] === sourceCallId) rows = [{ toolName: "jobs.search" }]
+        if (values[4] === sourceCallId) rows = [{ toolName: "jobs.search", taskAttemptCount: 1, role: "orchestrator", taskType: "root" }]
       } else if (query.includes('INSERT INTO "agent_tool_result_references"')) {
         stored = {
           id: values[0], userId: values[1], sessionId: values[2], turnId: values[3], stepId: values[4],
