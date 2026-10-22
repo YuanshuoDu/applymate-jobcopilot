@@ -17,10 +17,33 @@ import type { ToolResultChunk, ToolResultReferenceRepository } from "./tool-resu
 import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
 import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA } from "../subagents/task-graph-result-page-contract.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { SCHEDULED_APPLICATION_PREPARE_OUTPUT_SCHEMA } from "./scheduled-application-prepare.js"
 
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
 const ordinaryCall: LifecycleCall = { ...call, toolName: "notes.read" }
 const planCall: LifecycleCall = { ...call, toolName: "agent.plan" }
+const prepareTaskId = "subagent-abcdefab-cdef-4abc-8def-abcdefabcdef"
+const scheduledPrepareSummary = {
+  schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: prepareTaskId, attemptCount: 2,
+  snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64),
+  jobs: [{ jobId: "c123456789012345678901234", status: "prepared" }],
+  materials: [{ jobId: "c123456789012345678901234", kind: "resume", artifactRef: {
+    artifactId: `scheduled-draft:${"a".repeat(64)}`, version: 1, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+  } }],
+}
+function maxScheduledPrepareSummary() {
+  const jobs = Array.from({ length: 50 }, (_, index) => ({
+    jobId: `c${"a".repeat(22)}${String.fromCharCode(97 + Math.floor(index / 26), 97 + index % 26)}`, status: "prepared" as const,
+  }))
+  const materials = Array.from({ length: 100 }, (_, index) => ({
+    jobId: jobs[Math.floor(index / 2)]!.jobId,
+    kind: index % 2 === 0 ? "resume" as const : "cover_letter" as const,
+    artifactRef: { artifactId: `scheduled-draft:${String(index).padStart(3, "0")}${"a".repeat(61)}`, version: 1,
+      contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}` },
+  }))
+  return { ...scheduledPrepareSummary, jobs, materials }
+}
 const numericUuidV4 = "00000000-0000-4000-8000-000000000000"
 const numericUuidV1 = "00000000-0000-1000-8000-000000000000"
 const phoneLikeId = "+353 87 123 4567"
@@ -720,6 +743,71 @@ describe("ToolLifecycle", () => {
     const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
     const output = await lifecycle.completed(ordinaryCall, { waitId: durableWaitReceipt.waitId })
     expect(output).toEqual({ waitId: "wait-[REDACTED_PHONE]" })
+  })
+
+  it("returns the task-bound scheduled Prepare summary to Router and lifecycle events", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const tool: RuntimeToolDefinition = {
+      schemaVersion, name: "scheduled.application.prepare", version: "1", description: "Prepare scheduled materials",
+      capabilities: ["read", "write"], inputSchema: Type.Object({}, { additionalProperties: false }),
+      outputSchema: SCHEDULED_APPLICATION_PREPARE_OUTPUT_SCHEMA, risk: "read", domain: "resume",
+      idempotency: "requires_key", timeoutMs: 300_000, requiredCapabilities: [], execute: async () => scheduledPrepareSummary,
+    }
+    const router = new ToolRouter(new ToolRegistry([tool]), lifecycle)
+    const result = await router.execute({ scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1",
+      stepId: "prepare-step", taskId: prepareTaskId, capabilities: ["read", "write"] }, {
+      id: "call-scheduled-prepare", toolName: "scheduled.application.prepare", toolVersion: "1", input: {},
+    })
+    const completion = sink.events.find(event => event.phase === "completed")
+
+    expect(result.status).toBe("completed")
+    expect(result.output).toEqual(scheduledPrepareSummary)
+    expect((result.output as typeof scheduledPrepareSummary).materials[0]?.artifactRef.contentHash).toBe(`sha256:${"c".repeat(64)}`)
+    expect(completion?.item).toMatchObject({ type: "tool_result", output: result.output })
+    expect(completion?.payload.output).toEqual(result.output)
+    expect(Object.keys(result.output as object).sort()).toEqual(Object.keys(scheduledPrepareSummary).sort())
+    expect(JSON.stringify({ output: result.output, completion })).not.toContain("resume source body or secret")
+  })
+
+  it("rejects max-bounded Prepare summaries above the inline lifecycle limit", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const summary = maxScheduledPrepareSummary()
+    const canonicalSummary = canonicalJson(summary as never)
+    expect(Buffer.byteLength(canonicalSummary, "utf8")).toBeGreaterThan(8 * 1024)
+    const put = vi.fn()
+    const durableResults = { put, read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const lifecycle = new ToolLifecycle({ sink, durableResults, resolveOwner: () => owner })
+
+    await expect(lifecycle.completed({ ...call, toolName: "scheduled.application.prepare", taskId: prepareTaskId }, summary))
+      .rejects.toMatchObject({ code: "tool_result_too_large" })
+    expect(put).not.toHaveBeenCalled()
+    expect(sink.events.some(event => event.phase === "completed")).toBe(false)
+  })
+
+  it.each([
+    { label: "extra source body and secret fields", output: { ...scheduledPrepareSummary, resumeText: "resume source body or secret", apiKey: "sk_test_private_secret_value" }, taskId: prepareTaskId },
+    { label: "mismatched task ID", output: scheduledPrepareSummary, taskId: "subagent-fedcbafe-dcba-4abc-8def-fedcbafedcba" },
+    { label: "missing task ID", output: scheduledPrepareSummary, taskId: undefined },
+  ])("rejects scheduled Prepare lifecycle output with $label", async ({ output, taskId }) => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const prepareCall: LifecycleCall = { ...call, toolName: "scheduled.application.prepare", ...(taskId ? { taskId } : {}) }
+
+    await expect(lifecycle.completed(prepareCall, output)).rejects.toMatchObject({
+      code: "scheduled_prepare_lifecycle_output_invalid",
+      message: "Scheduled Prepare output is invalid",
+    })
+    expect(sink.events).toHaveLength(0)
+    expect(JSON.stringify(sink.events)).not.toContain("resume source body or secret")
+    expect(JSON.stringify(sink.events)).not.toContain("sk_test_private_secret_value")
+  })
+
+  it("keeps generic redaction for the Prepare-shaped output under unrelated tools", async () => {
+    const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
+    const output = await lifecycle.completed(ordinaryCall, scheduledPrepareSummary) as typeof scheduledPrepareSummary
+
+    expect(output.materials[0]?.artifactRef.contentHash).toBe("[REDACTED]")
   })
 
   it("persists native spawn, alias, and follow-up receipts inline without redacting generated lineage", async () => {

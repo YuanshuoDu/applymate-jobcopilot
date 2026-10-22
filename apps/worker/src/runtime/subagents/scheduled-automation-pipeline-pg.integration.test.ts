@@ -1805,7 +1805,7 @@ function fixture(): Fixture {
     rootTaskId: `scheduled-pipeline-root-${suffix}`,
     scoutTaskId: `scheduled-pipeline-scout-${suffix}`,
     analystTaskId: `scheduled-pipeline-analyst-${suffix}`,
-    jobId: `scheduled-pipeline-job-${suffix}`,
+    jobId: `c${suffix.replaceAll("-", "").slice(0, 24)}`,
     leaseOwnerId: `scheduled-pipeline-turn-owner-${suffix}`,
     executionId: `scheduled-pipeline-execution-${suffix}`,
   }
