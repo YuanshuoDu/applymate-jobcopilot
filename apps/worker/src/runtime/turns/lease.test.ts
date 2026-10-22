@@ -38,6 +38,42 @@ function fakePool(rows: unknown[] = [row], sessionStatus = "running", sessionUse
   return { pool: { connect: vi.fn().mockResolvedValue(client) }, client, calls }
 }
 
+type PersistedFailure = {
+  turnId: string; sessionId: string; userId: string; leaseVersion: number
+  turnStatus: string; turnError: string; rootStatus: string; rootFailureReason: string; terminalEvents: boolean
+}
+
+const persistedNoProgress: PersistedFailure = {
+  turnId: row.id, sessionId: row.sessionId, userId: row.userId, leaseVersion: row.leaseVersion,
+  turnStatus: "failed", turnError: "no_progress", rootStatus: "failed", rootFailureReason: "no_progress", terminalEvents: true,
+}
+
+function noProgressReceiptPool(overrides: Partial<PersistedFailure> = {}) {
+  const persisted = { ...persistedNoProgress, ...overrides }
+  const calls: Array<[string, unknown[]?]> = []
+  const client = {
+    query: vi.fn(async (sql: string, values?: unknown[]) => {
+      calls.push([sql, values])
+      if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
+        return values?.[0] === persisted.sessionId && values?.[1] === persisted.userId
+          ? { rows: [{ id: persisted.sessionId }], rowCount: 1 }
+          : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_turns" AS turn')) {
+        const sameIdentity = values?.[0] === persisted.turnId && values?.[1] === persisted.sessionId
+          && values?.[2] === persisted.userId && values?.[3] === persisted.leaseVersion
+        const exactFailure = persisted.turnStatus === "failed" && persisted.turnError === "no_progress"
+          && persisted.rootStatus === "failed" && persisted.rootFailureReason === "no_progress" && persisted.terminalEvents
+        return sameIdentity && exactFailure ? { rows: [{ id: persisted.turnId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      return { rows: [], rowCount: 1 }
+    }),
+    release: vi.fn(),
+  }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) }, client, calls }
+}
+
 const payload = { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }
 
 describe("database Turn lease", () => {
@@ -224,6 +260,46 @@ describe("database Turn lease", () => {
 
     expect(calls.filter(sql => sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)
     expect(calls.some(sql => sql.includes('UPDATE "agent_inputs"'))).toBe(false)
+  })
+
+  it("treats a failed release as idempotent only for the exact persisted no-progress terminal receipt", async () => {
+    const fake = noProgressReceiptPool()
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+
+    await expect(releaseTurnLease(fake.pool, current, "failed", now)).resolves.toBe(true)
+
+    const [sql, values] = fake.calls.find(([text]) => text.includes('FROM "agent_turns" AS turn')) ?? ["", []]
+    expect(values).toEqual([current.turnId, current.sessionId, current.userId, current.leaseVersion])
+    expect(sql).toContain('JOIN "sub_agent_tasks" AS root')
+    expect(sql).toContain('JOIN "agent_events" AS no_progress')
+    expect(sql).toContain('JOIN "agent_events" AS turn_failed')
+    expect(sql).toContain('turn."status" = \'failed\' AND turn."error" = \'no_progress\'')
+    expect(sql).toContain('root."status" = \'failed\' AND root."failureReason" = \'no_progress\'')
+    expect(fake.calls.at(-1)?.[0]).toBe("COMMIT")
+  })
+
+  type LeaseIdentityOverrides = Partial<Pick<TurnLease, "turnId" | "sessionId" | "userId" | "leaseVersion">>
+  type PersistedFailureOverrides = Partial<PersistedFailure>
+  const mismatchCases: ReadonlyArray<readonly [string, LeaseIdentityOverrides, PersistedFailureOverrides]> = [
+    ["Turn id", { turnId: "turn_other" }, {}],
+    ["session id", { sessionId: "session_other" }, {}],
+    ["user id", { userId: "user_other" }, {}],
+    ["lease version", { leaseVersion: row.leaseVersion + 1 }, {}],
+    ["Turn status", {}, { turnStatus: "completed" }],
+    ["Turn failure reason", {}, { turnError: "provider_failure" }],
+    ["root status", {}, { rootStatus: "running" }],
+    ["root failure reason", {}, { rootFailureReason: "other_failure" }],
+    ["terminal event receipt", {}, { terminalEvents: false }],
+  ]
+  it.each(mismatchCases)("rejects a no-progress retry with a mismatched %s", async (_name, currentOverrides, persistedOverrides) => {
+    const fake = noProgressReceiptPool(persistedOverrides)
+    const current: TurnLease = {
+      ...payload, ...currentOverrides, userId: currentOverrides.userId ?? row.userId,
+      leaseVersion: currentOverrides.leaseVersion ?? row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt,
+    }
+
+    await expect(releaseTurnLease(fake.pool, current, "failed", now)).resolves.toBe(false)
+    expect(fake.calls.at(-1)?.[0]).toBe("ROLLBACK")
   })
 
   it("can fence an already-expired heartbeat before a scanner reclaims it", async () => {

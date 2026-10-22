@@ -109,7 +109,7 @@ export function createCanonicalRootCompletionGate(input: Readonly<{
   interactiveDiscovery?: () => Promise<TurnEngineCompletionGateResult>
   selectedJobMode: boolean
   selectedJobCompletion?: () => Promise<TurnEngineCompletionGateResult>
-  readTaskGraphDenialCheckpoint?: () => Promise<TaskGraphDenialCheckpoint | null>
+  readTaskGraphDenialCheckpoint?: (client?: Pick<PoolClient, "query" | "release">) => Promise<TaskGraphDenialCheckpoint | null>
 }>): TurnEngineCompletionGate | undefined {
   if (!input.enabled) return undefined
   const gate: TurnEngineCompletionGate = async ({ stepId, candidateText }) => {

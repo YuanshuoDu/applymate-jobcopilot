@@ -1,7 +1,8 @@
 import type pg from "pg"
 
-import { OPEN_SESSION, RUNNABLE_SESSION, assertSessionWorkAdmission, isSessionPauseRequestedError } from "../session-gate.js"
+import { RUNNABLE_SESSION, assertSessionWorkAdmission, isSessionPauseRequestedError } from "../session-gate.js"
 import { ClaimSessionUnavailable, lockClaimSession } from "./lease-claim-session.js"
+import { hasPersistedNoProgressTerminalReceipt, LeaseUnavailable, transaction, withOpenLease } from "./lease-transaction.js"
 
 /** Normal owner window. A scanner reclaims the Turn after this expires. */
 export const TURN_LEASE_WINDOW_MS = 60_000
@@ -43,49 +44,6 @@ function lease(row: LeaseRow): TurnLease {
 function validateWindow(leaseMs: number): void {
   if (!Number.isInteger(leaseMs) || leaseMs < 1 || leaseMs > TURN_MAX_LEASE_MS) {
     throw new RangeError(`Turn lease window must be an integer between 1 and ${TURN_MAX_LEASE_MS}ms`)
-  }
-}
-
-async function rollback(client: pg.PoolClient): Promise<void> {
-  await client.query("ROLLBACK").catch(() => undefined)
-}
-
-class LeaseUnavailable extends Error {}
-
-async function transaction<T>(pool: LeasePool, userId: string | null, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect()
-  let committed = false
-  try {
-    await client.query("BEGIN")
-    if (userId) await client.query("SELECT set_config('app.user_id', $1, true)", [userId])
-    const result = await work(client)
-    await client.query("COMMIT")
-    committed = true
-    return result
-  } catch (error: unknown) {
-    if (!committed) await rollback(client)
-    throw error
-  } finally {
-    client.release()
-  }
-}
-
-async function lockOpenSession(client: pg.PoolClient, sessionId: string, userId: string): Promise<void> {
-  const result = await client.query(
-    `SELECT session."id" FROM "agent_sessions" AS session
-     WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION}
-     FOR UPDATE`,
-    [sessionId, userId],
-  )
-  if (!result.rows[0] && result.rowCount !== 1) throw new LeaseUnavailable("Turn session is no longer open")
-}
-
-async function withOpenLease<T>(pool: LeasePool, current: TurnLease, fallback: T, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
-  try {
-    return await transaction(pool, current.userId, async client => { await lockOpenSession(client, current.sessionId, current.userId); return work(client) })
-  } catch (error: unknown) {
-    if (error instanceof LeaseUnavailable) return fallback
-    throw error
   }
 }
 
@@ -211,6 +169,7 @@ export async function releaseTurnLease(
         [current.turnId, current.sessionId, current.userId, current.leaseVersion])
         if (receipt.rows[0]) return true
       }
+      if (status === "failed" && await hasPersistedNoProgressTerminalReceipt(client, current)) return true
       throw new LeaseUnavailable("Turn lease is no longer owned")
     }
     if (status === "failed" || status === "interrupted") await client.query(`UPDATE "agent_inputs" SET "status" = 'cancelled', "cancelledAt" = $4

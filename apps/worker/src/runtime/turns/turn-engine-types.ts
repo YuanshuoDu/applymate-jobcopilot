@@ -11,6 +11,8 @@ import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import type { ToolCallRecovery, TurnEngineToolResult } from "./turn-engine-tool-types.js"
 import type { TurnQuestionStore } from "./turn-question-contract.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
+import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import type { TurnEngineQueryClient } from "./turn-engine-owner-sql.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -62,7 +64,12 @@ export type AtomicTurnCompletionInput = {
 }
 
 export type AtomicTurnCompletionResult = { readonly status: "completed"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
-export type AtomicTurnNoProgressInput = Readonly<{ stepId: string; finalItemId: string; finalContent: RepositoryJsonValue; stepCount: number; toolCallCount: number; usage: TurnUsage; inputThroughSequence: bigint; consumedInputIds: readonly string[]; reasonCode: string; signature: string; stateFingerprint: string }>
+export type AtomicTurnNoProgressInput = Readonly<{
+  stepId: string; finalItemId: string; finalContent: RepositoryJsonValue; stepCount: number; toolCallCount: number; usage: TurnUsage
+  inputThroughSequence: bigint; consumedInputIds: readonly string[]; reasonCode: string; signature: string; stateFingerprint: string
+  taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint
+  readTaskGraphDenialCheckpoint?: (client?: TurnEngineQueryClient) => Promise<TaskGraphDenialCheckpoint | null>
+}>
 export type AtomicTurnNoProgressResult = { readonly status: "input_changed" } | { readonly status: "no_progress"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
 
 export type { PersistedToolCallRecovery, ToolCallRecovery, TurnEngineToolCall, TurnEngineToolResult } from "./turn-engine-tool-types.js"
@@ -231,29 +238,4 @@ export type TurnEngineResult = {
 
 export type ModelProfileSnapshot = Pick<ModelCapabilityProfile, "provider" | "model" | "nativeTools" | "structuredOutput" | "streaming" | "continuationCursor">
 
-export class TurnEngineError extends Error {
-  constructor(
-    readonly code: "final_unverified" | "step_limit" | "model_incomplete" | "persistence_conflict" | "invalid_output" | "budget_exhausted" | "no_progress" | "evidence_missing" | "evidence_conflict" | "business_precondition_failed",
-    message: string,
-  ) {
-    super(message)
-    this.name = "TurnEngineError"
-  }
-}
-
-export function toRepositoryJson(value: unknown): RepositoryJsonValue {
-  if (value === null || value === undefined) return null
-  if (typeof value === "string" || typeof value === "boolean") return value
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TurnEngineError("invalid_output", "Engine output contains a non-finite number")
-    return value
-  }
-  if (Array.isArray(value)) return value.map(toRepositoryJson)
-  if (typeof value !== "object") throw new TurnEngineError("invalid_output", "Engine output is not JSON serializable")
-  const result: { [key: string]: RepositoryJsonValue } = {}
-  for (const key of Object.keys(value).sort()) {
-    const child = (value as Record<string, unknown>)[key]
-    if (child !== undefined) result[key] = toRepositoryJson(child)
-  }
-  return result
-}
+export { TurnEngineError, toRepositoryJson } from "./turn-engine-output.js"

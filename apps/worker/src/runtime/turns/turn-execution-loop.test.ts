@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
+import type pg from "pg"
 import { Value } from "@sinclair/typebox/value"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { AgentModelError, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
@@ -11,6 +12,7 @@ import { nativeVerificationFeedbackText } from "../canonical-turn-native-verific
 import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-accounting.js"
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { toRepositoryJson, type TurnEngineEvent, type TurnEngineItem, type TurnEngineStore, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
@@ -37,6 +39,7 @@ import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } fro
 import { steeringReconciliationRecoveryError } from "./turn-execution-completion-gate.js"
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -2238,6 +2241,47 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
   })
 
+  it("refreshes and retries when the transaction sees a newer TaskGraph checkpoint", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    addSteeringInput(root)
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const inputBuilder = root.options.contextBuilder
+    let inputBuilds = 0
+    root.options = { ...root.options, contextBuilder: { build: async request => ({ ...(await inputBuilder.build(request)),
+      taskGraphRevision: 4, inputThroughSequence: 1n, consumedInputIds: inputBuilds++ === 0 ? ["steer-1"] : [] }) } }
+    const checkpoint = taskGraphCheckpoint(4), changed = taskGraphCheckpoint(5, "b"), transactionClient = {}
+    let checkpointReads = 0
+    const read = vi.fn(async (_client?: unknown) => ++checkpointReads === 1 ? checkpoint : changed)
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
+    const baseStore = root.options.store
+    const recordFinalResponse = vi.fn(async (input: Parameters<NonNullable<TurnExecutionStore["recordFinalResponse"]>>[0]) => {
+      if (!input.noProgress) return baseStore.recordFinalResponse?.(input)
+      const current = await input.noProgress.readTaskGraphDenialCheckpoint?.(transactionClient as never)
+      expect(current).toEqual(changed)
+      return { status: "input_changed" as const }
+    })
+    const baseModel = root.options.model
+    let calls = 0
+    root.options = {
+      ...root.options, completionGate, maxSteps: 4, budget: { maxSteps: 4 }, store: { ...baseStore, recordFinalResponse },
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        calls += 1
+        yield { type: "text_delta", text: `Candidate ${calls} still lacks the required proof.` }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBeInstanceOf(TurnStateRefreshRetryError)
+
+    expect(root.requests).toHaveLength(2)
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(read.mock.calls.map(([client]) => client)).toEqual([undefined, transactionClient])
+    expect(recordFinalResponse).toHaveBeenCalledOnce()
+    expect(root.events.some(event => event.type === "turn.no_progress" || event.type === "turn.failed")).toBe(false)
+  })
+
   it("stops before a third provider call after two typed final denials with the same non-empty accepted-input IDs", async () => {
     const root = fixture(identity("turn", "root-1"))
     addSteeringInput(root)
@@ -2277,6 +2321,85 @@ describe("owner-agnostic turn execution loop", () => {
     expect(read).toHaveBeenCalledOnce()
     expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(2)
     expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
+  })
+
+  it("lets a steer accepted after the fresh denial check win before atomic no-progress writes", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    addSteeringInput(root)
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }
+    const baseBuilder = root.options.contextBuilder
+    const timeline: string[] = []
+    let contextBuilds = 0
+    root.options = { ...root.options, contextBuilder: { build: async request => {
+      const built = await baseBuilder.build(request)
+      contextBuilds += 1
+      if (contextBuilds === 3) timeline.push("fresh-context-captured")
+      return { ...built, taskGraphRevision: 4, inputThroughSequence: 1n, consumedInputIds: ["steer-1"] }
+    } } }
+
+    const checkpoint = taskGraphCheckpoint(4)
+    const readCheckpoint = vi.fn(async (client?: unknown) => {
+      if (client) timeline.push("transaction-checkpoint-read")
+      else timeline.push("fresh-checkpoint-read")
+      return checkpoint
+    })
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
+    Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: readCheckpoint })
+
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    let acceptedSteer: { id: string; acceptedSequence: bigint } | null = null
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (sql === "BEGIN") timeline.push("terminal-transaction-began")
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('SELECT "id" FROM "agent_sessions"') || sql.includes('SELECT session."id"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
+      if (sql.includes('SELECT "id","status","leaseOwner","attemptCount","interruptRequestedAt"')) return {
+        rows: [{ id: "root-1", status: "running", leaseOwner: "worker-1", attemptCount: 1, interruptRequestedAt: null }], rowCount: 1,
+      }
+      if (sql.includes('SELECT "status", "inputThroughSequence", "consumedInputIds"')) return {
+        rows: [{ status: "streaming", inputThroughSequence: "1", consumedInputIds: ["steer-1"] }], rowCount: 1,
+      }
+      if (sql.includes('FROM "agent_inputs"')) {
+        timeline.push("store-read-pending-steer")
+        const currentSteer = acceptedSteer
+        const visible = currentSteer !== null && currentSteer.acceptedSequence > BigInt(String(values?.[3] ?? "0"))
+        return { rows: visible && currentSteer ? [{ id: currentSteer.id }] : [], rowCount: visible ? 1 : 0 }
+      }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const pgStore = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    const baseStore = root.options.store
+    const recordFinalResponse = vi.fn(async (input: Parameters<NonNullable<TurnExecutionStore["recordFinalResponse"]>>[0]) => {
+      if (!input.noProgress) return baseStore.recordFinalResponse?.(input)
+      timeline.push("steer-accepted")
+      acceptedSteer = { id: "steer-after-checkpoint", acceptedSequence: 2n }
+      const owner = input.identity
+      if (owner.kind !== "turn") throw new Error("expected a root Turn owner")
+      return pgStore.recordFinalResponse({ owner, response: input.response, now: input.now, noProgress: input.noProgress })
+    })
+    const baseModel = root.options.model
+    root.options = {
+      ...root.options, completionGate, maxSteps: 4, budget: { maxSteps: 4 },
+      store: { ...baseStore, recordFinalResponse },
+      model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text: "Candidate still needs the required proof." }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBeInstanceOf(TurnStateRefreshRetryError)
+
+    expect(root.requests).toHaveLength(2)
+    expect(completionGate).toHaveBeenCalledTimes(2)
+    expect(readCheckpoint).toHaveBeenCalledOnce()
+    expect(timeline).toEqual(["fresh-context-captured", "fresh-checkpoint-read", "steer-accepted", "terminal-transaction-began", "store-read-pending-steer"])
+    expect(client.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_inputs"'))?.[1]).toEqual(["session-1", "user-1", "turn-1", "1"])
+    expect(calls.filter(({ sql }) => /^\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"(?:agent_(?:items|steps|turns|events|outbox|inputs|sessions)|sub_agent_tasks)"/.test(sql))).toEqual([])
+    expect(root.events.some(event => event.type === "turn.no_progress" || event.type === "turn.failed")).toBe(false)
+    expect(recordFinalResponse).toHaveBeenCalledOnce()
+    expect(client.release).toHaveBeenCalledOnce()
   })
 
   it("reopens the model after accepted input and current TaskGraph checkpoint changes", async () => {
