@@ -205,9 +205,6 @@ export class ToolLifecycle {
     if (call.toolName === "agent.plan" || call.toolName === "agent.spawn" || call.toolName === "spawn_subagent" || nativeFollowup) {
       throw new ToolExecutionError("tool_result_too_large", "Agent receipt exceeds the lifecycle event limit")
     }
-    if (call.toolName === "scheduled.application.prepare") {
-      throw new ToolExecutionError("tool_result_too_large", "Scheduled Prepare output exceeds the lifecycle event limit")
-    }
     if (!this.options.durableResults || !this.options.resolveOwner) {
       throw new ToolExecutionError("tool_result_storage_unavailable", "Durable tool result storage is unavailable")
     }

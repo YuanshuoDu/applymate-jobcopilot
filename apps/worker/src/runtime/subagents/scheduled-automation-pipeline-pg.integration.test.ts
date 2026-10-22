@@ -1954,10 +1954,10 @@ async function seedGraph(database: PgPool, value: Fixture, snapshot: ReturnType<
     ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
       "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
-    VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'Scheduled automation pipeline integration',
+    VALUES ($1, $2, $3, NULL, NULL, $4, 0, 'orchestrator', 'root', 'running', 'Scheduled automation pipeline integration',
       '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
       '{"subagentPolicy":{"maxConcurrency":4,"maxDepth":4,"maxFanOut":4,"maxAttempts":2}}'::jsonb,
-      1, 2, 'root-lease-owner', CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`, [value.rootTaskId, value.sessionId, value.turnId])
+      1, 2, 'root-lease-owner', CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`, [value.rootTaskId, value.sessionId, value.turnId, `/${value.rootTaskId}`])
   await database.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [value.rootTaskId])
   await database.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [value.rootTaskId, value.turnId])
   for (const node of snapshot.nodes) {
@@ -1976,7 +1976,7 @@ async function seedGraph(database: PgPool, value: Fixture, snapshot: ReturnType<
         '[]'::jsonb, $11::jsonb, $12::jsonb, '{}'::jsonb, $13::jsonb, '{}'::jsonb, '{}'::jsonb,
         '{}'::jsonb, 1, 2, $14::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
       node.taskId, value.sessionId, value.turnId, value.rootTaskId, value.rootTaskId,
-      `/root/${node.key}`, node.depth, template.role, template.taskType, node.goal, JSON.stringify(node.successCriteria),
+      `/${value.rootTaskId}/${node.taskId}`, node.depth, template.role, template.taskType, node.goal, JSON.stringify(node.successCriteria),
       JSON.stringify(template.allowedActions), JSON.stringify(template.expectedOutputSchema), JSON.stringify(result),
     ])
   }

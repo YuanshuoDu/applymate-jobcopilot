@@ -71,7 +71,7 @@ export function createWorkerToolRuntime(
   write?: WorkerWriteOptions,
   jobDiscovery?: JobDiscoverToolOptions,
   scheduledPrepare?: WorkerScheduledPrepareOptions,
-): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
+): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"]; durableResults: NonNullable<ToolLifecycleOptions["durableResults"]> } {
   const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
   definitions.push(createToolResultsReadTool(durableResults, context => {
@@ -96,5 +96,5 @@ export function createWorkerToolRuntime(
   if (scheduledPrepare) definitions.push(createScheduledApplicationPrepareTool(scheduledPrepare))
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
-  return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }
+  return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references, durableResults }
 }

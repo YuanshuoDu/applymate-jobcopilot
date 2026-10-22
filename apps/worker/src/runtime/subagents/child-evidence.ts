@@ -5,6 +5,7 @@ import { artifactReferenceKey, artifactResultKey, MAX_EVIDENCE_BYTES, parseAndBi
 import { createDurableDiscoveryAssembly, invalidateDurableDiscoveryAssembly, isPlainJson, MAX_DURABLE_DISCOVERY_BYTES, parseDurableDiscoveryReference, reduceDurableDiscoveryChunk, type DurableDiscoveryAssembly, type DurableDiscoveryReference } from "./child-durable-discovery.js"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import { redactJobReadOutput } from "../tools/job-read-output-redaction.js"
+import type { ScheduledPrepareReference } from "./child-scheduled-prepare-reference.js"
 
 const MAX_EVIDENCE_ENTRIES = 50
 // Accommodates 50 canonical IDs and 80-character sources after JSON escaping.
@@ -16,8 +17,8 @@ const RESTORED_TOOL_KEYS = ["toolCallId", "toolName", "input", "status", "output
 const RESTORED_READ_TOOLS = new Set(["jobs.search", "jobs.get", "jobs.discover", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read", "cover_letter.draft", "artifact.version.read", "artifact.review", "scheduled.application.prepare"])
 type ObservedEvidenceKind = "job" | "persona" | "resume"
 type RestoredObservation = { readonly toolCallId: string; readonly toolName: string; readonly input: unknown; readonly output: unknown; readonly failed: boolean }
-export type ScheduledPrepareToolBinding = Readonly<{ toolCallId: string; taskId: string; attemptCount: number }>
-type ScheduledPrepareReceipt = Readonly<{ toolCallId: string; result: PrepareResult }>
+export type ScheduledPrepareToolBinding = Readonly<{ toolCallId: string; taskId: string; attemptCount: number; reference?: ScheduledPrepareReference }>
+type ScheduledPrepareReceipt = Readonly<{ toolCallId: string; result: PrepareResult; reference?: ScheduledPrepareReference }>
 
 export type ObservedEvidenceIndex = {
   readonly entries: Map<string, RoleEvidence>
@@ -110,6 +111,8 @@ export function hydrateObservedEvidence(index: ObservedEvidenceIndex, observatio
     const conflictCount = index.conflicts.size
     const binding = restored.toolName === "scheduled.application.prepare" && prepareScope
       ? { toolCallId: restored.toolCallId, ...prepareScope } : undefined
+    if (restored.toolName === "scheduled.application.prepare" && (!binding || plainRecord(output)?.taskId !== binding.taskId
+      || plainRecord(output)?.attemptCount !== binding.attemptCount)) continue
     recordReadToolOutput(index, restored.toolName, output, restored.input, binding)
     if (index.conflicts.size !== conflictCount || index.conflicts.size > 0) throw new Error("child_resume_evidence_conflict")
   }
@@ -240,10 +243,13 @@ function recordScheduledPrepareResult(index: ObservedEvidenceIndex, output: unkn
     index.scheduledPrepareResultConflicts.add(identity); index.scheduledPrepareResults.delete(identity); return
   }
   const previous = index.scheduledPrepareResults.get(identity)
-  if (previous && (previous.toolCallId !== binding.toolCallId || JSON.stringify(previous.result) !== JSON.stringify(result))) {
+  if (previous && (previous.toolCallId !== binding.toolCallId || JSON.stringify(previous.result) !== JSON.stringify(result)
+    || JSON.stringify(previous.reference) !== JSON.stringify(binding.reference))) {
     index.scheduledPrepareResultConflicts.add(identity); index.scheduledPrepareResults.delete(identity); return
   }
-  if (!index.scheduledPrepareResultConflicts.has(identity)) index.scheduledPrepareResults.set(identity, { toolCallId: binding.toolCallId, result })
+  if (!index.scheduledPrepareResultConflicts.has(identity)) index.scheduledPrepareResults.set(identity, {
+    toolCallId: binding.toolCallId, result, ...(binding.reference ? { reference: binding.reference } : {}),
+  })
 }
 
 export { artifactReferenceKey }

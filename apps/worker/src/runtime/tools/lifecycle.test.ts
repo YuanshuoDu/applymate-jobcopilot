@@ -653,6 +653,18 @@ describe("ToolLifecycle", () => {
     })
   })
 
+  it("fails closed above the 1 MiB storage bound", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const put = vi.fn()
+    const durableResults = { put, read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const lifecycle = new ToolLifecycle({ sink, durableResults, resolveOwner: () => owner })
+
+    await expect(lifecycle.completed(ordinaryCall, { result: "x".repeat(1024 * 1024) }))
+      .rejects.toMatchObject({ code: "tool_result_too_large" })
+    expect(put).not.toHaveBeenCalled()
+    expect(sink.events).toHaveLength(0)
+  })
+
   it("preserves bounded TaskGraph IDs and valid punctuation/Unicode keys in the receipt and lifecycle event", async () => {
     const sink = new InMemoryToolLifecycleSink()
     const lifecycle = new ToolLifecycle({ sink })
@@ -770,28 +782,64 @@ describe("ToolLifecycle", () => {
     expect(JSON.stringify({ output: result.output, completion })).not.toContain("resume source body or secret")
   })
 
-  it("rejects max-bounded Prepare summaries above the inline lifecycle limit", async () => {
+  it("stores max-bounded Prepare summaries above the inline lifecycle limit by durable reference", async () => {
     const sink = new InMemoryToolLifecycleSink()
     const summary = maxScheduledPrepareSummary()
     const canonicalSummary = canonicalJson(summary as never)
     expect(Buffer.byteLength(canonicalSummary, "utf8")).toBeGreaterThan(8 * 1024)
-    const put = vi.fn()
+    expect(Buffer.byteLength(canonicalSummary, "utf8")).toBeLessThan(1024 * 1024)
+    const sourceCallId = "call-large-prepare"
+    let persistedValue: unknown
+    const put = vi.fn(async (capturedOwner: ExecutionOwner, input: { stepId: string; toolCallId: string; value: unknown }) => {
+      const encoded = canonicalJson(input.value as never)
+      persistedValue = input.value
+      return {
+        id: "tool-result-prepare-large", userId: capturedOwner.lease.userId, sessionId: capturedOwner.lease.sessionId,
+        turnId: capturedOwner.lease.turnId, stepId: input.stepId,
+        taskId: capturedOwner.kind === "turn" ? capturedOwner.taskId : capturedOwner.lease.id,
+        toolCallId: input.toolCallId, sanitizedJson: input.value as never,
+        sha256: createHash("sha256").update(encoded, "utf8").digest("hex"),
+        byteCount: Buffer.byteLength(encoded, "utf8"), createdAt: new Date(), updatedAt: new Date(),
+      }
+    })
     const durableResults = { put, read: vi.fn() } as unknown as ToolResultReferenceRepository
     const lifecycle = new ToolLifecycle({ sink, durableResults, resolveOwner: () => owner })
+    const prepareCall = { ...call, id: sourceCallId, toolName: "scheduled.application.prepare", taskId: prepareTaskId }
 
-    await expect(lifecycle.completed({ ...call, toolName: "scheduled.application.prepare", taskId: prepareTaskId }, summary))
-      .rejects.toMatchObject({ code: "tool_result_too_large" })
-    expect(put).not.toHaveBeenCalled()
-    expect(sink.events.some(event => event.phase === "completed")).toBe(false)
+    const output = await lifecycle.completed(prepareCall, summary) as { $ref: string; sizeBytes: number; sha256: string }
+    const eventContent = JSON.stringify(sink.events)
+
+    expect(output.$ref).toBe("tool-result-prepare-large")
+    expect(output.sizeBytes).toBe(Buffer.byteLength(canonicalSummary, "utf8"))
+    expect(output.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(Object.keys(output).sort()).toEqual(["$ref", "sha256", "sizeBytes"])
+    expect(Buffer.byteLength(JSON.stringify(output), "utf8")).toBeLessThan(8 * 1024)
+    expect(put).toHaveBeenCalledTimes(1)
+    expect(put).toHaveBeenCalledWith(owner, expect.objectContaining({ stepId: prepareCall.stepId, toolCallId: prepareCall.id }))
+    expect(put.mock.calls[0]?.[1].value).toEqual(summary)
+    expect(persistedValue).toEqual(summary)
+    expect(output.sha256).toBe(createHash("sha256").update(canonicalSummary, "utf8").digest("hex"))
+    expect(sink.events).toHaveLength(1)
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output })
+    expect(sink.events[0]?.payload.output).toEqual(output)
+    expect(validate(ToolResultItemSchema, sink.events[0]!.item)).toBe(true)
+    for (const field of ["snapshotDigest", "checkpointDigest", "artifactId", "contentHash", "sourceDigest", "jobId", "resumeText", "coverLetter"]) {
+      expect(eventContent).not.toContain(field)
+    }
+    expect(eventContent).not.toContain(`sha256:${"a".repeat(64)}`)
+    expect(eventContent).not.toContain(`sha256:${"c".repeat(64)}`)
+    expect(eventContent).not.toContain(`sha256:${"d".repeat(64)}`)
   })
 
   it.each([
-    { label: "extra source body and secret fields", output: { ...scheduledPrepareSummary, resumeText: "resume source body or secret", apiKey: "sk_test_private_secret_value" }, taskId: prepareTaskId },
+    { label: "oversized source body and secret fields", output: { ...scheduledPrepareSummary, resumeText: "resume source body or secret ".repeat(512), apiKey: "sk_test_private_secret_value" }, taskId: prepareTaskId },
     { label: "mismatched task ID", output: scheduledPrepareSummary, taskId: "subagent-fedcbafe-dcba-4abc-8def-fedcbafedcba" },
     { label: "missing task ID", output: scheduledPrepareSummary, taskId: undefined },
   ])("rejects scheduled Prepare lifecycle output with $label", async ({ output, taskId }) => {
     const sink = new InMemoryToolLifecycleSink()
-    const lifecycle = new ToolLifecycle({ sink })
+    const put = vi.fn()
+    const durableResults = { put, read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const lifecycle = new ToolLifecycle({ sink, durableResults, resolveOwner: () => owner })
     const prepareCall: LifecycleCall = { ...call, toolName: "scheduled.application.prepare", ...(taskId ? { taskId } : {}) }
 
     await expect(lifecycle.completed(prepareCall, output)).rejects.toMatchObject({
@@ -799,6 +847,7 @@ describe("ToolLifecycle", () => {
       message: "Scheduled Prepare output is invalid",
     })
     expect(sink.events).toHaveLength(0)
+    expect(put).not.toHaveBeenCalled()
     expect(JSON.stringify(sink.events)).not.toContain("resume source body or secret")
     expect(JSON.stringify(sink.events)).not.toContain("sk_test_private_secret_value")
   })

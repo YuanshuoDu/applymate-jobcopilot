@@ -2,9 +2,9 @@ import { createHash } from "node:crypto"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
-import { validateRoleResult, type PrepareResult } from "../subagents/role-results.js"
 import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
 import { nativeCoordinationLifecycleOutput } from "./task-graph-coordination-bridge.js"
+import { projectScheduledPrepareLifecycleOutput } from "./tool-result-reference-types.js"
 export const DEFAULT_MAX_LIFECYCLE_BYTES = 8 * 1024
 
 export interface ToolResultReference {
@@ -49,58 +49,17 @@ export function prepareLifecycleValue(value: unknown): PreparedLifecycleValue {
 
 /** Preserves only the validated, server-generated Prepare receipt fields needed by its caller. */
 export function prepareScheduledPrepareLifecycleOutput(value: unknown, expectedTaskId: string): PreparedLifecycleValue {
-  if (!isPlainPrepareLifecycleData(value)) throw invalidScheduledPrepareLifecycleOutput()
-  let result: PrepareResult
-  try { result = validateRoleResult(value, "prepare") }
+  try { return prepareSafeValue(projectScheduledPrepareLifecycleOutput(value, expectedTaskId)) }
   catch { throw invalidScheduledPrepareLifecycleOutput() }
-  const safeIdentifier = (identifier: string) => identifier.trim() === identifier && redactSensitiveText(identifier) === identifier
-  if (typeof expectedTaskId !== "string" || result.taskId !== expectedTaskId || !safePrepareTaskId(result.taskId)
-    || result.jobs.some(job => !JOB_ID.test(job.jobId) || !safeIdentifier(job.jobId))
-    || result.materials.some(material => !JOB_ID.test(material.jobId) || !safeIdentifier(material.jobId) || !safeScheduledDraftArtifactId(material.artifactRef.artifactId))) {
-    throw invalidScheduledPrepareLifecycleOutput()
-  }
-  const safe: RepositoryJsonValue = {
-    schemaVersion: result.schemaVersion,
-    role: result.role,
-    status: result.status,
-    taskId: result.taskId,
-    attemptCount: result.attemptCount,
-    snapshotDigest: result.snapshotDigest,
-    checkpointDigest: result.checkpointDigest,
-    jobs: result.jobs.map(job => ({ jobId: job.jobId, status: job.status })),
-    materials: result.materials.map(material => ({ jobId: material.jobId, kind: material.kind, artifactRef: {
-      artifactId: material.artifactRef.artifactId,
-      version: material.artifactRef.version,
-      contentHash: material.artifactRef.contentHash,
-      sourceDigest: material.artifactRef.sourceDigest,
-    } })),
-  }
-  return prepareSafeValue(safe)
 }
 
 const PLAN_RECEIPT_FIELDS = ["status", "revision", "nodes", "readyTaskIds"] as const
 const PLAN_NODE_FIELDS = ["key", "taskId", "status"] as const
 const SUBAGENT_TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const JOB_ID = /^c[a-z0-9]{24}$/
-const SCHEDULED_DRAFT_ARTIFACT_ID = /^scheduled-draft:[a-f0-9]{64}$/
 const SPAWN_RECEIPT_FIELDS = ["taskId", "rootTaskId", "parentTaskId", "path", "depth", "status", "replay"] as const
 const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_SUBAGENT_DEPTH = 8
 const DURABLE_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-
-function safePrepareTaskId(value: string): boolean {
-  if (!SUBAGENT_TASK_ID.test(value)) return false
-  // The text redactor mistakes UUID digits for a phone number; only this exact generated-ID grammar may bypass that false positive.
-  const stable = value.replace(SUBAGENT_TASK_ID, "subagent-opaque")
-  return redactSensitiveText(stable) === stable
-}
-
-function safeScheduledDraftArtifactId(value: string): boolean {
-  if (!SCHEDULED_DRAFT_ARTIFACT_ID.test(value)) return false
-  // Only the exact server-generated artifact digest grammar may bypass numeric false positives from text redaction.
-  const stable = value.replace(SCHEDULED_DRAFT_ARTIFACT_ID, "scheduled-draft:opaque")
-  return redactSensitiveText(stable) === stable
-}
 
 export function isDurableWaitId(value: unknown): value is string {
   return typeof value === "string" && DURABLE_WAIT_ID.test(value)
@@ -285,30 +244,4 @@ function invalidPlanReceipt(): Error {
   return new Error("task_graph_receipt_invalid")
 }
 
-function invalidScheduledPrepareLifecycleOutput(): Error {
-  return new Error("scheduled_prepare_lifecycle_output_invalid")
-}
-
-function isPlainPrepareLifecycleData(value: unknown, active = new Set<object>(), depth = 0): boolean {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return true
-  if (typeof value === "number") return Number.isFinite(value)
-  if (typeof value !== "object" || depth > 16 || active.has(value)) return false
-  try {
-    const array = Array.isArray(value)
-    const prototype = Object.getPrototypeOf(value)
-    if (array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) return false
-    const keys = Reflect.ownKeys(value)
-    if (keys.some(key => typeof key !== "string")) return false
-    const stringKeys = keys as string[]
-    if (array && (stringKeys.length !== (value as unknown[]).length + 1 || stringKeys.some(key => key !== "length" && !/^(0|[1-9]\d*)$/.test(key)))) return false
-    active.add(value)
-    for (const key of stringKeys) {
-      if (array && key === "length") continue
-      const descriptor = Object.getOwnPropertyDescriptor(value, key)
-      if (!descriptor?.enumerable || !("value" in descriptor)
-        || !isPlainPrepareLifecycleData(descriptor.value, active, depth + 1)) return false
-    }
-    return true
-  } catch { return false }
-  finally { active.delete(value) }
-}
+function invalidScheduledPrepareLifecycleOutput(): Error { return new Error("scheduled_prepare_lifecycle_output_invalid") }

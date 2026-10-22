@@ -2,10 +2,20 @@ import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 import { redactSensitiveValue } from "@jobcopilot/shared"
 
-import { validateRoleResult, RoleResultValidationError, type ArtifactVersionReference, type PrepareResult, type RoleEvidence, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
+import { roleResultOutputSchema, validateRoleResult, RoleResultValidationError, type ArtifactVersionReference, type PrepareResult, type RoleEvidence, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
+import { parseScheduledPrepareReference, type ScheduledPrepareReference } from "./child-scheduled-prepare-reference.js"
 import type { ObservedEvidenceIndex } from "./child-evidence.js"
 
 export const MAX_EVIDENCE_BYTES = 8 * 1024
+const PREPARE_REFERENCE_SCHEMA = { type: "object", properties: {
+  $ref: { type: "string", pattern: "^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+  sizeBytes: { type: "integer", minimum: 1, maximum: 1048576 }, sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+}, required: ["$ref", "sizeBytes", "sha256"], additionalProperties: false }
+
+export function structuredResultOutputSchema(role: StructuredRole): Record<string, unknown> {
+  const result = roleResultOutputSchema(role)
+  return role === "prepare" ? { anyOf: [result, PREPARE_REFERENCE_SCHEMA] } : result
+}
 
 export type StructuredOutputFailureCategory =
   | "missing_final_output"
@@ -60,18 +70,21 @@ function structurallyEqualJson(left: unknown, right: unknown): boolean {
     && structurallyEqualJson((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]))
 }
 
-function normalizeRegisteredPrepareReceipt(value: unknown, index: ObservedEvidenceIndex): PrepareResult | undefined {
+function normalizeRegisteredPrepareReceipt(value: unknown, index: ObservedEvidenceIndex): { result: PrepareResult; referenceBound: boolean } | undefined {
   const encoded = JSON.stringify(value)
   if (encoded === undefined) return undefined
-  let match: PrepareResult | undefined
+  let reference: ScheduledPrepareReference | undefined
+  try { reference = parseScheduledPrepareReference(value) } catch { /* Inline receipts use the existing comparison below. */ }
+  let match: { result: PrepareResult; referenceBound: boolean } | undefined
   for (const [identity, receipt] of index.scheduledPrepareResults) {
     if (index.scheduledPrepareResultConflicts.has(identity) || !receipt.toolCallId || receipt.toolCallId.trim() !== receipt.toolCallId) continue
     let canonical: PrepareResult
     try { canonical = validateRoleResult(receipt.result, "prepare") } catch { continue }
     if (scheduledPrepareIdentityKey(canonical.taskId, canonical.attemptCount) !== identity) continue
-    if (!structurallyEqualJson(value, canonical) && !structurallyEqualJson(value, redactSensitiveValue(canonical))) continue
+    const matchesReference = Boolean(reference && receipt.reference && structurallyEqualJson(reference, receipt.reference))
+    if (reference ? !matchesReference : !structurallyEqualJson(value, canonical) && !structurallyEqualJson(value, redactSensitiveValue(canonical))) continue
     if (match) return undefined
-    match = canonical
+    match = { result: canonical, referenceBound: matchesReference }
   }
   return match
 }
@@ -152,13 +165,13 @@ export function parseAndBindStructuredResultOutcome<T extends StructuredRole>(
   }
   try {
     const prepareReceipt = role === "prepare" ? normalizeRegisteredPrepareReceipt(parsed, index) : undefined
-    const validated = prepareReceipt ?? validateRoleResult(parsed, role)
-    const normalized = prepareReceipt ?? normalizeStructuredResult(validated, index)
+    const validated = prepareReceipt?.result ?? validateRoleResult(parsed, role)
+    const normalized = prepareReceipt?.result ?? normalizeStructuredResult(validated, index)
     if (!normalized) return invalid("evidence_binding_invalid")
     const rebound = validateRoleResult(normalized, role)
     const serialized = JSON.stringify(rebound)
     if (serialized === undefined) return invalid()
-    if (Buffer.byteLength(serialized, "utf8") > MAX_EVIDENCE_BYTES) return invalid("result_too_large")
+    if (Buffer.byteLength(serialized, "utf8") > MAX_EVIDENCE_BYTES && !prepareReceipt?.referenceBound) return invalid("result_too_large")
     return { kind: "valid", result: rebound }
   } catch (error: unknown) {
     return invalid(validationFailureCategory(error))

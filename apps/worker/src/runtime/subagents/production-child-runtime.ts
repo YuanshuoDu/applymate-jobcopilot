@@ -27,6 +27,7 @@ import { childDiscoveryExecutionFence, createChildDiscoveryObservers } from "./c
 import { createProductionChildPolicy } from "./production-child-policy.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { createScheduledApplicationPrepareRuntime } from "./scheduled-application-prepare-runtime.js"
+import { createScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
 
 export type ProductionChildRuntimeOptions = {
@@ -168,6 +169,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
   discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined, scheduledPrepare)
   return {
     definitions: runtime.registry.list(), router: runtime.router,
+    ...(scheduledPrepare ? { resolveScheduledPrepareReference: createScheduledPrepareReferenceResolver(pool, runtime.durableResults, executionOwner) } : {}),
     ...(discoveryObservers ? {
       discoveryAttemptSidecar: () => discoveryObservers.discoveryAttemptSidecar(),
       discoveryRecoverySidecar: () => discoveryObservers.discoveryRecoverySidecar(),

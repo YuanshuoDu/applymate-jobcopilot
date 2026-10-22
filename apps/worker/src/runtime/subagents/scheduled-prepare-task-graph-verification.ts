@@ -14,9 +14,9 @@ import { parseScheduledTaskGraphContinuationReceipt, scheduledSnapshotMatches, S
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { validateRoleResult, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES as TEMPLATES } from "./task-graph-templates.js"
+import { verifyScheduledPrepareToolResultReference } from "./scheduled-prepare-tool-result-verification.js"
 export const SCHEDULED_PREPARE_COMPLETION_SCHEMA = "agent-harness.v2.scheduled-taskgraph-prepare-completion.v1" as const; export const SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA = "agent-harness.v2.scheduled-taskgraph-prepare-proof-facts.v1" as const
-type Queryable = Pick<pg.PoolClient, "query">
-type Row = Record<string, unknown>
+type Queryable = Pick<pg.PoolClient, "query">; type Row = Record<string, unknown>
 export type ScheduledPrepareVerificationScope = TaskGraphVerificationScope
 export type ScheduledPrepareCompletionNode = Readonly<{ taskId: string; attemptCount: number; role: "scout" | "analyst" | "prepare"; taskType: string; status: "completed"; verification: "passed"; dependsOnTaskIds: readonly string[]; tool?: "scheduled.application.prepare@1"; resultDigest?: string }>
 export type ScheduledPrepareCompletionFacts = Readonly<{ schemaVersion: typeof SCHEDULED_PREPARE_COMPLETION_SCHEMA; graphRevision: number; nodes: readonly [ScheduledPrepareCompletionNode, ScheduledPrepareCompletionNode, ScheduledPrepareCompletionNode] }>
@@ -25,7 +25,7 @@ export type ScheduledPrepareDependencyWait = Readonly<{ waitId: string; status: 
 export type ScheduledPrepareTaskGraphProof = Readonly<{ receipt: ScheduledTaskGraphContinuationReceipt; completion: ScheduledPrepareCompletionFacts & Readonly<{ wait: ScheduledPrepareDependencyWait }>; result: PrepareResult }>
 export type ScheduledPrepareVerification = Readonly<{ verified: true; facts: ScheduledPrepareTaskGraphProofFacts }> | Readonly<{ verified: false; reasonCode: string }>
 /** Verifies Prepare against its exact registered call, Analyze lineage, checkpoint, and immutable material rows. */
-export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number }>): Promise<ScheduledPrepareVerification> {
+export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; ownerId?: string }>): Promise<ScheduledPrepareVerification> {
   try {
     const scope = input.scope, result = validateRoleResult(input.structuredResult, "prepare")
     if (result.status !== "completed" || result.taskId !== scope.taskId || result.attemptCount !== scope.attemptCount)
@@ -50,15 +50,15 @@ export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable,
     const expectedIds = checkpoint.eligibleJobIds
     if (!sameIds(result.jobs.map(job => job.jobId), expectedIds) || result.snapshotDigest !== receipt.snapshotDigest
       || result.checkpointDigest !== receipt.checkpointDigest || !resultMatchesMaterials(result)) return rejected("scheduled_prepare_result_invalid")
-    const toolCallId = await verifyPrepareToolReceipt(client, scope, input.structuredResult, result)
-    if (!toolCallId || !await verifyMaterialRows(client, scope, result)) return rejected("scheduled_prepare_artifact_invalid")
+    const verifiedResult = await verifyPrepareToolReceipt(client, scope, input.ownerId, input.structuredResult, result)
+    if (!verifiedResult || !await verifyMaterialRows(client, scope, verifiedResult)) return rejected("scheduled_prepare_artifact_invalid")
     const completion: ScheduledPrepareCompletionFacts = { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA,
       graphRevision: input.completionGraphRevision, nodes: [
         completionNode(scoutTask, scout, []), completionNode(analystTask, analyst, [scoutTask.id]),
         { ...completionNode(prepareTask, prepare, [analystTask.id]), tool: "scheduled.application.prepare@1",
-          resultDigest: scheduledPrepareResultDigest(result) },
+          resultDigest: scheduledPrepareResultDigest(verifiedResult) },
       ] }
-    return { verified: true, facts: { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, receipt, completion, result } }
+    return { verified: true, facts: { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, receipt, completion, result: verifiedResult } }
   } catch { return rejected("scheduled_prepare_evidence_invalid") }
 }
 /** Adds the ready TaskGraph dependency wait after the parent has observed its durable wait. */
@@ -179,7 +179,7 @@ async function readCheckpoint(client: Queryable, receipt: ScheduledTaskGraphCont
     .slice(0, automation.dailyCap).map(value => String(value.job!.id)) : null
   return eligible ? { checkpointDigest: computed, eligibleJobIds: eligible } : null
 }
-async function verifyPrepareToolReceipt(client: Queryable, scope: TaskGraphVerificationScope, rawResult: unknown, result: PrepareResult): Promise<string | null> {
+async function verifyPrepareToolReceipt(client: Queryable, scope: TaskGraphVerificationScope, ownerId: string | undefined, rawResult: unknown, result: PrepareResult): Promise<PrepareResult | null> {
   const receipts = await loadTaskGraphVerificationReceipts(client, scope)
   if (receipts.items.length !== 2 || receipts.replayReceipts.length !== 0 || receipts.outcomes.size !== 1) return null
   const call = receipts.items.find(item => item.type === "tool_call"), output = receipts.items.find(item => item.type === "tool_result")
@@ -188,9 +188,13 @@ async function verifyPrepareToolReceipt(client: Queryable, scope: TaskGraphVerif
     || content.toolName !== "scheduled.application.prepare" || content.toolVersion !== "1" || !emptyRecord(content.input)
     || content.status !== "completed" || content.errorCode !== null || receipts.outcomes.get(callId) !== "completed"
     || resultContent.errorCode !== null || !Object.hasOwn(resultContent, "output")
-    || !same(resultContent.output, rawResult) || !same(rawResult, result)) return null
-  return callId
+    || !same(rawResult, result)) return null
+  return verifyPrepareToolResultOutput(client, { scope, ownerId, stepId: output.stepId, callStepId: call.stepId, toolCallId: callId, output: resultContent.output, rawResult, expectedResult: result })
 }
+export async function verifyPrepareToolResultOutput(client: Queryable, input: Readonly<{ scope: TaskGraphVerificationScope; ownerId?: string; stepId: unknown; callStepId: unknown; toolCallId: string; output: unknown; rawResult: unknown; expectedResult: PrepareResult }>): Promise<PrepareResult | null> {
+  if (!same(input.rawResult, input.expectedResult)) return null; const marker = record(input.output)
+  if (marker && Object.hasOwn(marker, "$ref")) return input.ownerId && typeof input.stepId === "string" && input.stepId === input.callStepId ? verifyScheduledPrepareToolResultReference(client, { reference: input.output, scope: { ...input.scope, ownerId: input.ownerId }, stepId: input.stepId, toolCallId: input.toolCallId, expectedResult: input.expectedResult }) : null
+  return same(input.output, input.rawResult) ? input.expectedResult : null }
 async function verifyMaterialRows(client: Queryable, scope: TaskGraphVerificationScope, result: PrepareResult): Promise<boolean> {
   for (const material of result.materials) {
     const rows = await client.query(`SELECT version_row."artifactId", version_row."version", version_row."userId", version_row."sessionId",
@@ -291,9 +295,6 @@ function sameIds(left: readonly string[], right: readonly string[]): boolean { r
 function emptyRecord(value: unknown): boolean { const row = record(value); return Boolean(row && !Reflect.ownKeys(row).length) } function exact(value: Row, keys: readonly string[]): boolean { const actual = Reflect.ownKeys(value); return actual.length === keys.length && actual.every(key => typeof key === "string" && keys.includes(key)) }
 function record(value: unknown): Row | null { const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null; try { const proto = Object.getPrototypeOf(parsed); return proto === Object.prototype || proto === null ? parsed as Row : null } catch { return null } }
 function same(left: unknown, right: unknown): boolean { try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false } }
-function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) }
-function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
-function safeCount(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
-function hex(value: unknown): value is string { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value) }
-function stringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === "string") }
-function rejected(reasonCode: string): ScheduledPrepareVerification { return { verified: false, reasonCode } }
+function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) } function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
+function safeCount(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 } function hex(value: unknown): value is string { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value) }
+function stringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === "string") } function rejected(reasonCode: string): ScheduledPrepareVerification { return { verified: false, reasonCode } }

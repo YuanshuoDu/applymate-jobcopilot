@@ -11,6 +11,9 @@ import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { canonicalJson } from "@jobcopilot/shared"
+import { prepareToolResultJson, type CanonicalToolSourceName } from "../tools/tool-result-reference-types.js"
+import { verifyPrepareToolResultOutput } from "./scheduled-prepare-task-graph-verification.js"
 
 const binding = {
   owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
@@ -32,8 +35,56 @@ const completion = {
 }
 const facts = { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, receipt, completion, result }
 const wait = { waitId: "wait-1", status: "ready", mode: "all", targetTaskIds: [result.taskId], matchedTaskIds: [result.taskId] }
+const prepareTool = "scheduled.application.prepare" as CanonicalToolSourceName
+const prepareScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+  taskId: "subagent-12345678-1234-4234-9234-123456789012", attemptCount: 2 }
+
+function largeResult(): PrepareResult {
+  const jobs = Array.from({ length: 50 }, (_, index) => ({ jobId: "c" + index.toString(36).padStart(24, "0"), status: "prepared" as const }))
+  return { ...result, taskId: prepareScope.taskId, attemptCount: prepareScope.attemptCount,
+    jobs, materials: jobs.map((job, index) => ({ jobId: job.jobId, kind: "resume" as const, artifactRef: {
+      artifactId: "scheduled-draft:" + index.toString(16).padStart(64, "0"), version: 1,
+      contentHash: "sha256:" + "c".repeat(64), sourceDigest: "sha256:" + "d".repeat(64),
+    } })) }
+}
+
+function referenceFixture(expected: PrepareResult, leaseOwner: string, expired = false) {
+  const stored = prepareToolResultJson(expected, prepareTool, expected.taskId)
+  const id = "tool-result-12345678-1234-4234-9234-123456789012"
+  const stepId = "step-prepare-1", toolCallId = "call-prepare-1"
+  const row = { id, userId: prepareScope.userId, sessionId: prepareScope.sessionId, turnId: prepareScope.turnId, stepId,
+    taskId: expected.taskId, toolCallId, sanitizedJson: stored.value, sha256: stored.sha256, byteCount: stored.bytes,
+    createdAt: new Date("2026-10-01T00:00:00.000Z"), updatedAt: new Date("2026-10-01T00:00:00.000Z"),
+    currentRootTaskId: prepareScope.rootTaskId, currentAttemptCount: expected.attemptCount, currentTaskStatus: "running", currentLeaseOwner: leaseOwner,
+    currentLeaseExpiresAt: new Date(expired ? "2020-01-01T00:00:00.000Z" : "2099-01-01T00:00:00.000Z"), currentInterruptRequestedAt: null,
+    leaseCheckedAt: new Date(expired ? "2021-01-01T00:00:00.000Z" : "2098-12-31T00:00:00.000Z"), currentStepAttempt: expected.attemptCount,
+    sourceCallItemId: "tool-item-prepare-1", sourceCallStepId: stepId, sourceCallTaskId: expected.taskId, sourceCallType: "tool_call",
+    sourceCallStatus: "completed", sourceCallContent: { toolCallId, toolName: prepareTool, toolVersion: "1", input: {}, status: "completed", errorCode: null } }
+  return { expected, stepId, toolCallId, output: { $ref: id, sizeBytes: stored.bytes, sha256: stored.sha256 }, row }
+}
 
 describe("scheduled Prepare TaskGraph proof", () => {
+  it("preserves inline Prepare receipts and resolves references only under the exact live owner lease", async () => {
+    const query = vi.fn(async () => ({ rows: [] as unknown[] }))
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, stepId: "step-1", callStepId: "step-1",
+      toolCallId: "inline-call", output: result, rawResult: result, expectedResult: result })).resolves.toEqual(result)
+    expect(query).not.toHaveBeenCalled()
+
+    const expected = largeResult(), valid = referenceFixture(expected, "worker-owner-1")
+    expect(Buffer.byteLength(canonicalJson(expected), "utf8")).toBeGreaterThan(8 * 1024)
+    query.mockResolvedValueOnce({ rows: [valid.row] })
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, ownerId: "worker-owner-1", stepId: valid.stepId,
+      callStepId: valid.stepId, toolCallId: valid.toolCallId, output: valid.output, rawResult: expected, expectedResult: expected })).resolves.toEqual(expected)
+
+    for (const stale of [referenceFixture(expected, "other-worker"), referenceFixture(expected, "worker-owner-1", true)]) {
+      query.mockResolvedValueOnce({ rows: [stale.row] })
+      await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, ownerId: "worker-owner-1", stepId: stale.stepId,
+        callStepId: stale.stepId, toolCallId: stale.toolCallId, output: stale.output, rawResult: expected, expectedResult: expected })).resolves.toBeNull()
+    }
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, ownerId: "worker-owner-1", stepId: "stale-step",
+      callStepId: "step-1", toolCallId: "call-1", output: valid.output, rawResult: expected, expectedResult: expected })).resolves.toBeNull()
+  })
+
   it("builds a proof only when completion is bound to the stable receipt and exact ready dependency wait", () => {
     expect(buildScheduledPrepareTaskGraphProof(facts, wait)).toEqual({ receipt, completion: { ...completion, wait }, result })
     expect(buildScheduledPrepareTaskGraphProof(facts, { ...wait, matchedTaskIds: ["other-task"] })).toBeNull()

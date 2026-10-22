@@ -14,7 +14,7 @@ import { recoverExpired as recoverExpiredImpl } from "./pg-store-expiry-recovery
 import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
-export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
+export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; ownerId?: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
   const safeInputResult = stripTaskGraphMetadata(input.result)
   const finalizedResult = (value: unknown, status: string): unknown => stripNonterminalDiscoveryRecovery(value, status, input.retry)
   const graphType = taskGraphEventType(input.status, input.retry)
@@ -45,7 +45,7 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
     const completionGraph = exactCompletion ? { ...loaded, state: graph.state, tasks: completionTasks } : null
     const verification = completionGraph ? await verifyScheduledPrepareTaskGraphEvidence(client, {
       scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot,
-      current: currentTaskGraph(completionGraph), tasks: completionTasks, structuredResult: plainObject(safeInputResult)?.structuredResult,
+      current: currentTaskGraph(completionGraph), tasks: completionTasks, structuredResult: plainObject(safeInputResult)?.structuredResult, ownerId: input.ownerId,
       completionGraphRevision: graph.state.revision,
     }) : { verified: false as const, reasonCode: "scheduled_prepare_graph_invalid" }
     if (verification.verified) return { graph, status: "completed", failureReason: input.failureReason,

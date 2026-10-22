@@ -9,6 +9,7 @@ import { RootAbortController } from "../interrupt/registry.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxHydrationInput, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { prepareToolResultJson, type CanonicalToolSourceName } from "../tools/tool-result-reference-types.js"
 import type { SubagentLease } from "./types.js"
 import type { TreeBudgetExecutionLimits, TreeBudgetReservation, TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
@@ -86,6 +87,27 @@ function validAnalystResult() {
     findings: [{ jobId: "job-1", score: 8, evidenceIds: ["evidence-job-1"] }],
     evidence: [{ id: "evidence-job-1", kind: "job" as const, ref: "job-1", source: "greenhouse" }], summary: "Strong match",
   }
+}
+
+function largePrepareResult(taskId: string, attemptCount: number) {
+  const jobs = Array.from({ length: 50 }, (_, index) => ({ jobId: `c${index.toString(36).padStart(24, "0")}`, status: "prepared" as const }))
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" as const, status: "completed" as const, taskId, attemptCount,
+    snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs,
+    materials: jobs.map((job, index) => ({ jobId: job.jobId, kind: "resume" as const, artifactRef: {
+      artifactId: `scheduled-draft:${index.toString(16).padStart(64, "0")}`, version: 1,
+      contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+    } })),
+  }
+}
+
+function prepareReference(result: ReturnType<typeof largePrepareResult>) {
+  const prepared = prepareToolResultJson(result, "scheduled.application.prepare" as CanonicalToolSourceName, result.taskId)
+  return { $ref: "tool-result-00000000-0000-4000-8000-000000000001", sizeBytes: prepared.bytes, sha256: prepared.sha256 }
+}
+
+function scheduledPrepareTool(): RuntimeToolDefinition {
+  return { ...tool("scheduled.application.prepare", "resume"), risk: "draft_write", capabilities: ["read", "write"], requiredCapabilities: [] }
 }
 
 function nativeVerifierTask() {
@@ -603,14 +625,84 @@ describe("child executor composition", () => {
     await executor({ lease: child })
     expect(requests).toHaveLength(1)
     expect(requests[0]?.outputSchema).toBeDefined()
-    expect(requests[0]?.outputSchema).toMatchObject({
-      properties: {
+    expect(requests[0]?.outputSchema).toMatchObject({ anyOf: [
+      { properties: {
         schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: "prepare" }, status: { enum: ["completed", "partial"] },
         snapshotDigest: { pattern: "^sha256:[a-f0-9]{64}$" }, checkpointDigest: { pattern: "^[a-f0-9]{64}$" },
         jobs: { maxItems: 50, items: { properties: { jobId: { maxLength: 256 }, status: { enum: ["prepared", "skipped", "failed"] } }, additionalProperties: false } },
         materials: { maxItems: 100, items: { properties: { jobId: { maxLength: 256 }, kind: { enum: ["resume", "cover_letter"] } }, additionalProperties: false } },
-      }, additionalProperties: false,
+      }, additionalProperties: false },
+      { properties: { "$ref": { type: "string" }, sizeBytes: { maximum: 1048576 }, sha256: { type: "string" } },
+        required: ["$ref", "sizeBytes", "sha256"], additionalProperties: false },
+    ] })
+  })
+
+  it("keeps the model-facing output as a reference while binding the server-side large Prepare receipt", async () => {
+    const childId = "subagent-00000000-0000-4000-8000-000000000001"
+    const child = { ...lease(), id: childId, role: "prepare", taskType: "scheduled_application_prepare",
+      allowedActions: ["scheduled.application.prepare"], expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" } }
+    const prepared = largePrepareResult(child.id, child.attemptCount), reference = prepareReference(prepared), requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) { yield { type: "tool_call_completed", callId: "prepare-call", name: "scheduled.application.prepare", arguments: {} }; yield { type: "completed", finishReason: "tool_calls" } }
+        else { yield { type: "text_delta", text: JSON.stringify(reference) }; yield { type: "completed", finishReason: "stop" } }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({
+        ...childToolRuntime([scheduledPrepareTool()], async (_context, request) => ({ ...request, status: "completed", errorCode: null, output: reference })),
+        resolveScheduledPrepareReference: async () => ({ result: prepared, reference }),
+      }),
     })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "completed", result: { finalText: JSON.stringify(reference), structuredResult: prepared } })
+    expect(JSON.stringify(requests[1]?.messages)).toContain(reference.$ref)
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain(JSON.stringify(prepared))
+    expect(Buffer.byteLength(JSON.stringify(prepared), "utf8")).toBeGreaterThan(8 * 1024)
+  })
+
+  it("keeps a stale prior Prepare marker visible without poisoning a fresh retry receipt", async () => {
+    const childId = "subagent-00000000-0000-4000-8000-000000000001"
+    const child = { ...lease(), id: childId, role: "prepare", taskType: "scheduled_application_prepare",
+      allowedActions: ["scheduled.application.prepare"], expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" } }
+    const stale = largePrepareResult(child.id, 1), current = largePrepareResult(child.id, child.attemptCount)
+    const staleReference = prepareReference(stale), currentReference = prepareReference(current), requests: HarnessModelRequest[] = []
+    const resolveScheduledPrepareReference = vi.fn(async ({ output }: { output: unknown }) => {
+      if (JSON.stringify(output) === JSON.stringify(staleReference)) throw new Error("stale_source_attempt")
+      return { result: current, reference: currentReference }
+    })
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) { yield { type: "tool_call_completed", callId: "fresh-prepare-call", name: "scheduled.application.prepare", arguments: {} }; yield { type: "completed", finishReason: "tool_calls" } }
+        else { yield { type: "text_delta", text: JSON.stringify(currentReference) }; yield { type: "completed", finishReason: "stop" } }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({
+        ...childToolRuntime([scheduledPrepareTool()], async (_context, request) => ({ ...request, status: "completed", errorCode: null, output: currentReference })),
+        resolveScheduledPrepareReference,
+      }),
+      resumeLoader: async () => ({
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+        observations: [restoredRead("stale-prepare", "scheduled.application.prepare", staleReference)],
+      }),
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "completed", result: { structuredResult: current } })
+    expect(resolveScheduledPrepareReference).toHaveBeenCalledTimes(2)
+    expect(resolveScheduledPrepareReference.mock.calls[0]?.[0]).toMatchObject({ output: staleReference, expectedAttemptCount: child.attemptCount })
+    expect(resolveScheduledPrepareReference.mock.calls[1]?.[0]).toMatchObject({ output: currentReference, originalToolCallId: "fresh-prepare-call" })
+    expect(JSON.stringify(requests[0]?.messages)).toContain(staleReference.$ref)
   })
 
   it("exposes only a closed category for invalid Prepare output", async () => {

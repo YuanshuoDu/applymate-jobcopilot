@@ -122,7 +122,7 @@ export class PgSubagentTaskStore implements SubagentStore {
         let result = input.result
         let failureReason = input.failureReason
         const finish = await prepareTaskGraphFinish(client, {
-          taskId: input.taskId, sessionId: input.sessionId, attemptCount: input.attemptCount,
+          taskId: input.taskId, sessionId: input.sessionId, ownerId: input.ownerId, attemptCount: input.attemptCount,
           status, retry, failureReason, result,
         })
         status = finish.status; result = finish.result; failureReason = finish.failureReason

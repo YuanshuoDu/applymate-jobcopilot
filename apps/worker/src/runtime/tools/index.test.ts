@@ -7,6 +7,7 @@ import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
 import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
 import type { ApplicationSubmitIdentity } from "../../queue/application-submit-fence.js"
+import type { ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
@@ -78,6 +79,13 @@ describe("worker tool runtime entry point", () => {
     )
 
     expect(runtime.registry.resolve("tool_results.read", "1")).toMatchObject({ risk: "read", domain: "coordination" })
+  })
+
+  it("exposes the same durable result repository used by lifecycle and private reads", () => {
+    const durableResults = { put: vi.fn(), read: vi.fn() } as unknown as ToolResultReferenceRepository
+    const runtime = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), durableResults })
+
+    expect(runtime.durableResults).toBe(durableResults)
   })
 
   it("keeps all coordination definitions out of the registry unless the trusted gate supplies them", () => {
