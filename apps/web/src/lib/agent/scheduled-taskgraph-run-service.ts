@@ -59,13 +59,14 @@ export async function validateScheduledPrepareWaitIdentity(input: Readonly<{
   if (!step || latest.id !== candidate.finalStepId || !["streaming", "waiting_for_user", "waiting_for_tool", "completed"].includes(step.status)) return false
   if (!snapshot.requireApproval) return item === null
   if (!item) return false
-  const content = exactRecord(item.content, ["waitKind", "questionId", "toolCallId", "stage", "question", "options", "answer", "answerAvailable", "scheduledPrepareChoiceBinding"])
+  const content = exactRecord(item.content, ["waitKind", "questionId", "toolCallId", "stage", "question", "options", "answer", "answerAvailable", "scheduledPrepareChoiceBinding", "answeredAt"])
   const binding = choiceBinding(receipt, candidate.finalStepId, candidate.finalStepOrdinal)
   return Boolean(item.id === itemId && item.stepId === candidate.finalStepId && item.taskId === input.owner.rootTaskId && item.type === "question"
     && content && content.questionId === input.scheduledWaitId
     && sameCanonicalJson({ waitKind: content.waitKind, toolCallId: content.toolCallId, stage: content.stage, question: content.question, options: content.options }, CHOICE_CONTENT)
     && sameCanonicalJson(content.scheduledPrepareChoiceBinding, binding)
-    && item.status === "completed" && content.answerAvailable === true && ["apply_ai_changes", "keep_resume"].includes(String(content.answer)))
+    && item.status === "completed" && validIso(content.answeredAt) && content.answerAvailable === true
+    && ["apply_ai_changes", "keep_resume"].includes(String(content.answer)))
 }
 function parseChoiceReceipt(value: unknown, expected: ScheduledTaskGraphPipelineOwner): Record<string, unknown> | null {
   const keys = ["schemaVersion", "owner", "continuationKey", "snapshotDigest", "evidenceDigest", "checkpointDigest", "analyzeGraphRevision", "prepareScheduleRevision"]
@@ -110,6 +111,7 @@ function isHex(value: unknown): value is string { return typeof value === "strin
 function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) }
 function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
+function validIso(value: unknown): boolean { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
 /** Rebuilds a private Gate/Execute state from a verified Worker proof and owner-scoped artifact rows. */
 export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTaskGraphGateResumeInput): Promise<PipelineCheckpointState> {
   const { owner, continuationKey, claimToken } = input

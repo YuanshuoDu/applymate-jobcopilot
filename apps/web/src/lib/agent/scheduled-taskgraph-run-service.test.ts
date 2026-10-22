@@ -96,7 +96,8 @@ function scheduledChoiceItem(answer: string | null = null, waitId = scheduledWai
     status: answer === null ? "started" : "completed", content: { waitKind: "question", questionId: waitId,
       toolCallId: null, stage: "scheduled_prepare", question: "How should ApplyMate tailor your resume for this role?",
       options: [{ label: "Apply AI changes", value: "apply_ai_changes" }, { label: "Keep my current resume", value: "keep_resume" }],
-      answer, answerAvailable: answer !== null, scheduledPrepareChoiceBinding: { schemaVersion: "agent-harness.v2.scheduled-prepare-choice-wait.v1",
+      answer, answerAvailable: answer !== null, ...(answer !== null ? { answeredAt: "2026-10-21T10:00:00.000Z" } : {}),
+      scheduledPrepareChoiceBinding: { schemaVersion: "agent-harness.v2.scheduled-prepare-choice-wait.v1",
         owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
           rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount },
         continuationKey: receipt.continuationKey, snapshotDigest: receipt.snapshotDigest, evidenceDigest: receipt.evidenceDigest,
@@ -320,6 +321,9 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     mocks.items.mockResolvedValue(scheduledChoiceItem("apply_ai_changes", approvalWaitId, approvalReceipt))
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot, proof, scheduledWaitId: approvalWaitId })).resolves.toBe(true)
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot, proof, scheduledWaitId: `${approvalWaitId}-other` })).resolves.toBe(false)
+    mocks.items.mockResolvedValueOnce({ ...scheduledChoiceItem("apply_ai_changes", approvalWaitId, approvalReceipt),
+      content: { ...scheduledChoiceItem("apply_ai_changes", approvalWaitId, approvalReceipt).content, answeredAt: "invalid" } })
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot, proof, scheduledWaitId: approvalWaitId })).resolves.toBe(false)
     mocks.items.mockResolvedValueOnce(scheduledChoiceItem(null, approvalWaitId, approvalReceipt))
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot, proof, scheduledWaitId: approvalWaitId })).resolves.toBe(false)
     mocks.steps.mockResolvedValueOnce({ id: "newer_step" }).mockResolvedValueOnce({ id: finalStepId, status: "streaming" })
