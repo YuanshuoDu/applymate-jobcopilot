@@ -242,8 +242,14 @@ export function createToolResultReferenceRepository(pool: Pool): ToolResultRefer
         if (!result.rows[0]) return null
         const stored = row(result.rows[0])
         const source = await findCanonicalToolSource(client, stored)
-        if (source.toolName === SCHEDULED_PREPARE_TOOL && (source.role !== "prepare" || source.taskType !== "scheduled_application_prepare"
-          || source.taskAttemptCount < 1)) throw new ToolResultRepositoryError("tool_result_corrupt")
+        if (source.toolName === SCHEDULED_PREPARE_TOOL) {
+          if (fence.kind !== "task" || fence.taskId !== stored.taskId || fence.attemptCount !== source.taskAttemptCount) {
+            throw new ToolResultRepositoryError("tool_result_fence_rejected")
+          }
+          if (source.role !== "prepare" || source.taskType !== "scheduled_application_prepare" || source.taskAttemptCount < 1) {
+            throw new ToolResultRepositoryError("tool_result_corrupt")
+          }
+        }
         let sanitizedJson: ToolResultReferenceRecord["sanitizedJson"]
         try { sanitizedJson = verifyToolResultSanitization(stored, source.toolName, source.taskAttemptCount) }
         catch { throw new ToolResultRepositoryError("tool_result_corrupt") }

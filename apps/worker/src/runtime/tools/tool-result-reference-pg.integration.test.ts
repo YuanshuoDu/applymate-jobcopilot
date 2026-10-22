@@ -305,6 +305,7 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
     const source = "scheduled.application.prepare" as CanonicalToolSourceName
     const value = largePrepareReceipt(scheduledPrepare.taskId, scheduledPrepare.attemptCount)
     const prepared = prepareToolResultJson(value, source, scheduledPrepare.taskId, scheduledPrepare.attemptCount)
+    const readerCallId = `prepare-read-${randomUUID()}`
     expect(prepared.bytes).toBeGreaterThan(8 * 1024)
     expect(prepared.bytes).toBeLessThanOrEqual(MAX_TOOL_RESULT_BYTES)
 
@@ -336,7 +337,9 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
       expect(rollover.rows).toEqual([{ attemptCount: scheduledPrepare.attemptCount, status: "running" }])
 
       const afterRestart = createToolResultReferenceRepository(runtimePool(afterRestartPool, readerBackend))
-      await expect(afterRestart.read(scheduledPrepare.owner, { referenceId: stored.id }, toolCallId))
+      await expect(afterRestart.read(ownerC.owner, { referenceId: stored.id }, readerCallId))
+        .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+      await expect(afterRestart.read(scheduledPrepare.owner, { referenceId: stored.id }, readerCallId))
         .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
       const retried = await afterRestart.put(restartedOwner, {
         stepId: scheduledPrepare.stepId, toolCallId, value,
@@ -355,12 +358,12 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
       for (let index = 0; index < Math.ceil(stored.byteCount / 2_048) + 2; index += 1) {
         last = await afterRestart.read(restartedOwner, {
           referenceId: stored.id, ...(cursor === undefined ? {} : { cursor }),
-        }, toolCallId)
+        }, readerCallId)
         expect(last).not.toBeNull()
         const encodedChunk = JSON.stringify(last)
         expect(encodedChunk).toBeTypeOf("string")
         expect(Buffer.byteLength(encodedChunk!, "utf8")).toBeLessThanOrEqual(MAX_TOOL_RESULT_READ_BYTES)
-        expect(isVerifiedToolResultChunk(last, restartedOwner, toolCallId)).toBe(true)
+        expect(isVerifiedToolResultChunk(last, restartedOwner, readerCallId)).toBe(true)
         chunks.push(last!.chunk)
         if (last!.nextCursor === null) break
         cursor = last!.nextCursor
@@ -380,7 +383,7 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
       await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = $2 WHERE "id" = $1`, [
         scheduledPrepare.taskId, scheduledPrepare.attemptCount + 1,
       ])
-      await expect(afterRestart.read(restartedOwner, { referenceId: stored.id }, toolCallId))
+      await expect(afterRestart.read(restartedOwner, { referenceId: stored.id }, readerCallId))
         .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
       const staleVerificationClient = await afterRestartPool.connect()
       try {

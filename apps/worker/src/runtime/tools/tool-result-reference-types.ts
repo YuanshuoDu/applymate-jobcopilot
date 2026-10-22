@@ -153,7 +153,7 @@ export function verifyToolResultSanitization(value: ToolResultReferenceRecord, t
     try {
       if (typeof value.taskId !== "string") throw new Error("scheduled_prepare_task_fence_missing")
       const safe = prepareToolResultJson(value.sanitizedJson, toolName, value.taskId, expectedAttemptCount)
-      if (matchesStored(value, safe)) return safe.value
+      if (safe.bytes <= MAX_TOOL_RESULT_BYTES && matchesStored(value, safe)) return safe.value
     } catch { /* Prepare references must be valid under their stored task fence. */ }
     throw new ToolResultSanitizationError("tool_result_corrupt")
   }

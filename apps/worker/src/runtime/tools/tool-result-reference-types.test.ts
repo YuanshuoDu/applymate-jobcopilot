@@ -166,9 +166,15 @@ describe("tool result reference runtime contract", () => {
     expect(matchesVerifiedToolResultRetry(row, prepared, input, scheduledPrepareSource, 1)).toBe(true)
     expect(() => prepareToolResultJson(input, scheduledPrepareSource, scheduledPrepareTaskId, 2))
       .toThrowError(expect.objectContaining({ code: "tool_result_invalid_json" }))
+    expect(() => prepareToolResultJson(input, scheduledPrepareSource, "subagent-12345678-1234-4234-9234-123456789012", 1))
+      .toThrowError(expect.objectContaining({ code: "tool_result_invalid_json" }))
     expect(() => verifyToolResultSanitization(row, scheduledPrepareSource, 2))
       .toThrowError(expect.objectContaining({ code: "tool_result_corrupt" }))
     expect(matchesVerifiedToolResultRetry(row, prepared, input, scheduledPrepareSource, 2)).toBe(false)
+
+    const oversizedMalformed = { ...scheduledPrepareReceipt(), privateBody: "x".repeat(1024 * 1024 + 1) }
+    expect(() => prepareToolResultJson(oversizedMalformed, scheduledPrepareSource))
+      .toThrowError(expect.objectContaining({ code: "tool_result_invalid_json" }))
   })
 
   it("fails closed for malformed, redacted, or tampered scheduled Prepare references", () => {
