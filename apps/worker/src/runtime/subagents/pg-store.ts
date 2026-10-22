@@ -4,6 +4,7 @@ import { isTerminalSubagentStatus, PAUSE_DEFERRED_MARKER, type AtomicSubagentSpa
   type SubagentExecutionResult, type SubagentRetryDisposition, type SubagentStore, type SubagentTaskRecord, type SubagentTaskSpec, type SubagentPolicy } from "./types.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
+import { handoffDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
 import { assertSessionWorkAdmission, RUNNABLE_SESSION } from "../session-gate.js"
 import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentSession, lockSubagentTurn, lockSubagentTurnForWork, readSubagentTask } from "./pg-store-create.js"
 import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
@@ -137,6 +138,10 @@ export class PgSubagentTaskStore implements SubagentStore {
         const leaseClock = await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)
         const finishAt = leaseClock.rows[0]?.checkedAt
         if (!lockedExpiry || !finishAt || lockedExpiry <= finishAt) return null
+        if (input.status === "waiting" && row.parentTaskId !== null && row.parentTaskId !== undefined) {
+          const handoff = await handoffDurableSubagentWaitWithGraph(client, { lease: { id: input.taskId, userId: sessionRow.userId, sessionId: input.sessionId, turnId: String(row.turnId), rootTaskId: String(row.rootTaskId), ownerId: input.ownerId, attemptCount: input.attemptCount, leaseExpiresAt: lockedExpiry }, now: finishAt })
+          if (handoff) return "blocked" in handoff ? null : "waiting"
+        }
         const nextAttemptAt = retry ? computeSubagentNextAttemptAt(input.attemptCount, finishAt) : null
         const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
           "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
@@ -236,7 +241,6 @@ export class PgSubagentTaskStore implements SubagentStore {
       return true
     })
   }
-
   async interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number> { return interruptStoreTree(this.pool, input) }
   async interruptTurn(input: { userId: string; sessionId: string; turnId: string; now: Date }): Promise<number> { return interruptStoreTurn(this.pool, input) }
   async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> { return interruptStoreSubtree(this.pool, input) }

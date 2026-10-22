@@ -11,13 +11,13 @@ const input = {
 }
 
 type DeferredFence = { lastError: string | null; payload?: unknown; publishedAt?: unknown; attemptCount?: unknown }
-function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; outbox?: DeferredFence } = {}) {
+function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; childWaitResumable?: boolean; taskAttemptCount?: number; maxAttempts?: number; outbox?: DeferredFence } = {}) {
   const calls: string[] = []
   const parameters: Array<unknown[] | undefined> = []
   const outbox = options.outbox ? { id: "dispatch-1", ...options.outbox, payload: options.outbox.payload ?? { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" } } : null
   const task = { id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
     path: "/root-1/child-1", depth: 1, role: "analyst", taskType: "test", status: "running", goal: "inspect", constraints: [],
-    successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {}, attemptCount: 1, maxAttempts: 3,
+    successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {}, attemptCount: options.taskAttemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3,
     leaseOwner: "worker-1", leaseExpiresAt: new Date("2026-10-06T10:01:00Z"), interruptRequestedAt: null }
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -40,7 +40,12 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return outbox ? { rows: [outbox], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
       if (sql.includes('SELECT task."turnId", task."rootTaskId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, attemptCount: 0, userId: "user-1" }], rowCount: 1 }
-      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) {
+        const exactWait = options.childWaitResumable === true
+        const currentDispatch = params?.[7] === true
+        const exhausted = (options.taskAttemptCount ?? 1) >= (options.maxAttempts ?? 3)
+        return { rows: [], rowCount: exactWait && !currentDispatch || exhausted && !currentDispatch ? 0 : 1 }
+      }
       if (sql.startsWith('UPDATE "agent_outbox" SET "lastError" = NULL')) { if (outbox) outbox.lastError = null; return { rows: [], rowCount: 1 } }
       if (sql.startsWith("SELECT task.*")) return { rows: [task], rowCount: 1 }
       return { rows: [], rowCount: 0 }
@@ -108,6 +113,39 @@ describe("atomic child claim pause fence", () => {
     const claim = fake.calls.findIndex(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))
     expect(fence).toBeLessThan(claim)
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_outbox" SET "lastError" = NULL'))).toBe(false)
+  })
+
+  it("resumes an exact durable child wait at the current attempt and keeps the outbox generation separate", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 3), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture({ childWaitResumable: true, taskAttemptCount: 3, maxAttempts: 3,
+      outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 4 } })
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000)).resolves.toMatchObject({ id: "child-1", attemptCount: 3 })
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(update).toContain('"attemptCount" = CASE WHEN $8::boolean AND (SELECT COUNT(*) = 1')
+    expect(update).toContain('task."parentTaskId" IS NOT NULL AND task."status" = \'queued\'')
+    expect(update).toContain('step."attempt" = task."attemptCount"')
+    expect(update).toContain('step."status" = \'waiting_for_tool\'')
+    expect(update).toContain('step."ordinal" = (SELECT MAX(currentStep."ordinal")')
+    expect(update).toContain('continuation."ordinal" = step."ordinal" + 1')
+    expect(update).toContain('step."ordinal" + 1 = (SELECT MAX(currentStep."ordinal")')
+    expect(update).toContain('step."status" IN (\'waiting_for_tool\', \'completed\')')
+    expect(update).toContain('wait."id" = (SELECT currentWait."id"')
+    expect(update).toContain('wait."status" IN (\'ready\', \'timed_out\') AND wait."suspendedAt" IS NOT NULL')
+    expect(update).toContain('wait."consumedAt" IS NULL AND step."status" = \'waiting_for_tool\'')
+    expect(update.match(/wait\."consumedAt" IS NULL/g)).toHaveLength(3)
+    expect(update).toContain('"attemptCount" < "maxAttempts" OR ($8::boolean AND (SELECT COUNT(*) = 1')
+    expect(update).toContain('AND (NOT (SELECT COUNT(*) = 1')
+    expect(fake.parameters[fake.calls.indexOf(update)]).toEqual(["child-1", "session-1", "worker-1", 60_000, "turn-1", "root-1", "user-1", true])
+    expect(fake.outbox).toMatchObject({ attemptCount: 4 })
+  })
+
+  it("does not let a direct claim resume a persisted wait without the current published dispatch identity", async () => {
+    const fake = poolFixture({ childWaitResumable: true, taskAttemptCount: 3, maxAttempts: 3 })
+    await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toBeNull()
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(update).toContain('AND (NOT (SELECT COUNT(*) = 1')
+    expect(fake.parameters[fake.calls.indexOf(update)]?.[7]).toBe(false)
   })
 
   it("preserves ordinary outbox and direct-claim owner compatibility", async () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
-import { dispatchTaskInvalidReason, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
+import { CHILD_WAIT_RESUMABLE_SQL, dispatchTaskInvalidReason, lockDispatchTask, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
 import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
@@ -29,6 +29,36 @@ describe("subagent dispatch eligibility", () => {
     ["attempt", { attemptCount: 3 }, "attempts_exhausted"],
   ] as const)("rejects an invalid %s fence", (_label, overrides, reason) => {
     expect(dispatchTaskInvalidReason(task(overrides), payload, "session-1", "user-1")).toBe(reason)
+  })
+
+  it("permits only a database-proven durable child wait to resume at the attempt ceiling", () => {
+    expect(dispatchTaskInvalidReason(task({ attemptCount: 3, childWaitResumable: true }), payload, "session-1", "user-1")).toBeNull()
+    expect(dispatchTaskInvalidReason(task({ attemptCount: 3, childWaitResumable: false }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ status: "retrying", attemptCount: 3, childWaitResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ attemptCount: 3, maxAttempts: 0, childWaitResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ attemptCount: -1, childWaitResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+  })
+
+  it("uses bound ownership values and proves the latest same-attempt wait and direct-child set", async () => {
+    const client = { query: vi.fn().mockResolvedValue({ rows: [], rowCount: 0 }) } as unknown as Pick<pg.PoolClient, "query">
+    await lockDispatchTask(client, { taskId: "task-1", sessionId: "session-1", userId: "user-1" })
+    const [sql, values] = vi.mocked(client.query).mock.calls[0] ?? []
+    expect(values).toEqual(["task-1", "user-1", "session-1"])
+    expect(sql).toContain('waitTurn."userId" = wait."userId"')
+    expect(sql).toContain('waitTurn."rootTaskId" = task."rootTaskId"')
+    expect(sql).toContain('step."ordinal" = (SELECT MAX(currentStep."ordinal")')
+    expect(sql).toContain('continuation."ordinal" = step."ordinal" + 1')
+    expect(sql).toContain('step."ordinal" + 1 = (SELECT MAX(currentStep."ordinal")')
+    expect(sql).toContain('step."status" IN (\'waiting_for_tool\', \'completed\')')
+    expect(sql).toContain('wait."id" = (SELECT currentWait."id"')
+    expect(sql).toContain('wait."status" IN (\'ready\', \'timed_out\') AND wait."suspendedAt" IS NOT NULL')
+    expect(sql).toContain('wait."consumedAt" IS NULL AND step."status" = \'waiting_for_tool\'')
+    expect(sql.match(/wait\."consumedAt" IS NULL/g)).toHaveLength(1)
+    expect(sql).toContain('child."parentTaskId" = task."id"')
+    expect(sql).toContain('child."sessionId" = task."sessionId" AND child."turnId" = task."turnId"')
+    expect(sql).toContain('child."rootTaskId" = task."rootTaskId"')
+    expect(sql).toBeDefined()
+    expect(CHILD_WAIT_RESUMABLE_SQL).not.toContain("user-1")
   })
 
   it("marks a terminal dispatch with a bounded reason", async () => {

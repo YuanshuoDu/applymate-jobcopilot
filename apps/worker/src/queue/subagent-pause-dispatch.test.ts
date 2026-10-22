@@ -11,11 +11,11 @@ type PgSubagentPool = Pick<pg.Pool, "connect">
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
 
-type DeferOptions = { publishedAt?: Date | null; startedAt?: Date | null; failWrite?: Error; lastError?: string | null }
+type DeferOptions = { publishedAt?: Date | null; startedAt?: Date | null; failWrite?: Error; lastError?: string | null; childWaitResumable?: boolean; attemptCount?: number; maxAttempts?: number }
 function deferPool(options: DeferOptions = {}) {
   const calls: Array<[string, unknown[]?]> = []
   const outbox = { id: "dispatch-1", payload: { ...payload } as unknown, publishedAt: options.publishedAt === undefined ? new Date() : options.publishedAt, attemptCount: 3, lastError: options.lastError === undefined ? null : options.lastError }
-  const task = { attemptCount: 0 }
+  const task = { attemptCount: options.attemptCount ?? 0 }
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
@@ -25,15 +25,17 @@ function deferPool(options: DeferOptions = {}) {
       if (sql.includes('SELECT task."turnId", task."rootTaskId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS root') && sql.includes("FOR UPDATE")) return { rows: [{ id: "root-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task")) return { rows: [{
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task")) { const row = {
         id: "task-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", status: "queued", startedAt: options.startedAt ?? null,
-        attemptCount: task.attemptCount, maxAttempts: 3, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+        attemptCount: task.attemptCount, maxAttempts: options.maxAttempts ?? 3, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+        childWaitResumable: options.childWaitResumable ?? false,
         rootStatus: "running", turnStatus: "in_progress", turnUserId: "user-1",
-      }], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE")) return { rows: [{
+        }; return { rows: [row], rowCount: 1 } }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE")) { const row = {
         id: "task-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", status: "queued", startedAt: options.startedAt ?? null,
-        attemptCount: task.attemptCount, maxAttempts: 3, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
-      }], rowCount: 1 }
+        attemptCount: task.attemptCount, maxAttempts: options.maxAttempts ?? 3, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+        childWaitResumable: options.childWaitResumable ?? false,
+        }; return { rows: [row], rowCount: 1 } }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return { rows: [{ ...outbox }], rowCount: 1 }
       if (sql.startsWith('UPDATE "agent_outbox" SET "lastError" = $2')) {
         if (options.failWrite) throw options.failWrite
@@ -51,10 +53,12 @@ function deferPool(options: DeferOptions = {}) {
   return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as PgSubagentPool, calls, outbox, task, client }
 }
 
-type RecoveryOptions = { activePause?: boolean; startedAt?: Date | null; marker?: string | null }
+type RecoveryOptions = { activePause?: boolean; startedAt?: Date | null; marker?: string | null; childWaitResumable?: boolean; attemptCount?: number; maxAttempts?: number }
 function recoveryPool(options: RecoveryOptions = {}) {
   const calls: Array<[string, unknown[]?]> = []
-  const task = { id: "task-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", status: "queued", startedAt: options.startedAt ?? null, attemptCount: 0, maxAttempts: 3, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, rootStatus: "running", turnStatus: "in_progress" }
+  const task = { id: "task-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", status: "queued", startedAt: options.startedAt ?? null,
+    attemptCount: options.attemptCount ?? 0, maxAttempts: options.maxAttempts ?? 3, leaseOwner: null, leaseExpiresAt: null,
+    interruptRequestedAt: null, rootStatus: "running", turnStatus: "in_progress", childWaitResumable: options.childWaitResumable ?? false }
   const outbox: { id: string; payload: unknown; publishedAt: Date | null; attemptCount: number; lastError: string | null } = {
     id: "dispatch-1", payload: { ...payload }, publishedAt: new Date(), attemptCount: 3,
     lastError: options.marker === undefined ? PAUSE_DEFERRED_MARKER : options.marker,
@@ -63,12 +67,12 @@ function recoveryPool(options: RecoveryOptions = {}) {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [], rowCount: 0 }
-      if (sql.includes("LIMIT $3 FOR UPDATE SKIP LOCKED")) return options.activePause || outbox.lastError !== PAUSE_DEFERRED_MARKER || outbox.publishedAt === null || task.startedAt !== null ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes("LIMIT $3 FOR UPDATE SKIP LOCKED")) return options.activePause || outbox.lastError !== PAUSE_DEFERRED_MARKER || outbox.publishedAt === null || task.startedAt !== null && !task.childWaitResumable ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes("set_config('app.user_id'")) return { rows: [], rowCount: 1 }
       if (sql.includes('SELECT task."turnId" FROM "sub_agent_tasks"')) return { rows: [{ turnId: "turn-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS root') && sql.includes("FOR UPDATE")) return { rows: [{ id: "root-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
-      if (sql.includes('AS "taskId"') && sql.includes("LIMIT $4")) return { rows: [{ taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, userId: "user-1", dispatchId: outbox.id, payload: outbox.payload }], rowCount: 1 }
+      if (sql.includes('AS "taskId"') && sql.includes("LIMIT $4")) return { rows: [{ taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, userId: "user-1", dispatchId: outbox.id, payload: outbox.payload, dispatchAttemptCount: outbox.attemptCount }], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('ORDER BY dispatch."createdAt"')) return outbox.publishedAt === null ? { rows: [{ id: outbox.id, aggregateId: "session-1", payload: outbox.payload, attemptCount: outbox.attemptCount }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT session."id", session."status"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", status: "running", userId: "user-1" }], rowCount: 1 }
       if (sql.startsWith('SELECT "id", "turnId" FROM "sub_agent_tasks"')) return { rows: [{ id: task.id, turnId: task.turnId }], rowCount: 1 }
@@ -76,7 +80,7 @@ function recoveryPool(options: RecoveryOptions = {}) {
         if (sql.includes('LEFT JOIN "agent_turns" AS turn')) return { rows: [{ ...task, rootId: task.rootTaskId, rootSessionId: task.sessionId, rootTurnId: task.turnId, turnRowId: task.turnId, turnSessionId: task.sessionId, turnUserId: "user-1", turnStatus: "in_progress", retryDue: true }], rowCount: 1 }
         return sql.includes('WHERE task."id" = $1 AND task."sessionId" = $3')
           ? { rows: [task], rowCount: 1 }
-          : task.startedAt === null ? { rows: [{ ...task }], rowCount: 1 } : { rows: [], rowCount: 0 }
+          : task.startedAt === null || task.childWaitResumable ? { rows: [{ ...task }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE")) return { rows: [{ ...task }], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return outbox.lastError === PAUSE_DEFERRED_MARKER ? { rows: [{ id: outbox.id, aggregateId: "session-1", payload: outbox.payload, attemptCount: outbox.attemptCount, lastError: outbox.lastError }], rowCount: 1 } : { rows: [], rowCount: 0 }
@@ -169,6 +173,26 @@ describe("pause-deferred subagent dispatch", () => {
     expect(fake.task.attemptCount).toBe(0)
   })
 
+  it("pause-defers a max-attempt durable child wait only for its current published generation", async () => {
+    const fake = deferPool({ startedAt: new Date(), attemptCount: 3, maxAttempts: 3, childWaitResumable: true })
+    const identity = parseSubagentDispatchJobId(subagentJobId(payload.taskId, 2), payload.taskId)
+    if (!identity) throw new Error("Fixture current wait dispatch ID did not parse")
+    const manager = { run: vi.fn().mockResolvedValue({ taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }) }
+    await runSubagentQueueJob(fake.pool, manager as never, async () => ({ status: "completed" }), payload, identity)
+    expect(fake.outbox).toMatchObject({ lastError: PAUSE_DEFERRED_MARKER, attemptCount: 3 })
+    expect(fake.task.attemptCount).toBe(3)
+    const taskFence = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE"))?.[0] ?? ""
+    expect(taskFence).toContain('wait."id" = (SELECT currentWait."id"')
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "lastError"'))).toBe(true)
+  })
+
+  it("does not pause-defer a durable wait without a current published generation identity", async () => {
+    const fake = deferPool({ startedAt: new Date(), attemptCount: 3, maxAttempts: 3, childWaitResumable: true })
+    const manager = { run: vi.fn().mockResolvedValue({ taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }) }
+    await runSubagentQueueJob(fake.pool, manager as never, async () => ({ status: "completed" }), payload)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "lastError"'))).toBe(false)
+  })
+
   it("does not mark an active task that was already started", async () => {
     const fake = deferPool({ startedAt: new Date() })
     const manager = { run: vi.fn().mockResolvedValue({ taskId: "task-1", status: "skipped", reason: "session_pause_requested" }) }
@@ -208,13 +232,22 @@ describe("pause-deferred subagent dispatch", () => {
     expect(fake.outbox).toMatchObject({ publishedAt: null, attemptCount: 4, lastError: PAUSE_DEFERRED_MARKER, payload: { ...payload, ownerId: expect.stringMatching(/^recovery-worker-/) } })
     expect(fake.task.attemptCount).toBe(0)
     const session = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions" AS session') && sql.includes("LIMIT $3 FOR UPDATE SKIP LOCKED"))
-    const task = fake.calls.findIndex(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE") && !sql.includes("ORDER BY"))
+    const task = fake.calls.findIndex(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('task."startedAt"') && sql.includes("FOR UPDATE"))
     const dispatch = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE"))
     const update = fake.calls.findIndex(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))
     expect(session).toBeGreaterThan(-1)
     expect(session).toBeLessThan(task)
     expect(task).toBeLessThan(dispatch)
     expect(dispatch).toBeLessThan(update)
+  })
+
+  it("rotates a deferred max-attempt child-wait generation after resume", async () => {
+    const fake = recoveryPool({ startedAt: new Date(), attemptCount: 3, maxAttempts: 3, childWaitResumable: true })
+    await expect(repairDeferredSubagentDispatches(fake.pool, "recovery-worker", 1)).resolves.toBe(1)
+    expect(fake.task.attemptCount).toBe(3)
+    expect(fake.outbox).toMatchObject({ publishedAt: null, attemptCount: 4, lastError: PAUSE_DEFERRED_MARKER,
+      payload: { ...payload, ownerId: expect.stringMatching(/^recovery-worker-/) } })
+    expect(fake.calls.some(([sql]) => sql.includes('wait."id" = (SELECT currentWait."id"'))).toBe(true)
   })
 
   it("does not republish during pause, repeat a reset, or select an unmarked child", async () => {

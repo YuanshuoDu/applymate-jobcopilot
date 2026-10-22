@@ -20,6 +20,7 @@ import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./native-verification-contract.js"
 import { createNativeVerificationContext } from "./native-verification-packet.js"
+import * as rolePolicies from "./role-policy.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -550,29 +551,233 @@ describe("child executor composition", () => {
     expect(JSON.stringify(requests[0]?.messages)).toContain("UNTRUSTED_DATA")
   })
 
-  it("starts a recovered child attempt after durable steps and restores tool observations", async () => {
-    const child = lease(); const requests: HarnessModelRequest[] = []; const startedOrdinals: number[] = []
+  it("replays an acknowledged wait on redelivery without creating a duplicate continuation step", async () => {
+    const child = lease(); const requests: HarnessModelRequest[] = []; const startedOrdinals: number[] = []; const startedStepIds: string[] = []
+    const startAttempts: number[] = []; const createdSteps = new Map<string, { id: string; ordinal: number }>()
+    const deliveryOrder: string[] = []; const routedCalls: string[] = []
+    const durableWait = {
+      waitId: "wait-1", stepId: "waiting-step", attempt: child.attemptCount, ordinal: 2, toolCallId: "wait-call", sourceItemId: "wait-result",
+      input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
+      output: { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+        matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },
+    } as const
     const resumeLoader = vi.fn(async () => ({
       resume: { nextOrdinal: 3, stepCount: 3, toolCallCount: 1, inputThroughSequence: 8n, consumedInputIds: ["input-1"], usage: { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.2 } },
-      observations: [{ id: "child-resume:item-result", content: { toolCallId: "prior-call", toolName: "jobs.search", input: {}, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }],
+      observations: [
+        { id: "child-resume:item-result", content: { toolCallId: "prior-call", toolName: "jobs.search", input: {}, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } },
+        { id: "child-resume:wait-result", content: { toolCallId: "wait-call", toolName: "wait_subagents", input: durableWait.input, status: "completed", output: durableWait.output, errorCode: null } },
+      ],
+      durableWait,
     }))
     const model: ModelAdapter = {
       id: "fixture-model", profile,
       async *stream(request) { requests.push(request); yield { type: "text_delta", text: "recovered" }; yield { type: "completed", finishReason: "stop" } },
     }
     const executor = createChildExecutor({
-      store: { ...executionStore([], requests), startStep: async ({ ordinal, stepId }) => { startedOrdinals.push(ordinal); return { id: stepId, ordinal } } },
+      store: { ...executionStore([], requests), startStep: async ({ ordinal, stepId, attempt }) => {
+        startedOrdinals.push(ordinal); startedStepIds.push(stepId); startAttempts.push(attempt)
+        const existing = createdSteps.get(stepId)
+        if (existing) {
+          expect(existing.ordinal).toBe(ordinal); deliveryOrder.push("step-reused"); return existing
+        }
+        const created = { id: stepId, ordinal }; createdSteps.set(stepId, created); deliveryOrder.push("step-created"); return created
+      } },
       treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
-      toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
+      toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => {
+        routedCalls.push(request.toolName); return { ...request, status: "completed", errorCode: null }
+      }),
+      durableWaitResumeCommitter: async (_lease, wait, nextStepOrdinal) => { deliveryOrder.push("ack"); expect(wait.waitId).toBe("wait-1"); expect(nextStepOrdinal).toBe(3); return true },
       resumeLoader,
     })
 
-    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { stepCount: 4 } })
+    const execution = await executor({ lease: child })
+    expect(execution).toMatchObject({ status: "completed", result: { stepCount: 4 } })
+    const redelivery = await executor({ lease: child })
+    expect(redelivery).toMatchObject({ status: "completed", result: { stepCount: 4 } })
     expect(resumeLoader).toHaveBeenCalledWith(child)
-    expect(startedOrdinals).toEqual([3])
+    expect(resumeLoader).toHaveBeenCalledTimes(2)
+    expect(startedOrdinals).toEqual([3, 3])
+    expect(startedStepIds).toEqual(["task:child-1:step:3:attempt:2", "task:child-1:step:3:attempt:2"])
+    expect(startAttempts).toEqual([child.attemptCount, child.attemptCount])
+    expect(createdSteps.size).toBe(1)
+    expect(deliveryOrder).toEqual(["step-created", "ack", "step-reused", "ack"])
+    expect(routedCalls).toEqual([])
     expect(JSON.stringify(requests[0]?.messages)).toContain("prior-call")
+    expect(JSON.stringify(requests[0]?.messages)).toContain("wait-call")
     expect(JSON.stringify(requests[0]?.messages)).toContain("job-1")
+    const deliveredWaitResults = requests.map(request => {
+      const message = request.messages.find(candidate => candidate.role === "tool"
+        && candidate.content.some(block => block.type === "tool_result" && block.toolUseId === "wait-call"))
+      const result = message?.role === "tool" ? message.content.find(block => block.type === "tool_result" && block.toolUseId === "wait-call") : undefined
+      return result?.type === "tool_result" ? JSON.parse(result.content) as unknown : undefined
+    })
+    expect(deliveredWaitResults).toEqual([durableWait.output, durableWait.output])
     expect(requests[0]?.metadata).not.toHaveProperty("continuation")
+  })
+
+  it("recovers an unacknowledged wait after continuation persistence and reuses it at max attempts", async () => {
+    const oldOwner = { ...lease(), attemptCount: 3, maxAttempts: 3, ownerId: "worker-old", leaseOwner: "worker-old" }
+    const newOwner = { ...oldOwner, ownerId: "worker-new", leaseOwner: "worker-new" }
+    const requests: HarnessModelRequest[] = []; const deliveryOrder: string[] = []; const routedCalls: string[] = []
+    const startedAttempts: number[] = []; const persistedSteps = new Map<string, { id: string; ordinal: number }>()
+    const durableWait = {
+      waitId: "wait-crash-cut", stepId: "waiting-step", attempt: 3, ordinal: 2, toolCallId: "wait-call", sourceItemId: "recovered-wait-result:wait-crash-cut",
+      input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
+      output: { waitId: "wait-crash-cut", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+        matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },
+    } as const
+    const resumeLoader = vi.fn(async (current: SubagentLease) => {
+      expect(current.attemptCount).toBe(3)
+      return {
+        resume: { nextOrdinal: 3, stepCount: 3, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+        observations: [{ id: `child-resume:${durableWait.sourceItemId}`, content: {
+          toolCallId: durableWait.toolCallId, toolName: "wait_subagents", input: durableWait.input, status: "completed", output: durableWait.output, errorCode: null,
+        } }],
+        durableWait,
+      }
+    })
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) { requests.push(request); deliveryOrder.push("model"); yield { type: "text_delta", text: "resumed once" }; yield { type: "completed", finishReason: "stop" } },
+    }
+    const executor = createChildExecutor({
+      store: { ...executionStore([], requests), startStep: async ({ ordinal, stepId, attempt }) => {
+        startedAttempts.push(attempt)
+        const existing = persistedSteps.get(stepId)
+        if (existing) { expect(existing.ordinal).toBe(ordinal); deliveryOrder.push("step-reused"); return existing }
+        const created = { id: stepId, ordinal }; persistedSteps.set(stepId, created); deliveryOrder.push("step-persisted"); return created
+      } },
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => {
+        routedCalls.push(request.toolName); return { ...request, status: "completed", errorCode: null }
+      }),
+      resumeLoader,
+      durableWaitResumeCommitter: async (current, wait, nextStepOrdinal) => {
+        deliveryOrder.push(`ack:${current.ownerId}`)
+        expect(wait.waitId).toBe("wait-crash-cut"); expect(nextStepOrdinal).toBe(3)
+        if (current.ownerId === "worker-old") throw new Error("simulated crash before acknowledgement")
+        return true
+      },
+    })
+
+    await expect(executor({ lease: oldOwner })).resolves.toMatchObject({ status: "failed" })
+    expect(requests).toHaveLength(0)
+    expect(persistedSteps.size).toBe(1)
+    await expect(executor({ lease: newOwner })).resolves.toMatchObject({ status: "completed", result: { finalText: "resumed once" } })
+
+    expect(resumeLoader).toHaveBeenCalledTimes(2)
+    expect(startedAttempts).toEqual([3, 3])
+    expect(persistedSteps.size).toBe(1)
+    expect(deliveryOrder).toEqual(["step-persisted", "ack:worker-old", "step-reused", "ack:worker-new", "model"])
+    expect(routedCalls).toEqual([])
+    const delivered = requests[0]?.messages.find(message => message.role === "tool"
+      && message.content.some(block => block.type === "tool_result" && block.toolUseId === "wait-call"))
+    const result = delivered?.role === "tool" ? delivered.content.find(block => block.type === "tool_result" && block.toolUseId === "wait-call") : undefined
+    expect(result?.type === "tool_result" ? JSON.parse(result.content) : undefined).toEqual(durableWait.output)
+    expect(oldOwner.attemptCount).toBe(3)
+    expect(newOwner.attemptCount).toBe(3)
+  })
+
+  it("replays an acknowledged consumed wait after a continuation crash at max attempts", async () => {
+    const oldOwner = { ...lease(), attemptCount: 3, maxAttempts: 3, ownerId: "worker-old", leaseOwner: "worker-old" }
+    const newOwner = { ...oldOwner, ownerId: "worker-new", leaseOwner: "worker-new" }
+    const requests: HarnessModelRequest[] = []; const deliveryOrder: string[] = []; const routedCalls: string[] = []
+    const startedAttempts: number[] = []; const persistedSteps = new Map<string, { id: string; ordinal: number }>()
+    const durableWait = {
+      waitId: "wait-post-ack", stepId: "waiting-step", attempt: 3, ordinal: 2, toolCallId: "wait-call", sourceItemId: "recovered-wait-result:wait-post-ack",
+      input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
+      output: { waitId: "wait-post-ack", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+        matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },
+    } as const
+    let acknowledged = false; let modelCalls = 0
+    const resumeLoader = vi.fn(async (current: SubagentLease) => {
+      expect(current.attemptCount).toBe(3)
+      if (acknowledged) expect([...persistedSteps.values()]).toContainEqual({ id: expect.any(String), ordinal: 3 })
+      else expect(persistedSteps.size).toBe(0)
+      return {
+        resume: { nextOrdinal: 3, stepCount: 3, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+        observations: [{ id: `child-resume:${durableWait.sourceItemId}`, content: {
+          toolCallId: durableWait.toolCallId, toolName: "wait_subagents", input: durableWait.input, status: "completed", output: durableWait.output, errorCode: null,
+        } }],
+        durableWait,
+      }
+    })
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        modelCalls += 1
+        if (modelCalls === 1) { deliveryOrder.push("model-crashed"); throw new Error("simulated crash after durable acknowledgement") }
+        deliveryOrder.push("model-replayed")
+        yield { type: "text_delta", text: "replayed after acknowledgement" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const executor = createChildExecutor({
+      store: { ...executionStore([], requests), startStep: async ({ ordinal, stepId, attempt }) => {
+        startedAttempts.push(attempt)
+        const existing = persistedSteps.get(stepId)
+        if (existing) { expect(existing.ordinal).toBe(ordinal); deliveryOrder.push("continuation-reused"); return existing }
+        const created = { id: stepId, ordinal }; persistedSteps.set(stepId, created); deliveryOrder.push("continuation-created"); return created
+      } },
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => {
+        routedCalls.push(request.toolName); return { ...request, status: "completed", errorCode: null }
+      }),
+      resumeLoader,
+      durableWaitResumeCommitter: async (current, wait, nextStepOrdinal) => {
+        deliveryOrder.push(`ack:${current.ownerId}`)
+        expect(wait.waitId).toBe("wait-post-ack"); expect(nextStepOrdinal).toBe(3)
+        if (current.ownerId === "worker-old") {
+          expect(acknowledged).toBe(false)
+          acknowledged = true
+          return true
+        }
+        expect(acknowledged).toBe(true)
+        return true
+      },
+    })
+
+    await expect(executor({ lease: oldOwner })).resolves.toMatchObject({ status: "failed" })
+    expect(acknowledged).toBe(true)
+    expect(persistedSteps.size).toBe(1)
+    await expect(executor({ lease: newOwner })).resolves.toMatchObject({ status: "completed", result: { finalText: "replayed after acknowledgement" } })
+
+    expect(resumeLoader).toHaveBeenCalledTimes(2)
+    expect(startedAttempts).toEqual([3, 3])
+    expect(persistedSteps.size).toBe(1)
+    expect(deliveryOrder).toEqual(["continuation-created", "ack:worker-old", "model-crashed", "continuation-reused", "ack:worker-new", "model-replayed"])
+    expect(routedCalls).toEqual([])
+    expect(oldOwner.attemptCount).toBe(3)
+    expect(newOwner.attemptCount).toBe(3)
+    const waitResults = requests.map(request => {
+      const message = request.messages.find(candidate => candidate.role === "tool"
+        && candidate.content.some(block => block.type === "tool_result" && block.toolUseId === "wait-call"))
+      const result = message?.role === "tool" ? message.content.find(block => block.type === "tool_result" && block.toolUseId === "wait-call") : undefined
+      return result?.type === "tool_result" ? JSON.parse(result.content) as unknown : undefined
+    })
+    expect(waitResults).toEqual([durableWait.output, durableWait.output])
+  })
+
+  it("does not return child success when durable wait delivery is not acknowledged", async () => {
+    const child = lease()
+    const durableWait = {
+      waitId: "wait-1", stepId: "waiting-step", attempt: child.attemptCount, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result",
+      input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "any", timeoutMs: 1_000 },
+      output: { waitId: "wait-1", status: "timed_out", taskIds: ["grandchild-1"], deadlineAt: "2026-01-01T00:00:00.000Z",
+        matchedTaskIds: [], tasks: [{ taskId: "grandchild-1", status: "running", role: "scout", result: null, failureReason: null }] },
+    } as const
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => finalTextModel("completed output"), toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
+      resumeLoader: async () => ({
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+        observations: [], durableWait,
+      }),
+      durableWaitResumeCommitter: async () => false,
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "turn_execution_failed" })
   })
 
   it("binds restored jobs, persona, and resume evidence before a resumed provider call", async () => {
@@ -834,7 +1039,7 @@ describe("child executor composition", () => {
     expect(modelRuntimeFactory).not.toHaveBeenCalled()
   })
 
-  it("keeps attempt one unchanged and does not invoke the resume loader", async () => {
+  it("skips resume loading on an ordinary first attempt", async () => {
     const child = { ...lease(), attemptCount: 1 }; const resumeLoader = vi.fn(async () => undefined); const modelRuntimeFactory = vi.fn(() => finalTextModel("completed output"))
     const executor = createChildExecutor({
       store: { ...executionStore([], []), startStep: async ({ ordinal, stepId }) => ({ id: stepId, ordinal }) },
@@ -847,6 +1052,53 @@ describe("child executor composition", () => {
     expect(result.retryDisposition).toBeUndefined()
     expect(resumeLoader).not.toHaveBeenCalled()
     expect(modelRuntimeFactory).toHaveBeenCalledOnce()
+  })
+
+  it("loads a first-attempt durable wait only when role policy and persisted actions allow it", async () => {
+    const child = { ...lease(), attemptCount: 1, allowedActions: ["wait_subagents"] }
+    const rolePolicy = rolePolicies.getSubagentRolePolicy.bind(rolePolicies)
+    const policySpy = vi.spyOn(rolePolicies, "getSubagentRolePolicy").mockImplementation(role => {
+      const policy = rolePolicy(role)
+      return role === child.role && policy ? { ...policy, canManageChildren: true } : policy
+    })
+    const requests: HarnessModelRequest[] = []
+    const durableWait = {
+      waitId: "wait-first-attempt", stepId: "waiting-step", attempt: 1, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result",
+      input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "any", timeoutMs: 5_000 },
+      output: { waitId: "wait-first-attempt", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+        matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },
+    } as const
+    const resumeLoader = vi.fn(async () => ({
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      observations: [{ id: "child-resume:wait-result", content: {
+        toolCallId: "wait-call", toolName: "wait_subagents", input: durableWait.input, status: "completed", output: durableWait.output, errorCode: null,
+      } }],
+      durableWait,
+    }))
+    const deliveryOrder: string[] = []
+    try {
+      const executor = createChildExecutor({
+        store: { ...executionStore([], requests), startStep: async ({ ordinal, stepId, attempt }) => {
+          expect(attempt).toBe(1); deliveryOrder.push("step"); return { id: stepId, ordinal }
+        } },
+        treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+        modelRuntimeFactory: () => textOnlyModel("continued after wait", request => requests.push(request)),
+        toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]),
+        resumeLoader,
+        durableWaitResumeCommitter: async (_lease, wait, nextStepOrdinal) => {
+          deliveryOrder.push("ack"); expect(wait.waitId).toBe(durableWait.waitId); expect(nextStepOrdinal).toBe(1); return true
+        },
+      })
+
+      await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { stepCount: 2 } })
+      expect(resumeLoader).toHaveBeenCalledWith(child)
+      expect(deliveryOrder).toEqual(["step", "ack"])
+      expect(JSON.stringify(requests[0]?.messages)).toContain("wait-first-attempt")
+      expect(JSON.stringify(requests[0]?.messages)).toContain("ready")
+      expect(child.attemptCount).toBe(1)
+    } finally {
+      policySpy.mockRestore()
+    }
   })
 
   it("runs model → tool observation → model under child identity and shared reservation", async () => {

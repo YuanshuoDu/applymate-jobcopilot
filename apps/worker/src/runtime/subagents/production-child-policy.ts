@@ -1,6 +1,8 @@
 import type { PolicyRule, PolicySnapshot } from "@jobcopilot/agent-protocol"
 import { PolicyEngine } from "@jobcopilot/agent-policy"
 import { ROLE_RESULT_SCHEMA, type StructuredRole } from "./role-results.js"
+import { getSubagentRolePolicy } from "./role-policy.js"
+import { canManageChildrenWithWaitAction } from "./child-executor-admission.js"
 import type { SubagentTaskRecord } from "./types.js"
 
 const SCHEDULED_PREPARE_TOOL = "scheduled.application.prepare"
@@ -32,6 +34,12 @@ const SCHEDULED_PREPARE_VARIANT_DENY = {
   reasonCode: "server_scheduled_application_prepare_variant_denied",
   reason: "Subagents may use only the exact server-enabled scheduled application preparation tool",
 } satisfies PolicyRule
+const DURABLE_CHILD_WAIT_ALLOW = {
+  id: "canonical-durable-child-wait",
+  roles: ["subagent"], tools: ["wait_subagents"], toolVersions: ["1"],
+  risks: ["internal_write"], domains: ["coordination"], outcome: "allow",
+  reasonCode: "server_durable_child_wait", reason: "The server enabled the exact durable child wait tool",
+} satisfies PolicyRule
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -52,7 +60,7 @@ function selectedJobPolicyRule(role: string, selectedJob: boolean): PolicyRule |
   return undefined
 }
 
-export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role" | "taskType" | "toolPolicySnapshot">, selectedJob: boolean): PolicyEngine {
+export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role" | "taskType" | "toolPolicySnapshot"> & Partial<Pick<SubagentTaskRecord, "allowedActions">>, selectedJob: boolean): PolicyEngine {
   const snapshot = record(task.toolPolicySnapshot)
   const hasMatrixField = Object.prototype.hasOwnProperty.call(snapshot, "version") || Object.prototype.hasOwnProperty.call(snapshot, "rules")
   const configured = typeof snapshot.version === "string" && Array.isArray(snapshot.rules)
@@ -65,13 +73,16 @@ export function createProductionChildPolicy(task: Pick<SubagentTaskRecord, "role
     ? configuredRules.filter(rule => rule.outcome === "deny" && rule.roles.includes("subagent")
       && (!rule.tools || rule.tools.includes(SCHEDULED_PREPARE_TOOL)))
     : []
-  const priorityDenies = [...new Set([...explicitDiscoveryDenies, ...explicitPrepareDenies])]
+  const explicitWaitDenies = configuredRules.filter(rule => rule.outcome === "deny" && rule.roles.includes("subagent")
+    && rule.tools?.includes("wait_subagents"))
+  const priorityDenies = [...new Set([...explicitDiscoveryDenies, ...explicitPrepareDenies, ...explicitWaitDenies])]
   const remainingConfiguredRules = configuredRules.filter(rule => !priorityDenies.includes(rule))
   const discoveryRule = task.role === "scout" && !selectedJob ? [SCOUT_DISCOVERY_WRITE_RULE] : []
   const prepareRule = task.role === "prepare" && task.taskType === SCHEDULED_PREPARE_TASK_TYPE ? [SCHEDULED_PREPARE_WRITE_RULE] : []
   const taskRule = selectedJobPolicyRule(task.role, selectedJob)
+  const waitRule = canManageChildrenWithWaitAction(getSubagentRolePolicy(task.role), task.allowedActions) ? [DURABLE_CHILD_WAIT_ALLOW] : []
   const rules: PolicyRule[] = [
-    ...priorityDenies, ...discoveryRule, SUBAGENT_INTERNAL_WRITE_DENY,
+    ...priorityDenies, ...discoveryRule, ...waitRule, SUBAGENT_INTERNAL_WRITE_DENY,
     ...prepareRule, SCHEDULED_PREPARE_VARIANT_DENY,
     ...remainingConfiguredRules, SUBAGENT_READ_RULE, ...(taskRule ? [taskRule] : []),
   ]

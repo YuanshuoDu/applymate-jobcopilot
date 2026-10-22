@@ -7,6 +7,42 @@ import { parseSubagentDispatchIdentity, SubagentDispatchIdentityMismatchError, t
 
 type ClaimInput = { taskId: string; sessionId: string; ownerId: string; rootTaskId?: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }
 
+const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
+  FROM "agent_wait_conditions" AS wait
+  JOIN "agent_turns" AS waitTurn ON waitTurn."id" = wait."turnId" AND waitTurn."sessionId" = wait."sessionId"
+    AND waitTurn."userId" = wait."userId" AND waitTurn."userId" = $7 AND waitTurn."rootTaskId" = task."rootTaskId"
+  JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId"
+    AND step."turnId" = wait."turnId" AND step."taskId" = task."id"
+  WHERE task."parentTaskId" IS NOT NULL AND task."status" = 'queued'
+    AND wait."parentTaskId" = task."id" AND wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"
+    AND step."attempt" = task."attemptCount" AND task."attemptCount" >= 0 AND task."maxAttempts" > 0
+    AND ((wait."consumedAt" IS NULL AND step."status" = 'waiting_for_tool' AND step."ordinal" = (SELECT MAX(currentStep."ordinal") FROM "agent_steps" AS currentStep
+        WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId"
+          AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount'))
+      OR (step."status" IN ('waiting_for_tool', 'completed')
+        AND (SELECT COUNT(*) FROM "agent_steps" AS continuation WHERE continuation."taskId" = task."id"
+          AND continuation."sessionId" = task."sessionId" AND continuation."turnId" = task."turnId"
+          AND continuation."attempt" = task."attemptCount" AND continuation."ordinal" = step."ordinal" + 1) = 1
+        AND step."ordinal" + 1 = (SELECT MAX(currentStep."ordinal") FROM "agent_steps" AS currentStep
+          WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId"
+            AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount')))
+    AND wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL
+    AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait
+      WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
+        AND currentWait."turnId" = task."turnId" AND currentWait."stepId" = step."id"
+      ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)
+    AND wait."mode" IN ('any', 'all') AND jsonb_typeof(wait."targetTaskIds") = 'array'
+    AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) > 0
+    AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) <= 8
+    AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) = (SELECT COUNT(DISTINCT target."value")
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("value") WHERE jsonb_typeof(target."value") = 'string')
+    AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array'
+      THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("value")
+      WHERE jsonb_typeof(target."value") <> 'string' OR NOT EXISTS (SELECT 1 FROM "sub_agent_tasks" AS child
+      WHERE child."id" = target."value" #>> '{}' AND child."id" <> task."id"
+        AND child."parentTaskId" = task."id" AND child."sessionId" = task."sessionId"
+        AND child."turnId" = task."turnId" AND child."rootTaskId" = task."rootTaskId"))) = true`
+
 /** Read-only identity check used only to classify local concurrency denial. */
 export async function matchesPublishedSubagentDispatch(pool: PgSubagentPool, input: { payload: SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean> {
   const identity = parseSubagentDispatchIdentity(input.dispatchIdentity, input.payload.taskId)
@@ -71,6 +107,7 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
       FROM "agent_outbox" AS dispatch WHERE dispatch."topic" = 'agent.subagent.dispatch'
         AND dispatch."aggregateId" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || $2 FOR UPDATE`, [input.sessionId, input.taskId])
     const deferred = dispatch.rows[0]
+    let currentDispatchIdentity = false
     if (input.dispatchIdentity) {
       const identity = parseSubagentDispatchIdentity(input.dispatchIdentity, input.taskId)
       const currentPayload = deferred ? parseSubagentJobPayload(deferred.payload) : null
@@ -81,6 +118,7 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
         || currentPayload.rootTaskId !== rootTaskId || currentPayload.ownerId !== input.ownerId) {
         throw new SubagentDispatchIdentityMismatchError()
       }
+      currentDispatchIdentity = true
     }
     if (deferred?.lastError === PAUSE_DEFERRED_MARKER) {
       const payload = parseSubagentJobPayload(deferred.payload)
@@ -92,17 +130,20 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
     if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
     const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.started" })
     if (graph && "blocked" in graph) return null
-    const updated = await client.query(`UPDATE "sub_agent_tasks"
+    const updated = await client.query(`UPDATE "sub_agent_tasks" AS task
       SET "status" = 'running', "leaseOwner" = $3, "leaseExpiresAt" = clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
-        "attemptCount" = "attemptCount" + 1, "startedAt" = COALESCE("startedAt", clock_timestamp()), "updatedAt" = clock_timestamp()
+        "attemptCount" = CASE WHEN $8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL} THEN "attemptCount" ELSE "attemptCount" + 1 END,
+        "startedAt" = COALESCE("startedAt", clock_timestamp()), "updatedAt" = clock_timestamp()
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $5 AND "rootTaskId" = $6
-        AND "status" = 'queued' AND "interruptRequestedAt" IS NULL AND "attemptCount" < "maxAttempts"
+        AND "status" = 'queued' AND "interruptRequestedAt" IS NULL
+        AND ("attemptCount" < "maxAttempts" OR ($8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL}))
+        AND (NOT ${CHILD_WAIT_RESUMABLE_SQL} OR $8::boolean)
         AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= clock_timestamp())
         AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= clock_timestamp())
         AND EXISTS (SELECT 1 FROM "sub_agent_tasks" root WHERE root."id" = $6 AND root."sessionId" = $2
           AND root."turnId" = $5 AND root."interruptRequestedAt" IS NULL
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
-    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId])
+    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId, userId, currentDispatchIdentity])
     if (updated.rowCount !== 1) return null
     if (graph) await persistGraphTransition(client, graph, input.now)
     return readSubagentTask(client, input.taskId, input.sessionId)

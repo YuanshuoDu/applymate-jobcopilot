@@ -18,6 +18,7 @@ type RepairCandidate = {
   attemptCount?: number
   maxAttempts?: number
   scopeValid?: boolean
+  childWaitResumable?: boolean
 }
 type StaleCandidate = RepairCandidate & {
   userId?: string
@@ -47,7 +48,8 @@ function staleCandidateEligible(candidate: StaleCandidate): boolean {
   const terminal = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
   return (candidate.status === "queued" || candidate.status === "retrying")
     && candidate.startedAt !== false && candidate.leaseOwner == null && candidate.leaseExpiresAt == null
-    && candidate.interruptRequestedAt == null && (candidate.attemptCount ?? 0) < (candidate.maxAttempts ?? 3)
+    && candidate.interruptRequestedAt == null && ((candidate.attemptCount ?? 0) < (candidate.maxAttempts ?? 3)
+      || candidate.status === "queued" && candidate.childWaitResumable === true)
     && !terminal.has(candidate.rootStatus ?? "running") && !terminal.has(candidate.turnStatus ?? "in_progress")
     && candidate.sessionStatus !== "aborted" && candidate.sessionStatus !== "archived" && candidate.publishedAt !== null
     && candidate.publishedAt !== undefined && candidate.updatedAt !== undefined && candidate.publishedAt < candidate.updatedAt
@@ -125,6 +127,19 @@ describe("stale subagent dispatch recovery", () => {
   it("keeps runtime-paused sessions recoverable", async () => {
     const fake = staleRepairPool({ candidate: staleCandidate({ sessionStatus: "paused" }) })
     await expect(repairStaleSubagentDispatches(fake.pool, "recovery-worker")).resolves.toBe(1)
+  })
+
+  it("repairs an exhausted queued task only for its exact current child wait", async () => {
+    const fake = staleRepairPool({ candidate: staleCandidate({ attemptCount: 3, maxAttempts: 3, childWaitResumable: true }) })
+    await expect(repairStaleSubagentDispatches(fake.pool, "recovery-worker")).resolves.toBe(1)
+    const taskScan = fake.calls.find(([sql]) => sql.includes("FOR UPDATE OF task, dispatch"))?.[0] ?? ""
+    expect(taskScan).toContain('task."attemptCount" < task."maxAttempts" OR (SELECT COUNT(*) = 1')
+    expect(taskScan).toContain('wait."id" = (SELECT currentWait."id"')
+    expect(fake.dispatches[0]).toMatchObject({ attemptCount: 5, payload: { ownerId: "recovery-worker" } })
+    expect(fake.candidates[0]).toMatchObject({ attemptCount: 3, maxAttempts: 3 })
+
+    const retrying = staleRepairPool({ candidate: staleCandidate({ status: "retrying", attemptCount: 3, maxAttempts: 3, childWaitResumable: true }) })
+    await expect(repairStaleSubagentDispatches(retrying.pool, "recovery-worker")).resolves.toBe(0)
   })
 
   it("resets a stale published dispatch with the recovery owner and fences the SQL", async () => {

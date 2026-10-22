@@ -4,6 +4,7 @@ import type { AgentTreeManager } from "../runtime/subagents/manager.js"
 import { parseSubagentDispatchIdentity, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, type SubagentDispatchIdentity } from "../runtime/subagents/dispatch-identity.js"
 import { assertSessionWorkAdmission, isSessionPauseRequestedError, OPEN_SESSION, RUNNABLE_SESSION, SESSION_WORK_ADMISSION } from "../runtime/session-gate.js"
 import { PAUSE_DEFERRED_MARKER, parseSubagentJobPayload, type PgSubagentPool, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
+import { CHILD_WAIT_RESUMABLE_SQL } from "./subagent-dispatch-eligibility.js"
 
 export { PAUSE_DEFERRED_MARKER }
 const DISPATCH_TOPIC = "agent.subagent.dispatch"
@@ -90,14 +91,17 @@ async function deferPauseDeniedDispatch(pool: PgSubagentPool, payload: SubagentJ
       WHERE root."id" = $1 AND root."sessionId" = $2 AND root."turnId" = $3 FOR UPDATE`, [payload.rootTaskId, payload.sessionId, turnId])
     if (!root.rows[0] || root.rows[0].interruptRequestedAt != null || TERMINAL.includes(String(root.rows[0].status))) return false
     const task = await client.query<Record<string, unknown>>(`SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", task."status",
-        task."startedAt", task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt"
+        task."startedAt", task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
+        ${CHILD_WAIT_RESUMABLE_SQL} AS "childWaitResumable"
       FROM "sub_agent_tasks" AS task
       WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 FOR UPDATE`,
     [payload.taskId, payload.sessionId, turnId, payload.rootTaskId])
     const row = task.rows[0]
-    if (!row || row.status !== "queued" || row.startedAt != null
+    const childWaitResumable = row?.childWaitResumable === true
+    if (!row || row.status !== "queued" || (!childWaitResumable && row.startedAt != null)
       || row.leaseOwner != null || row.leaseExpiresAt != null || row.interruptRequestedAt != null
-      || Number(row.attemptCount) >= Number(row.maxAttempts)) return false
+      || (!childWaitResumable && Number(row.attemptCount) >= Number(row.maxAttempts))
+      || (childWaitResumable && !dispatchIdentity)) return false
     const dispatch = await client.query<{ id: string; payload: unknown; publishedAt: Date | null; lastError: string | null; attemptCount: unknown }>(`SELECT dispatch."id", dispatch."payload", dispatch."publishedAt", dispatch."lastError", dispatch."attemptCount"
       FROM "agent_outbox" AS dispatch WHERE dispatch."topic" = $1 AND dispatch."aggregateId" = $2
         AND dispatch."idempotencyKey" = $3 FOR UPDATE`, [DISPATCH_TOPIC, payload.sessionId, `subagent-dispatch:${payload.taskId}`])
@@ -121,8 +125,9 @@ async function deferPauseDeniedDispatch(pool: PgSubagentPool, payload: SubagentJ
           JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" AND turn."userId" = $8
           WHERE task."id" = $6 AND task."sessionId" = $4 AND task."rootTaskId" = $7 AND task."status" = 'queued'
-            AND task."startedAt" IS NULL AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL
-            AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+            AND ((task."startedAt" IS NULL AND task."attemptCount" < task."maxAttempts") OR ${CHILD_WAIT_RESUMABLE_SQL})
+            AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL
+            AND task."interruptRequestedAt" IS NULL
             AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND root."interruptRequestedAt" IS NULL AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
@@ -131,7 +136,7 @@ async function deferPauseDeniedDispatch(pool: PgSubagentPool, payload: SubagentJ
   })
 }
 
-type DeferredCandidate = { taskId: string; sessionId: string; rootTaskId: string; userId: string; dispatchId: string; payload: unknown }
+type DeferredCandidate = { taskId: string; sessionId: string; rootTaskId: string; userId: string; dispatchId: string; payload: unknown; dispatchAttemptCount: unknown }
 
 /** Rotates only a durable pause-denied, published, never-started child after resume. */
 export async function repairDeferredSubagentDispatches(pool: PgSubagentPool, ownerId: string, limit = 50): Promise<number> {
@@ -147,9 +152,10 @@ export async function repairDeferredSubagentDispatches(pool: PgSubagentPool, own
         JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" AND turn."userId" = session."userId"
         JOIN "agent_outbox" AS dispatch ON dispatch."topic" = $1 AND dispatch."aggregateId" = session."id"
           AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
-        WHERE task."sessionId" = session."id" AND task."status" = 'queued' AND task."startedAt" IS NULL
+        WHERE task."sessionId" = session."id" AND task."status" = 'queued'
           AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL AND task."interruptRequestedAt" IS NULL
-          AND task."attemptCount" < task."maxAttempts" AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
+          AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
+          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
           AND root."interruptRequestedAt" IS NULL AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
           AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
           AND dispatch."lastError" = $2 AND dispatch."publishedAt" IS NOT NULL AND ${admission})
@@ -159,15 +165,16 @@ export async function repairDeferredSubagentDispatches(pool: PgSubagentPool, own
       if (repaired >= limit) break
       await client.query("SELECT set_config('app.user_id', $1, true)", [session.userId])
       const candidates = await client.query<DeferredCandidate>(`SELECT task."id" AS "taskId", task."sessionId", task."rootTaskId", session."userId",
-          dispatch."id" AS "dispatchId", dispatch."payload"
+          dispatch."id" AS "dispatchId", dispatch."payload", dispatch."attemptCount" AS "dispatchAttemptCount"
         FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
         JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
         JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" AND turn."userId" = session."userId"
         JOIN "agent_outbox" AS dispatch ON dispatch."topic" = $2 AND dispatch."aggregateId" = session."id"
           AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
-        WHERE session."id" = $1 AND task."status" = 'queued' AND task."startedAt" IS NULL
+        WHERE session."id" = $1 AND task."status" = 'queued'
           AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL AND task."interruptRequestedAt" IS NULL
-          AND task."attemptCount" < task."maxAttempts" AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
+          AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
+          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
           AND root."interruptRequestedAt" IS NULL AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
           AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
           AND dispatch."lastError" = $3 AND dispatch."publishedAt" IS NOT NULL AND ${admission}
@@ -186,20 +193,25 @@ async function repairDeferredCandidate(client: pg.PoolClient, row: DeferredCandi
     WHERE root."id" = $1 AND root."sessionId" = $2 AND root."turnId" = $3 FOR UPDATE`, [row.rootTaskId, row.sessionId, turnId])
   if (!root.rows[0] || root.rows[0].interruptRequestedAt != null || TERMINAL.includes(String(root.rows[0].status))) return 0
   const task = await client.query<Record<string, unknown>>(`SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", task."status", task."startedAt",
-      task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt"
+      task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
+      ${CHILD_WAIT_RESUMABLE_SQL} AS "childWaitResumable"
     FROM "sub_agent_tasks" AS task
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 FOR UPDATE`,
   [row.taskId, row.sessionId, turnId, row.rootTaskId])
   const currentTask = task.rows[0]
-  if (!currentTask || currentTask.status !== "queued" || currentTask.startedAt != null
+  const childWaitResumable = currentTask?.childWaitResumable === true
+  if (!currentTask || currentTask.status !== "queued" || (!childWaitResumable && currentTask.startedAt != null)
     || currentTask.leaseOwner != null || currentTask.leaseExpiresAt != null || currentTask.interruptRequestedAt != null
-    || Number(currentTask.attemptCount) >= Number(currentTask.maxAttempts)) return 0
-  const dispatch = await client.query<{ id: string; payload: unknown; lastError: string | null }>(`SELECT dispatch."id", dispatch."payload", dispatch."lastError" FROM "agent_outbox" AS dispatch
+    || (!childWaitResumable && Number(currentTask.attemptCount) >= Number(currentTask.maxAttempts))) return 0
+  const dispatch = await client.query<{ id: string; payload: unknown; lastError: string | null; attemptCount: unknown }>(`SELECT dispatch."id", dispatch."payload", dispatch."lastError", dispatch."attemptCount" FROM "agent_outbox" AS dispatch
     WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2 AND dispatch."topic" = $3 AND dispatch."lastError" = $4
       AND dispatch."publishedAt" IS NOT NULL FOR UPDATE`, [row.dispatchId, row.sessionId, DISPATCH_TOPIC, PAUSE_DEFERRED_MARKER])
   const current = dispatch.rows[0]
   const payload = current ? parseSubagentJobPayload(current.payload) : null
-  if (!current || !payload || payload.taskId !== row.taskId || payload.sessionId !== row.sessionId || payload.rootTaskId !== row.rootTaskId) return 0
+  const scannedPayload = parseSubagentJobPayload(row.payload)
+  if (!current || !payload || !scannedPayload || payload.taskId !== row.taskId || payload.sessionId !== row.sessionId
+    || payload.rootTaskId !== row.rootTaskId || payload.ownerId !== scannedPayload.ownerId
+    || !Number.isSafeInteger(Number(current.attemptCount)) || Number(current.attemptCount) !== Number(row.dispatchAttemptCount)) return 0
   const nextPayload: SubagentJobPayload = { ...payload, ownerId: `${ownerId}-${randomUUID()}` }
   const admission = SESSION_WORK_ADMISSION
     .replaceAll("$1", 'session."id"')
@@ -213,8 +225,8 @@ async function repairDeferredCandidate(client: pg.PoolClient, row: DeferredCandi
           JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" AND turn."userId" = session."userId"
           WHERE task."id" = $6 AND task."sessionId" = $3 AND task."rootTaskId" = $7 AND task."status" = 'queued'
-            AND task."startedAt" IS NULL AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL
-            AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+          AND ((task."startedAt" IS NULL AND task."attemptCount" < task."maxAttempts") OR ${CHILD_WAIT_RESUMABLE_SQL})
+          AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL AND task."interruptRequestedAt" IS NULL
             AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND root."interruptRequestedAt" IS NULL AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed') AND ${admission})`,

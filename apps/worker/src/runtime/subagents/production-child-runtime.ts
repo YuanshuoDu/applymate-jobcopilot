@@ -6,7 +6,6 @@ import { createWorkerUsageAuthorizer } from "../../queue/ai-usage-bridge.js"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import { createWorkerToolRuntime } from "../tools/index.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
-import type { ArtifactToolExecutionContext } from "../tools/artifact-tools.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
@@ -15,6 +14,7 @@ import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
 import { loadChildAttemptResume } from "./child-resume.js"
+import { commitDurableSubagentWaitResume, loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext, type TaskGraphWriterReviewDependency, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -28,6 +28,7 @@ import { createProductionChildPolicy } from "./production-child-policy.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { createScheduledApplicationPrepareRuntime } from "./scheduled-application-prepare-runtime.js"
 import { createScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
+import { createPrivateSelectedJobToolExecutor, registerProductionChildWaitTool } from "./production-child-tools.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
 
 export type ProductionChildRuntimeOptions = {
@@ -167,6 +168,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     ...(discoveryObservers ? { onDiscoveryAttemptLifecycleEvent: discoveryObservers.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
   discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined, scheduledPrepare)
+  registerProductionChildWaitTool({ pool, task, lease, registry: runtime.registry })
   return {
     definitions: runtime.registry.list(), router: runtime.router,
     ...(scheduledPrepare ? { resolveScheduledPrepareReference: createScheduledPrepareReferenceResolver(pool, runtime.durableResults, executionOwner) } : {}),
@@ -177,65 +179,9 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
     ...(serverContext ? { serverContext } : {}),
     ...(writerReviewRevision ? { writerReviewRevision } : {}),
-    ...(selectedJobPreparation ? {
-      executePrivateTool: async (context, request) => {
-        const privateRead = request.toolName === "artifact.version.read" && (task.role === "reviewer" || (task.role === "writer" && Boolean(writerReviewRevision)))
-        const privateDraft = task.role === "writer" && request.toolName === "cover_letter.draft"
-        const privateReview = task.role === "reviewer" && request.toolName === "artifact.review"
-        if ((!privateRead && !privateDraft && !privateReview) || request.toolVersion !== "1" || context.actorRole !== "subagent") {
-          throw new Error("private_artifact_read_unavailable")
-        }
-        const definition = runtime.registry.resolve(request.toolName, request.toolVersion)
-        const validRead = definition.risk === "read" && definition.domain === "resume" && definition.idempotency === "read_only"
-          && definition.capabilities.length === 1 && definition.capabilities[0] === "read" && definition.requiredCapabilities.length === 0
-        const validDraft = definition.risk === "draft_write" && definition.domain === "resume" && definition.idempotency === "requires_key"
-          && definition.capabilities.length === 2 && definition.capabilities.includes("read") && definition.capabilities.includes("write")
-          && definition.requiredCapabilities.length === 0
-        const validReview = validDraft && definition.name === "artifact.review" && definition.requiredCapabilities.length === 0
-        if ((privateRead && !validRead) || ((privateDraft || privateReview) && !validDraft) || (privateReview && !validReview)) {
-          throw new Error("private_artifact_read_unavailable")
-        }
-        const policyDecision = toolPolicy.evaluate({
-          scope: context.scope, sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId,
-          toolCallId: request.id, actorRole: context.actorRole, capabilities: context.capabilities ?? [],
-          tool: {
-            name: definition.name, version: definition.version, risk: definition.risk, domain: definition.domain,
-            capabilities: definition.capabilities, requiredCapabilities: definition.requiredCapabilities,
-          },
-          input: request.input,
-        })
-        if (policyDecision.outcome !== "allow") throw new Error("private_artifact_tool_policy_denied")
-        const effectiveInput = policyDecision.safeInput === undefined ? request.input : policyDecision.safeInput
-        const validation = runtime.registry.validateArguments(request.toolName, effectiveInput, request.toolVersion)
-        if (validation !== true) throw new Error("private_artifact_read_input_invalid")
-        const parentSignal = context.signal
-        const controller = new AbortController()
-        let timedOut = false
-        const onAbort = () => controller.abort()
-        if (parentSignal?.aborted) controller.abort()
-        else parentSignal?.addEventListener("abort", onAbort, { once: true })
-        const timer = setTimeout(() => { timedOut = true; controller.abort() }, definition.timeoutMs)
-        const executionContext: ArtifactToolExecutionContext = {
-          scope: context.scope, sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId,
-          toolCallId: request.id, taskId: context.taskId, rootTaskId: context.rootTaskId, actorRole: context.actorRole,
-          remainingTurnSteps: context.remainingTurnSteps, selectedJobPreparation: context.selectedJobPreparation, taskFence: context.taskFence,
-          signal: controller.signal, capabilities: context.capabilities ?? [],
-          reportProgress: async () => {
-            if (controller.signal.aborted) throw new Error(timedOut ? "timeout" : "cancelled")
-          },
-        }
-        try {
-          if (controller.signal.aborted) throw new Error(timedOut ? "timeout" : "cancelled")
-          const output = await definition.execute(executionContext, effectiveInput)
-          if (controller.signal.aborted) throw new Error(timedOut ? "timeout" : "cancelled")
-          runtime.registry.validators.validate(definition.outputSchema, output, `${request.toolName} output`)
-          return { id: request.id, toolName: request.toolName, toolVersion: request.toolVersion, status: "completed" as const, output, errorCode: null }
-        } finally {
-          clearTimeout(timer)
-          parentSignal?.removeEventListener("abort", onAbort)
-        }
-      },
-    } : {}),
+    ...(selectedJobPreparation ? { executePrivateTool: createPrivateSelectedJobToolExecutor({
+      task, writerReviewRevision: writerReviewRevision?.context, registry: runtime.registry, policy: toolPolicy,
+    }) } : {}),
     validateArguments: (name, input, version) => runtime.registry.validateArguments(name, input, version),
   }
 }
@@ -251,7 +197,10 @@ function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReade
 function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"] | undefined {
   const candidate = pool as unknown as { readonly connect?: unknown }
   if (typeof candidate.connect !== "function") return undefined
-  return lease => loadChildAttemptResume(pool, lease)
+  return async lease => {
+    const wait = await loadDurableSubagentWaitResume(pool, lease)
+    return loadChildAttemptResume(pool, lease, new Date(), wait)
+  }
 }
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
@@ -272,6 +221,9 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
           authorizeUsage, treeBudget, modelRuntimeFactory: options.modelRuntimeFactory,
         })),
         mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? defaultResumeLoader(options.pool),
+        durableWaitResumeCommitter: (lease, wait, nextStepOrdinal) => commitDurableSubagentWaitResume(options.pool, lease, {
+          waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,
+        }),
       })
     }
     return genericExecutor({ lease })

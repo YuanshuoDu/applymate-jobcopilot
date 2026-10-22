@@ -12,7 +12,7 @@ const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", 
 
 type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissing?: boolean; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; activePause?: boolean; attemptCount?: number; task?: DispatchTaskOptions }
 
-type DispatchTaskOptions = { exists?: boolean; status?: string; sessionId?: string; rootTaskId?: string; rootId?: string; rootSessionId?: string; rootTurnId?: string; rootStatus?: string | null; turnId?: string | null; turnRowId?: string; turnSessionId?: string; turnUserId?: string; turnStatus?: string | null; leaseOwner?: string | null; leaseExpiresAt?: Date | null; interruptRequestedAt?: Date | string | null; attemptCount?: number; maxAttempts?: number; nextAttemptAt?: Date | null; retryDue?: boolean }
+type DispatchTaskOptions = { exists?: boolean; status?: string; sessionId?: string; rootTaskId?: string; rootId?: string; rootSessionId?: string; rootTurnId?: string; rootStatus?: string | null; turnId?: string | null; turnRowId?: string; turnSessionId?: string; turnUserId?: string; turnStatus?: string | null; leaseOwner?: string | null; leaseExpiresAt?: Date | null; interruptRequestedAt?: Date | string | null; attemptCount?: number; maxAttempts?: number; nextAttemptAt?: Date | null; retryDue?: boolean; childWaitResumable?: boolean }
 
 function dispatchTaskRow(options: DispatchTaskOptions = {}): Record<string, unknown> {
   return {
@@ -22,7 +22,7 @@ function dispatchTaskRow(options: DispatchTaskOptions = {}): Record<string, unkn
     nextAttemptAt: options.nextAttemptAt ?? null, rootId: options.rootId ?? "root-1", rootSessionId: options.rootSessionId ?? "session-1",
     rootTurnId: options.rootTurnId ?? "turn-1", rootStatus: options.rootStatus ?? "running", turnRowId: options.turnRowId ?? "turn-1",
     turnSessionId: options.turnSessionId ?? "session-1", turnUserId: options.turnUserId ?? "user-1", turnStatus: options.turnStatus ?? "in_progress",
-    retryDue: options.retryDue ?? options.nextAttemptAt == null,
+    retryDue: options.retryDue ?? options.nextAttemptAt == null, childWaitResumable: options.childWaitResumable ?? false,
   }
 }
 
@@ -36,7 +36,9 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
         scanCompleted = true
-        return { rows: [outbox], rowCount: 1 }
+        const scopedSession = sql.includes('dispatch."aggregateId" = $3') ? params?.[2] : null
+        const matches = scopedSession == null || scopedSession === outbox.aggregateId
+        return { rows: matches ? [outbox] : [], rowCount: matches ? 1 : 0 }
       }
       if (sql.includes("pause_request")) {
         const status = options.sessionStatus === undefined ? "running" : options.sessionStatus
@@ -94,7 +96,7 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
 }
 
 type RepairOutbox = { id: string; sessionId: string; key: string; payload: SubagentJobPayload; publishedAt: Date | null; lastError: string | null }
-type RepairCandidate = { id: string; sessionId: string; rootTaskId: string; status?: string; rootStatus?: string; turnStatus?: string; sessionStatus?: string; interruptRequestedAt?: string | null; attemptCount?: number; maxAttempts?: number; scopeValid?: boolean }
+type RepairCandidate = { id: string; sessionId: string; rootTaskId: string; status?: string; rootStatus?: string; turnStatus?: string; sessionStatus?: string; interruptRequestedAt?: string | null; attemptCount?: number; maxAttempts?: number; scopeValid?: boolean; childWaitResumable?: boolean }
 type RepairOptions = { candidate?: RepairCandidate | null; existing?: RepairOutbox[]; failInsert?: Error; respectExisting?: boolean }
 
 function eligibleCandidate(candidate: RepairCandidate): boolean {
@@ -105,7 +107,8 @@ function eligibleCandidate(candidate: RepairCandidate): boolean {
       && (candidate.turnStatus ?? "in_progress") !== "failed" && (candidate.turnStatus ?? "in_progress") !== "interrupted"
       && (candidate.turnStatus ?? "in_progress") !== "cancelled" && (candidate.sessionStatus ?? "running") !== "aborted"
       && (candidate.sessionStatus ?? "running") !== "archived" && candidate.interruptRequestedAt == null
-      && (candidate.attemptCount ?? 0) < (candidate.maxAttempts ?? 1) && candidate.scopeValid !== false
+      && ((candidate.attemptCount ?? 0) < (candidate.maxAttempts ?? 1)
+        || (candidate.status ?? "queued") === "queued" && candidate.childWaitResumable === true) && candidate.scopeValid !== false
     : false
 }
 
@@ -288,6 +291,17 @@ describe("Subagent queue", () => {
     expect(mark?.[0]).toContain('"publishedAt"')
   })
 
+  it("restricts pending outbox publication to the requested session", async () => {
+    const fake = fakePool(undefined, { aggregateId: "unrelated-session" })
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue, 50, "session-1")).resolves.toBe(0)
+    const scan = fake.calls.find(([sql]) => sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch."))
+    expect(scan?.[0]).toContain('dispatch."aggregateId" = $3')
+    expect(scan?.[1]).toEqual(["agent.subagent.dispatch", 50, "session-1"])
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.outbox.publishedAt).toBeNull()
+  })
+
   it.each(["aborted", "archived", null] as const)("does not queue a %s session", async sessionStatus => {
     const fake = fakePool(undefined, { sessionStatus })
     const queue = { add: vi.fn() }
@@ -317,6 +331,25 @@ describe("Subagent queue", () => {
     expect(queue.add).not.toHaveBeenCalled()
     expect(fake.outbox.publishedAt).toBeNull()
     expect(fake.outbox.lastError).toBeNull()
+  })
+
+  it("dispatches an exact child-wait continuation at max attempts with its independent outbox generation", async () => {
+    const fake = fakePool(undefined, { attemptCount: 7, task: { attemptCount: 3, maxAttempts: 3, childWaitResumable: true } })
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(1)
+    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 7), attempts: 3 })
+    expect(fake.outbox.attemptCount).toBe(8)
+    const taskFence = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('FOR UPDATE OF task'))?.[0] ?? ""
+    expect(taskFence).toContain('wait."id" = (SELECT currentWait."id"')
+    expect(taskFence).toContain('step."attempt" = task."attemptCount"')
+  })
+
+  it("does not dispatch an exhausted task when its current wait proof is absent", async () => {
+    const fake = fakePool(undefined, { task: { attemptCount: 3, maxAttempts: 3, childWaitResumable: false } })
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.outbox.lastError).toBe("attempts_exhausted")
   })
 
   it.each([
@@ -422,6 +455,19 @@ describe("Subagent queue", () => {
     expect(insert?.[1]?.[2]).toBe("session-1")
     await expect(dispatchPendingSubagentOutbox(fake.pool, { add: vi.fn().mockResolvedValue(undefined) })).resolves.toBe(1)
     expect(fake.outbox[0]?.publishedAt).not.toBeNull()
+  })
+
+  it("repairs only an exact queued child wait at the attempt ceiling", async () => {
+    const candidate = { id: "task-1", sessionId: "session-1", rootTaskId: "root-1", attemptCount: 3, maxAttempts: 3, childWaitResumable: true }
+    const fake = repairPool({ candidate })
+    await expect(repairMissingSubagentDispatches(fake.pool, "repair-worker")).resolves.toBe(1)
+    const scan = fake.calls.find(([sql]) => sql.includes('FOR UPDATE OF task SKIP LOCKED'))?.[0] ?? ""
+    expect(scan).toContain('task."attemptCount" < task."maxAttempts" OR (SELECT COUNT(*) = 1')
+    expect(scan).toContain('wait."id" = (SELECT currentWait."id"')
+    expect(fake.outbox[0]).toMatchObject({ payload: { taskId: "task-1", ownerId: "repair-worker" } })
+
+    const retrying = repairPool({ candidate: { ...candidate, status: "retrying" } })
+    await expect(repairMissingSubagentDispatches(retrying.pool, "repair-worker")).resolves.toBe(0)
   })
 
   it("keeps repair idempotent for repeated scanners and existing outbox rows", async () => {

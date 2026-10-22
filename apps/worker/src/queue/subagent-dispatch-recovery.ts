@@ -2,6 +2,7 @@ import type pg from "pg"
 
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload } from "../runtime/subagents/types.js"
 import { RUNNABLE_SESSION } from "../runtime/session-gate.js"
+import { CHILD_WAIT_RESUMABLE_SQL } from "./subagent-dispatch-eligibility.js"
 
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 const DEFAULT_REPAIR_LIMIT = 50
@@ -72,7 +73,7 @@ export async function repairStaleSubagentDispatches(
             AND task."leaseOwner" IS NULL
             AND task."leaseExpiresAt" IS NULL
              AND task."interruptRequestedAt" IS NULL
-             AND task."attemptCount" < task."maxAttempts"
+             AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
              AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
@@ -108,7 +109,7 @@ export async function repairStaleSubagentDispatches(
         AND task."leaseOwner" IS NULL
         AND task."leaseExpiresAt" IS NULL
         AND task."interruptRequestedAt" IS NULL
-        AND task."attemptCount" < task."maxAttempts"
+        AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
         AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
         AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
         AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
@@ -150,7 +151,7 @@ export async function repairStaleSubagentDispatches(
           AND task."leaseOwner" IS NULL
           AND task."leaseExpiresAt" IS NULL
           AND task."interruptRequestedAt" IS NULL
-          AND task."attemptCount" < task."maxAttempts"
+          AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
           AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
           AND session."id" = $5
           AND ${RUNNABLE_SESSION}

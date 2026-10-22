@@ -12,6 +12,10 @@ const scheduledPrepareTool: PolicyEvaluationContext["tool"] = {
   name: "scheduled.application.prepare", version: "1", risk: "draft_write", domain: "resume",
   capabilities: ["read", "write"], requiredCapabilities: [],
 }
+const durableWaitTool: PolicyEvaluationContext["tool"] = {
+  name: "wait_subagents", version: "1", risk: "internal_write", domain: "coordination",
+  capabilities: ["coordination"], requiredCapabilities: [],
+}
 
 function scheduledPrepareDecision(
   policy: ReturnType<typeof createProductionChildPolicy>,
@@ -20,6 +24,13 @@ function scheduledPrepareDecision(
   return policy.evaluate({
     scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", toolCallId: "call-1",
     actorRole: "subagent", capabilities: ["read"], tool: scheduledPrepareTool, input: {}, ...overrides,
+  })
+}
+
+function durableWaitDecision(policy: ReturnType<typeof createProductionChildPolicy>, tool = durableWaitTool) {
+  return policy.evaluate({
+    scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", toolCallId: "call-1",
+    actorRole: "subagent", capabilities: [], tool, input: {},
   })
 }
 
@@ -93,6 +104,33 @@ describe("createProductionChildPolicy scheduled Prepare permission", () => {
     expect(scheduledPrepareDecision(policy)).toMatchObject({
       outcome: "deny", reasonCode: "configured_scheduled_prepare_deny",
     })
+  })
+})
+
+describe("createProductionChildPolicy durable child wait permission", () => {
+  it("keeps the wait-only exception closed while every current child role is not authorized to manage children", () => {
+    for (const role of ["scout", "analyst", "prepare", "writer", "reviewer", "auditor", "executor"]) {
+      const policy = createProductionChildPolicy({ role, taskType: "research", allowedActions: ["wait_subagents"], toolPolicySnapshot: undefined }, false)
+      expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "server_subagent_internal_write_denied" })
+      expect(durableWaitDecision(policy, { ...durableWaitTool, name: "agent.wait" }).outcome).toBe("deny")
+      expect(durableWaitDecision(policy, { ...durableWaitTool, version: "2" }).outcome).toBe("deny")
+      expect(durableWaitDecision(policy, { ...durableWaitTool, domain: "jobs" }).outcome).toBe("deny")
+    }
+  })
+
+  it("does not grant wait from an alias in persisted allowedActions", () => {
+    const policy = createProductionChildPolicy({ role: "scout", taskType: "research", allowedActions: ["agent.wait"], toolPolicySnapshot: undefined }, false)
+    expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "server_subagent_internal_write_denied" })
+  })
+
+  it("keeps a configured wait denial ahead of a future server-owned exact wait exception", () => {
+    const policy = createProductionChildPolicy({
+      role: "scout", taskType: "research", toolPolicySnapshot: {
+        version: "policy.v1",
+        rules: [{ id: "deny-wait", roles: ["subagent"], tools: ["wait_subagents"], outcome: "deny", reasonCode: "configured_wait_deny", reason: "Configured wait denial" }],
+      },
+    }, false)
+    expect(durableWaitDecision(policy)).toMatchObject({ outcome: "deny", reasonCode: "configured_wait_deny" })
   })
 })
 

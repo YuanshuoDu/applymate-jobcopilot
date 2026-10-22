@@ -11,6 +11,7 @@ import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runti
 import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
 import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { CHILD_WAIT_RESUMABLE_SQL } from "./subagent-dispatch-eligibility.js"
 import { lockAndAdmitSubagentDispatch, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches } from "./subagent-pause-dispatch.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
 import { recoverMissingPublishedSubagentDispatches } from "./subagent-published-dispatch-recovery.js"
@@ -338,7 +339,7 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
       if (sql.includes('SELECT dispatch."id", dispatch."payload", dispatch."lastError"') && sql.includes('WHERE dispatch."id" = $1')) {
         const row = outbox.find(candidate => candidate.id === values[0] && candidate.aggregateId === values[1] && candidate.topic === values[2]
           && candidate.lastError === values[3] && candidate.publishedAt !== null)
-        return row ? { rows: [{ id: row.id, payload: row.payload, lastError: row.lastError }], rowCount: 1 } : none
+        return row ? { rows: [{ id: row.id, payload: row.payload, lastError: row.lastError, attemptCount: row.attemptCount }], rowCount: 1 } : none
       }
       if (sql.includes('SELECT session."id", session."userId" FROM "agent_sessions" AS session') && sql.includes('ORDER BY session."updatedAt"')) {
         const candidate = [...input.tasks.values()].some(task => {
@@ -373,7 +374,7 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         const dispatch = candidate && outbox.find(row => row.idempotencyKey === `subagent-dispatch:${candidate.id}`
           && row.topic === values[1] && row.lastError === values[2] && row.publishedAt !== null)
         return candidate && dispatch ? { rows: [{ taskId: candidate.id, sessionId: candidate.sessionId, rootTaskId: candidate.rootTaskId,
-          userId: session.userId, dispatchId: dispatch.id, payload: dispatch.payload }], rowCount: 1 } : none
+          userId: session.userId, dispatchId: dispatch.id, payload: dispatch.payload, dispatchAttemptCount: dispatch.attemptCount }], rowCount: 1 } : none
       }
       if (sql.includes('UPDATE "agent_outbox" SET "payload" = $1::jsonb, "publishedAt" = NULL')) {
         const row = outbox.find(candidate => candidate.id === values[1] && candidate.aggregateId === values[2] && candidate.topic === values[3]
@@ -388,7 +389,7 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         row.payload = JSON.parse(String(values[0])) as Record<string, unknown>; row.publishedAt = null; row.attemptCount += 1
         return { rows: [], rowCount: 1 }
       }
-      if (sql.includes('FROM "agent_steps"')) {
+      if (sql.includes('FROM "agent_steps"') && !sql.includes(CHILD_WAIT_RESUMABLE_SQL)) {
         return values[0] === wait.stepId ? { rows: [{ id: wait.stepId, taskId: input.rootTaskId, attempt: 1, status: "waiting_for_tool" }], rowCount: 1 } : none
       }
       if (sql.includes('WHERE task."id" = ANY($1::text[])')) {

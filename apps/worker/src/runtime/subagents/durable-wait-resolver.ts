@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 
 import type { LeasePool } from "../turns/lease.js"
+import { reconcileDurableSubagentWaits } from "./durable-subagent-wait-resolver.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -168,7 +169,7 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
 /** Reconciles a bounded set of active Turns and wakes only suspended parents. */
 export async function reconcileDurableWaits(pool: LeasePool, options: DurableWaitReconcileOptions = {}): Promise<DurableWaitReconcileReport> {
   const batchSize = validBatch(options.batchSize ?? DEFAULT_BATCH_SIZE); const now = options.now ?? new Date(); const ownerId = options.ownerId ?? "wait-resolver"
-  return transaction(pool, async client => {
+  const report = await transaction(pool, async client => {
     const turns = await client.query<Row>(
       `SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status", turn."leaseOwnerId", session."status" AS "sessionStatus"
        FROM "agent_sessions" AS session
@@ -200,6 +201,10 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
     }
     return { scanned, resolved, woken }
   })
+  // The child scanner owns its transaction and locks sessions before waits/tasks.
+  // Run it only after root-wait locks are released to keep the recovery order stable.
+  await reconcileDurableSubagentWaits(pool, { now, batchSize, ownerId })
+  return report
 }
 
 export function startDurableWaitResolver(pool: LeasePool, options: DurableWaitResolverOptions = {}) {
