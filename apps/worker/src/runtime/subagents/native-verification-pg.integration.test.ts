@@ -614,6 +614,26 @@ describePg("native verification PostgreSQL producer and readback", () => {
       await answerBaselineClient.query("ROLLBACK").catch(() => undefined)
       throw error
     } finally { answerBaselineClient.release() }
+    const priorAnswerRevision = await pool!.query<{ revision: number | string }>(
+      `SELECT "revision" FROM "agent_items" WHERE "id" = $1`, [priorQuestion.itemId])
+    const originalPriorAnswerRevision = priorAnswerRevision.rows[0]?.revision
+    if (originalPriorAnswerRevision === undefined) throw new Error("native_prior_answer_item_unavailable")
+    try {
+      await pool!.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{answer}', $2::jsonb, false)
+        WHERE "id" = $1`, [priorQuestion.itemId, JSON.stringify("Edited historical answer after terminal verification.")])
+      const editedPriorAnswer = await pool!.query<{ revision: number | string }>(
+        `SELECT "revision" FROM "agent_items" WHERE "id" = $1`, [priorQuestion.itemId])
+      expect(editedPriorAnswer.rows[0]?.revision).toBe(originalPriorAnswerRevision)
+      await expect(port.readRecoverableGoal(scope)).resolves.toBeNull()
+    } finally {
+      await pool!.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{answer}', $2::jsonb, false)
+        WHERE "id" = $1`, [priorQuestion.itemId, JSON.stringify(priorQuestion.answer)])
+    }
+    const restoredPriorAnswer = await pool!.query<{ revision: number | string; answer: string }>(
+      `SELECT "revision", "content"->>'answer' AS "answer" FROM "agent_items" WHERE "id" = $1`, [priorQuestion.itemId])
+    expect(restoredPriorAnswer.rows[0]).toEqual({ revision: originalPriorAnswerRevision, answer: priorQuestion.answer })
+    await expect(port.readRecoverableGoal(scope)).resolves.toMatchObject({ status: "passed", candidateText })
+
     await pool!.query(`UPDATE "agent_items" SET "revision" = "revision" + 1, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`,
       [answeredQuestion.itemId])
     await expectCommittedEvidenceRejected()
