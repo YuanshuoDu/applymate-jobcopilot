@@ -1444,12 +1444,12 @@ describe("createCanonicalTurnRuntime", () => {
     const planningSummary = { observedPlanRevision: 0, graphRevisionAtAsk: 1, pendingSteerCount: 1,
       unconsumedSteerCount: 1, inputThroughSequence: "3" }
     const priorInputHistory = priorConversation([
-      { id: "prior-accepted-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_ACCEPTED_STEER" }, acceptedSequence: "10", historyRole: "user", historySequence: "10", delivery: "steer", status: "accepted" },
-      { id: "prior-queued-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_QUEUED_STEER" }, acceptedSequence: "11", historyRole: "user", historySequence: "11", delivery: "steer", status: "queued" },
-      { id: "prior-cancelled-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CANCELLED_FOLLOW_UP" }, acceptedSequence: "12", historyRole: "user", historySequence: "12", delivery: "follow_up", status: "cancelled" },
-      { id: "prior-rejected-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_REJECTED_FOLLOW_UP" }, acceptedSequence: "13", historyRole: "user", historySequence: "13", delivery: "follow_up", status: "rejected" },
-      { id: "prior-consumed-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CONSUMED_FOLLOW_UP" }, acceptedSequence: "14", historyRole: "user", historySequence: "14", delivery: "follow_up", status: "consumed" },
-      { id: "prior-pending-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_PENDING_FOLLOW_UP" }, acceptedSequence: "15", historyRole: "user", historySequence: "15", delivery: "follow_up", status: "accepted" },
+      { id: "prior-accepted-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_ACCEPTED_STEER" }, acceptedSequence: "10", historyRole: "user", historySequence: "10", delivery: "steer", status: "accepted", consumedByStepId: null, consumedAt: null, cancelledAt: null },
+      { id: "prior-queued-steer", targetTurnId: "prior-turn", content: { text: "PRIOR_QUEUED_STEER" }, acceptedSequence: "11", historyRole: "user", historySequence: "11", delivery: "steer", status: "queued", consumedByStepId: null, consumedAt: null, cancelledAt: null },
+      { id: "prior-cancelled-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CANCELLED_FOLLOW_UP" }, acceptedSequence: "12", historyRole: "user", historySequence: "12", delivery: "follow_up", status: "cancelled", consumedByStepId: null, consumedAt: null, cancelledAt: new Date("2026-10-08T00:00:00.000Z") },
+      { id: "prior-rejected-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_REJECTED_FOLLOW_UP" }, acceptedSequence: "13", historyRole: "user", historySequence: "13", delivery: "follow_up", status: "rejected", consumedByStepId: null, consumedAt: null, cancelledAt: null },
+      { id: "prior-consumed-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_CONSUMED_FOLLOW_UP" }, acceptedSequence: "14", historyRole: "user", historySequence: "14", delivery: "follow_up", status: "consumed", consumedByStepId: "prior-step-14", consumedAt: new Date("2026-10-08T00:00:00.000Z"), cancelledAt: null },
+      { id: "prior-pending-follow-up", targetTurnId: "prior-turn", content: { text: "PRIOR_PENDING_FOLLOW_UP" }, acceptedSequence: "15", historyRole: "user", historySequence: "15", delivery: "follow_up", status: "accepted", consumedByStepId: null, consumedAt: null, cancelledAt: null },
       { id: "prior-missing-status", targetTurnId: "prior-turn", content: { text: "PRIOR_MISSING_STATUS" }, acceptedSequence: "16", historyRole: "user", historySequence: "16", delivery: "steer" },
       { id: "prior-assistant-reply", turnId: "prior-turn", content: { text: "PRIOR_ASSISTANT_REPLY" }, historyRole: "assistant", historySequence: "17" },
     ], lease.turnId, null)
@@ -1666,6 +1666,33 @@ describe("createCanonicalTurnRuntime", () => {
     expect(contexts.map(context => context.consumedInputIds)).toEqual([[], []])
     const requestMessages = requests.map(request => JSON.stringify(request.messages))
     expect(requestMessages).toHaveLength(2)
+    const requestUserTexts = requests.map(request => request.messages.filter(message => message.role === "user")
+      .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []))
+    const laterRequestUserTexts = requestUserTexts[1]!
+    for (const [content, expected] of [
+      ["PRIOR_ACCEPTED_STEER", '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"priorInputDisposition":"not_consumed","role":"user","text":"PRIOR_ACCEPTED_STEER"}'],
+      ["PRIOR_QUEUED_STEER", '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"priorInputDisposition":"not_consumed","role":"user","text":"PRIOR_QUEUED_STEER"}'],
+      ["PRIOR_CANCELLED_FOLLOW_UP", '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"priorInputDisposition":"cancelled","role":"user","text":"PRIOR_CANCELLED_FOLLOW_UP"}'],
+      ["PRIOR_REJECTED_FOLLOW_UP", '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"priorInputDisposition":"rejected","role":"user","text":"PRIOR_REJECTED_FOLLOW_UP"}'],
+      ["PRIOR_CONSUMED_FOLLOW_UP", '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"role":"user","text":"PRIOR_CONSUMED_FOLLOW_UP"}'],
+      ["PRIOR_ASSISTANT_REPLY", '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"role":"assistant","text":"PRIOR_ASSISTANT_REPLY"}'],
+    ] as const) {
+      expect(laterRequestUserTexts.find(text => text.includes(content))).toBe(expected)
+    }
+    expect(requestUserTexts[0]).toContain(`[harness context layer=pending_input trust=UNTRUSTED_DATA source=user_input]\n${JSON.stringify({ inputId: steer.id, partIndex: 0, text: steerParts[0] })}`)
+    expect(requestUserTexts[1]).not.toContain(steerParts[0]!)
+    expect(requestUserTexts[1]).toContain(`[harness context layer=pending_input trust=UNTRUSTED_DATA source=user_input]\n${JSON.stringify({ inputId: originalInput.id, partIndex: 0, text: originalText })}`)
+    for (const requestTexts of requestUserTexts) {
+      expect(requestTexts).toContain(`[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n${JSON.stringify({
+        options: [{ label: "Germany", value: "de" }], question: latestStepQuestionText, role: "assistant", type: "question",
+      })}`)
+      expect(requestTexts).toContain(`[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n${JSON.stringify({
+        questionId: "wait-2", role: "user", text: latestStepAnswerText, type: "answer",
+      })}`)
+      expect(requestTexts).toContain(`[harness context layer=steer_history trust=internal_record source=native_question_recovery]\n${JSON.stringify({
+        graphRevisionAtAsk: 1, inputThroughSequence: "3", observedPlanRevision: 0, pendingSteerCount: 1, unconsumedSteerCount: 1,
+      })}`)
+    }
     for (const request of requests) {
       const modelText = request.messages.flatMap(message => message.content)
         .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
