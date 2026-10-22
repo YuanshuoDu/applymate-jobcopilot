@@ -66,6 +66,7 @@ import { buildTaskGraphPlanningFacts } from "./subagents/task-graph-planning-fac
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionStore } from "./turns/turn-execution-types.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./turns/task-graph-terminal-assessment.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./subagents/child-discovery-attempt.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
@@ -3887,7 +3888,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requests).toHaveLength(2)
     expect(checkCompletion).toHaveBeenCalledTimes(3)
     expect(checkCompletion).toHaveBeenNthCalledWith(3, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true, nativeVerificationPassed: false }))
-    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed", errorCode: "no_progress" }) }))
+    expect(roots.finish).not.toHaveBeenCalled()
   })
 
   it("stops a restored two-denial checkpoint before another model call and accounts only prior usage", async () => {
@@ -3955,9 +3956,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(settlements).toBe(0)
     expect(checkCompletion).toHaveBeenCalledTimes(1)
     expect(checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true, nativeVerificationPassed: false }))
-    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({
-      status: "failed", errorCode: "no_progress", stepCount: 3, toolCallCount: 4,
-    }) }))
+    expect(roots.finish).not.toHaveBeenCalled()
     expect(stepUpdates).toHaveLength(0)
     expect(events.filter(event => event.type === "model.usage")).toHaveLength(0)
     expect(events).toContainEqual(expect.objectContaining({ type: "step.completed", payload: expect.objectContaining({ status: "failed", errorCode: "no_progress" }) }))
@@ -4663,7 +4662,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(checkCompletion).toHaveBeenNthCalledWith(1, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true }))
     expect(checkCompletion).toHaveBeenNthCalledWith(2, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true }))
     expect(checkCompletion).toHaveBeenNthCalledWith(3, expect.objectContaining({ lease, rootTaskId: "root-1", taskGraphVerification: true, nativeVerificationPassed: false }))
-    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed", errorCode: "no_progress" }) }))
+    expect(roots.finish).not.toHaveBeenCalled()
     expect(roots.finish).not.toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
     expect(events.some(event => event.type === "tool_call.completed" && event.correlationId === "root-plan-current-failure")).toBe(true)
     const completedToolNames = events.filter(event => event.type === "tool_call.completed")
@@ -5005,6 +5004,59 @@ describe("createCanonicalTurnRuntime", () => {
     expect(fixture.sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
       result: expect.objectContaining({ status: "waiting_for_user", waitId: "question-456" }),
     }))
+  })
+
+  it("skips root finish only after the atomic no-progress receipt and still finishes projections", async () => {
+    const checkpoint = { schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1", taskId: "root-1", graphRevision: 4, verificationDigest: "a".repeat(64) }
+    const checkCompletion = vi.fn(async () => {
+      const denial = { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing." }
+      Object.defineProperty(denial, TASK_GRAPH_DENIAL_CHECKPOINT, { value: checkpoint })
+      return denial
+    })
+    const roots = { ...rootStore(), checkCompletion }
+    const executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const events: RuntimeEvent[] = []
+    const runtimeTools = tools(true)
+    const registeredTools = [...runtimeTools.registry.list()]
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 4, nodes: [], readyTaskIds: [] }),
+      readCurrent: async () => ({ revision: 4, nodes: [] }),
+    }
+    const baseStore = store(events)
+    const recordFinalResponse = vi.fn((input: Parameters<TurnEngineStore["recordFinalResponse"]>[0]) => baseStore.recordFinalResponse?.(input))
+    const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
+      workerId: lease.ownerId,
+      stateLoader: async () => ({ ...state(), snapshot: { ...state().snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1" }] } }),
+      productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }),
+      taskGraphCommandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      rootTaskStore: roots as never,
+      selectedJobPreparationLoader: async () => undefined, applicationFillPreparationLoader: async () => undefined,
+      turnEngineStoreFactory: () => ({ ...baseStore, recordFinalResponse }),
+      toolRuntimeFactory: () => ({
+        registry: { ...runtimeTools.registry, list: () => registeredTools,
+          register: (definition: { name: string; version: string }) => { registeredTools.push(definition) } },
+        router: runtimeTools.router,
+      }) as never,
+      contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream() {
+          yield { type: "text_delta", text: "The current candidate still lacks a typed criterion." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }), executionProjection, sessionProjection,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "no_progress" })
+
+    expect(recordFinalResponse).toHaveBeenCalledOnce()
+    expect(recordFinalResponse.mock.calls[0]?.[0].noProgress).toMatchObject({ reasonCode: "repeated_signature", signature: "task_graph_terminal_denial" })
+    expect(checkCompletion).toHaveBeenCalledTimes(3)
+    expect(roots.finish).not.toHaveBeenCalled()
+    expect(executionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ errorCode: "no_progress" }) }))
+    expect(sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ errorCode: "no_progress" }) }))
   })
 
 

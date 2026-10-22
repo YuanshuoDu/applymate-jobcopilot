@@ -253,6 +253,7 @@ describe("canonical native verification runtime composition", () => {
         now: Date
         taskGraphVerification: true
         nativeVerificationPassed: false
+        client?: unknown
       }) => {
         const checkpoint = checkpoints[checkpointIndex++] ?? null
         if (!checkpoint) return null
@@ -265,13 +266,15 @@ describe("canonical native verification runtime composition", () => {
     const nativeVerification = createCanonicalNativeVerificationRuntime({
       pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
     })
+    const transactionClient = { query: vi.fn(), release: vi.fn() } as unknown as PoolClient
     const onCandidateStart = vi.fn(), checkChildren = vi.fn()
     const gate = createCanonicalRootCompletionGate({
       enabled: true, nativeVerification, onCandidateStart, checkChildren, selectedJobMode: false,
-      readTaskGraphDenialCheckpoint: async () => taskGraphDenialCheckpointFromDecision(
+      readTaskGraphDenialCheckpoint: async client => taskGraphDenialCheckpointFromDecision(
         await rootTasks.checkCompletion({
           lease: owner, rootTaskId: owner.rootTaskId, now: nowValue,
           taskGraphVerification: true, nativeVerificationPassed: false,
+          ...(client ? { client } : {}),
         }), owner.rootTaskId,
       ),
     })
@@ -280,11 +283,13 @@ describe("canonical native verification runtime composition", () => {
     if (!read) throw new Error("expected the root gate to expose the fresh checkpoint reader")
     await expect(read()).resolves.toEqual(firstCheckpoint)
     await expect(read()).resolves.toEqual(secondCheckpoint)
-    await expect(read()).resolves.toBeNull()
+    await expect(read(transactionClient)).resolves.toBeNull()
     expect(rootTasks.checkCompletion).toHaveBeenCalledTimes(3)
-    expect(rootTasks.checkCompletion.mock.calls).toEqual(Array.from({ length: 3 }, () => [{
-      lease: owner, rootTaskId: "root-1", now: nowValue, taskGraphVerification: true, nativeVerificationPassed: false,
-    }]))
+    expect(rootTasks.checkCompletion.mock.calls).toEqual([
+      [{ lease: owner, rootTaskId: "root-1", now: nowValue, taskGraphVerification: true, nativeVerificationPassed: false }],
+      [{ lease: owner, rootTaskId: "root-1", now: nowValue, taskGraphVerification: true, nativeVerificationPassed: false }],
+      [{ lease: owner, rootTaskId: "root-1", now: nowValue, taskGraphVerification: true, nativeVerificationPassed: false, client: transactionClient }],
+    ])
     expect(port.ensureChildren).not.toHaveBeenCalled()
     expect(port.ensureRootGoal).not.toHaveBeenCalled()
     expect(onCandidateStart).not.toHaveBeenCalled()
