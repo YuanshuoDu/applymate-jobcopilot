@@ -43,11 +43,12 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
     if (exactCompletion && prepareTask) completionTasks.set(input.taskId, { ...prepareTask, status: "completed",
       attemptCount: input.attemptCount, failureReason: null, result: finalizedResult(safeInputResult, "completed") })
     const completionGraph = exactCompletion ? { ...loaded, state: graph.state, tasks: completionTasks } : null
-    const verification = completionGraph ? await verifyScheduledPrepareTaskGraphEvidence(client, {
+    const verification = completionGraph && input.ownerId ? await verifyScheduledPrepareTaskGraphEvidence(client, {
       scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot,
-      current: currentTaskGraph(completionGraph), tasks: completionTasks, structuredResult: plainObject(safeInputResult)?.structuredResult, ownerId: input.ownerId,
+      current: currentTaskGraph(completionGraph), tasks: completionTasks, structuredResult: plainObject(safeInputResult)?.structuredResult,
+      referenceVerificationMode: { phase: "finish", ownerId: input.ownerId },
       completionGraphRevision: graph.state.revision,
-    }) : { verified: false as const, reasonCode: "scheduled_prepare_graph_invalid" }
+    }) : { verified: false as const, reasonCode: completionGraph ? "scheduled_prepare_owner_invalid" : "scheduled_prepare_graph_invalid" }
     if (verification.verified) return { graph, status: "completed", failureReason: input.failureReason,
       result: finalizedResult({ ...(plainObject(safeInputResult) ?? {}), taskGraphScheduledPrepareProofFacts: verification.facts }, "completed"), reconcileDependents: true }
     const failureReason = verification.reasonCode

@@ -19,9 +19,12 @@ export type ScheduledPrepareToolResultScope = Readonly<{
   turnId: string
   rootTaskId: string
   taskId: string
-  ownerId: string
   attemptCount: number
 }>
+
+export type ScheduledPrepareToolResultVerificationMode =
+  | Readonly<{ phase: "finish"; ownerId: string }>
+  | Readonly<{ phase: "persisted_gate" }>
 
 export type ScheduledPrepareToolResultReference = Readonly<{
   $ref: string
@@ -32,6 +35,7 @@ export type ScheduledPrepareToolResultReference = Readonly<{
 export type ScheduledPrepareToolResultVerificationInput = Readonly<{
   reference: unknown
   scope: ScheduledPrepareToolResultScope
+  mode: ScheduledPrepareToolResultVerificationMode
   stepId: string
   toolCallId: string
   expectedResult: PrepareResult
@@ -43,15 +47,15 @@ const SHA256 = /^[0-9a-f]{64}$/
 const REFERENCE_FIELDS = ["$ref", "sizeBytes", "sha256"] as const
 const ROW_FIELDS = [
   "id", "userId", "sessionId", "turnId", "stepId", "taskId", "toolCallId", "sanitizedJson", "sha256", "byteCount",
-  "createdAt", "updatedAt", "currentRootTaskId", "currentAttemptCount", "currentTaskStatus", "currentLeaseOwner",
+  "createdAt", "updatedAt", "currentRootTaskId", "currentAttemptCount", "currentTaskStatus", "currentTaskFailureReason", "currentLeaseOwner",
   "currentLeaseExpiresAt", "currentInterruptRequestedAt", "leaseCheckedAt",
   "currentStepAttempt", "sourceCallItemId", "sourceCallStepId", "sourceCallTaskId", "sourceCallType", "sourceCallStatus", "sourceCallContent",
 ] as const
 
-const SELECT_REFERENCE = `SELECT ref."id", ref."userId", ref."sessionId", ref."turnId",
+const SELECT_REFERENCE_BASE = `SELECT ref."id", ref."userId", ref."sessionId", ref."turnId",
     ref."stepId", ref."taskId", ref."toolCallId", ref."sanitizedJson", ref."sha256",
     ref."byteCount", ref."createdAt", ref."updatedAt", task."rootTaskId" AS "currentRootTaskId",
-    task."attemptCount" AS "currentAttemptCount", task."status" AS "currentTaskStatus",
+    task."attemptCount" AS "currentAttemptCount", task."status" AS "currentTaskStatus", task."failureReason" AS "currentTaskFailureReason",
     task."leaseOwner" AS "currentLeaseOwner", task."leaseExpiresAt" AS "currentLeaseExpiresAt",
     task."interruptRequestedAt" AS "currentInterruptRequestedAt", clock_timestamp() AS "leaseCheckedAt",
     step."attempt" AS "currentStepAttempt",
@@ -74,13 +78,17 @@ const SELECT_REFERENCE = `SELECT ref."id", ref."userId", ref."sessionId", ref."t
     AND step."attempt" = $9 AND call."content"->>'toolName' = 'scheduled.application.prepare'
     AND call."content"->>'toolVersion' = '1' AND call."content"->>'status' = 'completed'
     AND call."content"->'errorCode' = 'null'::jsonb AND call."status" = 'completed'
-    AND turn."rootTaskId" = $8 AND task."status" = 'running' AND task."leaseOwner" = $10
+    AND turn."rootTaskId" = $8`
+const SELECT_FINISH_REFERENCE = `${SELECT_REFERENCE_BASE}
+    AND task."status" = 'running' AND task."failureReason" IS NULL AND task."leaseOwner" = $10
     AND task."leaseExpiresAt" > clock_timestamp() AND task."interruptRequestedAt" IS NULL
   FOR UPDATE OF task`
+const SELECT_PERSISTED_GATE_REFERENCE = `${SELECT_REFERENCE_BASE}
+    AND task."status" = 'completed' AND task."failureReason" IS NULL
+    AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL AND task."interruptRequestedAt" IS NULL`
 
 /**
- * Resolves a durable Prepare result only inside pg-store's finish transaction, after it sets transaction-local
- * app.user_id. The current task lease is locked until that transaction commits so its receipt cannot race a new attempt.
+ * Resolves a durable Prepare result under an explicit live-finish lease or immutable completed-task Gate binding.
  */
 export async function verifyScheduledPrepareToolResultReference(
   client: Queryable,
@@ -88,18 +96,18 @@ export async function verifyScheduledPrepareToolResultReference(
 ): Promise<PrepareResult | null> {
   try {
     const reference = parseReference(input.reference)
-    const scope = input.scope
-    if (!reference || !validScope(scope) || !validText(input.stepId) || !validText(input.toolCallId)) return null
+    const { scope, mode } = input
+    if (!reference || !validScope(scope) || !validMode(mode) || !validText(input.stepId) || !validText(input.toolCallId)) return null
     const expected = validateRoleResult(input.expectedResult, "prepare")
     if (expected.taskId !== scope.taskId || expected.attemptCount !== scope.attemptCount) return null
 
-    const result = await client.query<Row>(SELECT_REFERENCE, [
-      reference.$ref, scope.userId, scope.sessionId, scope.turnId, scope.taskId, input.stepId,
-      input.toolCallId, scope.rootTaskId, scope.attemptCount, scope.ownerId,
-    ])
+    const values: unknown[] = [reference.$ref, scope.userId, scope.sessionId, scope.turnId, scope.taskId,
+      input.stepId, input.toolCallId, scope.rootTaskId, scope.attemptCount]
+    if (mode.phase === "finish") values.push(mode.ownerId)
+    const result = await client.query<Row>(mode.phase === "finish" ? SELECT_FINISH_REFERENCE : SELECT_PERSISTED_GATE_REFERENCE, values)
     if (result.rows.length !== 1) return null
     const row = dataRecord(result.rows[0], ROW_FIELDS)
-    if (!row || !rowMatches(row, reference, scope, input.stepId, input.toolCallId)) return null
+    if (!row || !rowMatches(row, reference, scope, mode, input.stepId, input.toolCallId)) return null
 
     const encoded = canonicalJson(row.sanitizedJson as Parameters<typeof canonicalJson>[0])
     const byteCount = Buffer.byteLength(encoded, "utf8")
@@ -127,9 +135,15 @@ function parseReference(value: unknown): ScheduledPrepareToolResultReference | n
 
 function validScope(value: ScheduledPrepareToolResultScope): boolean {
   return Boolean(value && validText(value.userId) && validText(value.sessionId) && validText(value.turnId)
-    && validText(value.rootTaskId) && validText(value.ownerId) && typeof value.taskId === "string"
+    && validText(value.rootTaskId) && typeof value.taskId === "string"
     && /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.taskId)
     && Number.isSafeInteger(value.attemptCount) && value.attemptCount > 0)
+}
+
+function validMode(value: ScheduledPrepareToolResultVerificationMode): boolean {
+  const fields = value?.phase === "finish" ? ["phase", "ownerId"] : value?.phase === "persisted_gate" ? ["phase"] : []
+  const row = fields.length ? dataRecord(value, fields) : null
+  return Boolean(row && (row.phase === "finish" ? validText(row.ownerId) : row.phase === "persisted_gate"))
 }
 
 function validText(value: unknown): value is string {
@@ -152,14 +166,18 @@ function dataRecord(value: unknown, fields: readonly string[]): Row | null {
 }
 
 function rowMatches(row: Row, reference: ScheduledPrepareToolResultReference, scope: ScheduledPrepareToolResultScope,
-  stepId: string, toolCallId: string): boolean {
+  mode: ScheduledPrepareToolResultVerificationMode, stepId: string, toolCallId: string): boolean {
+  const taskMatches = mode.phase === "finish"
+    ? row.currentTaskStatus === "running" && row.currentTaskFailureReason === null && row.currentLeaseOwner === mode.ownerId
+      && row.currentLeaseExpiresAt instanceof Date && Number.isFinite(row.currentLeaseExpiresAt.getTime())
+      && row.leaseCheckedAt instanceof Date && Number.isFinite(row.leaseCheckedAt.getTime())
+      && row.currentLeaseExpiresAt > row.leaseCheckedAt
+    : row.currentTaskStatus === "completed" && row.currentTaskFailureReason === null
+      && row.currentLeaseOwner === null && row.currentLeaseExpiresAt === null
   return row.id === reference.$ref && row.userId === scope.userId && row.sessionId === scope.sessionId
     && row.turnId === scope.turnId && row.taskId === scope.taskId && row.stepId === stepId && row.toolCallId === toolCallId
     && row.currentRootTaskId === scope.rootTaskId && row.currentAttemptCount === scope.attemptCount
-    && row.currentTaskStatus === "running" && row.currentLeaseOwner === scope.ownerId
-    && row.currentLeaseExpiresAt instanceof Date && Number.isFinite(row.currentLeaseExpiresAt.getTime())
-    && row.leaseCheckedAt instanceof Date && Number.isFinite(row.leaseCheckedAt.getTime())
-    && row.currentLeaseExpiresAt > row.leaseCheckedAt && row.currentInterruptRequestedAt === null
+    && taskMatches && row.currentInterruptRequestedAt === null
     && row.currentStepAttempt === scope.attemptCount && row.sourceCallStepId === stepId && row.sourceCallTaskId === scope.taskId
     && validText(row.sourceCallItemId) && row.sourceCallType === "tool_call" && row.sourceCallStatus === "completed"
     && validPrepareCall(row.sourceCallContent, toolCallId)

@@ -109,6 +109,7 @@ async function verifyPersistedScheduledPrepare(pool: Pick<pg.Pool, "connect">,
       scope: { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
         parentTaskId: scope.rootTaskId, taskId: prepareTaskId, attemptCount: task.attemptCount },
       snapshot, current, tasks: loaded.tasks, structuredResult: envelope.structuredResult,
+      referenceVerificationMode: { phase: "persisted_gate" },
       completionGraphRevision: current.revision,
     })
     if (signal.aborted) throw signal.reason ?? new Error("scheduled_prepare_verification_cancelled")

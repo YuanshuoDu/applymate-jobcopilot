@@ -1163,7 +1163,8 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
           if (!graph.snapshot || !task || !Number.isSafeInteger(task.attemptCount)) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
           return verifyScheduledPrepareTaskGraphEvidence(pool!, { scope: { ...verifyScope, taskId: verifyTaskId, attemptCount: task.attemptCount! },
             snapshot: graph.snapshot, current, tasks: graph.tasks,
-            structuredResult: (task.result as Record<string, unknown> | null)?.structuredResult, completionGraphRevision: current.revision })
+            structuredResult: (task.result as Record<string, unknown> | null)?.structuredResult, completionGraphRevision: current.revision,
+            referenceVerificationMode: { phase: "persisted_gate" } })
         },
       })
       const continuationInput = {
@@ -1446,13 +1447,16 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       }
       await expect(verifyScheduledPrepareTaskGraphEvidence(pool!, {
         ...verificationInput, structuredResult: { ...structuredResult, jobs: "malformed" },
+        referenceVerificationMode: { phase: "persisted_gate" },
       })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_evidence_invalid" })
       await expect(verifyScheduledPrepareTaskGraphEvidence(pool!, {
         ...verificationInput,
         structuredResult: { ...structuredResult, status: "partial", jobs: [{ jobId: value.jobId, status: "failed" }], materials: [] },
+        referenceVerificationMode: { phase: "persisted_gate" },
       })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_result_invalid" })
       await expect(verifyScheduledPrepareTaskGraphEvidence(pool!, {
         ...verificationInput, scope: { ...verificationScope, userId: `${value.userId}-foreign` }, structuredResult,
+        referenceVerificationMode: { phase: "persisted_gate" },
       })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_receipt_invalid" })
       const staleAttemptClient = await pool!.connect()
       try {
@@ -1467,6 +1471,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         await expect(verifyScheduledPrepareTaskGraphEvidence(staleAttemptClient, {
           scope: { ...verificationScope, attemptCount: currentAttempt! }, snapshot: staleAttemptGraph.snapshot!,
           current: staleCurrent, tasks: staleAttemptGraph.tasks, structuredResult,
+          referenceVerificationMode: { phase: "persisted_gate" },
           completionGraphRevision: staleCurrent.revision,
         })).resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_result_invalid" })
       } finally {

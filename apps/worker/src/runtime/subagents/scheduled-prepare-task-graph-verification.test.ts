@@ -55,34 +55,66 @@ function referenceFixture(expected: PrepareResult, leaseOwner: string, expired =
   const row = { id, userId: prepareScope.userId, sessionId: prepareScope.sessionId, turnId: prepareScope.turnId, stepId,
     taskId: expected.taskId, toolCallId, sanitizedJson: stored.value, sha256: stored.sha256, byteCount: stored.bytes,
     createdAt: new Date("2026-10-01T00:00:00.000Z"), updatedAt: new Date("2026-10-01T00:00:00.000Z"),
-    currentRootTaskId: prepareScope.rootTaskId, currentAttemptCount: expected.attemptCount, currentTaskStatus: "running", currentLeaseOwner: leaseOwner,
+    currentRootTaskId: prepareScope.rootTaskId, currentAttemptCount: expected.attemptCount, currentTaskStatus: "running", currentTaskFailureReason: null, currentLeaseOwner: leaseOwner,
     currentLeaseExpiresAt: new Date(expired ? "2020-01-01T00:00:00.000Z" : "2099-01-01T00:00:00.000Z"), currentInterruptRequestedAt: null,
     leaseCheckedAt: new Date(expired ? "2021-01-01T00:00:00.000Z" : "2098-12-31T00:00:00.000Z"), currentStepAttempt: expected.attemptCount,
     sourceCallItemId: "tool-item-prepare-1", sourceCallStepId: stepId, sourceCallTaskId: expected.taskId, sourceCallType: "tool_call",
     sourceCallStatus: "completed", sourceCallContent: { toolCallId, toolName: prepareTool, toolVersion: "1", input: {}, status: "completed", errorCode: null } }
   return { expected, stepId, toolCallId, output: { $ref: id, sizeBytes: stored.bytes, sha256: stored.sha256 }, row }
 }
+function completedReferenceFixture(expected: PrepareResult) {
+  const active = referenceFixture(expected, "worker-owner-1")
+  return { ...active, row: { ...active.row, currentTaskStatus: "completed", currentLeaseOwner: null, currentLeaseExpiresAt: null } }
+}
 
 describe("scheduled Prepare TaskGraph proof", () => {
   it("preserves inline Prepare receipts and resolves references only under the exact live owner lease", async () => {
     const query = vi.fn(async () => ({ rows: [] as unknown[] }))
     await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, stepId: "step-1", callStepId: "step-1",
-      toolCallId: "inline-call", output: result, rawResult: result, expectedResult: result })).resolves.toEqual(result)
+      mode: { phase: "finish", ownerId: "worker-owner-1" }, toolCallId: "inline-call", output: result, rawResult: result, expectedResult: result })).resolves.toEqual(result)
     expect(query).not.toHaveBeenCalled()
 
     const expected = largeResult(), valid = referenceFixture(expected, "worker-owner-1")
     expect(Buffer.byteLength(canonicalJson(expected), "utf8")).toBeGreaterThan(8 * 1024)
     query.mockResolvedValueOnce({ rows: [valid.row] })
-    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, ownerId: "worker-owner-1", stepId: valid.stepId,
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, mode: { phase: "finish", ownerId: "worker-owner-1" }, stepId: valid.stepId,
       callStepId: valid.stepId, toolCallId: valid.toolCallId, output: valid.output, rawResult: expected, expectedResult: expected })).resolves.toEqual(expected)
 
     for (const stale of [referenceFixture(expected, "other-worker"), referenceFixture(expected, "worker-owner-1", true)]) {
       query.mockResolvedValueOnce({ rows: [stale.row] })
-      await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, ownerId: "worker-owner-1", stepId: stale.stepId,
+      await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, mode: { phase: "finish", ownerId: "worker-owner-1" }, stepId: stale.stepId,
         callStepId: stale.stepId, toolCallId: stale.toolCallId, output: stale.output, rawResult: expected, expectedResult: expected })).resolves.toBeNull()
     }
-    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, ownerId: "worker-owner-1", stepId: "stale-step",
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, mode: { phase: "finish", ownerId: "worker-owner-1" }, stepId: "stale-step",
       callStepId: "step-1", toolCallId: "call-1", output: valid.output, rawResult: expected, expectedResult: expected })).resolves.toBeNull()
+  })
+
+  it("resolves a large receipt through the explicit completed-task Gate mode and rejects wrong bindings", async () => {
+    const expected = largeResult(), completed = completedReferenceFixture(expected), mode = { phase: "persisted_gate" as const }
+    const query = vi.fn(async () => ({ rows: [completed.row] as unknown[] }))
+    expect(Buffer.byteLength(canonicalJson(expected), "utf8")).toBeGreaterThan(8 * 1024)
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, mode, stepId: completed.stepId,
+      callStepId: completed.stepId, toolCallId: completed.toolCallId, output: completed.output, rawResult: expected,
+      expectedResult: expected })).resolves.toEqual(expected)
+    for (const invalid of [
+      { ...completed.row, currentTaskStatus: "running" },
+      { ...completed.row, currentTaskFailureReason: "failed" },
+      { ...completed.row, currentLeaseOwner: "not-cleared" },
+      { ...completed.row, currentLeaseExpiresAt: new Date("2099-01-01T00:00:00.000Z") },
+    ]) {
+      query.mockResolvedValueOnce({ rows: [invalid] })
+      await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, mode, stepId: completed.stepId,
+        callStepId: completed.stepId, toolCallId: completed.toolCallId, output: completed.output, rawResult: expected,
+        expectedResult: expected })).resolves.toBeNull()
+    }
+    query.mockResolvedValueOnce({ rows: [completed.row] })
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, mode, stepId: completed.stepId,
+      callStepId: completed.stepId, toolCallId: "wrong-call", output: completed.output, rawResult: expected,
+      expectedResult: expected })).resolves.toBeNull()
+    query.mockResolvedValueOnce({ rows: [completed.row] })
+    await expect(verifyPrepareToolResultOutput({ query } as never, { scope: prepareScope, mode, stepId: completed.stepId,
+      callStepId: completed.stepId, toolCallId: completed.toolCallId, output: { ...completed.output, sha256: "e".repeat(64) },
+      rawResult: expected, expectedResult: expected })).resolves.toBeNull()
   })
 
   it("builds a proof only when completion is bound to the stable receipt and exact ready dependency wait", () => {
@@ -98,7 +130,7 @@ describe("scheduled Prepare TaskGraph proof", () => {
     const verification = await verifyScheduledPrepareTaskGraphEvidence({ query } as never, {
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", taskId: "prepare-1", attemptCount: 3 },
       snapshot: {} as never, current: {} as never, tasks: new Map(),
-      structuredResult: { ...result, taskId: "other-task" }, completionGraphRevision: 14,
+      structuredResult: { ...result, taskId: "other-task" }, completionGraphRevision: 14, referenceVerificationMode: { phase: "persisted_gate" },
     })
     expect(verification).toEqual({ verified: false, reasonCode: "scheduled_prepare_result_invalid" })
     expect(query).not.toHaveBeenCalled()
@@ -129,6 +161,7 @@ describe("scheduled Prepare TaskGraph proof", () => {
     const completed = await verifyScheduledPrepareTaskGraphEvidence({ query } as never, {
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", taskId: "prepare-1", attemptCount: 1 },
       snapshot: snapshot as never, current: current as never, tasks: tasks as never, structuredResult: { ...result, attemptCount: 1 }, completionGraphRevision: 13,
+      referenceVerificationMode: { phase: "persisted_gate" },
     })
     expect(completed).toEqual({ verified: false, reasonCode: "scheduled_prepare_receipt_invalid" })
     expect(query).toHaveBeenCalledOnce()
@@ -140,6 +173,7 @@ describe("scheduled Prepare TaskGraph proof", () => {
     const incomplete = await verifyScheduledPrepareTaskGraphEvidence({ query } as never, {
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", taskId: "prepare-1", attemptCount: 1 },
       snapshot: snapshot as never, current: running as never, tasks: runningTasks as never, structuredResult: { ...result, attemptCount: 1 }, completionGraphRevision: 13,
+      referenceVerificationMode: { phase: "persisted_gate" },
     })
     expect(incomplete).toEqual({ verified: false, reasonCode: "scheduled_prepare_graph_invalid" })
     expect(query).not.toHaveBeenCalled()
@@ -150,6 +184,7 @@ describe("scheduled Prepare TaskGraph proof", () => {
     const rejectedFailure = await verifyScheduledPrepareTaskGraphEvidence({ query } as never, {
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", taskId: "prepare-1", attemptCount: 1 },
       snapshot: snapshot as never, current: failed as never, tasks: failedTasks as never, structuredResult: { ...result, attemptCount: 1 }, completionGraphRevision: 13,
+      referenceVerificationMode: { phase: "persisted_gate" },
     })
     expect(rejectedFailure).toEqual({ verified: false, reasonCode: "scheduled_prepare_graph_invalid" })
     expect(query).not.toHaveBeenCalled()

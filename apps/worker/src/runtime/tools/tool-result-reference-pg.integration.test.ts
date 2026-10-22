@@ -6,6 +6,7 @@ import { canonicalJson } from "@jobcopilot/shared"
 import type { TurnLease } from "../turns/lease.js"
 import type { SubagentLease } from "../subagents/types.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { verifyScheduledPrepareToolResultReference } from "../subagents/scheduled-prepare-tool-result-verification.js"
 import { createToolResultReferenceRepository, isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { MAX_TOOL_RESULT_BYTES, prepareToolResultJson, type CanonicalToolSourceName, type PutToolResultInput, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
@@ -346,6 +347,37 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
       expect(writerBackend[0]).toBeDefined()
       expect(readerBackend[0]).toBeDefined()
       expect(readerBackend[0]).not.toBe(writerBackend[0])
+
+      await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed' WHERE "id" = $1`, [scheduledPrepare.stepId])
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'completed', "failureReason" = NULL,
+        "leaseOwner" = NULL, "leaseExpiresAt" = NULL WHERE "id" = $1`, [scheduledPrepare.taskId])
+      const verificationClient = await afterRestartPool.connect()
+      try {
+        await setRuntimeRole(verificationClient)
+        await verificationClient.query("BEGIN")
+        await verificationClient.query("SELECT set_config('app.user_id', $1, true)", [ownerC.userId])
+        const reference = { $ref: stored.id, sizeBytes: stored.byteCount, sha256: stored.sha256 }
+        const verificationScope = { userId: ownerC.userId, sessionId: ownerC.sessionId, turnId: ownerC.turnId,
+          rootTaskId: ownerC.rootTaskId, taskId: scheduledPrepare.taskId, attemptCount: scheduledPrepare.attemptCount }
+        const verificationInput = { reference, scope: verificationScope, mode: { phase: "persisted_gate" as const },
+          stepId: scheduledPrepare.stepId, toolCallId, expectedResult: value }
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, verificationInput)).resolves.toEqual(value)
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, {
+          ...verificationInput, toolCallId: `wrong-${toolCallId}`,
+        })).resolves.toBeNull()
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, {
+          ...verificationInput, reference: { ...reference, sha256: "e".repeat(64) },
+        })).resolves.toBeNull()
+        await expect(verifyScheduledPrepareToolResultReference(verificationClient, {
+          ...verificationInput, scope: { ...verificationScope, attemptCount: scheduledPrepare.attemptCount + 1 },
+        })).resolves.toBeNull()
+        await verificationClient.query("COMMIT")
+      } catch (error) {
+        await verificationClient.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally {
+        verificationClient.release()
+      }
     } finally {
       await beforeRestartPool?.end()
       await afterRestartPool?.end()

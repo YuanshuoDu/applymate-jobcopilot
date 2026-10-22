@@ -227,7 +227,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       .mockResolvedValueOnce({ verified: true, facts: proofFacts } as never)
     try {
       const result = await prepareTaskGraphFinish({} as never, {
-        taskId: "prepare-1", sessionId: "session-1", attemptCount: 3, status: "completed", retry: false,
+        taskId: "prepare-1", sessionId: "session-1", ownerId: "worker-owner-1", attemptCount: 3, status: "completed", retry: false,
         result: { structuredResult: { toolResult: true }, taskGraphScheduledPrepareProofFacts: { forged: true } },
       })
       expect(result.status).toBe("completed")
@@ -243,6 +243,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       expect(verify).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ completionGraphRevision: 14,
         scope: expect.objectContaining({ taskId: "prepare-1", attemptCount: 3 }), current: expect.objectContaining({ revision: 14,
           nodes: expect.arrayContaining([expect.objectContaining({ key: "prepare", taskId: "prepare-1", status: "completed" })]) }),
+        referenceVerificationMode: { phase: "finish", ownerId: "worker-owner-1" },
         tasks: expect.any(Map) }))
       const verifiedTasks = verify.mock.calls[0]?.[1].tasks
       expect(verifiedTasks.get("prepare-1")).toMatchObject({ status: "completed", attemptCount: 3 })

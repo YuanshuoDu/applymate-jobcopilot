@@ -14,7 +14,7 @@ import { parseScheduledTaskGraphContinuationReceipt, scheduledSnapshotMatches, S
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { validateRoleResult, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES as TEMPLATES } from "./task-graph-templates.js"
-import { verifyScheduledPrepareToolResultReference } from "./scheduled-prepare-tool-result-verification.js"
+import { verifyScheduledPrepareToolResultReference, type ScheduledPrepareToolResultVerificationMode } from "./scheduled-prepare-tool-result-verification.js"
 export const SCHEDULED_PREPARE_COMPLETION_SCHEMA = "agent-harness.v2.scheduled-taskgraph-prepare-completion.v1" as const; export const SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA = "agent-harness.v2.scheduled-taskgraph-prepare-proof-facts.v1" as const
 type Queryable = Pick<pg.PoolClient, "query">; type Row = Record<string, unknown>
 export type ScheduledPrepareVerificationScope = TaskGraphVerificationScope
@@ -25,7 +25,7 @@ export type ScheduledPrepareDependencyWait = Readonly<{ waitId: string; status: 
 export type ScheduledPrepareTaskGraphProof = Readonly<{ receipt: ScheduledTaskGraphContinuationReceipt; completion: ScheduledPrepareCompletionFacts & Readonly<{ wait: ScheduledPrepareDependencyWait }>; result: PrepareResult }>
 export type ScheduledPrepareVerification = Readonly<{ verified: true; facts: ScheduledPrepareTaskGraphProofFacts }> | Readonly<{ verified: false; reasonCode: string }>
 /** Verifies Prepare against its exact registered call, Analyze lineage, checkpoint, and immutable material rows. */
-export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; ownerId?: string }>): Promise<ScheduledPrepareVerification> {
+export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; referenceVerificationMode: ScheduledPrepareToolResultVerificationMode }>): Promise<ScheduledPrepareVerification> {
   try {
     const scope = input.scope, result = validateRoleResult(input.structuredResult, "prepare")
     if (result.status !== "completed" || result.taskId !== scope.taskId || result.attemptCount !== scope.attemptCount)
@@ -50,7 +50,7 @@ export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable,
     const expectedIds = checkpoint.eligibleJobIds
     if (!sameIds(result.jobs.map(job => job.jobId), expectedIds) || result.snapshotDigest !== receipt.snapshotDigest
       || result.checkpointDigest !== receipt.checkpointDigest || !resultMatchesMaterials(result)) return rejected("scheduled_prepare_result_invalid")
-    const verifiedResult = await verifyPrepareToolReceipt(client, scope, input.ownerId, input.structuredResult, result)
+    const verifiedResult = await verifyPrepareToolReceipt(client, scope, input.referenceVerificationMode, input.structuredResult, result)
     if (!verifiedResult || !await verifyMaterialRows(client, scope, verifiedResult)) return rejected("scheduled_prepare_artifact_invalid")
     const completion: ScheduledPrepareCompletionFacts = { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA,
       graphRevision: input.completionGraphRevision, nodes: [
@@ -179,7 +179,7 @@ async function readCheckpoint(client: Queryable, receipt: ScheduledTaskGraphCont
     .slice(0, automation.dailyCap).map(value => String(value.job!.id)) : null
   return eligible ? { checkpointDigest: computed, eligibleJobIds: eligible } : null
 }
-async function verifyPrepareToolReceipt(client: Queryable, scope: TaskGraphVerificationScope, ownerId: string | undefined, rawResult: unknown, result: PrepareResult): Promise<PrepareResult | null> {
+async function verifyPrepareToolReceipt(client: Queryable, scope: TaskGraphVerificationScope, mode: ScheduledPrepareToolResultVerificationMode, rawResult: unknown, result: PrepareResult): Promise<PrepareResult | null> {
   const receipts = await loadTaskGraphVerificationReceipts(client, scope)
   if (receipts.items.length !== 2 || receipts.replayReceipts.length !== 0 || receipts.outcomes.size !== 1) return null
   const call = receipts.items.find(item => item.type === "tool_call"), output = receipts.items.find(item => item.type === "tool_result")
@@ -189,11 +189,11 @@ async function verifyPrepareToolReceipt(client: Queryable, scope: TaskGraphVerif
     || content.status !== "completed" || content.errorCode !== null || receipts.outcomes.get(callId) !== "completed"
     || resultContent.errorCode !== null || !Object.hasOwn(resultContent, "output")
     || !same(rawResult, result)) return null
-  return verifyPrepareToolResultOutput(client, { scope, ownerId, stepId: output.stepId, callStepId: call.stepId, toolCallId: callId, output: resultContent.output, rawResult, expectedResult: result })
+  return verifyPrepareToolResultOutput(client, { scope, mode, stepId: output.stepId, callStepId: call.stepId, toolCallId: callId, output: resultContent.output, rawResult, expectedResult: result })
 }
-export async function verifyPrepareToolResultOutput(client: Queryable, input: Readonly<{ scope: TaskGraphVerificationScope; ownerId?: string; stepId: unknown; callStepId: unknown; toolCallId: string; output: unknown; rawResult: unknown; expectedResult: PrepareResult }>): Promise<PrepareResult | null> {
+export async function verifyPrepareToolResultOutput(client: Queryable, input: Readonly<{ scope: TaskGraphVerificationScope; mode: ScheduledPrepareToolResultVerificationMode; stepId: unknown; callStepId: unknown; toolCallId: string; output: unknown; rawResult: unknown; expectedResult: PrepareResult }>): Promise<PrepareResult | null> {
   if (!same(input.rawResult, input.expectedResult)) return null; const marker = record(input.output)
-  if (marker && Object.hasOwn(marker, "$ref")) return input.ownerId && typeof input.stepId === "string" && input.stepId === input.callStepId ? verifyScheduledPrepareToolResultReference(client, { reference: input.output, scope: { ...input.scope, ownerId: input.ownerId }, stepId: input.stepId, toolCallId: input.toolCallId, expectedResult: input.expectedResult }) : null
+  if (marker && Object.hasOwn(marker, "$ref")) return typeof input.stepId === "string" && input.stepId === input.callStepId ? verifyScheduledPrepareToolResultReference(client, { reference: input.output, scope: input.scope, mode: input.mode, stepId: input.stepId, toolCallId: input.toolCallId, expectedResult: input.expectedResult }) : null
   return same(input.output, input.rawResult) ? input.expectedResult : null }
 async function verifyMaterialRows(client: Queryable, scope: TaskGraphVerificationScope, result: PrepareResult): Promise<boolean> {
   for (const material of result.materials) {

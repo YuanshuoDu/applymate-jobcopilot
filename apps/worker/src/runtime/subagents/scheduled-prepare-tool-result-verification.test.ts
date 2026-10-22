@@ -11,8 +11,9 @@ const PREPARE_TOOL = "scheduled.application.prepare" as CanonicalToolSourceName
 const taskId = "subagent-12345678-1234-4234-9234-123456789012"
 const scope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", taskId,
-  ownerId: "worker-owner-1", attemptCount: 2,
+  attemptCount: 2,
 }
+const finishMode = { phase: "finish" as const, ownerId: "worker-owner-1" }
 const stepId = "step-prepare-1"
 const toolCallId = "call-prepare-1"
 
@@ -61,7 +62,8 @@ function referenceRow(result: PrepareResult) {
     currentRootTaskId: scope.rootTaskId,
     currentAttemptCount: scope.attemptCount,
     currentTaskStatus: "running",
-    currentLeaseOwner: scope.ownerId,
+    currentTaskFailureReason: null,
+    currentLeaseOwner: finishMode.ownerId,
     currentLeaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"),
     currentInterruptRequestedAt: null,
     leaseCheckedAt: new Date("2098-12-31T00:00:00.000Z"),
@@ -95,7 +97,7 @@ describe("scheduled Prepare durable tool result verification", () => {
     expect(Buffer.byteLength(canonicalJson(expected), "utf8")).toBeGreaterThan(8 * 1024)
     expect(row.byteCount).toBeLessThan(MAX_TOOL_RESULT_BYTES)
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: referenceFor(row), scope, stepId, toolCallId, expectedResult: expected,
+      reference: referenceFor(row), scope, mode: finishMode, stepId, toolCallId, expectedResult: expected,
     })).resolves.toEqual(expected)
 
     expect(query).toHaveBeenCalledOnce()
@@ -111,7 +113,7 @@ describe("scheduled Prepare durable tool result verification", () => {
     ]) expect(sql).toContain(predicate)
     expect(values).toEqual([
       row.id, scope.userId, scope.sessionId, scope.turnId, taskId, stepId, toolCallId,
-      scope.rootTaskId, scope.attemptCount, scope.ownerId,
+      scope.rootTaskId, scope.attemptCount, finishMode.ownerId,
     ])
   })
 
@@ -140,7 +142,7 @@ describe("scheduled Prepare durable tool result verification", () => {
     const row = { ...referenceRow(expected), ...override }
     const { client } = clientFor(row)
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: referenceFor(referenceRow(expected)), scope, stepId, toolCallId, expectedResult: expected,
+      reference: referenceFor(referenceRow(expected)), scope, mode: finishMode, stepId, toolCallId, expectedResult: expected,
     })).resolves.toBeNull()
   })
 
@@ -149,7 +151,7 @@ describe("scheduled Prepare durable tool result verification", () => {
     const row = referenceRow(expected)
     const { client } = clientFor(row)
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: referenceFor(row), scope: { ...scope, ownerId: "stale-worker-owner" },
+      reference: referenceFor(row), scope, mode: { phase: "finish", ownerId: "stale-worker-owner" },
       stepId, toolCallId, expectedResult: expected,
     })).resolves.toBeNull()
   })
@@ -158,10 +160,10 @@ describe("scheduled Prepare durable tool result verification", () => {
     const row = referenceRow(largePrepareResult())
     const { client, query } = clientFor(row)
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: { ...referenceFor(row), extra: true }, scope, stepId, toolCallId, expectedResult: largePrepareResult(),
+      reference: { ...referenceFor(row), extra: true }, scope, mode: finishMode, stepId, toolCallId, expectedResult: largePrepareResult(),
     })).resolves.toBeNull()
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: { ...referenceFor(row), sizeBytes: MAX_TOOL_RESULT_BYTES + 1 }, scope, stepId, toolCallId,
+      reference: { ...referenceFor(row), sizeBytes: MAX_TOOL_RESULT_BYTES + 1 }, scope, mode: finishMode, stepId, toolCallId,
       expectedResult: largePrepareResult(),
     })).resolves.toBeNull()
     expect(query).not.toHaveBeenCalled()
@@ -180,7 +182,7 @@ describe("scheduled Prepare durable tool result verification", () => {
     }
     const { client } = clientFor(invalidRow)
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: referenceFor(invalidRow), scope, stepId, toolCallId, expectedResult: expected,
+      reference: referenceFor(invalidRow), scope, mode: finishMode, stepId, toolCallId, expectedResult: expected,
     })).resolves.toBeNull()
   })
 
@@ -189,12 +191,60 @@ describe("scheduled Prepare durable tool result verification", () => {
     const row = referenceRow(expected)
     const { client } = clientFor(row)
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: referenceFor(row), scope: { ...scope, attemptCount: scope.attemptCount + 1 },
+      reference: referenceFor(row), scope: { ...scope, attemptCount: scope.attemptCount + 1 }, mode: finishMode,
       stepId, toolCallId, expectedResult: expected,
     })).resolves.toBeNull()
     await expect(verifyScheduledPrepareToolResultReference(client, {
-      reference: referenceFor(row), scope, stepId, toolCallId,
+      reference: referenceFor(row), scope, mode: finishMode, stepId, toolCallId,
       expectedResult: { ...expected, snapshotDigest: "sha256:" + "f".repeat(64) },
     })).resolves.toBeNull()
+  })
+
+  it("resolves only an exact completed receipt after Worker restart, with the lease cleared", async () => {
+    const expected = largePrepareResult(), original = referenceRow(expected)
+    const completed = { ...original, currentTaskStatus: "completed", currentLeaseOwner: null, currentLeaseExpiresAt: null }
+    const { client, query } = clientFor(completed)
+    const mode = { phase: "persisted_gate" as const }
+    expect(Buffer.byteLength(canonicalJson(expected), "utf8")).toBeGreaterThan(8 * 1024)
+    await expect(verifyScheduledPrepareToolResultReference(client, {
+      reference: referenceFor(original), scope, mode, stepId, toolCallId, expectedResult: expected,
+    })).resolves.toEqual(expected)
+    const [sql, values] = query.mock.calls[0] as unknown as [string, unknown[]]
+    expect(sql).toContain(`task."status" = 'completed'`)
+    expect(sql).toContain('task."failureReason" IS NULL')
+    expect(sql).toContain('task."leaseOwner" IS NULL')
+    expect(sql).toContain('task."leaseExpiresAt" IS NULL')
+    expect(sql).not.toContain("FOR UPDATE OF task")
+    expect(values).toEqual([original.id, scope.userId, scope.sessionId, scope.turnId, taskId, stepId,
+      toolCallId, scope.rootTaskId, scope.attemptCount])
+
+    for (const invalid of [
+      { ...completed, currentTaskStatus: "running" },
+      { ...completed, currentTaskFailureReason: "failed" },
+      { ...completed, currentLeaseOwner: "still-owned" },
+      { ...completed, currentLeaseExpiresAt: new Date("2099-01-01T00:00:00.000Z") },
+    ]) {
+      query.mockResolvedValueOnce({ rows: [invalid] })
+      await expect(verifyScheduledPrepareToolResultReference(client, {
+        reference: referenceFor(original), scope, mode, stepId, toolCallId, expectedResult: expected,
+      })).resolves.toBeNull()
+    }
+    query.mockResolvedValueOnce({ rows: [completed] })
+    await expect(verifyScheduledPrepareToolResultReference(client, {
+      reference: referenceFor(original), scope, mode, stepId, toolCallId: "other-call", expectedResult: expected,
+    })).resolves.toBeNull()
+    query.mockResolvedValueOnce({ rows: [completed] })
+    await expect(verifyScheduledPrepareToolResultReference(client, {
+      reference: { ...referenceFor(original), sha256: "e".repeat(64) }, scope, mode, stepId, toolCallId, expectedResult: expected,
+    })).resolves.toBeNull()
+  })
+
+  it("does not infer completed Gate verification from an omitted mode", async () => {
+    const expected = largePrepareResult(), original = referenceRow(expected)
+    const { client, query } = clientFor({ ...original, currentTaskStatus: "completed", currentLeaseOwner: null, currentLeaseExpiresAt: null })
+    await expect(verifyScheduledPrepareToolResultReference(client, {
+      reference: referenceFor(original), scope, mode: undefined as never, stepId, toolCallId, expectedResult: expected,
+    })).resolves.toBeNull()
+    expect(query).not.toHaveBeenCalled()
   })
 })
