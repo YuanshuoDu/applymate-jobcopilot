@@ -17,14 +17,14 @@ const MAX_PACKET_EVIDENCE = 32
 function validDate(value: unknown): value is Date { return value instanceof Date && Number.isFinite(value.getTime()) }
 function validId(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 }
 
-/** Adds bounded, DB-rederived prior root answers after protected current evidence. */
+/** Adds a bounded DB-rederived selection; returns unavailable if that complete selection cannot fit. */
 export async function appendNativePriorQuestionSelfAttestations(
   client: Client, current: NativeVerificationLiveQuestionTurn, content: NativeVerificationPacketContent,
 ): Promise<NativeVerificationPacketContent | null> {
   if (content.target.kind !== "root_goal") return content
   try { if (Buffer.byteLength(canonicalNativeVerificationJson(content), "utf8") > NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES) return null }
   catch { return null }
-  if (content.evidence.length >= MAX_PACKET_EVIDENCE) return content
+  if (content.evidence.length > MAX_PACKET_EVIDENCE) return null
   const turns = await client.query<Row>(`WITH prior_window AS (
       SELECT turn."id", turn."sessionId", turn."rootTaskId", turn."createdAt"
       FROM "agent_turns" AS turn JOIN "agent_sessions" AS session
@@ -55,7 +55,7 @@ export async function appendNativePriorQuestionSelfAttestations(
     ORDER BY prior."createdAt" DESC, prior."id" DESC LIMIT $6`,
   [current.identity.sessionId, current.identity.userId, current.identity.turnId, current.createdAt, MAX_PRIOR_TURNS, MAX_PRIOR_ROOTS])
   const selected: NativeVerificationEvidence[] = []
-  let evidenceBytes = 0
+  const selectionLimit = Math.min(MAX_PRIOR_PAIRS, MAX_PACKET_EVIDENCE - content.evidence.length)
   for (const row of turns.rows.slice(0, MAX_PRIOR_ROOTS)) {
     if (selected.length >= MAX_PRIOR_PAIRS) break
     if (!validId(row.id) || !validId(row.rootTaskId) || !validDate(row.createdAt) || row.createdAt >= current.createdAt) continue
@@ -64,21 +64,19 @@ export async function appendNativePriorQuestionSelfAttestations(
     }, MAX_QUESTIONS_PER_ROOT, { turnRelation: "earlier_turn" })
     if (!source || source.length === 0) continue
     for (const pair of [...source].reverse()) {
-      if (selected.length >= MAX_PRIOR_PAIRS || content.evidence.length + selected.length >= MAX_PACKET_EVIDENCE) break
-      let pairBytes: number
-      try { pairBytes = Buffer.byteLength(canonicalNativeVerificationJson(pair), "utf8") }
-      catch { return null }
-      let candidateBytes: number
-      try {
-        candidateBytes = Buffer.byteLength(canonicalNativeVerificationJson({ ...content, evidence: [...content.evidence, ...selected, pair] }), "utf8")
-      } catch (error) {
-        if (error instanceof TypeError && error.message === "native_verification_value_too_large") continue
-        return null
-      }
-      if (evidenceBytes + pairBytes > MAX_PRIOR_BYTES || candidateBytes > NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES) continue
+      if (selectionLimit === 0) return null
       selected.push(pair)
-      evidenceBytes += pairBytes
+      if (selected.length >= selectionLimit) break
     }
+    if (selected.length >= selectionLimit) break
   }
-  return selected.length === 0 ? content : { ...content, evidence: [...content.evidence, ...selected] }
+  if (selected.length === 0) return content
+  let evidenceBytes = 0
+  try {
+    for (const pair of selected) evidenceBytes += Buffer.byteLength(canonicalNativeVerificationJson(pair), "utf8")
+    if (evidenceBytes > MAX_PRIOR_BYTES) return null
+    const candidate = { ...content, evidence: [...content.evidence, ...selected] }
+    if (Buffer.byteLength(canonicalNativeVerificationJson(candidate), "utf8") > NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES) return null
+    return candidate
+  } catch { return null }
 }

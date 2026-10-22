@@ -237,7 +237,7 @@ describe("native prior question evidence", () => {
     expect(attestedAnswers(pairBound!)).toHaveLength(16)
   })
 
-  it("bounds the 64-Turn scan and skips whole pairs that exceed UTF-8 or aggregate packet limits", async () => {
+  it("bounds the 64-Turn scan and rejects complete selected answers that exceed packet limits", async () => {
     const turns = Array.from({ length: 65 }, (_, index) => priorTurn(index + 1))
     const oldest = turns[64]!
     const f = mockClient(turns, [sourceFor(oldest, 1)])
@@ -250,8 +250,12 @@ describe("native prior question evidence", () => {
     const largeTurn = priorTurn(1)
     const large = [sourceFor(largeTurn, 1, "🙂".repeat(10_000)), sourceFor(largeTurn, 2, "🙂".repeat(10_000))]
     const byteBound = await appendNativePriorQuestionSelfAttestations(mockClient([largeTurn], large).client, current, currentPacket())
-    expect(attestedAnswers(byteBound!)).toEqual(["🙂".repeat(10_000)])
-    expect(Buffer.byteLength(canonicalNativeVerificationJson(byteBound), "utf8")).toBeLessThanOrEqual(256 * 1024)
+    expect(byteBound).toBeNull()
+
+    const oneLargeAnswer = await appendNativePriorQuestionSelfAttestations(
+      mockClient([largeTurn], [large[0]!]).client, current, currentPacket())
+    expect(attestedAnswers(oneLargeAnswer!)).toEqual(["🙂".repeat(10_000)])
+    expect(Buffer.byteLength(canonicalNativeVerificationJson(oneLargeAnswer), "utf8")).toBeLessThanOrEqual(256 * 1024)
 
     const packetTurn = priorTurn(2), packetSource = sourceFor(packetTurn, 1, "x".repeat(8_000))
     const nearLimit = currentPacket(Array.from({ length: 31 }, (_, index) => ({ referenceId: `fact-${index}`,
@@ -261,11 +265,10 @@ describe("native prior question evidence", () => {
       { ...packetSource.evidence, referenceId: "probe" }] }), "utf8")).toBeGreaterThan(256 * 1024)
     const packetBound = await appendNativePriorQuestionSelfAttestations(mockClient([packetTurn], [packetSource]).client,
       current, nearLimit)
-    expect(packetBound).toEqual(nearLimit)
-    expect(packetBound?.evidence).toHaveLength(31)
+    expect(packetBound).toBeNull()
   })
 
-  it("does not read beyond eight root candidates and checks oversized full packets before the entry-count fast path", async () => {
+  it("does not read beyond eight roots and rejects answers when no packet entry is available", async () => {
     const turns = Array.from({ length: 65 }, (_, index) => priorTurn(index + 1))
     const invalidRecent = turns.slice(0, 8).map((turn, index) => {
       const source = sourceFor(turn, index + 1)
@@ -291,8 +294,8 @@ describe("native prior question evidence", () => {
 
     const fullButValid = currentPacket(Array.from({ length: 32 }, (_, index) => ({ referenceId: `full-valid-${index}`,
       kind: "artifact", summary: "bounded" })))
-    const noRead = mockClient([turns[0]!], [sourceFor(turns[0]!, 1)])
-    expect(await appendNativePriorQuestionSelfAttestations(noRead.client, current, fullButValid)).toEqual(fullButValid)
-    expect(noRead.query).not.toHaveBeenCalled()
+    const noCapacity = mockClient([turns[0]!], [sourceFor(turns[0]!, 1)])
+    expect(await appendNativePriorQuestionSelfAttestations(noCapacity.client, current, fullButValid)).toBeNull()
+    expect(noCapacity.query).toHaveBeenCalled()
   })
 })
