@@ -8,7 +8,7 @@ import type { SubagentLease } from "../subagents/types.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { verifyScheduledPrepareToolResultReference } from "../subagents/scheduled-prepare-tool-result-verification.js"
 import { createToolResultReferenceRepository, isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
-import { MAX_TOOL_RESULT_BYTES, prepareToolResultJson, type CanonicalToolSourceName, type PutToolResultInput, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
+import { MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES, prepareToolResultJson, type CanonicalToolSourceName, type PutToolResultInput, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RUNTIME_ROLE = "agent_runtime_p1_test"
@@ -334,6 +334,9 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
           referenceId: stored.id, ...(cursor === undefined ? {} : { cursor }),
         }, toolCallId)
         expect(last).not.toBeNull()
+        const encodedChunk = JSON.stringify(last)
+        expect(encodedChunk).toBeTypeOf("string")
+        expect(Buffer.byteLength(encodedChunk!, "utf8")).toBeLessThanOrEqual(MAX_TOOL_RESULT_READ_BYTES)
         expect(isVerifiedToolResultChunk(last, scheduledPrepare.owner, toolCallId)).toBe(true)
         chunks.push(last!.chunk)
         if (last!.nextCursor === null) break
