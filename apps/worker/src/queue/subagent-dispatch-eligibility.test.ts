@@ -46,6 +46,8 @@ describe("subagent dispatch eligibility", () => {
     expect(values).toEqual(["task-1", "user-1", "session-1"])
     expect(sql).toContain('waitTurn."userId" = wait."userId"')
     expect(sql).toContain('waitTurn."rootTaskId" = task."rootTaskId"')
+    expect(sql).toContain('currentStep."attempt" = task."attemptCount"')
+    expect(sql).not.toContain(`task."attemptCount'`)
     expect(sql).toContain('step."ordinal" = (SELECT MAX(currentStep."ordinal")')
     expect(sql).toContain('continuation."ordinal" = step."ordinal" + 1')
     expect(sql).toContain('step."ordinal" + 1 = (SELECT MAX(currentStep."ordinal")')

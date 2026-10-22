@@ -127,6 +127,8 @@ describe("atomic child claim pause fence", () => {
     expect(update).toContain('step."attempt" = task."attemptCount"')
     expect(update).toContain('step."status" = \'waiting_for_tool\'')
     expect(update).toContain('step."ordinal" = (SELECT MAX(currentStep."ordinal")')
+    expect(update).toContain('currentStep."attempt" = task."attemptCount"')
+    expect(update).not.toContain(`task."attemptCount'`)
     expect(update).toContain('continuation."ordinal" = step."ordinal" + 1')
     expect(update).toContain('step."ordinal" + 1 = (SELECT MAX(currentStep."ordinal")')
     expect(update).toContain('step."status" IN (\'waiting_for_tool\', \'completed\')')

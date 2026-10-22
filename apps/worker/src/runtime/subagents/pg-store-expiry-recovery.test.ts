@@ -118,6 +118,8 @@ describe("expired subagent recovery fence", () => {
     const waitProof = fake.calls.find(sql => sql.includes('AS "childWaitResumable"')) ?? ""
     expect(waitProof).toContain('task."status" = \'running\'')
     expect(waitProof).toContain('step."attempt" = task."attemptCount"')
+    expect(waitProof).toContain('currentStep."attempt" = task."attemptCount"')
+    expect(waitProof).not.toContain(`task."attemptCount'`)
     expect(waitProof).toContain('continuation."attempt" = task."attemptCount" AND continuation."ordinal" = step."ordinal" + 1')
     expect(waitProof).toContain('step."ordinal" + 1 = (SELECT MAX(currentStep."ordinal")')
     expect(waitProof).toContain('wait."status" IN (\'ready\', \'timed_out\') AND wait."suspendedAt" IS NOT NULL')
