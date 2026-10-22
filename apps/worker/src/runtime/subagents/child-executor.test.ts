@@ -613,6 +613,44 @@ describe("child executor composition", () => {
     })
   })
 
+  it("exposes only a closed category for invalid Prepare output", async () => {
+    const privateMarker = "PRIVATE_PREPARE_MODEL_OUTPUT"
+    const child: SubagentLease = {
+      ...lease(), role: "prepare", taskType: "scheduled_application_prepare", allowedActions: ["scheduled.application.prepare"],
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" },
+    }
+    const malformedPrepare = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed",
+      taskId: child.id, attemptCount: child.attemptCount, snapshotDigest: `sha256:${"a".repeat(64)}`,
+      checkpointDigest: "b".repeat(64), jobs: [], materials: [], privateText: privateMarker,
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => readSequenceModel(JSON.stringify(malformedPrepare), ["scheduled.application.prepare"]),
+      toolRuntimeFactory: () => childToolRuntime([{
+        ...tool("scheduled.application.prepare", "resume"),
+        risk: "draft_write", capabilities: ["read", "write"], requiredCapabilities: [], idempotency: "idempotent",
+      }], async (_context, request) => ({
+        ...request, status: "completed", errorCode: null,
+        output: {
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: child.id,
+          attemptCount: child.attemptCount, snapshotDigest: `sha256:${"c".repeat(64)}`,
+          checkpointDigest: "d".repeat(64), jobs: [], materials: [],
+        },
+      })),
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({
+      status: "failed", failureReason: "invalid_structured_result",
+      result: { status: "failed", structuredOutputFailureCategory: "result_shape_invalid" },
+    })
+    expect(result.result).not.toHaveProperty("finalText")
+    expect(result.result).not.toHaveProperty("structuredResult")
+    expect(JSON.stringify(result.result)).not.toContain(privateMarker)
+  })
+
   it.each([
     ["marker mismatch", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, profile }],
     ["unsupported structured output", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, profile: { ...profile, structuredOutput: false } }],

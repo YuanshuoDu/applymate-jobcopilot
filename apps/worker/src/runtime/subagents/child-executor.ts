@@ -255,7 +255,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     if (result.status === "completed" && structuredRole) {
       const finalText = result.finalText, outcome = parseAndBindStructuredResultOutcome(finalText, structuredRole, observedEvidence)
-      if (outcome.kind === "invalid") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), status: "failed" as const, ...((structuredRole === "scout" || structuredRole === "analyst") && outcome.category ? { structuredOutputFailureCategory: outcome.category } : {}) }, failureReason: "invalid_structured_result" }
+      if (outcome.kind === "invalid") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), status: "failed" as const, ...((structuredRole === "scout" || structuredRole === "analyst" || structuredRole === "prepare") && outcome.category ? { structuredOutputFailureCategory: outcome.category } : {}) }, failureReason: "invalid_structured_result" }
       if (typeof finalText !== "string") return { status: "failed", result: { ...childResult, ...discoveryAttemptField, ...discoveryRecoveryField(), status: "failed" as const }, failureReason: "invalid_structured_result" }; const structuredResult = outcome.result
       const selectedEvidenceRole = Boolean(selectedJobPreparation && (structuredRole === "scout" || structuredRole === "analyst"))
       const safeStructuredResult = selectedEvidenceRole ? redactSelectedEvidenceResult(structuredResult, runtime.selectedJobArtifactContext!) : structuredResult

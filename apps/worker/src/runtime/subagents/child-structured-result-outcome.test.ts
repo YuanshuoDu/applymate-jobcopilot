@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
 import { describe, expect, it, vi } from "vitest"
+import { redactSensitiveValue } from "@jobcopilot/shared"
 
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import { MAX_EVIDENCE_BYTES, parseAndBindStructuredResultOutcome, scheduledPrepareToolReceiptKey } from "./child-structured-result-outcome.js"
@@ -17,16 +18,22 @@ function scoutWithEvidence(ref = "job-1", source = "model") {
   }
 }
 
-function scheduledPrepareResult(snapshotDigest = `sha256:${"a".repeat(64)}`) {
+function scheduledPrepareResult(snapshotDigest = `sha256:${"a".repeat(64)}`, contentHash = `sha256:${"c".repeat(64)}`, taskId = "prepare-task-1") {
   return {
     schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare" as const, status: "completed" as const,
-    taskId: "prepare-task-1", attemptCount: 2,
+    taskId, attemptCount: 2,
     snapshotDigest, checkpointDigest: "b".repeat(64),
     jobs: [{ jobId: "job-1", status: "prepared" as const }],
     materials: [{ jobId: "job-1", kind: "resume" as const, artifactRef: {
-      artifactId: "resume-1", version: 2, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+      artifactId: "resume-1", version: 2, contentHash, sourceDigest: `sha256:${"d".repeat(64)}`,
     } }],
   }
+}
+
+function reverseObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseObjectKeys)
+  if (!value || typeof value !== "object") return value
+  return Object.fromEntries(Object.entries(value).reverse().map(([key, entry]) => [key, reverseObjectKeys(entry)]))
 }
 
 describe("single-pass structured result outcomes", () => {
@@ -145,6 +152,42 @@ describe("single-pass structured result outcomes", () => {
       .toEqual({ kind: "invalid", category: "evidence_binding_invalid" })
     expect(index.scheduledPrepareResults.get("prepare-task-1\u00002")?.toolCallId).toBe("prepare-call-1")
     expect(index.artifactResults.has(scheduledPrepareToolReceiptKey(receipt))).toBe(false)
+  })
+
+  it("rebinds only the exact lifecycle-redacted projection of its registered Prepare receipt", () => {
+    const taskId = "12345678-1234-1234-1234-123456789012"
+    const receipt = scheduledPrepareResult(undefined, `sha256:${"12345678"}${"a".repeat(56)}`, taskId)
+    const index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "scheduled.application.prepare", receipt, {}, {
+      toolCallId: "prepare-call-1", taskId, attemptCount: 2,
+    })
+    const modelVisible = redactSensitiveValue(receipt)
+    expect(modelVisible).toEqual({
+      ...receipt, taskId: "[REDACTED_PHONE]",
+      materials: [{ ...receipt.materials[0], artifactRef: { ...receipt.materials[0]!.artifactRef, contentHash: "[REDACTED]" } }],
+    })
+
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(modelVisible), "prepare", index))
+      .toEqual({ kind: "valid", result: receipt })
+
+    const reorderedModelVisible = reverseObjectKeys(modelVisible)
+    expect(JSON.stringify(reorderedModelVisible)).not.toBe(JSON.stringify(modelVisible))
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(reorderedModelVisible), "prepare", index))
+      .toEqual({ kind: "valid", result: receipt })
+
+    const tampered = JSON.parse(JSON.stringify(modelVisible)) as { snapshotDigest: string }
+    tampered.snapshotDigest = `sha256:${"f".repeat(64)}`
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(tampered), "prepare", index))
+      .toEqual({ kind: "invalid", category: "result_shape_invalid" })
+    expect(index.scheduledPrepareResults.get(`${taskId}\u00002`)?.toolCallId).toBe("prepare-call-1")
+
+    const otherTaskId = "87654321-4321-4321-4321-210987654321"
+    const otherReceipt = scheduledPrepareResult(undefined, receipt.materials[0]!.artifactRef.contentHash, otherTaskId)
+    const ambiguousIndex = createObservedEvidenceIndex()
+    recordReadToolOutput(ambiguousIndex, "scheduled.application.prepare", receipt, {}, { toolCallId: "first-call", taskId, attemptCount: 2 })
+    recordReadToolOutput(ambiguousIndex, "scheduled.application.prepare", otherReceipt, {}, { toolCallId: "second-call", taskId: otherTaskId, attemptCount: 2 })
+    expect(redactSensitiveValue(otherReceipt)).toEqual(modelVisible)
+    expect(parseAndBindStructuredResultOutcome(JSON.stringify(modelVisible), "prepare", ambiguousIndex).kind).toBe("invalid")
   })
 
   it("fails closed when the registered call identity does not match its tool output", () => {

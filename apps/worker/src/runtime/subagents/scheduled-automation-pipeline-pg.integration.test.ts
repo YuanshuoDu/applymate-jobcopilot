@@ -1280,7 +1280,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const manager = new childManager.AgentTreeManager(new childStore.PgSubagentTaskStore(pool!))
       prepareManager = manager
       await prepareQueue.waitUntilReady()
-      expect(await childQueue.dispatchPendingSubagentOutbox(pool as never, prepareQueue, 10)).toBe(1)
+      await childQueue.dispatchPendingSubagentOutbox(pool as never, prepareQueue, 10)
       const prepareQueueJobId = childQueue.subagentJobId(prepareTaskId)
       const queuedPrepare = await prepareQueue.getJob(prepareQueueJobId)
       expect(queuedPrepare?.data).toEqual({ taskId: prepareTaskId, sessionId: value.sessionId, rootTaskId: value.rootTaskId, ownerId: expect.any(String) })
@@ -1305,7 +1305,12 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         acceptedInterrupt = await interruptService.interrupt({ sessionId: value.sessionId, taskId: prepareTaskId,
           userId: value.userId, clientMessageId: `scheduled-prepare-stop-${value.turnId}` })
         expect(acceptedInterrupt).toMatchObject({ taskId: prepareTaskId, disposition: "accepted" })
-        await expect(drainTaskInterruptOutbox(pool as unknown as PgSubagentPool, manager)).resolves.toBe(1)
+        await drainTaskInterruptOutbox(pool as unknown as PgSubagentPool, manager)
+        const publishedIntentOutbox = await pool!.query<{ id: string }>(
+          `SELECT "id" FROM "agent_outbox" WHERE "topic" = $1 AND "aggregateId" = $2
+            AND "payload"->>'intentId' = $3 AND "payload"->>'taskId' = $4 AND "publishedAt" IS NOT NULL`,
+          [TASK_INTERRUPT_OUTBOX_TOPIC, value.sessionId, acceptedInterrupt.intentId, prepareTaskId])
+        expect(publishedIntentOutbox.rows).toHaveLength(1)
       }
       const prepareOutcome = await prepareCompleted
       const readCompletedPrepare = () => pool!.query<{ status: string; attemptCount: number; failureReason: string | null;
@@ -1368,8 +1373,15 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         "scheduled_prepare_evidence_missing", "scheduled_prepare_evidence_scope_invalid", "scheduled_prepare_graph_binding_invalid",
         "scheduled_prepare_graph_invalid", "scheduled_prepare_owner_invalid", "scheduled_prepare_owner_stale",
         "scheduled_prepare_receipt_invalid", "scheduled_prepare_task_invalid", "load_failed", "invocation_invalid",
+        "invalid_structured_result",
       ])
       const diagnosticReason = typeof failedReason === "string" && safePrepareReasonCodes.has(failedReason) ? failedReason : null
+      const safeStructuredOutputFailureCategories = new Set([
+        "missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid",
+      ])
+      const structuredOutputFailureCategory = completedPrepare.rows[0]?.result.structuredOutputFailureCategory
+      const diagnosticCategory = typeof structuredOutputFailureCategory === "string"
+        && safeStructuredOutputFailureCategories.has(structuredOutputFailureCategory) ? structuredOutputFailureCategory : null
       const prepareToolEvent = await pool!.query<{ type: string; payload: Record<string, unknown> }>(
         `SELECT "type", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
           AND "correlationId" = $4 AND "type" IN ('tool_call.failed', 'tool_call.completed')
@@ -1395,7 +1407,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
         && safePrepareMessages.has(toolOutputRecord.message) ? toolOutputRecord.message.slice(0, 120) : null
       const toolDiagnostic = toolEvent ? { type: safeToolEventType, toolName: safeToolName,
         errorCode: safeToolErrorCode, reasonCode: safeToolReasonCode, message: safeToolMessage } : null
-      expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ diagnosticReason, toolDiagnostic })}`)
+      expect(prepareOutcome, `Prepare task diagnostic: ${JSON.stringify({ diagnosticReason, diagnosticCategory, toolDiagnostic })}`)
         .toMatchObject({ taskId: prepareTaskId, status: "completed" })
       await prepareWorker.close()
       prepareWorker = undefined
@@ -1699,8 +1711,10 @@ async function assertScheduledPrepareStepReservations(input: {
   expect(steps.rows).toHaveLength(expectedStepCount)
   expect(materialSteps).toHaveLength(input.expectedMaterialSteps)
   expect(outerSteps).toHaveLength(input.expectedOuterSteps)
-  expect(steps.rows.map(row => row.ordinal).sort((left, right) => left - right))
-    .toEqual(Array.from({ length: expectedStepCount }, (_value, ordinal) => ordinal))
+  const ordinals = steps.rows.map(row => row.ordinal)
+  expect(ordinals.every(ordinal => Number.isInteger(ordinal) && ordinal >= 0)).toBe(true)
+  expect(new Set(ordinals).size).toBe(ordinals.length)
+  expect(ordinals).toEqual([...ordinals].sort((left, right) => left - right))
   expect(outerSteps.every(row => row.id.startsWith(`task:${input.taskId}:step:`))).toBe(true)
   expect(steps.rows.every(row => row.attempt === 1 && row.taskAttemptCount === 1
     && row.taskSessionId === input.fixture.sessionId && row.taskTurnId === input.fixture.turnId

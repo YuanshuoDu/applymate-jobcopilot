@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
+import { redactSensitiveValue } from "@jobcopilot/shared"
 
 import { validateRoleResult, RoleResultValidationError, type ArtifactVersionReference, type PrepareResult, type RoleEvidence, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
 import type { ObservedEvidenceIndex } from "./child-evidence.js"
@@ -46,6 +47,34 @@ export function scheduledPrepareToolReceiptKey(value: PrepareResult): string {
 }
 
 export function scheduledPrepareIdentityKey(taskId: string, attemptCount: number): string { return `${taskId}\u0000${attemptCount}` }
+
+function structurallyEqualJson(left: unknown, right: unknown): boolean {
+  if (left === right) return true
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left) && Array.isArray(right) && left.length === right.length
+      && left.every((entry, index) => structurallyEqualJson(entry, right[index]))
+  }
+  const leftKeys = Object.keys(left), rightKeys = Object.keys(right)
+  return leftKeys.length === rightKeys.length && leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key)
+    && structurallyEqualJson((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key]))
+}
+
+function normalizeRegisteredPrepareReceipt(value: unknown, index: ObservedEvidenceIndex): PrepareResult | undefined {
+  const encoded = JSON.stringify(value)
+  if (encoded === undefined) return undefined
+  let match: PrepareResult | undefined
+  for (const [identity, receipt] of index.scheduledPrepareResults) {
+    if (index.scheduledPrepareResultConflicts.has(identity) || !receipt.toolCallId || receipt.toolCallId.trim() !== receipt.toolCallId) continue
+    let canonical: PrepareResult
+    try { canonical = validateRoleResult(receipt.result, "prepare") } catch { continue }
+    if (scheduledPrepareIdentityKey(canonical.taskId, canonical.attemptCount) !== identity) continue
+    if (!structurallyEqualJson(value, canonical) && !structurallyEqualJson(value, redactSensitiveValue(canonical))) continue
+    if (match) return undefined
+    match = canonical
+  }
+  return match
+}
 
 function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedEvidenceIndex): StructuredRoleResult | undefined {
   if (value.role === "writer") {
@@ -122,8 +151,9 @@ export function parseAndBindStructuredResultOutcome<T extends StructuredRole>(
     return error instanceof SyntaxError ? invalid("result_shape_invalid") : invalid()
   }
   try {
-    const validated = validateRoleResult(parsed, role)
-    const normalized = normalizeStructuredResult(validated, index)
+    const prepareReceipt = role === "prepare" ? normalizeRegisteredPrepareReceipt(parsed, index) : undefined
+    const validated = prepareReceipt ?? validateRoleResult(parsed, role)
+    const normalized = prepareReceipt ?? normalizeStructuredResult(validated, index)
     if (!normalized) return invalid("evidence_binding_invalid")
     const rebound = validateRoleResult(normalized, role)
     const serialized = JSON.stringify(rebound)
