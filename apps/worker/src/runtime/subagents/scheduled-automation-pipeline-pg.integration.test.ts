@@ -1538,7 +1538,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       await restartedPrepareWorker.close()
       restartedPrepareWorker = undefined
       expect(toolModelCalls).toBe(1)
-      expect(materialModelCalls).toBe(scenario.mode === "zero-eligible" ? 0 : 2)
+      expect(materialModelCalls).toBe(scenario.mode === "zero-eligible" ? 0 : 1)
       const versionsAfterReplay = await pool!.query(`SELECT "id" FROM "agent_artifact_version" WHERE "taskId" = $1`, [prepareTaskId])
       expect(versionsAfterReplay.rows).toHaveLength(scenario.mode === "zero-eligible" ? 0 : 2)
 
