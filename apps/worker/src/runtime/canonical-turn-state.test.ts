@@ -641,14 +641,14 @@ describe("loadCanonicalTurnState", () => {
     expect(query).toContain(`'${COGNITIVE_AGENDA_EVENT_TYPE}'`)
     expect(query).toContain("'tool_call.started'")
 
-    const shiftedSecond = second.events.map(event => [TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE, "final.rejected", "step.completed"].includes(event.type)
-      ? { ...event, sequence: String(Number(event.sequence) + 2) } : event)
+    const shiftedSecond = second.events.map(event => Number(event.sequence) >= 15
+      ? { ...event, sequence: String(Number(event.sequence) + 1) } : event)
     const orphanToolStart = { ...second.events[0]!, id: "orphan-tool-start", type: "tool_call.started",
       correlationId: "missing-call", itemId: "missing-call-item", causationId: "missing-item-start",
       idempotencyKey: `turn:${scope.turnId}:event:tool-started:missing-call`, sequence: "15", payload: { taskId: scope.rootTaskId } }
     const interruptedStreak = await loadCanonicalTurnState(pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: scope.rootTaskId,
       contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [first.step, second.step],
-      events: [...first.events, ...shiftedSecond, orphanToolStart] }), lease)
+      items: [], events: [...first.events, ...shiftedSecond.slice(0, 4), orphanToolStart, ...shiftedSecond.slice(4)] }), lease)
     expect(interruptedStreak.resume?.taskGraphDenialProgress).toBeUndefined()
   })
 
