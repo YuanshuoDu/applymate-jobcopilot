@@ -52,7 +52,17 @@ function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?:
         row.payload = JSON.parse(String(payload)); row.attemptCount += 1
         return { rows: [{ attemptCount: row.attemptCount }], rowCount: 1 }
       }
-      if (sql.includes('INSERT INTO "agent_outbox"')) { state.outbox += 1; return { rows: [{ attemptCount: 2 }], rowCount: 1 } }
+      if (sql.includes('INSERT INTO "agent_outbox"')) {
+        const predicate = 'WHERE "agent_outbox"."topic" = \'agent.subagent.dispatch\' AND "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'
+        if (!sql.includes(predicate)) throw new Error("Child dispatch conflict predicate is invalid")
+        const [id, sessionId, idempotencyKey, serializedPayload] = params
+        state.outbox += 1
+        state.dispatchRow = {
+          id: String(id), topic: "agent.subagent.dispatch", aggregateId: String(sessionId), idempotencyKey: String(idempotencyKey),
+          payload: JSON.parse(String(serializedPayload)) as Record<string, unknown>, attemptCount: 0, publishedAt: null,
+        }
+        return { rows: [{ idempotencyKey: state.dispatchRow.idempotencyKey }], rowCount: 1 }
+      }
       return { rows: [], rowCount: 1 }
     },
     release() {},
@@ -85,6 +95,24 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(dispatch?.params[2]).toBe("subagent-dispatch:parent-1")
     expect(dispatch?.sql).toContain("ON CONFLICT (\"idempotencyKey\") DO UPDATE")
     expect(dispatch?.sql).not.toContain('"attemptCount"')
+  })
+
+  it("persists a wake dispatch only when the conflict predicate is valid and session-scoped", async () => {
+    const fake = fixture()
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now, ownerId: "recover-1" })).resolves.toEqual({
+      scanned: 1, resolved: 1, woken: 1,
+    })
+
+    const dispatch = fake.calls.find(call => call.sql.includes('INSERT INTO "agent_outbox"'))
+    expect(dispatch?.sql).toContain('WHERE "agent_outbox"."topic" = \'agent.subagent.dispatch\' AND "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"')
+    expect(dispatch?.params[1]).toBe("session-1")
+    expect(dispatch?.params[2]).toBe("subagent-dispatch:parent-1")
+    expect(fake.state).toMatchObject({ waitStatus: "ready", parentStatus: "queued", outbox: 1 })
+    expect(fake.state.dispatchRow).toMatchObject({
+      topic: "agent.subagent.dispatch", aggregateId: "session-1", idempotencyKey: "subagent-dispatch:parent-1",
+      payload: { taskId: "parent-1", sessionId: "session-1", rootTaskId: "root-1" },
+    })
+    expect(fake.state.dispatchRow?.payload.ownerId).toEqual(expect.any(String))
   })
 
   it("leaves a nonterminal any/all wait parked until a child or timeout resolves it", async () => {

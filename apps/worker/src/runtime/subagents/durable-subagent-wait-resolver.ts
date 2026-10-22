@@ -51,7 +51,7 @@ async function dispatch(client: Queryable, wait: Row, ownerId: string): Promise<
     WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $2 AND ${OPEN_SESSION})
     ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL,
       "lastError" = NULL
-    WHERE "agent_outbox"."topic" = 'agent.subagent.dispatch' AND "agent_outbox"."aggregateId" = EXCLUDED."aggregateId'
+    WHERE "agent_outbox"."topic" = 'agent.subagent.dispatch' AND "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"
     RETURNING "idempotencyKey"`, [randomUUID(), sessionId, `subagent-dispatch:${taskId}`, JSON.stringify(payload)])
   if (written.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Child wait dispatch could not be fenced")
 }
