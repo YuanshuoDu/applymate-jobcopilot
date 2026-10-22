@@ -54,14 +54,12 @@ export async function resolveScheduledPrepareChoice(pool: pg.Pool, invocation: V
     prepareScheduleRevision: binding.prepareScheduleRevision, owner: invocation.owner }
   return { status: "answered", choice }
 }
-
 export function eligibleScheduledPrepareScore(value: unknown): { jobId: string; score: number; matched: string[]; missing: string[] } | null {
   const row = record(value), job = record(row?.job)
   return row && job && validId(job.id) && Number.isSafeInteger(row.score) && Number(row.score) >= 0 && Number(row.score) <= 100
     && stringArray(row.matchedKeywords) && stringArray(row.missingKeywords)
     ? { jobId: job.id, score: Number(row.score), matched: [...row.matchedKeywords], missing: [...row.missingKeywords] } : null
 }
-
 export function scheduledPrepareCitedRefs(result: AnalystResult, jobId: string, ids: readonly string[], baseResumeId: string): string[] | null {
   const evidence = new Map(result.evidence.map(value => [value.id, value]))
   const refs = ids.map(id => evidence.get(id)).filter((value): value is NonNullable<typeof value> => Boolean(value))
@@ -71,12 +69,10 @@ export function scheduledPrepareCitedRefs(result: AnalystResult, jobId: string, 
     || !validId(baseResumeId) || refs.some(ref => ref !== jobRef && ref !== resumeRef && !ref.startsWith("persona:"))) return null
   return [jobRef, resumeRef, ...refs.filter(ref => ref.startsWith("persona:"))].sort()
 }
-
 export function scheduledPrepareContainsRefs(sources: ScheduledPrepareMaterialSources, refs: readonly string[]): boolean {
   const approved = new Set(sources.preparation.evidenceRefs), available = new Set(sources.transientSources.map(source => source.sourceRef))
   return refs.length > 0 && new Set(refs).size === refs.length && refs.every(ref => approved.has(ref) && available.has(ref))
 }
-
 export async function prepareScheduledJobMaterials(options: ScheduledPrepareMaterialOptions, input: ScheduledPrepareJobInput,
   detail: ScheduledPrepareMaterialDetail | undefined, signal: AbortSignal): Promise<{ status: "prepared"; materials: Array<{ kind: "resume" | "cover_letter"; artifactRef: unknown }> }> {
   if (signal.aborted) throw new Error("scheduled_prepare_cancelled")
