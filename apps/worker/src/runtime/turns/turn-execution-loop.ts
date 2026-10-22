@@ -1,25 +1,23 @@
 import type { ModelContinuation } from "@jobcopilot/agent-model"
-import { signalWasInterrupted } from "../interrupt/registry.js"
-import { isSessionPauseRequestedError } from "../session-gate.js"
-import { BudgetExceededError, createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
-import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
-import { NoProgressError, createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
+import { createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
+import { createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
-import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { publishCommentary, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, SCHEDULED_PIPELINE_COMPLETION, type TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
+import { assertExecutionAlive, assertModelAllowance, makeExecutionId, resumedBudgetLimits, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate, stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
-import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
+import { nativeQuestionCallId, recoverPendingNativeQuestion } from "./turn-execution-question.js"
 import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
 import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
 import { takeRecoveredScheduledPipelineCandidate, withScheduledPipelineCandidateModelOutput } from "../subagents/scheduled-pipeline-candidate-store.js"
+import { handleTurnExecutionStepError, matchedTaskGraphDenialCheckpoint, terminalizeTurnExecutionError, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
 const DEFAULT_MAX_STEPS = 32
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
@@ -93,8 +91,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           const outcome = await withScheduledPipelineCandidateModelOutput({ owner, finalStepId: step.id,
             finalStepOrdinal: step.ordinal, candidateText: output.text, finishReason: output.finishReason, usage: output.usage }, complete)
           if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
-          snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, replayContext,
-            options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId)
+          snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, replayContext)
           continuation = undefined
           continue
         }
@@ -115,8 +112,10 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         consumedInputIds = context.consumedInputIds
         // The model sees the durable root background, but later agenda receipts must not turn it into actionable pending input.
         const agendaContext = excludeUnconsumedRootReferenceFromAgenda(context, ordinal > 0 ? options.rootContextInputId : undefined)
-        if (await denialProgress.shouldStop(context, options.identity.rootTaskId, options.completionGate?.[READ_TASK_GRAPH_DENIAL_CHECKPOINT])) {
-          const terminal = await stopForRepeatedTaskGraphDenial({ options, writer, step, context, stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now })
+        const readCheckpoint = options.completionGate?.[READ_TASK_GRAPH_DENIAL_CHECKPOINT]
+        const checkpoint = await matchedTaskGraphDenialCheckpoint(denialProgress.shouldStop, context, options.identity.rootTaskId, readCheckpoint)
+        if (checkpoint) {
+          const terminal = await stopForRepeatedTaskGraphDenial({ options: withTaskGraphDenialCheckpoint(options, checkpoint, readCheckpoint), writer, step, context, stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now })
           closedSteps.add(step.id); return terminal
         }
         const receipt = buildCognitiveAgendaReceipt({
@@ -212,74 +211,12 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
         snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, context); continuation = undefined; continue
       } catch (error: unknown) {
-        if (receiptClosedSteps.has(step.id)) throw error
-        if (isPreparedQuestionRetryError(error) || isTurnStateRefreshRetryError(error)) throw error
-        if (questionIntentCallId && isSessionPauseRequestedError(error)) {
-          const questionCall = stepOutput?.toolCalls.find(call => call.id === questionIntentCallId)
-          if (!questionCall || !stepOutput?.usage || !executionOptions.store.cancelPausedQuestion) throw error
-          let disposition: "cancelled" | "prepared"
-          try {
-            disposition = await executionOptions.store.cancelPausedQuestion({
-              identity: options.identity, stepId: step.id, toolCallId: questionIntentCallId, callArguments: questionCall.arguments,
-              finishReason: stepOutput.finishReason, usage: stepOutput.usage, now: now(),
-            })
-          } catch {
-            // A failed cleanup transaction must not turn the original pause into a terminal step failure.
-            throw error
-          }
-          if (disposition === "prepared") throw new PreparedQuestionRetryError()
-          closedSteps.add(step.id)
-          throw error
-        }
-        if (questionIntentCallId && (signal.aborted || options.isOwnershipLost?.(error, signal))) throw error
-        if (closedSteps.has(step.id) && (isSessionPauseRequestedError(error) || error instanceof NoProgressError)) throw error
-        const status = signalWasInterrupted(signal) || isSessionPauseRequestedError(error) ? "interrupted" : "failed"
-        await updateExecutionStep(options, {
-          stepId: step.id, status, finishReason: stepOutput?.finishReason ?? null, errorCode: turnErrorCode(error),
-          inputTokens: stepOutput?.usage?.inputTokens ?? 0, outputTokens: stepOutput?.usage?.outputTokens ?? 0,
-          estimatedCostUsd: stepOutput?.usage?.estimatedCostUsd ?? 0, now: now(),
-        }).catch(() => undefined)
-        await writer.append(
-          "step.completed", step.id, null,
-          { stepId: step.id, status, errorCode: turnErrorCode(error), taskId: options.identity.taskId },
-          `step-${status === "interrupted" ? "interrupted" : "failed"}:${step.id}`,
-        ).catch(() => undefined)
-        throw error
+        await handleTurnExecutionStepError({ error, options, writer, step, stepOutput, questionIntentCallId, executionOptions, signal, now, closedSteps, receiptClosedSteps })
       }
     }
   } catch (error: unknown) {
-    if (isPreparedQuestionRetryError(error) || isTurnStateRefreshRetryError(error)) throw error
-    if (signalWasInterrupted(signal)) {
-      const code = turnErrorCode(error)
-      await writer.append(
-        "turn.interrupted", options.identity.turnId, null,
-        { turnId: options.identity.turnId, taskId: options.identity.taskId, errorCode: code },
-        "turn-interrupted",
-      ).catch(() => undefined)
-      return { status: "interrupted", stepCount: steps, toolCallCount: toolCalls, errorCode: code }
-    }
-    if (isSessionPauseRequestedError(error)) throw error
-    if (signal.aborted) throw error
-    const code = turnErrorCode(error)
-    if (error instanceof NoProgressError) await writer.append("turn.no_progress", options.identity.turnId, null, { reasonCode: error.reasonCode, signature: error.observation.signature, stateFingerprint: error.observation.stateFingerprint, taskId: options.identity.taskId }, "turn-no-progress").catch(() => undefined)
-    if (error instanceof BudgetExceededError) await writer.append("turn.budget_exhausted", options.identity.turnId, null, { reasonCode: error.code, metric: error.metric, limit: error.limit, attempted: error.attempted, used: error.used, taskId: options.identity.taskId }, "turn-budget-exhausted").catch(() => undefined)
-    const terminalReason = error instanceof BudgetExceededError ? "budget_exhausted" : error instanceof NoProgressError ? "no_progress" : code === "final_unverified" || code.startsWith("evidence_") || code === "business_precondition_failed" ? "final_unverified" : "unrecoverable_error"
-    const finalResponse = finalizeTurn({
-      goal: options.goal, terminalReason, blocker: error instanceof Error ? error.message : code,
-      usage: totalTurnUsage(options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls,
-      next: ["Review the blocker and resume the Turn"],
-    })
-    if (options.isOwnershipLost?.(error, signal)) throw error
-    const finalItem = await publishFinalResponse(writer, options, lastStep, finalResponse, now).catch(() => null)
-    if (finalItem && canPersistFinalResponse(options)) {
-      await options.store.recordFinalResponse?.({ identity: options.identity, response: serializeFinalResponse(finalResponse), now: now() }).catch(() => undefined)
-    }
-    await writer.append(
-      "turn.failed", options.identity.turnId, finalItem?.id ?? null,
-      { turnId: options.identity.turnId, taskId: options.identity.taskId, errorCode: code, finalItemId: finalItem?.id ?? null, final: finalResponse },
-      `turn-failed:${code}`,
-    ).catch(() => undefined)
-    return { status: "failed", stepCount: steps, toolCallCount: toolCalls, errorCode: code, ...(finalItem ? { finalItemId: finalItem.id } : {}) }
+    return terminalizeTurnExecutionError({ error, options, writer, signal, lastStep, stepOpen: !!lastStep && !closedSteps.has(lastStep.id),
+      stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now, inputThroughSequence, consumedInputIds })
   }
 }
 

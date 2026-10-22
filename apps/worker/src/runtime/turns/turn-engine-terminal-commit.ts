@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
-import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
@@ -11,6 +11,7 @@ import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./comp
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { assertPlanningRootHasNoUnresolvedSteering } from "../subagents/pg-store-create.js"
 import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
+import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
@@ -19,7 +20,13 @@ type TerminalInput = AtomicTurnCompletionInput & { readonly owner: TurnExecution
 export type TurnEngineTerminalGuard = (client: pg.PoolClient, input: TerminalInput) => Promise<TurnEngineCompletionGateResult>
 const json = (value: unknown) => JSON.stringify(value)
 const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
-function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
+function markerIdentity(value: SteeringMarkerPayload): string { return JSON.stringify({ schemaVersion: value.schemaVersion, kind: value.kind, status: value.status, sessionId: value.sessionId, turnId: value.turnId, taskId: value.taskId, inputId: value.inputId, idempotencyKey: value.idempotencyKey, obligationId: value.obligationId, goalRevision: value.goalRevision, planRevision: value.planRevision, acceptedSequence: value.acceptedSequence }) }
+export function sameEventPayload(type: unknown, left: unknown, right: unknown): boolean { if (type !== STEERING_MARKER_EVENT_TYPE) return sameJson(left, right); const a = parseSteeringMarkerPayload(left), b = parseSteeringMarkerPayload(right); return a !== null && b !== null && markerIdentity(a) === markerIdentity(b) }
+export async function projectRootTerminalEvent(client: Pick<pg.PoolClient, "query">, owner: ExecutionOwnerFence, type: string, eventId: string): Promise<void> {
+  if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId || !["turn.failed", "turn.interrupted"].includes(type)) return
+  if (!await updateRootObjectiveHistoryProjection(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }, { terminalEventId: eventId })) throw conflict(`terminal objective history ${eventId}`)
+}
+export function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
 
 function record(value: unknown): Row {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}

@@ -4,10 +4,17 @@ import type pg from "pg"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { SessionPauseRequestedError, SESSION_WORK_ADMISSION } from "../session-gate.js"
+import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 
-const { updateRootObjectiveHistoryProjectionMock } = vi.hoisted(() => ({ updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true) }))
+const { updateRootObjectiveHistoryProjectionMock, cleanupFailedRootTaskGraphMock } = vi.hoisted(() => ({
+  updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true), cleanupFailedRootTaskGraphMock: vi.fn(async () => undefined),
+}))
 vi.mock("../context/objective-history-projection.js", () => ({ updateRootObjectiveHistoryProjection: updateRootObjectiveHistoryProjectionMock }))
-beforeEach(() => updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true))
+vi.mock("../subagents/task-graph-pg-root-failure-cleanup.js", () => ({ cleanupFailedRootTaskGraph: cleanupFailedRootTaskGraphMock }))
+beforeEach(() => {
+  updateRootObjectiveHistoryProjectionMock.mockReset().mockResolvedValue(true)
+  cleanupFailedRootTaskGraphMock.mockReset().mockResolvedValue(undefined)
+})
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1", userId: "user-1", leaseVersion: 3,
@@ -774,7 +781,10 @@ describe("PostgreSQL TurnEngine store", () => {
   })
 
   it("linearizes repeated-denial terminalization against accepted steer input", async () => {
-    async function run(pendingInput: boolean) {
+    const checkpoint: TaskGraphDenialCheckpoint = { schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA,
+      taskId: owner.rootTaskId, graphRevision: 3, verificationDigest: "a".repeat(64) }
+    const changedCheckpoint: TaskGraphDenialCheckpoint = { ...checkpoint, graphRevision: 4, verificationDigest: "b".repeat(64) }
+    async function run(pendingInput: boolean, graphChanged = false) {
       const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
       let stepStatus = "streaming"
       const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -783,6 +793,9 @@ describe("PostgreSQL TurnEngine store", () => {
         if (sql.includes(SESSION_WORK_ADMISSION)) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
         if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
         if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+        if (sql.includes('SELECT "id","status","leaseOwner"') && sql.includes('FROM "sub_agent_tasks"')) return {
+          rows: [{ id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, interruptRequestedAt: null }], rowCount: 1,
+        }
         if (sql.includes('FROM "agent_steps"')) return { rows: [{ status: stepStatus, inputThroughSequence: "8", consumedInputIds: ["accepted-8"] }], rowCount: 1 }
         if (sql.includes('FROM "agent_inputs"')) return pendingInput ? { rows: [{ id: "accepted-9" }], rowCount: 1 } : { rows: [], rowCount: 0 }
         if (sql.includes('FROM "agent_events"')) return values?.[2] === `turn:${owner.turnId}:event:step-started:step-denial-3`
@@ -797,13 +810,18 @@ describe("PostgreSQL TurnEngine store", () => {
       }), release: vi.fn() }
       const pool = { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">
       const store = createPgTurnEngineStore(pool)
+      const readCheckpoint = vi.fn(async (transactionClient?: unknown) => {
+        if (transactionClient) expect(transactionClient).toBe(client)
+        return graphChanged ? changedCheckpoint : checkpoint
+      })
       const input = { owner, response: JSON.stringify({ response: "safe no-progress" }), now, noProgress: {
         stepId: "step-denial-3", finalItemId: "final-item", finalContent: { text: "safe no-progress" }, stepCount: 3, toolCallCount: 0,
         usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, inputThroughSequence: 8n, consumedInputIds: ["accepted-8"],
         reasonCode: "repeated_signature", signature: "task_graph_terminal_denial", stateFingerprint: "task_graph_terminal_denial",
+        taskGraphDenialCheckpoint: checkpoint, readTaskGraphDenialCheckpoint: readCheckpoint,
       } }
       const result = await store.recordFinalResponse(input)
-      return { result, calls, client, store, input }
+      return { result, calls, client, store, input, readCheckpoint }
     }
 
     const inputWins = await run(true)
@@ -811,9 +829,11 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(inputWins.calls.findIndex(call => call.sql.includes('FROM "agent_sessions"'))).toBeLessThan(inputWins.calls.findIndex(call => call.sql.includes('SELECT turn."id"')))
     expect(inputWins.calls.find(call => call.sql.includes('FROM "agent_inputs"'))?.sql).toContain('"acceptedSequence">$4 FOR UPDATE')
     expect(inputWins.calls.some(call => /^(INSERT|UPDATE) "agent_(items|steps|turns|events|outbox)"/.test(call.sql))).toBe(false)
+    expect(inputWins.readCheckpoint).not.toHaveBeenCalled()
 
     const terminalWins = await run(false)
     expect(terminalWins.result).toMatchObject({ status: "no_progress", finalItemId: "final-item" })
+    if (terminalWins.result?.status !== "no_progress") throw new Error("Expected atomic no-progress terminal receipt")
     const indexOf = (needle: string) => terminalWins.calls.findIndex(call => call.sql.includes(needle))
     expect(indexOf('FROM "agent_sessions"')).toBeLessThan(indexOf('SELECT turn."id"'))
     expect(indexOf('FROM "agent_inputs"')).toBeLessThan(indexOf('INSERT INTO "agent_items"'))
@@ -825,6 +845,12 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(terminalEvents[0]?.values?.[9]).toBe("step-started-event")
     for (let index = 1; index < terminalEvents.length; index += 1) expect(terminalEvents[index]?.values?.[9]).toBe(terminalEvents[index - 1]?.values?.[0])
     expect(terminalEvents.at(-1)?.values?.[10]).toBe(`turn:${owner.turnId}:event:turn-failed:no_progress`)
+    expect(terminalWins.result.events.map(event => event.causationId)).toEqual([
+      "step-started-event", ...terminalEvents.slice(0, -1).map(call => String(call.values?.[0])),
+    ])
+    expect(terminalWins.readCheckpoint).toHaveBeenCalledWith(terminalWins.client)
+    expect(cleanupFailedRootTaskGraphMock).toHaveBeenCalledWith(terminalWins.client,
+      expect.objectContaining({ id: owner.taskId, rootTaskId: owner.taskId }), { kind: "terminal-failed-turn-recovery" }, now)
     expect(terminalWins.calls.at(-1)?.sql).toBe("COMMIT")
     expect(terminalWins.client.release).toHaveBeenCalledOnce()
     await expect(terminalWins.store.recordFinalResponse(terminalWins.input)).rejects.toThrow(/no-progress Step .* fence/)
@@ -833,6 +859,13 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(terminalWins.calls.filter(call => call.sql.includes('UPDATE "agent_steps"'))).toHaveLength(1)
     expect(terminalWins.calls.filter(call => call.sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)
     assertDenseBindings(terminalWins.calls)
+
+    cleanupFailedRootTaskGraphMock.mockClear()
+    const graphChanged = await run(false, true)
+    expect(graphChanged.result).toEqual({ status: "input_changed" })
+    expect(graphChanged.readCheckpoint).toHaveBeenCalledWith(graphChanged.client)
+    expect(graphChanged.calls.some(call => /^(INSERT|UPDATE) "agent_(items|steps|turns|events|outbox)"/.test(call.sql))).toBe(false)
+    expect(cleanupFailedRootTaskGraphMock).not.toHaveBeenCalled()
   })
 
   it("locks the owner before updating a Step or Item", async () => {

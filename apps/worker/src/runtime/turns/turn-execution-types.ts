@@ -26,6 +26,7 @@ import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } f
 import type { DurableWaitControlReader } from "../tools/coordination-types.js"
 import type { RecoveredArchivedWaitControl } from "./turn-execution-wait.js"
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import type { TurnEngineQueryClient } from "./turn-engine-owner-sql.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
 export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
@@ -106,7 +107,7 @@ export type TurnEngineCompletionGate = ((input: {
   readonly now: Date
 }) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult) & {
   [RESET_NATIVE_SEMANTIC_PROGRESS]?: () => void
-  [READ_TASK_GRAPH_DENIAL_CHECKPOINT]?: () => Promise<TaskGraphDenialCheckpoint | null>
+  [READ_TASK_GRAPH_DENIAL_CHECKPOINT]?: (client?: TurnEngineQueryClient) => Promise<TaskGraphDenialCheckpoint | null>
   [SCHEDULED_PIPELINE_COMPLETION]?: (input: {
     readonly identity: TurnExecutionIdentity
     readonly scope: TenantScope
