@@ -51,16 +51,24 @@ describe("TaskGraph denial progress", () => {
     expect(taskGraphDenialProgressMatches(twice, null, context, "root-1")).toBe(false)
   })
 
+  it("requires a structurally valid terminal-assessment checkpoint and clears when evidence is absent", async () => {
+    expect(taskGraphDenialProgressFor({ ...checkpoint, verificationDigest: "invalid" }, context)).toBeUndefined()
+    const tracker = createTaskGraphDenialProgressTracker()
+    tracker.record(checkpoint, context)
+    tracker.record(undefined, context)
+    await expect(tracker.shouldStop(context, "root-1", async () => checkpoint)).resolves.toBe(false)
+  })
+
   it("keeps a first denial until a second denial can be checked against a fresh graph", async () => {
     const tracker = createTaskGraphDenialProgressTracker()
     const read = vi.fn(async () => checkpoint)
     const firstContext = { ...context, consumedInputIds: ["input-3"] }
-    tracker.record(checkpoint, firstContext, true)
+    tracker.record(checkpoint, firstContext)
 
     await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(false)
     expect(read).not.toHaveBeenCalled()
 
-    tracker.record(checkpoint, firstContext, true)
+    tracker.record(checkpoint, firstContext)
     await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(true)
     expect(read).toHaveBeenCalledOnce()
   })
@@ -70,11 +78,11 @@ describe("TaskGraph denial progress", () => {
     const changed = { ...checkpoint, verificationDigest: "b".repeat(64) }
     const read = vi.fn(async () => changed)
     const firstContext = { ...context, consumedInputIds: ["input-3"] }
-    tracker.record(checkpoint, firstContext, true)
-    tracker.record(checkpoint, firstContext, true)
+    tracker.record(checkpoint, firstContext)
+    tracker.record(checkpoint, firstContext)
     await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(false)
 
-    tracker.record(checkpoint, context, true)
+    tracker.record(checkpoint, context)
     await expect(tracker.shouldStop(firstContext, "root-1", read)).resolves.toBe(false)
     expect(read).toHaveBeenCalledOnce()
   })

@@ -104,6 +104,21 @@ function store(events: RuntimeEvent[] = [], batches: RuntimeEvent[][] = [], item
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }), updateItem: async input => { itemUpdates.push(input); return { id: input.itemId, revision: input.expectedRevision + 1 } },
     appendEvent: async ({ id, type, payload, correlationId, idempotencyKey, owner }) => { events.push({ id, type, payload, correlationId, idempotencyKey, owner }); return { id } },
     recordFinalResponse: async input => {
+      const noProgress = input.noProgress
+      if (noProgress) {
+        const prefix = `turn:${input.owner.turnId}:event:`, final = JSON.parse(input.response) as TurnEngineEvent["payload"]
+        const start = events.find(event => event.idempotencyKey?.endsWith(`step-started:${noProgress.stepId}`))
+        const entries: TurnEngineEvent[] = [
+          { id: `${prefix}step-failed:${noProgress.stepId}`, type: "step.completed", itemId: null, correlationId: noProgress.stepId, causationId: start?.id ?? null, payload: { stepId: noProgress.stepId, status: "failed", errorCode: "no_progress", taskId: input.owner.taskId } },
+          { id: `${prefix}turn-no-progress`, type: "turn.no_progress", itemId: null, correlationId: input.owner.turnId, causationId: null, payload: { reasonCode: noProgress.reasonCode, signature: noProgress.signature, stateFingerprint: noProgress.stateFingerprint, taskId: input.owner.taskId } },
+          { id: `${prefix}item-started:${noProgress.finalItemId}`, type: "item.started", itemId: noProgress.finalItemId, correlationId: noProgress.stepId, causationId: null, payload: { itemId: noProgress.finalItemId, type: "agent_message", phase: "final_answer" } },
+          { id: `${prefix}final-completed:${noProgress.finalItemId}:1`, type: "item.completed", itemId: noProgress.finalItemId, correlationId: noProgress.finalItemId, causationId: null, payload: { itemId: noProgress.finalItemId, status: "completed", content: noProgress.finalContent } },
+          { id: `${prefix}turn-failed:no_progress`, type: "turn.failed", itemId: noProgress.finalItemId, correlationId: input.owner.turnId, causationId: null, payload: { turnId: input.owner.turnId, taskId: input.owner.taskId, errorCode: "no_progress", finalItemId: noProgress.finalItemId, final } },
+        ]
+        const saved = entries.map((event, index) => ({ ...event, causationId: index ? entries[index - 1]!.id : event.causationId }))
+        events.push(...saved.map(event => ({ ...event, owner: input.owner, idempotencyKey: event.id })))
+        return { status: "no_progress", finalItemId: noProgress.finalItemId, events: saved }
+      }
       const terminal = input.terminal
       if (!terminal) return
       const saved: TurnEngineEvent[] = [
@@ -3936,8 +3951,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({
       status: "failed", errorCode: "no_progress", stepCount: 3, toolCallCount: 4,
     }) }))
-    expect(stepUpdates).toHaveLength(1)
-    expect(stepUpdates[0]).toEqual(expect.objectContaining({ status: "failed", errorCode: "no_progress", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }))
+    expect(stepUpdates).toHaveLength(0)
     expect(events.filter(event => event.type === "model.usage")).toHaveLength(0)
     expect(events).toContainEqual(expect.objectContaining({ type: "step.completed", payload: expect.objectContaining({ status: "failed", errorCode: "no_progress" }) }))
     const turnFailed = events.find(event => event.type === "turn.failed")

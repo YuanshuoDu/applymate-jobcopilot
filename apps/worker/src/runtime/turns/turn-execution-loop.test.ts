@@ -12,7 +12,7 @@ import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-acc
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
-import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
+import { toRepositoryJson, type TurnEngineEvent, type TurnEngineItem, type TurnEngineStore, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
@@ -82,8 +82,21 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ identity, id, type, itemId, payload, idempotencyKey }) => { events.push({ id, type, itemId, taskId: identity.taskId, payload, idempotencyKey }); return { id } },
     appendEvents: async inputs => { for (const input of inputs) events.push({ id: input.id, type: input.type, itemId: input.itemId, taskId: input.identity.taskId }); return inputs.map(input => ({ id: input.id })) },
-    recordFinalResponse: async ({ identity, response, terminal }) => {
+    recordFinalResponse: async ({ identity, response, terminal, noProgress }) => {
       finalResponses.push(`${identity.taskId}:${response}`)
+      if (noProgress) {
+        const final = toRepositoryJson(JSON.parse(response) as unknown), eventPayloads = [
+          ["step.completed", { stepId: noProgress.stepId, status: "failed", errorCode: "no_progress", taskId: identity.taskId }],
+          ["turn.no_progress", { reasonCode: noProgress.reasonCode, signature: noProgress.signature, stateFingerprint: noProgress.stateFingerprint, taskId: identity.taskId }],
+          ["item.started", { itemId: noProgress.finalItemId, type: "agent_message", phase: "final_answer" }],
+          ["item.completed", { itemId: noProgress.finalItemId, status: "completed", content: noProgress.finalContent }],
+          ["turn.failed", { turnId: identity.turnId, taskId: identity.taskId, errorCode: "no_progress", finalItemId: noProgress.finalItemId, final }],
+        ] as const
+        items.push({ id: noProgress.finalItemId, revision: 1 }); stepStatuses.push("failed")
+        const saved = eventPayloads.map(([type, payload], index) => ({ id: `no-progress-${index}`, type, itemId: index > 1 ? noProgress.finalItemId : null, correlationId: noProgress.stepId, causationId: index ? `no-progress-${index - 1}` : null, payload }))
+        saved.forEach(event => events.push({ ...event, taskId: identity.taskId }))
+        return { status: "no_progress", finalItemId: noProgress.finalItemId, events: saved }
+      }
       if (!terminal) return
       items.push({ id: terminal.finalItemId, revision: 1 })
       const saved: TurnEngineEvent[] = [
@@ -2284,7 +2297,7 @@ describe("owner-agnostic turn execution loop", () => {
       [5, 2n, []], [5, 2n, []], [5, 2n, []],
     ])
     expect(requestText(0)).toContain("Initial accepted instruction")
-    expect(requestText(1)).not.toContain("New accepted instruction changes the cursor")
+    expect(requestText(0)).not.toContain("New accepted instruction changes the cursor")
     expect(requestText(2)).toContain("New accepted instruction changes the cursor")
     expect(requestText(0)).toContain('"revision":4')
     expect(requestText(1)).toContain('"revision":4')

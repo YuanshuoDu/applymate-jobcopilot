@@ -2,6 +2,7 @@ import { parseModelCompletedReceipt } from "./turns/model-completed-receipt.js"
 import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import type { TaskGraphDenialProgress } from "./turns/turn-execution-types.js"
 import type { RecoveredArchivedWaitControl } from "./turns/turn-execution-wait.js"
+import { isTaskGraphDenialProgressValid } from "./turns/task-graph-denial-progress.js"
 
 type Row = Record<string, unknown>
 type Usage = { inputTokens: number; outputTokens: number; estimatedCostUsd: number }
@@ -187,6 +188,8 @@ export function buildCanonicalTurnResumeState(input: {
     inputTokens: total.inputTokens + Number(step.inputTokens ?? 0), outputTokens: total.outputTokens + Number(step.outputTokens ?? 0),
     estimatedCostUsd: total.estimatedCostUsd + Number(step.estimatedCostUsd ?? 0),
   }), usageZero())
+  const taskGraphDenialProgress = isTaskGraphDenialProgressValid(input.taskGraphDenialProgress, input.scope.rootTaskId)
+    ? input.taskGraphDenialProgress : undefined
   let toolCallCount = input.persistedToolCallCount
   const closedCounts = new Map<string, number>()
   for (const step of input.steps) {
@@ -211,7 +214,7 @@ export function buildCanonicalTurnResumeState(input: {
   return {
     nextOrdinal: (input.maxOrdinal ?? Number(input.last?.ordinal)) + 1, stepCount: input.steps.length, toolCallCount,
     ...(evidenceRecoveryUsed ? { finalEvidenceRecoveryUsed: true } : {}),
-    ...(input.taskGraphDenialProgress ? { taskGraphDenialProgress: input.taskGraphDenialProgress } : {}),
+    ...(taskGraphDenialProgress ? { taskGraphDenialProgress } : {}),
     inputThroughSequence: BigInt(String(input.last?.inputThroughSequence ?? 0)),
     consumedInputIds: Array.isArray(input.last?.consumedInputIds) ? input.last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
     usage,

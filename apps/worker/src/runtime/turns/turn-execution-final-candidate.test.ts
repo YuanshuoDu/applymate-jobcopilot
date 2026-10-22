@@ -3,7 +3,8 @@ import type { ModelStepResult } from "./turn-engine-model.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
-import { completeTurnCandidate, persistedFinalCandidate } from "./turn-execution-final-candidate.js"
+import { completeTurnCandidate, persistedFinalCandidate, stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
+import type { StepContext } from "../context/step-context-builder.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
@@ -23,6 +24,19 @@ describe("persistedFinalCandidate", () => {
 })
 
 describe("atomic TaskGraph finalization recovery", () => {
+  it("rejects a completed receipt from the repeated-denial terminal store", async () => {
+    const recordFinalResponse = vi.fn(async () => ({ status: "completed" as const, finalItemId: "final-item", events: [] }))
+    const options = {
+      identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() },
+      goal: "Find a role", store: { recordFinalResponse },
+    } as unknown as TurnExecutionOptions
+    await expect(stopForRepeatedTaskGraphDenial({ options, writer: {} as TurnExecutionEventWriter, step: { id: "step-3", ordinal: 2 },
+      context: { inputThroughSequence: 0n, consumedInputIds: [] } as unknown as StepContext, stepCount: 3, toolCallCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, now: () => new Date() }))
+      .rejects.toMatchObject({ name: "TurnEngineError", code: "persistence_conflict" })
+    expect(recordFinalResponse).toHaveBeenCalledOnce()
+  })
+
   it("records the exact final response once only after scheduled continuation completes", async () => {
     const order: string[] = []
     const candidateText = "  The exact scheduled final.  "

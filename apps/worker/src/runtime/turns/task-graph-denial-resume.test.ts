@@ -71,6 +71,17 @@ describe("TaskGraph denial resume", () => {
       .toMatchObject({ count: 1 })
   })
 
+  it("does not restore a zero-tool streak when a root-scoped tool start precedes its missing item", () => {
+    const first = closedDenial("step-1", 1, 0), second = closedDenial("step-2", 2, 10)
+    const shifted = second.events.map(event => [TASK_GRAPH_DENIAL_CHECKPOINT_EVENT_TYPE, "final.rejected", "step.completed"].includes(event.type)
+      ? { ...event, sequence: String(Number(event.sequence) + 2) } : event)
+    const started = { ...second.events[0]!, id: "orphan-tool-start", type: "tool_call.started", correlationId: "call-2",
+      itemId: "missing-call-item", causationId: "missing-item-start", idempotencyKey: `turn:${scope.turnId}:event:tool-started:call-2`,
+      sequence: "15", payload: null }
+    expect(restoreTaskGraphDenialProgress({ scope, items: [], steps: [first.step, second.step], events: [...first.events, ...shifted, started] }))
+      .toBeUndefined()
+  })
+
   it.each([
     ["open close cut", { open: true }],
     ["legacy model receipt", { legacy: true }],

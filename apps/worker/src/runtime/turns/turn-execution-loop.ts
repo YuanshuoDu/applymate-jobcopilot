@@ -14,13 +14,12 @@ import { assertExecutionAlive, assertModelAllowance, canPersistFinalResponse, ma
 import { buildCognitiveActionAgenda, excludeUnconsumedRootReferenceFromAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
-import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
+import { completeTurnCandidate, stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 import { isPreparedQuestionRetryError, isTurnStateRefreshRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
 import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
 import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
 const DEFAULT_MAX_STEPS = 32
-
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
   const now = options.now ?? (() => new Date())
@@ -84,7 +83,10 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         consumedInputIds = context.consumedInputIds
         // The model sees the durable root background, but later agenda receipts must not turn it into actionable pending input.
         const agendaContext = excludeUnconsumedRootReferenceFromAgenda(context, ordinal > 0 ? options.rootContextInputId : undefined)
-        if (await denialProgress.shouldStop(context, options.identity.rootTaskId, options.completionGate?.[READ_TASK_GRAPH_DENIAL_CHECKPOINT])) throw new NoProgressError({ signature: "task_graph_terminal_denial", stateFingerprint: "task_graph_terminal_denial" })
+        if (await denialProgress.shouldStop(context, options.identity.rootTaskId, options.completionGate?.[READ_TASK_GRAPH_DENIAL_CHECKPOINT])) {
+          const terminal = await stopForRepeatedTaskGraphDenial({ options, writer, step, context, stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now })
+          closedSteps.add(step.id); return terminal
+        }
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
           inputThroughSequence, consumedInputIds,
@@ -170,7 +172,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
           } })
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
-        snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, context, options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId); continuation = undefined; continue
+        snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, context); continuation = undefined; continue
       } catch (error: unknown) {
         if (receiptClosedSteps.has(step.id)) throw error
         if (isPreparedQuestionRetryError(error) || isTurnStateRefreshRetryError(error)) throw error
@@ -223,13 +225,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     const code = turnErrorCode(error)
     if (error instanceof NoProgressError) await writer.append("turn.no_progress", options.identity.turnId, null, { reasonCode: error.reasonCode, signature: error.observation.signature, stateFingerprint: error.observation.stateFingerprint, taskId: options.identity.taskId }, "turn-no-progress").catch(() => undefined)
     if (error instanceof BudgetExceededError) await writer.append("turn.budget_exhausted", options.identity.turnId, null, { reasonCode: error.code, metric: error.metric, limit: error.limit, attempted: error.attempted, used: error.used, taskId: options.identity.taskId }, "turn-budget-exhausted").catch(() => undefined)
-    const terminalReason = error instanceof BudgetExceededError
-      ? "budget_exhausted"
-      : error instanceof NoProgressError
-        ? "no_progress"
-        : code === "final_unverified" || code.startsWith("evidence_") || code === "business_precondition_failed"
-          ? "final_unverified"
-          : "unrecoverable_error"
+    const terminalReason = error instanceof BudgetExceededError ? "budget_exhausted" : error instanceof NoProgressError ? "no_progress" : code === "final_unverified" || code.startsWith("evidence_") || code === "business_precondition_failed" ? "final_unverified" : "unrecoverable_error"
     const finalResponse = finalizeTurn({
       goal: options.goal, terminalReason, blocker: error instanceof Error ? error.message : code,
       usage: totalTurnUsage(options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls,

@@ -1,8 +1,7 @@
 import type { ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-model"
 import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
-import type { TurnBudgetLimits } from "../budget.js"
-import type { TurnUsage } from "../budget.js"
+import type { TurnBudgetLimits, TurnUsage } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
@@ -62,8 +61,9 @@ export type AtomicTurnCompletionInput = {
   readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding
 }
 
-export type AtomicTurnCompletionResult =
-  { readonly status: "completed"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
+export type AtomicTurnCompletionResult = { readonly status: "completed"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
+export type AtomicTurnNoProgressInput = Readonly<{ stepId: string; finalItemId: string; finalContent: RepositoryJsonValue; stepCount: number; toolCallCount: number; usage: TurnUsage; inputThroughSequence: bigint; consumedInputIds: readonly string[]; reasonCode: string; signature: string; stateFingerprint: string }>
+export type AtomicTurnNoProgressResult = { readonly status: "input_changed" } | { readonly status: "no_progress"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
 
 export type { PersistedToolCallRecovery, ToolCallRecovery, TurnEngineToolCall, TurnEngineToolResult } from "./turn-engine-tool-types.js"
 
@@ -118,7 +118,8 @@ export type TurnEngineStore = {
     response: string
     now: Date
     terminal?: AtomicTurnCompletionInput
-  }): Promise<void | AtomicTurnCompletionResult>
+    noProgress?: AtomicTurnNoProgressInput
+  }): Promise<void | AtomicTurnCompletionResult | AtomicTurnNoProgressResult>
 } & import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore & Partial<TurnQuestionStore>
 
 export type TurnEngineToolExecutor = (input: {

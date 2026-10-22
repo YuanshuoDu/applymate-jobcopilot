@@ -113,6 +113,14 @@ describe("canonical resume accounting for archived waits", () => {
     expect(resumed).toMatchObject({ stepCount: baseline?.stepCount, toolCallCount: baseline?.toolCallCount, usage: baseline?.usage })
   })
 
+  it("drops malformed or foreign-root denial progress before building resume state", () => {
+    const progress: TaskGraphDenialProgress = { taskId: "foreign-root", graphRevision: 4, verificationDigest: "a".repeat(64),
+      inputThroughSequence: 8n, consumedInputIds: ["input-1"], count: 2 }
+    expect(build({ taskGraphDenialProgress: progress })?.taskGraphDenialProgress).toBeUndefined()
+    expect(build({ taskGraphDenialProgress: { ...progress, taskId: scope.rootTaskId, consumedInputIds: ["", ""] } })
+      ?.taskGraphDenialProgress).toBeUndefined()
+  })
+
   it("leaves exact no-tool native gate waits on persisted usage with current and legacy model receipts", () => {
     const nativeGateStep = { ...archivedStep }
     const expectedUsage = { inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.003 }
