@@ -1228,6 +1228,7 @@ draft
 | [#561](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/561) — typed TaskGraph repair feedback | [#562](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/562) |
 | [#685](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/685) — bounded Root TaskGraph outcome recall | [#686](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/686) |
 | [#885](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/885) — pin automation runner mode per Turn | this PR |
+| [#916](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/916) — scheduled Gate as a durable TaskGraph task (proposed; pending PM approval) | Not opened — scope approval pending |
 
 ---
 
