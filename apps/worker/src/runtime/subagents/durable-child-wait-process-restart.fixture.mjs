@@ -45,7 +45,7 @@ async function waitForChild(lease, crashAfterRegistration = false) {
   const owner = executionOwnerFence({ kind: "task", lease })
   const stepId = `child-wait-step:${lease.id}:attempt:${lease.attemptCount}`
   const toolCallId = `child-wait-call:${lease.id}:attempt:${lease.attemptCount}`
-  const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 60_000, idempotencyKey: `child-wait:${lease.id}:attempt:${lease.attemptCount}` }
+  const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000, idempotencyKey: `child-wait:${lease.id}:attempt:${lease.attemptCount}` }
   const now = new Date()
   await turnStore.startStep({ owner, stepId, ordinal: 0, attempt: lease.attemptCount, inputThroughSequence: 0n,
     consumedInputIds: [], modelProfileSnapshot: {}, now })
