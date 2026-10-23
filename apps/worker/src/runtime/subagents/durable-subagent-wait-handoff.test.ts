@@ -6,7 +6,7 @@ vi.mock("./task-graph-pg-lifecycle.js", () => ({
   persistGraphTransition: graphMocks.persist,
 }))
 
-import { handoffDurableSubagentWait, handoffDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
+import { handoffDurableSubagentWait, handoffDurableSubagentWaitWithGraph, recoverExpiredDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
 
 const now = new Date("2026-10-22T10:00:00.000Z")
 const lease = {
@@ -101,6 +101,19 @@ describe("handoffDurableSubagentWait", () => {
     expect(fake.state.waitWrites).toBe(0)
     expect(fake.state.taskWrites).toBe(0)
     expect(fake.state.outboxWrites).toBe(0)
+  })
+
+  it("promotes the exact latest streaming step before recovering its committed wait", async () => {
+    const fake = fixture({ stepStatus: "streaming" })
+    const expiredLease = { ...lease, leaseExpiresAt: new Date(now.getTime() - 1) }
+    await expect(recoverExpiredDurableSubagentWaitWithGraph(fake.client as never, { lease: expiredLease, now }))
+      .resolves.toMatchObject({ waitId: "wait-1", handoff: "suspended", waitStatus: "waiting" })
+    const promote = fake.calls.find(call => call.sql.includes('UPDATE "agent_steps"'))
+    expect(promote?.sql).toContain('"status" = \'streaming\'')
+    expect(promote?.sql).toContain('"attempt" = $6')
+    expect(promote?.sql).toContain('"leaseOwner" = $9')
+    expect(promote?.sql).toContain('"leaseExpiresAt" = $10')
+    expect(promote?.params).toEqual([now, "step-1", lease.sessionId, lease.turnId, lease.id, lease.attemptCount, 4, lease.rootTaskId, lease.ownerId, expiredLease.leaseExpiresAt])
   })
 
   it("rejects recovery when the persisted wait call does not identify the exact registered request", async () => {

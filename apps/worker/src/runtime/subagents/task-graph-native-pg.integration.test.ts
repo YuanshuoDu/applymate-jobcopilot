@@ -74,7 +74,7 @@ const spawn = (key: string): TaskGraphNativeCommandInput => ({
   },
 })
 
-const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox"] as const
+const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_wait_conditions"] as const
 const TENANT_POLICIES: ReadonlyArray<readonly [typeof TENANT_TABLES[number], string]> = [
   ["agent_sessions", `"userId" = public.app_current_user_id()`],
   ["agent_turns", `"userId" = public.app_current_user_id() AND EXISTS (
@@ -84,6 +84,7 @@ const TENANT_POLICIES: ReadonlyArray<readonly [typeof TENANT_TABLES[number], str
   ["agent_items", `EXISTS (SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "sessionId" AND session."userId" = public.app_current_user_id())`],
   ["agent_events", `EXISTS (SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "sessionId" AND session."userId" = public.app_current_user_id())`],
   ["agent_outbox", `EXISTS (SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "aggregateId" AND session."userId" = public.app_current_user_id())`],
+  ["agent_wait_conditions", `"userId" = public.app_current_user_id()`],
 ]
 
 async function installRestrictedRoles(): Promise<void> {
@@ -126,7 +127,9 @@ async function installRestrictedRoles(): Promise<void> {
   await pool!.query(`GRANT SELECT ON "agent_outbox" TO "${claimRole}"`)
   await pool!.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError", "payload") ON "agent_outbox" TO "${claimRole}"`)
   await pool!.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${claimRole}"`)
-  await pool!.query(`GRANT SELECT, INSERT, UPDATE ON "agent_steps", "agent_items", "agent_events", "agent_tree_budget_reservations" TO "${claimRole}"`)
+  await pool!.query(`GRANT SELECT ON "agent_steps", "agent_items", "agent_events", "agent_tree_budget_reservations" TO "${claimRole}"`)
+  await pool!.query(`GRANT INSERT, UPDATE ON "agent_steps", "agent_items", "agent_events", "agent_tree_budget_reservations" TO "${claimRole}"`)
+  await pool!.query(`GRANT SELECT ON "agent_wait_conditions" TO "${claimRole}"`)
   await pool!.query(`GRANT SELECT, INSERT, UPDATE ON ai_usage_events, ai_budgets TO "${claimRole}"`)
   await pool!.query(`GRANT INSERT ON "agent_outbox" TO "${claimRole}"`)
 }

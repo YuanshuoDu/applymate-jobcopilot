@@ -3,6 +3,8 @@ import { Buffer } from "node:buffer"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import type pg from "pg"
 import type { SubagentLease } from "./types.js"
+import { canManageChildrenWithWaitAction } from "./child-executor-admission.js"
+import { getSubagentRolePolicy } from "./role-policy.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Pool = Pick<pg.Pool, "connect">
@@ -14,7 +16,7 @@ export type DurableSubagentWaitResult = Readonly<{
   matchedTaskIds: readonly string[]; tasks: readonly DurableSubagentWaitTask[]
 }>
 export type RegisterDurableSubagentWaitInput = Readonly<{
-  lease: SubagentLease; stepId: string; idempotencyKey: string; targetTaskIds: readonly string[]
+  lease: Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount" | "leaseExpiresAt">; stepId: string; idempotencyKey: string; targetTaskIds: readonly string[]
   mode: "any" | "all"; timeoutMs: number; now?: Date
 }>
 
@@ -126,12 +128,12 @@ export function required(value: unknown, name: string, max = 256): string {
   if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.length > max) throw new DurableSubagentWaitError("wait_invalid", `${name} is invalid`)
   return value
 }
-export function assertLease(row: Row, lease: Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount">, now: Date): void {
+export function assertLease(row: Row, lease: Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount" | "leaseExpiresAt">, now: Date, expired = false): void {
   const expires = dateValue(row.leaseExpiresAt, "leaseExpiresAt")
   if (String(row.id) !== lease.id || String(row.userId) !== lease.userId || String(row.sessionId) !== lease.sessionId
     || String(row.turnId) !== lease.turnId || String(row.rootTaskId) !== lease.rootTaskId || row.status !== "running"
-    || String(row.leaseOwner) !== lease.ownerId || Number(row.attemptCount) !== lease.attemptCount
-    || row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined || expires <= now) {
+    || String(row.leaseOwner) !== lease.ownerId || Number(row.attemptCount) !== lease.attemptCount || expired && expires.getTime() !== dateValue(lease.leaseExpiresAt, "leaseExpiresAt").getTime()
+    || row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined || (expired ? expires > now : expires <= now)) {
     throw new DurableSubagentWaitError("wait_scope_error", "Child task lease is stale")
   }
 }
@@ -159,18 +161,44 @@ function replayMatches(row: Row, input: RegisterDurableSubagentWaitInput, ids: r
     && Number(request.timeoutMs) === input.timeoutMs && sameIds(parseIds(request.targetTaskIds ?? row.targetTaskIds), ids)
 }
 
+export type ExpiredWaitRegistration = Readonly<{ registered: true } | { rejectedCallId: string }>
+export async function recoverExpiredWaitRegistration(client: Queryable, lease: RegisterDurableSubagentWaitInput["lease"], now: Date): Promise<ExpiredWaitRegistration | undefined> {
+  const rows = (await client.query<Row>(`SELECT started."id" AS "eventId", started."createdAt", task."role", task."allowedActions", step."id" AS "stepId", call."content"
+    FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $2 AND ${OPEN_SESSION} JOIN "agent_steps" AS step ON step."taskId" = task."id" AND step."sessionId" = task."sessionId" AND step."turnId" = task."turnId" JOIN "agent_items" AS call ON call."stepId" = step."id" AND call."taskId" = task."id" AND call."sessionId" = task."sessionId" JOIN "agent_events" AS started ON started."itemId" = call."id" AND started."sessionId" = task."sessionId" AND started."turnId" = task."turnId" AND started."taskId" = task."id"
+    WHERE task."id" = $1 AND task."sessionId" = $3 AND task."turnId" = $4 AND task."rootTaskId" = $5 AND task."parentTaskId" IS NOT NULL AND task."status" = 'running' AND task."leaseOwner" = $6 AND task."attemptCount" = $7 AND task."leaseExpiresAt" = $8 AND task."leaseExpiresAt" <= $9 AND task."interruptRequestedAt" IS NULL
+      AND step."attempt" = $7 AND step."status" = 'streaming' AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."taskId" = $1 AND current."sessionId" = $3 AND current."turnId" = $4 AND current."attempt" = $7)
+      AND call."type" = 'tool_call' AND call."status" IN ('started', 'streaming') AND call."content"->>'toolName' = 'wait_subagents' AND call."content"->>'toolVersion' = '1' AND started."type" = 'tool_call.started' AND started."itemId" = call."id" AND started."correlationId" = call."content"->>'toolCallId'
+      AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled WHERE settled."sessionId" = started."sessionId" AND settled."taskId" = started."taskId" AND settled."correlationId" = started."correlationId" AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))
+      AND NOT EXISTS (SELECT 1 FROM "agent_items" AS result WHERE result."sessionId" = call."sessionId" AND result."turnId" = call."turnId" AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = call."content"->>'toolCallId') AND NOT EXISTS (SELECT 1 FROM "agent_wait_conditions" AS wait WHERE wait."parentTaskId" = task."id" AND (wait."stepId" = step."id" OR wait."idempotencyKey" = call."content"->'input'->>'idempotencyKey'))
+    ORDER BY started."createdAt" DESC, started."id" DESC LIMIT 2 FOR UPDATE OF task, step, call`,
+  [lease.id, lease.userId, lease.sessionId, lease.turnId, lease.rootTaskId, lease.ownerId, lease.attemptCount, lease.leaseExpiresAt, now])).rows
+  if (rows.length !== 1) return undefined
+  const row = rows[0]!, call = object(row.content), input = object(call.input), eventId = String(row.eventId), reject = (): ExpiredWaitRegistration => ({ rejectedCallId: eventId })
+  if (!canManageChildrenWithWaitAction(getSubagentRolePolicy(String(row.role)), row.allowedActions) || Object.keys(input).sort().join(",") !== "idempotencyKey,mode,taskIds,timeoutMs"
+    || typeof input.idempotencyKey !== "string" || !(input.mode === "any" || input.mode === "all") || !Number.isSafeInteger(input.timeoutMs)
+    || Number(input.timeoutMs) < 1 || Number(input.timeoutMs) > MAX_WAIT_MS || !Array.isArray(input.taskIds) || input.taskIds.some(id => typeof id !== "string")) return reject()
+  let startedAt: Date
+  try { startedAt = dateValue(row.createdAt, "startedAt") } catch { return reject() }; if (startedAt > now) return reject()
+  const request: RegisterDurableSubagentWaitInput = { lease, stepId: String(row.stepId), idempotencyKey: input.idempotencyKey, targetTaskIds: input.taskIds as string[], mode: input.mode, timeoutMs: Number(input.timeoutMs), now: startedAt }
+  try {
+    const ids = [...request.targetTaskIds]
+    required(request.idempotencyKey, "idempotencyKey")
+    if (!ids.length || ids.length > MAX_TARGETS || ids.some(id => !id.trim() || id !== id.trim() || id.length > 256) || new Set(ids).size !== ids.length || ids.includes(lease.id)) return reject()
+    await registerOnClient(client, request, ids.sort(), startedAt, now); return { registered: true }
+  } catch (error: unknown) { if (error instanceof DurableSubagentWaitError) return reject(); throw error }
+}
 export async function registerDurableSubagentWait(pool: Pool, input: RegisterDurableSubagentWaitInput): Promise<DurableSubagentWaitResult> {
   const lease = input.lease; const now = input.now ?? new Date()
-  required(lease.id, "taskId"); required(lease.userId, "userId"); required(lease.sessionId, "sessionId")
-  required(lease.turnId, "turnId"); required(lease.rootTaskId, "rootTaskId"); required(lease.ownerId, "ownerId")
+  required(lease.id, "taskId"); required(lease.userId, "userId"); required(lease.sessionId, "sessionId"); required(lease.turnId, "turnId"); required(lease.rootTaskId, "rootTaskId"); required(lease.ownerId, "ownerId")
   required(input.stepId, "stepId"); required(input.idempotencyKey, "idempotencyKey")
-  if (!(input.mode === "any" || input.mode === "all") || !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > MAX_WAIT_MS
-    || !(now instanceof Date) || !Number.isFinite(now.getTime()) || !Array.isArray(input.targetTaskIds)) throw new DurableSubagentWaitError("wait_invalid", "Wait request is invalid")
+  if (!(input.mode === "any" || input.mode === "all") || !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > MAX_WAIT_MS || !(now instanceof Date) || !Number.isFinite(now.getTime()) || !Array.isArray(input.targetTaskIds)) throw new DurableSubagentWaitError("wait_invalid", "Wait request is invalid")
   const targetIds = [...input.targetTaskIds]
-  if (!targetIds.length || targetIds.length > MAX_TARGETS || targetIds.some(id => typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 256)
-    || new Set(targetIds).size !== targetIds.length || targetIds.includes(lease.id)) throw new DurableSubagentWaitError("wait_invalid", "Wait targets are invalid")
-  targetIds.sort()
-  return transaction(pool, lease.userId, async client => {
+  if (!targetIds.length || targetIds.length > MAX_TARGETS || targetIds.some(id => typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 256) || new Set(targetIds).size !== targetIds.length || targetIds.includes(lease.id)) throw new DurableSubagentWaitError("wait_invalid", "Wait targets are invalid")
+  targetIds.sort(); return transaction(pool, lease.userId, client => registerOnClient(client, input, targetIds, now))
+}
+
+async function registerOnClient(client: Queryable, input: RegisterDurableSubagentWaitInput, targetIds: readonly string[], now: Date, expiredAt?: Date): Promise<DurableSubagentWaitResult> {
+    const lease = input.lease
     const session = (await client.query<Row>(`SELECT "id", "userId", "status" FROM "agent_sessions"
       WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [lease.sessionId, lease.userId])).rows[0]
     if (!session) throw new DurableSubagentWaitError("wait_scope_error", "Session is unavailable")
@@ -181,7 +209,7 @@ export async function registerDurableSubagentWait(pool: Pool, input: RegisterDur
       WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND session."userId" = $5
         AND ${OPEN_SESSION} FOR UPDATE OF task`, [lease.id, lease.sessionId, lease.turnId, lease.rootTaskId, lease.userId])).rows[0]
     if (!task) throw new DurableSubagentWaitError("wait_scope_error", "Child task is unavailable")
-    assertLease(task, lease, now)
+    assertLease(task, lease, expiredAt ?? now, expiredAt !== undefined)
     if (String(task.turnStatus).match(/^(completed|failed|interrupted|cancelled)$/) || String(task.rootStatus).match(/^(completed|failed|interrupted|cancelled|closed)$/)) throw new DurableSubagentWaitError("wait_scope_error", "Child task tree is closed")
     const step = (await client.query<Row>(`SELECT step."id", step."taskId", step."attempt", step."ordinal", step."status",
         (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = step."sessionId" AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt") AS "latestOrdinal"
@@ -219,5 +247,4 @@ export async function registerDurableSubagentWait(pool: Pool, input: RegisterDur
       FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2 FOR UPDATE`, [lease.id, input.idempotencyKey])).rows[0]
     if (!raced || !replayMatches(raced, input, targetIds)) throw new DurableSubagentWaitError("wait_conflict", "Concurrent wait registration conflicted")
     return waitResult(raced)
-  })
 }

@@ -24,7 +24,7 @@ let stopped = false
 
 function say(value) { process.stdout.write(`${value}\n`) }
 
-async function waitForChild(lease) {
+async function waitForChild(lease, crashAfterRegistration = false) {
   const owner = executionOwnerFence({ kind: "task", lease })
   const stepId = `child-wait-step:${lease.id}:attempt:${lease.attemptCount}`
   const toolCallId = `child-wait-call:${lease.id}:attempt:${lease.attemptCount}`
@@ -32,10 +32,18 @@ async function waitForChild(lease) {
   const now = new Date()
   await turnStore.startStep({ owner, stepId, ordinal: 0, attempt: lease.attemptCount, inputThroughSequence: 0n,
     consumedInputIds: [], modelProfileSnapshot: {}, now })
-  await turnStore.createItem({ owner, itemId: `child-wait-call-item:${lease.id}`, stepId, type: "tool_call", status: "completed", phase: null,
+  const callItemId = `child-wait-call-item:${lease.id}`
+  await turnStore.createItem({ owner, itemId: callItemId, stepId, type: "tool_call", status: "started", phase: null,
     content: { toolCallId, toolName: "wait_subagents", toolVersion: "1", input }, now })
+  await turnStore.appendEvent({ owner, id: `task:${lease.id}:event:tool-started:${toolCallId}`, itemId: callItemId, type: "tool_call.started",
+    correlationId: toolCallId, causationId: null, idempotencyKey: `task:${lease.id}:event:tool-started:${toolCallId}`,
+    payload: { toolCallId, toolName: "wait_subagents", taskId: lease.id } })
   const wait = await registerDurableSubagentWait(pool, { lease, stepId, targetTaskIds: input.taskIds, mode: input.mode,
     timeoutMs: input.timeoutMs, idempotencyKey: input.idempotencyKey, now })
+  if (crashAfterRegistration) {
+    say(`WORKER_A_REGISTERED ${JSON.stringify({ waitId: wait.waitId, stepId, toolCallId })}`)
+    return new Promise(() => {})
+  }
   await turnStore.createItem({ owner, itemId: `child-wait-result-item:${lease.id}`, stepId, type: "tool_result", status: "completed", phase: null,
     content: { toolCallId, output: wait, errorCode: null }, now })
   await turnStore.updateStep({ owner, stepId, status: "waiting_for_tool", finishReason: "tool_calls", errorCode: null,
@@ -43,7 +51,7 @@ async function waitForChild(lease) {
   return { status: "waiting", result: { waitId: wait.waitId } }
 }
 
-async function resumeChild(lease) {
+async function resumeChild(lease, crashBeforeWaitAck = false) {
   const wait = await loadDurableSubagentWaitResume(pool, lease)
   if (!wait) throw new Error("durable_child_wait_not_ready")
   const restored = await loadChildAttemptResume(pool, lease, new Date(), wait)
@@ -58,6 +66,10 @@ async function resumeChild(lease) {
   await turnStore.startStep({ owner, stepId, ordinal: nextOrdinal, attempt: lease.attemptCount,
     inputThroughSequence: restored.resume.inputThroughSequence, consumedInputIds: restored.resume.consumedInputIds,
     modelProfileSnapshot: {}, now })
+  if (crashBeforeWaitAck) {
+    say(`WORKER_B_RESUME_STEP_STARTED ${JSON.stringify({ waitId: wait.waitId, stepId, ordinal: nextOrdinal })}`)
+    return new Promise(() => {})
+  }
   await turnStore.createItem({ owner, itemId: `child-resume-final:${wait.sourceItemId}`, stepId, type: "agent_message", status: "completed",
     phase: "final_answer", content: { text: "parent-resumed-from-durable-child-result", wait: restored.durableWait.output }, now })
   await turnStore.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null,
@@ -80,7 +92,10 @@ const worker = new Worker(queueName, async job => {
   if (job.data.taskId !== ids.waiterTaskId) throw new Error("unexpected_subagent_task")
   const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
   if (!identity) throw new Error("invalid_subagent_dispatch_identity")
-  const execute = mode === "worker-a" ? waitForChild : mode === "worker-b" ? resumeChild : undefined
+  const execute = mode === "worker-a" ? waitForChild
+    : mode === "worker-a-crash" ? lease => waitForChild(lease, true)
+      : mode === "worker-b-crash-resume" ? lease => resumeChild(lease, true)
+      : mode === "worker-b" ? resumeChild : undefined
   if (!execute) throw new Error("invalid_fixture_mode")
   return runSubagentQueueJob(pool, manager, execute, job.data, identity)
 }, { connection: redis, concurrency: 1, lockDuration: 15_000, skipVersionCheck: true })
@@ -98,6 +113,10 @@ worker.on("failed", (job, error) => {
 })
 
 try {
+  if (mode.startsWith("worker-b")) {
+    const recovered = await manager.recover()
+    say(`WORKER_B_RECOVERED ${JSON.stringify({ reclaimed: recovered.reclaimed, terminal: recovered.terminal, rows: recovered.rows.map(row => ({ id: row.id, status: row.status })) })}`)
+  }
   await worker.waitUntilReady()
   say(`${mode.toUpperCase()}_READY`)
 } catch (error) {

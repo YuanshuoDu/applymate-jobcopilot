@@ -158,7 +158,7 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(
       (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = step."sessionId" AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt") AS "latestOrdinal"
     FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = wait."parentTaskId"
     WHERE wait."parentTaskId" = $1 AND wait."userId" = $2 AND wait."sessionId" = $3 AND wait."turnId" = $4 AND wait."status" = 'waiting'
-      AND wait."suspendedAt" IS NULL AND wait."consumedAt" IS NULL AND step."attempt" = $5 AND step."status" = 'waiting_for_tool'
+      AND wait."suspendedAt" IS NULL AND wait."consumedAt" IS NULL AND step."attempt" = $5 AND step."status" IN ('streaming', 'waiting_for_tool')
       AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = step."sessionId" AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt")
       AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = wait."sessionId" AND session."userId" = wait."userId" AND ${OPEN_SESSION})
     ORDER BY wait."createdAt" DESC, wait."id" DESC LIMIT 2 FOR UPDATE OF wait, step`,
@@ -174,6 +174,16 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(
   catch (error: unknown) {
     if (error instanceof DurableSubagentWaitError && error.code === "wait_scope_error") return undefined
     throw error
+  }
+  if (wait.stepStatus === "streaming") {
+    // This crash precedes durable tool/model completion; step.completed would invent output the writer never committed.
+    const promoted = await client.query(`UPDATE "agent_steps" SET "status" = 'waiting_for_tool', "finishReason" = 'tool_calls', "errorCode" = NULL, "completedAt" = $1
+      WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "attempt" = $6 AND "ordinal" = $7 AND "status" = 'streaming'
+        AND "ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = $3 AND current."turnId" = $4 AND current."taskId" = $5 AND current."attempt" = $6)
+        AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS task WHERE task."id" = $5 AND task."sessionId" = $3 AND task."turnId" = $4
+          AND task."rootTaskId" = $8 AND task."status" = 'running' AND task."leaseOwner" = $9 AND task."attemptCount" = $6 AND task."leaseExpiresAt" = $10 AND task."leaseExpiresAt" <= clock_timestamp() AND task."interruptRequestedAt" IS NULL)`,
+    [now, wait.stepId, lease.sessionId, lease.turnId, lease.id, lease.attemptCount, wait.ordinal, lease.rootTaskId, lease.ownerId, lease.leaseExpiresAt])
+    if (promoted.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Expired wait source step changed during recovery")
   }
   const targets = (await client.query<Row>(`SELECT task."id", task."parentTaskId", task."rootTaskId", task."turnId", task."sessionId", task."status", task."role", task."result", task."failureReason"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"

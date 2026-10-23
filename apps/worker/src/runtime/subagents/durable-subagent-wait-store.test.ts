@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
-import { registerDurableSubagentWait } from "./durable-subagent-wait-store.js"
+vi.mock("./role-policy.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./role-policy.js")>()
+  const scout = actual.getSubagentRolePolicy("scout")!
+  return { ...actual, getSubagentRolePolicy: (role: string) => role === "wait-enabled" ? { ...scout, canManageChildren: true } : actual.getSubagentRolePolicy(role) }
+})
+import { recoverExpiredWaitRegistration, registerDurableSubagentWait } from "./durable-subagent-wait-store.js"
 import type { SubagentLease } from "./types.js"
 
 const now = new Date("2026-10-22T10:00:00.000Z")
@@ -19,9 +24,10 @@ function lease(): SubagentLease {
 
 function fixture() {
   const calls: { sql: string; params: unknown[] }[] = []
-  const state: { existing?: Record<string, unknown>; inserted?: Record<string, unknown>; insertCount: number; leaseExpiresAt?: Date; leaseOwner?: string; attemptCount?: number } = { insertCount: 0 }
+  const state: { existing?: Record<string, unknown>; inserted?: Record<string, unknown>; insertCount: number; leaseExpiresAt?: Date; leaseOwner?: string; attemptCount?: number;
+    recovery?: boolean; recoveryRole?: string; recoveryInput?: Record<string, unknown>; startedAt?: Date | null; targetParentId?: string } = { insertCount: 0 }
   const targets = targetIds.map((id, index) => ({
-    id, parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1",
+    id, parentTaskId: state.targetParentId ?? "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1",
     status: index === 0 ? "completed" : "running", role: `role-${index + 1}`,
     result: index === 0 ? { summary: "safe result", apiKey: "super-secret", detail: "Bearer hidden-token" } : null,
     failureReason: null,
@@ -30,6 +36,13 @@ function fixture() {
     async query(sql: string, params: unknown[] = []) {
       calls.push({ sql, params })
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('started."createdAt"') && sql.includes("FOR UPDATE OF task, step, call")) return state.recovery ? { rows: [{
+        eventId: "start-event-1", createdAt: state.startedAt === undefined ? new Date(now.getTime() - 10_000) : state.startedAt,
+        role: state.recoveryRole ?? "wait-enabled", allowedActions: ["wait_subagents"], stepId: "step-1",
+        content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: state.recoveryInput ?? {
+          idempotencyKey: "recovered-wait", mode: "any", taskIds: targetIds, timeoutMs: 5_000,
+        } },
+      }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"') && !sql.includes("ANY($1::text[])")) return { rows: [{
         id: "parent-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "running",
@@ -37,7 +50,7 @@ function fixture() {
         userId: "user-1", turnStatus: "in_progress", rootStatus: "running",
       }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: "parent-1", attempt: 3, ordinal: 4, latestOrdinal: 4, status: "streaming" }], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: targets, rowCount: targets.length }
+    if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: targets.map(target => ({ ...target, parentTaskId: state.targetParentId ?? target.parentTaskId })), rowCount: targets.length }
       if (sql.includes('FROM "agent_wait_conditions"') && !sql.includes("INSERT")) return { rows: state.existing ? [state.existing] : [], rowCount: state.existing ? 1 : 0 }
       if (sql.includes('INSERT INTO "agent_wait_conditions"')) {
         state.insertCount += 1
@@ -54,10 +67,37 @@ function fixture() {
     },
     release() {},
   }
-  return { pool: { connect: async () => client }, calls, state }
+  return { pool: { connect: async () => client }, client, calls, state }
 }
 
 describe("registerDurableSubagentWait", () => {
+  it("reconstructs only the exact persisted, admitted pre-insert wait and preserves its original deadline", async () => {
+    const fake = fixture(), startedAt = new Date(now.getTime() - 10_000), expiredLease = new Date(now.getTime() - 1_000)
+    const oldLease = { ...lease(), leaseExpiresAt: expiredLease }
+    fake.state.recovery = true; fake.state.leaseExpiresAt = expiredLease; fake.state.startedAt = startedAt
+    await expect(recoverExpiredWaitRegistration(fake.client as never, oldLease, now)).resolves.toEqual({ registered: true })
+    expect(fake.state.insertCount).toBe(1)
+    expect(fake.state.inserted?.deadlineAt).toEqual(new Date(startedAt.getTime() + 5_000))
+    const query = fake.calls.find(call => call.sql.includes('started."createdAt"'))
+    expect(query?.sql).toContain('started."type" = \'tool_call.started\'')
+    expect(query?.sql).toContain('started."correlationId" = call."content"->>\'toolCallId\'')
+    expect(query?.sql).toContain('task."leaseExpiresAt" = $8 AND task."leaseExpiresAt" <= $9')
+    expect(query?.sql).toContain('step."ordinal" = (SELECT MAX(current."ordinal")')
+    expect(query?.params).toEqual([oldLease.id, oldLease.userId, oldLease.sessionId, oldLease.turnId, oldLease.rootTaskId, oldLease.ownerId, oldLease.attemptCount, expiredLease, now])
+  })
+
+  it("fails closed for an unadmitted role, absent event timestamp, or non-direct target", async () => {
+    for (const change of [
+      { recoveryRole: "scout" }, { startedAt: null }, { targetParentId: "other-parent" },
+    ]) {
+      const fake = fixture(), expiredLease = new Date(now.getTime() - 1_000)
+      Object.assign(fake.state, { recovery: true, leaseExpiresAt: expiredLease, ...change })
+      await expect(recoverExpiredWaitRegistration(fake.client as never, { ...lease(), leaseExpiresAt: expiredLease }, now))
+        .resolves.toEqual({ rejectedCallId: "start-event-1" })
+      expect(fake.state.insertCount).toBe(0)
+    }
+  })
+
   it("validates bounded unique direct targets before opening a transaction", async () => {
     const fake = fixture()
     const input = { lease: lease(), stepId: "step-1", idempotencyKey: "wait-key", targetTaskIds: ["child-1", "child-1"], mode: "any" as const, timeoutMs: 5_000, now }

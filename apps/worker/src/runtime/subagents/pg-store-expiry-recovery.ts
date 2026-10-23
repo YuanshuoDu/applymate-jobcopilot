@@ -6,9 +6,9 @@ import { RUNNABLE_SESSION } from "../session-gate.js"
 import { lockFailedRootTurn, prepareGraphTransition, rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { dateValue, json, rowToTask, transaction } from "./pg-store-persistence.js"
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentTaskRecord } from "./types.js"
-import { hasUnsettledExternalCall } from "./external-call-state.js"
 import { prepareTaskGraphFinish } from "./pg-store-lifecycle.js"
 import { recoverExpiredDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
+import { recoverExpiredWaitRegistration } from "./durable-subagent-wait-store.js"
 
 type Candidate = Record<string, unknown> & Readonly<{ id: string; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
 
@@ -69,6 +69,40 @@ const CHILD_WAIT_CONSUMED_SQL = `(SELECT COUNT(*) = 1 FROM "agent_wait_condition
       ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)) = true`
 
 type ExpiredWaitDispatch = { id: string; payload: unknown; attemptCount: unknown; publishedAt: unknown }
+
+async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<string, unknown>, ignoredEventId?: string): Promise<boolean> {
+  const result = await client.query(`SELECT started."id" FROM "agent_events" AS started
+    WHERE started."sessionId" = $1 AND started."taskId" = $2 AND started."type" IN ('tool_call.started', 'model.started')
+      AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled WHERE settled."sessionId" = started."sessionId" AND settled."taskId" = started."taskId"
+        AND settled."correlationId" = started."correlationId" AND ((started."type" = 'tool_call.started' AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))
+          OR (started."type" = 'model.started' AND settled."type" IN ('model.completed', 'model.failed'))))
+      AND NOT (started."type" = 'tool_call.started' AND EXISTS (
+        SELECT 1 FROM "sub_agent_tasks" AS owner JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = owner."id"
+        JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId" AND source."taskId" = owner."id"
+        JOIN "agent_items" AS call ON call."id" = started."itemId" AND call."sessionId" = source."sessionId" AND call."turnId" = source."turnId" AND call."taskId" = source."taskId" AND call."stepId" = source."id"
+        WHERE owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3 AND owner."rootTaskId" = $4 AND owner."status" = 'running'
+          AND owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7 AND source."attempt" = $6
+          AND wait."sessionId" = $1 AND wait."turnId" = $3 AND wait."userId" = $8
+          AND ((wait."status" = 'waiting' AND wait."suspendedAt" IS NULL AND wait."consumedAt" IS NULL
+              AND source."status" IN ('streaming', 'waiting_for_tool') AND source."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."taskId" = owner."id" AND current."sessionId" = $1 AND current."turnId" = $3 AND current."attempt" = $6))
+            OR (wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL
+              AND source."status" IN ('waiting_for_tool', 'completed') AND EXISTS (SELECT 1 FROM "agent_steps" AS next WHERE next."sessionId" = source."sessionId" AND next."turnId" = source."turnId" AND next."taskId" = source."taskId" AND next."attempt" = source."attempt" AND next."ordinal" = source."ordinal" + 1
+                AND (wait."consumedAt" IS NOT NULL OR next."status" = 'streaming')
+                AND next."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."taskId" = owner."id" AND current."sessionId" = $1 AND current."turnId" = $3 AND current."attempt" = $6))))
+          AND wait."id" = (SELECT latest."id" FROM "agent_wait_conditions" AS latest WHERE latest."parentTaskId" = owner."id" AND latest."stepId" = source."id" ORDER BY latest."createdAt" DESC, latest."id" DESC LIMIT 1)
+          AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents' AND call."content"->>'toolVersion' = '1'
+          AND call."status" IN ('started', 'streaming', 'completed') AND call."content"->>'toolCallId' = started."correlationId" AND started."itemId" = call."id" AND started."turnId" = $3
+          AND call."content"->'input' - 'taskIds' = jsonb_build_object('idempotencyKey', wait."idempotencyKey", 'mode', wait."mode", 'timeoutMs', wait."result"->'request'->'timeoutMs')
+          AND (SELECT jsonb_agg(target."id" ORDER BY target."id") FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(call."content"->'input'->'taskIds') = 'array' THEN call."content"->'input'->'taskIds' ELSE '[]'::jsonb END) AS target("id")) = wait."targetTaskIds"
+          AND wait."result"->'request' = jsonb_build_object('targetTaskIds', wait."targetTaskIds", 'mode', wait."mode", 'timeoutMs', wait."result"->'request'->'timeoutMs')
+          AND wait."result"->'outcome'->>'waitId' = wait."id" AND wait."result"->'outcome'->>'status' = wait."status"
+          AND wait."result"->'outcome'->'taskIds' = wait."targetTaskIds" AND wait."result"->'outcome'->'matchedTaskIds' = wait."matchedTaskIds"
+          AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) BETWEEN 1 AND 8
+          AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("id")
+            WHERE NOT EXISTS (SELECT 1 FROM "sub_agent_tasks" AS child WHERE child."id" = target."id" AND child."parentTaskId" = owner."id" AND child."rootTaskId" = $4 AND child."sessionId" = $1 AND child."turnId" = $3))))
+      AND ($9::text IS NULL OR started."id" <> $9) LIMIT 1`, [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, ignoredEventId ?? null])
+  return result.rows.length > 0
+}
 
 export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; limit: number; sessionId?: string; turnId?: string }): Promise<SubagentTaskRecord[]> {
   if (!Number.isInteger(input.limit) || input.limit < 1) throw new RangeError("Recovery limit must be positive")
@@ -139,12 +173,14 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   const lockedExpiry = dateValue(row.leaseExpiresAt)
   const lockedRetryAt = dateValue(row.nextAttemptAt)
   if (!lockedExpiry || lockedExpiry > checkedAt || (lockedRetryAt && lockedRetryAt > checkedAt)) return null
+  let rejectedWaitCallId: string | undefined
   if (!interrupted && row.parentTaskId != null && typeof row.leaseOwner === "string" && typeof row.turnId === "string") {
-    const wait = await recoverExpiredDurableSubagentWaitWithGraph(client, {
-      lease: { id: candidate.id, userId: candidate.userId, sessionId: candidate.sessionId, turnId: row.turnId,
-        rootTaskId: String(row.rootTaskId), ownerId: row.leaseOwner, attemptCount, leaseExpiresAt: lockedExpiry },
-      now: checkedAt,
-    })
+    const lease = { id: candidate.id, userId: candidate.userId, sessionId: candidate.sessionId, turnId: row.turnId,
+      rootTaskId: String(row.rootTaskId), ownerId: row.leaseOwner, attemptCount, leaseExpiresAt: lockedExpiry }
+    const registration = await recoverExpiredWaitRegistration(client, lease, checkedAt)
+    if (registration && "rejectedCallId" in registration) rejectedWaitCallId = registration.rejectedCallId
+    if (await hasBlockingExternalCall(client, row, rejectedWaitCallId)) return null
+    const wait = await recoverExpiredDurableSubagentWaitWithGraph(client, { lease, now: checkedAt })
     if (wait && "blocked" in wait) return null
     if (wait) return { ...rowToTask(row), status: wait.handoff === "suspended" ? "waiting" : "queued",
       nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null }
@@ -168,11 +204,11 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
       waitContinuation = false
     }
   }
-  const unsettledExternalCall = await hasUnsettledExternalCall(client, candidate.sessionId, candidate.id)
+  const unsettledExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId)
   if (unsettledExternalCall && (!waitContinuation || childWaitConsumed)) return null
-  const terminal = interrupted || failedRootTurn || atAttemptCeiling && !waitContinuation
+  const terminal = Boolean(rejectedWaitCallId) || interrupted || failedRootTurn || atAttemptCeiling && !waitContinuation
   const status = terminal ? interrupted ? "interrupted" : "failed" : "queued"
-  let failureReason = status === "failed" ? failedRootTurn ? "Linked Turn failed before root lease recovery." : "Worker lease expired after maximum attempts." : old.failureReason ?? null
+  let failureReason = status === "failed" ? rejectedWaitCallId ? "Persisted wait_subagents call was not admitted for the current child role." : failedRootTurn ? "Linked Turn failed before root lease recovery." : "Worker lease expired after maximum attempts." : old.failureReason ?? null
   let graph = await prepareGraphTransition(client, {
     taskId: candidate.id, sessionId: candidate.sessionId,
     type: status === "interrupted" ? "task.interrupted" : status === "failed" ? "task.failed" : "task.retrying",
