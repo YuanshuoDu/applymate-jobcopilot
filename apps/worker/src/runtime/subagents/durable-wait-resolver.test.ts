@@ -2,13 +2,23 @@ import { describe, expect, it, vi } from "vitest"
 
 import { reconcileDurableWaits, startDurableWaitResolver } from "./durable-wait-resolver.js"
 
+const gateMatcher = vi.hoisted(() => ({ disposition: null as "pending" | "matched" | "stale" | null, calls: [] as unknown[] }))
+vi.mock("./scheduled-gate-wait-match.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-gate-wait-match.js")>()
+  return { ...actual, matchScheduledGateWaitTarget: vi.fn(async (_client: unknown, scope: unknown) => {
+    gateMatcher.calls.push(scope)
+    return gateMatcher.disposition
+  }) }
+})
+
 const now = new Date("2026-09-09T12:00:00.000Z")
 const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
 
 type Steer = { userId: string; sessionId: string; targetTurnId: string; delivery: string; status: string; consumedByStepId: string | null; consumedAt: Date | null; cancelledAt: Date | null; acceptedSequence: string; content: string }
-function fixture(input: { turnStatus?: string; waitStatus?: string; waitParentTaskId?: string; suspended?: boolean; deadline?: Date; targetStatus?: string; targetUser?: string; consumed?: boolean; turnCount?: number; sessionStatus?: string; sessionSource?: string; closeBeforeWake?: boolean; closeBeforeOutbox?: boolean; checkpoint?: string; steer?: Partial<Steer> }) {
+function fixture(input: { turnStatus?: string; waitStatus?: string; waitParentTaskId?: string; suspended?: boolean; deadline?: Date; targetStatus?: string; targetUser?: string; consumed?: boolean; turnCount?: number; sessionStatus?: string; sessionSource?: string; closeBeforeWake?: boolean; closeBeforeOutbox?: boolean; checkpoint?: string; steer?: Partial<Steer>; scheduledGate?: { gateTaskId: string; requestAttemptCount: number } }) {
   const turn = { id: "turn-1", userId: "user-1", sessionId: "session-1", rootTaskId: "root-1", status: input.turnStatus ?? "in_progress", leaseOwnerId: null, sessionStatus: input.sessionStatus ?? "running" }
-  const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: input.waitParentTaskId ?? "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "any", status: input.waitStatus ?? "waiting", deadlineAt: input.deadline ?? new Date("2026-09-09T13:00:00.000Z"), suspendedAt: input.suspended ? now : null, consumedAt: input.consumed ? now : null, matchedTaskIds: [] }
+  const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: input.waitParentTaskId ?? "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "any", status: input.waitStatus ?? "waiting", deadlineAt: input.deadline ?? new Date("2026-09-09T13:00:00.000Z"), suspendedAt: input.suspended ? now : null, consumedAt: input.consumed ? now : null, matchedTaskIds: [],
+    result: input.scheduledGate ? { request: { targetTaskIds: ["child-1"], mode: "any", timeoutMs: 60_000, scheduledGate: input.scheduledGate } } : null }
   const secondTurn = { ...turn, id: "turn-2", rootTaskId: "root-2", sessionId: "session-2", userId: "user-2" }
   const secondWait = { ...wait, id: "wait-2", turnId: "turn-2", parentTaskId: "root-2", stepId: "step-2", userId: "user-2", sessionId: "session-2", targetTaskIds: ["child-2"] }
   const turns = input.turnCount === 2 ? [turn, secondTurn] : [turn]
@@ -78,6 +88,26 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; waitParentTa
 }
 
 describe("durable wait resolver", () => {
+  it("uses the stored Gate matcher for the same readiness decision as registration", async () => {
+    gateMatcher.calls = []
+    gateMatcher.disposition = "matched"
+    const ready = fixture({ scheduledGate: { gateTaskId: "child-1", requestAttemptCount: 0 } })
+    await expect(reconcileDurableWaits(ready.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 0 })
+    expect(ready.state.waits[0]).toMatchObject({ status: "ready", matchedTaskIds: ["child-1"] })
+    expect(gateMatcher.calls).toEqual([{
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", stepId: "step-1", gateTaskId: "child-1", requestAttemptCount: 0,
+    }])
+
+    gateMatcher.calls = []
+    gateMatcher.disposition = "pending"
+    const pending = fixture({ suspended: true, turnStatus: "waiting_for_dependency", targetStatus: "completed",
+      steer: { acceptedSequence: "9007199254740992" }, scheduledGate: { gateTaskId: "child-1", requestAttemptCount: 0 } })
+    await expect(reconcileDurableWaits(pending.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
+    expect(pending.state.waits[0].status).toBe("waiting")
+    expect(pending.state.turns[0].status).toBe("waiting_for_dependency")
+    expect(pending.state.waitUpdates).toBe(0)
+  })
+
   it("marks an early terminal match ready without waking an unsuspended parent", async () => {
     const fake = fixture({})
     await expect(reconcileDurableWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 0 })

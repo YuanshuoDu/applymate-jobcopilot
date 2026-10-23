@@ -214,6 +214,23 @@ describe("TaskGraph planning kernel", () => {
     expect(reduceTaskGraphEvent(state, { type: "task.completed", nodeKey: "a", idempotencyKey: "event-2", expectedRevision: 1 })).toMatchObject({ ok: false, error: { code: "revision_mismatch" } })
   })
 
+  it("resumes only the exact scheduled Gate node after an answered private choice", () => {
+    const state: TaskGraphState = { revision: 12, appliedEvents: [], nodes: [
+      { ...node("prepare", { templateId: "prepare" }), depth: 3, status: "completed", taskId: "prepare-task", verificationDisposition: "specialized" },
+      { ...node("gate", { templateId: "gate", dependsOn: ["prepare"] }), depth: 4, status: "waiting_for_user", taskId: "gate-task", verificationDisposition: "specialized" },
+    ] }
+    const resumed = { type: "task.gate_choice_resumed", nodeKey: "gate", gateTaskId: "gate-task", requestAttemptCount: 3,
+      resumedAttemptCount: 4, idempotencyKey: "gate-choice-resume-3", expectedRevision: 12 }
+    const result = reduceTaskGraphEvent(state, resumed)
+    expect(result).toMatchObject({ ok: true, duplicate: false, state: { revision: 13, nodes: [{ status: "completed" }, { status: "queued" }] } })
+    expect(reduceTaskGraphEvent(state, { ...resumed, gateTaskId: "other-task" })).toMatchObject({ ok: false, error: { code: "invalid_transition" } })
+    expect(reduceTaskGraphEvent(state, { ...resumed, resumedAttemptCount: 5 })).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    const ordinaryGate = { ...state, nodes: state.nodes.map(item => item.key === "gate" ? { ...item, templateId: "analyst" } : item) }
+    expect(reduceTaskGraphEvent(ordinaryGate, resumed)).toMatchObject({ ok: false, error: { code: "invalid_transition" } })
+    const staleGate = { ...state, nodes: state.nodes.map(item => item.key === "gate" ? { ...item, status: "waiting" as const } : item) }
+    expect(reduceTaskGraphEvent(staleGate, resumed)).toMatchObject({ ok: false, error: { code: "invalid_transition" } })
+  })
+
   it("appends without rewriting active or completed nodes", () => {
     let state = append(createInitialTaskGraphState(), [node("active"), node("done")])
     state = transition(state, "task.started", "active", "start-active")

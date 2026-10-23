@@ -1,7 +1,16 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { createPgDurableWaitPort, DurableWaitStoreError, type DurableWaitResolveInput } from "./durable-wait-store.js"
-import type { DurableWaitControlInvocation, DurableWaitPort } from "../tools/coordination-types.js"
+import type { DurableWaitControlInvocation, DurableWaitPort, DurableWaitScheduledGateInvocation } from "../tools/coordination-types.js"
+
+const gateMatcher = vi.hoisted(() => ({ disposition: "pending" as "pending" | "matched" | "stale" | null, calls: [] as unknown[] }))
+vi.mock("./scheduled-gate-wait-match.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-gate-wait-match.js")>()
+  return { ...actual, matchScheduledGateWaitTarget: vi.fn(async (_client: unknown, scope: unknown) => {
+    gateMatcher.calls.push(scope)
+    return gateMatcher.disposition
+  }) }
+})
 
 type Row = Record<string, unknown>
 type Response = { rows: Row[]; rowCount?: number }
@@ -12,18 +21,18 @@ const base: Parameters<DurableWaitPort["wait"]>[0] = {
 }
 const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
 
-function parent(status = "running"): Row { return { id: "parent-a", rootTaskId: "root-a", turnId: "turn-a", sessionId: "session-a", status, userId: "user-a" } }
+function parent(status = "running", id = "parent-a", rootTaskId: string | null = "root-a"): Row { return { id, rootTaskId, turnId: "turn-a", sessionId: "session-a", status, userId: "user-a" } }
 function session(status = "running", userId = "user-a"): Row { return { id: "session-a", userId, status } }
 function turn(status = "in_progress"): Row { return { id: "turn-a", sessionId: "session-a", userId: "user-a", rootTaskId: "root-a", status } }
 function step(taskId = "parent-a"): Row { return { id: "step-a", taskId } }
 function targets(statuses: readonly string[], rootTaskId = "root-a"): Row[] { return statuses.map((status, index) => ({ id: `child-${String.fromCharCode(97 + index)}`, rootTaskId, turnId: "turn-a", sessionId: "session-a", status, userId: "user-a" })) }
-function waitRow(status: string, matchedTaskIds: readonly string[] = [], options: { mode?: "any" | "all"; targetTaskIds?: readonly string[] } = {}): Row {
+function waitRow(status: string, matchedTaskIds: readonly string[] = [], options: { mode?: "any" | "all"; targetTaskIds?: readonly string[]; scheduledGate?: { gateTaskId: string; requestAttemptCount: number } } = {}): Row {
   const createdAt = new Date(now); const deadlineAt = new Date(now.getTime() + base.timeoutMs)
   const targetTaskIds = options.targetTaskIds ?? base.targetTaskIds
   const mode = options.mode ?? base.mode
   return { id: "wait-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", parentTaskId: "parent-a", stepId: "step-a", idempotencyKey: base.idempotencyKey,
     targetTaskIds: [...targetTaskIds], mode, status, deadlineAt, matchedTaskIds: [...matchedTaskIds], createdAt,
-    result: { request: { targetTaskIds: [...targetTaskIds], mode, timeoutMs: base.timeoutMs } } }
+    result: { request: { targetTaskIds: [...targetTaskIds], mode, timeoutMs: base.timeoutMs, ...(options.scheduledGate ? { scheduledGate: options.scheduledGate } : {}) } } }
 }
 function fixture(responses: Response[], options: { sessionStatus?: string; sessionUserId?: string } = {}) {
   const calls: Array<{ sql: string; params: readonly unknown[] }> = []
@@ -46,12 +55,58 @@ function fixture(responses: Response[], options: { sessionStatus?: string; sessi
   }
   return { calls, pool: { connect: vi.fn(async () => client) } }
 }
-function validation(targetRows: Row[], existing?: Row): Response[] {
-  return [{ rows: [session()] }, { rows: [parent()] }, { rows: [turn()] }, { rows: [step()] }, { rows: targetRows }, ...(existing ? [{ rows: [existing] }] : [])]
+function validation(targetRows: Row[], existing?: Row, parentRow = parent()): Response[] {
+  return [{ rows: [session()] }, { rows: [parentRow] }, { rows: [turn()] }, { rows: [step(parentRow.id as string)] }, { rows: targetRows }, ...(existing ? [{ rows: [existing] }] : [])]
 }
 function inserted(row: Row): Response { return { rows: [row] } }
 
 describe("durable PostgreSQL wait port", () => {
+  it("registers the server-only Gate matcher with its derived target and persists its private replay marker", async () => {
+    vi.setSystemTime(now)
+    gateMatcher.disposition = "pending"
+    gateMatcher.calls = []
+    const input: DurableWaitScheduledGateInvocation = {
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", stepId: "step-a", taskId: "root-a", rootTaskId: "root-a",
+      timeoutMs: 10_000, idempotencyKey: "gate-key", gateTaskId: "gate-a", requestAttemptCount: 0,
+    }
+    const gateTarget = { ...targets(["queued"])[0], id: "gate-a" }
+    const row = waitRow("waiting", [], { mode: "any", targetTaskIds: ["gate-a"], scheduledGate: { gateTaskId: "gate-a", requestAttemptCount: 0 } })
+    const test = fixture([...validation([gateTarget], undefined, parent("running", "root-a", null)), { rows: [] }, inserted(row)])
+    await expect(createPgDurableWaitPort(test.pool as never).waitScheduledGate(input)).resolves.toMatchObject({ status: "waiting", waitId: "wait-a" })
+    expect(gateMatcher.calls).toEqual([{
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", stepId: "step-a", gateTaskId: "gate-a", requestAttemptCount: 0,
+    }])
+    const insert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_wait_conditions"'))
+    expect(insert?.params[7]).toBe(JSON.stringify(["gate-a"]))
+    expect(insert?.params[8]).toBe("any")
+    expect(JSON.parse(String(insert?.params[12]))).toEqual({ request: {
+      targetTaskIds: ["gate-a"], mode: "any", timeoutMs: 10_000, scheduledGate: { gateTaskId: "gate-a", requestAttemptCount: 0 },
+    } })
+    vi.useRealTimers()
+  })
+
+  it("does not allow generic wait input to activate Gate matching and rejects cross-kind replays", async () => {
+    gateMatcher.calls = []
+    const genericInput = { ...base, taskId: "root-a", rootTaskId: "root-a", targetTaskIds: ["gate-a"], mode: "any" as const }
+    const gateTarget = { ...targets(["queued"])[0], id: "gate-a" }
+    const genericRow = waitRow("waiting", [], { mode: "any", targetTaskIds: ["gate-a"] })
+    const generic = fixture([...validation([gateTarget], genericRow, parent("running", "root-a", null))])
+    await expect(createPgDurableWaitPort(generic.pool as never).wait({ ...genericInput, scheduledGate: { gateTaskId: "gate-a", requestAttemptCount: 0 } } as never))
+      .resolves.toMatchObject({ waitId: "wait-a", status: "waiting" })
+    expect(gateMatcher.calls).toHaveLength(0)
+
+    const specializedRow = waitRow("waiting", [], { mode: "any", targetTaskIds: ["gate-a"], scheduledGate: { gateTaskId: "gate-a", requestAttemptCount: 0 } })
+    const genericReplay = fixture([...validation([gateTarget], specializedRow, parent("running", "root-a", null))])
+    await expect(createPgDurableWaitPort(genericReplay.pool as never).wait(genericInput)).rejects.toMatchObject({ code: "wait_conflict" })
+
+    gateMatcher.disposition = "pending"
+    const specializedReplay = fixture([...validation([gateTarget], genericRow, parent("running", "root-a", null))])
+    await expect(createPgDurableWaitPort(specializedReplay.pool as never).waitScheduledGate({
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", stepId: "step-a", taskId: "root-a", rootTaskId: "root-a",
+      timeoutMs: 10_000, idempotencyKey: "wait-key", gateTaskId: "gate-a", requestAttemptCount: 0,
+    })).rejects.toMatchObject({ code: "wait_conflict" })
+  })
+
   it("uses the store replay contract for an exact archived-control invocation", async () => {
     const createReaderPool = () => {
       const calls: string[] = []

@@ -4,6 +4,8 @@ import { APPLYMATE_BACKING, loadUserAiConfig, resolveConfig } from "@/lib/model-
 import { db } from "@/lib/db";
 import { runAgentPipeline, type ScheduledTaskGraphWaitResult } from "@/lib/agent/run-service";
 import { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity } from "@/lib/agent/scheduled-taskgraph-run-service";
+import { parseScheduledTaskGraphActionRequest, type ScheduledTaskGraphLegacyRpcRequest } from "@/lib/agent/scheduled-taskgraph-gate-rpc";
+import { runScheduledTaskGraphActionRpc } from "@/lib/agent/scheduled-taskgraph-gate-runtime-rpc";
 import { parseScheduledAutomationSnapshot } from "@/lib/agent/scheduled-automation-snapshot";
 import { completedScheduledTaskGraphReport, rebindScheduledTaskGraphAnalysisStateForLease } from "@/lib/agent/scheduled-taskgraph-analysis-journal";
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
@@ -12,29 +14,14 @@ import { hasEffectiveEntitlement, isFeatureAllowed, resolveAiAccess } from "@/li
 
 export const maxDuration = 300;
 const CLAIM_SCHEMA = "agent-harness.v2.scheduled-pipeline-claim.v1";
-const OWNER_KEYS = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion"];
 type RequestOwner = Pick<ScheduledTaskGraphPipelineOwner, "userId" | "sessionId" | "turnId" | "rootTaskId" | "rootAttemptCount" | "turnLeaseOwnerId" | "turnLeaseVersion">;
-type ParsedBody = { owner: RequestOwner; attestation: unknown; prepareProof?: unknown; scheduledWaitId?: string };
+type ParsedBody = Omit<ScheduledTaskGraphLegacyRpcRequest, "action"> & { gateCompletionProof?: unknown };
 type StoredExecution = { id: string; status: string; attemptCount: number; state: unknown };
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value; }
 function safeCount(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0; }
-function parseOwner(value: unknown): RequestOwner | null {
-  const row = record(value);
-  if (!row || Object.keys(row).sort().join(",") !== [...OWNER_KEYS].sort().join(",")
-    || ![row.userId, row.sessionId, row.turnId, row.rootTaskId, row.turnLeaseOwnerId].every(validId)
-    || !Number.isSafeInteger(row.rootAttemptCount) || Number(row.rootAttemptCount) < 1
-    || !Number.isSafeInteger(row.turnLeaseVersion) || Number(row.turnLeaseVersion) < 1) return null;
-  return { userId: row.userId as string, sessionId: row.sessionId as string, turnId: row.turnId as string, rootTaskId: row.rootTaskId as string, rootAttemptCount: Number(row.rootAttemptCount), turnLeaseOwnerId: row.turnLeaseOwnerId as string, turnLeaseVersion: Number(row.turnLeaseVersion) };
-}
-function parseBody(value: unknown): ParsedBody | null {
-  const row = record(value), keys = Object.keys(row ?? {}).sort().join(",");
-  if (!row || !["attestation,owner", "attestation,owner,prepareProof", "attestation,owner,prepareProof,scheduledWaitId"].includes(keys) || !Object.hasOwn(row, "attestation") || Object.hasOwn(row, "scheduledWaitId") && (!Object.hasOwn(row, "prepareProof") || !isScheduledPrepareChoiceWaitId(String(record(row.owner)?.turnId ?? ""), row.scheduledWaitId))) return null;
-  const owner = parseOwner(row.owner);
-  return owner ? { owner, attestation: row.attestation, ...(Object.hasOwn(row, "prepareProof") ? { prepareProof: row.prepareProof, ...(typeof row.scheduledWaitId === "string" ? { scheduledWaitId: row.scheduledWaitId } : {}) } : {}) } : null;
-}
 function json(status: number, value: unknown, scheduledWaitId?: string): Response { const row = record(value); return Response.json(scheduledWaitId && row ? { ...row, scheduledWaitId } : value, { status }); }
 function blocked(status: number, errorCode: string): Response { return json(status, { status: "blocked", errorCode }); }
 function candidates(value: unknown): string[] | null {
@@ -125,8 +112,15 @@ async function canonicalQuestionItemMissing(owner: RequestOwner, waitId: string)
 export async function POST(request: Request): Promise<Response> {
   const secret = process.env.AGENT_WORKER_SECRET;
   if (!secret || request.headers.get("x-agent-worker-secret") !== secret) return blocked(401, "scheduled_pipeline_unauthorized");
-  const body = parseBody(await request.json().catch(() => null));
-  if (!body) return blocked(400, "scheduled_pipeline_request_invalid");
+  const parsed = parseScheduledTaskGraphActionRequest(await request.json().catch(() => null));
+  if (!parsed) return blocked(400, "scheduled_pipeline_request_invalid");
+  let body: ParsedBody;
+  if (parsed.action === "legacy") body = parsed;
+  else {
+    const result = await runScheduledTaskGraphActionRpc(parsed, request.signal);
+    if (result instanceof Response) return result;
+    body = result.request;
+  }
   const { owner, attestation } = body;
   const [turn, root, session, user] = await Promise.all([
     db.agentTurn.findFirst({ where: { id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId },
@@ -200,7 +194,7 @@ export async function POST(request: Request): Promise<Response> {
     if (!waitQuestion) return blocked(409, "scheduled_pipeline_claim_conflict");
     const resumable = waitQuestion.answered && ["running", "waiting_for_user"].includes(execution.status)
       && turn.status === "in_progress" && leaseIsCurrent(turn, owner);
-    if (!resumable) return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
+    if (!resumable) return parsed.action === "execute" ? json(202, { status: "waiting_for_user" }) : json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
   } else if (!rootIsCurrent(root, owner) || !leaseIsCurrent(turn, owner)) {
     return blocked(409, "scheduled_pipeline_turn_stale");
   }
@@ -278,16 +272,17 @@ export async function POST(request: Request): Promise<Response> {
       executionId: execution.id, source: "automation", aiConfig, autonomous: snapshot.autoApply,
       ...(resumeQuestionId ? { questionId: resumeQuestionId } : {}),
       scheduledTaskGraph: { owner: executionOwner, snapshot, attestation, continuationKey: key, claimToken, ownedJobs: jobs,
-        ...(body.prepareProof !== undefined ? { prepareProof: body.prepareProof, ...(body.scheduledWaitId ? { scheduledWaitId: body.scheduledWaitId } : {}) } : {}) }, signal: request.signal });
+        ...(body.prepareProof !== undefined ? { prepareProof: body.prepareProof, ...(body.scheduledWaitId ? { scheduledWaitId: body.scheduledWaitId } : {}) } : {}),
+        ...(body.gateCompletionProof !== undefined ? { gateCompletionProof: body.gateCompletionProof } : {}) }, signal: request.signal });
     if (!result) {
       const wakeWait = await loadDurableScheduledTaskGraphWait({ owner: executionOwner, key, claimToken, answeredOnly: true });
-      return wakeWait ? json(202, { status: "waiting_for_user", ...wakeWait }, responseWaitId)
+      return wakeWait ? parsed.action === "execute" ? json(202, { status: "waiting_for_user" }) : json(202, { status: "waiting_for_user", ...wakeWait }, responseWaitId)
         : blocked(500, "scheduled_pipeline_execution_failed");
     }
     if (isWaitResult(result)) {
       const durableWait = await loadDurableScheduledTaskGraphWait({ owner: executionOwner, key, claimToken });
       return durableWait?.waitId === result.waitId && durableWait.stage === result.stage
-        ? json(202, { status: "waiting_for_user", ...durableWait }, responseWaitId) : blocked(500, "scheduled_pipeline_execution_failed");
+        ? parsed.action === "execute" ? json(202, { status: "waiting_for_user" }) : json(202, { status: "waiting_for_user", ...durableWait }, responseWaitId) : blocked(500, "scheduled_pipeline_execution_failed");
     }
     if ("status" in result && result.status === "analyze_checkpointed") return json(200, result, responseWaitId);
     return json(200, { status: "completed", report: result }, responseWaitId);

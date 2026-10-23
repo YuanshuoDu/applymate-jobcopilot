@@ -9,6 +9,8 @@ import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-
 import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "./turn-execution-types.js"
+import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
+import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 
 describe("persistedFinalCandidate", () => {
   it("returns only the exact content agreed by the durable item and serialized response", () => {
@@ -100,6 +102,59 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(append).not.toHaveBeenCalledWith("step.completed", expect.anything(), expect.anything(), expect.anything(), expect.anything())
     expect(recordFinalResponse).not.toHaveBeenCalled()
     expect(onStepClosed).toHaveBeenCalledOnce()
+  })
+
+  it("persists a private Gate choice with the current model step finish reason and usage", async () => {
+    const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA,
+      owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
+        executionId: "execution-1", executionAttemptCount: 4 }, continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
+      snapshotDigest: `sha256:${"b".repeat(64)}`, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
+      analyzeGraphRevision: 3, graphRevision: 5, gateTaskId: "gate-1", gateAttempt: 1, kind: "weak_cover_letter" as const,
+      jobIds: ["job-1"], allowedChoiceIds: ["continue", "review", "skip"] as const }
+    const waitId = turnScheduledGateChoiceWaitId(binding)!, question = "A prepared application has a weak cover letter. How should I handle it?"
+    const waitForQuestion = vi.fn(async (input: { expectedWaitId?: string }) => ({ status: "waiting_for_user" as const, disposition: "created" as const,
+      waitId: input.expectedWaitId!, itemId: `agent-wait:question:${input.expectedWaitId}`, turnId: "turn-1", toolCallId: null, nextTurnRevision: 6 }))
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "waiting_for_scheduled_gate_choice", waitId,
+      question, binding, candidateText: input.candidateText })
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
+    const options = { identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() }, scope: { userId: "user-1" }, goal: "Find a role",
+      snapshot, completionGate, store: { waitForQuestion, updateStep: vi.fn(), recordFinalResponse: vi.fn() } } as unknown as TurnExecutionOptions
+    const output = { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model",
+      finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, continuation: null } satisfies ModelStepResult
+    const outcome = await completeTurnCandidate({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-1", ordinal: 0 }, output, snapshot, stepCount: 1, toolCallCount: 0,
+      usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, signal: new AbortController().signal,
+      now: () => new Date(), onStepClosed: vi.fn() })
+
+    expect(outcome).toEqual({ kind: "wait", result: { status: "waiting_for_user", waitId, stepCount: 1, toolCallCount: 0 } })
+    expect(waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: "step-1", toolCallId: null, expectedWaitId: waitId,
+      gateChoiceBinding: binding, gateChoiceQuestion: question, finishReason: "stop", usage: output.usage }))
+    expect(options.store.recordFinalResponse).not.toHaveBeenCalled()
+  })
+
+  it("refreshes when the Gate answer arrives before the private wait is inserted", async () => {
+    const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA,
+      owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
+        executionId: "execution-1", executionAttemptCount: 4 }, continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
+      snapshotDigest: `sha256:${"b".repeat(64)}`, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
+      analyzeGraphRevision: 3, graphRevision: 5, gateTaskId: "gate-1", gateAttempt: 1, kind: "weak_cover_letter" as const,
+      jobIds: ["job-1"], allowedChoiceIds: ["continue", "review", "skip"] as const }
+    const waitId = turnScheduledGateChoiceWaitId(binding)!
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "waiting_for_scheduled_gate_choice", waitId,
+      question: "A prepared application has a weak cover letter. How should I handle it?", binding, candidateText: input.candidateText })
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
+    const options = { identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() }, scope: { userId: "user-1" }, goal: "Find a role",
+      snapshot, completionGate, store: { waitForQuestion: vi.fn(async () => ({ status: "answered" as const, disposition: "replayed" as const,
+        waitId, itemId: `agent-wait:question:${waitId}`, turnId: "turn-1", toolCallId: null, nextTurnRevision: 6 })) } } as unknown as TurnExecutionOptions
+    await expect(completeTurnCandidate({ options, writer: { append: vi.fn() } as unknown as TurnExecutionEventWriter,
+      step: { id: "step-1", ordinal: 0 }, output: { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider: "fixture",
+        model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
+      snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn() })).rejects.toBeInstanceOf(TurnStateRefreshRetryError)
   })
 
   it("suspends on the Web Gate question without passing its ID to the Worker choice store", async () => {

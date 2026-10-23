@@ -4,7 +4,8 @@ import { redactAgentEvent } from "@jobcopilot/shared"
 import { db } from "@/lib/db"
 
 import { AgentExecutionCancelledError } from "../execution-control"
-import { clientReceipt, hashLegacyValue, issueLegacyReceipt } from "../approval/legacy-receipt"
+import { clientReceipt, findScheduledGateReviewReceiptReplay, hashLegacyValue, issueLegacyReceipt } from "../approval/legacy-receipt"
+import type { LegacyReceiptInput } from "../approval/legacy-receipt"
 import type { ApplicationPackage, PipelineCtx } from "../types"
 
 const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
@@ -14,9 +15,26 @@ export async function createGateReviewReceipt(
   ctx: PipelineCtx,
   pkg: ApplicationPackage,
   projectedWaitAlreadyIssued: boolean,
+  scheduledGate = false,
 ) {
+  const prepared = await buildGateReviewReceiptInput(ctx, pkg, projectedWaitAlreadyIssued, scheduledGate)
+  const result = await issueLegacyReceipt(db, prepared.input)
+  return { projectedWait: prepared.projectedWait, receipt: clientReceipt(result, { externalSubmission: false, jobId: pkg.job.id }) }
+}
+
+/** Reads a same-owner, same-checkpoint Gate receipt without preparing or writing anything when absent. */
+export async function findGateReviewReceiptReplay(ctx: PipelineCtx, pkg: ApplicationPackage) {
+  if (!ctx.scheduledTaskGraphOwnerFence) throw new AgentExecutionCancelledError()
+  const prepared = await buildGateReviewReceiptInput(ctx, pkg, false, true)
+  if (prepared.input.replayMode !== "scheduled-taskgraph-gate-review") return null
+  const result = await findScheduledGateReviewReceiptReplay(db, { ...prepared.input, replayMode: "scheduled-taskgraph-gate-review" })
+  return result ? clientReceipt(result, { externalSubmission: false, jobId: pkg.job.id }) : null
+}
+
+async function buildGateReviewReceiptInput(ctx: PipelineCtx, pkg: ApplicationPackage, projectedWaitAlreadyIssued: boolean, scheduledGate: boolean) {
   const { sessionId, turnId } = ctx
   if (!sessionId || !turnId || !ctx.executionAttempt || ctx.signal?.aborted) throw new AgentExecutionCancelledError()
+  if (scheduledGate && !ctx.scheduledTaskGraphOwnerFence) throw new AgentExecutionCancelledError()
   const currentTurn = await db.agentTurn.findFirst({
     where: { id: turnId, sessionId, userId: ctx.userId },
     select: { revision: true, status: true },
@@ -66,7 +84,7 @@ export async function createGateReviewReceipt(
     artifactReviews: pkg.artifactReviews ?? [],
   }
   const projectedWait = !projectedWaitAlreadyIssued && currentTurn.status !== "waiting_for_approval"
-  const result = await issueLegacyReceipt(db, {
+  const input: LegacyReceiptInput = {
     userId: ctx.userId,
     sessionId,
     turnId,
@@ -84,9 +102,9 @@ export async function createGateReviewReceipt(
     revision: currentTurn.revision,
     projectWait: projectedWait,
     executionAttempt: ctx.executionAttempt,
-    ...(ctx.scheduledTaskGraphOwnerFence ? {
+    ...(scheduledGate && ctx.scheduledTaskGraphOwnerFence ? {
       scheduledOwnerFence: ctx.scheduledTaskGraphOwnerFence,
-      replayMode: "gate-review",
+      replayMode: "scheduled-taskgraph-gate-review",
     } : {}),
     signal: ctx.signal,
     prepareInTransaction: async tx => {
@@ -149,9 +167,6 @@ export async function createGateReviewReceipt(
       const payload = { ...basePayload, applicationTaskId: task.id }
       return { taskId: task.id, payload, material: reviewedMaterial }
     },
-  })
-  return {
-    projectedWait,
-    receipt: clientReceipt(result, { externalSubmission: false, jobId: pkg.job.id }),
   }
+  return { projectedWait, input }
 }

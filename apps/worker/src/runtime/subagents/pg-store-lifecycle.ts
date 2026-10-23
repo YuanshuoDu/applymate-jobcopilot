@@ -12,15 +12,37 @@ import { dateValue, json, transaction } from "./pg-store-persistence.js"
 import type { PgSubagentPool, SubagentTaskRecord } from "./types.js"
 import { recoverExpired as recoverExpiredImpl } from "./pg-store-expiry-recovery.js"
 import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
+import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { validateScheduledGateTaskGraphFinish } from "./pg-scheduled-task-graph-gate-verification.js"
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
-export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
+export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown; ownerId?: string; taskRole?: string; taskType?: string }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
   const safeInputResult = stripTaskGraphMetadata(input.result)
   const finalizedResult = (value: unknown, status: string): unknown => stripNonterminalDiscoveryRecovery(value, status, input.retry)
   const graphType = taskGraphEventType(input.status, input.retry)
   let graph = graphType ? await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: graphType, attemptCount: input.attemptCount, failureReason: input.failureReason }) : null
-  if (!graph || "blocked" in graph) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
-  const node = graph.snapshot.nodes.find(candidate => candidate.taskId === input.taskId)
+  const node = graph && !("blocked" in graph) ? graph.snapshot.nodes.find(candidate => candidate.taskId === input.taskId) : undefined
+  const gateCandidate = input.taskType === SCHEDULED_GATE_TASK_TYPE || node?.templateId === "gate"
+  const rejectGate = async () => {
+    const failureReason = "scheduled_gate_result_invalid"
+    const failedGraph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId,
+      type: "task.failed", attemptCount: input.attemptCount, failureReason })
+    return { graph: failedGraph, status: "failed", failureReason, result: finalizedResult(safeInputResult, "failed") }
+  }
+  if (!graph || "blocked" in graph) {
+    if (gateCandidate && (input.status === "completed" || input.status === "waiting_for_user" || input.status === "waiting")) return rejectGate()
+    return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
+  }
+  if (gateCandidate) {
+    if (input.status === "waiting" || input.status === "completed" || input.status === "waiting_for_user") {
+      const envelope = node?.templateId === "gate" && input.taskRole === SCHEDULED_GATE_ROLE
+        && input.taskType === SCHEDULED_GATE_TASK_TYPE && input.ownerId && input.status !== "waiting"
+        ? await validateScheduledGateTaskGraphFinish(client, { graph, taskId: input.taskId, ownerId: input.ownerId,
+          attemptCount: input.attemptCount, status: input.status, result: input.result }) : null
+      if (envelope) return { graph, status: envelope.status, result: envelope, reconcileDependents: envelope.status === "completed" }
+      return rejectGate()
+    }
+  }
   if (!node || (node.templateId !== "scout" && node.templateId !== "analyst" && node.templateId !== "prepare")) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
   if (node.templateId === "prepare") {
     if (input.status !== "completed") return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }

@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { postScheduledPipelineContinuation, scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { postScheduledPipelineContinuation, postScheduledPipelineExecute, postScheduledPipelineGate, scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
+import { scheduledGateCandidateSetDigest } from "./scheduled-gate-contract.js"
+import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
 
 const owner: ScheduledAutomationPipelineBridgeScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
@@ -23,6 +25,11 @@ const analyzeProof = (handoffOwner = owner) => {
   return { status: "analyze_checkpointed", continuationKey: scheduledTaskGraphContinuationKey(handoffOwner, attestation, executionId, executionAttemptCount),
     checkpointDigest: "b".repeat(64), claimTokenDigest: `sha256:${"c".repeat(64)}`, executionId, executionAttemptCount }
 }
+const prepareProof = { result: { jobs: [{ jobId: "job-1", status: "prepared" }, { jobId: "job-2", status: "skipped" }] } } as unknown as ScheduledPrepareTaskGraphProof
+const gateInput = { ...input, prepareProof, gateTaskId: "gate-1", gateLeaseOwnerId: "gate-worker-1", gateAttemptCount: 2 }
+const gateQuestion = { status: "question_required", kind: "weak_cover_letter", jobIds: ["job-1"],
+  candidateSetDigest: scheduledGateCandidateSetDigest("weak_cover_letter", ["job-1"]), allowedChoiceIds: ["continue", "review", "skip"] }
+const gateChoice = { kind: "weak_cover_letter", jobIds: ["job-1"], choiceId: "continue" } as const
 
 beforeEach(() => {
   vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
@@ -142,6 +149,68 @@ describe("scheduled pipeline HTTP handoff", () => {
     await expect(postScheduledPipelineContinuation(preparedInput, new AbortController().signal,
       vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "web-gate-wait-123", scheduledWaitId: "unexpected" }))))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_wait_identity_mismatch" })
+  })
+
+  it("accepts only the explicit Gate checkpoint after a verified Prepare handoff", async () => {
+    const preparedInput = { ...input, prepareProof: { proof: "opaque" } }
+    await expect(postScheduledPipelineContinuation(preparedInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(200, { status: "gate_checkpointed" }))))
+      .resolves.toEqual({ status: "gate_checkpointed" })
+    await expect(postScheduledPipelineContinuation(preparedInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report }))))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_gate_checkpoint_missing" })
+    await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(200, { status: "gate_checkpointed" }))))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_gate_checkpoint_unexpected" })
+  })
+
+  it("posts Execute only with the typed Gate completion proof and accepts a wait response without a wait ID", async () => {
+    const prepared = { prepareProof: { result: {} }, scheduledWaitId: "prepare-choice-wait-1",
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" } } as const
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) => {
+      expect(JSON.parse(String(init?.body))).toEqual({ action: "execute", ...input, ...prepared })
+      return reply(200, { status: "completed", report })
+    })
+    await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
+      .resolves.toEqual({ status: "completed" })
+    await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user" }))))
+      .resolves.toEqual({ status: "waiting_for_user" })
+    await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "must-not-leak" }))))
+      .rejects.toThrow("scheduled_pipeline_handoff_in_progress")
+    await expect(postScheduledPipelineExecute({ ...input, ...prepared, scheduledWaitId: " " } as never,
+      new AbortController().signal, fetcher)).rejects.toThrow("scheduled_pipeline_handoff_input_invalid")
+  })
+
+  it("posts only the fixed child fence and projected current/prior Gate choices", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, gateQuestion))
+    await expect(postScheduledPipelineGate({ ...gateInput, scheduledWaitId: "root-wait-1",
+      validatedChoice: gateChoice as never,
+      priorChoices: [gateChoice] }, new AbortController().signal, fetcher)).resolves.toEqual(gateQuestion)
+    const [url, init] = fetcher.mock.calls[0]!
+    expect(url).toBe("https://applymate.example/api/internal/agent-runtime/scheduled-pipeline")
+    expect(new Headers(init?.headers).get("x-agent-worker-secret")).toBe("worker-secret-canary")
+    expect(JSON.parse(String(init?.body))).toEqual({ action: "gate", ...gateInput, scheduledWaitId: "root-wait-1",
+      validatedChoice: gateChoice, priorChoices: [gateChoice] })
+    expect(String(init?.body)).not.toContain("scheduledGateChoiceBinding")
+    expect(String(init?.body)).not.toContain("claimToken")
+    await expect(postScheduledPipelineGate({ ...gateInput,
+      validatedChoice: { ...gateChoice, scheduledGateChoiceBinding: "private" } as never }, new AbortController().signal, fetcher))
+      .rejects.toThrow("scheduled_pipeline_gate_input_invalid")
+  })
+
+  it("rejects malformed Gate outcomes and maps only typed Gate blocks", async () => {
+    await expect(postScheduledPipelineGate(gateInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(200, { ...gateQuestion, unexpected: true }))))
+      .rejects.toThrow("scheduled_pipeline_gate_response_invalid")
+    await expect(postScheduledPipelineGate(gateInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(200, { ...gateQuestion, jobIds: ["job-2"],
+        candidateSetDigest: scheduledGateCandidateSetDigest("weak_cover_letter", ["job-2"]) }))))
+      .rejects.toThrow("scheduled_pipeline_gate_response_invalid")
+    await expect(postScheduledPipelineGate(gateInput, new AbortController().signal,
+      vi.fn<typeof fetch>(async () => reply(409, { status: "blocked", errorCode: "scheduled_pipeline_gate_task_stale" }))))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_gate_task_stale" })
   })
 
   it.each(["different-scheduled-choice", undefined])("rejects a missing or mismatched scheduled wait echo (%s)", async echoedScheduledWaitId => {

@@ -19,8 +19,26 @@ import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-cat
 import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-structured-failure-category.js"
 import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
-import type { ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
+import type {
+  ScheduledAnalyzeCheckpointHandoff,
+  ScheduledGateCompletionProof,
+  ScheduledTaskGraphExecutionOwner,
+  TaskGraphScheduledGateCompletionInput,
+  TaskGraphScheduledGateInput,
+  TaskGraphScheduledGateResumeInput,
+  TaskGraphScheduledGateResumeReceipt,
+  TaskGraphScheduledPrepareInput,
+} from "./scheduled-gate-contract.js"
+export type {
+  ScheduledAnalyzeCheckpointHandoff,
+  ScheduledTaskGraphExecutionOwner,
+  TaskGraphScheduledGateCompletionInput,
+  TaskGraphScheduledGateInput,
+  TaskGraphScheduledGateResumeInput,
+  TaskGraphScheduledGateResumeReceipt,
+  TaskGraphScheduledPrepareInput,
+} from "./scheduled-gate-contract.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,
@@ -154,26 +172,6 @@ export type TaskGraphScheduleInput = Readonly<{
   verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>
 
-export type ScheduledAnalyzeCheckpointHandoff = Readonly<{
-  status: "analyze_checkpointed"
-  continuationKey: string
-  checkpointDigest: string
-  claimTokenDigest: string
-  executionId: string
-  executionAttemptCount: number
-}>
-export type ScheduledTaskGraphExecutionOwner = Readonly<{ executionId: string; executionAttemptCount: number }>
-export type TaskGraphScheduledPrepareInput = Readonly<{
-  scope: TaskGraphExecutionScope
-  /** Independently sourced from the leased scheduled execution claim. */
-  executionOwner: ScheduledTaskGraphExecutionOwner
-  /** Authenticated Analyze-only Web response; the digest is opaque to Worker. */
-  handoff: ScheduledAnalyzeCheckpointHandoff
-  attestation: ScheduledAutomationPipelineAttestation
-  /** Server-produced one-node proposal; continuation binding is never proposal content. */
-  proposal: TaskGraphProposal
-}>
-
 /** Exact proposal shape accepted by the scheduled-only Prepare command. */
 export function parseScheduledPrepareProposal(value: unknown, analystKey: string, analyzeRevision: number): TaskGraphProposal | undefined {
   if (!boundedString(analystKey, 128) || !Number.isSafeInteger(analyzeRevision) || analyzeRevision < 1
@@ -268,6 +266,12 @@ export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
   /** Scheduled-only same-root append; production callers must fail closed if absent. */
   appendScheduledPrepare?(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt>
+  /** Server-only fixed Gate registration; never exposed to model planning. */
+  appendScheduledGate?(input: TaskGraphScheduledGateInput): Promise<TaskGraphScheduleReceipt>
+  /** Atomic private-answer acknowledgement, Gate requeue, lifecycle, and outbox write. */
+  resumeScheduledGateChoice?(input: TaskGraphScheduledGateResumeInput): Promise<TaskGraphScheduledGateResumeReceipt>
+  /** Re-loads strict Gate result/history and returns proof only after canonical completion validation. */
+  verifyScheduledGateCompletion?(input: TaskGraphScheduledGateCompletionInput): Promise<ScheduledGateCompletionProof | null>
   appendAndScheduleWithReconciliation?(input: TaskGraphScheduleInput, operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt>
   reconcileSteering?(operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphKeepReconciliationReceipt>
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */

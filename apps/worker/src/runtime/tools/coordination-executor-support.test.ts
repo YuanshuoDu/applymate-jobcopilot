@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { DurableWaitStoreError } from "../subagents/durable-wait-store.js"
+import type { DurableWaitScheduledGateInvocation } from "./coordination-types.js"
 import { digestNativeVerificationValue, NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "./coordination-types.js"
@@ -278,6 +279,22 @@ describe("coordination executor support", () => {
     }
     await expect(wrapped.wait(input)).resolves.toBe(expected)
     expect(wait.wait).toHaveBeenCalledOnce()
+  })
+
+  it("keeps the server-only scheduled Gate wait off the generic tool-safe port", async () => {
+    const wait = vi.fn(async () => ({ waitId: "wait-1", status: "waiting" as const, deadlineAt: "2026-10-04T12:00:00.000Z", matchedTaskIds: [] }))
+    const waitScheduledGate = vi.fn(async (_input: DurableWaitScheduledGateInvocation) => ({ waitId: "gate-wait", status: "waiting" as const, deadlineAt: "2026-10-04T12:00:00.000Z", matchedTaskIds: [] }))
+    const cancel = vi.fn(async () => undefined)
+    const serverPort = { wait, waitScheduledGate, cancel }
+    const wrapped = toolSafeDurableWaitPort(serverPort)
+    expect(Object.keys(wrapped).sort()).toEqual(["cancel", "wait"])
+    expect("waitScheduledGate" in wrapped).toBe(false)
+    await wrapped.cancel?.({ userId: "user-1", sessionId: "session-1", taskId: "root-1", reason: "closed" })
+    expect(cancel).toHaveBeenCalledOnce()
+    await serverPort.waitScheduledGate({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1",
+      taskId: "root-1", rootTaskId: "root-1", timeoutMs: 1000, idempotencyKey: "gate-wait", gateTaskId: "gate-1", requestAttemptCount: 0 })
+    expect(waitScheduledGate).toHaveBeenCalledOnce()
+    expect(wait).not.toHaveBeenCalled()
   })
   it.each([
     ["wait_invalid", "Durable wait request is invalid"],

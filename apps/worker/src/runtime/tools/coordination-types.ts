@@ -109,6 +109,18 @@ export type DurableWaitInvocation = {
     idempotencyKey: string
 }
 
+/** Fixed server-only wait input; model-visible waits retain their own target and mode schema. */
+export type DurableWaitScheduledGateInvocation = Omit<DurableWaitInvocation, "targetTaskIds" | "mode"> & {
+  readonly gateTaskId: string
+  /** 0 for the first Gate attempt; N only after the private N to N+1 answer acknowledgement. */
+  readonly requestAttemptCount: number
+}
+
+/** Not part of DurableWaitPort, so the generic coordination tool cannot select this matcher. */
+export interface DurableWaitScheduledGatePort {
+  waitScheduledGate(input: DurableWaitScheduledGateInvocation): Promise<DurableWaitResult>
+}
+
 /** A bounded control projection; task details remain in the canonical wait outcome. */
 export type DurableWaitControl = {
   readonly waitId: string

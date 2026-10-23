@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { holdForApplicationReview, requestUserTakeover, skipApplicationForGate } from "./application-control"
 
 const mocks = vi.hoisted(() => ({
   taskUpsert: vi.fn(),
@@ -7,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   taskUpdate: vi.fn(),
   transaction: vi.fn(),
   eventCreate: vi.fn(),
+  queryRaw: vi.fn(),
 }))
 
 vi.mock("@/lib/db", () => ({
@@ -19,20 +21,20 @@ vi.mock("@/lib/db", () => ({
 
 describe("application control plane", () => {
   beforeEach(() => {
-    vi.resetModules()
     mocks.taskUpsert.mockReset().mockResolvedValue({ id: "task_1" })
     mocks.taskUpdateMany.mockReset().mockResolvedValue({ count: 1 })
     mocks.taskFindUnique.mockReset().mockResolvedValue({ id: "task_1", checkpoint: "materials_ready" })
     mocks.taskUpdate.mockReset().mockResolvedValue({ id: "task_1" })
     mocks.eventCreate.mockReset().mockResolvedValue({})
+    mocks.queryRaw.mockReset().mockResolvedValue([{ id: "session_1" }])
     mocks.transaction.mockReset().mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({
+      $queryRaw: mocks.queryRaw,
       applicationTask: { upsert: mocks.taskUpsert, updateMany: mocks.taskUpdateMany, findUnique: mocks.taskFindUnique },
       applicationTaskEvent: { create: mocks.eventCreate },
     }))
   })
 
   it("creates a durable review checkpoint without queuing a submission", async () => {
-    const { holdForApplicationReview } = await import("./application-control")
     await holdForApplicationReview({ userId: "user_1", jobId: "job_1", sessionId: "session_1", resumeId: "resume_1" })
     expect(mocks.taskUpsert).toHaveBeenCalledWith(expect.objectContaining({
       create: expect.objectContaining({ sessionId: "session_1", status: "waiting_for_user", checkpoint: "materials_ready" }),
@@ -58,9 +60,29 @@ describe("application control plane", () => {
     }))
   })
 
-  it("requires a session before creating or refreshing the review checkpoint", async () => {
-    const { holdForApplicationReview } = await import("./application-control")
+  it("rejects a scheduled Gate skip after its child lease fence is lost", async () => {
+    const assertScheduledGateCurrent = vi.fn(async () => false)
+    mocks.queryRaw.mockResolvedValueOnce([{ id: "session_1" }]).mockResolvedValueOnce([{ id: "turn_1", status: "waiting_for_user" }])
 
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      checkpoint: "review_quality_declined", owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      .rejects.toMatchObject({ name: "AgentExecutionCancelledError" })
+    expect(assertScheduledGateCurrent).toHaveBeenCalledOnce()
+    expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
+  })
+
+  it("allows a scheduled Gate skip only after its transactional child fence accepts", async () => {
+    const assertScheduledGateCurrent = vi.fn(async () => true)
+    mocks.queryRaw.mockResolvedValueOnce([{ id: "session_1" }]).mockResolvedValueOnce([{ id: "turn_1", status: "waiting_for_user" }])
+
+    await expect(skipApplicationForGate({ userId: "user_1", jobId: "job_1", sessionId: "session_1",
+      checkpoint: "below_match_threshold", owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", attemptCount: 2 }, assertScheduledGateCurrent } }))
+      .resolves.toBe(true)
+    expect(assertScheduledGateCurrent).toHaveBeenCalledOnce()
+    expect(mocks.taskUpdateMany).toHaveBeenCalledOnce()
+  })
+
+  it("requires a session before creating or refreshing the review checkpoint", async () => {
     await expect(holdForApplicationReview({ userId: "user_1", jobId: "job_1" }))
       .rejects.toThrow("application_review_session_scope_required")
 
@@ -71,8 +93,6 @@ describe("application control plane", () => {
     mocks.taskFindUnique.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "waiting_for_user", checkpoint: "materials_ready",
     })
-    const { holdForApplicationReview } = await import("./application-control")
-
     await expect(holdForApplicationReview({ userId: "user_1", jobId: "job_1", sessionId: "session_1" }))
       .resolves.toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
 
@@ -102,8 +122,6 @@ describe("application control plane", () => {
     mocks.taskFindUnique.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "waiting_for_user", checkpoint: "materials_ready",
     })
-    const { holdForApplicationReview } = await import("./application-control")
-
     await expect(holdForApplicationReview({ userId: "user_1", jobId: "job_1", sessionId: "session_1" }))
       .resolves.toMatchObject({ status: "waiting_for_user", checkpoint: "materials_ready" })
 
@@ -121,8 +139,6 @@ describe("application control plane", () => {
     mocks.taskFindUnique.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_1", status: "cancelled", checkpoint: "turn_stopped_before_submit",
     })
-    const { holdForApplicationReview } = await import("./application-control")
-
     await expect(holdForApplicationReview({ userId: "user_1", jobId: "job_1", sessionId: "session_1" }))
       .resolves.toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit" })
 
@@ -134,8 +150,6 @@ describe("application control plane", () => {
     mocks.taskFindUnique.mockResolvedValueOnce({
       id: "task_1", sessionId: "session_2", status: "generating_materials", checkpoint: "tailoring_and_cover_letter",
     })
-    const { holdForApplicationReview } = await import("./application-control")
-
     await expect(holdForApplicationReview({ userId: "user_1", jobId: "job_1", sessionId: "session_1" }))
       .resolves.toMatchObject({ sessionId: "session_2", status: "generating_materials" })
 
@@ -148,8 +162,6 @@ describe("application control plane", () => {
   it.each(["submission_request_started", "submission_uncertain"] as const)("preserves a concurrent %s checkpoint and does not emit a materials-ready event", async checkpoint => {
     mocks.taskUpdateMany.mockResolvedValueOnce({ count: 0 })
     mocks.taskFindUnique.mockResolvedValueOnce({ id: "task_1", status: "filling", checkpoint })
-    const { holdForApplicationReview } = await import("./application-control")
-
     await expect(holdForApplicationReview({ userId: "user_1", jobId: "job_1", sessionId: "session_1" }))
       .resolves.toMatchObject({ status: "filling", checkpoint })
 
@@ -171,7 +183,6 @@ describe("application control plane", () => {
 
   it("moves CAPTCHA, login and MFA cases to a user-takeover checkpoint", async () => {
     mocks.taskFindUnique.mockResolvedValueOnce({ id: "task_1", status: "waiting_for_user", checkpoint: "user_takeover" })
-    const { requestUserTakeover } = await import("./application-control")
     await requestUserTakeover({ userId: "user_1", jobId: "job_1", reason: "captcha", detail: "CAPTCHA detected" })
     expect(mocks.taskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: {
@@ -190,8 +201,6 @@ describe("application control plane", () => {
     mocks.taskUpdateMany.mockResolvedValueOnce({ count: 0 })
     const status = checkpoint === "turn_stopped_before_submit" ? "cancelled" : "filling"
     mocks.taskFindUnique.mockResolvedValueOnce({ id: "task_1", status, checkpoint })
-    const { requestUserTakeover } = await import("./application-control")
-
     await expect(requestUserTakeover({ userId: "user_1", jobId: "job_1", reason: "captcha", detail: "CAPTCHA detected" }))
       .resolves.toMatchObject({ status, checkpoint })
 

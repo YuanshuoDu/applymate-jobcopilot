@@ -25,9 +25,8 @@ export type ScheduledPrepareDependencyWait = Readonly<{ waitId: string; status: 
 export type ScheduledPrepareTaskGraphProof = Readonly<{ receipt: ScheduledTaskGraphContinuationReceipt; completion: ScheduledPrepareCompletionFacts & Readonly<{ wait: ScheduledPrepareDependencyWait }>; result: PrepareResult }>
 export type ScheduledPrepareVerification = Readonly<{ verified: true; facts: ScheduledPrepareTaskGraphProofFacts }> | Readonly<{ verified: false; reasonCode: string }>
 /** Verifies Prepare against its exact registered call, Analyze lineage, checkpoint, and immutable material rows. */
-export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; referenceVerificationMode: ScheduledPrepareToolResultVerificationMode }>): Promise<ScheduledPrepareVerification> {
-  try {
-    const scope = input.scope, result = validateRoleResult(input.structuredResult, "prepare")
+export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable, input: Readonly<{ scope: ScheduledPrepareVerificationScope; snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: ReadonlyMap<string, GraphTaskRow>; structuredResult: unknown; completionGraphRevision: number; referenceVerificationMode: ScheduledPrepareToolResultVerificationMode; checkpointStage?: "prepare" | "gate" }>): Promise<ScheduledPrepareVerification> {
+  try { const scope = input.scope, result = validateRoleResult(input.structuredResult, "prepare")
     if (result.status !== "completed" || result.taskId !== scope.taskId || result.attemptCount !== scope.attemptCount)
       return rejected("scheduled_prepare_result_invalid")
     const snapshot = parseTaskGraphSnapshot(input.snapshot)
@@ -45,7 +44,7 @@ export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable,
     const automation = parseScheduledAutomationSnapshot(record(record(turnRows.rows[0])?.input)?.scheduledAutomationSnapshot)
     const handoffKey = await verifyAnalyzePrefix(client, scope, snapshot, current, input.tasks, scout!, analyst!, scoutTask, analystTask, receipt)
     if (!handoffKey) return rejected("scheduled_prepare_analyze_invalid")
-    const checkpoint = automation ? await readCheckpoint(client, receipt, automation, handoffKey) : null
+    const checkpoint = automation ? await readCheckpoint(client, receipt, automation, handoffKey, input.checkpointStage ?? "prepare") : null
     if (!checkpoint || checkpoint.checkpointDigest !== receipt.checkpointDigest) return rejected("scheduled_prepare_checkpoint_invalid")
     const expectedIds = checkpoint.eligibleJobIds
     if (!sameIds(result.jobs.map(job => job.jobId), expectedIds) || result.snapshotDigest !== receipt.snapshotDigest
@@ -162,16 +161,16 @@ async function receiptOwnerMatchesCurrentRoot(client: Queryable, scope: Schedule
   [owner.rootTaskId, scope.sessionId, scope.turnId, scope.userId])
   return rows.rows.length === 1 && Number(record(rows.rows[0])?.attemptCount) === owner.rootAttemptCount
 }
-async function readCheckpoint(client: Queryable, receipt: ScheduledTaskGraphContinuationReceipt, automation: NonNullable<ReturnType<typeof parseScheduledAutomationSnapshot>>, handoffKey: string): Promise<{ checkpointDigest: string; eligibleJobIds: string[] } | null> {
+async function readCheckpoint(client: Queryable, receipt: ScheduledTaskGraphContinuationReceipt, automation: NonNullable<ReturnType<typeof parseScheduledAutomationSnapshot>>, handoffKey: string, checkpointStage: "prepare" | "gate"): Promise<{ checkpointDigest: string; eligibleJobIds: string[] } | null> {
   const owner = receipt.owner
   const rows = await client.query(`SELECT "status", "attemptCount", "checkpoint", "state" FROM "agent_executions"
     WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3`, [owner.executionId, owner.userId, owner.sessionId])
   if (rows.rows.length !== 1) return null
   const execution = record(rows.rows[0]), state = record(execution?.state), marker = record(state?.scheduledTaskGraphContinuation)
-  if (!execution || execution.status !== "running" || Number(execution.attemptCount) !== owner.executionAttemptCount || execution.checkpoint !== "prepare"
-    || !state || state.nextStage !== "prepare" || !marker || marker.key !== handoffKey || marker.snapshotDigest !== receipt.snapshotDigest
+  if (!execution || execution.status !== "running" || Number(execution.attemptCount) !== owner.executionAttemptCount || execution.checkpoint !== checkpointStage
+    || !state || state.nextStage !== checkpointStage || !marker || marker.key !== handoffKey || marker.snapshotDigest !== receipt.snapshotDigest
     || marker.graphRevision !== receipt.analyzeGraphRevision || marker.evidenceDigest !== receipt.evidenceDigest) return null
-  const computed = analyzeCheckpointDigest(state, receipt, handoffKey)
+  const computed = analyzeCheckpointDigest(checkpointStage === "gate" ? { ...state, nextStage: "prepare" } : state, receipt, handoffKey, checkpointStage === "gate")
   if (!computed) return null
   const scored = record(state)?.scoredJobs
   const eligible = Array.isArray(scored) ? scored.map(value => { const row = record(value); return { job: record(row?.job), score: row?.score } })
@@ -241,12 +240,12 @@ function parseEnvelope(value: unknown, withDiscovery: boolean): Row | null {
     || !safeCount(row.stepCount) || !safeCount(row.toolCallCount) || !Object.hasOwn(row, "structuredResult")) return null
   return row
 }
-function analyzeCheckpointDigest(state: Row, receipt: ScheduledTaskGraphContinuationReceipt, handoffKey: string): string | null {
+function analyzeCheckpointDigest(state: Row, receipt: ScheduledTaskGraphContinuationReceipt, handoffKey: string, allowTurnLeaseDrift = false): string | null {
   const marker = record(state.scheduledTaskGraphContinuation), scouted = state.scoutedJobs, scored = state.scoredJobs
   if (state.nextStage !== "prepare" || !marker || !Array.isArray(scouted) || !Array.isArray(scored) || !safeCount(state.analysisFailed)) return null
   const owner = receipt.owner, stableOwner = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount]
   if (marker.key !== handoffKey || marker.snapshotDigest !== receipt.snapshotDigest || marker.graphRevision !== receipt.analyzeGraphRevision
-    || marker.evidenceDigest !== receipt.evidenceDigest || !same(marker.owner, owner)) return null
+    || marker.evidenceDigest !== receipt.evidenceDigest || !(allowTurnLeaseDrift ? sameStableOwner(marker.owner, owner) : same(marker.owner, owner))) return null
   const scoutedIds = new Set<string>()
   for (const value of scouted) { const job = record(value); if (!job || !validId(job.id) || job.userId !== owner.userId || scoutedIds.has(job.id)) return null; scoutedIds.add(job.id) }
   if (Number(state.analysisFailed) + scored.length !== scoutedIds.size) return null
@@ -291,6 +290,7 @@ function parseDependencyWait(value: unknown, taskId: string | undefined): Schedu
   return row as unknown as ScheduledPrepareDependencyWait
 }
 function sameOwnerScope(receipt: ScheduledTaskGraphContinuationReceipt, scope: ScheduledPrepareVerificationScope): boolean { const owner = receipt.owner; return owner.userId === scope.userId && owner.sessionId === scope.sessionId && owner.turnId === scope.turnId && owner.rootTaskId === scope.rootTaskId }
+function sameStableOwner(value: unknown, owner: ScheduledTaskGraphContinuationReceipt["owner"]): boolean { const row = record(value); return Boolean(row && exact(row, ["executionAttemptCount", "executionId", "rootAttemptCount", "rootTaskId", "sessionId", "turnId", "turnLeaseOwnerId", "turnLeaseVersion", "userId"]) && validId(row.turnLeaseOwnerId) && positive(row.turnLeaseVersion) && same([row.userId, row.sessionId, row.turnId, row.rootTaskId, row.rootAttemptCount, row.executionId, row.executionAttemptCount], [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount])) }
 function sameIds(left: readonly string[], right: readonly string[]): boolean { return left.length === right.length && left.every(id => right.includes(id)) } function unique(values: readonly string[]): boolean { return new Set(values).size === values.length }
 function emptyRecord(value: unknown): boolean { const row = record(value); return Boolean(row && !Reflect.ownKeys(row).length) } function exact(value: Row, keys: readonly string[]): boolean { const actual = Reflect.ownKeys(value); return actual.length === keys.length && actual.every(key => typeof key === "string" && keys.includes(key)) }
 function record(value: unknown): Row | null { const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null; try { const proto = Object.getPrototypeOf(parsed); return proto === Object.prototype || proto === null ? parsed as Row : null } catch { return null } }

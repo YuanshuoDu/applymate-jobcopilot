@@ -8,6 +8,7 @@ import type { ScheduledPipelineCandidate, ScheduledPipelineCandidateIdentity } f
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import type { ScheduledPipelineGateContinuationInput, ScheduledPipelineGateContinuationResult } from "./scheduled-automation-gate-bridge.js"
 
 export type ScheduledPipelineDependencyWait = Readonly<{ status: "waiting_for_dependency"; waitId: string }>
 export type ScheduledPipelineChoiceWait = Readonly<{ status: "waiting_for_choice"; waitId: string }>
@@ -27,6 +28,7 @@ export type ScheduledPipelinePrepareContinuationInput = Readonly<{
 }>
 /** Must idempotently append or schedule Prepare under this exact root and replay its durable wait. */
 export type ScheduledPipelinePrepareContinuation = (input: ScheduledPipelinePrepareContinuationInput) => Promise<ScheduledPipelinePrepareContinuationResult>
+export type ScheduledPipelineGateContinuation = (input: ScheduledPipelineGateContinuationInput) => Promise<ScheduledPipelineGateContinuationResult>
 
 export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
   owner: ScheduledAutomationPipelineBridgeScope
@@ -39,6 +41,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
   signal: AbortSignal
   bridge: (scope: ScheduledAutomationPipelineBridgeScope) => Promise<ScheduledAutomationPipelineBridgeResult>
   continueAfterAnalyze?: ScheduledPipelinePrepareContinuation
+  continueAfterGate?: ScheduledPipelineGateContinuation
   recoveredCandidate?: ScheduledPipelineCandidate
   fetcher?: typeof fetch
   isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
@@ -74,6 +77,17 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
         return { status: "waiting_for_external_user", externalWaitId: gate.waitId, candidateText: input.candidateText }
       }
       if (gate.status === "analyze_checkpointed") return { status: "blocked", errorCode: "scheduled_pipeline_prepare_proof_not_accepted" }
+      if (gate.status !== "gate_checkpointed" || !input.continueAfterGate) {
+        return { status: "blocked", errorCode: "scheduled_pipeline_gate_checkpoint_missing" }
+      }
+      const gateResult = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
+        attestation: evidence.attestation, handoff: continuation.proof, prepareProof: prepared.prepareProof as ScheduledPipelineGateContinuationInput["prepareProof"],
+        ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
+        finalStepId: input.finalStepId, signal: input.signal })
+      if (gateResult.status === "waiting_for_dependency") return { status: gateResult.status, waitId: gateResult.waitId, candidateText: input.candidateText }
+      if (gateResult.status === "waiting_for_choice") return { status: "waiting_for_scheduled_gate_choice", waitId: gateResult.waitId,
+        question: gateResult.question, binding: gateResult.binding, candidateText: input.candidateText }
+      if (gateResult.status === "blocked") return gateResult
       return { status: "completed", candidateText: input.candidateText }
     }
     return { status: "completed", candidateText: input.candidateText }
@@ -90,6 +104,7 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
   recoveredCandidate?: ScheduledPipelineCandidate
   bridge: (scope: ScheduledAutomationPipelineBridgeScope) => Promise<ScheduledAutomationPipelineBridgeResult>
   continueAfterAnalyze?: ScheduledPipelinePrepareContinuation
+  continueAfterGate?: ScheduledPipelineGateContinuation
   fetcher?: typeof fetch
   onWebAccepted(): void
   stageCandidate(input: ScheduledPipelineCandidateIdentity & { candidateText: string }): Promise<void>
@@ -103,8 +118,10 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
       stageCandidate: input.stageCandidate, rootAttemptCount: input.rootAttemptCount,
       finalStepId: recovered?.finalStepId ?? stepId, finalStepOrdinal: recovered?.finalStepOrdinal ?? stepOrdinal,
       bridge: input.bridge, ...(input.continueAfterAnalyze ? { continueAfterAnalyze: input.continueAfterAnalyze } : {}),
+      ...(input.continueAfterGate ? { continueAfterGate: input.continueAfterGate } : {}),
       ...(input.fetcher ? { fetcher: input.fetcher } : {}), ...(isOwnershipLost ? { isOwnershipLost } : {}) })
-    if (disposition.status === "completed" || disposition.status === "waiting_for_user" || disposition.status === "waiting_for_external_user"
+    if (disposition.status === "completed" || disposition.status === "waiting_for_user" || disposition.status === "waiting_for_scheduled_gate_choice"
+      || disposition.status === "waiting_for_external_user"
       || disposition.status === "waiting_for_dependency") input.onWebAccepted()
     return disposition
   }

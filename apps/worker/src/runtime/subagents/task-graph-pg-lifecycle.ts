@@ -54,6 +54,7 @@ export async function prepareGraphTransition(client: Queryable, input: {
   type: TaskGraphEventType
   attemptCount?: number
   failureReason?: string
+  gateChoiceResume?: Readonly<{ gateTaskId: string; requestAttemptCount: number; resumedAttemptCount: number }>
 }): Promise<GraphTransitionPreparation> {
   const identity = await client.query(`SELECT task."turnId", task."rootTaskId", task."parentTaskId", task."attemptCount", session."userId"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -76,7 +77,7 @@ export async function prepareGraphTransition(client: Queryable, input: {
   }
   const attemptCount = input.attemptCount ?? Number(row.attemptCount) + (input.type === "task.started" ? 1 : 0)
   if (!Number.isSafeInteger(attemptCount) || attemptCount < 0) throw new Error("task_graph_attempt_count_invalid")
-  const event = sanitizeTaskGraphLifecycleEvent(makeEvent({ ...input, attemptCount }, node.key, loaded.state.revision, scope.parentTaskId))
+  const event = sanitizeTaskGraphLifecycleEvent(makeEvent({ ...input, attemptCount }, input.taskId, node.key, loaded.state.revision, scope.parentTaskId))
   const reduced = reduceTaskGraphEvent(loaded.state, event)
   if (!reduced.ok) {
     if (reduced.error.code === "dependencies_incomplete" || reduced.error.code === "blocked_dependency") return { blocked: true }
@@ -248,11 +249,20 @@ export async function deleteGraphDispatch(client: Queryable, sessionId: string, 
   [sessionId, `subagent-dispatch:${taskId}`])
 }
 
-function makeEvent(input: { type: TaskGraphEventType; attemptCount: number; failureReason?: string }, nodeKey: string, expectedRevision: number, parentTaskId: string): TaskGraphEvent {
+function makeEvent(input: { type: TaskGraphEventType; attemptCount: number; failureReason?: string; taskId: string;
+  gateChoiceResume?: Readonly<{ gateTaskId: string; requestAttemptCount: number; resumedAttemptCount: number }> },
+  taskId: string, nodeKey: string, expectedRevision: number, parentTaskId: string): TaskGraphEvent {
   const idempotencyKey = taskGraphLifecycleKey(parentTaskId, nodeKey, input.attemptCount, input.type)
   if (input.type === "task.failed") return {
     idempotencyKey, expectedRevision, nodeKey, type: input.type,
     failureReason: input.failureReason || "Child task failed.",
   }
+  if (input.type === "task.gate_choice_resumed") {
+    const resume = input.gateChoiceResume
+    if (!resume || resume.gateTaskId !== taskId || resume.requestAttemptCount !== input.attemptCount
+      || resume.resumedAttemptCount !== resume.requestAttemptCount + 1) throw new Error("task_graph_gate_choice_resume_invalid")
+    return { idempotencyKey, expectedRevision, nodeKey, type: input.type, ...resume }
+  }
+  if (input.gateChoiceResume) throw new Error("task_graph_gate_choice_resume_invalid")
   return { idempotencyKey, expectedRevision, nodeKey, type: input.type }
 }

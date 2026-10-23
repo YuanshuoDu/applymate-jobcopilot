@@ -1,9 +1,12 @@
+import type { PoolClient } from "pg"
 import { RUNNABLE_SESSION, assertSessionWorkAdmission } from "../session-gate.js"
 import { lockSubagentTurnForWork, readSubagentTask, SubagentTurnUnavailableError } from "./pg-store-create.js"
 import { transaction } from "./pg-store-persistence.js"
 import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
 import { PAUSE_DEFERRED_MARKER, parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { parseSubagentDispatchIdentity, SubagentDispatchIdentityMismatchError, type SubagentDispatchIdentity } from "./dispatch-identity.js"
+import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { matchScheduledGateWaitTarget } from "./scheduled-gate-wait-match.js"
 
 type ClaimInput = { taskId: string; sessionId: string; ownerId: string; rootTaskId?: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }
 
@@ -48,6 +51,27 @@ const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
       WHERE child."id" = target."value" #>> '{}' AND child."id" <> task."id"
         AND child."parentTaskId" = task."id" AND child."sessionId" = task."sessionId"
         AND child."turnId" = task."turnId" AND child."rootTaskId" = task."rootTaskId"))) = true`
+
+const ANSWER_STEP_SQL = `SELECT DISTINCT item."stepId" FROM "agent_items" AS item
+  JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId"
+  WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."type" = 'question'
+    AND item."status" = 'completed' AND item."content"->>'stage' = 'scheduled_gate'
+    AND item."content"->'scheduledGateChoiceBinding'->>'gateTaskId' = $4
+    AND item."content"->'scheduledGateChoiceBinding'->>'gateAttempt' = $5
+    AND item."content"->'scheduledGateChoiceResumeAcknowledgement'->>'requestAttemptCount' = $5
+    AND item."content"->'scheduledGateChoiceResumeAcknowledgement'->>'resumedAttemptCount' = $6
+    AND step."taskId" = $3 AND step."status" = 'waiting_for_user' LIMIT 2`
+
+async function hasScheduledGateResumeAcknowledgement(client: Pick<PoolClient, "query">, input: {
+  taskId: string; sessionId: string; turnId: string; rootTaskId: string; userId: string; attemptCount: number
+}): Promise<boolean> {
+  const steps = await client.query<{ stepId: string }>(ANSWER_STEP_SQL, [input.sessionId, input.turnId, input.rootTaskId,
+    input.taskId, String(input.attemptCount), String(input.attemptCount + 1)])
+  const stepId = steps.rows.length === 1 ? steps.rows[0]?.stepId : undefined
+  if (typeof stepId !== "string" || !stepId.trim()) return false
+  return await matchScheduledGateWaitTarget(client, { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId,
+    rootTaskId: input.rootTaskId, stepId, gateTaskId: input.taskId, requestAttemptCount: input.attemptCount }) === "pending"
+}
 
 /** Read-only identity check used only to classify local concurrency denial. */
 export async function matchesPublishedSubagentDispatch(pool: PgSubagentPool, input: { payload: SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean> {
@@ -98,12 +122,12 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
 
     await assertSessionWorkAdmission(client, { userId, sessionId: input.sessionId, turnId })
 
-    const root = await client.query(`SELECT "id", "turnId", "status", "interruptRequestedAt" FROM "sub_agent_tasks"
+    const root = await client.query(`SELECT "id", "turnId", "status", "attemptCount", "interruptRequestedAt" FROM "sub_agent_tasks"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [rootTaskId, input.sessionId, turnId])
     const rootRow = root.rows[0] as Record<string, unknown> | undefined
     if (!rootRow || rootRow.interruptRequestedAt != null || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(rootRow.status))) return null
 
-    const task = await client.query(`SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt" FROM "sub_agent_tasks"
+    const task = await client.query(`SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt", "role", "taskType", "attemptCount", "maxAttempts" FROM "sub_agent_tasks"
       WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [input.taskId, input.sessionId])
     const taskRow = task.rows[0] as Record<string, unknown> | undefined
     if (!taskRow || taskRow.turnId !== turnId || taskRow.rootTaskId !== rootTaskId
@@ -131,6 +155,12 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
       if (!payload || payload.taskId !== input.taskId || payload.sessionId !== input.sessionId
         || payload.rootTaskId !== rootTaskId || payload.ownerId !== input.ownerId) return null
     }
+    const taskAttemptCount = Number(taskRow.attemptCount)
+    const scheduledGateResume = currentDispatchIdentity && taskRow.role === SCHEDULED_GATE_ROLE
+      && taskRow.taskType === SCHEDULED_GATE_TASK_TYPE && Number.isSafeInteger(taskAttemptCount)
+      && taskAttemptCount >= Number(taskRow.maxAttempts)
+      ? await hasScheduledGateResumeAcknowledgement(client, { taskId: input.taskId, sessionId: input.sessionId,
+        turnId, rootTaskId, userId, attemptCount: taskAttemptCount }) : false
     const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
       WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp()`, [input.sessionId])
     if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
@@ -142,14 +172,14 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
         "startedAt" = COALESCE("startedAt", clock_timestamp()), "updatedAt" = clock_timestamp()
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $5 AND "rootTaskId" = $6
         AND "status" = 'queued' AND "interruptRequestedAt" IS NULL
-        AND ("attemptCount" < "maxAttempts" OR ($8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL}))
-        AND (NOT ${CHILD_WAIT_RESUMABLE_SQL} OR $8::boolean)
+        AND ("attemptCount" < "maxAttempts" OR ($8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL}) OR $9::boolean)
+        AND (NOT (${CHILD_WAIT_RESUMABLE_SQL} OR $9::boolean) OR $8::boolean)
         AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= clock_timestamp())
         AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= clock_timestamp())
         AND EXISTS (SELECT 1 FROM "sub_agent_tasks" root WHERE root."id" = $6 AND root."sessionId" = $2
           AND root."turnId" = $5 AND root."interruptRequestedAt" IS NULL
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
-    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId, userId, currentDispatchIdentity])
+    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId, userId, currentDispatchIdentity, scheduledGateResume])
     if (updated.rowCount !== 1) return null
     if (graph) await persistGraphTransition(client, graph, input.now)
     return readSubagentTask(client, input.taskId, input.sessionId)

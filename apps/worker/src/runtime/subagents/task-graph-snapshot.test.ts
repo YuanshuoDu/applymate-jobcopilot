@@ -18,6 +18,15 @@ describe("parseTaskGraphEvent", () => {
     expect(parseTaskGraphEvent(JSON.stringify(queuedEvent))).toEqual(queuedEvent)
   })
 
+  it("parses only the bounded Gate-choice-resume event identity and attempt pair", () => {
+    const event = { type: "task.gate_choice_resumed", idempotencyKey: "resume-gate-3", expectedRevision: 8,
+      nodeKey: "gate", gateTaskId: "gate-task", requestAttemptCount: 3, resumedAttemptCount: 4 }
+    expect(parseTaskGraphEvent(event)).toEqual(event)
+    expect(parseTaskGraphEvent(JSON.stringify(event))).toEqual(event)
+    expect(parseTaskGraphEvent({ ...event, resumedAttemptCount: 5 })).toBeNull()
+    expect(parseTaskGraphEvent({ ...event, choiceId: "skip" })).toBeNull()
+  })
+
   it("rejects unknown and malformed lifecycle events", () => {
     expect(parseTaskGraphEvent({ ...queuedEvent, type: "task.unknown" })).toBeNull()
     expect(parseTaskGraphEvent({ ...queuedEvent, nodeKey: " " })).toBeNull()

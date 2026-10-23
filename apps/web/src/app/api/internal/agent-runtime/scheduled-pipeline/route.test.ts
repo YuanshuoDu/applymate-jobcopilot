@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   turn: vi.fn(), root: vi.fn(), session: vi.fn(), user: vi.fn(), execution: vi.fn(), claim: vi.fn(), jobs: vi.fn(),
-  question: vi.fn(), runPipeline: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
+  question: vi.fn(), runPipeline: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
 }));
 vi.mock("@/lib/db", () => ({ db: {
   agentTurn: { findFirst: mocks.turn }, subAgentTask: { findFirst: mocks.root },
@@ -11,6 +11,7 @@ vi.mock("@/lib/db", () => ({ db: {
   agentItem: { findFirst: mocks.question },
 } }));
 vi.mock("@/lib/agent/run-service", () => ({ runAgentPipeline: mocks.runPipeline }));
+vi.mock("@/lib/agent/scheduled-taskgraph-gate-runtime-rpc", () => ({ runScheduledTaskGraphActionRpc: mocks.gateAction }));
 vi.mock("@/lib/agent/scheduled-taskgraph-run-service", () => ({
   isScheduledPrepareChoiceWaitId: (turnId: string, value: unknown) => typeof value === "string" && value.startsWith(`agent-question:${turnId}:canonical:`) && /^[a-f0-9]{64}$/.test(value.slice(`agent-question:${turnId}:canonical:`.length)),
   validateScheduledPrepareWaitIdentity: mocks.validatePrepareWait,
@@ -816,6 +817,25 @@ describe("scheduled pipeline continuation route", () => {
     }));
   });
 
+  it("normalizes Execute-tail waits to the Worker bridge status contract", async () => {
+    const waitId = "agent-question:turn-1:canonical:q1";
+    const prior = waitingState();
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+      status: "waiting_for_user", source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, rootTaskId: owner.rootTaskId,
+      leaseOwnerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "waiting_for_user", attemptCount: 0, state: prior });
+    mocks.question.mockResolvedValueOnce(canonicalQuestion(waitId));
+    mocks.gateAction.mockImplementationOnce(async (parsed: unknown) => ({ kind: "execute", request: parsed as never }));
+    const { POST } = await import("./route");
+    const response = await POST(request({ action: "execute", owner, attestation, prepareProof: {}, scheduledWaitId: waitId,
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+        prepareProof: {}, gate: { taskId: "gate-1", attemptCount: 1, resultDigest: "sha256:" + "a".repeat(64), completedEventRevision: 1 } } }));
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ status: "waiting_for_user" });
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
   it("keeps an answered wait typed while its Turn has not resumed", async () => {
     mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
       status: "waiting_for_user", source: "automation", executionMode: "canonical_task_graph",

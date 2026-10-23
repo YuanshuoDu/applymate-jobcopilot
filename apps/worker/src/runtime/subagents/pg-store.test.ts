@@ -4,6 +4,8 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { deriveTaskGraphReadModel } from "../planning/task-graph.js"
 
 import { PgSubagentTaskStore } from "./pg-store.js"
+import * as pgStoreLifecycle from "./pg-store-lifecycle.js"
+import { scheduledGateRegistrationReceiptKey } from "./scheduled-gate-registration-receipt.js"
 import { normalizeSubagentPolicy, PAUSE_DEFERRED_MARKER, SubagentLimitError, type SubagentPolicy } from "./types.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
@@ -122,12 +124,12 @@ function fakePool(
         const owned = ownsTurn(turnId, sessionId, userId)
         return { rows: owned ? [{ id: sessionId }] : [], rowCount: owned ? 1 : 0, ...result }
       }
-      if (sql.startsWith('SELECT "id", "turnId", "status", "interruptRequestedAt"') && result.rows === undefined) {
+      if (sql.startsWith('SELECT "id", "turnId", "status", "attemptCount", "interruptRequestedAt"') && result.rows === undefined) {
         const rootTaskId = String(params?.[0] ?? "")
         const turnId = String(params?.[2] ?? "")
         const ownedRoot = String(params?.[1] ?? "") === owner.sessionId
           && Object.values(bindings).some(binding => binding.rootTaskId === rootTaskId && binding.turnId === turnId)
-        return { rows: ownedRoot ? [{ id: rootTaskId, turnId, status: "running", interruptRequestedAt: null }] : [], rowCount: ownedRoot ? 1 : 0, ...result }
+        return { rows: ownedRoot ? [{ id: rootTaskId, turnId, status: "running", attemptCount: 1, interruptRequestedAt: null }] : [], rowCount: ownedRoot ? 1 : 0, ...result }
       }
       if (sql.startsWith('SELECT root."id", root."turnId", root."status", root."interruptRequestedAt"') && result.rows === undefined) {
         const rootTaskId = String(params?.[0] ?? "")
@@ -1398,5 +1400,43 @@ describe("PgSubagentTaskStore", () => {
     expect(result[0]?.status).toBe("interrupted")
     const select = fake.calls.find(([sql]) => sql.includes('session."status" AS "sessionStatus"'))?.[0] ?? ""
     expect(select).toContain('session."status"')
+  })
+
+  it("locks a scheduled Gate finish in session, Turn, root, child, execution, graph order", async () => {
+    const order: string[] = []
+    const continuationKey = `scheduled-taskgraph:sha256:${"a".repeat(64)}`
+    const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      rootAttemptCount: 1, executionId: "execution-1", executionAttemptCount: 0 }
+    const receipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-binding.v1", owner, continuationKey,
+      snapshotDigest: `sha256:${"b".repeat(64)}`, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
+      analyzeGraphRevision: 10, prepareScheduleRevision: 11, prepareWaitId: "prepare-wait", gateTaskId: "gate-1", gateAppendRevision: 12 }
+    const gate = taskRow({ id: "gate-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+      parentTaskId: "root-1", role: "prepare", taskType: "scheduled_taskgraph_gate", status: "running", attemptCount: 1,
+      maxAttempts: 3, leaseOwner: "gate-worker", leaseExpiresAt: new Date(now.getTime() + 60_000), sessionStatus: "running" })
+    const fake = fakePool((sql, params) => {
+      if (sql.startsWith('SELECT task.*, session."userId" AS "userId"')) return { rows: [gate] }
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) { order.push("session"); return { rows: [{ id: "session-1", userId: "user-1", status: "running" }] } }
+      if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) { order.push("turn"); return { rows: [{ id: "turn-1", status: "waiting_for_tool" }] } }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('"parentTaskId" IS NULL') && sql.includes("FOR UPDATE")) { order.push("root"); return { rows: [{ id: "root-1" }] } }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('"taskType" = $6') && sql.includes("FOR UPDATE")) { order.push("gate"); return { rows: [{ id: "gate-1" }] } }
+      if (sql.includes('FROM "agent_events"') && sql.includes('"type" = \'agent.plan.scheduled_gate_binding\'')) return { rows: [{ payload: receipt }] }
+      if (sql.includes('SELECT event."itemId"')) return { rows: [{ itemId: null, taskId: null, actor: "system",
+        idempotencyKey: scheduledGateRegistrationReceiptKey(continuationKey, "gate-1"), payload: receipt, hasOutbox: false }] }
+      if (sql.includes('FROM "agent_executions"') && sql.includes("FOR UPDATE")) { order.push("execution"); return { rows: [{ id: "execution-1" }] } }
+      if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [gate] }
+      if (sql.includes('SELECT clock_timestamp()')) return { rows: [{ checkedAt: now }] }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const graph = vi.spyOn(pgStoreLifecycle, "prepareTaskGraphFinish").mockImplementationOnce(async (_client, input) => {
+      order.push("graph")
+      return { graph: null, status: input.status, result: input.result }
+    })
+    try {
+      const store = new PgSubagentTaskStore(fake.pool)
+      await expect(store.finish({ taskId: "gate-1", sessionId: "session-1", ownerId: "gate-worker", attemptCount: 1,
+        status: "completed", result: {}, now })).resolves.toBe("completed")
+      expect(order).toEqual(["session", "turn", "root", "gate", "execution", "graph"])
+    } finally { graph.mockRestore() }
   })
 })

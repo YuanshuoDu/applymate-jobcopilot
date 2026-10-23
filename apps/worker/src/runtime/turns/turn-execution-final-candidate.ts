@@ -134,6 +134,25 @@ export async function completeTurnCandidate(input: Readonly<{
     input.onStepClosed()
     return { kind: "wait", result: { status: "waiting_for_user", waitId: gate.scheduledWaitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
   }
+  if (gate && "scheduledGateChoice" in gate) {
+    const choice = gate.scheduledGateChoice
+    if (choice.candidateText !== output.text) throw new TurnEngineError("invalid_output", "Scheduled Gate wait changed the final candidate")
+    try {
+      if (!options.store.waitForQuestion) throw new Error("scheduled_gate_choice_store_unavailable")
+      const receipt = await options.store.waitForQuestion({ identity: options.identity, stepId: step.id, toolCallId: null,
+        expectedWaitId: choice.waitId, gateChoiceBinding: choice.binding, gateChoiceQuestion: choice.question,
+        finishReason: output.finishReason, usage: output.usage, now: now() })
+      if (receipt.waitId !== choice.waitId) throw new TurnEngineError("persistence_conflict", "Scheduled Gate wait ID did not match the expected receipt")
+      if (receipt.status === "answered") throw new TurnStateRefreshRetryError()
+    } catch (error: unknown) {
+      if (error instanceof TurnEngineError && error.code === "persistence_conflict") throw error
+      if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(signal)
+        || signal.aborted || options.isOwnershipLost?.(error, signal)) throw error
+      throw new TurnStateRefreshRetryError()
+    }
+    input.onStepClosed()
+    return { kind: "wait", result: { status: "waiting_for_user", waitId: choice.waitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
+  }
   if (gate && "externalWaitId" in gate) {
     if (!gate.externalWaitId.trim() || gate.externalWaitId === gate.scheduledWaitId) {
       throw new TurnEngineError("invalid_output", "Scheduled Web wait identity is invalid")

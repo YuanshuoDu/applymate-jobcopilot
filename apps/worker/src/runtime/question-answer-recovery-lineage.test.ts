@@ -51,8 +51,11 @@ function client(itemRows: Row[] = [item()], eventRows: Row[] = events(), rootOnl
     }
     if (sql.includes('event."idempotencyKey" = ANY($2::text[])')) return { rows: [] }
     if (sql.includes('SELECT prior."id", prior."createdAt", root."id" AS "rootTaskId"')) return { rows: [], rowCount: 0 }
-    return { rows: sql.includes('FROM "agent_items"')
-      ? rootOnly ? itemRows.filter(row => row.taskId === rootTaskId) : itemRows : eventRows }
+    if (!sql.includes('FROM "agent_items"')) return { rows: eventRows }
+    const candidates = rootOnly ? itemRows.filter(row => row.taskId === rootTaskId) : itemRows
+    const rows = sql.includes(`IS DISTINCT FROM 'scheduled_gate'`)
+      ? candidates.filter(row => (row.content as Row | undefined)?.stage !== 'scheduled_gate') : candidates
+    return { rows, rowCount: rows.length }
   }) }
   return value as unknown as Pick<pg.PoolClient, "query"> & { readonly query: typeof value.query }
 }
@@ -87,6 +90,32 @@ describe("durable question answer lineage", () => {
         { id: "agent-question:question-2:answer", content: { role: "user", type: "answer", questionId: "wait-2", text: "Cork" } },
       ] })
     expect(await recoverAnsweredQuestionHistory(client(rows, eventRows), supplied)).toEqual(lineage.flatMap(row => row.entries))
+  })
+
+  it("excludes private scheduled Gate choices from generic recovery while retaining ordinary and legacy questions", async () => {
+    const ordinary = item("ordinary-question", "ordinary-wait", "ordinary-call", { taskId: rootTaskId })
+    const legacy = item("legacy-question", "legacy-wait", "legacy-call", { taskId: null })
+    const gate = item("gate-question", "gate-wait", "unused-call", { taskId: rootTaskId, content: {
+      ...(item("gate-question", "gate-wait", "unused-call").content as Row), toolCallId: null, stage: "scheduled_gate",
+      answer: "skip", answerAvailable: true,
+      scheduledGateChoiceBinding: { privateBinding: "DO_NOT_PROJECT" },
+      scheduledGateChoiceResumeAcknowledgement: { privateAck: "DO_NOT_PROJECT" },
+    } })
+    const eventRows = [...events(ordinary), ...events(legacy), ...events(gate)]
+    const f = client([ordinary, legacy, gate], eventRows)
+    const lineage = await recoverAnsweredQuestionLineage(f, input({ toolItems: [
+      { id: "ordinary-call-item", stepId: "step-1", taskId: rootTaskId, type: "tool_call", content: { toolCallId: "ordinary-call" } },
+      { id: "legacy-call-item", stepId: "step-1", taskId: rootTaskId, type: "tool_call", content: { toolCallId: "legacy-call" } },
+    ] }))
+
+    expect(lineage.map(row => row.item.id)).toEqual(expect.arrayContaining([ordinary.id, legacy.id]))
+    expect(lineage.map(row => row.item.id)).toHaveLength(2)
+    expect(lineage.flatMap(row => row.entries).map(entry => entry.content)).toEqual(expect.arrayContaining([
+      { role: "assistant", type: "question", question: "Where should I focus?", options: [{ label: "Dublin", value: "dublin" }] },
+      { role: "user", type: "answer", questionId: "ordinary-wait", text: "dublin" },
+    ]))
+    expect(JSON.stringify(lineage)).not.toMatch(/DO_NOT_PROJECT|skip/)
+    expect(f.query.mock.calls.some(([sql]) => sql.includes(`IS DISTINCT FROM 'scheduled_gate'`))).toBe(true)
   })
 
   it("accepts the broker's null-task answer for a turn-scoped question only with the matching root tool call", async () => {

@@ -4,7 +4,12 @@ import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphExecutionSco
 import type { ScheduledPipelinePrepareContinuation } from "./scheduled-pipeline-completion.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
-import { buildScheduledPrepareTaskGraphProof, type ScheduledPrepareTaskGraphProof, type ScheduledPrepareVerification } from "./scheduled-prepare-task-graph-verification.js"
+import { buildScheduledPrepareTaskGraphProof, SCHEDULED_PREPARE_COMPLETION_SCHEMA, SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA,
+  scheduledPrepareResultDigest, type ScheduledPrepareTaskGraphProof, type ScheduledPrepareVerification } from "./scheduled-prepare-task-graph-verification.js"
+import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import { validateRoleResult } from "./role-results.js"
+import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_OUTPUT_SCHEMA,
+  SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
 
 const WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1_000
 const PREPARE_GOAL = "Prepare application materials using the persisted scheduled Analyze checkpoint."
@@ -13,7 +18,8 @@ const PREPARE_CRITERIA = [
   "Persist immutable owner-fenced material references and return no resume or letter bodies.",
 ]
 
-type PipelineTask = Readonly<{ id: string; role: string; taskType: string; status: string; attemptCount: number; failureReason: string | null; expectedOutputSchema: unknown; allowedActions: unknown }>
+type PipelineTask = Readonly<{ id: string; role: string; taskType: string; status: string; attemptCount: number; failureReason: string | null;
+  expectedOutputSchema: unknown; allowedActions: unknown; result?: unknown; rootTaskId?: string; parentTaskId?: string }>
 export type ScheduledAnalyzePrefix<T extends PipelineTask = PipelineTask> = Readonly<{ snapshot: TaskGraphSnapshot; current: TaskGraphCurrentState; tasks: readonly T[] }>
 export type ScheduledPipelinePrepareResult = Readonly<{ status: "waiting_for_dependency"; waitId: string }>
   | Readonly<{ status: "waiting_for_choice"; waitId: string }>
@@ -21,16 +27,17 @@ export type ScheduledPipelinePrepareResult = Readonly<{ status: "waiting_for_dep
     choice: Readonly<{ required: true; status: "answered"; scheduledWaitId: string }> | Readonly<{ required: false }> }>
 type ReadyPrepareVerifier = (input: Readonly<{ scope: TaskGraphExecutionScope; prepareTaskId: string; signal: AbortSignal }>) => Promise<ScheduledPrepareVerification>
 
-/** Projects the stable Scout+Analyst revision from an exact initial graph or one appended Prepare node. */
+/** Projects the immutable Scout+Analyst revision from its exact Prepare proof after later Gate appends. */
 export function projectScheduledAnalyzePrefix<T extends PipelineTask>(snapshotValue: unknown, current: TaskGraphCurrentState, tasks: readonly T[]): ScheduledAnalyzePrefix<T> | null {
   let snapshot: TaskGraphSnapshot
   try { snapshot = parseTaskGraphSnapshot(snapshotValue) } catch { return null }
   const count = snapshot.nodes.length
-  if ((count !== 2 && count !== 3) || current.nodes.length !== count || tasks.length !== count
+  if ((count !== 2 && count !== 3 && count !== 4) || current.nodes.length !== count || tasks.length !== count
     || !Number.isSafeInteger(current.revision) || current.revision < count) return null
   const [scout, analyst, prepare] = snapshot.nodes
   if (scout?.templateId !== "scout" || scout.depth !== 1 || scout.dependsOn.length !== 0
     || analyst?.templateId !== "analyst" || analyst.depth !== 2 || analyst.dependsOn.length !== 1 || analyst.dependsOn[0] !== scout.key) return null
+  let analyzeRevision = current.revision
   if (prepare) {
     const currentPrepare = current.nodes.find(node => node.key === prepare.key), task = tasks.find(value => value.id === prepare.taskId)
     if (prepare.key !== "prepare" || prepare.templateId !== "prepare" || prepare.depth !== 3 || prepare.dependsOn.length !== 1
@@ -40,15 +47,79 @@ export function projectScheduledAnalyzePrefix<T extends PipelineTask>(snapshotVa
       || !currentPrepare || currentPrepare.taskId !== prepare.taskId || currentPrepare.templateId !== "prepare"
       || currentPrepare.status !== task?.status || currentPrepare.failureReason !== task?.failureReason
       || !task || task.role !== TASK_GRAPH_TEMPLATES.prepare.role || task.taskType !== TASK_GRAPH_TEMPLATES.prepare.taskType
-      || task.status !== "queued" || task.attemptCount !== 0 || task.failureReason !== null
+      || task.status !== "completed" || !Number.isSafeInteger(task.attemptCount) || task.attemptCount < 1 || task.failureReason !== null
       || !sameJson(task.expectedOutputSchema, TASK_GRAPH_TEMPLATES.prepare.expectedOutputSchema)
       || !sameJson(task.allowedActions, TASK_GRAPH_TEMPLATES.prepare.allowedActions)) return null
+    const prepared = prepareAnalyzeRevision(task, prepare, snapshot, current.revision)
+    if (prepared === null) return null
+    analyzeRevision = prepared
+    if (count === 4 && !validGateSuffix(snapshot.nodes[3], current, tasks, task)) return null
   }
+  if (count === 2 && (snapshot.nodes.length !== 2 || current.nodes.length !== 2)) return null
   const prefix = parseTaskGraphSnapshot({ schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2),
     ...(snapshot.rootSuccessCriteria ? { rootSuccessCriteria: snapshot.rootSuccessCriteria } : {}) })
-  return { snapshot: prefix, current: { revision: count === 3 ? current.revision - 1 : current.revision,
+  return { snapshot: prefix, current: { revision: analyzeRevision,
     nodes: current.nodes.slice(0, 2), ...(current.rootSuccessCriteria ? { rootSuccessCriteria: current.rootSuccessCriteria } : {}) }, tasks: tasks.slice(0, 2) }
 }
+
+function prepareAnalyzeRevision<T extends PipelineTask>(task: T, node: TaskGraphSnapshot["nodes"][number], snapshot: TaskGraphSnapshot, currentRevision: number): number | null {
+  const envelope = record(task.result), facts = record(envelope?.taskGraphScheduledPrepareProofFacts)
+  const receipt = parseScheduledTaskGraphContinuationReceipt(facts?.receipt), completion = record(facts?.completion)
+  if (!envelope || envelope.status !== "completed" || !sameJson(envelope.structuredResult, facts?.result)
+    || !facts || !exact(facts, ["schemaVersion", "receipt", "completion", "result"])
+    || facts.schemaVersion !== SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA || !receipt
+    || receipt.continuationKey !== scheduledTaskGraphStableContinuationKey(receipt)
+    || receipt.prepareScheduleRevision !== receipt.analyzeGraphRevision + 1
+    || receipt.prepareScheduleRevision > currentRevision || !completion
+    || !exact(completion, ["schemaVersion", "graphRevision", "nodes"])
+    || completion.schemaVersion !== SCHEDULED_PREPARE_COMPLETION_SCHEMA || !positive(completion.graphRevision)
+    || completion.graphRevision <= receipt.prepareScheduleRevision || completion.graphRevision > currentRevision
+    || !Array.isArray(completion.nodes) || completion.nodes.length !== 3
+    || receipt.owner.rootTaskId !== task.parentTaskId || task.rootTaskId !== task.parentTaskId) return null
+  let result: ReturnType<typeof validatePrepareResult>
+  try { result = validatePrepareResult(facts.result) } catch { return null }
+  if (result.status !== "completed" || result.taskId !== task.id || result.attemptCount !== task.attemptCount
+    || result.snapshotDigest !== receipt.snapshotDigest || result.checkpointDigest !== receipt.checkpointDigest
+    || scheduledPrepareResultDigest(result) !== (completion.nodes[2] as Record<string, unknown> | undefined)?.resultDigest) return null
+  for (let index = 0; index < 3; index += 1) {
+    const graphNode = snapshot.nodes[index], certified = record(completion.nodes[index])
+    if (!graphNode || !certified || graphNode.taskId !== certified.taskId || graphNode.templateId !== certified.role
+      || certified.status !== "completed" || certified.verification !== "passed"
+      || Number(certified.attemptCount) < 1 || !Array.isArray(certified.dependsOnTaskIds)
+      || !sameJson(certified.dependsOnTaskIds, index === 0 ? [] : [snapshot.nodes[index - 1]?.taskId])) return null
+  }
+  return receipt.analyzeGraphRevision
+}
+
+function validatePrepareResult(value: unknown) { return validateRoleResult(value, "prepare") }
+
+function validGateSuffix<T extends PipelineTask>(node: TaskGraphSnapshot["nodes"][number] | undefined, current: TaskGraphCurrentState,
+  tasks: readonly T[], prepare: T): boolean {
+  const gate = node, state = gate && current.nodes.find(value => value.key === gate.key), task = gate && tasks.find(value => value.id === gate.taskId)
+  return Boolean(gate && gate.key === SCHEDULED_GATE_TEMPLATE_ID && gate.templateId === SCHEDULED_GATE_TEMPLATE_ID
+    && gate.depth === 4 && gate.dependsOn.length === 1 && gate.dependsOn[0] === "prepare"
+    && gate.verificationDisposition === "specialized" && gate.verification === undefined
+    && gate.goal === SCHEDULED_GATE_NODE_GOAL && sameJson(gate.successCriteria, SCHEDULED_GATE_NODE_CRITERIA)
+    && state && state.taskId === gate.taskId && state.templateId === SCHEDULED_GATE_TEMPLATE_ID && state.status === task?.status
+    && state.failureReason === task?.failureReason && task && task.role === SCHEDULED_GATE_ROLE && task.taskType === SCHEDULED_GATE_TASK_TYPE
+    && Number.isSafeInteger(task.attemptCount) && task.attemptCount >= 0 && !task.failureReason
+    && ["queued", "running", "waiting_for_user", "completed"].includes(task.status)
+    && (task.status === "queued" || task.attemptCount > 0)
+    && sameJson(task.expectedOutputSchema, SCHEDULED_GATE_OUTPUT_SCHEMA) && sameJson(task.allowedActions, [])
+    && task.rootTaskId === prepare.rootTaskId && task.parentTaskId === prepare.parentTaskId
+    && task.rootTaskId === task.parentTaskId && !!task.rootTaskId)
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : null
+}
+function exact(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Reflect.ownKeys(value)
+  return actual.length === keys.length && actual.every(key => typeof key === "string" && keys.includes(key))
+}
+function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 
 /** Appends the fixed Prepare node and waits on its durable same-root TaskGraph task. */
 export function createScheduledAutomationPrepareContinuation(input: Readonly<{
@@ -128,12 +199,16 @@ export function createScheduledAutomationPrepareContinuation(input: Readonly<{
 function hasScheduledPrepare(graph: Awaited<ReturnType<TaskGraphCommandPort["readCurrent"]>>, expectedRevision: number): boolean {
   const prepare = graph.nodes.filter(node => node.key === "prepare")
   const analyst = graph.nodes.filter(node => node.templateId === "analyst")
-  return graph.revision >= expectedRevision && graph.nodes.length === 3 && prepare.length === 1 && analyst.length === 1
-    && prepare[0]?.templateId === "prepare" && prepare[0].taskId.trim().length > 0
+  const gate = graph.nodes.filter(node => node.key === SCHEDULED_GATE_TEMPLATE_ID)
+  const base = graph.revision >= expectedRevision && (graph.nodes.length === 3 || graph.nodes.length === 4)
+    && prepare.length === 1 && analyst.length === 1 && prepare[0]?.templateId === "prepare" && prepare[0].taskId.trim().length > 0
     && prepare[0].dependsOn.length === 1 && prepare[0].dependsOn[0] === analyst[0]?.key
-    && prepare[0].goal === PREPARE_GOAL && prepare[0].successCriteria.length === PREPARE_CRITERIA.length
-    && prepare[0].successCriteria.every((criterion, index) => criterion === PREPARE_CRITERIA[index])
-    && prepare[0].failureReason === null
+    && prepare[0].goal === PREPARE_GOAL && sameJson(prepare[0].successCriteria, PREPARE_CRITERIA)
+    && prepare[0].failureReason === null && prepare[0].status === "completed"
+  if (!base) return false
+  if (graph.nodes.length === 3) return gate.length === 0
+  return gate.length === 1 && gate[0]?.templateId === SCHEDULED_GATE_TEMPLATE_ID
+    && gate[0].status !== "failed" && gate[0].status !== "cancelled" && gate[0].failureReason === null
 }
 
 function waitKey(continuationKey: string, finalStepId: string): string {

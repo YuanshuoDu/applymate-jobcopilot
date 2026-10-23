@@ -12,6 +12,8 @@ import type { SubagentDispatchIdentity } from "./dispatch-identity.js"
 import { dateValue, json, rowToTask, SELECT_TASK, spawnKey, transaction, uniqueMessageIds } from "./pg-store-persistence.js"
 import { findUnobservedMailboxMessageIds } from "./subagent-mailbox-completion.js"
 import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
+import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { parseScheduledGateRegistrationReceipt, readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import type { SubagentFinishResult } from "./types.js"
 export class PgSubagentTaskStore implements SubagentStore {
   constructor(private readonly pool: PgSubagentPool, private readonly leaseMs = 60_000) {}
@@ -119,6 +121,7 @@ export class PgSubagentTaskStore implements SubagentStore {
         const row = task.rows[0] as Record<string, unknown> | undefined
         if (!row || String(row.id) !== input.taskId || String(row.sessionId) !== input.sessionId
           || row.status !== "running" || row.leaseOwner !== input.ownerId || Number(row.attemptCount) !== input.attemptCount) return null
+        if (row.taskType === SCHEDULED_GATE_TASK_TYPE && !await lockScheduledGateFinish(client, row, input)) return null
         const interrupted = row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined
         const retry = input.status === "failed" && !interrupted && input.retryDisposition !== "terminal" && Number(row.attemptCount) < Number(row.maxAttempts)
         let status = interrupted ? "interrupted" : retry ? "queued" : input.status
@@ -126,7 +129,7 @@ export class PgSubagentTaskStore implements SubagentStore {
         let failureReason = input.failureReason
         const finish = await prepareTaskGraphFinish(client, {
           taskId: input.taskId, sessionId: input.sessionId, attemptCount: input.attemptCount,
-          status, retry, failureReason, result,
+          status, retry, failureReason, result, ownerId: input.ownerId, taskRole: String(row.role), taskType: String(row.taskType),
         })
         status = finish.status; result = finish.result; failureReason = finish.failureReason
         const graph = finish.graph
@@ -255,3 +258,30 @@ export class PgSubagentTaskStore implements SubagentStore {
 }
 class FinishFenceSignal extends Error {}
 class DuplicateSpawnSignal extends Error {}
+
+async function lockScheduledGateFinish(client: pg.PoolClient, task: Record<string, unknown>, input: {
+  taskId: string; sessionId: string; ownerId: string; attemptCount: number
+}): Promise<boolean> {
+  const userId = String(task.userId), turnId = String(task.turnId), rootTaskId = String(task.rootTaskId)
+  if (task.parentTaskId !== rootTaskId || task.role !== SCHEDULED_GATE_ROLE) return false
+  const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [turnId, input.sessionId, userId])
+  const root = await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
+    AND "rootTaskId" = $1 AND "parentTaskId" IS NULL FOR UPDATE`, [rootTaskId, input.sessionId, turnId])
+  const gate = await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
+    AND "rootTaskId" = $4 AND "parentTaskId" = $4 AND "role" = $5 AND "taskType" = $6
+    AND "status" = 'running' AND "leaseOwner" = $7 AND "attemptCount" = $8
+    AND "leaseExpiresAt" > clock_timestamp() AND "interruptRequestedAt" IS NULL FOR UPDATE`,
+  [input.taskId, input.sessionId, turnId, rootTaskId, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, input.ownerId, input.attemptCount])
+  if (turn.rows.length !== 1 || root.rows.length !== 1 || gate.rows.length !== 1) return false
+  const event = await client.query(`SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+    AND "type" = 'agent.plan.scheduled_gate_binding' AND "payload"->>'gateTaskId' = $3`, [input.sessionId, turnId, input.taskId])
+  const receipt = event.rows.length === 1 && parseScheduledGateRegistrationReceipt(event.rows[0]?.payload)
+  if (!receipt || receipt.gateTaskId !== input.taskId) return false
+  const registered = await readScheduledGateRegistrationReceipt(client, { userId, sessionId: input.sessionId, turnId,
+    owner: receipt.owner, gateTaskId: input.taskId })
+  if (!registered) return false
+  const execution = await client.query(`SELECT "id" FROM "agent_executions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3
+    AND "status" = 'running' AND "attemptCount" = $4 FOR UPDATE`,
+  [registered.owner.executionId, userId, input.sessionId, registered.owner.executionAttemptCount])
+  return execution.rows.length === 1
+}

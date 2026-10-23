@@ -28,9 +28,13 @@ export const TASK_GRAPH_LIMITS = {
   maxDependencies: 8,
 } as const
 
-export type TaskGraphEventType = "task.started" | "task.queued" | "task.waiting" | "task.waiting_for_user" | "task.retrying" | "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled" | "task.closed"
+export type TaskGraphEventType = "task.started" | "task.queued" | "task.gate_choice_resumed" | "task.waiting" | "task.waiting_for_user" | "task.retrying" | "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled" | "task.closed"
 type TaskGraphEventBase = Readonly<{ idempotencyKey: string; expectedRevision: number; nodeKey: string }>
-export type TaskGraphEvent = TaskGraphEventBase & (Readonly<{ type: Exclude<TaskGraphEventType, "task.failed"> }> | Readonly<{ type: "task.failed"; failureReason: string }>)
+export type TaskGraphEvent = TaskGraphEventBase & (
+  | Readonly<{ type: Exclude<TaskGraphEventType, "task.failed" | "task.gate_choice_resumed"> }>
+  | Readonly<{ type: "task.failed"; failureReason: string }>
+  | Readonly<{ type: "task.gate_choice_resumed"; gateTaskId: string; requestAttemptCount: number; resumedAttemptCount: number }>
+)
 
 export type TaskGraphErrorCode = "invalid_shape" | "invalid_options" | "invalid_state" | "revision_mismatch" | "empty_proposal" | "duplicate_key" | "unknown_template" | "missing_dependency" | "dependency_cycle" | "node_limit" | "depth_limit" | "node_not_found" | "invalid_transition" | "dependencies_incomplete" | "blocked_dependency" | "idempotency_conflict" | "verification_required" | "verification_invalid" | "unsupported_verification_template" | "repair_invalid"
 export type TaskGraphError = Readonly<{ code: TaskGraphErrorCode; path: string; message: string }>
@@ -48,7 +52,7 @@ const TERMINAL = new Set<TaskGraphNodeStatus>(["completed", "failed", "interrupt
 const BLOCKING = new Set<TaskGraphNodeStatus>(["failed", "interrupted", "cancelled", "closed"])
 const ACTIVE_FROM: Readonly<Record<TaskGraphEventType, readonly TaskGraphNodeStatus[]>> = {
   "task.started": ["queued", "retrying", "waiting", "waiting_for_user"],
-  "task.queued": ["waiting"],
+  "task.queued": ["waiting"], "task.gate_choice_resumed": ["waiting_for_user"],
   "task.waiting": ["running"], "task.waiting_for_user": ["running"], "task.retrying": ["running"],
   "task.completed": ["running"], "task.failed": ["running"],
   "task.interrupted": ["queued", "running", "retrying", "waiting", "waiting_for_user"],
@@ -56,7 +60,7 @@ const ACTIVE_FROM: Readonly<Record<TaskGraphEventType, readonly TaskGraphNodeSta
   "task.closed": ["queued", "running", "retrying", "waiting", "waiting_for_user"],
 }
 const NEXT_STATUS: Readonly<Record<TaskGraphEventType, TaskGraphNodeStatus>> = {
-  "task.started": "running", "task.queued": "queued", "task.waiting": "waiting", "task.waiting_for_user": "waiting_for_user",
+  "task.started": "running", "task.queued": "queued", "task.gate_choice_resumed": "queued", "task.waiting": "waiting", "task.waiting_for_user": "waiting_for_user",
   "task.retrying": "queued", "task.completed": "completed", "task.failed": "failed",
   "task.interrupted": "interrupted", "task.cancelled": "cancelled", "task.closed": "closed",
 }
@@ -219,15 +223,27 @@ function parseEvent(value: unknown): TaskGraphEvent | TaskGraphFailure {
   if (!text(row.type) || !text(row.idempotencyKey) || !text(row.nodeKey) || !integer(row.expectedRevision, 0)) return fail("invalid_shape", "event", "Event identity, node key, and revision are required")
   const type = row.type as TaskGraphEventType
   if (!Object.hasOwn(ACTIVE_FROM, type)) return fail("invalid_shape", "event.type", "Unsupported task event")
-  const keys = type === "task.failed" ? "expectedRevision,failureReason,idempotencyKey,nodeKey,type" : "expectedRevision,idempotencyKey,nodeKey,type"
-  if (!plainRecord(value, keys) || (type === "task.failed" && !text(row.failureReason))) return fail("invalid_shape", "event", "Event has an invalid exact shape")
+  const keys = type === "task.failed" ? "expectedRevision,failureReason,idempotencyKey,nodeKey,type"
+    : type === "task.gate_choice_resumed" ? "expectedRevision,gateTaskId,idempotencyKey,nodeKey,requestAttemptCount,resumedAttemptCount,type"
+      : "expectedRevision,idempotencyKey,nodeKey,type"
+  if (!plainRecord(value, keys) || (type === "task.failed" && !text(row.failureReason))
+    || (type === "task.gate_choice_resumed" && (!text(row.gateTaskId) || !integer(row.requestAttemptCount, 1)
+      || !integer(row.resumedAttemptCount, 1) || row.resumedAttemptCount !== row.requestAttemptCount + 1))) {
+    return fail("invalid_shape", "event", "Event has an invalid exact shape")
+  }
   return type === "task.failed"
     ? { type, idempotencyKey: row.idempotencyKey as string, expectedRevision: row.expectedRevision as number, nodeKey: row.nodeKey as string, failureReason: row.failureReason as string }
+    : type === "task.gate_choice_resumed"
+      ? { type, idempotencyKey: row.idempotencyKey as string, expectedRevision: row.expectedRevision as number, nodeKey: row.nodeKey as string,
+        gateTaskId: row.gateTaskId as string, requestAttemptCount: row.requestAttemptCount as number, resumedAttemptCount: row.resumedAttemptCount as number }
     : { type, idempotencyKey: row.idempotencyKey as string, expectedRevision: row.expectedRevision as number, nodeKey: row.nodeKey as string }
 }
 function sameEvent(left: TaskGraphEvent, right: TaskGraphEvent): boolean {
   return left.type === right.type && left.idempotencyKey === right.idempotencyKey && left.expectedRevision === right.expectedRevision
-    && left.nodeKey === right.nodeKey && (left.type !== "task.failed" || (right.type === "task.failed" && left.failureReason === right.failureReason))
+    && left.nodeKey === right.nodeKey
+    && (left.type !== "task.failed" || (right.type === "task.failed" && left.failureReason === right.failureReason))
+    && (left.type !== "task.gate_choice_resumed" || (right.type === "task.gate_choice_resumed"
+      && left.gateTaskId === right.gateTaskId && left.requestAttemptCount === right.requestAttemptCount && left.resumedAttemptCount === right.resumedAttemptCount))
 }
 export function reduceTaskGraphEvent(state: TaskGraphState, value: unknown): TaskGraphTransitionResult {
   const event = parseEvent(value)
@@ -238,7 +254,12 @@ export function reduceTaskGraphEvent(state: TaskGraphState, value: unknown): Tas
   const node = state.nodes.find(item => item.key === event.nodeKey)
   if (!node) return fail("node_not_found", "event.nodeKey", "TaskGraph node does not exist")
   if (!ACTIVE_FROM[event.type].includes(node.status)) return fail("invalid_transition", "event.type", `Cannot apply ${event.type} to ${node.status}`)
-  if (event.type === "task.started" || event.type === "task.queued") {
+  if (event.type === "task.gate_choice_resumed" && (node.key !== "gate" || node.templateId !== "gate"
+    || node.taskId !== event.gateTaskId || node.depth !== 4 || node.dependsOn.length !== 1 || node.dependsOn[0] !== "prepare"
+    || node.verificationDisposition !== "specialized")) {
+    return fail("invalid_transition", "event.nodeKey", "Only the registered scheduled Gate can resume from a private choice")
+  }
+  if (event.type === "task.started" || event.type === "task.queued" || event.type === "task.gate_choice_resumed") {
     const byKey = new Map<string, TaskGraphNode>(state.nodes.map(item => [item.key, item] as const)), repaired = new Set(state.repairSatisfiedNodeKeys ?? []), pending = new Set(state.repairPendingNodeKeys ?? [])
     if (blockedByDependency(node, byKey, new Map(), repaired, pending)) return fail("blocked_dependency", "event.nodeKey", "A blocking dependency prevents this node from becoming ready")
     if (!node.dependsOn.every(key => byKey.get(key)?.status === "completed" || repaired.has(key))) return fail("dependencies_incomplete", "event.nodeKey", "All dependencies must be completed before a node can be queued or started")
