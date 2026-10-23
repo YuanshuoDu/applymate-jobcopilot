@@ -365,10 +365,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(thirdExit.code).toBe(0)
       expect(thirdExit.signal).toBeNull()
       expect(workerD.stdoutText.match(/WORKER_B_RESUMED/g) ?? []).toHaveLength(1)
-      const finished = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(
-        `SELECT "status", "attemptCount", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId],
+      const finished = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; failureReason: string | null }>(
+        `SELECT "status", "attemptCount", "leaseOwner", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId],
       )
-      expect(finished.rows[0]).toMatchObject({ status: "completed", attemptCount: 1, leaseOwner: null })
+      expect(finished.rows[0], JSON.stringify({ workerOutput: workerD.stdoutText, workerError: workerD.stderrText,
+        failureReason: finished.rows[0]?.failureReason }))
+        .toMatchObject({ status: "completed", attemptCount: 1, leaseOwner: null })
       const durable = await pool.query<{ status: string; consumedAt: Date | null; outcome: { status: string; matchedTaskIds: string[] } }>(
         `SELECT "status", "consumedAt", "result"->'outcome' AS "outcome" FROM "agent_wait_conditions"
          WHERE "parentTaskId" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId],
