@@ -101,6 +101,52 @@ describe("ensureAutomationTurn", () => {
     }))
   })
 
+  it("stores a validated owner snapshot only on a newly created manual Turn", async () => {
+    const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({ id: "turn_manual" }) } }
+
+    await ensureAutomationTurn(db, {
+      sessionId: "session_1", userId: "user_1", name: "Weekday Scout", automationRunMode: "manual",
+      scheduledAutomationSnapshot,
+    })
+
+    expect(db.agentTurn.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        input: {
+          goal: "Run automation: Weekday Scout",
+          automationRunMode: "manual",
+          scheduledAutomationSnapshot: {
+            schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+            ...scheduledAutomationSnapshot,
+          },
+        },
+      }),
+    }))
+  })
+
+  it("reuses an active manual Turn without replacing its original snapshot", async () => {
+    const originalSnapshot = {
+      schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+      targetRoles: ["Original role"], targetLocations: ["Original city"], minScore: 60, dailyCap: 3,
+      requireApproval: true, autoApply: false,
+    }
+    const existingTurn = { id: "turn_active_manual", input: { automationRunMode: "manual", scheduledAutomationSnapshot: originalSnapshot } }
+    const db = {
+      agentTurn: {
+        findFirst: vi.fn().mockResolvedValue(existingTurn),
+        create: vi.fn(),
+        update: vi.fn(),
+      },
+    }
+
+    await expect(ensureAutomationTurn(db, {
+      sessionId: "session_1", userId: "user_1", name: "Weekday Scout", automationRunMode: "manual",
+      scheduledAutomationSnapshot,
+    })).resolves.toEqual({ turnId: "turn_active_manual", created: false })
+    expect(db.agentTurn.create).not.toHaveBeenCalled()
+    expect(db.agentTurn.update).not.toHaveBeenCalled()
+    expect(existingTurn.input.scheduledAutomationSnapshot).toEqual(originalSnapshot)
+  })
+
   it("validates a scheduled snapshot before creating a new Turn", async () => {
     const db = { agentTurn: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn() } }
 

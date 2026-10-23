@@ -58,7 +58,7 @@ type EnsureAutomationTurnInput = {
   sessionId: string; userId: string; name: string
 } & (
   | { automationRunMode: "scheduled"; scheduledAutomationSnapshot: ScheduledAutomationSnapshotInput }
-  | { automationRunMode: "manual"; scheduledAutomationSnapshot?: never }
+  | { automationRunMode: "manual"; scheduledAutomationSnapshot?: ScheduledAutomationSnapshotInput }
 )
 
 /** Returns the active run Turn or atomically creates the next automation Turn. */
@@ -75,7 +75,7 @@ export async function ensureAutomationTurn(
   }
 
   const turnInput: Record<string, unknown> = { goal: `Run automation: ${input.name}`, automationRunMode: input.automationRunMode }
-  if (input.automationRunMode === "scheduled") {
+  if (input.scheduledAutomationSnapshot !== undefined) {
     turnInput.scheduledAutomationSnapshot = buildScheduledAutomationSnapshot(input.scheduledAutomationSnapshot)
   }
 
