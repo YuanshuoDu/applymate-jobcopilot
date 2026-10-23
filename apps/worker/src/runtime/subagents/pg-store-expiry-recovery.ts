@@ -34,9 +34,8 @@ const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
             AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount")))
     AND wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL
     AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait
-      WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
-        AND currentWait."turnId" = task."turnId" AND currentWait."stepId" = step."id"
-      ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)
+      JOIN "agent_steps" AS currentWaitStep ON currentWaitStep."id" = currentWait."stepId" AND currentWaitStep."sessionId" = currentWait."sessionId" AND currentWaitStep."turnId" = currentWait."turnId" AND currentWaitStep."taskId" = task."id" AND currentWaitStep."attempt" = task."attemptCount"
+      WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId" AND currentWait."turnId" = task."turnId" ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)
     AND wait."mode" IN ('any', 'all') AND jsonb_typeof(wait."targetTaskIds") = 'array'
     AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) > 0
     AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) <= 8
@@ -61,8 +60,9 @@ const CHILD_WAIT_CONSUMED_SQL = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(continu
     AND source."status" IN ('waiting_for_tool', 'completed') AND continuation."status" = 'streaming'
     AND continuation."ordinal" = (SELECT MAX(currentStep."ordinal") FROM "agent_steps" AS currentStep
       WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId" AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount")
-    AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
-        AND currentWait."turnId" = task."turnId" AND currentWait."stepId" = source."id" ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1))`
+    AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait
+      JOIN "agent_steps" AS currentWaitStep ON currentWaitStep."id" = currentWait."stepId" AND currentWaitStep."sessionId" = currentWait."sessionId" AND currentWaitStep."turnId" = currentWait."turnId" AND currentWaitStep."taskId" = task."id" AND currentWaitStep."attempt" = task."attemptCount"
+      WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId" AND currentWait."turnId" = task."turnId" ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1))`
 
 type ExpiredWaitDispatch = { id: string; payload: unknown; attemptCount: unknown; publishedAt: unknown }
 async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<string, unknown>, ignoredEventId?: string, continuationId?: string): Promise<boolean> {

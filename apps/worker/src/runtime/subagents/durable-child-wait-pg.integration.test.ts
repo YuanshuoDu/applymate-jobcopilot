@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
 import { subagentDispatchJobId } from "./dispatch-identity.js"
+import { CHILD_WAIT_RESUMABLE_SQL } from "../../queue/subagent-dispatch-eligibility.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const FINAL_MARKER = "parent-resumed-from-durable-child-result"
@@ -416,4 +417,43 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await queueRedis.quit().catch(() => queueRedis.disconnect())
     }
   }, 90_000)
+
+  it("selects the latest sequential wait by step ordinal at maxAttempts", async () => {
+    const client = await pool.connect()
+    try {
+      await client.query(`CREATE TEMP TABLE "sub_agent_tasks" (
+        "id" text, "parentTaskId" text, "sessionId" text, "turnId" text, "rootTaskId" text,
+        "status" text, "attemptCount" integer, "maxAttempts" integer
+      );
+      CREATE TEMP TABLE "agent_turns" ("id" text, "sessionId" text, "userId" text, "rootTaskId" text);
+      CREATE TEMP TABLE "agent_steps" (
+        "id" text, "sessionId" text, "turnId" text, "taskId" text, "attempt" integer, "status" text, "ordinal" integer
+      );
+      CREATE TEMP TABLE "agent_wait_conditions" (
+        "id" text, "parentTaskId" text, "sessionId" text, "turnId" text, "userId" text, "stepId" text,
+        "status" text, "suspendedAt" timestamptz, "consumedAt" timestamptz, "mode" text,
+        "targetTaskIds" jsonb, "createdAt" timestamptz
+      );`)
+      await client.query(`INSERT INTO "sub_agent_tasks" VALUES
+        ('child', 'root', 'session', 'turn', 'root', 'queued', 3, 3),
+        ('target', 'child', 'session', 'turn', 'root', 'completed', 1, 3)`)
+      await client.query(`INSERT INTO "agent_turns" VALUES ('turn', 'session', 'user', 'root')`)
+      await client.query(`INSERT INTO "agent_steps" VALUES
+        ('step-w1', 'session', 'turn', 'child', 3, 'completed', 0),
+        ('step-w2', 'session', 'turn', 'child', 3, 'waiting_for_tool', 1)`)
+      const sameRegistrationTime = new Date("2026-10-23T10:00:00.000Z")
+      await client.query(`INSERT INTO "agent_wait_conditions" VALUES
+        ('wait-w1', 'child', 'session', 'turn', 'user', 'step-w1', 'ready', $1, $1, 'any', '["target"]'::jsonb, $2),
+        ('wait-w2', 'child', 'session', 'turn', 'user', 'step-w2', 'waiting', $1, NULL, 'any', '["target"]'::jsonb, $2)`, [sameRegistrationTime, sameRegistrationTime])
+
+      const readEligibility = () => client.query<{ resumable: boolean }>(
+        `SELECT ${CHILD_WAIT_RESUMABLE_SQL} AS "resumable" FROM "sub_agent_tasks" AS task WHERE task."id" = 'child'`,
+      )
+      await expect(readEligibility()).resolves.toMatchObject({ rows: [{ resumable: false }] })
+      await client.query(`UPDATE "agent_wait_conditions" SET "status" = 'ready' WHERE "id" = 'wait-w2'`)
+      await expect(readEligibility()).resolves.toMatchObject({ rows: [{ resumable: true }] })
+    } finally {
+      client.release()
+    }
+  })
 })
