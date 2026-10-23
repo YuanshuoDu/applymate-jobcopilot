@@ -187,6 +187,15 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(firstOwner).toEqual(expect.any(String))
       expect(cut.rows[0]?.leaseExpiresAt).toBeInstanceOf(Date)
       expect(await firstJob!.getState()).toBe("active")
+      await expect(taskStore.release({ taskId: waiter.id, sessionId: ids.sessionId, ownerId: firstOwner!, attemptCount: 1, now: new Date() })).resolves.toBe(false)
+      const afterRelease = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null; dispatchAttemptCount: number; publishedAt: Date | null }>(
+        `SELECT task."status", task."attemptCount", task."leaseOwner", task."leaseExpiresAt", dispatch."attemptCount" AS "dispatchAttemptCount", dispatch."publishedAt"
+         FROM "sub_agent_tasks" AS task JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = task."sessionId"
+           AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id" AND dispatch."topic" = 'agent.subagent.dispatch'
+         WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
+      )
+      expect(afterRelease.rows[0]).toMatchObject({ status: "running", attemptCount: 1, leaseOwner: firstOwner,
+        leaseExpiresAt: cut.rows[0]!.leaseExpiresAt, dispatchAttemptCount: firstOutbox.rows[0]!.attemptCount, publishedAt: firstOutbox.rows[0]!.publishedAt })
       await stopWorker(workerA)
       const firstExit = await workerA.exited
       expect(firstExit.code).toBeNull()

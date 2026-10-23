@@ -6,7 +6,7 @@ vi.mock("./task-graph-pg-lifecycle.js", () => ({
   persistGraphTransition: graphMocks.persist,
 }))
 
-import { handoffDurableSubagentWait, handoffDurableSubagentWaitWithGraph, recoverExpiredDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
+import { handoffDurableSubagentWait, handoffDurableSubagentWaitWithGraph, recoverExpiredDurableSubagentWaitWithGraph, releaseDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
 
 const now = new Date("2026-10-22T10:00:00.000Z")
 const lease = {
@@ -25,6 +25,7 @@ function fixture(options: { wait?: boolean; waitStatus?: string; stepStatus?: st
         return { rows: [], rowCount: 1 }
       }
       if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('SELECT task."turnId", task."rootTaskId", task."leaseExpiresAt"')) return options.wait === false ? { rows: [], rowCount: 0 } : { rows: [{ turnId: "turn-1", rootTaskId: "root-1", leaseExpiresAt: lease.leaseExpiresAt, stepStatus: options.stepStatus ?? "waiting_for_tool" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && !sql.includes("ANY($1::text[])")) return { rows: [{
         id: "parent-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", status: state.taskStatus,
         attemptCount: 3, leaseOwner: state.taskStatus === "running" ? "worker-1" : null,
@@ -62,6 +63,31 @@ describe("handoffDurableSubagentWait", () => {
   beforeEach(() => {
     graphMocks.prepare.mockReset().mockResolvedValue(null)
     graphMocks.persist.mockReset().mockResolvedValue(undefined)
+  })
+
+  it("preserves the exact live lease when release meets a streaming wait", async () => {
+    const fake = fixture({ stepStatus: "streaming" })
+    await expect(releaseDurableSubagentWaitWithGraph(fake.client as never, {
+      id: lease.id, userId: lease.userId, sessionId: lease.sessionId, ownerId: lease.ownerId, attemptCount: lease.attemptCount, now,
+    })).resolves.toBe(false)
+    expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
+    expect(graphMocks.prepare).not.toHaveBeenCalled()
+  })
+
+  it("uses the graph-aware durable handoff for a completed tool step", async () => {
+    const fake = fixture({ targetStatus: "completed" })
+    await expect(releaseDurableSubagentWaitWithGraph(fake.client as never, {
+      id: lease.id, userId: lease.userId, sessionId: lease.sessionId, ownerId: lease.ownerId, attemptCount: lease.attemptCount, now,
+    })).resolves.toBe(true)
+    expect(fake.state).toMatchObject({ waitStatus: "ready", taskStatus: "queued", waitWrites: 1, taskWrites: 1, outboxWrites: 1 })
+  })
+
+  it("leaves the generic release path available when no durable wait is registered", async () => {
+    const fake = fixture({ wait: false })
+    await expect(releaseDurableSubagentWaitWithGraph(fake.client as never, {
+      id: lease.id, userId: lease.userId, sessionId: lease.sessionId, ownerId: lease.ownerId, attemptCount: lease.attemptCount, now,
+    })).resolves.toBeUndefined()
+    expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
   })
 
   it("returns undefined for a waiting child without a persisted matching wait", async () => {
