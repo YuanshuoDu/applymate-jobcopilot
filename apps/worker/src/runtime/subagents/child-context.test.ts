@@ -380,7 +380,7 @@ describe("child context", () => {
     const hydrateMessages = vi.fn<(input: ChildMailboxHydrationInput) => Promise<readonly CoordinationMailboxMessage[]>>(async input => {
       expect(input).toEqual({
         userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, rootTaskId: task.rootTaskId, toTaskId: task.id,
-        ownerId: identity.ownerId, attemptCount: identity.attemptCount, stepId: "step-durable", limit: 20,
+        ownerId: identity.ownerId, attemptCount: identity.attemptCount, stepId: "step-durable", limit: 20, priorityMessageIds: [],
       })
       return [
         mailboxMessage({ result: "stale" }, { id: "mailbox-stale", turnId: "turn-old" }),
@@ -548,6 +548,23 @@ describe("child context", () => {
     expect(first.blocks.find(block => block.id === "mailbox:metadata")?.content).toEqual({ cachedMessageCount: 20, maxCachedMessageCount: 20, omittedMessageCount: 2, omittedMessageCountScope: "max_per_read" })
     expect(second.blocks.find(block => block.id === "mailbox:metadata")?.content).toEqual({ cachedMessageCount: 20, maxCachedMessageCount: 20, omittedMessageCount: 2, omittedMessageCountScope: "max_per_read" })
     expect(builder.getMailboxMessageIds()).toEqual(messages.slice(0, 20).map(message => message.id))
+  })
+
+  it("presents required continuation ids before older mailbox rows within the 20-message cap", async () => {
+    const messages = Array.from({ length: 25 }, (_, index) => mailboxMessage({ order: index }, { id: `message-${index}` }))
+    const hydrateMessages = vi.fn<NonNullable<ChildMailboxReader["hydrateMessages"]>>(async input => {
+      const priority = new Set(input.priorityMessageIds)
+      return [...messages.filter(message => priority.has(message.id)), ...messages.filter(message => !priority.has(message.id))].slice(0, input.limit)
+    })
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages: vi.fn(async () => []), hydrateMessages }, [], undefined, ["message-24"])
+    const snapshot = childContextSnapshot(task)
+    const context = await builder.build({ scope: { userId: task.userId }, identity, stepId: "step-continuation", snapshot })
+    const presentedIds = context.blocks.filter(block => block.layer === "pending_input").map(block => block.id)
+
+    expect(hydrateMessages).toHaveBeenCalledWith(expect.objectContaining({ limit: 20, priorityMessageIds: ["message-24"] }))
+    expect(presentedIds).toHaveLength(20)
+    expect(presentedIds[0]).toBe("mailbox:message-24")
+    expect(builder.getMailboxMessageIds()).toContain("message-24")
   })
 
   it("keeps cached ids when a later mailbox read fails", async () => {

@@ -519,7 +519,7 @@ describe("child executor composition", () => {
     const hydrateMessages = vi.fn<(input: ChildMailboxHydrationInput) => Promise<readonly CoordinationMailboxMessage[]>>(async input => {
       expect(input).toEqual({
         userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, toTaskId: child.id,
-        ownerId: child.ownerId, attemptCount: child.attemptCount, stepId: expect.any(String), limit: 20,
+        ownerId: child.ownerId, attemptCount: child.attemptCount, stepId: expect.any(String), limit: 20, priorityMessageIds: [],
       })
       return [mailboxMessage(child)]
     })
@@ -778,6 +778,71 @@ describe("child executor composition", () => {
     })
 
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "turn_execution_failed" })
+  })
+
+  it("continues from its durable final, keeps resolved waits without re-acknowledging, and exposes accepted input", async () => {
+    const child = lease(), requests: HarnessModelRequest[] = [], startedOrdinals: number[] = []
+    const secret = "abcdefghijklmnop"
+    const refreshedExpiry = new Date("2099-09-09T12:30:00.000Z"), factoryOrder: string[] = []
+    const sameAttemptContinuationLoader = vi.fn(async () => {
+      factoryOrder.push("loader")
+      return {
+      resume: { nextOrdinal: 7, stepCount: 7, toolCallCount: 2, inputThroughSequence: 12n, consumedInputIds: ["input-1"],
+        usage: { inputTokens: 120, outputTokens: 36, estimatedCostUsd: 0.24 } },
+      // A consumed wait is restored as model context, not as a fresh ack token.
+      observations: [restoredRead("completed-search", "jobs.search", { jobs: [{ id: "job-1", source: "greenhouse" }] }),
+        restoredRead("resolved-wait", "wait_subagents", { status: "ready", taskIds: ["grandchild-1"] })],
+      previousFinalText: `Checked the original task and found one result. Authorization: Bearer ${secret}`,
+      leaseExpiresAt: refreshedExpiry,
+      }
+    })
+    const missingMessage = { ...mailboxMessage(child), id: "message-21", payload: { instruction: "Use the newly accepted constraint" } }
+    const hydrateMessages = vi.fn(async (input: ChildMailboxHydrationInput) => {
+      expect(input.priorityMessageIds).toEqual(["message-21"])
+      return [missingMessage]
+    })
+    const router = vi.fn(async (_context, request) => ({ ...request, status: "completed" as const, errorCode: null, output: {} }))
+    const baseStore = executionStore([], requests)
+    const store: TurnExecutionStore = {
+      ...baseStore,
+      startStep: async input => { startedOrdinals.push(input.ordinal); return baseStore.startStep(input) },
+    }
+    const model = textOnlyModel("continued with the new constraint", request => requests.push(request))
+    const resumeLoader = vi.fn(async () => undefined)
+    const durableWaitResumeCommitter = vi.fn(async () => true)
+    let runtimeLease: SubagentLease | undefined
+    const executor = createChildExecutor({
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => { factoryOrder.push("model"); return model },
+      toolRuntimeFactory: input => { factoryOrder.push("tool"); runtimeLease = input.lease; return childToolRuntime([tool("jobs.search", "jobs")], router) },
+      mailboxReader: { listPendingMessages: vi.fn(async () => []), hydrateMessages }, resumeLoader, sameAttemptContinuationLoader, durableWaitResumeCommitter,
+    })
+
+    const result = await executor({ lease: child, continuation: {
+      kind: "mailbox_input_pending", missingMessageIds: ["message-21"], observedMessageIds: ["message-1", "message-2"],
+    } })
+    const modelInput = JSON.stringify(requests[0]?.messages)
+
+    expect(result).toMatchObject({ status: "completed", mailboxMessageIds: ["message-21"], result: { stepCount: 8, toolCallCount: 2, finalText: "continued with the new constraint" } })
+    expect(sameAttemptContinuationLoader).toHaveBeenCalledWith(child)
+    expect(factoryOrder).toEqual(["loader", "tool", "model"])
+    expect(runtimeLease).not.toBe(child)
+    expect(runtimeLease).toMatchObject({ id: child.id, ownerId: child.ownerId, leaseOwner: child.leaseOwner, attemptCount: child.attemptCount, leaseExpiresAt: refreshedExpiry })
+    expect(runtimeLease?.signal).toBe(child.signal)
+    expect(child.leaseExpiresAt).toEqual(new Date("2026-09-09T12:00:00.000Z"))
+    expect(resumeLoader).not.toHaveBeenCalled()
+    expect(durableWaitResumeCommitter).not.toHaveBeenCalled()
+    expect(startedOrdinals).toEqual([7])
+    expect(hydrateMessages).toHaveBeenCalledOnce()
+    expect(modelInput).toContain("original task and found one result")
+    expect(modelInput).toContain("Authorization=[REDACTED] [REDACTED]")
+    expect(modelInput).not.toContain(secret)
+    expect(modelInput).toContain("message-21")
+    expect(modelInput).toContain("Use the newly accepted constraint")
+    expect(modelInput).toContain("completed-search")
+    expect(modelInput).toContain("resolved-wait")
+    expect(modelInput).toContain("grandchild-1")
+    expect(router).not.toHaveBeenCalled()
   })
 
   it("binds restored jobs, persona, and resume evidence before a resumed provider call", async () => {
@@ -1569,6 +1634,28 @@ describe("child executor composition", () => {
     await expect(executor({ lease: malformed })).resolves.toMatchObject({
       status: "failed", failureReason: "native_verification_control_invalid", retryDisposition: "terminal",
     })
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(toolRuntimeFactory).not.toHaveBeenCalled()
+    expect(budget.store.readRootLimits).not.toHaveBeenCalled()
+  })
+
+  it("rejects mailbox continuation for a native verifier instead of replaying its fixed handler", async () => {
+    const native = nativeVerifierTask()
+    const modelRuntimeFactory = vi.fn(() => textOnlyModel("must not rerun verifier"))
+    const toolRuntimeFactory = vi.fn(() => childToolRuntime([]))
+    const sameAttemptContinuationLoader = vi.fn(async () => null)
+    const budget = budgetStore()
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budget.store,
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory, toolRuntimeFactory, sameAttemptContinuationLoader,
+    })
+
+    await expect(executor({ lease: native.lease, continuation: {
+      kind: "mailbox_input_pending", missingMessageIds: ["late-input"], observedMessageIds: [],
+    } })).resolves.toMatchObject({
+      status: "failed", failureReason: "child_mailbox_continuation_unsupported", retryDisposition: "terminal",
+    })
+    expect(sameAttemptContinuationLoader).not.toHaveBeenCalled()
     expect(modelRuntimeFactory).not.toHaveBeenCalled()
     expect(toolRuntimeFactory).not.toHaveBeenCalled()
     expect(budget.store.readRootLimits).not.toHaveBeenCalled()

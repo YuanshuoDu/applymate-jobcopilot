@@ -7,6 +7,7 @@ import {
   type AtomicSubagentSpawnResult,
   type SubagentJobPayload,
   type SubagentLease,
+  type SubagentMailboxContinuation,
   type SubagentStore,
   type SubagentTaskRecord,
   type SubagentTaskSpec,
@@ -113,7 +114,7 @@ export class AgentTreeManager {
     this.active.set(payload.taskId, execution)
     return execution.lease
   }
-  async run(payload: SubagentJobPayload, execute: (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>, dispatchIdentity?: SubagentDispatchIdentity): Promise<SubagentRunOutcome> {
+  async run(payload: SubagentJobPayload, execute: (input: { lease: SubagentLease; continuation?: SubagentMailboxContinuation }) => Promise<SubagentExecutionResult>, dispatchIdentity?: SubagentDispatchIdentity): Promise<SubagentRunOutcome> {
     let lease: SubagentLease | null
     try { lease = await this.claim(payload, this.now(), dispatchIdentity) } catch (error: unknown) {
       if (isSessionPauseRequestedError(error)) return { taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }
