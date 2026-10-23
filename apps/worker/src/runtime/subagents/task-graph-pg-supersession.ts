@@ -1,17 +1,16 @@
-import { taskGraphFingerprint, taskGraphItemId } from "./task-graph-snapshot.js"
+import { taskGraphFingerprint, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { parseRegisteredScoutEnvelope, TaskGraphCommandError, type RegisteredScoutEnvelope, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { actionList, type Queryable } from "./pg-store-persistence.js"
-import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { reduceTaskGraphEvent, type TaskGraphNodeProposal } from "../planning/task-graph.js"
 import { taskGraphVerificationRole } from "../planning/task-graph-verification.js"
 import { createGraphTasks } from "./task-graph-pg-create.js"
-import { loadTaskGraphCancellationSource, parseTaskGraphSupersessionRelation, TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION,
+import { parseTaskGraphSupersessionRelation, TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION,
   taskGraphSupersessionEnvelopeMatches, taskGraphSupersessionProposalMatches, writePlanReceiptWithIdentity, writeTaskLifecycleReceiptWithIdentity } from "./task-graph-pg-events.js"
-import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { deleteGraphDispatch } from "./task-graph-pg-lifecycle.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
-import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
+import type { GraphEventScope, GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphScheduleInput, TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 
 type Row = Record<string, unknown>
@@ -42,6 +41,31 @@ export type TaskGraphSupersessionRelation = Readonly<{
 }>
 
 export { parseTaskGraphSupersessionRelation }
+
+export async function loadTaskGraphCancellationSource(client: Queryable, scope: GraphEventScope, selection: Readonly<{
+  eventId?: string; sequence?: string; nodeKey: string; taskId: string; expectedRevision: number; stepId: string
+}>): Promise<StoredTaskGraphNode | null> {
+  const result = await client.query<Row>(`SELECT event."payload"->'item'->'content' AS "content",
+      EXISTS (SELECT 1 FROM "agent_outbox" outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
+    FROM "agent_events" AS event JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+    JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+    WHERE ($1::text IS NULL OR event."id" = $1) AND ($2::bigint IS NULL OR event."sequence" = $2::bigint)
+      AND event."sessionId" = $3 AND event."turnId" = $4 AND event."itemId" = $5 AND event."taskId" = $6
+      AND event."type" = 'item.delta' AND event."actor" = 'system' AND event."correlationId" = $4 AND event."causationId" = $7
+      AND event."idempotencyKey" = $8 AND event."payload"->>'kind' = 'lifecycle' AND event."payload"->>'revision' = $9::text
+      AND event."payload"->'event'->>'type' = 'task.cancelled' AND event."payload"->'event'->>'nodeKey' = $10
+      AND event."payload"->'event'->>'expectedRevision' = $11::text
+      AND event."payload"->'item'->>'id' = $5 AND event."payload"->'item'->>'revision' = $9::text
+      AND turn."userId" = $12 AND turn."rootTaskId" = $13 AND session."userId" = $12 LIMIT 2`,
+  [selection.eventId ?? null, selection.sequence ?? null, scope.sessionId, scope.turnId, taskGraphItemId(scope.rootTaskId), selection.taskId,
+    selection.stepId, taskGraphLifecycleKey(scope.rootTaskId, selection.nodeKey, 0, "task.cancelled"), selection.expectedRevision + 1,
+    selection.nodeKey, selection.expectedRevision, scope.userId, scope.rootTaskId])
+  if (result.rows.length !== 1 || result.rows[0]!.hasOutbox !== true) return null
+  try {
+    const source = parseTaskGraphSnapshot(result.rows[0]!.content).nodes.find(node => node.key === selection.nodeKey)
+    return source?.taskId === selection.taskId ? source : null
+  } catch { return null }
+}
 
 export function taskGraphSupersessionProposalKey(rootTaskId: string, expectedRevision: number): string {
   return `${taskGraphItemId(rootTaskId)}:supersession:${expectedRevision}`
@@ -154,7 +178,7 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   const snapshot = pinnedCriteria ? parseTaskGraphSnapshot({ ...stamped, rootSuccessCriteria: pinnedCriteria }) : stamped
   const replacementNode = snapshot.nodes.find(node => node.key === created.created[0]?.key)
   if (created.state.revision !== revision + 2 || created.created.length !== 1 || !replacementNode || replacementNode.taskId === source.taskId
-    || !taskGraphSupersessionEnvelopeMatches(source, replacementNode, true) || snapshot.nodes.some(node => node.key === sourceKey || node.taskId === sourceTaskId)
+    || !taskGraphSupersessionEnvelopeMatches(source, replacementNode, true, snapshot.nodes) || snapshot.nodes.some(node => node.key === sourceKey || node.taskId === sourceTaskId)
     || loaded.snapshot.nodes.filter(node => node.key !== sourceKey).some(node => { const next = snapshot.nodes.find(candidate => candidate.key === node.key)
       return !next || next.taskId !== node.taskId || canonicalTaskGraphJson(node) !== canonicalTaskGraphJson(next) })) throw new TaskGraphCommandError("task_graph_supersession_conflict", "Replacement does not preserve the original graph envelope")
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }

@@ -4,9 +4,8 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import type { TaskGraphEvent } from "../planning/task-graph.js"
 import type { GraphEventScope } from "./task-graph-pg-state.js"
-import { canonicalTaskGraphJson, TASK_GRAPH_ITEM_TYPE, taskGraphItemId, taskGraphSnapshot,
+import { canonicalTaskGraphJson, TASK_GRAPH_ITEM_TYPE, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphSnapshot,
   type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
-import { parseTaskGraphSnapshot, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import type { TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import type { TaskGraphState } from "../planning/task-graph.js"
 
@@ -87,11 +86,25 @@ export function parseTaskGraphSupersessionRelation(value: unknown): TaskGraphSup
   } catch { return null }
 }
 
-export function taskGraphSupersessionEnvelopeMatches(source: unknown, replacement: unknown, allowDependencyRewire = false): boolean {
+export function taskGraphSupersessionEnvelopeMatches(source: unknown, replacement: unknown, allowDependencyRewire = false,
+  graphNodes?: readonly Pick<StoredTaskGraphNode, "key" | "depth">[]): boolean {
   const record = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
   const left = record(source), right = record(replacement), mutable = new Set(["key", "taskId", "goal", "successCriteria"])
   if (!left || !right) return false
-  if (allowDependencyRewire) mutable.add("dependsOn")
+  const rewired = allowDependencyRewire && canonicalTaskGraphJson(left.dependsOn ?? null) !== canonicalTaskGraphJson(right.dependsOn ?? null)
+  if (rewired) {
+    const dependencies: readonly unknown[] = Array.isArray(right.dependsOn) ? right.dependsOn : []
+    if (!Array.isArray(right.dependsOn) || !graphNodes) return false
+    let expectedDepth = 1
+    for (const key of dependencies) {
+      if (typeof key !== "string") return false
+      const dependency = graphNodes.find(node => node.key === key)
+      if (!dependency) return false
+      expectedDepth = Math.max(expectedDepth, dependency.depth + 1)
+    }
+    if (right.depth !== expectedDepth) return false
+    mutable.add("dependsOn"); mutable.add("depth")
+  }
   const envelope = (node: Record<string, unknown>) => Object.fromEntries(Object.entries(node).filter(([key]) => !mutable.has(key)))
   return canonicalTaskGraphJson(envelope(left)) === canonicalTaskGraphJson(envelope(right))
 }
@@ -108,34 +121,6 @@ export function taskGraphSupersessionProposalMatches(source: unknown, proposal: 
     .every(key => canonicalTaskGraphJson(left[key] ?? null) === canonicalTaskGraphJson(right[key] ?? null))
     && (allowDependencyRewire || canonicalTaskGraphJson(left.dependsOn ?? null) === canonicalTaskGraphJson(right.dependsOn ?? null))
     && canonicalTaskGraphJson(repairOf(left.repairOf)) === canonicalTaskGraphJson(repairOf(right.repairOf))
-}
-
-export async function loadTaskGraphCancellationSource(client: Queryable, scope: GraphEventScope, selection: Readonly<{
-  eventId?: string; sequence?: string; nodeKey: string; taskId: string; expectedRevision: number; stepId: string
-}>): Promise<StoredTaskGraphNode | null> {
-  const result = await client.query<Row>(`SELECT event."payload"->'item'->'content' AS "content",
-      EXISTS (SELECT 1 FROM "agent_outbox" outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
-    FROM "agent_events" AS event
-    JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
-    JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
-    WHERE ($1::text IS NULL OR event."id" = $1) AND ($2::bigint IS NULL OR event."sequence" = $2::bigint)
-      AND event."sessionId" = $3 AND event."turnId" = $4 AND event."itemId" = $5 AND event."taskId" = $6
-      AND event."type" = 'item.delta' AND event."actor" = 'system' AND event."correlationId" = $4
-      AND event."causationId" = $7 AND event."idempotencyKey" = $8
-      AND event."payload"->>'kind' = 'lifecycle' AND event."payload"->>'revision' = $9::text
-      AND event."payload"->'event'->>'type' = 'task.cancelled'
-      AND event."payload"->'event'->>'nodeKey' = $10
-      AND event."payload"->'event'->>'expectedRevision' = $11::text
-      AND event."payload"->'item'->>'id' = $5 AND event."payload"->'item'->>'revision' = $9::text
-      AND turn."userId" = $12 AND turn."rootTaskId" = $13 AND session."userId" = $12
-    LIMIT 2`, [selection.eventId ?? null, selection.sequence ?? null, scope.sessionId, scope.turnId, taskGraphItemId(scope.rootTaskId),
-    selection.taskId, selection.stepId, taskGraphLifecycleKey(scope.rootTaskId, selection.nodeKey, 0, "task.cancelled"),
-    selection.expectedRevision + 1, selection.nodeKey, selection.expectedRevision, scope.userId, scope.rootTaskId])
-  if (result.rows.length !== 1 || result.rows[0]!.hasOutbox !== true) return null
-  try {
-    const source = parseTaskGraphSnapshot(result.rows[0]!.content).nodes.find(node => node.key === selection.nodeKey)
-    return source?.taskId === selection.taskId ? source : null
-  } catch { return null }
 }
 
 export async function writeTaskGraphSnapshot(client: Queryable, scope: GraphEventScope, snapshot: TaskGraphSnapshot, expectedRevision: number, now: Date): Promise<{ itemId: string; revision: number }> {

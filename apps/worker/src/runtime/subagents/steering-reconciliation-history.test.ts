@@ -300,7 +300,7 @@ describe("durable steering reconciliation history", () => {
     const sourceNode = { key: "stale-scout", taskId: "source-task", templateId: "scout", goal: "old goal",
       successCriteria: ["old criterion"], dependsOn: ["old-prerequisite"], depth: 1 }
     const replacementNode = { ...sourceNode, key: "fresh-scout", taskId: "replacement-task", goal: "new goal",
-      successCriteria: ["new criterion"], dependsOn: ["new-prerequisite"] }
+      successCriteria: ["new criterion"], dependsOn: ["new-prerequisite"], depth: 2 }
     const relatedNodes = ["old-prerequisite", "new-prerequisite"].map((key, index) => ({ key, taskId: `${key}-task`, templateId: "analyst",
       goal: `${key} goal`, successCriteria: [`${key} report`], dependsOn: [], depth: 1 }))
     const seed = supersessionFixture({ callInput, sourceNode, replacementNode, relatedNodes })
@@ -318,6 +318,9 @@ describe("durable steering reconciliation history", () => {
       item: { ...item, content: changedContent } } } : event)
     const tampered = supersessionFixture({ callInput, sourceNode, replacementNode, relatedNodes, relation, events })
     await expect(historyEntries(tampered.client, 3)).rejects.toThrow()
+
+    const forgedDepth = supersessionFixture({ callInput, sourceNode, replacementNode: { ...replacementNode, depth: 3 }, relatedNodes, relation })
+    await expect(historyEntries(forgedDepth.client, 3)).rejects.toThrow("steering_reconciliation_supersession_event_invalid")
   })
 
   it.each([

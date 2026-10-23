@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
-import { appendTaskGraphReceipt, appendTaskGraphReceiptWithIdentity, loadTaskGraphCancellationSource, taskGraphSupersessionEnvelopeMatches, taskGraphSupersessionProposalMatches, writePlanReceipt, writeTaskLifecycleReceipt, writeTaskLifecycleReceiptWithIdentity } from "./task-graph-pg-events.js"
+import { appendTaskGraphReceipt, appendTaskGraphReceiptWithIdentity, taskGraphSupersessionEnvelopeMatches, taskGraphSupersessionProposalMatches, writePlanReceipt, writeTaskLifecycleReceipt, writeTaskLifecycleReceiptWithIdentity } from "./task-graph-pg-events.js"
+import { loadTaskGraphCancellationSource } from "./task-graph-pg-supersession.js"
 import { taskGraphFingerprint, taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { GraphScope } from "./task-graph-pg-state.js"
 import type { TaskGraphEvent } from "../planning/task-graph.js"
@@ -47,10 +48,14 @@ describe("TaskGraph event persistence", () => {
       dependsOn: ["prerequisite"], depth: 2, verificationDisposition: "typed", verification: { role: "scout" },
       registeredScoutEnvelope: { role: "scout", taskType: "discovery" }, repairOf: { nodeKey: "prior", taskId: "prior-task" } }
     const replacement = { ...source, key: "new", taskId: "new-task", goal: "New goal", successCriteria: ["Previously verified" ] }
+    const graphNodes = [{ ...source, key: "new-prerequisite", taskId: "prerequisite-task", dependsOn: [], depth: 1 }]
     expect(taskGraphSupersessionEnvelopeMatches(source, replacement)).toBe(true)
     const rewired = { ...replacement, dependsOn: ["new-prerequisite"] }
     expect(taskGraphSupersessionEnvelopeMatches(source, rewired)).toBe(false)
-    expect(taskGraphSupersessionEnvelopeMatches(source, rewired, true)).toBe(true)
+    expect(taskGraphSupersessionEnvelopeMatches(source, rewired, true, graphNodes)).toBe(true)
+    expect(taskGraphSupersessionEnvelopeMatches(source, rewired, true)).toBe(false)
+    expect(taskGraphSupersessionEnvelopeMatches(source, { ...rewired, depth: 3 }, true, graphNodes)).toBe(false)
+    expect(taskGraphSupersessionEnvelopeMatches(source, { ...replacement, depth: 3 }, true, graphNodes)).toBe(false)
     expect(taskGraphSupersessionEnvelopeMatches(source, { ...rewired, verification: { role: "analyst" } }, true)).toBe(false)
     expect(taskGraphSupersessionEnvelopeMatches(source, { ...replacement, depth: 3 })).toBe(false)
     expect(taskGraphSupersessionEnvelopeMatches(source, { ...replacement, registeredScoutEnvelope: { role: "scout", taskType: "other" } })).toBe(false)

@@ -6,9 +6,9 @@ import {
   type SteeringReconciliationReceipt, type SteeringReconciliationScope,
 } from "./steering-reconciliation-contract.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
-import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
+import { loadTaskGraphCancellationSource, taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import { callMatches, type SupersessionCallBinding } from "./root-plan-criteria.js"
-import { loadTaskGraphCancellationSource } from "./task-graph-pg-events.js"
+import { taskGraphSupersessionEnvelopeMatches } from "./task-graph-pg-events.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 
 type Client = Pick<pg.PoolClient, "query">
@@ -132,7 +132,7 @@ function validPlanEvent(row: Row, scope: SteeringReconciliationScope, relation: 
     && unchanged.every(oldNode => {
       const current = snapshot.nodes.find(node => node.key === oldNode.key)
       return current?.taskId === oldNode.taskId && canonicalTaskGraphJson(current) === canonicalTaskGraphJson(oldNode)
-    }) && replacement && sameReplacementEnvelope(source, replacement, true))
+    }) && replacement && sameReplacementEnvelope(source, replacement, snapshot.nodes))
   const valid = Boolean(row.hasOutbox === true && row.itemId === taskGraphItemId(scope.rootTaskId) && row.taskId === scope.rootTaskId && row.type === "item.delta"
     && row.actor === "orchestrator" && row.correlationId === scope.turnId && row.causationId === relation.agentPlanCall.stepId
     && row.idempotencyKey === taskGraphSupersessionProposalKey(scope.rootTaskId, relation.observedRevision)
@@ -186,13 +186,8 @@ function exactAllowed(value: Row, required: readonly string[], optional: readonl
     && Boolean(descriptors[key]?.enumerable && "value" in descriptors[key]!)) && required.every(key => Object.hasOwn(value, key))
 }
 
-function sameReplacementEnvelope(sourceValue: unknown, replacementValue: unknown, allowDependencyRewire = false): boolean {
-  const source = object(sourceValue), replacement = object(replacementValue)
-  if (!source || !replacement) return false
-  const mutable = new Set(["key", "taskId", "goal", "successCriteria"])
-  if (allowDependencyRewire) mutable.add("dependsOn")
-  const omitMutable = (node: Row) => Object.fromEntries(Object.entries(node).filter(([key]) => !mutable.has(key)))
-  return canonicalTaskGraphJson(omitMutable(source)) === canonicalTaskGraphJson(omitMutable(replacement))
+function sameReplacementEnvelope(source: unknown, replacement: unknown, graphNodes: readonly StoredTaskGraphNode[]): boolean {
+  return taskGraphSupersessionEnvelopeMatches(source, replacement, true, graphNodes)
 }
 
 async function assertHistoryCalls(client: Client, scope: SteeringReconciliationScope, entries: readonly ParsedReceipt[], replacements: ReadonlyMap<string, VerifiedSupersession>): Promise<void> {
