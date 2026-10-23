@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
+import { PolicyEngine } from "@jobcopilot/agent-policy"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { createOptionalProductionChildExecutor, childExecutionEnabled, createProductionChildExecutor, createProductionChildPolicy } from "./production-child-runtime.js"
@@ -1387,6 +1388,60 @@ describe("production child runtime", () => {
       outcome, reasonCode: `configured_private_draft_${outcome}`,
       scope: { toolCallId: "draft-call", toolName: "cover_letter.draft", role: "subagent" },
     })
+    expect(draftSpy).not.toHaveBeenCalled()
+  })
+
+  it("persists an invalid private selected-job policy rewrite as terminal deny without executing the draft tool", async () => {
+    const body = "PRIVATE_INVALID_REWRITE_CANARY"
+    const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`
+    const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: "job-1" })
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream() {
+        yield { type: "tool_call_completed", callId: "invalid-rewrite-draft", name: "cover_letter.draft", arguments: {
+          baseArtifactId, baseHash, content: body, constraints: {},
+        } }
+        yield { type: "completed", finishReason: "tool_calls" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore()
+    const draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const persistence = recordingStore()
+    const originalEvaluate = PolicyEngine.prototype.evaluate
+    const invalidRewritePolicy = new PolicyEngine({
+      snapshot: {
+        version: "policy.v1",
+        rules: [{
+          id: "selected-job-draft", roles: ["subagent"], tools: ["cover_letter.draft"], toolVersions: ["1"],
+          risks: ["draft_write"], domains: ["resume"], requiredCapabilities: ["draft"], outcome: "allow",
+          reasonCode: "server_selected_job_draft_gate", reason: "The server enabled the selected-job cover-letter draft tool",
+        }],
+      },
+      hooks: [{
+        name: "invalid-selected-job-scope-rewrite", order: 1, stage: "before_tool_use",
+        evaluate: () => ({ outcome: "rewrite_input" }),
+      }],
+    })
+    const evaluation = vi.spyOn(PolicyEngine.prototype, "evaluate").mockImplementation(function (this: PolicyEngine, context) {
+      return context.tool.name === "cover_letter.draft"
+        ? originalEvaluate.call(invalidRewritePolicy, context)
+        : originalEvaluate.call(this, context)
+    })
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence, model, pool: legacyInitialWriterPool(), mailboxReader: emptyMailboxReader })
+
+    try {
+      await expect(executor({ lease: { ...jobTask("writer"), id: "writer-invalid-rewrite" } })).resolves.toMatchObject({ status: "failed" })
+    } finally {
+      evaluation.mockRestore()
+    }
+
+    const decision = persistence.events.find(event => event.type === "policy.decision")
+    expect(decision?.payload).toMatchObject({
+      outcome: "deny", reasonCode: "rewrite_invalid",
+      scope: { toolCallId: "invalid-rewrite-draft", toolName: "cover_letter.draft", role: "subagent" },
+    })
+    expect(decision?.payload).not.toHaveProperty("safeInput")
+    expect(stringsDeep(decision?.payload).join("\n")).not.toContain(body)
     expect(draftSpy).not.toHaveBeenCalled()
   })
 

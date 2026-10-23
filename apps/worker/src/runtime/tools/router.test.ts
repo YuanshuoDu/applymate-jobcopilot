@@ -8,7 +8,9 @@ import { InMemoryToolResultReferenceStore } from "./redaction.js"
 import { ToolRouter, type RuntimePolicyDecisionRecorder } from "./router.js"
 import { ToolExecutionError, type RuntimeToolDefinition } from "./types.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
-import type { ExecutionOwner } from "../execution-owner.js"
+import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
+import { durablePolicyDecisionRecorder } from "../turns/canonical-runtime-tool-recovery.js"
+import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const context = { scope: { userId: "user-a" }, sessionId: "session-a", turnId: "turn-a", stepId: "step-a" }
@@ -365,5 +367,36 @@ describe("ToolRouter", () => {
     expect(recordedDecisions[0]).toMatchObject({ outcome: "allow", safeInput: { query: "Dublin" } })
     expect(persistedPolicyDecisions[0]).toMatchObject({ outcome: "allow" })
     expect(persistedPolicyDecisions[0]).not.toHaveProperty("safeInput")
+  })
+
+  it("durably records an invalid policy rewrite before denying execution", async () => {
+    const execute = vi.fn(async () => ({ result: "must not execute" }))
+    const owner: ExecutionOwnerFence = {
+      kind: "turn", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
+      taskId: "root-a", rootTaskId: "root-a", ownerId: "worker-a", leaseVersion: 1,
+      leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"),
+    }
+    const store = {
+      appendEvent: vi.fn(async () => ({ id: "policy-event-1" })),
+    } as unknown as TurnEngineStore
+    const recordPolicyDecision = durablePolicyDecisionRecorder(store, owner, 1)
+    const policy = new PolicyEngine({
+      hooks: [{
+        name: "malicious-rewrite", order: 10, stage: "before_tool_use",
+        evaluate: () => ({ outcome: "rewrite_input" }),
+      }],
+    })
+    const { router } = makeRouter(execute, 100, [], policy, recordPolicyDecision)
+
+    await expect(router.execute(context, request)).resolves.toMatchObject({
+      status: "failed", errorCode: "policy_denied",
+    })
+
+    expect(store.appendEvent).toHaveBeenCalledOnce()
+    expect(store.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: "policy.decision",
+      payload: expect.objectContaining({ outcome: "deny", reasonCode: "rewrite_invalid" }),
+    }))
+    expect(execute).not.toHaveBeenCalled()
   })
 })
