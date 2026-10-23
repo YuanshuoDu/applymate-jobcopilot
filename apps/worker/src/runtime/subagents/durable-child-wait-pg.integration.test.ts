@@ -432,10 +432,6 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
 
       workerE = launchWorker("worker-b", queueName, ids)
       await waitForMarker(workerE, "WORKER_B_RECOVERED")
-      await waitForMarker(workerE, "WORKER_B_CONSUMED_WAIT_STEP_REUSED")
-      expect(workerE.stdoutText).toContain(`WORKER_B_CONSUMED_WAIT_STEP_REUSED ${JSON.stringify({ waitId: acknowledged!.waitId,
-        sourceStepId: acknowledged!.sourceStepId, attempt: acknowledged!.sourceAttempt, sourceOrdinal: acknowledged!.sourceOrdinal,
-        stepId: acknowledged!.continuationStepId, ordinal: acknowledged!.continuationOrdinal })}`)
       const acknowledgedRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
         sourceStepId: string; sourceAttempt: number; sourceOrdinal: number;
         waitStatus: string; consumedAt: Date | null; continuationStepId: string; continuationOrdinal: number; continuationStatus: string }>(
@@ -467,6 +463,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: postAckGeneration + 1 })
       expect(finalDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      await waitForMarker(workerE, "WORKER_B_CONSUMED_WAIT_STEP_REUSED")
+      expect(workerE.stdoutText).toContain(`WORKER_B_CONSUMED_WAIT_STEP_REUSED ${JSON.stringify({ waitId: acknowledged!.waitId,
+        sourceStepId: acknowledged!.sourceStepId, attempt: acknowledged!.sourceAttempt, sourceOrdinal: acknowledged!.sourceOrdinal,
+        stepId: acknowledged!.continuationStepId, ordinal: acknowledged!.continuationOrdinal })}`)
 
       await waitForMarker(workerE, "WORKER_B_RESUMED")
       const finalExit = await workerE.exited
