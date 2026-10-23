@@ -149,7 +149,7 @@ export async function reconcileDurableSubagentWaits(pool: Pool, options: Durable
         JOIN "sub_agent_tasks" AS root ON root."id" = parent."rootTaskId" AND root."sessionId" = wait."sessionId" AND root."turnId" = wait."turnId"
         JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = parent."id"
         WHERE wait."sessionId" = session."id" AND wait."userId" = session."userId" AND wait."status" = 'waiting'
-          AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NULL AND parent."status" = 'waiting'
+          AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NULL AND parent."parentTaskId" IS NOT NULL AND parent."status" = 'waiting'
           AND parent."leaseOwner" IS NULL AND parent."leaseExpiresAt" IS NULL AND step."attempt" = parent."attemptCount"
           AND step."status" = 'waiting_for_tool' AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current
             WHERE current."sessionId" = step."sessionId" AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt")
@@ -166,7 +166,7 @@ export async function reconcileDurableSubagentWaits(pool: Pool, options: Durable
         JOIN "agent_sessions" AS session ON session."id" = wait."sessionId" AND session."userId" = wait."userId"
         JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = parent."id"
         WHERE wait."sessionId" = $1 AND wait."userId" = $2 AND wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL
-          AND wait."consumedAt" IS NULL AND parent."status" = 'waiting' AND parent."leaseOwner" IS NULL AND parent."leaseExpiresAt" IS NULL
+          AND wait."consumedAt" IS NULL AND parent."parentTaskId" IS NOT NULL AND parent."status" = 'waiting' AND parent."leaseOwner" IS NULL AND parent."leaseExpiresAt" IS NULL
           AND step."attempt" = parent."attemptCount" AND step."status" = 'waiting_for_tool'
           AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = step."sessionId"
             AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt")

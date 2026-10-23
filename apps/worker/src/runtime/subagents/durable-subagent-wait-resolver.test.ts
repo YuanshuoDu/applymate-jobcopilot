@@ -12,14 +12,14 @@ const now = new Date("2026-10-22T10:00:00.000Z")
 
 type DispatchFixture = { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: Record<string, unknown>; attemptCount: number; publishedAt: Date | null }
 
-function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?: string; batchSize?: number; dispatchRow?: DispatchFixture | null } = {}) {
+function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const state = { waitStatus: "waiting", parentStatus: "waiting", matched: [] as string[], outbox: input.dispatchRow ? 1 : 0,
     dispatchRow: input.dispatchRow ? structuredClone(input.dispatchRow) : null as DispatchFixture | null }
   let rollbackSnapshot: typeof state | undefined
   const cloneState = () => ({ ...state, matched: [...state.matched], dispatchRow: state.dispatchRow ? structuredClone(state.dispatchRow) : null })
   const wait = {
-    id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", rootTaskId: "root-1", parentAttempt: 3,
+    id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: input.rootOwnedWait ? "root-1" : "parent-1", rootTaskId: "root-1", parentAttempt: 3,
     targetTaskIds: ["child-1", "child-2"], mode: "all", status: state.waitStatus, deadlineAt: input.deadline ?? new Date(now.getTime() + 30_000),
     matchedTaskIds: [], result: { request: { targetTaskIds: ["child-1", "child-2"], mode: "all", timeoutMs: 30_000 } },
   }
@@ -33,10 +33,13 @@ function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?:
       if (sql.includes('SELECT session."id", session."userId"') && sql.includes('JOIN "sub_agent_tasks" AS parent')) {
         return { rows: [{ id: "session-1", userId: "user-1" }], rowCount: 1 }
       }
-      if (sql.includes('SELECT wait."id", wait."userId"') && sql.includes('FOR UPDATE OF wait, parent')) return { rows: [wait], rowCount: 1 }
+      if (sql.includes('SELECT wait."id", wait."userId"') && sql.includes('FOR UPDATE OF wait, parent')) {
+        if (input.rootOwnedWait && sql.includes('parent."parentTaskId" IS NOT NULL')) return { rows: [], rowCount: 0 }
+        return { rows: [wait], rowCount: 1 }
+      }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) return { rows: [
-        { id: "child-1", parentTaskId: input.targetParent ?? "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "writer", result: { title: "safe" }, failureReason: null },
-        { id: "child-2", parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: input.targetStatus ?? "completed", role: "reviewer", result: { score: 1 }, failureReason: null },
+        { id: "child-1", parentTaskId: input.targetParent ?? (input.rootOwnedWait ? "root-1" : "parent-1"), rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "writer", result: { title: "safe" }, failureReason: null },
+        { id: "child-2", parentTaskId: input.rootOwnedWait ? "root-1" : "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: input.targetStatus ?? "completed", role: "reviewer", result: { score: 1 }, failureReason: null },
       ], rowCount: 2 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) { state.waitStatus = String(params[0]); state.matched = JSON.parse(String(params[1])); return { rows: [], rowCount: 1 } }
       if (sql.includes('UPDATE "sub_agent_tasks"')) { state.parentStatus = "queued"; return { rows: [], rowCount: 1 } }
@@ -95,6 +98,18 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(dispatch?.params[2]).toBe("subagent-dispatch:parent-1")
     expect(dispatch?.sql).toContain("ON CONFLICT (\"idempotencyKey\") DO UPDATE")
     expect(dispatch?.sql).not.toContain('"attemptCount"')
+  })
+
+  it("excludes root-owned waits from child wait reconciliation and dispatch", async () => {
+    const fake = fixture({ rootOwnedWait: true })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
+
+    const candidate = fake.calls.find(call => call.sql.includes('SELECT session."id", session."userId"'))
+    const waitRows = fake.calls.find(call => call.sql.includes('SELECT wait."id", wait."userId"'))
+    expect(candidate?.sql).toContain('parent."parentTaskId" IS NOT NULL')
+    expect(waitRows?.sql).toContain('parent."parentTaskId" IS NOT NULL')
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
   it("persists a wake dispatch only when the conflict predicate is valid and session-scoped", async () => {
