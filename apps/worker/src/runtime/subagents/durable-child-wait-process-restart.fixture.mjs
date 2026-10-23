@@ -36,6 +36,11 @@ let stopped = false
 
 function say(value) { process.stdout.write(`${value}\n`) }
 
+function boundedErrorDetails(error) {
+  if (error instanceof Error) return { name: String(error.name).slice(0, 128), message: error.message.slice(0, 1_000), stack: error.stack?.slice(0, 3_000) ?? null }
+  return { name: typeof error, message: String(error).slice(0, 1_000), stack: null }
+}
+
 async function waitForChild(lease, crashAfterRegistration = false) {
   const owner = executionOwnerFence({ kind: "task", lease })
   const stepId = `child-wait-step:${lease.id}:attempt:${lease.attemptCount}`
@@ -104,16 +109,23 @@ const worker = new Worker(queueName, async job => {
   if (job.data.taskId !== ids.waiterTaskId) throw new Error("unexpected_subagent_task")
   const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
   if (!identity) throw new Error("invalid_subagent_dispatch_identity")
-  const execute = mode === "worker-a" ? waitForChild
-    : mode === "worker-a-crash" ? lease => waitForChild(lease, true)
-      : mode === "worker-b-crash-before-resume" ? lease => {
+  const execute = mode === "worker-a" ? ({ lease }) => waitForChild(lease)
+    : mode === "worker-a-crash" ? ({ lease }) => waitForChild(lease, true)
+      : mode === "worker-b-crash-before-resume" ? ({ lease }) => {
         say(`WORKER_B_RESUME_NOT_STARTED ${JSON.stringify({ taskId: lease.id, attemptCount: lease.attemptCount })}`)
         return new Promise(() => {})
       }
-      : mode === "worker-b-crash-resume" ? lease => resumeChild(lease, true)
-      : mode === "worker-b" ? resumeChild : undefined
+      : mode === "worker-b-crash-resume" ? ({ lease }) => resumeChild(lease, true)
+      : mode === "worker-b" ? ({ lease }) => resumeChild(lease) : undefined
   if (!execute) throw new Error("invalid_fixture_mode")
-  return runSubagentQueueJob(pool, manager, execute, job.data, identity)
+  const executeWithDiagnostics = async input => {
+    try { return await execute(input) }
+    catch (error) {
+      if (crashCutModes.has(mode)) process.stderr.write(`CRASH_CUT_EXECUTOR_ERROR ${JSON.stringify({ mode, ...boundedErrorDetails(error) })}\n`)
+      throw error
+    }
+  }
+  return runSubagentQueueJob(pool, manager, executeWithDiagnostics, job.data, identity)
 }, { connection: redis, concurrency: 1, lockDuration: 15_000, skipVersionCheck: true })
 
 worker.on("completed", (job, result) => {
