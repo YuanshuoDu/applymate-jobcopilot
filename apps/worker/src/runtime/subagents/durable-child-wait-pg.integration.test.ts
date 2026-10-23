@@ -209,9 +209,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const firstExit = await workerA.exited
       expect(firstExit.code).toBeNull()
       expect(firstExit.signal).toBe("SIGKILL")
-      await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
-        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 AND "leaseExpiresAt" = $4`,
-      [waiter.id, ids.sessionId, firstOwner, cut.rows[0]!.leaseExpiresAt])
+      const firstExpiry = await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [waiter.id, ids.sessionId, firstOwner])
+      expect(firstExpiry.rowCount).toBe(1)
 
       workerB = launchWorker("worker-b-crash-before-resume", queueName, ids)
       await waitForMarker(workerB, "WORKER_B_RECOVERED")
@@ -300,16 +301,27 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(preContinuationCut.rows[0]?.leaseExpiresAt).toBeInstanceOf(Date)
       expect(preContinuationCut.rows[0]?.suspendedAt).toBeInstanceOf(Date)
       const preContinuationOwner = preContinuationCut.rows[0]!.leaseOwner
+      const preContinuationExpiry = preContinuationCut.rows[0]!.leaseExpiresAt
+      if (!(preContinuationExpiry instanceof Date)) throw new Error("Pre-continuation lease has no expiry")
       await stopWorker(workerB)
       const preContinuationExit = await workerB.exited
       expect(preContinuationExit.code).toBeNull()
       expect(preContinuationExit.signal).toBe("SIGKILL")
-      await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
-        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 AND "leaseExpiresAt" = $4`,
-      [waiter.id, ids.sessionId, preContinuationOwner, preContinuationCut.rows[0]!.leaseExpiresAt])
+      const renewedAfterSnapshot = await pool.query<{ leaseExpiresAt: Date }>(`UPDATE "sub_agent_tasks"
+        SET "leaseExpiresAt" = GREATEST("leaseExpiresAt" + interval '30 seconds', clock_timestamp() + interval '30 seconds')
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3
+          AND "leaseExpiresAt" IS NOT NULL RETURNING "leaseExpiresAt"`,
+      [waiter.id, ids.sessionId, preContinuationOwner])
+      expect(renewedAfterSnapshot.rowCount).toBe(1)
+      expect(renewedAfterSnapshot.rows[0]?.leaseExpiresAt.getTime()).toBeGreaterThan(preContinuationExpiry.getTime())
+      const preContinuationExpiryUpdate = await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [waiter.id, ids.sessionId, preContinuationOwner])
+      expect(preContinuationExpiryUpdate.rowCount).toBe(1)
 
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_RECOVERED")
+      expect(workerC.stdoutText).toContain(`"id":"${waiter.id}","status":"queued"`)
       const preContinuationRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
         sourceStatus: string; waitStatus: string; consumedAt: Date | null }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", source."status" AS "sourceStatus",
@@ -363,9 +375,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const secondExit = await workerC.exited
       expect(secondExit.code).toBeNull()
       expect(secondExit.signal).toBe("SIGKILL")
-      await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
-        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 AND "leaseExpiresAt" = $4`,
-      [waiter.id, ids.sessionId, secondOwner, secondCut.rows[0]!.leaseExpiresAt])
+      const secondExpiry = await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [waiter.id, ids.sessionId, secondOwner])
+      expect(secondExpiry.rowCount).toBe(1)
 
       workerD = launchWorker("worker-b-crash-after-wait-ack", queueName, ids)
       await waitForMarker(workerD, "WORKER_B_RECOVERED")
@@ -426,9 +439,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const ackCutExit = await workerD.exited
       expect(ackCutExit.code).toBeNull()
       expect(ackCutExit.signal).toBe("SIGKILL")
-      await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
-        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 AND "leaseExpiresAt" = $4`,
-      [waiter.id, ids.sessionId, acknowledgedOwner, acknowledged!.leaseExpiresAt])
+      const acknowledgedExpiry = await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [waiter.id, ids.sessionId, acknowledgedOwner])
+      expect(acknowledgedExpiry.rowCount).toBe(1)
 
       workerE = launchWorker("worker-b", queueName, ids)
       await waitForMarker(workerE, "WORKER_B_RECOVERED")
