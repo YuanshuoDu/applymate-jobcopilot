@@ -39,25 +39,22 @@ function ownDataRecord(value: unknown): Record<string, unknown> | undefined {
   }
 }
 
-function taskGraphTemplatesForScheduledAutomation(
+function taskGraphTemplatesForAutomationCriteria(
   templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined,
   criteria: ScheduledAutomationCriteria,
+  includeAnalyst = false,
 ): Readonly<Record<string, TaskGraphTaskTemplate>> | undefined {
   const scout = templates?.scout
   const analyst = templates?.analyst
   if (!templates || !scout || !analyst) return undefined
-  const existingContext = ownDataRecord(scout.context)
-  const context = Object.freeze({
-    ...(existingContext ?? {}),
-    scheduledAutomationCriteria: criteria,
+  const withCriteria = (template: TaskGraphTaskTemplate) => Object.freeze({
+    ...template,
+    context: Object.freeze({ ...(ownDataRecord(template.context) ?? {}), scheduledAutomationCriteria: criteria }),
+    constraints: Object.freeze([...(template.constraints ?? []), SCHEDULED_AUTOMATION_CRITERIA_GUIDANCE]),
   })
-  const constraints = Object.freeze([
-    ...(scout.constraints ?? []),
-    SCHEDULED_AUTOMATION_CRITERIA_GUIDANCE,
-  ])
   return Object.freeze({
-    scout: Object.freeze({ ...scout, context, constraints }),
-    analyst,
+    scout: withCriteria(scout),
+    analyst: includeAnalyst ? withCriteria(analyst) : analyst,
   })
 }
 
@@ -190,13 +187,22 @@ export async function taskGraphRuntimeForTurn(input: {
     enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode: false,
     templates: taskGraphTemplatesForApplicationFill(input.taskGraphTemplates, undefined),
   }
-  let automationSnapshot: ScheduledAutomationSnapshot | undefined
+  let scheduledSnapshot: ScheduledAutomationSnapshot | undefined
+  let manualSnapshot: ScheduledAutomationSnapshot | undefined
   if (input.turnSource === "automation") {
     if (input.automationRunMode === "scheduled") {
       const turnInput = ownDataRecord(input.turnInput)
-      automationSnapshot = parseScheduledAutomationSnapshot(turnInput?.scheduledAutomationSnapshot)
-      if (!automationSnapshot) throw new Error("scheduled_automation_context_invalid")
-    } else if (input.automationRunMode !== "manual") {
+      scheduledSnapshot = parseScheduledAutomationSnapshot(turnInput?.scheduledAutomationSnapshot)
+      if (!scheduledSnapshot) throw new Error("scheduled_automation_context_invalid")
+    } else if (input.automationRunMode === "manual") {
+      const turnInput = ownDataRecord(input.turnInput)
+      const snapshotPresent = input.turnInput !== null && typeof input.turnInput === "object" &&
+        Object.prototype.hasOwnProperty.call(input.turnInput, "scheduledAutomationSnapshot")
+      if (snapshotPresent) {
+        manualSnapshot = parseScheduledAutomationSnapshot(turnInput?.scheduledAutomationSnapshot)
+        if (!manualSnapshot) throw new Error("scheduled_automation_context_invalid")
+      }
+    } else {
       throw new Error("scheduled_automation_context_invalid")
     }
   }
@@ -209,10 +215,12 @@ export async function taskGraphRuntimeForTurn(input: {
   ])
   // Scheduled automation approvals are owned by the pipeline Gate; keep the #873 draft writer/reviewer path out.
   const scheduledDraftMode = false
-  const templates = automationSnapshot ? taskGraphTemplatesForScheduledAutomation(input.taskGraphTemplates, criteriaForScheduledSnapshot(automationSnapshot))
+  const templates = scheduledSnapshot
+    ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(scheduledSnapshot))
     : preparation ? taskGraphTemplatesForSelectedJob(preparation)
-      : input.taskGraphTemplates
-  if (automationSnapshot && !preparation && (!templates?.scout || !templates.analyst)) {
+      : manualSnapshot ? taskGraphTemplatesForAutomationCriteria(input.taskGraphTemplates, criteriaForScheduledSnapshot(manualSnapshot), true)
+        : input.taskGraphTemplates
+  if ((scheduledSnapshot || (manualSnapshot && !preparation)) && (!templates?.scout || !templates.analyst)) {
     return { enabled: false, selectedJobMode: false, selectedJobPreparation: undefined, scheduledDraftMode, templates: undefined }
   }
   return {

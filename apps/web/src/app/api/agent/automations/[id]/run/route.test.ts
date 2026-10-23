@@ -45,8 +45,11 @@ vi.mock("@/lib/db", () => ({
 
 type RouteCtx = { params: Promise<{ id: string }> }
 
-function postRequest() {
-  return new Request("http://localhost/api/agent/automations/automation_1/run", { method: "POST" })
+function postRequest(body?: unknown) {
+  return new Request("http://localhost/api/agent/automations/automation_1/run", {
+    method: "POST",
+    ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+  })
 }
 
 function ctx(id = "automation_1"): RouteCtx {
@@ -108,10 +111,19 @@ describe("agent automation run API", () => {
     mocks.executionUpdate.mockResolvedValue({})
   })
 
-  it("creates an AgentSession for an owned automation run", async () => {
+  it("persists owner settings for an owned run and ignores request criteria", async () => {
     const { POST } = await import("./route")
 
-    const res = await POST(postRequest() as never, ctx())
+    const res = await POST(postRequest({
+      automationId: "attacker_automation",
+      targetRoles: ["Chief Executive Officer"],
+      targetLocations: ["Anywhere"],
+      minScore: 0,
+      dailyCap: 50,
+      requireApproval: false,
+      autoApply: false,
+      scheduledAutomationSnapshot: { schemaVersion: "forged", targetRoles: ["attacker"] },
+    }) as never, ctx())
 
     expect(res.status).toBe(201)
     await expect(res.json()).resolves.toMatchObject({
@@ -161,7 +173,19 @@ describe("agent automation run API", () => {
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_1", executionId: "execution_1" })
     expect(mocks.turnCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
-        input: { goal: "Run automation: Weekday Berlin SWE Scout", automationRunMode: "manual" },
+        input: {
+          goal: "Run automation: Weekday Berlin SWE Scout",
+          automationRunMode: "manual",
+          scheduledAutomationSnapshot: {
+            schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+            targetRoles: ["SWE"],
+            targetLocations: ["Berlin"],
+            minScore: 85,
+            dailyCap: 8,
+            requireApproval: true,
+            autoApply: true,
+          },
+        },
       }),
     }))
   })
@@ -175,6 +199,45 @@ describe("agent automation run API", () => {
     expect(res.status).toBe(404)
     await expect(res.json()).resolves.toEqual({ error: "Automation not found" })
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["empty roles", { targetRoles: [] }],
+    ["out-of-range score", { minScore: 101 }],
+    ["invalid daily cap", { dailyCap: 0 }],
+    ["non-boolean approval setting", { requireApproval: "yes" }],
+  ])("rejects %s saved settings before any run mutation", async (_label, invalidFields) => {
+    mocks.automationFindFirst.mockResolvedValueOnce({
+      id: "automation_1",
+      name: "Weekday Berlin SWE Scout",
+      enabled: true,
+      cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin",
+      triggerType: "weekdays",
+      targetRoles: ["SWE"],
+      targetLocations: ["Berlin"],
+      minScore: 85,
+      dailyCap: 8,
+      requireApproval: true,
+      autoApply: true,
+      sessionId: null,
+      ...invalidFields,
+    })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({ targetRoles: ["valid request data"] }) as never, ctx())
+
+    expect(res.status).toBe(400)
+    expect(mocks.automationUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.turnFindFirst).not.toHaveBeenCalled()
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.executionUpdate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
   })
 
   it("reuses the canonical session for a later automation run", async () => {
@@ -229,7 +292,7 @@ describe("agent automation run API", () => {
   it("does not queue a second run while the canonical execution is active", async () => {
     mocks.automationFindFirst.mockResolvedValueOnce({
       id: "automation_1", name: "Weekday Berlin SWE Scout", enabled: true, cron: null,
-      timezone: "Europe/Berlin", triggerType: "manual", targetRoles: [], targetLocations: [],
+      timezone: "Europe/Berlin", triggerType: "manual", targetRoles: ["SWE"], targetLocations: [],
       minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
     })
     mocks.executionFindFirst.mockResolvedValueOnce({ status: "running" })

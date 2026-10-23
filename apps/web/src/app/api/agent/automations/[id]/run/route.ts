@@ -4,6 +4,7 @@ import { redactAgentEvent } from "@jobcopilot/shared"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
+import { buildScheduledAutomationSnapshot, ScheduledAutomationSnapshotValidationError } from "@/lib/agent/scheduled-automation-snapshot"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
 import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
@@ -110,6 +111,21 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (!automation) return err("Automation not found", 404)
   if (!automation.enabled) return err("Automation is paused", 409)
 
+  let scheduledAutomationSnapshot: ReturnType<typeof buildScheduledAutomationSnapshot>
+  try {
+    scheduledAutomationSnapshot = buildScheduledAutomationSnapshot({
+      targetRoles: automation.targetRoles,
+      targetLocations: automation.targetLocations,
+      minScore: automation.minScore,
+      dailyCap: automation.dailyCap,
+      requireApproval: automation.requireApproval,
+      autoApply: automation.autoApply,
+    })
+  } catch (error: unknown) {
+    if (error instanceof ScheduledAutomationSnapshotValidationError) return err(error.message, 400)
+    throw error
+  }
+
   if (automation.sessionId) {
     const execution = await db.agentExecution.findFirst({
       where: { userId: auth.userId, sessionId: automation.sessionId },
@@ -150,6 +166,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       userId: auth.userId,
       name: automation.name,
       automationRunMode: "manual",
+      scheduledAutomationSnapshot,
     })
   } catch (error: unknown) {
     if (error instanceof AutomationTurnOccupiedError) return err(error.message, 409)

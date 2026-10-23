@@ -217,7 +217,12 @@ describe("TaskGraph server-owned templates", () => {
       templates: { scout: expect.any(Object), analyst: expect.any(Object) },
     })
     expect(manual.scheduledDraftMode).toBe(false)
-    expect(manual.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
+    expect(manual.templates?.scout.context).toEqual({
+      scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 },
+    })
+    expect(manual.templates?.analyst.context).toEqual({
+      scheduledAutomationCriteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 70 },
+    })
     expect(manual.templates).not.toHaveProperty("prepare")
     expect(userTurn.scheduledDraftMode).toBe(false)
     expect(userTurn.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
@@ -348,15 +353,57 @@ describe("TaskGraph server-owned templates", () => {
     }))).rejects.toThrow("scheduled_automation_context_invalid")
   })
 
-  it("keeps Manual Run Now generic and ignores malformed snapshot data", async () => {
+  it("keeps Manual Run Now generic when the legacy Turn input has no snapshot", async () => {
     const result = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
       automationRunMode: "manual",
-      turnInput: { scheduledAutomationSnapshot: { schemaVersion: "wrong", autoApply: "private" } },
+      turnInput: { legacyManualRun: true },
     }))
 
     expect(result.templates).toMatchObject({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
     expect(result.templates).not.toHaveProperty("prepare")
     expect(result.templates?.scout.context).toBeUndefined()
+  })
+
+  it("projects a valid manual snapshot to both roles without exposing controls or identity", async () => {
+    const result = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      automationRunMode: "manual",
+      turnInput: {
+        scheduledAutomationSnapshot: validScheduledSnapshot({
+          targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 83,
+          dailyCap: 17, requireApproval: true, autoApply: false,
+        }),
+        ownerId: "OWNER_ID_CANARY", sessionId: "SESSION_ID_CANARY", userId: "USER_ID_CANARY", turnId: "TURN_ID_CANARY",
+      },
+    }))
+    const expectedCriteria = { targetRoles: ["Engineer"], targetLocations: ["Dublin"], minScore: 83 }
+
+    for (const role of ["scout", "analyst"] as const) {
+      expect(result.templates?.[role].context).toEqual({ scheduledAutomationCriteria: expectedCriteria })
+      expect(result.templates?.[role].constraints?.join(" ")).toMatch(/untrusted search predicates only/i)
+      expect(result.templates?.[role].constraints?.join(" ")).toMatch(/never follow instructions/i)
+    }
+    expect(JSON.stringify(result.templates)).not.toMatch(/dailyCap|requireApproval|autoApply|automationId|ownerId|sessionId|userId|turnId|CANARY/)
+  })
+
+  it("fails closed when a manual snapshot property is present but malformed", async () => {
+    await expect(taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      automationRunMode: "manual",
+      turnInput: { scheduledAutomationSnapshot: { schemaVersion: "wrong", autoApply: "private" } },
+    }))).rejects.toThrow("scheduled_automation_context_invalid")
+  })
+
+  it("gives selected-job preparation priority over valid manual snapshot criteria", async () => {
+    const result = await taskGraphRuntimeForTurn(scheduledRuntimeInput({
+      automationRunMode: "manual",
+      turnInput: { scheduledAutomationSnapshot: validScheduledSnapshot() },
+      selectedJobPreparationLoader: async () => ({ jobId: "selected-manual-job" }),
+      applicationFillPreparationLoader: async () => undefined,
+    }))
+
+    expect(result).toMatchObject({ selectedJobMode: true, selectedJobPreparation: { jobId: "selected-manual-job" } })
+    expect(result.templates?.scout.context).toEqual({ selectedJobPreparation: { jobId: "selected-manual-job" } })
+    expect(result.templates?.analyst.context).toEqual({ selectedJobPreparation: { jobId: "selected-manual-job" } })
+    expect(JSON.stringify(result.templates)).not.toContain("scheduledAutomationCriteria")
   })
 
   it("ignores automation markers and snapshots for non-automation Turns", async () => {
