@@ -143,7 +143,7 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
     modelRuntimeFactory: async () => ({ adapter: model, registry: {} as never, candidates: [] }),
     toolRuntimeFactory: () => ({ registry, router }),
     rootTaskStore: {
-      ensure: vi.fn(async () => ({ id: "root_fixture" } as never)),
+      ensure: vi.fn(async () => ({ id: "root_fixture", attemptCount: 1 } as never)),
       finish: vi.fn(async () => undefined),
     },
     turnEngineStoreFactory: () => compositionStore(persistedItems, persistedEvents),
@@ -179,7 +179,7 @@ async function coordinationRuntime(input: { workerId?: string; manager: AgentTre
     ...(input.stateLoader ? { stateLoader: async (_pool, lease) => input.stateLoader!(state, lease) } : {}),
     modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }),
     toolRuntimeFactory: () => ({ registry, router }),
-    rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) },
+    rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture", attemptCount: 1 } as never)), finish: vi.fn(async () => undefined) },
     turnEngineStoreFactory: () => compositionStore(),
     contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore),
     authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })),
