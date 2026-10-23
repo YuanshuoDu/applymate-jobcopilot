@@ -14,6 +14,13 @@ import { loadChildAttemptResume } from "./child-resume.ts"
 
 const [, , mode, queueName, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
+const readyMarkerByMode = {
+  "worker-a": "WORKER_A_READY",
+  "worker-a-crash": "WORKER_A_READY",
+  "worker-b-crash-before-resume": "WORKER_B_READY",
+  "worker-b-crash-resume": "WORKER_B_READY",
+  "worker-b": "WORKER_B_READY",
+}
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
 const store = new PgSubagentTaskStore(pool, 30_000)
@@ -122,7 +129,9 @@ try {
     say(`WORKER_B_RECOVERED ${JSON.stringify({ reclaimed: recovered.reclaimed, terminal: recovered.terminal, rows: recovered.rows.map(row => ({ id: row.id, status: row.status })) })}`)
   }
   await worker.waitUntilReady()
-  say(`${mode.toUpperCase()}_READY`)
+  const readyMarker = readyMarkerByMode[mode]
+  if (!readyMarker) throw new Error("invalid_fixture_mode")
+  say(readyMarker)
 } catch (error) {
   process.stderr.write(`WORKER_START_FAILED ${String(error)}\n`)
   await stop(1)
