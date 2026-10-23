@@ -6,7 +6,7 @@ import { redisConnection } from "../redis.js"
 import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
 import { recoverMissingPublishedSubagentDispatches } from "./subagent-published-dispatch-recovery.js"
-import { dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
+import { CHILD_WAIT_RESUMABLE_SQL, dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
 import { lockAndAdmitSubagentDispatch, markPauseAwareDispatchError, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches, runSubagentQueueJob } from "./subagent-pause-dispatch.js"
 import { runWithSubagentConcurrencyDeferral } from "./subagent-concurrency-deferral.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
@@ -56,7 +56,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
           LEFT JOIN "agent_outbox" AS dispatch
             ON dispatch."topic" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
            WHERE task."sessionId" = session."id" AND task."status" IN ('queued', 'retrying')
-             AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+             AND task."interruptRequestedAt" IS NULL AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
              AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
@@ -74,7 +74,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
       LEFT JOIN "agent_outbox" AS dispatch
         ON dispatch."topic" = $2 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
        WHERE task."status" IN ('queued', 'retrying')
-         AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+         AND task."interruptRequestedAt" IS NULL AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
         AND session."id" = ANY($1::text[])
         AND ${RUNNABLE_SESSION}
@@ -94,7 +94,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
             AND turn."userId" = session."userId"
            WHERE task."id" = $6 AND task."sessionId" = $3 AND task."status" IN ('queued', 'retrying')
-             AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+             AND task."interruptRequestedAt" IS NULL AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
              AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND ${RUNNABLE_SESSION}
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
@@ -106,17 +106,17 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
     return repaired
   })
 }
-export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue: SubagentQueueLike, limit = SUBAGENT_MAX_BATCH): Promise<number> {
-  if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
+export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue: SubagentQueueLike, limit = SUBAGENT_MAX_BATCH, sessionId?: string): Promise<number> {
+  if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive"); if (sessionId !== undefined && !sessionId.trim()) throw new TypeError("Subagent dispatch session filter must be non-empty")
   const rows = await transaction(pool, async client => {
     const result = await client.query<{ id: string; aggregateId: string; payload: unknown; attemptCount?: number }>(`SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"
       FROM "agent_outbox" AS dispatch
       LEFT JOIN "agent_sessions" AS session
         ON session."id" = dispatch."aggregateId"
-      WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
+      WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL AND ($3::text IS NULL OR dispatch."aggregateId" = $3)
         AND (session."id" IS NULL OR ${RUNNABLE_SESSION})
       ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
-      LIMIT $2 FOR UPDATE OF dispatch SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
+      LIMIT $2 FOR UPDATE OF dispatch SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit, sessionId ?? null])
     return result.rows
   })
   let dispatched = 0

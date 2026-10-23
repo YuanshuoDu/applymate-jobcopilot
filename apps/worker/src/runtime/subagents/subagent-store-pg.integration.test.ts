@@ -394,6 +394,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await installTestTenantRls(adminPool)
     await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT ON "agent_wait_conditions" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError", "payload") ON "agent_outbox" TO ${RUNTIME_ROLE}`)
@@ -437,10 +438,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
           relation.relrowsecurity AS "tableRlsEnabled", row_security_active(relation.oid) AS "rowSecurityActive"
         FROM pg_roles role CROSS JOIN pg_class AS relation
         WHERE role.rolname = current_user AND relation.oid = ANY(ARRAY[
-          'agent_sessions'::regclass, 'agent_turns'::regclass, 'sub_agent_tasks'::regclass,
+          'agent_sessions'::regclass, 'agent_turns'::regclass, 'agent_wait_conditions'::regclass, 'sub_agent_tasks'::regclass,
           'agent_steps'::regclass, 'ai_usage_events'::regclass, 'ai_budgets'::regclass
         ]) ORDER BY relation.relname`)
-      expect(result.rows).toEqual(["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "ai_usage_events", "ai_budgets"].sort().map(tableName => ({
+      expect(result.rows).toEqual(["agent_sessions", "agent_turns", "agent_wait_conditions", "sub_agent_tasks", "agent_steps", "ai_usage_events", "ai_budgets"].sort().map(tableName => ({
         tableName,
         isSuperuser: false,
         bypassesRls: false,

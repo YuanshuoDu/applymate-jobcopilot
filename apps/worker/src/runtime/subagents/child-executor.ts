@@ -1,11 +1,10 @@
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import type { PolicyRole } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 import { Buffer } from "node:buffer"
 import { executionOwnerFence } from "../execution-owner.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
-import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
+import { getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
 import { type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
 import { expectedStructuredRole } from "./production-child-policy.js"
@@ -18,7 +17,7 @@ import { parseAndBindStructuredResultOutcome } from "./child-structured-result-o
 import { structuredResultOutputSchema } from "./child-structured-result-outcome.js"
 import { parseScheduledPrepareReference, resolveScheduledPrepareResumeEvidence, type ScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
 import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, type PrivateArtifactToolContext } from "./child-private-artifact.js"
-import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, selectedJobToolAllowed, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
+import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
 import { dispatchNativeVerificationTask } from "./native-verification-executor.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ChildResumeLoader } from "./child-resume.js"
@@ -33,26 +32,13 @@ import { createUsageAwareModelAdapter, type UsageAwareModelOptions } from "../tu
 import type { SelectedJobArtifactContextBundle } from "./selected-job-artifact-context.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { RuntimeToolDefinition, ToolRouterContext, ToolExecutionResult, ToolCallRequest } from "../tools/types.js"
-
-/** Public metadata keeps the runtime's readonly tool contracts without exposing execution functions to the model. */
-export type ChildPublicDefinition = Omit<RuntimeToolDefinition, "execute">
-export type ChildToolRuntime = {
-  readonly definitions: readonly ChildPublicDefinition[]
-  readonly router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
-  readonly selectedJobArtifactContext?: SelectedJobArtifactContextBundle
-  readonly writerReviewRevision?: Readonly<{ context: ArtifactToolRevisionContext; feedback: TaskGraphWriterReviewFeedbackFrame }>
-  readonly serverContext?: unknown
-  readonly discoveryAttemptSidecar?: () => DiscoveryAttemptSidecar | undefined
-  readonly discoveryRecoverySidecar?: () => DiscoveryRecoverySnapshot | undefined
-  readonly resolveScheduledPrepareReference?: ScheduledPrepareReferenceResolver
-  /** Private scoped tools bypass normal lifecycle persistence; only their ref receipt is persisted. */
-  readonly executePrivateTool?: (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
-  readonly validateArguments?: (name: string, input: unknown, version?: string) => true | string
-}
+import { canManageChildrenWithWaitAction, visibleChildDefinitions, isOrdinaryScout, childResultStatus as resultStatus, isDeterministicChildResumeError, acknowledgeDurableWaitAtContinuationStart } from "./child-executor-admission.js"
+import type { ChildPublicDefinition, ChildToolRuntime } from "./child-executor-admission.js"
+import type { DurableWaitResume } from "./child-resume-observations.js"
+export type { ChildPublicDefinition, ChildToolRuntime } from "./child-executor-admission.js"
 
 const MAX_CHILD_FINAL_TEXT_BYTES = 8 * 1024
 const CHILD_FINAL_TEXT_TRUNCATION_MARKER = "...[TRUNCATED]"
-
 function utf8Prefix(value: string, maxBytes: number): string {
   let bytes = 0
   let prefix = ""
@@ -82,15 +68,12 @@ export type ChildExecutorOptions = {
   readonly mailboxReader?: ChildMailboxReader
   /** Restores only server-owned state from prior durable attempts. */
   readonly resumeLoader?: ChildResumeLoader
+  /** Acknowledges a delivered durable wait only after the continuation step exists. */
+  readonly durableWaitResumeCommitter?: (lease: SubagentLease, wait: DurableWaitResume, nextStepOrdinal: number) => Promise<boolean | void>
   readonly now?: () => Date
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
-function isOrdinaryScout(lease: SubagentLease, structuredRole: StructuredRole | undefined, selectedJob: string | undefined, selectedJobPreparation: unknown): boolean {
-  const context = record(lease.context)
-  return lease.role === "scout" && lease.taskType === "job_discovery" && structuredRole === "scout" && !selectedJob && !selectedJobPreparation
-    && !["selectedJobPreparation", "coverLetterBase", "writerReviewFeedback"].some(key => Object.hasOwn(context, key))
-}
 function configWithSnapshot(config: AiConfig, snapshot: unknown): AiConfig {
   const value = record(snapshot)
   const provider = value.provider
@@ -107,43 +90,6 @@ async function defaultModel(task: SubagentTaskRecord): Promise<ModelAdapter> {
   return (await createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
 
-function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly ChildPublicDefinition[], selectedJob?: string, writerRevision = false): ChildPublicDefinition[] {
-  const policy = getSubagentRolePolicy(task.role)
-  if (!policy) throw new Error("subagent_role_unknown")
-  const allowedActions = new Set(Array.isArray(task.allowedActions) ? task.allowedActions.filter((action): action is string => typeof action === "string") : [])
-  return definitions.filter(definition => {
-    if (!allowedActions.has(definition.name) || (selectedJob && !selectedJobToolAllowed(task.role, definition.name, writerRevision))) return false
-    if (definition.name === "tool_results.read") {
-      return definition.risk === "read"
-        && definition.idempotency === "read_only"
-        && definition.capabilities.includes("read")
-        && policy.allowedRisks.includes("read")
-        && definition.requiredCapabilities.every(capability => policy.capabilities.includes(capability))
-    }
-    if (definition.domain === "coordination") return false
-    return visibleToolPolicy(task.role, definition).visible
-  })
-}
-
-function resultStatus(status: "completed" | "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user" | "interrupted" | "failed"): SubagentExecutionResult["status"] {
-  if (status === "completed") return "completed"
-  if (status === "waiting_for_dependency") return "waiting"
-  // SubagentTask has no separate approval state; retain the durable wait.
-  if (status === "waiting_for_approval" || status === "waiting_for_user") return "waiting_for_user"
-  return "failed"
-}
-
-function isDeterministicChildResumeError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false
-  const code = error.message
-  if (!code.startsWith("child_resume_") || code.includes("owner_mismatch") || code.includes("lease_expired")) return false
-  return code.startsWith("child_resume_invalid_")
-    || code.endsWith("_lineage")
-    || code.endsWith("_limit")
-    || code.endsWith("_tool_call_conflict")
-    || code.endsWith("_tool_result_conflict")
-    || code === "child_resume_usage_overflow"
-}
 export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult> {
   if (!options.treeBudget) throw new TypeError("treeBudget is required for child execution")
   return async ({ lease }) => {
@@ -170,19 +116,22 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const selectedJobPreparation = runtime.selectedJobArtifactContext?.preparation
     if (selectedJob && !hasSelectedJobReadContext(runtime.selectedJobArtifactContext, selectedJob)) return { status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" }
     if (runtime.writerReviewRevision && lease.role !== "writer") return { status: "failed", failureReason: "writer_review_revision_role_invalid", retryDisposition: "terminal" }
-    const definitions = visibleDefinitions(lease, runtime.definitions, selectedJob, Boolean(runtime.writerReviewRevision))
+    const definitions = visibleChildDefinitions(lease, runtime.definitions, selectedJob, Boolean(runtime.writerReviewRevision))
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
     let snapshot = childContextSnapshot(lease, runtime.serverContext), resume: TurnResumeState | undefined
+    let durableWaitResume: DurableWaitResume | undefined
     const observedEvidence = createObservedEvidenceIndex()
-    if (options.resumeLoader && lease.attemptCount > 1) {
+    const durableWaitResumeEligible = canManageChildrenWithWaitAction(policy, lease.allowedActions)
+    if (options.resumeLoader && (lease.attemptCount > 1 || durableWaitResumeEligible)) {
       try {
         const restored = await options.resumeLoader(lease)
         if (restored) {
+          durableWaitResume = restored.durableWait
           if (!selectedEvidenceTask) {
             try {
               const prepare = await resolveScheduledPrepareResumeEvidence(restored.observations, runtime.resolveScheduledPrepareReference, lease.id, lease.attemptCount)
-              const evidence = restored.observations.filter(item => record(item.content).toolName !== "scheduled.application.prepare")
+              const evidence = restored.observations.filter(item => !["scheduled.application.prepare", "wait_subagents"].includes(String(record(item.content).toolName)))
               hydrateObservedEvidence(observedEvidence, evidence, { taskId: lease.id, attemptCount: lease.attemptCount })
               for (const item of prepare) recordReadToolOutput(observedEvidence, "scheduled.application.prepare", item.result, undefined,
                 { toolCallId: item.toolCallId, taskId: lease.id, attemptCount: lease.attemptCount, ...(item.reference ? { reference: item.reference } : {}) })
@@ -195,6 +144,9 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
         if (isDeterministicChildResumeError(error)) return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" }
         return { status: "failed", failureReason: "child_resume_unavailable" }
       }
+    }
+    if (durableWaitResume && (!resume || durableWaitResume.attempt !== lease.attemptCount || resume.nextOrdinal !== durableWaitResume.ordinal + 1)) {
+      return { status: "failed", failureReason: "child_resume_wait_step_lineage", retryDisposition: "terminal" }
     }
     const budget = await options.treeBudget.readRootLimits?.({
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: lease.rootTaskId,
@@ -247,7 +199,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     )
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
-      contextBuilder, store: safeStore, model, tools: definitions,
+      contextBuilder, store: acknowledgeDurableWaitAtContinuationStart(safeStore, lease, durableWaitResume, options.durableWaitResumeCommitter), model, tools: definitions,
       executeTool, actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
       budget,

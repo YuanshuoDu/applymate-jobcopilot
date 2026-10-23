@@ -16,7 +16,7 @@ function snapshotRow(taskId = payload.taskId) {
     userId: "user-1", sessionStatus: "running",
     turnStatus: "in_progress", rootStatus: "running", rootInterruptRequestedAt: null, taskStatus: "queued",
     taskAttemptCount: 0, taskMaxAttempts: 3, taskStartedAt: null, taskLeaseOwner: null, taskLeaseExpiresAt: null,
-    taskInterruptRequestedAt: null, taskNextAttemptAt: null,
+    taskInterruptRequestedAt: null, taskNextAttemptAt: null, childWaitResumable: false,
   }
 }
 
@@ -69,7 +69,7 @@ function fakePool(options: FakeOptions = {}) {
           if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE")) {
             const task = options.task ?? { id: payload.taskId, sessionId: payload.sessionId, turnId: "turn-1", rootTaskId: payload.rootTaskId,
               status: "queued", attemptCount: 0, maxAttempts: 3, startedAt: null, leaseOwner: null, leaseExpiresAt: null,
-              interruptRequestedAt: null, nextAttemptAt: null }
+              interruptRequestedAt: null, nextAttemptAt: null, childWaitResumable: false }
             return { rows: task.status === "missing" ? [] : [task], rowCount: task.status === "missing" ? 0 : 1 }
           }
           if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return { rows: [dispatch], rowCount: 1 }
@@ -101,6 +101,9 @@ describe("recoverMissingPublishedSubagentDispatches", () => {
     const snapshotSql = fake.events.find(event => event.sql.includes('LIMIT $4'))?.sql ?? ""
     expect(snapshotSql).toContain('turn."rootTaskId" AS "turnRootTaskId"')
     expect(snapshotSql).toContain('turn."rootTaskId" = task."rootTaskId"')
+    expect(snapshotSql).toContain('wait."status" IN (\'ready\', \'timed_out\') AND wait."suspendedAt" IS NOT NULL')
+    expect(snapshotSql).toContain('wait."consumedAt" IS NULL AND step."status" = \'waiting_for_tool\'')
+    expect(snapshotSql).toContain('continuation."ordinal" = (SELECT MIN(later."ordinal")')
     const statements = fake.events.filter(event => event.client === 1).map(event => event.sql)
     expect(statements.findIndex(sql => sql.includes('FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE")))
       .toBeLessThan(statements.findIndex(sql => sql.includes('FROM "agent_turns" AS turn')))
@@ -125,6 +128,49 @@ describe("recoverMissingPublishedSubagentDispatches", () => {
     expect(getJob).toHaveBeenCalledTimes(1)
     expect(fake.connect).toHaveBeenCalledTimes(1)
     expect(fake.clients[0]).toMatchObject({ inTransaction: false, released: true })
+  })
+
+  it("keeps an active canonical job in place while it may still claim", async () => {
+    const fake = fakePool()
+    const getState = vi.fn(async () => "active")
+    const getJob = vi.fn(async () => ({ id: subagentDispatchJobId(payload.taskId, 1), data: { ...payload }, getState }))
+    await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(0)
+    expect(getState).toHaveBeenCalledTimes(1)
+    expect(fake.connect).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(["completed", "failed"] as const)("clears only a retained %s canonical job so a fresh generation can be published", async state => {
+    const fake = fakePool()
+    const expectedId = subagentDispatchJobId(payload.taskId, 1)
+    const getState = vi.fn(async () => state)
+    const getJob = vi.fn(async () => ({ id: expectedId, data: { ...payload }, getState }))
+    await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(1)
+    expect(getJob).toHaveBeenCalledWith(expectedId)
+    expect(getState).toHaveBeenCalledTimes(1)
+    const update = fake.events.find(event => event.sql.startsWith('UPDATE "agent_outbox"'))
+    expect(update?.sql).toContain('SET "publishedAt" = NULL')
+    expect(update?.sql).toContain('"attemptCount" = $5')
+    expect(update?.sql).toContain('"payload" = $7::jsonb')
+    expect(update?.sql).not.toMatch(/SET[^\n]*(?:payload|attemptCount|lastError)/)
+    expect(fake.clients.every(client => client.released && !client.inTransaction)).toBe(true)
+  })
+
+  it("keeps a retained job when its state cannot be read safely", async () => {
+    const fake = fakePool()
+    const getJob = vi.fn(async () => ({ id: subagentDispatchJobId(payload.taskId, 1), data: { ...payload },
+      getState: async () => { throw new Error("redis unavailable") } }))
+    await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(0)
+    expect(fake.connect).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not clear a terminal job whose payload is from a different dispatch owner", async () => {
+    const fake = fakePool()
+    const getState = vi.fn(async () => "completed")
+    const getJob = vi.fn(async () => ({ id: subagentDispatchJobId(payload.taskId, 1),
+      data: { ...payload, ownerId: "stale-owner" }, getState }))
+    await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(0)
+    expect(getState).not.toHaveBeenCalled()
+    expect(fake.connect).toHaveBeenCalledTimes(1)
   })
 
   it("skips a missing getJob capability and an uncertain Redis probe", async () => {
@@ -182,6 +228,49 @@ describe("recoverMissingPublishedSubagentDispatches", () => {
     const getJob = vi.fn(async () => undefined)
     await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(0)
     expect(getJob).not.toHaveBeenCalled()
+    expect(fake.events.some(event => event.sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
+  })
+
+  it("recovers a published child-wait continuation at the exhausted task attempt using the separate outbox generation", async () => {
+    const continuation = { ...snapshotRow(), attemptCount: 9, taskAttemptCount: 3, taskMaxAttempts: 3,
+      taskStartedAt: new Date(Date.now() - 180_000), childWaitResumable: true }
+    const fake = fakePool({ rows: [continuation], task: { id: payload.taskId, sessionId: payload.sessionId, turnId: "turn-1",
+      rootTaskId: payload.rootTaskId, status: "queued", attemptCount: 3, maxAttempts: 3,
+      startedAt: continuation.taskStartedAt, leaseOwner: null, leaseExpiresAt: null,
+      interruptRequestedAt: null, nextAttemptAt: null, childWaitResumable: true } })
+    const getJob = vi.fn(async (id: string) => {
+      expect(id).toBe(subagentDispatchJobId(payload.taskId, 8))
+      return undefined
+    })
+
+    await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(1)
+    const snapshotSql = fake.events.find(event => event.sql.includes('LIMIT $4'))?.sql ?? ""
+    const currentTaskSql = fake.events.find(event => event.sql.includes('FROM "sub_agent_tasks" AS task') && event.sql.includes("FOR UPDATE"))?.sql ?? ""
+    expect(snapshotSql).toContain('OR (SELECT COUNT(*) = 1')
+    expect(snapshotSql).toContain('task."status" = \'queued\'')
+    expect(currentTaskSql).toContain('AS "childWaitResumable"')
+    expect(fake.events.some(event => event.sql.startsWith('UPDATE "agent_outbox"'))).toBe(true)
+  })
+
+  it("does not treat an exhausted started task as a continuation without the exact current wait", async () => {
+    const stale = { ...snapshotRow(), attemptCount: 9, taskAttemptCount: 3, taskMaxAttempts: 3,
+      taskStartedAt: new Date(Date.now() - 180_000), childWaitResumable: false }
+    const fake = fakePool({ rows: [stale] })
+    const getJob = vi.fn(async () => undefined)
+    await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(0)
+    expect(getJob).not.toHaveBeenCalled()
+  })
+
+  it("rechecks that the task attempt stayed current while the queue absence was probed", async () => {
+    const continuation = { ...snapshotRow(), attemptCount: 9, taskAttemptCount: 3, taskMaxAttempts: 3,
+      taskStartedAt: new Date(Date.now() - 180_000), childWaitResumable: true }
+    const fake = fakePool({ rows: [continuation], task: { id: payload.taskId, sessionId: payload.sessionId, turnId: "turn-1",
+      rootTaskId: payload.rootTaskId, status: "queued", attemptCount: 4, maxAttempts: 3,
+      startedAt: continuation.taskStartedAt, leaseOwner: null, leaseExpiresAt: null,
+      interruptRequestedAt: null, nextAttemptAt: null, childWaitResumable: true } })
+    const getJob = vi.fn(async () => undefined)
+    await expect(recoverMissingPublishedSubagentDispatches(fake.pool, { getJob })).resolves.toBe(0)
+    expect(getJob).toHaveBeenCalledTimes(1)
     expect(fake.events.some(event => event.sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
   })
 

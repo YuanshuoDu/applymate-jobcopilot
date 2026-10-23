@@ -289,8 +289,12 @@ describe("durable wait resolver", () => {
   it("honors the finite batch and closes an opt-in scanner", async () => {
     const fake = fixture({ turnCount: 2 })
     await expect(reconcileDurableWaits(fake.pool as never, { now, batchSize: 1 })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 0 })
+    const childScan = fake.calls.find(sql => sql.includes('JOIN "sub_agent_tasks" AS parent') && sql.includes('parent."status" = \'waiting\'')) ?? ""
+    expect(childScan).toContain('wait."suspendedAt" IS NOT NULL')
+    expect(fake.calls.indexOf(childScan)).toBeGreaterThan(fake.calls.indexOf("COMMIT"))
     const empty = fixture({ turnStatus: "queued" })
     const scanner = startDurableWaitResolver(empty.pool as never, { intervalMs: 60_000, batchSize: 1 })
     await scanner.close()
+    expect(empty.calls.some(sql => sql.includes('JOIN "sub_agent_tasks" AS parent') && sql.includes('parent."status" = \'waiting\''))).toBe(true)
   })
 })

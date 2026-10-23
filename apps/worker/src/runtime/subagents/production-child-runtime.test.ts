@@ -294,6 +294,7 @@ function selectedJobExecutor(input: {
   const executor = createOptionalProductionChildExecutor({
     enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
     authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => input.model,
+    resumeLoader: async () => undefined,
     ...(input.mailboxReader ? { mailboxReader: input.mailboxReader } : {}),
   })
   if (!executor) throw new Error("production selected-job child executor was not created")
@@ -583,7 +584,7 @@ describe("production child runtime", () => {
     const scoutExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
       authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => scoutModel,
-      jobDiscoveryClient: discoveryClient, mailboxReader: emptyMailboxReader,
+      jobDiscoveryClient: discoveryClient, mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
     })
     if (!scoutExecutor) throw new Error("generic Scout child executor was not created")
 
@@ -674,7 +675,7 @@ describe("production child runtime", () => {
     const analystExecutor = createOptionalProductionChildExecutor({
       enabled: true, pool: poolFixture as never, turnStore: turnPersistence.engineStore, treeBudget: budget(),
       authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => analystModel,
-      mailboxReader: emptyMailboxReader,
+      mailboxReader: emptyMailboxReader, resumeLoader: async () => undefined,
     })
     if (!analystExecutor) throw new Error("Analyst child executor was not created")
 
@@ -907,7 +908,7 @@ describe("production child runtime", () => {
     })
     if (!executor) throw new Error("child executor was not created")
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
-    expect(poolWithConnect.connect).toHaveBeenCalledOnce()
+    expect(poolWithConnect.connect).toHaveBeenCalledTimes(2)
     expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
   })
 

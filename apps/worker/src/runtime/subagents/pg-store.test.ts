@@ -92,6 +92,9 @@ function fakePool(
       if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"') && result.rows === undefined) {
         return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000) }], rowCount: 1, ...result }
       }
+      if (sql.includes('JOIN "agent_wait_conditions" AS wait') && result.rows === undefined) {
+        return { rows: [], rowCount: 0, ...result }
+      }
       if (sql.startsWith("SELECT clock_timestamp()") && result.rows === undefined) {
         return { rows: [{ checkedAt: now }], rowCount: 1, ...result }
       }
@@ -1116,6 +1119,19 @@ describe("PgSubagentTaskStore", () => {
     expect(updates[1]?.[0]).toContain("jsonb_set(\"payload\", '{ownerId}'")
     expect(updates[1]?.[1]?.slice(0, 3)).toEqual(["subagent-dispatch:task-1", "session-1", PAUSE_DEFERRED_MARKER])
     expect(updates[1]?.[1]?.[3]).toMatch(/^release-/)
+  })
+
+  it("preserves the active lease and outbox for an unsuspended streaming child wait", async () => {
+    const fake = fakePool(sql => sql.includes('JOIN "agent_wait_conditions" AS wait')
+      ? { rows: [{ waitId: "wait-1", turnId: "turn-1", rootTaskId: "root-1", stepId: "step-1", stepStatus: "streaming", leaseExpiresAt: new Date(now.getTime() + 60_000) }], rowCount: 1 }
+      : sql.startsWith("UPDATE") ? { rowCount: 1 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(false)
+    expect(fake.calls.find(([sql]) => sql.includes('JOIN "agent_wait_conditions" AS wait'))?.[0]).not.toContain("FOR UPDATE")
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
   })
 
   it("does not release or redispatch a lease that expires while waiting for its task lock", async () => {

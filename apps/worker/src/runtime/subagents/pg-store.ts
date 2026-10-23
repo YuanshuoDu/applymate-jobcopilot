@@ -4,6 +4,7 @@ import { isTerminalSubagentStatus, PAUSE_DEFERRED_MARKER, type AtomicSubagentSpa
   type SubagentExecutionResult, type SubagentRetryDisposition, type SubagentStore, type SubagentTaskRecord, type SubagentTaskSpec, type SubagentPolicy } from "./types.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
+import { handoffDurableSubagentWaitWithGraph, releaseDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
 import { assertSessionWorkAdmission, RUNNABLE_SESSION } from "../session-gate.js"
 import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentSession, lockSubagentTurn, lockSubagentTurnForWork, readSubagentTask } from "./pg-store-create.js"
 import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
@@ -137,6 +138,10 @@ export class PgSubagentTaskStore implements SubagentStore {
         const leaseClock = await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)
         const finishAt = leaseClock.rows[0]?.checkedAt
         if (!lockedExpiry || !finishAt || lockedExpiry <= finishAt) return null
+        if (input.status === "waiting" && row.parentTaskId !== null && row.parentTaskId !== undefined) {
+          const handoff = await handoffDurableSubagentWaitWithGraph(client, { lease: { id: input.taskId, userId: sessionRow.userId, sessionId: input.sessionId, turnId: String(row.turnId), rootTaskId: String(row.rootTaskId), ownerId: input.ownerId, attemptCount: input.attemptCount, leaseExpiresAt: lockedExpiry }, now: finishAt })
+          if (handoff) return "blocked" in handoff ? null : "waiting"
+        }
         const nextAttemptAt = retry ? computeSubagentNextAttemptAt(input.attemptCount, finishAt) : null
         const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
           "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
@@ -192,23 +197,22 @@ export class PgSubagentTaskStore implements SubagentStore {
       const userId = session.rows[0]?.userId
       if (!userId) return false
       await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId])
-      const releasedAt = await this.leaseTimeAfterLock(client, input); if (!releasedAt) return false
+      const releasedAt = await this.leaseTimeAfterLock(client, input)
+      if (!releasedAt) return false
+      const waitRelease = await releaseDurableSubagentWaitWithGraph(client, { id: input.taskId, userId, sessionId: input.sessionId, ownerId: input.ownerId, attemptCount: input.attemptCount, now: releasedAt })
+      if (waitRelease !== undefined) return waitRelease
       const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.retrying", attemptCount: input.attemptCount })
       if (graph && "blocked" in graph) return false
-      const updated = await client.query(`UPDATE "sub_agent_tasks"
-        SET "status" = 'queued', "nextAttemptAt" = NULL, "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $5
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4
-          AND "interruptRequestedAt" IS NULL AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp()
-          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
-            WHERE session."id" = "sub_agent_tasks"."sessionId"
-              AND session."status" NOT IN ('aborted', 'archived'))`,
+      const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'queued', "nextAttemptAt" = NULL, "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $5
+        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4 AND "interruptRequestedAt" IS NULL
+          AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp() AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+            WHERE session."id" = "sub_agent_tasks"."sessionId" AND session."status" NOT IN ('aborted', 'archived'))`,
       [input.taskId, input.sessionId, input.ownerId, input.attemptCount, releasedAt])
       if (updated.rowCount !== 1) return false
       if (graph) await persistGraphTransition(client, graph, releasedAt)
       await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1,
         "payload" = CASE WHEN "lastError" = $3 THEN jsonb_set("payload", '{ownerId}', to_jsonb($4::text), true) ELSE "payload" END,
-        "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END
-        WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
+        "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
       [`subagent-dispatch:${input.taskId}`, input.sessionId, PAUSE_DEFERRED_MARKER, `release-${randomUUID()}`])
       return true
     })
@@ -236,7 +240,6 @@ export class PgSubagentTaskStore implements SubagentStore {
       return true
     })
   }
-
   async interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number> { return interruptStoreTree(this.pool, input) }
   async interruptTurn(input: { userId: string; sessionId: string; turnId: string; now: Date }): Promise<number> { return interruptStoreTurn(this.pool, input) }
   async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> { return interruptStoreSubtree(this.pool, input) }
