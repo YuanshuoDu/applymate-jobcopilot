@@ -241,7 +241,7 @@ export async function releaseDurableSubagentWaitWithGraph(client: pg.PoolClient,
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."leaseOwner" = $3 AND task."attemptCount" = $4 AND task."status" = 'running'
       AND task."leaseExpiresAt" > clock_timestamp() AND task."interruptRequestedAt" IS NULL AND task."parentTaskId" IS NOT NULL
       AND session."userId" = $5 AND ${OPEN_SESSION} AND wait."status" = 'waiting' AND wait."suspendedAt" IS NULL AND wait."consumedAt" IS NULL
-      AND step."attempt" = task."attemptCount" LIMIT 2 FOR UPDATE OF task, wait, step`,
+      AND step."attempt" = task."attemptCount" LIMIT 2`,
   [input.id, input.sessionId, input.ownerId, input.attemptCount, input.userId])).rows
   const wait = rows[0]
   if (rows.length !== 1 || wait?.stepStatus !== "waiting_for_tool") return rows.length ? false : undefined

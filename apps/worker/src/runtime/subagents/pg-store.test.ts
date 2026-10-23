@@ -1128,6 +1128,7 @@ describe("PgSubagentTaskStore", () => {
     const store = new PgSubagentTaskStore(fake.pool)
 
     await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(false)
+    expect(fake.calls.find(([sql]) => sql.includes('JOIN "agent_wait_conditions" AS wait'))?.[0]).not.toContain("FOR UPDATE")
     expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
     expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
