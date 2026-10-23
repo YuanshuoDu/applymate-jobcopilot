@@ -125,7 +125,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         VALUES ($1, $2, $3, 'in_progress', 'system', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`, [ids.turnId, ids.sessionId, ids.userId])
 
       const root = await taskStore.create({ userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId,
-        role: "orchestrator", taskType: "root", goal: "durable child wait fixture", allowedActions: [], policy })
+        role: "orchestrator", taskType: "root", goal: "durable child wait fixture", allowedActions: ["wait_subagents"], policy })
       ids.rootTaskId = root.id
       await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2 WHERE "id" = $1 AND "sessionId" = $3`, [ids.turnId, root.id, ids.sessionId])
       await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'running' WHERE "id" = $1 AND "sessionId" = $2`, [root.id, ids.sessionId])
