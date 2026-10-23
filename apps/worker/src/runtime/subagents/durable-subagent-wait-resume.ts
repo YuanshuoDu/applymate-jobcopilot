@@ -1,7 +1,8 @@
 import type pg from "pg"
 
 import type { SubagentLease } from "./types.js"
-import { assertLease, dateValue, DurableSubagentWaitError, object, parseIds, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
+import { assertLease, dateValue, DurableSubagentWaitError, object, parseIds, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
+import { resolveDurableWaitOutcome } from "./child-resume-observations.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Pool = Pick<pg.Pool, "connect">
@@ -34,43 +35,9 @@ function exactTargets(ids: readonly string[], rows: readonly Row[], lease: Resum
     && rows.length === ids.length && rows.every(row => ids.includes(String(row.id)) && String(row.parentTaskId) === lease.id
       && String(row.rootTaskId) === lease.rootTaskId && String(row.turnId) === lease.turnId && String(row.sessionId) === lease.sessionId)
 }
-
 function sameIds(left: readonly string[], right: readonly string[]): boolean {
   return [...left].sort().join("\u0000") === [...right].sort().join("\u0000")
 }
-
-function strictIds(value: unknown): string[] | undefined {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
-  if (!Array.isArray(parsed)) return undefined
-  const ids: string[] = []
-  for (const id of parsed) {
-    if (typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 256) return undefined
-    ids.push(id)
-  }
-  return new Set(ids).size === ids.length ? ids : undefined
-}
-
-function resolvedOutcome(wait: Row, ids: readonly string[], currentMatched: readonly string[], now: Date): DurableSubagentWaitResult {
-  const stored = object(object(wait.result).outcome)
-  const rowMatched = strictIds(wait.matchedTaskIds), storedMatched = strictIds(stored.matchedTaskIds)
-  const storedIds = strictIds(stored.taskIds)
-  const deadline = dateValue(wait.deadlineAt, "deadlineAt")
-  const outcome = waitResult(wait)
-  const modeIsValid = wait.mode === "any" || wait.mode === "all"
-  const matchedIsValid = !!rowMatched && !!storedMatched && sameIds(rowMatched, storedMatched)
-    && rowMatched.every(id => ids.includes(id) && currentMatched.includes(id))
-  const readyIsValid = wait.status !== "ready" || (!!rowMatched && (wait.mode === "any" ? rowMatched.length > 0 : rowMatched.length === ids.length))
-  const timeoutIsValid = wait.status !== "timed_out" || now >= deadline
-  if (stored.waitId !== wait.id || stored.status !== wait.status || !storedIds || !sameIds(storedIds, ids)
-    || dateValue(stored.deadlineAt, "outcome.deadlineAt").getTime() !== deadline.getTime()
-    || !modeIsValid || !matchedIsValid || !readyIsValid || !timeoutIsValid
-    || outcome.status !== wait.status || !sameIds(outcome.taskIds, ids) || outcome.tasks.length !== ids.length
-    || !sameIds(outcome.tasks.map(task => task.taskId), ids) || !sameIds(outcome.matchedTaskIds, rowMatched ?? [])) {
-    throw new DurableSubagentWaitError("wait_scope_error", "Persisted child wait result is invalid")
-  }
-  return outcome
-}
-
 function validReceipt(content: unknown, wait: Row, ids: readonly string[], toolCallId: string): boolean {
   const result = object(content), receipt = object(result.output)
   if (!receipt || result.toolCallId !== toolCallId || result.errorCode !== null && result.errorCode !== undefined
@@ -119,6 +86,15 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     if (candidates.length === 0) return undefined
     if (candidates.length !== 1) throw new DurableSubagentWaitError("wait_conflict", "Multiple resolved waits match the current child attempt")
     const step = candidates[0]
+    const sourceOrdinal = Number(step.ordinal)
+    if (!Number.isSafeInteger(sourceOrdinal) || sourceOrdinal < 0) throw new DurableSubagentWaitError("wait_scope_error", "Child wait step ordinal is invalid")
+    const laterSteps = (await client.query<Row>(`SELECT "id", "ordinal", "status" FROM "agent_steps"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "attempt" = $4 AND "ordinal" > $5
+      ORDER BY "ordinal" ASC, "id" ASC LIMIT 2 FOR SHARE`,
+    [lease.sessionId, lease.turnId, lease.id, lease.attemptCount, sourceOrdinal])).rows
+    if (laterSteps.length > 1 || laterSteps.length === 1 && laterSteps[0]?.status !== "streaming") {
+      throw new DurableSubagentWaitError("wait_conflict", "Child wait has an ambiguous continuation")
+    }
 
     const waits = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
       FROM "agent_wait_conditions" WHERE "id" IN (
@@ -146,7 +122,7 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     [ids, lease.sessionId, lease.turnId, lease.rootTaskId, lease.userId, lease.id])).rows
     if (!exactTargets(ids, targets, lease)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait targets changed scope")
     const currentMatched = targets.filter(target => TERMINAL.has(String(target.status))).map(target => String(target.id))
-    const outcome = resolvedOutcome(wait, ids, currentMatched, now)
+    const outcome = resolveDurableWaitOutcome(wait, ids, currentMatched, now)
     const callRows = (await client.query<Row>(`SELECT "id" AS "callItemId", "content" AS "callContent", "status" AS "callStatus" FROM "agent_items"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
         AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents'
@@ -195,7 +171,9 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
     const source = (await client.query<Row>(`SELECT "id", "ordinal", "attempt", "status" FROM "agent_steps"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "attempt" = $5 FOR SHARE`,
     [input.stepId, lease.sessionId, lease.turnId, lease.id, lease.attemptCount])).rows[0]
-    if (!source || !["waiting_for_tool", "completed"].includes(String(source.status)) || Number(source.ordinal) + 1 !== input.nextStepOrdinal) {
+    const sourceOrdinal = Number(source?.ordinal)
+    if (!source || !["waiting_for_tool", "completed"].includes(String(source.status))
+      || !Number.isSafeInteger(sourceOrdinal) || sourceOrdinal < 0 || sourceOrdinal >= input.nextStepOrdinal) {
       throw new DurableSubagentWaitError("wait_scope_error", "Source step does not precede the acknowledged resume step")
     }
     const wait = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
@@ -212,7 +190,7 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
     [ids, lease.sessionId, lease.turnId, lease.rootTaskId, lease.userId, lease.id])).rows
     if (!exactTargets(ids, targets, lease)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait targets changed scope")
     const currentMatched = targets.filter(target => TERMINAL.has(String(target.status))).map(target => String(target.id))
-    const outcome = resolvedOutcome(wait, ids, currentMatched, now)
+    const outcome = resolveDurableWaitOutcome(wait, ids, currentMatched, now)
     const calls = (await client.query<Row>(`SELECT call."content" AS "callContent", call."status" AS "callStatus"
       FROM "agent_items" AS call JOIN "agent_wait_conditions" AS wait ON wait."id" = $6 AND wait."stepId" = call."stepId"
       WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND call."stepId" = $4
@@ -231,12 +209,18 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
       || results[0].status !== "completed" || !validReceipt(results[0].content, wait, ids, toolCallId))) {
       throw new DurableSubagentWaitError("wait_scope_error", "Wait tool input does not match the acknowledged condition")
     }
-    const next = (await client.query<Row>(`SELECT "id", "ordinal", "attempt", "status" FROM "agent_steps"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "attempt" = $4 AND "ordinal" = $5 FOR SHARE`,
-    [lease.sessionId, lease.turnId, lease.id, lease.attemptCount, input.nextStepOrdinal])).rows[0]
+    const laterSteps = (await client.query<Row>(`SELECT "id", "ordinal", "attempt", "status" FROM "agent_steps"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "attempt" = $4 AND "ordinal" > $5
+      ORDER BY "ordinal" ASC, "id" ASC LIMIT 2 FOR SHARE`,
+    [lease.sessionId, lease.turnId, lease.id, lease.attemptCount, sourceOrdinal])).rows
+    if (laterSteps.length > 1) throw new DurableSubagentWaitError("wait_conflict", "Child wait has multiple continuation steps")
+    const next = laterSteps[0]
     if (!next) {
       if (wait.consumedAt !== null && wait.consumedAt !== undefined) throw new DurableSubagentWaitError("wait_scope_error", "Acknowledged child wait has no continuation step")
       return false
+    }
+    if (Number(next.ordinal) !== input.nextStepOrdinal) {
+      throw new DurableSubagentWaitError("wait_scope_error", "Acknowledged child wait does not match its first continuation step")
     }
     if (wait.consumedAt !== null && wait.consumedAt !== undefined) return true
     const acknowledged = await client.query(`UPDATE "agent_wait_conditions" SET "consumedAt" = $1, "updatedAt" = $1

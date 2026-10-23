@@ -20,12 +20,15 @@ const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
         WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId"
           AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount"))
       OR (step."status" IN ('waiting_for_tool', 'completed')
-        AND (SELECT COUNT(*) FROM "agent_steps" AS continuation WHERE continuation."taskId" = task."id"
+        AND EXISTS (SELECT 1 FROM "agent_steps" AS continuation WHERE continuation."taskId" = task."id"
           AND continuation."sessionId" = task."sessionId" AND continuation."turnId" = task."turnId"
-          AND continuation."attempt" = task."attemptCount" AND continuation."ordinal" = step."ordinal" + 1) = 1
-        AND step."ordinal" + 1 = (SELECT MAX(currentStep."ordinal") FROM "agent_steps" AS currentStep
-          WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId"
-            AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount")))
+          AND continuation."attempt" = task."attemptCount"
+          AND continuation."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+            WHERE later."taskId" = task."id" AND later."sessionId" = task."sessionId"
+              AND later."turnId" = task."turnId" AND later."attempt" = task."attemptCount" AND later."ordinal" > step."ordinal")
+          AND continuation."ordinal" = (SELECT MAX(currentStep."ordinal") FROM "agent_steps" AS currentStep
+            WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId"
+              AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount")))
     AND wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL
     AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait
       JOIN "agent_steps" AS currentWaitStep ON currentWaitStep."id" = currentWait."stepId"

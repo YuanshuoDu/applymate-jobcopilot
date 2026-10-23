@@ -7,7 +7,7 @@ const lease = {
   id: "parent-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
   ownerId: "worker-1", attemptCount: 3, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
-function fixture(options: { consumed?: boolean; nextStep?: boolean; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string } = {}) {
+function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinals?: number[]; sourceOrdinal?: number; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const state = { consumedAt: options.consumed ? now : null, acknowledgements: 0 }
   const waitStatus = options.waitStatus ?? "ready"
@@ -41,9 +41,12 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; ownerId?: st
         status: "running", attemptCount: 3, leaseOwner: options.ownerId ?? "worker-1", leaseExpiresAt: lease.leaseExpiresAt,
         interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running",
       }], rowCount: 1 }
-      if (sql.includes('FROM "agent_steps"') && sql.includes('ORDER BY step."ordinal" DESC')) return { rows: [{ id: "step-1", taskId: "parent-1", attempt: 3, ordinal: 4, status: "waiting_for_tool" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps"') && sql.includes('ORDER BY step."ordinal" DESC')) return { rows: [{ id: "step-1", taskId: "parent-1", attempt: 3, ordinal: options.sourceOrdinal ?? 4, status: "waiting_for_tool" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps"') && sql.includes('"ordinal" > $5')) {
+        const ordinals = options.nextStep === false ? [] : options.laterOrdinals ?? [5]
+        return { rows: ordinals.slice(0, 2).map((ordinal, index) => ({ id: `step-next-${index}`, ordinal, attempt: 3, status: "streaming" })), rowCount: Math.min(ordinals.length, 2) }
+      }
       if (sql.includes('FROM "agent_steps"') && sql.includes('WHERE "id" = $1') && params[0] === "step-1") return { rows: [{ id: "step-1", ordinal: 4, attempt: 3, status: "waiting_for_tool" }], rowCount: 1 }
-      if (sql.includes('FROM "agent_steps"') && sql.includes('"ordinal" = $5')) return options.nextStep === false ? { rows: [], rowCount: 0 } : { rows: [{ id: "step-2", ordinal: 5, attempt: 3, status: "queued" }], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "id" IN')) return { rows: [wait], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "id" = $1')) return { rows: [wait], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) return { rows: currentTargets, rowCount: currentTargets.length }
@@ -110,6 +113,11 @@ describe("durable child wait resume", () => {
     expect(fake.state.consumedAt).toEqual(now)
   })
 
+  it("rejects ambiguous pending continuations instead of selecting one by row order", async () => {
+    const fake = fixture({ laterOrdinals: [8, 9] })
+    await expect(loadDurableSubagentWaitResume(fake.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_conflict" })
+  })
+
   it("fails closed for a stale lease and a tool result receipt for another wait", async () => {
     const stale = fixture({ ownerId: "other-worker" })
     await expect(loadDurableSubagentWaitResume(stale.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
@@ -142,5 +150,21 @@ describe("durable child wait resume", () => {
       { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
     expect(fake.state.consumedAt).toEqual(now)
     expect(fake.state.acknowledgements).toBe(1)
+  })
+
+  it("acknowledges the first later child step across a Turn-global ordinal gap", async () => {
+    const fake = fixture({ laterOrdinals: [9], sourceOrdinal: 4 })
+    await expect(commitDurableSubagentWaitResume(fake.pool as never, lease,
+      { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 9, now })).resolves.toBe(true)
+    const continuationQuery = fake.calls.find(call => call.sql.includes('"ordinal" > $5'))
+    expect(continuationQuery?.params).toEqual([lease.sessionId, lease.turnId, lease.id, lease.attemptCount, 4])
+    expect(fake.state.acknowledgements).toBe(1)
+  })
+
+  it("rejects multiple later rows when acknowledging an unconsumed wait", async () => {
+    const fake = fixture({ laterOrdinals: [8, 9], sourceOrdinal: 4 })
+    await expect(commitDurableSubagentWaitResume(fake.pool as never, lease,
+      { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 8, now })).rejects.toMatchObject({ code: "wait_conflict" })
+    expect(fake.state.acknowledgements).toBe(0)
   })
 })

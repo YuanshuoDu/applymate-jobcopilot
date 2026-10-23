@@ -101,7 +101,7 @@ export function acknowledgeDurableWaitAtContinuationStart(
     const owner = input.identity
     if (owner.kind !== "task" || owner.userId !== lease.userId || owner.sessionId !== lease.sessionId || owner.turnId !== lease.turnId
       || owner.taskId !== lease.id || owner.rootTaskId !== lease.rootTaskId || owner.ownerId !== lease.ownerId
-      || owner.attemptCount !== wait.attempt || input.attempt !== wait.attempt || step.ordinal !== input.ordinal) {
+      || owner.attemptCount !== wait.attempt || input.attempt !== wait.attempt || step.ordinal <= wait.ordinal) {
       throw new Error("child_resume_wait_owner_mismatch")
     }
     if (await commit(lease, wait, step.ordinal) === false) throw new Error("child_resume_wait_commit_pending")

@@ -103,7 +103,7 @@ describe("recoverMissingPublishedSubagentDispatches", () => {
     expect(snapshotSql).toContain('turn."rootTaskId" = task."rootTaskId"')
     expect(snapshotSql).toContain('wait."status" IN (\'ready\', \'timed_out\') AND wait."suspendedAt" IS NOT NULL')
     expect(snapshotSql).toContain('wait."consumedAt" IS NULL AND step."status" = \'waiting_for_tool\'')
-    expect(snapshotSql).toContain('continuation."ordinal" = step."ordinal" + 1')
+    expect(snapshotSql).toContain('continuation."ordinal" = (SELECT MIN(later."ordinal")')
     const statements = fake.events.filter(event => event.client === 1).map(event => event.sql)
     expect(statements.findIndex(sql => sql.includes('FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE")))
       .toBeLessThan(statements.findIndex(sql => sql.includes('FROM "agent_turns" AS turn')))

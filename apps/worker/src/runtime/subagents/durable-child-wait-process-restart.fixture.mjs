@@ -19,12 +19,14 @@ const readyMarkerByMode = {
   "worker-a-crash": "WORKER_A_READY",
   "worker-b-crash-before-resume": "WORKER_B_READY",
   "worker-b-crash-resume": "WORKER_B_READY",
+  "worker-b-crash-after-wait-ack": "WORKER_B_READY",
   "worker-b": "WORKER_B_READY",
 }
 const crashCutModes = new Set([
   "worker-a-crash",
   "worker-b-crash-before-resume",
   "worker-b-crash-resume",
+  "worker-b-crash-after-wait-ack",
 ])
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
@@ -68,30 +70,42 @@ async function waitForChild(lease, crashAfterRegistration = false) {
   return { status: "waiting", result: { waitId: wait.waitId } }
 }
 
-async function resumeChild(lease, crashBeforeWaitAck = false) {
-  const wait = await loadDurableSubagentWaitResume(pool, lease)
-  if (!wait) throw new Error("durable_child_wait_not_ready")
-  const restored = await loadChildAttemptResume(pool, lease, new Date(), wait)
-  if (!restored?.durableWait || restored.durableWait.waitId !== wait.waitId
+async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck = false) {
+  const now = new Date()
+  const pendingWait = await loadDurableSubagentWaitResume(pool, lease, now)
+  const restored = await loadChildAttemptResume(pool, lease, now, pendingWait)
+  const wait = pendingWait ?? restored?.durableWait
+  if (!wait || !restored?.durableWait || restored.durableWait.waitId !== wait.waitId
+    || restored.durableWait.stepId !== wait.stepId || restored.durableWait.attempt !== wait.attempt
+    || restored.durableWait.ordinal !== wait.ordinal
     || restored.resume.nextOrdinal !== wait.ordinal + 1 || wait.attempt !== lease.attemptCount) {
     throw new Error("durable_child_wait_resume_projection_invalid")
   }
+  if (!pendingWait) say(`WORKER_B_CONSUMED_WAIT_RECOVERED ${JSON.stringify({ waitId: wait.waitId, stepId: wait.stepId, attempt: wait.attempt, ordinal: wait.ordinal })}`)
   const owner = executionOwnerFence({ kind: "task", lease })
   const stepId = `child-resume-step:${lease.id}:attempt:${lease.attemptCount}`
   const nextOrdinal = wait.ordinal + 1
-  const now = new Date()
-  await turnStore.startStep({ owner, stepId, ordinal: nextOrdinal, attempt: lease.attemptCount,
+  const continuation = await turnStore.startStep({ owner, stepId, ordinal: nextOrdinal, attempt: lease.attemptCount,
     inputThroughSequence: restored.resume.inputThroughSequence, consumedInputIds: restored.resume.consumedInputIds,
     modelProfileSnapshot: {}, now })
+  if (continuation.id !== stepId || continuation.ordinal <= wait.ordinal) throw new Error("durable_child_wait_continuation_identity_invalid")
+  if (!pendingWait) say(`WORKER_B_CONSUMED_WAIT_STEP_REUSED ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId,
+    attempt: wait.attempt, sourceOrdinal: wait.ordinal, stepId: continuation.id, ordinal: continuation.ordinal })}`)
   if (crashBeforeWaitAck) {
-    say(`WORKER_B_RESUME_STEP_STARTED ${JSON.stringify({ waitId: wait.waitId, stepId, ordinal: nextOrdinal })}`)
+    say(`WORKER_B_RESUME_STEP_STARTED ${JSON.stringify({ waitId: wait.waitId, stepId, ordinal: continuation.ordinal })}`)
+    return new Promise(() => {})
+  }
+  if (!await commitDurableSubagentWaitResume(pool, lease, { waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal: continuation.ordinal, now })) {
+    throw new Error("durable_child_wait_ack_pending")
+  }
+  if (crashAfterWaitAck) {
+    say(`WORKER_B_RESUME_ACK_COMMITTED ${JSON.stringify({ waitId: wait.waitId, stepId, ordinal: continuation.ordinal })}`)
     return new Promise(() => {})
   }
   await turnStore.createItem({ owner, itemId: `child-resume-final:${wait.sourceItemId}`, stepId, type: "agent_message", status: "completed",
     phase: "final_answer", content: { text: "parent-resumed-from-durable-child-result", wait: restored.durableWait.output }, now })
   await turnStore.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null,
     inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now })
-  await commitDurableSubagentWaitResume(pool, lease, { waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal: nextOrdinal, now })
   return { status: "completed", result: { finalText: "parent-resumed-from-durable-child-result", waitId: wait.waitId } }
 }
 
@@ -116,6 +130,7 @@ const worker = new Worker(queueName, async job => {
         return new Promise(() => {})
       }
       : mode === "worker-b-crash-resume" ? ({ lease }) => resumeChild(lease, true)
+      : mode === "worker-b-crash-after-wait-ack" ? ({ lease }) => resumeChild(lease, false, true)
       : mode === "worker-b" ? ({ lease }) => resumeChild(lease) : undefined
   if (!execute) throw new Error("invalid_fixture_mode")
   const executeWithDiagnostics = async input => {

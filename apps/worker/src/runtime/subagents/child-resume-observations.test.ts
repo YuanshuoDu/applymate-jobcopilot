@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { mergeDurableWaitObservation } from "./child-resume-observations.js"
+import { mergeDurableWaitObservation, resolveDurableWaitOutcome } from "./child-resume-observations.js"
 
 const wait = {
   waitId: "wait-1", stepId: "step-1", attempt: 1, ordinal: 2, toolCallId: "wait-call", sourceItemId: "wait-result",
@@ -10,6 +10,15 @@ const wait = {
 } as const
 
 describe("durable child wait resume observation", () => {
+  it("accepts only the persisted outcome matching its exact direct children", () => {
+    const row = { id: "wait-1", status: "ready", mode: "all", targetTaskIds: ["child-a", "child-b"],
+      matchedTaskIds: ["child-a", "child-b"], deadlineAt: "2099-01-01T00:00:00.000Z", result: { outcome: wait.output } }
+    expect(resolveDurableWaitOutcome(row, row.targetTaskIds, row.matchedTaskIds, new Date("2026-10-22T10:00:00.000Z")))
+      .toMatchObject({ waitId: "wait-1", status: "ready", taskIds: row.targetTaskIds })
+    expect(() => resolveDurableWaitOutcome(row, row.targetTaskIds, ["child-a"], new Date("2026-10-22T10:00:00.000Z")))
+      .toThrow("Persisted child wait result is invalid")
+  })
+
   it("replaces the immutable original result with the persisted resolved projection exactly once", () => {
     const observations = [
       { id: "child-resume:old-wait-result", content: { toolCallId: "wait-call", toolName: "wait_subagents", input: wait.input, status: "completed", output: { status: "waiting" }, errorCode: null } },

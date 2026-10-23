@@ -3,6 +3,7 @@ import { canonicalJson, redactSensitiveText } from "@jobcopilot/shared"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { SubagentLease } from "./types.js"
+import { dateValue, DurableSubagentWaitError, object as waitObject, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 
 type Row = Record<string, unknown>
 type ToolCall = { readonly stepId: string; readonly toolName: string; readonly input: unknown }
@@ -20,7 +21,7 @@ function text(row: Row, key: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw new Error(`child_resume_invalid_${key}`)
   return value
 }
-function integer(row: Row, key: string, minimum = 0): number {
+export function integer(row: Row, key: string, minimum = 0): number {
   const value = typeof row[key] === "number" ? row[key] : Number(row[key])
   if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`child_resume_invalid_${key}`)
   return value
@@ -167,6 +168,38 @@ function inputIdsOf(value: unknown): string[] {
   return input.taskIds as string[]
 }
 
-function sameIds(left: readonly string[], right: readonly string[]): boolean {
+export function sameIds(left: readonly string[], right: readonly string[]): boolean {
   return [...left].sort().join("\u0000") === [...right].sort().join("\u0000")
+}
+
+function strictIds(value: unknown): string[] | undefined {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  if (!Array.isArray(parsed)) return undefined
+  const ids: string[] = []
+  for (const id of parsed) {
+    if (typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 256) return undefined
+    ids.push(id)
+  }
+  return new Set(ids).size === ids.length ? ids : undefined
+}
+
+export function resolveDurableWaitOutcome(wait: Row, ids: readonly string[], currentMatched: readonly string[], now: Date): DurableSubagentWaitResult {
+  const stored = waitObject(waitObject(wait.result).outcome)
+  const rowMatched = strictIds(wait.matchedTaskIds), storedMatched = strictIds(stored.matchedTaskIds)
+  const storedIds = strictIds(stored.taskIds)
+  const deadline = dateValue(wait.deadlineAt, "deadlineAt")
+  const outcome = waitResult(wait)
+  const modeIsValid = wait.mode === "any" || wait.mode === "all"
+  const matchedIsValid = !!rowMatched && !!storedMatched && sameIds(rowMatched, storedMatched)
+    && rowMatched.every(id => ids.includes(id) && currentMatched.includes(id))
+  const readyIsValid = wait.status !== "ready" || (!!rowMatched && (wait.mode === "any" ? rowMatched.length > 0 : rowMatched.length === ids.length))
+  const timeoutIsValid = wait.status !== "timed_out" || now >= deadline
+  if (stored.waitId !== wait.id || stored.status !== wait.status || !storedIds || !sameIds(storedIds, ids)
+    || dateValue(stored.deadlineAt, "outcome.deadlineAt").getTime() !== deadline.getTime()
+    || !modeIsValid || !matchedIsValid || !readyIsValid || !timeoutIsValid
+    || outcome.status !== wait.status || !sameIds(outcome.taskIds, ids) || outcome.tasks.length !== ids.length
+    || !sameIds(outcome.tasks.map(task => task.taskId), ids) || !sameIds(outcome.matchedTaskIds, rowMatched ?? [])) {
+    throw new DurableSubagentWaitError("wait_scope_error", "Persisted child wait result is invalid")
+  }
+  return outcome
 }

@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { RuntimeToolDefinition } from "../tools/types.js"
-import { canManageChildrenWithWaitAction, visibleChildDefinitions } from "./child-executor-admission.js"
+import type { DurableWaitResume } from "./child-resume-observations.js"
+import { acknowledgeDurableWaitAtContinuationStart, canManageChildrenWithWaitAction, visibleChildDefinitions } from "./child-executor-admission.js"
 import { createDurableSubagentWaitTool } from "./durable-subagent-wait-tool.js"
 import type { SubagentLease } from "./types.js"
 
@@ -23,6 +24,20 @@ function readTool(name = "jobs.search", domain: RuntimeToolDefinition["domain"] 
 }
 
 describe("child wait admission", () => {
+  it("acknowledges the first persisted continuation at its Turn-global ordinal", async () => {
+    const task = { ...baseLease, attemptCount: 3 } as SubagentLease
+    const identity = { kind: "task", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id,
+      rootTaskId: task.rootTaskId, ownerId: task.ownerId, attemptCount: task.attemptCount, leaseExpiresAt: task.leaseExpiresAt }
+    const wait: DurableWaitResume = { waitId: "wait-1", stepId: "source-step", attempt: 3, ordinal: 4, toolCallId: "wait-call", sourceItemId: "wait-result",
+      input: {}, output: {} }
+    const startStep = vi.fn(async () => ({ id: "continuation-step", ordinal: 9 }))
+    const commit = vi.fn(async (_lease: SubagentLease, _wait: DurableWaitResume, ordinal: number) => ordinal === 9)
+    const store = acknowledgeDurableWaitAtContinuationStart({ startStep } as never, task, wait, commit)
+
+    await expect(store.startStep({ ordinal: 5, attempt: 3, identity } as never)).resolves.toEqual({ id: "continuation-step", ordinal: 9 })
+    expect(commit).toHaveBeenCalledWith(task, wait, 9)
+  })
+
   it("requires the server role policy and exact persisted wait action", () => {
     expect(canManageChildrenWithWaitAction({ canManageChildren: true }, ["wait_subagents"])).toBe(true)
     expect(canManageChildrenWithWaitAction({ canManageChildren: true }, ["agent.wait"])).toBe(false)

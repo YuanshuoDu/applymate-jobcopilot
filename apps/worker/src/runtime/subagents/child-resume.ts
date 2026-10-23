@@ -2,7 +2,7 @@ import type pg from "pg"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import type { SubagentLease } from "./types.js"
-import { buildChildResumeObservations, countChildResumeToolCalls, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
+import { buildChildResumeObservations, countChildResumeToolCalls, integer, mergeDurableWaitObservation, sameIds, type DurableWaitResume } from "./child-resume-observations.js"
 import { object as waitObject, parseIds, safeSubagentWaitJson, waitResult } from "./durable-subagent-wait-store.js"
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
 type ResumePool = Pick<pg.Pool, "connect">
@@ -22,12 +22,6 @@ function text(row: Row, key: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw new Error(`child_resume_invalid_${key}`)
   return value
 }
-function integer(row: Row, key: string, minimum = 0): number {
-  const value = typeof row[key] === "number" ? row[key] : Number(row[key])
-  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`child_resume_invalid_${key}`)
-  return value
-}
-
 function amount(row: Row, key: string): number {
   const value = typeof row[key] === "number" ? row[key] : Number(row[key])
   if (!Number.isFinite(value) || value < 0) throw new Error(`child_resume_invalid_${key}`)
@@ -82,9 +76,6 @@ function waitResumeItemsSql(): string {
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_PRIOR_ITEMS + 1}`
 }
 
-function sameIds(left: readonly string[], right: readonly string[]): boolean {
-  return [...left].sort().join("\u0000") === [...right].sort().join("\u0000")
-}
 async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease): Promise<DurableWaitResume | undefined> {
   const rows = (await client.query<Row>(`WITH latest_wait AS (
     SELECT candidateWait."id" FROM "agent_wait_conditions" AS candidateWait
@@ -93,7 +84,10 @@ async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease)
       AND candidateStep."attempt" <= $6 AND candidateWait."status" IN ('ready', 'timed_out')
       AND candidateWait."suspendedAt" IS NOT NULL AND candidateWait."consumedAt" IS NOT NULL
       AND EXISTS (SELECT 1 FROM "agent_steps" AS next WHERE next."sessionId" = candidateStep."sessionId" AND next."turnId" = candidateStep."turnId"
-        AND next."taskId" = candidateStep."taskId" AND next."attempt" = candidateStep."attempt" AND next."ordinal" = candidateStep."ordinal" + 1
+        AND next."taskId" = candidateStep."taskId" AND next."attempt" = candidateStep."attempt"
+        AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later WHERE later."sessionId" = candidateStep."sessionId"
+          AND later."turnId" = candidateStep."turnId" AND later."taskId" = candidateStep."taskId" AND later."attempt" = candidateStep."attempt"
+          AND later."ordinal" > candidateStep."ordinal")
         AND (candidateStep."attempt" < $6 OR next."ordinal" = (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest
           WHERE latest."sessionId" = candidateStep."sessionId" AND latest."turnId" = candidateStep."turnId" AND latest."taskId" = candidateStep."taskId" AND latest."attempt" = candidateStep."attempt")))
     ORDER BY candidateStep."attempt" DESC, candidateStep."ordinal" DESC, candidateWait."createdAt" DESC, candidateWait."id" DESC LIMIT 1
@@ -102,7 +96,11 @@ async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease)
     FROM "agent_wait_conditions" AS wait
     JOIN latest_wait ON latest_wait."id" = wait."id"
     JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = wait."parentTaskId"
-    JOIN "agent_steps" AS next ON next."sessionId" = step."sessionId" AND next."turnId" = step."turnId" AND next."taskId" = step."taskId" AND next."attempt" = step."attempt" AND next."ordinal" = step."ordinal" + 1
+    JOIN "agent_steps" AS next ON next."sessionId" = step."sessionId" AND next."turnId" = step."turnId"
+      AND next."taskId" = step."taskId" AND next."attempt" = step."attempt"
+      AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later WHERE later."sessionId" = step."sessionId"
+        AND later."turnId" = step."turnId" AND later."taskId" = step."taskId" AND later."attempt" = step."attempt"
+        AND later."ordinal" > step."ordinal")
     JOIN "sub_agent_tasks" AS task ON task."id" = wait."parentTaskId" AND task."sessionId" = wait."sessionId" AND task."turnId" = wait."turnId"
     JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = wait."userId"
     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" AND turn."userId" = session."userId"
@@ -156,7 +154,7 @@ async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease)
   const attempt = Number(row.attempt); const ordinal = Number(row.ordinal); const continuationStepId = typeof row.continuationStepId === "string" ? row.continuationStepId : ""
   const continuationOrdinal = Number(row.continuationOrdinal); const continuationLatestOrdinal = Number(row.continuationLatestOrdinal)
   if (!stepId.trim() || !sourceItemId.trim() || !Number.isSafeInteger(attempt) || attempt < 1 || attempt > lease.attemptCount
-    || !Number.isSafeInteger(ordinal) || ordinal < 0 || !continuationStepId.trim() || continuationOrdinal !== ordinal + 1
+    || !Number.isSafeInteger(ordinal) || ordinal < 0 || !continuationStepId.trim() || !Number.isSafeInteger(continuationOrdinal) || continuationOrdinal <= ordinal
     || attempt === lease.attemptCount && continuationLatestOrdinal !== continuationOrdinal) throw new Error("child_resume_wait_lineage")
   return { waitId: String(row.waitId), stepId, attempt, ordinal, toolCallId, sourceItemId,
     input: safeSubagentWaitJson(input, 8_192), output }

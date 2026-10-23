@@ -123,7 +123,7 @@ describe("child attempt durable resume", () => {
       observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: "wait-1", status: "ready" } } }],
     })
     expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('wait."consumedAt" IS NOT NULL')
-    expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('next."ordinal" = candidateStep."ordinal" + 1')
+    expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('next."ordinal" = (SELECT MIN(later."ordinal")')
     expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('next."ordinal" = (SELECT MAX(latest."ordinal")')
     expect(db.calls.find(call => call.sql.includes('WHERE task."id" = ANY($1::text[])'))?.values).toEqual([[
       "grandchild-1",
@@ -155,9 +155,26 @@ describe("child attempt durable resume", () => {
     expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('LEFT JOIN "agent_items" AS result')
   })
 
+  it("uses the first later task ordinal while keeping the deterministic logical resume ordinal", async () => {
+    const child = lease({ attemptCount: 3, maxAttempts: 3 })
+    const wait = { ...consumedWait(child), continuationOrdinal: 9, continuationLatestOrdinal: 9 }
+    const db = fakePool(child, [
+      step(child, { id: "step-1", attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
+      step(child, { id: "step-2", attempt: 3, ordinal: 9, status: "streaming" }),
+    ], [], wait, [{ id: "grandchild-1", parentTaskId: child.id, rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }])
+
+    await expect(loadChildAttemptResume(db.pool as never, child)).resolves.toMatchObject({
+      resume: { nextOrdinal: 1 },
+      durableWait: { ordinal: 0, attempt: 3 },
+    })
+    const lineage = db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql ?? ""
+    expect(lineage).toContain('later."ordinal" > candidateStep."ordinal"')
+    expect(lineage).toContain('next."ordinal" = (SELECT MAX(latest."ordinal")')
+  })
+
   it("fails closed when a same-attempt consumed wait has no exact latest continuation", async () => {
     const child = lease({ attemptCount: 3, maxAttempts: 3 })
-    const wait = { ...consumedWait(child), continuationOrdinal: 2, continuationLatestOrdinal: 2 }
+    const wait = { ...consumedWait(child), continuationOrdinal: 2, continuationLatestOrdinal: 3 }
     const db = fakePool(child, [
       step(child, { id: "step-1", attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
       step(child, { id: "step-2", attempt: 3, ordinal: 1, status: "queued" }),
