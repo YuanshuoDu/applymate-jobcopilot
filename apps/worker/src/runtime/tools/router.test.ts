@@ -127,7 +127,7 @@ describe("ToolRouter", () => {
 
   it("fails closed when a denied policy decision cannot be recorded", async () => {
     const execute = vi.fn(async () => ({ result: "must not execute" }))
-    const recordPolicyDecision = vi.fn(async () => { throw new Error("policy recorder unavailable") })
+    const recordPolicyDecision = vi.fn(async (_decision: RuntimePolicyDecision) => { throw new Error("policy recorder unavailable") })
     const { router } = makeRouter(execute, 100, [], policyForOutcome("deny"), recordPolicyDecision)
 
     await expect(router.execute(context, request)).resolves.toMatchObject({ status: "failed" })
