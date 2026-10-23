@@ -578,7 +578,13 @@ async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> 
   return BigInt(sequence)
 }
 
-async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture, rootSuccessCriteria?: readonly string[]) {
+type TypedSupersessionOptions = Readonly<{
+  includeIndependentPrerequisite?: boolean
+  replacementDependsOn?: readonly string[]
+}>
+
+async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
+  rootSuccessCriteria?: readonly string[], options: TypedSupersessionOptions = {}) {
   await seed(pool, value, rootSuccessCriteria ? { goal: "Find roles", successCriteria: [] } : undefined)
   if (rootSuccessCriteria) await pool.query(`UPDATE "sub_agent_tasks" SET "goal" = 'Find roles' WHERE "id" = $1`, [value.rootTaskId])
   const analystTemplate = TASK_GRAPH_TEMPLATES.analyst
@@ -602,8 +608,12 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     consumedInputIds: [value.originalInputId],
   })
 
-  const scheduledInput = scheduleInput(value, 1, true)
-  const initialInput: TaskGraphScheduleInput = { ...scheduledInput, ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}), templates: {
+  const scheduledInput = scheduleInput(value, options.includeIndependentPrerequisite ? 2 : 1, true)
+  const initialNodes = options.includeIndependentPrerequisite
+    ? scheduledInput.proposal.nodes.map(node => ({ ...node, dependsOn: [] }))
+    : scheduledInput.proposal.nodes
+  const initialInput: TaskGraphScheduleInput = { ...scheduledInput, proposal: { ...scheduledInput.proposal, nodes: initialNodes },
+    ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}), templates: {
     ...scheduledInput.templates, analyst: analystTemplate,
   } }
   const initialPlanInput: TaskGraphScheduleInput = { ...initialInput, scope: { ...initialInput.scope, stepId: value.originStepId } }
@@ -622,7 +632,8 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     role: analystTemplate.role, taskType: analystTemplate.taskType, allowedActions: analystTemplate.allowedActions,
     constraints: analystTemplate.constraints ?? [], expectedOutputSchema: analystTemplate.expectedOutputSchema ?? {},
   }])
-  const replacement = { ...originalNode, key: "replacement-1", goal: "Complete the revised graph task", successCriteria: ["Revised task completed"] }
+  const replacement = { ...originalNode, key: "replacement-1", goal: "Complete the revised graph task", successCriteria: ["Revised task completed"],
+    ...(options.replacementDependsOn === undefined ? {} : { dependsOn: [...options.replacementDependsOn] }) }
   const replaceUnstarted = { nodeKey: source.key }
   const rawCallInput = { expectedRevision: 1, replaceUnstarted, nodes: [replacement], ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}) }
   const input: TaskGraphScheduleInput = {
@@ -632,7 +643,7 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}),
     replaceUnstarted,
   }
-  const replacementFingerprint = taskGraphSupersessionFingerprint({ nodeKey: source.key, taskId: source.taskId }, {
+  const replacementFingerprint = taskGraphSupersessionFingerprint({ nodeKey: source.key, taskId: source.taskId, dependsOn: source.dependsOn }, {
     expectedRevision: 1, replaceUnstartedNodeKey: source.key, nodes: [replacement], rootSuccessCriteria,
   })
 
@@ -657,7 +668,8 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     scope: input.scope, decision: "revise" as const, expectedRevision: 1, callId: value.planCallId,
     rootInputId: value.originalInputId, replaceUnstartedNodeKey: source.key,
   }
-  return { command, input, operation, source, replacement, rawCallInput, replacementFingerprint }
+  return { command, input, operation, source, replacement, rawCallInput, replacementFingerprint,
+    incompletePrerequisite: options.includeIndependentPrerequisite ? initialInput.proposal.nodes[1] : undefined }
 }
 
 async function supersessionDurableRows(pool: PgPool, value: Fixture): Promise<Record<string, unknown>> {
@@ -2375,6 +2387,97 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await expect(reopened.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
       .resolves.toEqual({ ...accepted, status: "duplicate" })
     expect(await supersessionDurableRows(adminPool!, value)).toEqual(committed)
+  }, 60_000)
+
+  it("rewires a typed leaf to an incomplete prerequisite, preserves the envelope, and binds both edge sets on replay", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value, undefined, {
+      includeIndependentPrerequisite: true,
+      replacementDependsOn: ["task-2"],
+    })
+    const prerequisite = prepared.incompletePrerequisite
+    if (!prerequisite) throw new Error("TaskGraph rewiring fixture lost its independent prerequisite")
+    expect(prepared.source.dependsOn).toEqual([])
+    expect(prerequisite.key).toBe("task-2")
+
+    const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 3, readyTaskIds: [],
+      nodes: [{ key: "replacement-1", status: "waiting" }] })
+    const current = await prepared.command.readCurrent(readScope(value))
+    const replacement = current.nodes.find(node => node.key === "replacement-1")
+    expect(replacement).toMatchObject({ key: "replacement-1", status: "waiting", readiness: "waiting_for_dependencies",
+      dependsOn: [prerequisite.key], templateId: prepared.source.templateId, verification: prepared.source.verification })
+    expect(replacement?.taskId).not.toBe(prepared.source.taskId)
+    expect(current.nodes.find(node => node.key === prerequisite.key)?.status).toBe("queued")
+    const replacementTask = await adminPool!.query<{ status: string; attemptCount: number; result: unknown; outputArtifactIds: unknown;
+      contextSnapshotId: string | null; role: string; taskType: string; allowedActions: unknown; constraints: unknown; expectedOutputSchema: unknown }>(
+      `SELECT "status", "attemptCount", "result", "outputArtifactIds", "contextSnapshotId", "role", "taskType", "allowedActions", "constraints", "expectedOutputSchema"
+        FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4`,
+      [replacement?.taskId, value.sessionId, value.turnId, value.rootTaskId],
+    )
+    expect(replacementTask.rows).toEqual([{
+      status: "waiting", attemptCount: 0, result: null, outputArtifactIds: [], contextSnapshotId: null,
+      role: prepared.input.templates.analyst?.role, taskType: prepared.input.templates.analyst?.taskType,
+      allowedActions: prepared.input.templates.analyst?.allowedActions ?? [], constraints: prepared.input.templates.analyst?.constraints ?? [],
+      expectedOutputSchema: prepared.input.templates.analyst?.expectedOutputSchema ?? {},
+    }])
+
+    const relationRows = await adminPool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = $3`, [value.sessionId, value.turnId, STEERING_RECONCILIATION_EVENT_TYPE])
+    const relation = (relationRows.rows[0]?.payload as { supersession?: { cancellationEvent?: { id?: string }; planEvent?: { id?: string }; replacementFingerprint?: string } } | undefined)?.supersession
+    if (!relation?.cancellationEvent?.id || !relation.planEvent?.id) throw new Error("TaskGraph rewiring fixture lost its persisted relation")
+    expect(relation.replacementFingerprint).toBe(prepared.replacementFingerprint)
+    const proofEvents = await adminPool!.query<{ id: string; payload: unknown }>(`SELECT "id", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "id" = ANY($3::text[])`, [
+      value.sessionId, value.turnId, [relation.cancellationEvent.id, relation.planEvent.id],
+    ])
+    const cancellation = proofEvents.rows.find(row => row.id === relation.cancellationEvent!.id)
+    const plan = proofEvents.rows.find(row => row.id === relation.planEvent!.id)
+    const cancellationContent = (cancellation?.payload as { item?: { content?: unknown } } | undefined)?.item?.content
+    const planContent = (plan?.payload as { item?: { content?: unknown } } | undefined)?.item?.content
+    expect(parseTaskGraphSnapshot(cancellationContent).nodes.find(node => node.key === prepared.source.key)?.dependsOn).toEqual([])
+    expect(parseTaskGraphSnapshot(planContent).nodes.find(node => node.key === "replacement-1")?.dependsOn).toEqual([prerequisite.key])
+
+    const committed = await supersessionDurableRows(adminPool!, value)
+    await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(committed)
+
+    const changedEdges = { ...prepared.input, proposal: { ...prepared.input.proposal, nodes: [{ ...prepared.replacement, dependsOn: [] }] } }
+    await expect(prepared.command.appendAndScheduleWithReconciliation!(changedEdges, prepared.operation)).rejects.toThrow()
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(committed)
+
+    // Change only the old edge set in its durable cancellation snapshot. A replay must bind this owner-fenced historical source too.
+    const tampered = await adminPool!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{item,content,nodes,0,dependsOn}', $2::jsonb)
+      WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4`, [
+      relation.cancellationEvent.id, JSON.stringify([prerequisite.key]), value.sessionId, value.turnId,
+    ])
+    expect(tampered.rowCount).toBe(1)
+    const afterTamper = await supersessionDurableRows(adminPool!, value)
+    await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)).rejects.toThrow()
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(afterTamper)
+  }, 60_000)
+
+  it("rejects missing, duplicate, self-cyclic, and superseded-source rewiring edges atomically", async () => {
+    const invalidEdges = [
+      { label: "missing", dependsOn: ["missing-prerequisite"] },
+      { label: "duplicate", dependsOn: ["task-2", "task-2"] },
+      { label: "self-cycle", dependsOn: ["replacement-1"] },
+      { label: "superseded source", dependsOn: ["task-1"] },
+    ] as const
+    for (const invalid of invalidEdges) {
+      const value = fixture()
+      additionalFixtures.push(value)
+      const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value, undefined, {
+        includeIndependentPrerequisite: true,
+        replacementDependsOn: invalid.dependsOn,
+      })
+      const before = await supersessionDurableRows(adminPool!, value)
+      await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation),
+        `TaskGraph supersession ${invalid.label} edge should be rejected`).rejects.toThrow()
+      expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+    }
   }, 60_000)
 
   it("rejects changed supersession fingerprint, source, and revision without durable writes", async () => {
