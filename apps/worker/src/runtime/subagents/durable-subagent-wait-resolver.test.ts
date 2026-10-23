@@ -12,8 +12,9 @@ const now = new Date("2026-10-22T10:00:00.000Z")
 
 type DispatchFixture = { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: Record<string, unknown>; attemptCount: number; publishedAt: Date | null }
 
-function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null } = {}) {
+function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; includeRootOwnedWaitInCandidateScan?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
+  const queryRowCounts = { candidateSessions: undefined as number | undefined, lockedWaits: undefined as number | undefined }
   const state = { waitStatus: "waiting", parentStatus: "waiting", matched: [] as string[], outbox: input.dispatchRow ? 1 : 0,
     dispatchRow: input.dispatchRow ? structuredClone(input.dispatchRow) : null as DispatchFixture | null }
   let rollbackSnapshot: typeof state | undefined
@@ -31,11 +32,17 @@ function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?:
       if (sql === "COMMIT") { rollbackSnapshot = undefined; return { rows: [], rowCount: 1 } }
       if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
       if (sql.includes('SELECT session."id", session."userId"') && sql.includes('JOIN "sub_agent_tasks" AS parent')) {
-        return { rows: [{ id: "session-1", userId: "user-1" }], rowCount: 1 }
+        const excludesRootWait = input.rootOwnedWait && !input.includeRootOwnedWaitInCandidateScan
+          && sql.includes('parent."parentTaskId" IS NOT NULL')
+        const rows = excludesRootWait ? [] : [{ id: "session-1", userId: "user-1" }]
+        queryRowCounts.candidateSessions = rows.length
+        return { rows, rowCount: rows.length }
       }
       if (sql.includes('SELECT wait."id", wait."userId"') && sql.includes('FOR UPDATE OF wait, parent')) {
-        if (input.rootOwnedWait && sql.includes('parent."parentTaskId" IS NOT NULL')) return { rows: [], rowCount: 0 }
-        return { rows: [wait], rowCount: 1 }
+        const excludesRootWait = input.rootOwnedWait && sql.includes('parent."parentTaskId" IS NOT NULL')
+        const rows = excludesRootWait ? [] : [wait]
+        queryRowCounts.lockedWaits = rows.length
+        return { rows, rowCount: rows.length }
       }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) return { rows: [
         { id: "child-1", parentTaskId: input.targetParent ?? (input.rootOwnedWait ? "root-1" : "parent-1"), rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "writer", result: { title: "safe" }, failureReason: null },
@@ -70,7 +77,7 @@ function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?:
     },
     release() {},
   }
-  return { pool: { connect: async () => client }, calls, state }
+  return { pool: { connect: async () => client }, calls, queryRowCounts, state }
 }
 
 describe("reconcileDurableSubagentWaits", () => {
@@ -100,16 +107,34 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(dispatch?.sql).not.toContain('"attemptCount"')
   })
 
-  it("excludes root-owned waits from child wait reconciliation and dispatch", async () => {
+  it("filters root-owned waits out of the candidate session scan", async () => {
     const fake = fixture({ rootOwnedWait: true })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
+
+    const candidate = fake.calls.find(call => call.sql.includes('SELECT session."id", session."userId"'))
+    expect(candidate?.sql).toContain('parent."parentTaskId" IS NOT NULL')
+    expect(fake.queryRowCounts.candidateSessions).toBe(0)
+    expect(fake.calls.some(call => call.sql.includes('SELECT wait."id", wait."userId"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
+  })
+
+  it("excludes a root-owned wait when the locked row scan rechecks its owner", async () => {
+    const fake = fixture({ rootOwnedWait: true, includeRootOwnedWaitInCandidateScan: true })
     await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
 
     const candidate = fake.calls.find(call => call.sql.includes('SELECT session."id", session."userId"'))
     const waitRows = fake.calls.find(call => call.sql.includes('SELECT wait."id", wait."userId"'))
     expect(candidate?.sql).toContain('parent."parentTaskId" IS NOT NULL')
+    expect(fake.queryRowCounts.candidateSessions).toBe(1)
     expect(waitRows?.sql).toContain('parent."parentTaskId" IS NOT NULL')
-    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
+    expect(fake.queryRowCounts.lockedWaits).toBe(0)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
   })
 
   it("persists a wake dispatch only when the conflict predicate is valid and session-scoped", async () => {
