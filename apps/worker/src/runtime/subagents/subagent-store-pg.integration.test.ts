@@ -394,6 +394,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await installTestTenantRls(adminPool)
     await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT ("id", "sessionId", "toTaskId", "turnId", "consumedAt", "targetAttemptCount", "kind", "createdAt") ON "agent_mailbox_messages" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE ("consumedAt") ON "agent_mailbox_messages" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_wait_conditions" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
