@@ -178,7 +178,7 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
   if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isSafeInteger(input.nextStepOrdinal) || input.nextStepOrdinal < 1
     || !input.waitId.trim() || !input.stepId.trim()) throw new DurableSubagentWaitError("wait_invalid", "Resume acknowledgement is invalid")
   return transaction(pool, lease.userId, async client => {
-    const session = (await client.query<Row>(`SELECT "id", "userId", "status" FROM "agent_sessions"
+    const session = (await client.query<Row>(`SELECT "id", "userId", "status" FROM "agent_sessions" AS session
       WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [lease.sessionId, lease.userId])).rows[0]
     if (!session) throw new DurableSubagentWaitError("wait_scope_error", "Session is unavailable for resume acknowledgement")
     const task = (await client.query<Row>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", task."status", task."attemptCount", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt", turn."status" AS "turnStatus", root."status" AS "rootStatus"

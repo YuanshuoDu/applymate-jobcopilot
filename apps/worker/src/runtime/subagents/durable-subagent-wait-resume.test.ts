@@ -35,7 +35,7 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; ownerId?: st
     async query(sql: string, params: unknown[] = []) {
       calls.push({ sql, params })
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions" AS session')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && !sql.includes("ANY($1::text[])")) return { rows: [{
         id: "parent-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
         status: "running", attemptCount: 3, leaseOwner: options.ownerId ?? "worker-1", leaseExpiresAt: lease.leaseExpiresAt,
@@ -127,6 +127,8 @@ describe("durable child wait resume", () => {
 
     const fake = fixture()
     await expect(commitDurableSubagentWaitResume(fake.pool as never, lease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions" AS session')
+      && call.sql.includes(`session."status" NOT IN ('aborted', 'archived')`))).toBe(true)
     expect(fake.state.consumedAt).toEqual(now)
     expect(fake.state.acknowledgements).toBe(1)
     expect(fake.calls.some(call => call.sql.includes("outputMatches"))).toBe(false)
