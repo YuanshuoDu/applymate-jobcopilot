@@ -50,31 +50,31 @@ const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
         AND child."sessionId" = task."sessionId" AND child."turnId" = task."turnId"
         AND child."rootTaskId" = task."rootTaskId"))) = true`
 
-const CHILD_WAIT_CONSUMED_SQL = `(SELECT COUNT(*) = 1 FROM "agent_wait_conditions" AS wait
-  JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
-    AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+const CHILD_WAIT_CONSUMED_SQL = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(continuation."id"::text) END FROM "agent_wait_conditions" AS wait
+  JOIN "agent_turns" AS waitTurn ON waitTurn."id" = wait."turnId" AND waitTurn."sessionId" = wait."sessionId" AND waitTurn."userId" = wait."userId" AND waitTurn."userId" = $3 AND waitTurn."rootTaskId" = task."rootTaskId"
+  JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
   JOIN "agent_steps" AS continuation ON continuation."sessionId" = source."sessionId"
-    AND continuation."turnId" = source."turnId" AND continuation."taskId" = source."taskId"
-    AND continuation."attempt" = source."attempt" AND continuation."ordinal" = source."ordinal" + 1
+    AND continuation."turnId" = source."turnId" AND continuation."taskId" = source."taskId" AND continuation."attempt" = source."attempt" AND continuation."ordinal" = source."ordinal" + 1
   WHERE task."parentTaskId" IS NOT NULL AND task."status" = 'running' AND wait."parentTaskId" = task."id"
     AND wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId" AND wait."consumedAt" IS NOT NULL
-    AND wait."suspendedAt" IS NOT NULL AND wait."status" IN ('ready', 'timed_out')
-    AND source."attempt" = task."attemptCount" AND source."status" IN ('waiting_for_tool', 'completed')
+    AND wait."suspendedAt" IS NOT NULL AND wait."status" IN ('ready', 'timed_out') AND source."attempt" = task."attemptCount"
+    AND source."status" IN ('waiting_for_tool', 'completed') AND continuation."status" = 'streaming'
     AND continuation."ordinal" = (SELECT MAX(currentStep."ordinal") FROM "agent_steps" AS currentStep
-      WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId"
-        AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount")
-    AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait
-      WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
-        AND currentWait."turnId" = task."turnId" AND currentWait."stepId" = source."id"
-      ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)) = true`
+      WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId" AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount")
+    AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
+        AND currentWait."turnId" = task."turnId" AND currentWait."stepId" = source."id" ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)) = true`
 
 type ExpiredWaitDispatch = { id: string; payload: unknown; attemptCount: unknown; publishedAt: unknown }
-async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<string, unknown>, ignoredEventId?: string): Promise<boolean> {
-  const result = await client.query(`SELECT started."id" FROM "agent_events" AS started
-    WHERE started."sessionId" = $1 AND started."taskId" = $2 AND started."type" IN ('tool_call.started', 'model.started')
+async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<string, unknown>, ignoredEventId?: string, continuationId?: string): Promise<boolean> {
+  const result = await client.query(`SELECT started."id" FROM "agent_events" AS started WHERE started."sessionId" = $1 AND started."taskId" = $2 AND started."type" IN ('tool_call.started', 'model.started')
       AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled WHERE settled."sessionId" = started."sessionId" AND settled."taskId" = started."taskId"
         AND settled."correlationId" = started."correlationId" AND ((started."type" = 'tool_call.started' AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))
           OR (started."type" = 'model.started' AND settled."type" IN ('model.completed', 'model.failed'))))
+      AND NOT (started."type" = 'model.started' AND $10::text IS NOT NULL AND started."actor" = 'subagent'
+        AND started."itemId" IS NULL AND started."turnId" = $3 AND started."correlationId" = $10
+        AND started."idempotencyKey" = 'task:' || $2 || ':event:model-started:' || $10
+        AND started."payload" = jsonb_build_object('taskId', $2, 'provider', started."payload"->>'provider', 'model', started."payload"->>'model')
+        AND jsonb_typeof(started."payload"->'provider') = 'string' AND jsonb_typeof(started."payload"->'model') = 'string')
       AND NOT (started."type" = 'tool_call.started' AND EXISTS (
         SELECT 1 FROM "sub_agent_tasks" AS owner JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = owner."id"
         JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId" AND source."taskId" = owner."id"
@@ -100,7 +100,7 @@ async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<strin
           AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) BETWEEN 1 AND 8
           AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("id")
             WHERE NOT EXISTS (SELECT 1 FROM "sub_agent_tasks" AS child WHERE child."id" = target."id" AND child."parentTaskId" = owner."id" AND child."rootTaskId" = $4 AND child."sessionId" = $1 AND child."turnId" = $3))))
-      AND ($9::text IS NULL OR started."id" <> $9) LIMIT 1`, [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, ignoredEventId ?? null])
+      AND ($9::text IS NULL OR started."id" <> $9) LIMIT 1`, [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, ignoredEventId ?? null, continuationId ?? null])
   return result.rows.length > 0
 }
 
@@ -119,8 +119,7 @@ export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; l
       ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT $1`, [input.limit, input.sessionId ?? null, input.turnId ?? null])
     const recovered: SubagentTaskRecord[] = []
     for (const candidate of candidates.rows as Candidate[]) {
-      const outcome = await recoverOne(client, candidate, input)
-      if (outcome) recovered.push(outcome)
+      const outcome = await recoverOne(client, candidate, input); if (outcome) recovered.push(outcome)
     }
     return recovered
   })
@@ -137,7 +136,7 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     if (!turn.rows[0]) return null
   }
   const sql = `SELECT task.*, session."userId" AS "userId", session."status" AS "sessionStatus",
-      ${CHILD_WAIT_RESUMABLE_SQL} AS "childWaitResumable", ${CHILD_WAIT_CONSUMED_SQL} AS "childWaitConsumed",
+      ${CHILD_WAIT_RESUMABLE_SQL} AS "childWaitResumable", ${CHILD_WAIT_CONSUMED_SQL} AS "childWaitContinuationId",
       root."status" AS "rootStatus", root."interruptRequestedAt" AS "rootInterruptRequestedAt"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
@@ -160,12 +159,13 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   if (canonicalRoot && !interrupted && !failedRootTurn) return null
   const atAttemptCeiling = attemptCount >= Number(old.maxAttempts)
   const childWaitResumable = old.childWaitResumable === true
-  const childWaitConsumed = old.childWaitConsumed === true
+  const childWaitContinuationId = typeof old.childWaitContinuationId === "string" ? old.childWaitContinuationId : undefined
+  const childWaitConsumed = childWaitContinuationId !== undefined
   let waitContinuation = !interrupted && !failedRootTurn && childWaitResumable
   const locked = await client.query(`${sql} FOR UPDATE OF task`, values)
   const row = locked.rows[0] as Record<string, unknown> | undefined
   if (!row || Number(row.attemptCount) !== attemptCount || row.turnId !== (candidate.turnId ?? null)
-    || (row.childWaitResumable === true) !== childWaitResumable || (row.childWaitConsumed === true) !== childWaitConsumed
+    || (row.childWaitResumable === true) !== childWaitResumable || (typeof row.childWaitContinuationId === "string" ? row.childWaitContinuationId : undefined) !== childWaitContinuationId
     || (canonicalRoot && (row.taskType !== old.taskType || row.id !== old.id || row.rootTaskId !== old.rootTaskId
       || row.parentTaskId !== old.parentTaskId || row.turnId !== old.turnId))) return null
   const checkedAt = (await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)).rows[0]?.checkedAt
@@ -179,7 +179,7 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
       rootTaskId: String(row.rootTaskId), ownerId: row.leaseOwner, attemptCount, leaseExpiresAt: lockedExpiry }
     const registration = await recoverExpiredWaitRegistration(client, lease, checkedAt)
     if (registration && "rejectedCallId" in registration) rejectedWaitCallId = registration.rejectedCallId
-    if (await hasBlockingExternalCall(client, row, rejectedWaitCallId)) return null
+    if (await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)) return null
     const wait = await recoverExpiredDurableSubagentWaitWithGraph(client, { lease, now: checkedAt })
     if (wait && "blocked" in wait) return null
     if (wait) return { ...rowToTask(row), status: wait.handoff === "suspended" ? "waiting" : "queued",
@@ -204,7 +204,7 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
       waitContinuation = false
     }
   }
-  const unsettledExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId)
+  const unsettledExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)
   if (unsettledExternalCall && (!waitContinuation || childWaitConsumed)) return null
   const terminal = Boolean(rejectedWaitCallId) || interrupted || failedRootTurn || atAttemptCeiling && !waitContinuation
   const status = terminal ? interrupted ? "interrupted" : "failed" : "queued"

@@ -14,13 +14,14 @@ type FixtureOptions = { pendingCall?: boolean; candidate?: boolean; childWaitRes
   maxAttempts?: number; child?: boolean; outboxOwnerId?: string; dispatchPublished?: boolean; rearmCount?: number;
   registeredWait?: boolean; targetStatus?: string; callMatches?: boolean; recoveryLeaseLost?: boolean; continuationWait?: boolean;
   exactWaitCall?: boolean; unrelatedPendingCall?: boolean; preinsertWaitCall?: boolean; unconsumedContinuation?: boolean;
-  unconsumedNoContinuation?: boolean }
+  unconsumedNoContinuation?: boolean; pendingModelStart?: "exact" | "wrong-correlation" | "wrong-actor" | "wrong-item" | "wrong-key" | "wrong-payload";
+  pendingToolStart?: boolean }
 function fixture(options: FixtureOptions = {}) {
   const calls: string[] = []
   const task = { id: options.child ? "child-1" : "task-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: options.child ? "root-1" : "task-1", parentTaskId: options.child ? "root-1" : null,
     path: "/task-1", depth: 0, role: "scout", taskType: "scout", status: "running", goal: "inspect", constraints: [], successCriteria: [],
     allowedActions: [], context: {}, expectedOutputSchema: {}, result: null, failureReason: null, attemptCount: options.attemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3,
-    leaseOwner: "worker-1", leaseExpiresAt: new Date(checkedAt.getTime() - 1_000), nextAttemptAt: null, interruptRequestedAt: null,
+    leaseOwner: "worker-1" as string | null, leaseExpiresAt: new Date(checkedAt.getTime() - 1_000) as Date | null, nextAttemptAt: null as Date | null, interruptRequestedAt: null,
     budgetSnapshot: {}, toolPolicySnapshot: {} }
   const outbox = { id: "dispatch-1", topic: "agent.subagent.dispatch", aggregateId: task.sessionId,
     idempotencyKey: `subagent-dispatch:${task.id}`, payload: { taskId: task.id, sessionId: task.sessionId,
@@ -39,9 +40,9 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: task.sessionId, userId: task.userId, status: "running" }], rowCount: 1 }
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: task.turnId }], rowCount: 1 }
     if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: null,
-      childWaitResumable: options.childWaitResumable ?? false, childWaitConsumed: options.continuationWait ?? false }], rowCount: 1 }
+      childWaitResumable: options.childWaitResumable ?? false, childWaitContinuationId: options.continuationWait ? "continuation-1" : null }], rowCount: 1 }
     if (sql.startsWith('SELECT task.*') && sql.includes("FOR UPDATE OF task")) return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: null,
-      childWaitResumable: options.childWaitResumable ?? false, childWaitConsumed: options.continuationWait ?? false }], rowCount: 1 }
+      childWaitResumable: options.childWaitResumable ?? false, childWaitContinuationId: options.continuationWait ? "continuation-1" : null }], rowCount: 1 }
     if (sql.includes('SELECT task."id", task."parentTaskId"') && sql.includes("FOR UPDATE OF task")) return options.recoveryLeaseLost
       ? { rows: [], rowCount: 0 } : { rows: [{ ...task, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 }
     if (sql.includes('FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS step') && sql.includes('wait."status" = \'waiting\'')) return options.registeredWait
@@ -67,11 +68,20 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $1')) { task.status = String(_values?.[0]); return { rows: [], rowCount: 1 } }
     if (sql.startsWith('INSERT INTO "agent_outbox"')) { outbox.payload = JSON.parse(String(_values?.[3])) as typeof outbox.payload; return { rows: [{ idempotencyKey: _values?.[2] }], rowCount: 1 } }
     if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
-    if (sql.includes('FROM "agent_events" AS started')) return options.unrelatedPendingCall || options.recoveryLeaseLost
-      || options.pendingCall && !((options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation || options.registeredWait) && options.exactWaitCall) && _values?.[8] !== "start-event"
-      ? { rows: [{ id: "started-event" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_events" AS started')) {
+      const exactWait = (options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation || options.registeredWait)
+        && options.exactWaitCall && _values?.[8] !== "start-event"
+      const exactModel = options.pendingModelStart === "exact" && _values?.[9] === "continuation-1"
+      return options.unrelatedPendingCall || options.recoveryLeaseLost || options.pendingToolStart
+        || options.pendingModelStart && !exactModel
+        || options.pendingCall && !exactWait && !exactModel && _values?.[8] !== "start-event"
+        ? { rows: [{ id: "started-event" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
     if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return { rows: [outbox], rowCount: 1 }
-    if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3')) { task.status = String(_values?.[2]); return { rows: [], rowCount: 1 } }
+    if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3')) {
+      task.status = String(_values?.[2]); task.leaseOwner = null; task.leaseExpiresAt = null; task.nextAttemptAt = _values?.[3] as Date | null
+      return { rows: [], rowCount: 1 }
+    }
     if (sql.startsWith('UPDATE "agent_outbox" SET "payload"')) {
       if (options.rearmCount === 0) return { rows: [], rowCount: 0 }
       outbox.payload = JSON.parse(String(_values?.[0])) as typeof outbox.payload
@@ -262,12 +272,65 @@ describe("expired subagent recovery fence", () => {
     expect(fake.calls.some(sql => sql.includes('FROM "agent_events" AS started'))).toBe(true)
   })
 
-  it("does not replay a consumed continuation while a model call remains unsettled", async () => {
-    const fake = fixture({ child: true, childWaitResumable: true, continuationWait: true, pendingCall: true, attemptCount: 3, maxAttempts: 3 })
+  it("replays only the exact unsettled model start for a consumed same-attempt continuation", async () => {
+    const fake = fixture({ child: true, childWaitResumable: true, continuationWait: true, pendingModelStart: "exact", attemptCount: 3, maxAttempts: 3 })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toMatchObject([
+      { id: "child-1", status: "queued", attemptCount: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null },
+    ])
+    expect(fake.task).toMatchObject({ status: "queued", attemptCount: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null })
+    expect(fake.wait.consumedAt).toEqual(checkedAt)
+    expect(fake.outbox).toMatchObject({ id: "dispatch-1", attemptCount: 4, publishedAt: null, lastError: null })
+    expect(fake.outbox.payload.ownerId).not.toBe("worker-1")
+    const taskUpdate = fake.client.query.mock.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    const rearm = fake.client.query.mock.calls.find(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))
+    expect(taskUpdate?.[0]).toContain('"leaseOwner" = NULL, "leaseExpiresAt" = NULL')
+    expect(taskUpdate?.[0].split("WHERE")[0]).not.toContain('"attemptCount"')
+    expect(taskUpdate?.[1]?.[2]).toBe("queued")
+    expect(rearm?.[0]).toContain('"attemptCount" = $5')
+    expect(rearm?.[1]?.[4]).toBe(4)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("COMMIT")
+
+    const proof = fake.calls.find(sql => sql.includes('AS "childWaitContinuationId"')) ?? ""
+    expect(proof).toContain('waitTurn."rootTaskId" = task."rootTaskId"')
+    expect(proof).toContain('wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"')
+    expect(proof).toContain('continuation."sessionId" = source."sessionId"')
+    expect(proof).toContain('continuation."turnId" = source."turnId" AND continuation."taskId" = source."taskId"')
+    expect(proof).toContain('continuation."status" = \'streaming\'')
+    expect(proof).toContain('source."attempt" = task."attemptCount"')
+    expect(proof).toContain('continuation."attempt" = source."attempt"')
+    expect(proof).toContain('continuation."ordinal" = (SELECT MAX(currentStep."ordinal")')
+    const pendingCalls = fake.client.query.mock.calls.filter(([sql]) => sql.includes('FROM "agent_events" AS started'))
+    expect(pendingCalls).toHaveLength(2)
+    expect(pendingCalls.every(([, values]) => values?.[9] === "continuation-1")).toBe(true)
+    const blocker = pendingCalls[0]?.[0] ?? ""
+    expect(blocker).toContain('started."actor" = \'subagent\'')
+    expect(blocker).toContain('started."sessionId" = $1 AND started."taskId" = $2')
+    expect(blocker).toContain('started."itemId" IS NULL')
+    expect(blocker).toContain('started."turnId" = $3 AND started."correlationId" = $10')
+    expect(blocker).toContain('started."idempotencyKey" = \'task:\' || $2 || \':event:model-started:\' || $10')
+    expect(blocker).toContain('jsonb_build_object(\'taskId\', $2, \'provider\', started."payload"->>\'provider\', \'model\', started."payload"->>\'model\')')
+  })
+
+  it.each(["wrong-correlation", "wrong-actor", "wrong-item", "wrong-key", "wrong-payload"] as const)(
+    "keeps a consumed continuation blocked for an unsettled model start with %s",
+    async pendingModelStart => {
+      const fake = fixture({ child: true, childWaitResumable: true, continuationWait: true, pendingModelStart, attemptCount: 3, maxAttempts: 3 })
+      await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+      expect(fake.task.status).toBe("running")
+      expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+      expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
+    },
+  )
+
+  it("keeps a consumed continuation blocked when an unmatched tool call remains", async () => {
+    const fake = fixture({ child: true, childWaitResumable: true, continuationWait: true, pendingToolStart: true, attemptCount: 3, maxAttempts: 3 })
     await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
-    expect(fake.calls.some(sql => sql.includes('FROM "agent_events" AS started'))).toBe(true)
-    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
-    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
+    expect(fake.task.status).toBe("running")
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
   })
 
   it("does not grant attempt-neutral replay to a prior-attempt consumed wait", async () => {
