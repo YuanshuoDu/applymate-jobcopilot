@@ -51,6 +51,7 @@ describe("subagent dispatch eligibility", () => {
     expect(sql).toContain('step."ordinal" = (SELECT MAX(currentStep."ordinal")')
     expect(sql).toContain('continuation."ordinal" = (SELECT MIN(later."ordinal")')
     expect(sql).toContain('continuation."ordinal" = (SELECT MAX(currentStep."ordinal")')
+    expect(sql).toContain('currentStep."attempt" = task."attemptCount"))))\n    AND wait."status" IN')
     expect(sql).toContain('step."status" IN (\'waiting_for_tool\', \'completed\')')
     expect(sql).toContain('wait."id" = (SELECT currentWait."id"')
     expect(sql).toContain('currentWaitStep."taskId" = task."id" AND currentWaitStep."attempt" = task."attemptCount"')

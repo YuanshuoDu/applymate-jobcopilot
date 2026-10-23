@@ -110,6 +110,8 @@ describe("expired subagent recovery fence", () => {
     const scan = fake.calls.find(sql => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) ?? ""
     expect(scan).toContain('task."leaseExpiresAt" <= clock_timestamp()')
     expect(scan).not.toContain('task."leaseExpiresAt" IS NULL')
+    const eligibility = fake.calls.find(sql => sql.startsWith("SELECT task.*") && sql.includes("FOR UPDATE OF task")) ?? ""
+    expect(eligibility).toContain('currentStep."attempt" = task."attemptCount"))))\n    AND wait."status" IN')
   })
 
   it("keeps an expired lease as a blocker when a model or tool start has no terminal event", async () => {
