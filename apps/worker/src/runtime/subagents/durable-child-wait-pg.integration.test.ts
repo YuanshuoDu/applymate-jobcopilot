@@ -291,14 +291,16 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
           AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
-      expect(preContinuationDispatch.rows[0]).toMatchObject({ attemptCount: 2, publishedAt: null })
+      // Recovery fences the in-flight generation before publishing its replacement.
+      expect(preContinuationDispatch.rows[0]).toMatchObject({ attemptCount: initialGeneration + 2, publishedAt: null })
+      const generation = preContinuationDispatch.rows[0]!.attemptCount
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       const resumedOutbox = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(`SELECT "attemptCount", "publishedAt" FROM "agent_outbox"
         WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`])
-      expect(resumedOutbox.rows[0]).toMatchObject({ attemptCount: 3 })
+      expect(resumedOutbox.rows[0]).toMatchObject({ attemptCount: generation + 1 })
       expect(resumedOutbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
-      const generation = resumedOutbox.rows[0]!.attemptCount - 1
-      expect(generation).toBe(firstGeneration + 2)
+      expect(resumedOutbox.rows[0]!.attemptCount - 1).toBe(generation)
+      expect(generation).toBeGreaterThan(initialGeneration)
       const resumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, generation))
       expect(resumeJob).toBeDefined()
 
@@ -348,13 +350,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
           AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
-      expect(continuationDispatch.rows[0]).toMatchObject({ attemptCount: 3, publishedAt: null })
+      expect(continuationDispatch.rows[0]).toMatchObject({ attemptCount: generation + 2, publishedAt: null })
+      const finalGeneration = continuationDispatch.rows[0]!.attemptCount
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       const finalDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
         `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
           AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
-      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: 4 })
+      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: finalGeneration + 1 })
       expect(finalDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
 
       await waitForMarker(workerD, "WORKER_B_RESUMED")
@@ -382,7 +385,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const finalItems = await pool.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items"
         WHERE "taskId" = $1 AND "sessionId" = $2 AND "content"->>'text' = $3`, [waiter.id, ids.sessionId, FINAL_MARKER])
       expect(finalItems.rows[0]?.count).toBe(1)
-      const finalResumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, generation + 1))
+      expect(finalGeneration).toBeGreaterThan(generation)
+      expect(finalDispatch.rows[0]!.attemptCount - 1).toBe(finalGeneration)
+      const finalResumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, finalGeneration))
       expect(finalResumeJob).toBeDefined()
       expect(await finalResumeJob!.getState()).toBe("completed")
     } finally {
