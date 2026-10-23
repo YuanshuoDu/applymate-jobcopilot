@@ -111,7 +111,8 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   const normalizedNodes = normalizeSupersessionNodes(input.proposal.nodes, input.scope.rootTaskId)
   const rootSuccessCriteria = input.rootSuccessCriteria
   if (priorRelation) {
-    const cancelledSource = await loadTaskGraphCancellationSource(client, input.scope, { ...priorRelation.cancellationEvent,
+    const cancelledSource = await loadTaskGraphCancellationSource(client, input.scope, {
+      eventId: priorRelation.cancellationEvent.id, sequence: priorRelation.cancellationEvent.sequence,
       nodeKey: priorRelation.source.nodeKey, taskId: priorRelation.source.taskId,
       expectedRevision: priorRelation.observedRevision, stepId: priorRelation.agentPlanCall.stepId })
     if (!cancelledSource) throw new TaskGraphCommandError("idempotency_conflict", "Persisted supersession source proof is unavailable")

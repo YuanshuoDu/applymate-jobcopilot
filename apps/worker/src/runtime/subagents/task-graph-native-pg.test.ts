@@ -8,7 +8,11 @@ vi.mock("./pg-store-create.js", async importOriginal => ({
   createSubagentTask: nativeAppendMocks.createChild,
 }))
 vi.mock("./task-graph-pg-create.js", () => ({ enqueueGraphTask: nativeAppendMocks.enqueue }))
-vi.mock("./task-graph-pg-events.js", () => ({ writeTaskGraphSnapshot: nativeAppendMocks.writeSnapshot, appendTaskGraphReceipt: nativeAppendMocks.appendReceipt }))
+vi.mock("./task-graph-pg-events.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./task-graph-pg-events.js")>(),
+  writeTaskGraphSnapshot: nativeAppendMocks.writeSnapshot,
+  appendTaskGraphReceipt: nativeAppendMocks.appendReceipt,
+}))
 
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
