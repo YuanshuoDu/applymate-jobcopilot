@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { createWorkerToolRuntime } from "./index.js"
+import type { RuntimePolicyDecisionRecorder } from "./router.js"
 import { createJobDiscoveryClient } from "./job-discovery-client.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
 import type { ExecutionOwner } from "../execution-owner.js"
@@ -20,6 +21,25 @@ const submitIdentity: ApplicationSubmitIdentity = { sessionId: "session-1", fill
 describe("worker tool runtime entry point", () => {
   it("exports a factory without opening a database connection at import time", () => {
     expect(createWorkerToolRuntime).toBeTypeOf("function")
+  })
+
+  it("passes the optional policy decision recorder into the standard router", async () => {
+    const recordPolicyDecision = vi.fn(async (_decision: Parameters<RuntimePolicyDecisionRecorder>[0]) => undefined)
+    const pool = { query: vi.fn(async () => ({ rows: [] })) }
+    const runtime = createWorkerToolRuntime(
+      pool as never,
+      { sink: new InMemoryToolLifecycleSink() },
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      recordPolicyDecision,
+    )
+
+    await expect(runtime.router.execute(
+      { scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1" },
+      { id: "call-1", toolName: "jobs.search", toolVersion: "1", input: {} },
+    )).resolves.toMatchObject({ status: "completed" })
+
+    expect(recordPolicyDecision).toHaveBeenCalledOnce()
+    expect(recordPolicyDecision.mock.calls[0]?.[0]).toMatchObject({ outcome: "allow" })
   })
 
   it("adds write tools only when a provider is explicitly supplied", () => {

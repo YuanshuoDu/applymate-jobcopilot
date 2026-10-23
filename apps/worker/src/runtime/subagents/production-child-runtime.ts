@@ -9,6 +9,7 @@ import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
+import { durablePolicyDecisionRecorder } from "../turns/canonical-runtime-tool-recovery.js"
 import { durableLifecycleSink } from "../canonical-turn-runtime.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
@@ -160,6 +161,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     ...(coverLetterBase ? { coverLetterBase } : {}),
   } : undefined
   const toolPolicy = createProductionChildPolicy(task, Boolean(selectedJob || selectedJobPreparation))
+  const recordPolicyDecision = durablePolicyDecisionRecorder(store, owner, lease.attemptCount)
   const discoveryFence = childDiscoveryExecutionFence(task, lease, selectedJob, selectedJobPreparation)
   const discoveryObservers = discoveryFence ? await createChildDiscoveryObservers(pool, lease, discoveryFence) : undefined
   const scheduledPrepare = task.role === "prepare" && task.taskType === "scheduled_application_prepare" && prepareOptions
@@ -171,7 +173,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     resolveOwner: () => executionOwner,
     ...(discoveryObservers ? { onDiscoveryAttemptLifecycleEvent: discoveryObservers.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
-  discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined, scheduledPrepare)
+  discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined, scheduledPrepare, recordPolicyDecision)
   registerProductionChildWaitTool({ pool, task, lease, registry: runtime.registry })
   return {
     definitions: runtime.registry.list(), router: runtime.router,
@@ -183,9 +185,12 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
     ...(serverContext ? { serverContext } : {}),
     ...(writerReviewRevision ? { writerReviewRevision } : {}),
-    ...(selectedJobPreparation ? { executePrivateTool: createPrivateSelectedJobToolExecutor({
-      task, writerReviewRevision: writerReviewRevision?.context, registry: runtime.registry, policy: toolPolicy,
-    }) } : {}),
+    ...(selectedJobPreparation ? {
+      executePrivateTool: createPrivateSelectedJobToolExecutor({
+        task, writerReviewRevision: writerReviewRevision?.context, registry: runtime.registry, policy: toolPolicy,
+        recordPolicyDecision,
+      }),
+    } : {}),
     validateArguments: (name, input, version) => runtime.registry.validateArguments(name, input, version),
   }
 }

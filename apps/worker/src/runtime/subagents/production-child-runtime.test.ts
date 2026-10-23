@@ -261,6 +261,18 @@ function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPr
   }
 }
 
+function privateDraftPolicySnapshot(outcome: "deny" | "require_approval" | "require_user_input") {
+  return {
+    version: "policy.v1",
+    rules: [{
+      id: "configured-private-draft",
+      roles: ["subagent"], tools: ["cover_letter.draft"], toolVersions: ["1"], risks: ["draft_write"], domains: ["resume"],
+      requiredCapabilities: ["draft"], outcome, reasonCode: `configured_private_draft_${outcome}`,
+      reason: "Configured private draft decision",
+    }],
+  }
+}
+
 function advertisedTools(request: HarnessModelRequest): readonly Record<string, unknown>[] {
   return request.tools.flatMap(tool => tool && typeof tool === "object" && !Array.isArray(tool)
     ? [tool as Record<string, unknown>]
@@ -1079,6 +1091,12 @@ describe("production child runtime", () => {
     } satisfies SubagentLease
 
     await expect(executor({ lease: analyst })).resolves.toMatchObject({ status: "completed" })
+    const routedPolicyEvents = persistence.events.filter(event => event.type === "policy.decision")
+    expect(routedPolicyEvents.map(event => (event.payload as { scope: { toolName: string; toolCallId: string }; outcome: string }).scope.toolName)).toEqual([
+      "jobs.get", "resume.get_base", "persona.retrieve",
+    ])
+    expect(routedPolicyEvents.map(event => (event.payload as { outcome: string }).outcome)).toEqual(["allow", "allow", "allow"])
+    expect(routedPolicyEvents.map(event => event.taskId)).toEqual([analyst.id, analyst.id, analyst.id])
     expect(advertisedTools(requests[0]!).map(tool => tool.name)).toEqual([
       "jobs.get", "persona.retrieve", "resume.get_base",
     ])
@@ -1199,11 +1217,42 @@ describe("production child runtime", () => {
     const artifacts = new InMemoryArtifactToolStore()
     const draftSpy = vi.spyOn(artifacts, "writeDraft")
     const writerPersistence = recordingStore()
+    const decisionExecutionOrder: string[] = []
+    let releaseDecisionPersistence!: () => void
+    let signalDecisionPersistenceStarted!: () => void
+    const decisionPersistenceGate = new Promise<void>(resolve => { releaseDecisionPersistence = resolve })
+    const decisionPersistenceStarted = new Promise<void>(resolve => { signalDecisionPersistenceStarted = resolve })
+    const appendEvent = writerPersistence.engineStore.appendEvent.bind(writerPersistence.engineStore)
+    vi.spyOn(writerPersistence.engineStore, "appendEvent").mockImplementation(async event => {
+      if (event.type === "policy.decision") {
+        decisionExecutionOrder.push("decision")
+        signalDecisionPersistenceStarted()
+        await decisionPersistenceGate
+      }
+      return appendEvent(event)
+    })
     const writerPool = initialWriterPool("writer-task")
     const writerExecutor = selectedJobExecutor({ artifactStore: artifacts, persistence: writerPersistence, model: writerModel, pool: writerPool, mailboxReader: emptyMailboxReader })
-    const writerLease = { ...jobTask("writer"), id: "writer-task" }
-    const writer = await writerExecutor({ lease: writerLease })
+    const writerLease = { ...jobTask("writer"), id: "writer-task", leaseExpiresAt: new Date("2099-09-09T12:00:00.000Z") }
+    const writerRun = writerExecutor({ lease: writerLease })
+    await decisionPersistenceStarted
+    const draftCallsBeforeDecisionPersistence = draftSpy.mock.calls.length
+    releaseDecisionPersistence()
+    const writer = await writerRun
     expect(writer, JSON.stringify({ writer, writes: writerPersistence.writes })).toMatchObject({ status: "completed" })
+    expect(draftCallsBeforeDecisionPersistence).toBe(0)
+    expect(decisionExecutionOrder).toEqual(["decision"])
+    expect(draftSpy).toHaveBeenCalledTimes(1)
+    const privateDraftDecision = writerPersistence.events.find(event => event.type === "policy.decision")
+    expect(privateDraftDecision).toMatchObject({
+      taskId: writerLease.id,
+      payload: {
+        schemaVersion, outcome: "allow", reasonCode: "server_selected_job_draft_gate",
+        scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", toolCallId: "draft-call", toolName: "cover_letter.draft", role: "subagent" },
+      },
+    })
+    expect(privateDraftDecision?.payload).not.toHaveProperty("safeInput")
+    expect(privateDraftDecision?.payload).not.toHaveProperty("appliedHooks")
     expect(writerPool.transactionQueries).toEqual([
       "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
       "SELECT set_config('app.user_id', $1, true)",
@@ -1300,6 +1349,81 @@ describe("production child runtime", () => {
         expect(stringsDeep(write.value).join("\n")).not.toContain(body)
       }
     }
+  })
+
+  it.each(["deny", "require_approval", "require_user_input"] as const)("persists a private %s decision without executing the draft tool", async outcome => {
+    const body = "This fixture draft must remain unpersisted."
+    const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`
+    const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: "job-1" })
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "draft-call", name: "cover_letter.draft", arguments: {
+            baseArtifactId, baseHash, content: body, constraints: {},
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: "{}" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore()
+    const draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const persistence = recordingStore()
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence, model, pool: legacyInitialWriterPool(), mailboxReader: emptyMailboxReader })
+    const writerLease = {
+      ...jobTask("writer"), id: `writer-${outcome}`, leaseExpiresAt: new Date("2099-09-09T12:00:00.000Z"),
+      toolPolicySnapshot: privateDraftPolicySnapshot(outcome),
+    }
+
+    await expect(executor({ lease: writerLease })).resolves.toMatchObject({ status: "failed" })
+
+    const decision = persistence.events.find(event => event.type === "policy.decision")
+    expect(decision?.payload).toMatchObject({
+      outcome, reasonCode: `configured_private_draft_${outcome}`,
+      scope: { toolCallId: "draft-call", toolName: "cover_letter.draft", role: "subagent" },
+    })
+    expect(draftSpy).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when private decision persistence fails", async () => {
+    const body = "This fixture draft must remain unpersisted."
+    const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`
+    const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: "job-1" })
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "draft-call", name: "cover_letter.draft", arguments: {
+            baseArtifactId, baseHash, content: body, constraints: {},
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: "{}" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const artifacts = new InMemoryArtifactToolStore()
+    const draftSpy = vi.spyOn(artifacts, "writeDraft")
+    const persistence = recordingStore()
+    const appendEvent = persistence.engineStore.appendEvent.bind(persistence.engineStore)
+    const decisionPersistence = vi.spyOn(persistence.engineStore, "appendEvent").mockImplementation(async event => {
+      if (event.type === "policy.decision") throw new Error("fixture policy decision storage failure")
+      return appendEvent(event)
+    })
+    const executor = selectedJobExecutor({ artifactStore: artifacts, persistence, model, pool: legacyInitialWriterPool(), mailboxReader: emptyMailboxReader })
+
+    await executor({ lease: { ...jobTask("writer"), leaseExpiresAt: new Date("2099-09-09T12:00:00.000Z") } })
+
+    expect(decisionPersistence).toHaveBeenCalledWith(expect.objectContaining({ type: "policy.decision" }))
+    expect(draftSpy).not.toHaveBeenCalled()
   })
 
   it("hands private needs_revision feedback to one exact selected-job Writer revision", async () => {

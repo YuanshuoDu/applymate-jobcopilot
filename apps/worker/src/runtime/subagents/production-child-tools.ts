@@ -1,5 +1,5 @@
 import type pg from "pg"
-import type { PolicyEngine } from "@jobcopilot/agent-policy"
+import type { PolicyEngine, RuntimePolicyDecision } from "@jobcopilot/agent-policy"
 import { ToolRegistry } from "../tools/registry.js"
 import type { ArtifactToolExecutionContext, ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 import type { ToolCallRequest, ToolExecutionResult } from "../tools/types.js"
@@ -26,6 +26,7 @@ export function createPrivateSelectedJobToolExecutor(input: {
   readonly writerReviewRevision?: ArtifactToolRevisionContext
   readonly registry: ToolRegistry
   readonly policy: PolicyEngine
+  readonly recordPolicyDecision: (decision: RuntimePolicyDecision) => Promise<void>
 }): (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult> {
   return async (context, request) => {
     const privateRead = request.toolName === "artifact.version.read" && (input.task.role === "reviewer" || (input.task.role === "writer" && Boolean(input.writerReviewRevision)))
@@ -51,6 +52,7 @@ export function createPrivateSelectedJobToolExecutor(input: {
         capabilities: definition.capabilities, requiredCapabilities: definition.requiredCapabilities },
       input: request.input,
     })
+    await input.recordPolicyDecision(decision)
     if (decision.outcome !== "allow") throw new Error("private_artifact_tool_policy_denied")
     const effectiveInput = decision.safeInput === undefined ? request.input : decision.safeInput
     if (input.registry.validateArguments(request.toolName, effectiveInput, request.toolVersion) !== true) {

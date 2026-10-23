@@ -26,7 +26,7 @@ import type { ExecutionOwnerFence } from "./execution-owner.js"
 import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
 import type { ProductionAgentFlags } from "./production-agent-flags.js"
-import { assertCanonicalCoordinationSurface, assertCanonicalQuestionStore, assertCanonicalQuestionSurface, classifyToolCallRecovery, durableLifecycleSink, isNativeQuestionWaitEnabled, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
+import { assertCanonicalCoordinationSurface, assertCanonicalQuestionStore, assertCanonicalQuestionSurface, classifyToolCallRecovery, durableLifecycleSink, durablePolicyDecisionRecorder, isNativeQuestionWaitEnabled, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
 import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./canonical-turn-runtime-model.js"
 import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
@@ -169,6 +169,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const recoveredScheduledCandidate = await scheduledPipeline.readCandidate({ store: scheduledCandidateStore, owner: scheduledPipelineOwner, executionOwner: owner })
     lifecycle.owner = { kind: "turn", taskId: root.id, lease }
     lifecycle.sink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
+    lifecycle.policyDecisionRecorder = durablePolicyDecisionRecorder(turnStore, owner, root.attemptCount)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const { turnInput: internalTurnInput, ...modelState } = state; void internalTurnInput
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state: modelState }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))

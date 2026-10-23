@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto"
+import type { RuntimePolicyDecision } from "@jobcopilot/agent-policy"
 import type { ToolIdempotency } from "../tools/types.js"
 import type { ToolLifecycleEvent, ToolLifecycleSink } from "../tools/index.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
+import { durablePolicyDecisionProjection } from "../policy/telemetry.js"
 import type { TurnExecutionResult } from "./turn-queue.js"
 import type { TurnEngineStore, PersistedToolCallRecovery, ToolCallRecovery } from "./turn-engine-types.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
@@ -23,6 +25,35 @@ export function durableLifecycleSink(store: TurnEngineStore, owner: ExecutionOwn
         payload: toRepositoryJson(event.payload),
       })
     },
+  }
+}
+
+/** Persist a strict policy decision under a stable identity for one root/child attempt. */
+export function durablePolicyDecisionRecorder(
+  store: TurnEngineStore,
+  owner: ExecutionOwnerFence,
+  attemptCount: number,
+): (decision: RuntimePolicyDecision) => Promise<void> {
+  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1 || (owner.kind === "task" && owner.attemptCount !== attemptCount)) {
+    throw new Error("policy_decision_attempt_invalid")
+  }
+  return async decision => {
+    const payload = durablePolicyDecisionProjection(decision, owner)
+    const identity = JSON.stringify([
+      owner.userId, owner.sessionId, owner.turnId, owner.kind, owner.taskId,
+      attemptCount, payload.scope.stepId, payload.scope.toolCallId,
+    ])
+    const digest = createHash("sha256").update(identity).digest("hex")
+    await store.appendEvent({
+      owner,
+      id: `agent-policy-${digest}`,
+      itemId: null,
+      type: "policy.decision",
+      correlationId: payload.scope.toolCallId,
+      causationId: null,
+      idempotencyKey: `policy-decision:${digest}`,
+      payload: toRepositoryJson(payload),
+    })
   }
 }
 

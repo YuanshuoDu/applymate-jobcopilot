@@ -6,7 +6,7 @@ import { createReadOnlyTools } from "./read-tools.js"
 import { ToolRegistry } from "./registry.js"
 import { createToolResultReferenceRepository } from "./tool-result-reference-repo.js"
 import { createToolResultsReadTool } from "./tool-results-read-tool.js"
-import { ToolRouter } from "./router.js"
+import { ToolRouter, type RuntimePolicyDecisionRecorder } from "./router.js"
 import type { PolicyEngine } from "../policy/index.js"
 import { createCoordinationTools } from "./coordination-tools.js"
 import { createArtifactTools, type ArtifactToolStore } from "./artifact-tools.js"
@@ -71,6 +71,7 @@ export function createWorkerToolRuntime(
   write?: WorkerWriteOptions,
   jobDiscovery?: JobDiscoverToolOptions,
   scheduledPrepare?: WorkerScheduledPrepareOptions,
+  recordPolicyDecision?: RuntimePolicyDecisionRecorder,
 ): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"]; durableResults: NonNullable<ToolLifecycleOptions["durableResults"]> } {
   const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
@@ -96,5 +97,5 @@ export function createWorkerToolRuntime(
   if (scheduledPrepare) definitions.push(createScheduledApplicationPrepareTool(scheduledPrepare))
   const registry = new ToolRegistry(definitions)
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
-  return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references, durableResults }
+  return { registry, router: new ToolRouter(registry, lifecycle, policy, recordPolicyDecision), references: lifecycleOptions.references, durableResults }
 }

@@ -12,6 +12,8 @@ import type {
 import { ToolExecutionError } from "./types.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 
+export type RuntimePolicyDecisionRecorder = (decision: RuntimePolicyDecision) => Promise<void>
+
 export type ToolRouterErrorCode = "runtime_scope_error" | "capability_denied" | "idempotency_conflict" | "timeout" | "cancelled" | "tool_execution_failed" | "policy_denied" | "policy_requires_approval" | "policy_requires_user_input" | "policy_version_unknown" | "policy_rewrite_expands_permissions"
 
 export class ToolRouterError extends Error {
@@ -40,6 +42,7 @@ export class ToolRouter {
     private readonly registry: ToolRegistry,
     private readonly lifecycle: ToolLifecycle,
     private readonly policy: PolicyEngine = new PolicyEngine(),
+    private readonly recordPolicyDecision?: RuntimePolicyDecisionRecorder,
   ) {}
 
   execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> {
@@ -88,6 +91,7 @@ export class ToolRouter {
         },
         input: request.input,
       })
+      await this.recordPolicyDecision?.(policyDecision)
       this.assertPolicy(policyDecision)
       const effectiveInput = policyDecision.safeInput === undefined ? request.input : policyDecision.safeInput
       if (containsModelUserId(effectiveInput)) throw new ToolRouterError("policy_rewrite_expands_permissions", "A policy rewrite attempted to override tenant scope")
