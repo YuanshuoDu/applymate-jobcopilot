@@ -42,7 +42,7 @@ const withServices = databaseUrl && redisUrl && process.env.RUN_AGENT_TURN_REDIS
 type FixtureIds = { userId: string; sessionId: string; turnId: string; rootTaskId: string; waiterTaskId: string; targetTaskId: string }
 type WorkerProcess = ChildProcess & { stdoutText: string; stderrText: string; exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }> }
 
-function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-resume" | "worker-b", queueName: string, ids: FixtureIds): WorkerProcess {
+function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-before-resume" | "worker-b-crash-resume" | "worker-b", queueName: string, ids: FixtureIds): WorkerProcess {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, queueName, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl! },
@@ -89,7 +89,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
   beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8 }) })
   afterAll(async () => { await pool?.end() })
 
-  it("stops Worker A, resolves its direct-child wait, and resumes the same attempt exactly once in Worker B", async () => {
+  it("recovers registered, pre-continuation, and streaming-continuation crash cuts on one attempt", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
       userId: `durable-child-wait-user-${suffix}`,
@@ -107,6 +107,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     let workerA: WorkerProcess | undefined
     let workerB: WorkerProcess | undefined
     let workerC: WorkerProcess | undefined
+    let workerD: WorkerProcess | undefined
     const originalRedisUrl = process.env.REDIS_URL
     let closeSharedRedisConnections: (() => Promise<void>) | undefined
 
@@ -185,7 +186,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 AND "leaseExpiresAt" = $4`,
       [waiter.id, ids.sessionId, firstOwner, cut.rows[0]!.leaseExpiresAt])
 
-      workerB = launchWorker("worker-b-crash-resume", queueName, ids)
+      workerB = launchWorker("worker-b-crash-before-resume", queueName, ids)
       await waitForMarker(workerB, "WORKER_B_RECOVERED")
       const recovered = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
         stepStatus: string; waitStatus: string; suspendedAt: Date | null; consumedAt: Date | null }>(
@@ -221,17 +222,78 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       })
       expect(dispatch.attemptCount).toBe(1)
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
+      const initialResumeOutbox = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(`SELECT "attemptCount", "publishedAt" FROM "agent_outbox"
+        WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`])
+      expect(initialResumeOutbox.rows[0]).toMatchObject({ attemptCount: 2 })
+      expect(initialResumeOutbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      const initialGeneration = initialResumeOutbox.rows[0]!.attemptCount - 1
+      expect(initialGeneration).toBe(firstGeneration + 1)
+      const initialResumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, initialGeneration))
+      expect(initialResumeJob).toBeDefined()
+
+      await waitForMarker(workerB, "WORKER_B_RESUME_NOT_STARTED")
+      expect(await initialResumeJob!.getState()).toBe("active")
+      const preContinuationCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
+        leaseExpiresAt: Date | null; sourceStatus: string; sourceIsLatest: boolean; waitStatus: string; suspendedAt: Date | null;
+        consumedAt: Date | null; callStatus: string; startedCount: number; settledCount: number; continuationCount: number }>(
+        `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", task."leaseExpiresAt",
+          source."status" AS "sourceStatus", source."ordinal" = (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest
+            WHERE latest."taskId" = task."id" AND latest."sessionId" = task."sessionId" AND latest."turnId" = task."turnId" AND latest."attempt" = task."attemptCount") AS "sourceIsLatest",
+          wait."status" AS "waitStatus", wait."suspendedAt", wait."consumedAt", call."status" AS "callStatus",
+          (SELECT COUNT(*)::int FROM "agent_events" AS started WHERE started."sessionId" = task."sessionId" AND started."taskId" = task."id"
+            AND started."type" = 'tool_call.started' AND started."correlationId" = call."content"->>'toolCallId') AS "startedCount",
+          (SELECT COUNT(*)::int FROM "agent_events" AS settled WHERE settled."sessionId" = task."sessionId" AND settled."taskId" = task."id"
+            AND settled."correlationId" = call."content"->>'toolCallId' AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')) AS "settledCount",
+          (SELECT COUNT(*)::int FROM "agent_steps" AS next WHERE next."taskId" = task."id" AND next."sessionId" = task."sessionId"
+            AND next."turnId" = task."turnId" AND next."attempt" = source."attempt" AND next."ordinal" = source."ordinal" + 1) AS "continuationCount"
+         FROM "sub_agent_tasks" AS task JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = task."id" AND wait."sessionId" = task."sessionId"
+         JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."taskId" = task."id" AND source."sessionId" = task."sessionId"
+         JOIN "agent_items" AS call ON call."stepId" = source."id" AND call."taskId" = task."id" AND call."sessionId" = task."sessionId"
+           AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
+         WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
+      )
+      expect(preContinuationCut.rows[0]).toMatchObject({ taskStatus: "running", attemptCount: 1, sourceStatus: "waiting_for_tool",
+        sourceIsLatest: true, waitStatus: "ready", consumedAt: null, callStatus: "started", startedCount: 1, settledCount: 0, continuationCount: 0 })
+      expect(preContinuationCut.rows[0]?.leaseOwner).toEqual(expect.any(String))
+      expect(preContinuationCut.rows[0]?.leaseExpiresAt).toBeInstanceOf(Date)
+      expect(preContinuationCut.rows[0]?.suspendedAt).toBeInstanceOf(Date)
+      const preContinuationOwner = preContinuationCut.rows[0]!.leaseOwner
+      await stopWorker(workerB)
+      const preContinuationExit = await workerB.exited
+      expect(preContinuationExit.code).toBeNull()
+      expect(preContinuationExit.signal).toBe("SIGKILL")
+      await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 AND "leaseExpiresAt" = $4`,
+      [waiter.id, ids.sessionId, preContinuationOwner, preContinuationCut.rows[0]!.leaseExpiresAt])
+
+      workerC = launchWorker("worker-b-crash-resume", queueName, ids)
+      await waitForMarker(workerC, "WORKER_B_RECOVERED")
+      const preContinuationRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
+        sourceStatus: string; waitStatus: string; consumedAt: Date | null }>(
+        `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", source."status" AS "sourceStatus",
+          wait."status" AS "waitStatus", wait."consumedAt"
+         FROM "sub_agent_tasks" AS task JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = task."id" AND wait."sessionId" = task."sessionId"
+         JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."taskId" = task."id" AND source."sessionId" = task."sessionId"
+         WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
+      )
+      expect(preContinuationRecovery.rows[0]).toMatchObject({ taskStatus: "queued", attemptCount: 1, leaseOwner: null,
+        sourceStatus: "waiting_for_tool", waitStatus: "ready", consumedAt: null })
+      const preContinuationDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+          AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+      )
+      expect(preContinuationDispatch.rows[0]).toMatchObject({ attemptCount: 2, publishedAt: null })
+      await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       const resumedOutbox = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(`SELECT "attemptCount", "publishedAt" FROM "agent_outbox"
         WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`])
-      expect(resumedOutbox.rows[0]).toMatchObject({ attemptCount: 2 })
+      expect(resumedOutbox.rows[0]).toMatchObject({ attemptCount: 3 })
       expect(resumedOutbox.rows[0]?.publishedAt).toBeInstanceOf(Date)
       const generation = resumedOutbox.rows[0]!.attemptCount - 1
-      expect(generation).toBe(firstGeneration + 1)
-      const resumeJobId = subagentDispatchJobId(waiter.id, generation)
-      const resumeJob = await queue.getJob(resumeJobId)
+      expect(generation).toBe(firstGeneration + 2)
+      const resumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, generation))
       expect(resumeJob).toBeDefined()
 
-      await waitForMarker(workerB, "WORKER_B_RESUME_STEP_STARTED")
+      await waitForMarker(workerC, "WORKER_B_RESUME_STEP_STARTED")
       const secondCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
         stepOrdinal: number; stepStatus: string; consumedAt: Date | null; callStatus: string; settledCount: number }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", task."leaseExpiresAt", next."ordinal" AS "stepOrdinal",
@@ -251,16 +313,16 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(secondCut.rows[0]?.leaseOwner).toEqual(expect.any(String))
       expect(secondCut.rows[0]?.leaseExpiresAt).toBeInstanceOf(Date)
       const secondOwner = secondCut.rows[0]!.leaseOwner
-      await stopWorker(workerB)
-      const secondExit = await workerB.exited
+      await stopWorker(workerC)
+      const secondExit = await workerC.exited
       expect(secondExit.code).toBeNull()
       expect(secondExit.signal).toBe("SIGKILL")
       await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
         WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 AND "leaseExpiresAt" = $4`,
       [waiter.id, ids.sessionId, secondOwner, secondCut.rows[0]!.leaseExpiresAt])
 
-      workerC = launchWorker("worker-b", queueName, ids)
-      await waitForMarker(workerC, "WORKER_B_RECOVERED")
+      workerD = launchWorker("worker-b", queueName, ids)
+      await waitForMarker(workerD, "WORKER_B_RECOVERED")
       const continuationRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
         stepStatus: string; waitStatus: string; consumedAt: Date | null }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", next."status" AS "stepStatus",
@@ -277,20 +339,20 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
           AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
-      expect(continuationDispatch.rows[0]).toMatchObject({ attemptCount: 2, publishedAt: null })
+      expect(continuationDispatch.rows[0]).toMatchObject({ attemptCount: 3, publishedAt: null })
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       const finalDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
         `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
           AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
-      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: 3 })
+      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: 4 })
       expect(finalDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
 
-      await waitForMarker(workerC, "WORKER_B_RESUMED")
-      const thirdExit = await workerC.exited
+      await waitForMarker(workerD, "WORKER_B_RESUMED")
+      const thirdExit = await workerD.exited
       expect(thirdExit.code).toBe(0)
       expect(thirdExit.signal).toBeNull()
-      expect(workerC.stdoutText.match(/WORKER_B_RESUMED/g) ?? []).toHaveLength(1)
+      expect(workerD.stdoutText.match(/WORKER_B_RESUMED/g) ?? []).toHaveLength(1)
       const finished = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(
         `SELECT "status", "attemptCount", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId],
       )
@@ -318,6 +380,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await stopWorker(workerA)
       await stopWorker(workerB)
       await stopWorker(workerC)
+      await stopWorker(workerD)
       await queue.obliterate({ force: true }).catch(() => undefined)
       await queue.close().catch(() => undefined)
       if (closeSharedRedisConnections) await closeSharedRedisConnections().catch(() => undefined)

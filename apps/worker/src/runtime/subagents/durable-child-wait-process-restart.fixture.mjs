@@ -19,7 +19,7 @@ const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRe
 const store = new PgSubagentTaskStore(pool, 30_000)
 const manager = new AgentTreeManager(store, { heartbeatMs: 2_000 })
 const turnStore = createPgTurnEngineStore(pool)
-const resolver = mode === "worker-b" ? startDurableWaitResolver(pool, { intervalMs: 100, ownerId: "restart-fixture-worker-b" }) : undefined
+const resolver = mode.startsWith("worker-b") ? startDurableWaitResolver(pool, { intervalMs: 100, ownerId: "restart-fixture-worker-b" }) : undefined
 let stopped = false
 
 function say(value) { process.stdout.write(`${value}\n`) }
@@ -94,6 +94,10 @@ const worker = new Worker(queueName, async job => {
   if (!identity) throw new Error("invalid_subagent_dispatch_identity")
   const execute = mode === "worker-a" ? waitForChild
     : mode === "worker-a-crash" ? lease => waitForChild(lease, true)
+      : mode === "worker-b-crash-before-resume" ? lease => {
+        say(`WORKER_B_RESUME_NOT_STARTED ${JSON.stringify({ taskId: lease.id, attemptCount: lease.attemptCount })}`)
+        return new Promise(() => {})
+      }
       : mode === "worker-b-crash-resume" ? lease => resumeChild(lease, true)
       : mode === "worker-b" ? resumeChild : undefined
   if (!execute) throw new Error("invalid_fixture_mode")

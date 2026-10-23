@@ -13,7 +13,8 @@ const checkedAt = new Date("2026-10-06T10:00:00Z")
 type FixtureOptions = { pendingCall?: boolean; candidate?: boolean; childWaitResumable?: boolean; attemptCount?: number;
   maxAttempts?: number; child?: boolean; outboxOwnerId?: string; dispatchPublished?: boolean; rearmCount?: number;
   registeredWait?: boolean; targetStatus?: string; callMatches?: boolean; recoveryLeaseLost?: boolean; continuationWait?: boolean;
-  exactWaitCall?: boolean; unrelatedPendingCall?: boolean; preinsertWaitCall?: boolean; unconsumedContinuation?: boolean }
+  exactWaitCall?: boolean; unrelatedPendingCall?: boolean; preinsertWaitCall?: boolean; unconsumedContinuation?: boolean;
+  unconsumedNoContinuation?: boolean }
 function fixture(options: FixtureOptions = {}) {
   const calls: string[] = []
   const task = { id: options.child ? "child-1" : "task-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: options.child ? "root-1" : "task-1", parentTaskId: options.child ? "root-1" : null,
@@ -26,9 +27,9 @@ function fixture(options: FixtureOptions = {}) {
       rootTaskId: task.rootTaskId, ownerId: options.outboxOwnerId ?? task.leaseOwner }, attemptCount: 4,
     publishedAt: options.dispatchPublished === false ? null : new Date(checkedAt.getTime() - 1_000), lastError: "previous_error" as string | null }
   const wait = { id: "wait-1", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, parentTaskId: task.id,
-    stepId: "step-1", idempotencyKey: "wait-key-1", targetTaskIds: ["target-1"], mode: "any", status: options.continuationWait || options.unconsumedContinuation ? "ready" : "waiting",
+    stepId: "step-1", idempotencyKey: "wait-key-1", targetTaskIds: ["target-1"], mode: "any", status: options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation ? "ready" : "waiting",
     deadlineAt: new Date(checkedAt.getTime() + 10_000), matchedTaskIds: [] as string[],
-    suspendedAt: options.continuationWait || options.unconsumedContinuation ? checkedAt : null as Date | null,
+    suspendedAt: options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation ? checkedAt : null as Date | null,
     consumedAt: options.continuationWait ? checkedAt : null as Date | null,
     result: { request: { targetTaskIds: ["target-1"], mode: "any", timeoutMs: 10_000 }, outcome: { status: "waiting" } } }
   const client = { query: vi.fn(async (sql: string, _values?: unknown[]) => {
@@ -67,7 +68,7 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.startsWith('INSERT INTO "agent_outbox"')) { outbox.payload = JSON.parse(String(_values?.[3])) as typeof outbox.payload; return { rows: [{ idempotencyKey: _values?.[2] }], rowCount: 1 } }
     if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
     if (sql.includes('FROM "agent_events" AS started')) return options.unrelatedPendingCall || options.recoveryLeaseLost
-      || options.pendingCall && !((options.continuationWait || options.unconsumedContinuation || options.registeredWait) && options.exactWaitCall) && _values?.[8] !== "start-event"
+      || options.pendingCall && !((options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation || options.registeredWait) && options.exactWaitCall) && _values?.[8] !== "start-event"
       ? { rows: [{ id: "started-event" }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return { rows: [outbox], rowCount: 1 }
     if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3')) { task.status = String(_values?.[2]); return { rows: [], rowCount: 1 } }
@@ -113,7 +114,7 @@ describe("expired subagent recovery fence", () => {
     await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toMatchObject([{ id: "child-1", status: "queued" }])
     const pending = fake.calls.find(sql => sql.includes('FROM "agent_events" AS started')) ?? ""
     expect(pending).toContain('started."itemId" = call."id"')
-    expect(pending).toContain("call.\"content\"->'input' - 'taskIds'::text = jsonb_build_object")
+    expect(pending).toContain("(call.\"content\"->'input') - 'taskIds'::text = jsonb_build_object")
     expect(pending).toContain('wait."consumedAt" IS NOT NULL')
     expect(pending).toContain('owner."leaseOwner" = $5')
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(true)
@@ -132,6 +133,29 @@ describe("expired subagent recovery fence", () => {
     expect(pending).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7')
     expect(fake.outbox.payload.ownerId).not.toBe("worker-1")
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(true)
+  })
+
+  it("rearms an exact ready unconsumed wait when its waiting source is latest and has no continuation", async () => {
+    const fake = fixture({ child: true, childWaitResumable: true, unconsumedNoContinuation: true, pendingCall: true, exactWaitCall: true })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toMatchObject([
+      { id: "child-1", status: "queued", attemptCount: 1, nextAttemptAt: null },
+    ])
+    expect(fake.task).toMatchObject({ status: "queued", attemptCount: 1 })
+    expect(fake.wait).toMatchObject({ status: "ready", suspendedAt: checkedAt, consumedAt: null })
+    const pending = fake.calls.find(sql => sql.includes('FROM "agent_events" AS started')) ?? ""
+    expect(pending).toContain('wait."status" IN (\'ready\', \'timed_out\') AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NULL')
+    expect(pending).toContain('source."status" = \'waiting_for_tool\' AND source."ordinal" = (SELECT MAX(current."ordinal")')
+    expect(pending).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7')
+    expect(fake.outbox).toMatchObject({ attemptCount: 4, publishedAt: null })
+    expect(fake.outbox.payload.ownerId).not.toBe("worker-1")
+
+    for (const blocker of [{ exactWaitCall: false }, { exactWaitCall: true, unrelatedPendingCall: true }]) {
+      const blocked = fixture({ child: true, childWaitResumable: true, unconsumedNoContinuation: true, pendingCall: true, ...blocker })
+      await expect(recoverExpired(blocked.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+      expect(blocked.task.status).toBe("running")
+      expect(blocked.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+      expect(blocked.calls.some(sql => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
+    }
   })
 
   it("keeps an unconsumed wait blocked when another unmatched call remains", async () => {
