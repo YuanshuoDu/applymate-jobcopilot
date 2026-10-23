@@ -294,6 +294,9 @@ describe("expired subagent recovery fence", () => {
     expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("COMMIT")
 
     const proof = fake.calls.find(sql => sql.includes('AS "childWaitContinuationId"')) ?? ""
+    const consumedProof = proof.slice(proof.indexOf("CASE WHEN COUNT(*)"), proof.indexOf('AS "childWaitContinuationId"'))
+    expect(consumedProof).toContain('THEN MAX(continuation."id"::text) END')
+    expect(consumedProof).not.toContain("= true")
     expect(proof).toContain('waitTurn."rootTaskId" = task."rootTaskId"')
     expect(proof).toContain('wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"')
     expect(proof).toContain('continuation."sessionId" = source."sessionId"')

@@ -62,7 +62,7 @@ const CHILD_WAIT_CONSUMED_SQL = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(continu
     AND continuation."ordinal" = (SELECT MAX(currentStep."ordinal") FROM "agent_steps" AS currentStep
       WHERE currentStep."taskId" = task."id" AND currentStep."sessionId" = task."sessionId" AND currentStep."turnId" = task."turnId" AND currentStep."attempt" = task."attemptCount")
     AND wait."id" = (SELECT currentWait."id" FROM "agent_wait_conditions" AS currentWait WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId"
-        AND currentWait."turnId" = task."turnId" AND currentWait."stepId" = source."id" ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1)) = true`
+        AND currentWait."turnId" = task."turnId" AND currentWait."stepId" = source."id" ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1))`
 
 type ExpiredWaitDispatch = { id: string; payload: unknown; attemptCount: unknown; publishedAt: unknown }
 async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<string, unknown>, ignoredEventId?: string, continuationId?: string): Promise<boolean> {
