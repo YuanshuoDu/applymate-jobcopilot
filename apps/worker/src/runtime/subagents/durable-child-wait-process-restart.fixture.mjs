@@ -21,6 +21,11 @@ const readyMarkerByMode = {
   "worker-b-crash-resume": "WORKER_B_READY",
   "worker-b": "WORKER_B_READY",
 }
+const crashCutModes = new Set([
+  "worker-a-crash",
+  "worker-b-crash-before-resume",
+  "worker-b-crash-resume",
+])
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
 const store = new PgSubagentTaskStore(pool, 30_000)
@@ -113,6 +118,11 @@ const worker = new Worker(queueName, async job => {
 
 worker.on("completed", (job, result) => {
   if (job.data.taskId !== ids.waiterTaskId) return
+  if (crashCutModes.has(mode)) {
+    process.stderr.write(`UNEXPECTED_CRASH_CUT_COMPLETION ${JSON.stringify({ mode, result, taskId: ids.waiterTaskId })}\n`)
+    void stop(1)
+    return
+  }
   const marker = mode === "worker-a" ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
   say(`${marker} ${JSON.stringify({ result, taskId: ids.waiterTaskId })}`)
   void stop(0)

@@ -40,7 +40,12 @@ const databaseUrl = disposableDatabaseUrl()
 const redisUrl = disposableRedisUrl()
 const withServices = databaseUrl && redisUrl && process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1" ? describe : describe.skip
 type FixtureIds = { userId: string; sessionId: string; turnId: string; rootTaskId: string; waiterTaskId: string; targetTaskId: string }
-type WorkerProcess = ChildProcess & { stdoutText: string; stderrText: string; exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }> }
+type WorkerProcess = ChildProcess & {
+  stdoutText: string
+  stderrText: string
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
+  closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
+}
 
 function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-before-resume" | "worker-b-crash-resume" | "worker-b", queueName: string, ids: FixtureIds): WorkerProcess {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, queueName, JSON.stringify(ids)], {
@@ -55,6 +60,7 @@ function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-befo
   child.stdout?.on("data", (chunk: string) => { child.stdoutText += chunk })
   child.stderr?.on("data", (chunk: string) => { child.stderrText += chunk })
   child.exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })))
+  child.closed = new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })))
   return child
 }
 
@@ -62,10 +68,13 @@ async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 2
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (child.stdoutText.includes(marker)) return
-    if (child.exitCode !== null) throw new Error(`Worker exited before ${marker}: ${child.stderrText}`)
+    if (child.exitCode !== null || child.signalCode !== null) {
+      const exit = await child.closed
+      throw new Error(`Worker exited before ${marker} (code=${exit.code}, signal=${exit.signal}); stdout: ${child.stdoutText}; stderr: ${child.stderrText}`)
+    }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  throw new Error(`Timed out waiting for ${marker}; stderr: ${child.stderrText}`)
+  throw new Error(`Timed out waiting for ${marker}; stdout: ${child.stdoutText}; stderr: ${child.stderrText}`)
 }
 
 async function waitFor<T>(read: () => Promise<T | null>, timeoutMs = 20_000): Promise<T> {
