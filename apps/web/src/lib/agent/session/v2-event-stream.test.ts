@@ -110,6 +110,8 @@ describe("V2 agent event stream", () => {
         controlOperationId: marker, goalDigest: marker, evidencePacketDigest: marker,
         reference: marker, sentinel: marker,
         ...(type === "native_verification.scheduled_candidate_staged" ? { candidateText: "PRIVATE_SCHEDULED_FINAL_CANDIDATE" } : {}),
+        ...(type === "agent.plan.discovery_persona_snapshot" ? { projection: { facts: [{ value: "PRIVATE_DISCOVERY_FACT_VALUE" }] } } : {}),
+        ...(type === "agent.plan.discovery_persona_overflow" ? { observedFactCount: 33, rawValue: "PRIVATE_OVERFLOW_VALUE" } : {}),
       },
     })
     const rejection = {
@@ -144,8 +146,10 @@ describe("V2 agent event stream", () => {
               { ...privateEvent(BigInt(5), "agent.plan.clarification", "clarification"), itemId: null },
             ]
           : [
+              privateEvent(BigInt(6), "agent.plan.discovery_persona_snapshot", "discovery-snapshot"),
+              privateEvent(BigInt(7), "agent.plan.discovery_persona_overflow", "discovery-overflow"),
               {
-                ...privateEvent(BigInt(6), "agent.plan.denial_checkpoint", "denial-checkpoint"),
+                ...privateEvent(BigInt(8), "agent.plan.denial_checkpoint", "denial-checkpoint"),
                 itemId: null,
                 payload: {
                   schemaVersion: "agent-harness.v2.task-graph-denial-checkpoint.v1",
@@ -155,8 +159,8 @@ describe("V2 agent event stream", () => {
                   verificationDigest: marker,
                 },
               },
-              rejection,
-              visible,
+              { ...rejection, sequence: BigInt(9) },
+              { ...visible, sequence: BigInt(10) },
             ]
     })
     const pubsub = eventRedis()
@@ -184,11 +188,15 @@ describe("V2 agent event stream", () => {
       expect(text).not.toContain("agent.plan.reconciliation")
       expect(text).not.toContain("agent.plan.clarification")
       expect(text).not.toContain("agent.plan.denial_checkpoint")
+      expect(text).not.toContain("agent.plan.discovery_persona_snapshot")
+      expect(text).not.toContain("agent.plan.discovery_persona_overflow")
       expect(text).not.toContain('"verificationDigest"')
       expect(text).not.toContain('"graphRevision"')
       expect(text).not.toContain("task-graph-denial-checkpoint.v1")
       expect(text).not.toContain(marker)
       expect(text).not.toContain("PRIVATE_SCHEDULED_FINAL_CANDIDATE")
+      expect(text).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
+      expect(text).not.toContain("PRIVATE_OVERFLOW_VALUE")
       expect(text).not.toContain("private-event-")
       expect(text).not.toContain("private-item-")
       expect(text).not.toContain("private-task-")
@@ -236,6 +244,14 @@ describe("V2 agent event stream", () => {
         verificationDigest: marker,
       },
     }
+    const privateDiscoverySnapshotEnvelope = {
+      ...privateEnvelope, id: "private-discovery-snapshot-event", type: "agent.plan.discovery_persona_snapshot",
+      payload: { projection: { facts: [{ factId: "fact-1", value: "PRIVATE_DISCOVERY_FACT_VALUE" }] } },
+    }
+    const privateDiscoveryOverflowEnvelope = {
+      ...privateEnvelope, id: "private-discovery-overflow-event", type: "agent.plan.discovery_persona_overflow",
+      payload: { observedFactCount: 33, rawValue: "PRIVATE_OVERFLOW_VALUE" },
+    }
     const visibleEnvelope = {
       schemaVersion: "agent-harness.v2", id: "ordinary-delta-event", sessionId: "session_1",
       turnId: "turn_1", itemId: "ordinary-item", taskId: "ordinary-task", type: "item.snapshot",
@@ -248,8 +264,11 @@ describe("V2 agent event stream", () => {
     const disconnect = vi.fn()
     const connection: AgentStreamRedis = {
       xread: vi.fn()
-        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("1-0", privateEnvelope), entry("2-0", privateReconciliationEnvelope), entry("3-0", privateClarificationEnvelope), entry("4-0", privateDenialCheckpointEnvelope)]]])
-        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("5-0", visibleEnvelope)]]])
+        .mockResolvedValueOnce([["agent:session:session_1:deltas", [
+          entry("1-0", privateEnvelope), entry("2-0", privateReconciliationEnvelope), entry("3-0", privateClarificationEnvelope),
+          entry("4-0", privateDenialCheckpointEnvelope), entry("5-0", privateDiscoverySnapshotEnvelope), entry("6-0", privateDiscoveryOverflowEnvelope),
+        ]]])
+        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("7-0", visibleEnvelope)]]])
         .mockImplementation(() => new Promise(resolve => {
           if (controller.signal.aborted) return resolve(null)
           controller.signal.addEventListener("abort", () => resolve(null), { once: true })
@@ -264,17 +283,21 @@ describe("V2 agent event stream", () => {
     try {
       const text = new TextDecoder().decode((await reader.read()).value)
       expect(text).toContain("event: item.snapshot")
-      expect(text).toContain('"streamId":"5-0"')
+      expect(text).toContain('"streamId":"7-0"')
       expect(text).toContain("ordinary transient event remains visible")
       expect(text).not.toContain("native_verification.")
       expect(text).not.toContain("agent.plan.reconciliation")
       expect(text).not.toContain("agent.plan.clarification")
       expect(text).not.toContain("agent.plan.denial_checkpoint")
+      expect(text).not.toContain("agent.plan.discovery_persona_snapshot")
+      expect(text).not.toContain("agent.plan.discovery_persona_overflow")
       expect(text).not.toContain('"verificationDigest"')
       expect(text).not.toContain('"graphRevision"')
       expect(text).not.toContain("task-graph-denial-checkpoint.v1")
       expect(text).not.toContain(marker)
       expect(text).not.toContain("PRIVATE_DELTA_FINAL_CANDIDATE")
+      expect(text).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
+      expect(text).not.toContain("PRIVATE_OVERFLOW_VALUE")
       expect(text).not.toContain("private-delta-event")
       expect(text).not.toContain("private-clarification-event")
       expect(text).not.toContain("private-denial-checkpoint-event")
@@ -288,7 +311,7 @@ describe("V2 agent event stream", () => {
         1, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "$",
       )
       expect(connection.xread).toHaveBeenNthCalledWith(
-        2, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "4-0",
+        2, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "6-0",
       )
     } finally {
       controller.abort()

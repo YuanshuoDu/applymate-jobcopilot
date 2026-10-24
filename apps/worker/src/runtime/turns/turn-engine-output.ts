@@ -2,7 +2,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 export class TurnEngineError extends Error {
   constructor(
-    readonly code: "final_unverified" | "step_limit" | "model_incomplete" | "persistence_conflict" | "invalid_output" | "budget_exhausted" | "no_progress" | "evidence_missing" | "evidence_conflict" | "business_precondition_failed",
+    readonly code: "final_unverified" | "step_limit" | "model_incomplete" | "persistence_conflict" | "invalid_output" | "budget_exhausted" | "no_progress" | "evidence_missing" | "evidence_conflict" | "business_precondition_failed" | "discovery_memory_overflow",
     message: string,
   ) {
     super(message)

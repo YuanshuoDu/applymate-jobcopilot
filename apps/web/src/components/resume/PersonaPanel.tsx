@@ -1,15 +1,76 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { ClipboardPaste, Download, LoaderCircle, Pencil, Plus, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
 import type { PersonaField, PersonaProfile } from '@/lib/persona'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, type Lang } from '@/lib/i18n'
+import { isDiscoveryPersonaFactEnabled, personaDiscoveryMessage } from '@/lib/persona-discovery-messages'
+import type { DiscoveryPersonaFact } from '@/lib/persona-facts'
 import type { ResumeContent } from '@/lib/types'
 import { personaFieldsFromResumeContent } from '@/lib/persona-paste'
 
 const categories = ['personal', 'contact', 'work', 'education', 'preferences'] as const
+
+export type DiscoveryConsentChange =
+  | { kind: 'updated'; fact: DiscoveryPersonaFact }
+  | { kind: 'stale' }
+  | { kind: 'failed' }
+
+export function createDiscoveryRequestFence() {
+  let latestRequest = 0
+  return {
+    begin: () => ++latestRequest,
+    invalidate: () => { latestRequest += 1 },
+    isCurrent: (request: number) => request === latestRequest,
+  }
+}
+
+export async function requestDiscoveryConsentChange(
+  fact: DiscoveryPersonaFact, enabled: boolean, refresh: () => Promise<void>, fetcher: typeof fetch = fetch,
+): Promise<DiscoveryConsentChange> {
+  try {
+    const response = await fetcher('/api/me/persona/discovery', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        factId: fact.id, key: fact.key, expectedValue: fact.value,
+        expectedNormalizedValue: fact.normalizedValue, expectedUpdatedAt: fact.updatedAt, enabled,
+      }),
+    })
+    if (response.status === 409 || response.status === 404) {
+      try { await refresh() } catch { /* Keep the CAS outcome visible if refresh is unavailable. */ }
+      return { kind: 'stale' }
+    }
+    if (!response.ok) return { kind: 'failed' }
+    const payload: unknown = await response.json().catch(() => null)
+    if (!payload || typeof payload !== 'object' || !('fact' in payload)) return { kind: 'failed' }
+    const updated = (payload as { fact: unknown }).fact
+    if (!isDiscoveryPersonaFact(updated)) return { kind: 'failed' }
+    return { kind: 'updated', fact: updated }
+  } catch { return { kind: 'failed' } }
+}
+
+function isDiscoveryPersonaFact(value: unknown): value is DiscoveryPersonaFact {
+  if (!value || typeof value !== 'object') return false
+  const fact = value as Partial<DiscoveryPersonaFact>
+  return typeof fact.id === 'string' && typeof fact.key === 'string' && typeof fact.category === 'string' &&
+    typeof fact.label === 'string' && typeof fact.value === 'string' && typeof fact.normalizedValue === 'string' &&
+    typeof fact.source === 'string' && Array.isArray(fact.allowedUses) && fact.allowedUses.every(use => typeof use === 'string') &&
+    typeof fact.updatedAt === 'string' && (typeof fact.expiresAt === 'string' || fact.expiresAt === null)
+}
+
+export function PersonaDiscoveryFactRow({ fact, lang, busy, onChange }: {
+  fact: DiscoveryPersonaFact; lang: Lang; busy: boolean; onChange: (enabled: boolean) => void
+}) {
+  const enabled = isDiscoveryPersonaFactEnabled(fact.allowedUses)
+  return <label style={discoveryFactStyle}>
+    <input aria-label={`${personaDiscoveryMessage(lang, 'useFact')}: ${fact.label}`} type="checkbox" checked={enabled} disabled={busy} onChange={event => onChange(event.currentTarget.checked)} />
+    <span style={{ display: 'grid', gap: 2 }}><strong>{fact.label}</strong><small>{fact.value}</small><small>{personaDiscoveryMessage(lang, enabled ? 'enabled' : 'disabled')}</small></span>
+  </label>
+}
+
 export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDefault: boolean; onEditResume: (section: string) => void; onUseAsProfile: () => void }) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
+  const discoveryRequestFence = useMemo(() => createDiscoveryRequestFence(), [])
   const [profile, setProfile] = useState<PersonaProfile | null>(null)
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState<Partial<PersonaField> | null>(null)
@@ -19,6 +80,9 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
   const [pasteText, setPasteText] = useState('')
   const [extractingPaste, setExtractingPaste] = useState(false)
   const [extractedFields, setExtractedFields] = useState<PersonaField[]>([])
+  const [discoveryFacts, setDiscoveryFacts] = useState<DiscoveryPersonaFact[]>([])
+  const [discoveryLoading, setDiscoveryLoading] = useState(true)
+  const [discoveryBusy, setDiscoveryBusy] = useState<Record<string, boolean>>({})
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -27,8 +91,25 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     if (response.ok) setProfile(payload?.profile ?? null)
     else setError(payload?.error ?? t('persona.loadFailed'))
     setLoading(false)
-  }, [])
-  useEffect(() => { void load() }, [load])
+  }, [t])
+  const loadDiscovery = useCallback(async () => {
+    const request = discoveryRequestFence.begin()
+    setDiscoveryLoading(true)
+    try {
+      const response = await fetch('/api/me/persona/discovery')
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || !Array.isArray(payload?.facts)) throw new Error('load')
+      if (!discoveryRequestFence.isCurrent(request)) return
+      setDiscoveryFacts(payload.facts as DiscoveryPersonaFact[])
+    } catch {
+      if (!discoveryRequestFence.isCurrent(request)) return
+      setDiscoveryFacts([])
+      setError(personaDiscoveryMessage(lang, 'loadFailed'))
+    } finally {
+      if (discoveryRequestFence.isCurrent(request)) setDiscoveryLoading(false)
+    }
+  }, [discoveryRequestFence, lang])
+  useEffect(() => { void load(); void loadDiscovery() }, [load, loadDiscovery])
 
   const groups = useMemo(() => categories.map(category => ({ category, fields: (profile?.applicationAnswers ?? []).filter(field => field.category === category) })), [profile])
 
@@ -41,12 +122,12 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     const response = await fetch('/api/me/persona/fields', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields: [field] }) })
     const payload = await response.json().catch(() => null)
     if (!response.ok) { setError(payload?.error ?? t('persona.saveFailed')); return }
-    setDraft(null); setError(''); await load()
+    setDraft(null); setError(''); await Promise.all([load(), loadDiscovery()])
   }
 
   async function remove(key: string) {
     const response = await fetch('/api/me/persona/fields', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) })
-    if (response.ok) await load()
+    if (response.ok) await Promise.all([load(), loadDiscovery()])
     else setError(t('persona.deleteFailed'))
   }
 
@@ -94,7 +175,20 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     })
     const payload = await response.json().catch(() => null)
     if (!response.ok) { setError(payload?.error ?? t('persona.saveFailed')); return }
-    setExtractedFields([]); setPasteText(''); setPasteOpen(false); await load()
+    setExtractedFields([]); setPasteText(''); setPasteOpen(false); await Promise.all([load(), loadDiscovery()])
+  }
+
+  async function changeDiscoveryConsent(fact: DiscoveryPersonaFact, enabled: boolean) {
+    setDiscoveryBusy(current => ({ ...current, [fact.id]: true }))
+    const result = await requestDiscoveryConsentChange(fact, enabled, loadDiscovery)
+    if (result.kind === 'updated') {
+      discoveryRequestFence.invalidate()
+      setDiscoveryFacts(current => current.map(item => item.id === result.fact.id ? result.fact : item))
+      setError('')
+      await loadDiscovery()
+    } else if (result.kind === 'stale') setError(personaDiscoveryMessage(lang, 'stale'))
+    else setError(personaDiscoveryMessage(lang, 'saveFailed'))
+    setDiscoveryBusy(current => ({ ...current, [fact.id]: false }))
   }
 
   return <div style={{ padding: 14, overflowY: 'auto', height: '100%', boxSizing: 'border-box' }}>
@@ -104,6 +198,13 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     </div>
 
     <div style={privacyStyle}><ShieldCheck size={16} /><span><strong>{t('persona.controlled')}</strong> {t('persona.privacy')}</span></div>
+    <section data-persona-discovery-consent="true" style={discoveryBoxStyle}>
+      <PanelTitle title={personaDiscoveryMessage(lang, 'title')} />
+      <p style={discoveryDisclosureStyle}>{personaDiscoveryMessage(lang, 'disclosure')}</p>
+      {discoveryLoading ? <small>{personaDiscoveryMessage(lang, 'loading')}</small> : discoveryFacts.length === 0
+        ? <small>{personaDiscoveryMessage(lang, 'empty')}</small>
+        : discoveryFacts.map(fact => <PersonaDiscoveryFactRow key={fact.id} fact={fact} lang={lang} busy={Boolean(discoveryBusy[fact.id])} onChange={enabled => void changeDiscoveryConsent(fact, enabled)} />)}
+    </section>
     <button onClick={() => void buildKnowledgeIndex()} disabled={indexing} style={indexButton}>{indexing ? t('persona.indexing') : t('persona.buildIndex')}</button>
     <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4, margin: '-7px 0 12px' }}>{t('persona.indexDescription')}</div>
     <div style={pasteCardStyle}>
@@ -166,3 +267,6 @@ const pasteTextareaStyle = { width: '100%', boxSizing: 'border-box' as const, re
 const extractButton = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 5, border: 'none', borderRadius: 6, background: 'var(--primary)', color: '#fff', padding: '7px 9px', cursor: 'pointer', fontSize: 11, fontWeight: 700 }
 const previewStyle = { padding: 8, border: '1px solid rgba(16,185,129,.35)', borderRadius: 7, background: 'rgba(16,185,129,.05)', fontSize: 11 }
 const previewItemStyle = { display: 'grid', gap: 2, padding: '5px 0', borderTop: '1px solid rgba(0,0,0,.08)' }
+const discoveryBoxStyle = { padding: 9, margin: '10px 0 12px', border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }
+const discoveryDisclosureStyle = { margin: '4px 0 8px', color: 'var(--text-muted)', fontSize: 10, lineHeight: 1.5 }
+const discoveryFactStyle = { display: 'flex', alignItems: 'start', gap: 8, padding: '7px 0', borderTop: '1px solid var(--border)', fontSize: 11 }

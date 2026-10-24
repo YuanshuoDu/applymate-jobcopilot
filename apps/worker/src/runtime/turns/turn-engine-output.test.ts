@@ -5,6 +5,10 @@ import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-
 import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
 
 describe("TurnEngine output boundary", () => {
+  it("recognizes the discovery memory overflow terminal code", () => {
+    expect(new TurnEngineError("discovery_memory_overflow", "safe recovery").code).toBe("discovery_memory_overflow")
+  })
+
   it("sorts object keys recursively and omits undefined object fields", () => {
     expect(toRepositoryJson({ z: 1, a: undefined, nested: { b: true, a: "first" } })).toEqual({ nested: { a: "first", b: true }, z: 1 })
   })

@@ -99,6 +99,14 @@ describe("V2 transcript projector", () => {
     })).toThrow("private_native_verification_event_not_projectable")
   })
 
+  it.each([
+    ["agent.plan.discovery_persona_snapshot", { projection: { facts: [{ value: "PRIVATE_DISCOVERY_FACT_VALUE" }] } }],
+    ["agent.plan.discovery_persona_overflow", { rawValue: "PRIVATE_OVERFLOW_VALUE", observedFactCount: 33 }],
+  ])("rejects transcript projection of private automatic-memory event %s", (type, payload) => {
+    expect(() => projectV2EventToTranscript({ ...baseEvent, type, itemId: null, payload }))
+      .toThrow("private_native_verification_event_not_projectable")
+  })
+
   it.each(goldenCases)("keeps $flow golden transcript semantics stable", ({ flow, legacy }) => {
     const projected = projectV2EventToTranscript({
       ...baseEvent,
@@ -139,7 +147,7 @@ describe("V2 transcript projector", () => {
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
   })
 
-  it("omits private verification, planning, and reconciliation receipts during transcript rebuild", async () => {
+  it("omits private verification, planning, reconciliation, and automatic-memory events during transcript rebuild", async () => {
     const privateEvent = {
       ...baseEvent, id: "private-event", itemId: null, taskId: "private-control-task",
       type: "native_verification.scheduled_candidate_staged",
@@ -184,6 +192,16 @@ describe("V2 transcript projector", () => {
         verificationDigest: "private-denial-digest-sentinel",
       },
     }
+    const discoverySnapshotEvent = {
+      ...baseEvent, id: "private-discovery-snapshot-event", itemId: null,
+      type: "agent.plan.discovery_persona_snapshot",
+      payload: { projection: { facts: [{ value: "PRIVATE_DISCOVERY_FACT_VALUE" }] } },
+    }
+    const discoveryOverflowEvent = {
+      ...baseEvent, id: "private-discovery-overflow-event", itemId: null,
+      type: "agent.plan.discovery_persona_overflow",
+      payload: { observedFactCount: 33, rawValue: "PRIVATE_OVERFLOW_VALUE" },
+    }
     const finalRejectionEvent = {
       ...baseEvent,
       id: "public-final-rejection-event",
@@ -201,7 +219,8 @@ describe("V2 transcript projector", () => {
     const tx = {
       $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1" }]),
       agentEvent: { findMany: vi.fn().mockResolvedValue([
-        privateEvent, clarificationEvent, reconciliationEvent, denialCheckpointEvent, finalRejectionEvent, ordinaryEvent,
+        privateEvent, clarificationEvent, reconciliationEvent, denialCheckpointEvent,
+        discoverySnapshotEvent, discoveryOverflowEvent, finalRejectionEvent, ordinaryEvent,
       ]) },
       agentTranscriptEvent: {
         findMany: vi.fn().mockResolvedValue([]),
@@ -225,6 +244,10 @@ describe("V2 transcript projector", () => {
     expect(serializedTranscriptRows).not.toContain("private-denial-task")
     expect(serializedTranscriptRows).not.toContain("private-denial-step")
     expect(serializedTranscriptRows).not.toContain("private-denial-digest-sentinel")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.discovery_persona_snapshot")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.discovery_persona_overflow")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_OVERFLOW_VALUE")
     expect(serializedTranscriptRows).not.toContain("task-graph-denial-checkpoint.v1")
     expect(serializedTranscriptRows).not.toContain("private-event")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_SCHEDULED_FINAL_CANDIDATE")
