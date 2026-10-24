@@ -25,8 +25,8 @@ export async function scheduleTaskGraphBranchRepair(client: Client, input: TaskG
   operation: SteeringReconciliationOperation, checkBudget: () => Promise<void>): Promise<TaskGraphScheduleReceipt> {
   const opKey = steeringReconciliationIdempotencyKey(operation.scope, operation.callId)
   if (!opKey) return invalid()
-  const existing = await readReceipt(client, operation.scope.sessionId, operation.scope.userId, opKey)
-  if (existing) return replay(client, input, operation, opKey, existing)
+  const existingReplay = await replayTaskGraphBranchRepairIfPresent(client, input, operation)
+  if (existingReplay) return existingReplay
 
   const branch = sameBranch(input.replaceBranch, operation.replaceBranch)
   if (!branch || !sameScope(input.scope, operation.scope) || operation.decision !== "revise"
@@ -126,6 +126,15 @@ export async function scheduleTaskGraphBranchRepair(client: Client, input: TaskG
   return receipt
 }
 
+/** Replay a persisted v3 branch receipt without loading or validating the current graph. */
+export async function replayTaskGraphBranchRepairIfPresent(client: Client, input: TaskGraphScheduleInput,
+  operation: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt | null> {
+  const key = steeringReconciliationIdempotencyKey(operation.scope, operation.callId)
+  if (!key) return invalid()
+  const row = await readReceipt(client, operation.scope.sessionId, operation.scope.userId, key)
+  return row ? replay(client, input, operation, key, row) : null
+}
+
 async function replay(client: Client, input: TaskGraphScheduleInput, operation: SteeringReconciliationOperation, key: string, row: Row): Promise<TaskGraphScheduleReceipt> {
   const seq = steeringReconciliationSequence(row.sequence), receipt = parseSteeringReconciliationReceipt(row.payload, operation.scope)
   const relation = receipt?.branchRepair
@@ -204,7 +213,7 @@ async function lockedSources(client: Client, input: TaskGraphScheduleInput, sour
 function waitEvidenceSql(): string { return `SELECT 1 FROM "agent_wait_conditions" wait WHERE wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"
   AND (wait."parentTaskId" = task."id" OR wait."targetTaskIds" @> jsonb_build_array(task."id") OR wait."matchedTaskIds" @> jsonb_build_array(task."id"))` }
 
-function assertReplacementSnapshot(before: TaskGraphSnapshot, after: TaskGraphSnapshot, sources: readonly StoredTaskGraphNode[], mapping: ReadonlyMap<string, string>): void {
+export function assertReplacementSnapshot(before: TaskGraphSnapshot, after: TaskGraphSnapshot, sources: readonly StoredTaskGraphNode[], mapping: ReadonlyMap<string, string>): void {
   const oldKeys = new Set(sources.map(node => node.key)), oldIds = new Set(before.nodes.map(node => node.taskId))
   const retained = before.nodes.filter(node => !oldKeys.has(node.key)), inserted = after.nodes.filter(node => !before.nodes.some(old => old.key === node.key))
   if (after.nodes.length !== retained.length + sources.length || inserted.length !== sources.length

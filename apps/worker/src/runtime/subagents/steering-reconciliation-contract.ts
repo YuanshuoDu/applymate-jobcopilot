@@ -5,12 +5,15 @@ import { normalizeRootPlanCriteria } from "./root-plan-criteria.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { parseTaskGraphSupersessionRelation, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import { parseTaskGraphBranchRepairRelation, TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, type TaskGraphBranchRepairRelation } from "./task-graph-pg-branch-repair-relation.js"
+import { parseTaskGraphFailedBranchRepairRelation, TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+  type TaskGraphFailedBranchRepairRelation } from "./task-graph-pg-failed-branch-relation.js"
 import { parseTaskGraphBranchReplacement, type TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 
 export const STEERING_RECONCILIATION_EVENT_TYPE = "agent.plan.reconciliation" as const
 export const STEERING_RECONCILIATION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v1" as const
 export const STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v2" as const
 export const STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v3" as const
+export const STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v4" as const
 export const STEERING_RECONCILIATION_BLOCKER = "steering_reconciliation_pending" as const
 export const STEERING_RECONCILIATION_FEEDBACK = "Accepted user steering must be reconciled against the current TaskGraph before completion. Review current input and plan, then use agent.reconcile to keep the current revision or agent.plan to revise it." as const
 export const STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS = 128
@@ -19,7 +22,8 @@ const MAX_SEQUENCE = 9_223_372_036_854_775_807n
 type Row = Record<string, unknown>
 
 export type SteeringReconciliationReceipt = Readonly<{
-  schemaVersion: typeof STEERING_RECONCILIATION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
+  schemaVersion: typeof STEERING_RECONCILIATION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
+    | typeof STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION
   sessionId: string
   turnId: string
   rootTaskId: string
@@ -31,6 +35,7 @@ export type SteeringReconciliationReceipt = Readonly<{
   inputCheckpoint: Readonly<{ throughSequence: string }>
   supersession?: TaskGraphSupersessionRelation
   branchRepair?: TaskGraphBranchRepairRelation
+  failedBranch?: TaskGraphFailedBranchRepairRelation
 }>
 export type SteeringReconciliationScope = TaskGraphReadScope & Readonly<{ stepId?: string; rootInputId?: string | null }>
 export type SteeringReconciliationOperation = Readonly<{
@@ -163,6 +168,8 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
       ? parseTaskGraphSupersessionRelation(row.supersession) : null
     const branchRepair = row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
       ? parseTaskGraphBranchRepairRelation(row.branchRepair) : null
+    const failedBranch = row.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION
+      ? parseTaskGraphFailedBranchRepairRelation(row.failedBranch) : null
     if (row.schemaVersion === STEERING_RECONCILIATION_SCHEMA_VERSION) {
       if (!exact(row, baseKeys) || row.resultingRevision !== (row.decision === "keep" ? row.observedRevision : row.observedRevision + 1)) return null
     } else if (row.schemaVersion === STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION) {
@@ -173,10 +180,15 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
       if (!exact(row, [...baseKeys, "branchRepair"]) || row.decision !== "revise" || !branchRepair
         || branchRepair.observedRevision !== row.observedRevision || branchRepair.resultingRevision !== row.resultingRevision
         || branchRepair.agentPlanCall.stepId !== row.stepId) return null
+    } else if (row.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION) {
+      if (!exact(row, [...baseKeys, "failedBranch"]) || row.decision !== "revise" || !failedBranch
+        || failedBranch.graphRootTaskId !== row.rootTaskId || failedBranch.observedRevision !== row.observedRevision
+        || failedBranch.resultingRevision !== row.resultingRevision || failedBranch.agentPlanCall.stepId !== row.stepId) return null
     } else return null
     const inputIds = row.steerInputIds as unknown[]
-    const isBranchRepairReceipt = row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
-    if ((inputIds.length === 0 && !isBranchRepairReceipt)
+    const allowsEmptyCheckpoint = row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION && branchRepair !== null
+      || row.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION && failedBranch !== null
+    if ((inputIds.length === 0 && !allowsEmptyCheckpoint)
       || inputIds.length > STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS || !inputIds.every(steeringReconciliationId)
       || new Set(inputIds).size !== inputIds.length || inputIds.some((id, index) => index > 0 && String(inputIds[index - 1]) >= id)) return null
     const checkpoint = record(row.inputCheckpoint)
@@ -184,8 +196,10 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
     if (expected && (row.sessionId !== expected.sessionId || row.turnId !== expected.turnId || row.rootTaskId !== expected.rootTaskId
       || expected.stepId !== undefined && row.stepId !== expected.stepId
       || supersession && supersession.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, supersession.agentPlanCall.callId)
-      || branchRepair && branchRepair.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, branchRepair.agentPlanCall.callId))) return null
-    const receipt = (supersession ? { ...row, supersession } : branchRepair ? { ...row, branchRepair } : row) as unknown as SteeringReconciliationReceipt
+      || branchRepair && branchRepair.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, branchRepair.agentPlanCall.callId)
+      || failedBranch && failedBranch.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, failedBranch.agentPlanCall.callId))) return null
+    const receipt = (supersession ? { ...row, supersession } : branchRepair ? { ...row, branchRepair }
+      : failedBranch ? { ...row, failedBranch } : row) as unknown as SteeringReconciliationReceipt
     return Buffer.byteLength(JSON.stringify(receipt), "utf8") <= MAX_BYTES ? receipt : null
   } catch { return null }
 }

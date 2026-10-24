@@ -190,6 +190,12 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("Omitting it preserves normal top-N selection")
     expect(tool.description).toContain("append exactly one cover_letter_writer directly after that Reviewer")
     expect(tool.description).toContain("the Worker does not schedule it automatically")
+    expect(tool.description).toContain("The same complete branch request may retire a terminal failed typed Scout")
+    expect(tool.description).toContain("automatically cancelled by that failed prerequisite and never executed")
+    expect(tool.description).toContain("Every ancestor outside the replaced closure must be an ordinary typed node completed and verified before the Scout failure; repairOf ancestors are unsupported")
+    expect(tool.description).toContain("Do not use this for intentional/user cancellation, Root-failure cleanup, ordinary criterion repair, or ambiguous provenance")
+    expect(tool.description).toContain("the server derives eligibility from persisted task/event history, not a model-supplied failure label")
+    expect(tool.description).toContain("after new information, it does not require another human message")
   })
 
   it("advertises Writer revision guidance only when both selected-job templates are registered", () => {
@@ -581,7 +587,7 @@ describe("agent.plan tool executor", () => {
     expect(description).toContain("preserve topology, registered roles, exact typed verification IDs/checks")
     expect(description).toContain("remap only structured dependency selectors")
     expect(description).toContain("replaceBranch and replaceUnstarted are mutually exclusive")
-    expect(description).toContain("queued or dependency-waiting sources with attemptCount=0")
+    expect(description).toContain("every source must be queued or dependency-waiting with attemptCount=0")
     expect(description).toContain("no lease, execution, wait condition, result, artifact, evidence, or reservation")
     expect(description).toContain("a fresh model Step with the current graph and agenda revision")
     expect(description).toContain("it does not require another human message")

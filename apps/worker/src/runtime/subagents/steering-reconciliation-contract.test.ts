@@ -3,7 +3,8 @@ import { executionKey } from "../turns/turn-execution-types.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphBranchRepairFingerprint } from "./task-graph-pg-branch-repair-relation.js"
-import { taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphFailedBranchRepairFingerprint } from "./task-graph-pg-failed-branch-relation.js"
+import { taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import {
   parseSteeringReconciliationReceipt,
   steeringReconciliationIdempotencyKey,
@@ -14,6 +15,7 @@ import {
   STEERING_RECONCILIATION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BLOCKER,
   STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationReceipt,
@@ -80,6 +82,34 @@ function v3Receipt(patch: Record<string, unknown> = {}) {
     schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, branchRepair: branchRepair(), ...patch,
   }
 }
+function failedBranchRepair() {
+  const branchRoot = { nodeKey: "failed-scout", taskId: "failed-scout-task" }
+  const replaceBranch = { root: branchRoot, sources: [
+    { ...branchRoot, replacementKey: "fresh-scout" },
+    { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task", replacementKey: "fresh-analyst" },
+  ] }
+  const callId = "call-failed-branch"
+  const call = { expectedRevision: 4, replaceBranch, nodes: [{ key: "fresh-scout" }, { key: "fresh-analyst" }] }
+  return {
+    schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+    operationKey: steeringReconciliationIdempotencyKey(scope, callId), graphRootTaskId: scope.rootTaskId,
+    observedRevision: 4, resultingRevision: 5, branchRoot,
+    sources: replaceBranch.sources.map(({ nodeKey, taskId, replacementKey }) => ({ source: { nodeKey, taskId }, replacementKey })),
+    failedSource: { source: branchRoot, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64),
+      event: { id: "failed-event", sequence: "41", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, branchRoot.nodeKey, 1, "task.failed") } },
+    cancellations: [{ source: { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task" },
+      event: { id: "cancelled-event", sequence: "42", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
+    verifiedExternalDependencies: [],
+    planEvent: { id: "failed-branch-plan", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) },
+    requestFingerprint: taskGraphFailedBranchRepairFingerprint(call),
+    agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceBranch },
+  }
+}
+function v4Receipt(patch: Record<string, unknown> = {}) {
+  return { ...receipt({ decision: "revise", observedRevision: 4, resultingRevision: 5, steerInputIds: [],
+    inputCheckpoint: { throughSequence: "47" } }), schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
+    failedBranch: failedBranchRepair(), ...patch }
+}
 
 describe("steering reconciliation receipt contract", () => {
   it("defines fixed redacted recovery vocabulary in the pure contract", () => {
@@ -133,6 +163,15 @@ describe("steering reconciliation receipt contract", () => {
     ["unknown v3 field", { ...v3Receipt(), debug: true }],
   ] as const)("rejects malformed v3 %s claims", (_name, value) => {
     expect(parseSteeringReconciliationReceipt(value, scope)).toBeNull()
+  })
+
+  it("parses only a separately validated v4 failed-branch relation and retains v3 strictness", () => {
+    const value = v4Receipt()
+    expect(parseSteeringReconciliationReceipt(value, scope)).toEqual(value)
+    expect(parseSteeringReconciliationReceipt(v4Receipt({ resultingRevision: 8 }), scope)).toBeNull()
+    expect(parseSteeringReconciliationReceipt(v4Receipt({ failedBranch: { ...failedBranchRepair(), graphRootTaskId: "foreign-root" } }), scope)).toBeNull()
+    expect(parseSteeringReconciliationReceipt({ ...v3Receipt(), failedBranch: failedBranchRepair() }, scope)).toBeNull()
+    expect(parseSteeringReconciliationReceipt({ ...value, debug: true }, scope)).toBeNull()
   })
 
   it.each([
