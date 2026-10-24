@@ -140,7 +140,8 @@ function sameVerifiedPrefix(graph: Awaited<ReturnType<typeof loadTaskGraph>>, pr
     if (node.templateId !== certified.role || node.taskId !== certified.taskId || node.depth !== index + 1
       || (index === 0 ? node.dependsOn.length !== 0 : node.dependsOn.length !== 1 || node.dependsOn[0] !== nodes[index - 1]?.key)
       || node.verificationDisposition !== (index === 2 ? "specialized" : "typed")
-      || !state || state.taskId !== node.taskId || state.status !== "completed" || state.failureReason !== null
+      || !state || state.taskId !== node.taskId || state.status !== "completed"
+      || state.failureReason !== null && state.failureReason !== undefined
       || !task || task.id !== certified.taskId || task.status !== "completed" || task.failureReason !== null
       || task.role !== certified.role || task.taskType !== certified.taskType || task.attemptCount !== certified.attemptCount) return false
   }

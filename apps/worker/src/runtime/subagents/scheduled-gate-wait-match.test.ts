@@ -9,7 +9,8 @@ import { buildScheduledPrepareTaskGraphProof, SCHEDULED_PREPARE_COMPLETION_SCHEM
 import { buildScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
-import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { taskGraphLifecycleKey, taskGraphState, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import type { SubagentTaskStatus } from "./types.js"
 import { scheduledGateRegistrationReceiptKey, SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA } from "./scheduled-gate-registration-receipt.js"
 import { matchScheduledGateWaitTarget, readScheduledGateQuestionCandidate, scheduledGateWaitMatcherFromResult,
   scheduledGateWaitReplayMatches } from "./scheduled-gate-wait-match.js"
@@ -81,7 +82,7 @@ const start = (attempt: number, expectedRevision: number) => lifecycle("task.sta
 const expectedSchema = (role: "scout" | "analyst" | "prepare") => TASK_GRAPH_TEMPLATES[role].expectedOutputSchema
 const allowedActions = (role: "scout" | "analyst" | "prepare") => TASK_GRAPH_TEMPLATES[role].allowedActions
 
-function graph(taskStatus: string, currentAttempt: number, wrongStart = false, requestAttemptCount = 0) {
+function graph(taskStatus: string, currentAttempt: number, wrongStart = false, requestAttemptCount = 0, prefixFailureNode?: string) {
   const nodes = [
     { key: "scout", templateId: "scout", goal: "discover", successCriteria: [], dependsOn: [], depth: 1, taskId: "scout-1", verificationDisposition: "typed", verification: { role: "scout" } },
     { key: "analyst", templateId: "analyst", goal: "analyze", successCriteria: [], dependsOn: ["scout"], depth: 2, taskId: "analyst-1", verificationDisposition: "typed", verification: { role: "analyst" } },
@@ -119,9 +120,16 @@ function graph(taskStatus: string, currentAttempt: number, wrongStart = false, r
     } else events.push(lifecycle("task.retrying", currentAttempt, revision++))
   }
   if (wrongStart) events[0] = { ...events[0]!, idempotencyKey: "misbound-start" }
-  const current = nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.key === "gate" ? taskStatus : "completed", failureReason: null }))
+  const statuses = new Map<string, { status: SubagentTaskStatus; failureReason: string | null }>()
+  for (const node of nodes) {
+    const failureReason = node.key === prefixFailureNode ? "persisted completion failure" : null
+    statuses.set(node.taskId, { status: (node.key === "gate" ? taskStatus : "completed") as SubagentTaskStatus, failureReason })
+    if (failureReason) tasks.get(node.taskId)!.failureReason = failureReason
+  }
+  const projection = taskGraphState({ schemaVersion: "agent-harness.v2.task-graph", nodes } as unknown as TaskGraphSnapshot,
+    revision, statuses, events as unknown as Parameters<typeof taskGraphState>[3])
   return { item: { id: "task-graph-root", revision, content: {} }, snapshot: { nodes },
-    state: { revision, appliedEvents: events, nodes: current }, tasks }
+    state: projection, tasks }
 }
 
 function acknowledgementRow(overrides: Record<string, unknown> = {}) {
@@ -134,9 +142,9 @@ function acknowledgementRow(overrides: Record<string, unknown> = {}) {
 
 function fixture(options: { status?: string; attempts?: number; result?: unknown; turnStatus?: string; malformedTask?: Record<string, unknown>;
   noAck?: boolean; malformedAck?: boolean; wrongStart?: boolean; malformedPrepareWait?: boolean; malformedRegistration?: boolean;
-  wrongAppendRevision?: boolean; requestAttemptCount?: number } = {}) {
+  wrongAppendRevision?: boolean; requestAttemptCount?: number; prefixFailureNode?: string } = {}) {
   const status = options.status ?? "queued", attempts = options.attempts ?? 0
-  state.graph = graph(status, attempts, options.wrongStart, options.requestAttemptCount)
+  state.graph = graph(status, attempts, options.wrongStart, options.requestAttemptCount, options.prefixFailureNode)
   const currentRow = { id: scope.gateTaskId, parentTaskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, sessionId: scope.sessionId,
     turnId: scope.turnId, depth: 1, role: "prepare", taskType: "scheduled_taskgraph_gate", status, attemptCount: attempts, maxAttempts: 3,
     result: options.result ?? null, expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA, allowedActions: [], rootAttemptCount: 1, rootStatus: "running",
@@ -186,6 +194,18 @@ describe("scheduled Gate durable wait matcher", () => {
     await expect(matchScheduledGateWaitTarget(fixture({ status: "waiting_for_user", attempts: 1, result: {
       ...waitingEnvelope, structuredResult: { ...question, jobIds: ["job-2"], candidateSetDigest: scheduledGateCandidateSetDigest("weak_cover_letter", ["job-2"]) },
     } }) as never, scope)).resolves.toBeNull()
+  })
+
+  it("accepts reducer-omitted empty failure reasons but rejects a real prefix failure", async () => {
+    const healthy = fixture({ status: "running", attempts: 1 }) as never
+    const healthyNodes = (state.graph as { state: { nodes: Record<string, unknown>[] } }).state.nodes.slice(0, 3)
+    expect(healthyNodes.every(node => !Object.hasOwn(node, "failureReason"))).toBe(true)
+    await expect(matchScheduledGateWaitTarget(healthy, scope)).resolves.toBe("pending")
+
+    const failed = fixture({ status: "running", attempts: 1, prefixFailureNode: "analyst" }) as never
+    const analyst = (state.graph as { state: { nodes: Record<string, unknown>[] } }).state.nodes[1]
+    expect(analyst?.failureReason).toBe("persisted completion failure")
+    await expect(matchScheduledGateWaitTarget(failed, scope)).resolves.toBeNull()
   })
 
   it("loads the exact Prepare wait with the Analyze handoff key while binding Gate to the stable receipt key", async () => {
