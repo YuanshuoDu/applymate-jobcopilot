@@ -93,6 +93,13 @@ describe("scheduled Gate public contract", () => {
     expect(parseScheduledGateTaskEnvelope(waitingEnvelope, "waiting_for_user", jobIds)).toEqual(waitingEnvelope)
   })
 
+  it("returns the exact skip choice ID and rejects extra choice fields", () => {
+    expect(parseScheduledGateChoice({ kind: "weak_cover_letter", jobIds: ["job-a"], choiceId: "skip" }, question))
+      .toBe("skip")
+    expect(parseScheduledGateChoice({ kind: "weak_cover_letter", jobIds: ["job-a"], choiceId: "skip", source: "user" }, question))
+      .toBeNull()
+  })
+
   it("accepts only an exact partition for Execute without granting approval", () => {
     expect(parseScheduledGateResult({
       status: "completed", nextStage: "execute", approvedJobIds: [],

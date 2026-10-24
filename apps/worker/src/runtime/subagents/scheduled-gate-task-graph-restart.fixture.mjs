@@ -175,10 +175,7 @@ function plannedQuestion(plan, attempt, expectedJobIds) {
 }
 
 function matchesPlannedSkip(value, question) {
-  const parsed = parseScheduledGateChoice(value, question)
-  return !!parsed && parsed.choiceId === "skip" && parsed.kind === question.kind
-    && parsed.jobIds.length === question.jobIds.length
-    && parsed.jobIds.every((jobId, index) => jobId === question.jobIds[index])
+  return parseScheduledGateChoice(value, question) === "skip"
 }
 
 function validChoice(value, expectedJobIds) {
