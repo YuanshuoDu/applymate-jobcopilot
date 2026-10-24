@@ -78,6 +78,34 @@ describe('AgentSupervisorPanel selected evidence', () => {
     expect(renderToStaticMarkup(<AgentSupervisorPanel sessionId={null} timeline={timeline} />)).toBe('')
   })
 
+  it('passes the scoped current Turn projection to question lookup without adding it to the tree', () => {
+    const pageTurns = Array.from({ length: 100 }, (_, index) => ({
+      id: `turn-${index}`, sessionId: 'session-1', source: 'user', goal: `Goal ${index}`, status: 'completed', revision: 1,
+      activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null,
+    }))
+    supervisorApi.responses.set('/api/agent/sessions/session-1/turns?limit=100', {
+      data: { turns: pageTurns, projection: { activeTurnId: 'turn-current', activeTurn: { id: 'turn-current', status: 'waiting_for_user', revision: 14, goal: 'PROJECTION_PRIVATE_GOAL' } } },
+      loading: false, error: null, refetch: () => undefined,
+    })
+    const question = item({ id: 'question-current', turnId: 'turn-current', type: 'question', status: 'started', content: {
+      waitKind: 'question', questionId: 'question-current', stage: 'profile', question: 'Choose an option?',
+      options: [{ value: 'yes', label: 'Yes' }], pending: true, answerAvailable: false,
+    } })
+    const timeline = {
+      sessionId: 'session-1', items: [question], lastEventId: null, lifecycleRevision: 0, cognitiveAgenda: null, cognitiveAgendas: [],
+      approvalLedger: { sessionId: 'session-1', approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 },
+      connection: 'connected', restoring: false, error: null,
+    } satisfies AgentTimelineSnapshot
+
+    const html = renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={timeline} />)
+    const optionButton = html.match(/<button[^>]*>Yes<\/button>/)?.[0]
+    expect(supervisorApi.calls).toContain('/api/agent/sessions/session-1/turns?limit=100')
+    expect(optionButton).toBeDefined()
+    expect(optionButton).not.toContain('disabled=""')
+    expect(html).not.toContain(t('agent.question.turnUnavailable'))
+    expect(html).not.toContain('PROJECTION_PRIVATE_GOAL')
+  })
+
   it('keeps the current preparation query and restored draft bound to the preparation Turn', () => {
     const now = '2026-10-01T12:00:00.000Z'
     const graph = item({ id: 'graph-current', turnId: 'turn-current', taskId: 'root-current', type: 'task_graph', revision: 2,
