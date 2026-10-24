@@ -1,7 +1,8 @@
 /** Stage 2 — Analyst scores jobs and persists results. */
-import type { Job }     from '@prisma/client'
+import type { Job, Prisma } from '@prisma/client'
 import { db }           from '@/lib/db'
-import { modelChat, stripFences } from '@/lib/model-router'
+import { stripFences } from '@/lib/model-router'
+import { completeAnalyzeModelCall } from './analyze-model-call'
 import type {
   PipelineCtx, ScoredJob, AnalyzeOutput, StageResult, AcceptResult,
 } from '../types'
@@ -9,10 +10,8 @@ import { stageOk, stageFail } from '../types'
 import { roleAiConfig } from '../role-config'
 import { forEachConcurrent } from '../concurrency'
 import { assessApplicationPreflight } from '../application-preflight'
-import { claimAnalyzeTask, transitionAnalyzeTask } from './analyze-ownership'
+import { assertAnalyzeSignalActive, claimAnalyzeTask, transitionAnalyzeTask } from './analyze-ownership'
 import { AgentExecutionCancelledError } from '../execution-control'
-import { assertAnalyzeSignalActive } from './analyze-ownership'
-import type { Prisma } from '@prisma/client'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
 
@@ -159,11 +158,12 @@ export async function runAnalyze(
         const messages = systemPrompt
           ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
           : [{ role: 'user' as const, content: prompt }]
-        // Reasoning models need enough completion budget to return the JSON.
-        const result = await modelChat(messages, scoringConfig, 1600)
+        const result = await completeAnalyzeModelCall({
+          scoringConfig, messages, userId, sessionId: ctx.sessionId, turnId: ctx.turnId,
+          executionAttempt: ctx.executionAttempt, jobId: job.id, analysisFenceAt, signal: ctx.signal,
+        })
         throwIfFatal()
-        const parsed = parseScoreResult(result.text)
-
+        const parsed = parseScoreResult(result)
         const color = SCORE_COLOR(parsed.score)
         const scored = { job, ...parsed, analysisFenceAt: analysisFenceAt.toISOString() }
         // This conditional UPDATE locks the task through both writes; NULL is
