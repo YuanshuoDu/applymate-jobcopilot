@@ -13,6 +13,7 @@ import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA } from "./task-graph-terminal-assessment.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 
 type GateOptions = Pick<TurnExecutionOptions, "identity" | "scope" | "completionGate">
 type GateWriter = Pick<TurnExecutionEventWriter, "append">
@@ -41,6 +42,22 @@ function gateWriter(): GateWriter {
 }
 
 describe("assertCompletionAllowed", () => {
+  it("passes the private scheduled Gate question to the existing final-candidate wait seam", async () => {
+    const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA,
+      owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 1,
+        executionId: "execution-1", executionAttemptCount: 0 }, continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
+      snapshotDigest: `sha256:${"b".repeat(64)}`, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
+      analyzeGraphRevision: 3, graphRevision: 5, gateTaskId: "gate-1", gateAttempt: 1, kind: "weak_cover_letter" as const,
+      jobIds: ["job-1"], allowedChoiceIds: ["continue", "review", "skip"] as const }
+    const waitId = turnScheduledGateChoiceWaitId(binding)!
+    const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "waiting_for_scheduled_gate_choice",
+      waitId, candidateText: input.candidateText, question: "A prepared application has a weak cover letter. How should I handle it?", binding })
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "exact answer"))
+      .resolves.toEqual({ scheduledGateChoice: { status: "waiting_for_scheduled_gate_choice", waitId, candidateText: "exact answer",
+        question: "A prepared application has a weak cover letter. How should I handle it?", binding } })
+  })
+
   it("runs scheduled continuation only after the ordinary completion gate allows the exact candidate", async () => {
     const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
     const continuation = vi.fn(async input => ({ status: "waiting_for_user" as const, waitId: "wait-123", candidateText: input.candidateText }))

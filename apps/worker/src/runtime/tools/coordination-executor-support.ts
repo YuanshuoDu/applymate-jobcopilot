@@ -159,8 +159,8 @@ function durableWaitErrorCode(error: unknown): DurableWaitErrorCode | null {
   } catch { return null }
 }
 export function toolSafeDurableWaitPort(port: DurableWaitPort): DurableWaitPort {
+  const cancel = port.cancel
   return {
-    ...port,
     async wait(input) {
       try { return await port.wait(input) }
       catch (error: unknown) {
@@ -169,6 +169,7 @@ export function toolSafeDurableWaitPort(port: DurableWaitPort): DurableWaitPort 
         throw new Error("Durable wait operation failed")
       }
     },
+    ...(cancel ? { cancel: async input => { await cancel(input) } } : {}),
   }
 }
 export async function activity(context: ToolExecutionContext, options: CoordinationExecutorOptions, operation: string, taskId: string | null, data: Record<string, unknown>, operationKey?: string): Promise<void> {

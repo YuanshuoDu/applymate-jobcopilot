@@ -236,7 +236,7 @@ describe("runAgentPipeline", () => {
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 
-  it("continues an approval-free Prepare proof through Gate without a scheduled choice ID", async () => {
+  it("persists a Gate checkpoint and returns without running Gate or Execute", async () => {
     const { runAgentPipeline } = await import("./run-service");
     const snapshot = { ...scheduledSnapshot, requireApproval: false };
     const attestation = { ...scheduledAttestation, snapshotDigest: scheduledAutomationSnapshotDigest(snapshot) };
@@ -247,11 +247,13 @@ describe("runAgentPipeline", () => {
     const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner: scheduledOwner, snapshot, attestation,
       ownedJobs: [], analyzeResult: emptyAnalysis, existingCheckpoint: initialState }).checkpoint;
     const proof = { receipt: {}, completion: {}, result: {} };
-    await expect(runAgentPipeline(scheduledRunInput(checkpoint, snapshot, attestation, proof))).resolves.toMatchObject({ processed: 1 });
+    await expect(runAgentPipeline(scheduledRunInput(checkpoint, snapshot, attestation, proof))).resolves.toEqual({ status: "gate_checkpointed" });
     const gateInput = mocks.buildScheduledTaskGraphGateResumeState.mock.calls[0]?.[0];
     expect(gateInput).toMatchObject({ owner: scheduledOwner, snapshot, attestation, continuationKey, prepareProof: proof });
     expect(gateInput).not.toHaveProperty("scheduledWaitId");
-    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({ resumeState: { nextStage: "gate" } }));
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+    expect(mocks.finishScheduledExecution).not.toHaveBeenCalled();
+    expect(mocks.finalize).not.toHaveBeenCalled();
   });
 
   it("rejects a TaskGraph revision change between package loading and the Gate checkpoint CAS", async () => {

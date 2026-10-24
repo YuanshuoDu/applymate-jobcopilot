@@ -11,6 +11,8 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { createScheduledAutomationPrepareContinuation, projectScheduledAnalyzePrefix } from "./scheduled-automation-prepare-bridge.js"
 import type { TaskGraphCurrentState } from "./task-graph-command-port.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_OUTPUT_SCHEMA,
+  SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "worker-1", turnLeaseVersion: 5 }
@@ -81,26 +83,57 @@ function analyzeGraph(withPrepare: boolean) {
   if (withPrepare) nodes.push({ key: "prepare", taskId: "prepare-task", templateId: "prepare", goal: "Prepare application materials using the persisted scheduled Analyze checkpoint.",
     successCriteria: ["Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.", "Persist immutable owner-fenced material references and return no resume or letter bodies."],
     dependsOn: ["analyst"], depth: 3, verificationDisposition: "specialized" } as never)
-  const currentNodes = nodes.map(node => ({ ...node, status: node.templateId === "prepare" ? "queued" : "completed", readiness: "ready",
+  const prepared = prepareFacts()
+  const currentNodes = nodes.map(node => ({ ...node, status: node.templateId === "prepare" ? "completed" : "completed", readiness: "ready",
     resultSummary: null, failureReason: null }))
   const tasks = nodes.map(node => node.templateId === "prepare"
-    ? { id: node.taskId, role: "prepare", taskType: TASK_GRAPH_TEMPLATES.prepare.taskType, status: "queued", attemptCount: 0, failureReason: null,
-      expectedOutputSchema: TASK_GRAPH_TEMPLATES.prepare.expectedOutputSchema, allowedActions: TASK_GRAPH_TEMPLATES.prepare.allowedActions }
+    ? { id: node.taskId, role: "prepare", taskType: TASK_GRAPH_TEMPLATES.prepare.taskType, status: "completed", attemptCount: 1, failureReason: null,
+      expectedOutputSchema: TASK_GRAPH_TEMPLATES.prepare.expectedOutputSchema, allowedActions: TASK_GRAPH_TEMPLATES.prepare.allowedActions,
+      rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+      result: { status: "completed", structuredResult: prepared.result, taskGraphScheduledPrepareProofFacts: prepared } }
     : { id: node.taskId, role: node.templateId, taskType: TASK_GRAPH_TEMPLATES[node.templateId as "scout" | "analyst"].taskType, status: "completed", attemptCount: 1,
-      failureReason: null, expectedOutputSchema: TASK_GRAPH_TEMPLATES[node.templateId as "scout" | "analyst"].expectedOutputSchema,
+      rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, failureReason: null, expectedOutputSchema: TASK_GRAPH_TEMPLATES[node.templateId as "scout" | "analyst"].expectedOutputSchema,
       allowedActions: TASK_GRAPH_TEMPLATES[node.templateId as "scout" | "analyst"].allowedActions })
   return { snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes } as unknown as TaskGraphSnapshot,
-    current: { revision: withPrepare ? 8 : 7, nodes: currentNodes } as unknown as TaskGraphCurrentState, tasks }
+    current: { revision: withPrepare ? 9 : 7, nodes: currentNodes } as unknown as TaskGraphCurrentState, tasks }
+}
+
+function analyzeGraphWithGate() {
+  const graph = analyzeGraph(true)
+  const gateNode = { key: SCHEDULED_GATE_TEMPLATE_ID, taskId: "gate-task", templateId: SCHEDULED_GATE_TEMPLATE_ID,
+    goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA, dependsOn: ["prepare"], depth: 4,
+    verificationDisposition: "specialized" }
+  const gateCurrent = { ...gateNode, status: "waiting_for_user" as const, readiness: "blocked_dependency" as const, resultSummary: null, failureReason: null }
+  const gateTask = { id: "gate-task", role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE, status: "waiting_for_user",
+    attemptCount: 1, failureReason: null, expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA, allowedActions: [],
+    rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, result: { status: "waiting_for_user" } }
+  return { snapshot: { ...graph.snapshot, nodes: [...graph.snapshot.nodes, gateNode] },
+    current: { ...graph.current, revision: 12, nodes: [...graph.current.nodes, gateCurrent] }, tasks: [...graph.tasks, gateTask] }
 }
 
 describe("scheduled automation Prepare continuation", () => {
-  it("projects only the original Analyze prefix from an exact queued Prepare append", () => {
+  it("projects only the original Analyze prefix from the exact persisted completed Prepare proof", () => {
     const graph = analyzeGraph(true), projected = projectScheduledAnalyzePrefix(graph.snapshot, graph.current, graph.tasks)
     expect(() => parseTaskGraphSnapshot(graph.snapshot)).not.toThrow()
     expect(projected?.current.revision).toBe(7)
     expect(projected?.snapshot.nodes.map(node => node.templateId)).toEqual(["scout", "analyst"])
     expect(projected?.current.nodes.map(node => node.templateId)).toEqual(["scout", "analyst"])
     expect(projected?.tasks.map(task => task.id)).toEqual(["scout-task", "analyst-task"])
+  })
+
+  it("selects exact Scout and Analyst rows despite permuted Prepare and Gate task order", () => {
+    const prepared = analyzeGraph(true)
+    const threeNode = projectScheduledAnalyzePrefix(prepared.snapshot, prepared.current,
+      [prepared.tasks[2]!, prepared.tasks[1]!, prepared.tasks[0]!])
+    expect(threeNode?.tasks.map(task => task.id)).toEqual(["scout-task", "analyst-task"])
+
+    const gated = analyzeGraphWithGate()
+    const fourNode = projectScheduledAnalyzePrefix(gated.snapshot, gated.current,
+      [gated.tasks[3]!, gated.tasks[1]!, gated.tasks[2]!, gated.tasks[0]!])
+    expect(fourNode?.tasks.map(task => task.id)).toEqual(["scout-task", "analyst-task"])
+
+    const missingAnalyst = [prepared.tasks[2]!, prepared.tasks[0]!, { ...prepared.tasks[1]!, id: "unrelated-task" }]
+    expect(projectScheduledAnalyzePrefix(prepared.snapshot, prepared.current, missingAnalyst)).toBeNull()
   })
 
   it("rejects extra or malformed Prepare graph nodes", () => {
@@ -110,6 +143,20 @@ describe("scheduled automation Prepare continuation", () => {
     expect(projectScheduledAnalyzePrefix(graph.snapshot, running as TaskGraphCurrentState, graph.tasks)).toBeNull()
     const badDependency = { ...graph.snapshot, nodes: graph.snapshot.nodes.map(node => node.templateId === "prepare" ? { ...node, dependsOn: ["scout"] } : node) }
     expect(projectScheduledAnalyzePrefix(badDependency, graph.current, graph.tasks)).toBeNull()
+  })
+
+  it("reconstructs the Analyze revision from the immutable Prepare proof after the fixed Gate append", () => {
+    const graph = analyzeGraphWithGate(), projected = projectScheduledAnalyzePrefix(graph.snapshot, graph.current, graph.tasks)
+    expect(projected?.current.revision).toBe(7)
+    expect(projected?.snapshot.nodes.map(node => node.templateId)).toEqual(["scout", "analyst"])
+    const missingProof = { ...graph, tasks: graph.tasks.map(task => task.id === "prepare-task" ? { ...task, result: null } : task) }
+    expect(projectScheduledAnalyzePrefix(missingProof.snapshot, missingProof.current, missingProof.tasks)).toBeNull()
+    const wrongGate = { ...graph, snapshot: { ...graph.snapshot, nodes: graph.snapshot.nodes.map(node => node.templateId === "gate" ? { ...node, dependsOn: ["analyst"] } : node) } }
+    expect(projectScheduledAnalyzePrefix(wrongGate.snapshot, wrongGate.current, wrongGate.tasks)).toBeNull()
+    const wrongOwner = { ...graph, tasks: graph.tasks.map(task => task.id === "gate-task" ? { ...task, parentTaskId: "other-root" } : task) }
+    expect(projectScheduledAnalyzePrefix(wrongOwner.snapshot, wrongOwner.current, wrongOwner.tasks)).toBeNull()
+    const changedRevision = { ...graph, current: { ...graph.current, revision: 8 } }
+    expect(projectScheduledAnalyzePrefix(changedRevision.snapshot, changedRevision.current, changedRevision.tasks)).toBeNull()
   })
 
   it("appends the fixed child and durable same-root wait using the original final step", async () => {
@@ -195,6 +242,16 @@ describe("scheduled automation Prepare continuation", () => {
       proposal: expect.objectContaining({ expectedRevision: attestation.graphRevision }),
     }))
     expect(fixture.wait).toHaveBeenCalledWith(expect.objectContaining({ targetTaskIds: ["prepare-task"] }))
+  })
+
+  it("replays Prepare through the exact fixed Gate suffix without using a current-revision shortcut", async () => {
+    const graph = analyzeGraphWithGate()
+    const fixture = ports({ revision: graph.current.revision, receiptStatus: "duplicate", choice: { required: false }, nodes: graph.current.nodes })
+    const continuation = createScheduledAutomationPrepareContinuation(fixture)
+    await expect(continuation(base)).resolves.toMatchObject({ status: "waiting_for_dependency", waitId: "wait-1" })
+    expect(fixture.appendScheduledPrepare).toHaveBeenCalledWith(expect.objectContaining({
+      proposal: expect.objectContaining({ expectedRevision: attestation.graphRevision }),
+    }))
   })
 
   it("fails closed before scheduling when the Analyze graph has changed or the task is absent", async () => {

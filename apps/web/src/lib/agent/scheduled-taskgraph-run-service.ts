@@ -8,14 +8,13 @@ import { loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointFor
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { isScheduledTaskGraphOwnerCurrent, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "./scheduled-taskgraph-pipeline-fence"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
+import { scheduledTaskGraphExecuteGateCompletionProof } from "./scheduled-taskgraph-gate-rpc"
 import type { PipelineCtx } from "./pipeline-context"
 import type { GateOutput, PipelineCheckpointState, PipelineStage } from "./types"
 
 export type ScheduledTaskGraphAnalyzeCheckpointProof = Readonly<{ status: "analyze_checkpointed"; continuationKey: string; checkpointDigest: string; claimTokenDigest: string; executionId: string; executionAttemptCount: number }>
-export type ScheduledTaskGraphAnalyzeOnlyInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string;
-  ownedJobs: readonly Job[]; context: PipelineCtx; state: unknown; onStateChange: (state: unknown) => void }>
-export type ScheduledTaskGraphGateResumeInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string;
-  claimToken: string; ownedJobs: readonly Job[]; persistedCheckpoint: unknown; prepareProof: unknown; scheduledWaitId?: string }>
+export type ScheduledTaskGraphAnalyzeOnlyInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; context: PipelineCtx; state: unknown; onStateChange: (state: unknown) => void }>
+export type ScheduledTaskGraphGateResumeInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; persistedCheckpoint: unknown; prepareProof: unknown; scheduledWaitId?: string; gateCompletionProof?: unknown }>
 
 const CHOICE_SCHEMA = "agent-harness.v2.scheduled-prepare-choice-wait.v1"
 const RECEIPT_EVENT = "agent.plan.scheduled_prepare_binding"
@@ -25,9 +24,7 @@ const CHOICE_CONTENT = { waitKind: "question", toolCallId: null, stage: "schedul
   options: [{ label: "Apply AI changes", value: "apply_ai_changes" }, { label: "Keep my current resume", value: "keep_resume" }] }
 export function isScheduledPrepareChoiceWaitId(turnId: string, value: unknown): value is string { const prefix = `agent-question:${turnId}:canonical:`; return typeof value === "string" && value.startsWith(prefix) && /^[a-f0-9]{64}$/.test(value.slice(prefix.length)) }
 /** Validates the separate Worker choice wait against its private receipt and persisted final step. */
-export async function validateScheduledPrepareWaitIdentity(input: Readonly<{
-  owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; proof: unknown; scheduledWaitId?: string
-}>): Promise<boolean> {
+export async function validateScheduledPrepareWaitIdentity(input: Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; proof: unknown; scheduledWaitId?: string }>): Promise<boolean> {
   let snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>
   try { snapshot = parseScheduledAutomationSnapshot(input.snapshot) } catch { return false }
   const proof = exactRecord(input.proof, ["receipt", "completion", "result"]), receipt = parseChoiceReceipt(proof?.receipt, input.owner)
@@ -103,13 +100,11 @@ function scheduledChoiceId(receipt: Record<string, unknown>, stepId: string, ord
     binding.analyzeGraphRevision, binding.prepareScheduleRevision, stepId, ordinal, 1]
   return `agent-question:${String(owner.turnId)}:canonical:${createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")}`
 }
-function sameStableOwner(a: Record<string, unknown>, b: ScheduledTaskGraphPipelineOwner): boolean { return ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "executionId", "executionAttemptCount"].every(key => a[key] === b[key as keyof ScheduledTaskGraphPipelineOwner]) }
-function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null { const row = record(value); return row && Reflect.ownKeys(row).length === keys.length && Reflect.ownKeys(row).every(key => typeof key === "string" && keys.includes(key)) ? row : null }
-function sameCanonicalJson(a: unknown, b: unknown): boolean { try { return canonicalJson(a) === canonicalJson(b) } catch { return false } }
-function canonicalJson(value: unknown): string { if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`; const row = record(value); return row ? `{${Object.keys(row).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(row[key])}`).join(",")}}` : JSON.stringify(value) }
+function sameStableOwner(a: Record<string, unknown>, b: ScheduledTaskGraphPipelineOwner): boolean {
+  return ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "executionId", "executionAttemptCount"]
+    .every(key => a[key] === b[key as keyof ScheduledTaskGraphPipelineOwner])
+}
 function isHex(value: unknown): value is string { return typeof value === "string" && /^[a-f0-9]{64}$/.test(value) }
-function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) }
-function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function validIso(value: unknown): boolean { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
 /** Rebuilds a private Gate/Execute state from a verified Worker proof and owner-scoped artifact rows. */
@@ -122,23 +117,32 @@ export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTas
     || (snapshot.requireApproval ? persistedWaitId !== undefined && persistedWaitId !== input.scheduledWaitId : persistedWaitId !== undefined || input.scheduledWaitId !== undefined)
     || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) throw new AgentExecutionCancelledError()
   if (!await validateScheduledPrepareWaitIdentity({ owner, snapshot, proof: input.prepareProof, scheduledWaitId: input.scheduledWaitId })) throw new AgentExecutionCancelledError()
+  const storedStage = pipelineStage(persisted?.nextStage), completion = scheduledTaskGraphExecuteGateCompletionProof(input.gateCompletionProof)
+  const completionGate = completion?.gate as { taskId: string; attemptCount: number } | undefined
+  if (!storedStage || input.gateCompletionProof !== undefined && (!completion || !sameCanonicalJson(completion.prepareProof, input.prepareProof))) throw new AgentExecutionCancelledError()
+  const requestedStage = completion && storedStage === 'gate' ? 'execute' : storedStage
+  if ((storedStage === 'execute' || storedStage === 'audit') && !completion || input.gateCompletionProof !== undefined && requestedStage === 'prepare') throw new AgentExecutionCancelledError()
   const loaded = await loadScheduledTaskGraphGateInput({ owner, snapshot: input.snapshot,
-    analyzeCheckpoint, analyzeAttestation: input.attestation, prepareProof: input.prepareProof })
+    analyzeCheckpoint, analyzeAttestation: input.attestation, prepareProof: input.prepareProof,
+    ...(completionGate ? { gate: { taskId: completionGate.taskId, attemptCount: completionGate.attemptCount, phase: 'completed' as const,
+      completionProof: input.gateCompletionProof } } : {}) })
   if (!loaded) throw new AgentExecutionCancelledError()
   const handoff = buildScheduledTaskGraphGateCheckpoint({
-    analyze: { owner, snapshot: input.snapshot, attestation: input.attestation, ownedJobs: input.ownedJobs,
-      persistedCheckpoint: analyzeCheckpoint, activeClaimToken: claimToken },
-    proof: input.prepareProof, packages: loaded.packages, materials: loaded.materials,
-  })
+    analyze: { owner, snapshot: input.snapshot, attestation: input.attestation, ownedJobs: input.ownedJobs, persistedCheckpoint: analyzeCheckpoint, activeClaimToken: claimToken },
+    proof: input.prepareProof, packages: loaded.packages, materials: loaded.materials })
   if (!handoff || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) throw new AgentExecutionCancelledError()
   if (!persisted) throw new AgentExecutionCancelledError()
   const artifactRefs = loaded.materials.map(({ jobId, kind, artifactRef }) => ({ jobId, kind, artifactRef }))
   if (persisted?.scheduledTaskGraphPreparedArtifacts !== undefined
     && !sameJson(persisted.scheduledTaskGraphPreparedArtifacts, artifactRefs)) throw new AgentExecutionCancelledError()
-  const requestedStage = pipelineStage(persisted?.nextStage)
-  if (!requestedStage || !["prepare", "gate", "execute", "audit"].includes(requestedStage)) throw new AgentExecutionCancelledError()
-  const decisions = parseGateDecisions(persisted?.scheduledTaskGraphGateDecisions)
+  if (!["prepare", "gate", "execute", "audit"].includes(requestedStage)) throw new AgentExecutionCancelledError()
+  const decisions = loaded.gateResult?.status === 'completed' ? parseGateDecisions({
+    approvedJobIds: loaded.gateResult.approvedJobIds, pendingJobIds: loaded.gateResult.pendingJobIds, skippedJobIds: loaded.gateResult.skippedJobIds })
+    : parseGateDecisions(persisted?.scheduledTaskGraphGateDecisions)
+  if (loaded.gateResult && persisted?.scheduledTaskGraphGateDecisions !== undefined
+    && !sameJson(persisted.scheduledTaskGraphGateDecisions, decisions)) throw new AgentExecutionCancelledError()
   const gateOutput = decisions ? restoreGateOutput(decisions, loaded.packages) : undefined
+  if (completion && loaded.gateResult?.status !== 'completed') throw new AgentExecutionCancelledError()
   if (["execute", "audit"].includes(requestedStage) && !gateOutput) throw new AgentExecutionCancelledError()
   return {
     ...handoff.checkpoint,
@@ -204,9 +208,7 @@ function stageOrder(stage: PipelineStage): number { return ["scout", "analyze", 
 function sameJson(left: unknown, right: unknown): boolean { try { return JSON.stringify(left) === JSON.stringify(right) } catch { return false } }
 
 /** Persists Web's authoritative Analyze checkpoint and returns only its opaque proof. */
-export async function runScheduledTaskGraphAnalyzeOnly(
-  input: ScheduledTaskGraphAnalyzeOnlyInput,
-): Promise<ScheduledTaskGraphAnalyzeCheckpointProof> {
+export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraphAnalyzeOnlyInput): Promise<ScheduledTaskGraphAnalyzeCheckpointProof> {
   const { owner, continuationKey, claimToken } = input
   if (scheduledTaskGraphContinuationKey(owner, input.attestation) !== continuationKey
     || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) {
@@ -280,4 +282,19 @@ export async function runScheduledTaskGraphAnalyzeOnly(
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  const row = record(value)
+  return row && Reflect.ownKeys(row).length === keys.length && Reflect.ownKeys(row).every(key => typeof key === 'string' && keys.includes(key)) ? row : null
+}
+function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value }
+function positive(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) > 0 }
+function sameCanonicalJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  const row = record(value)
+  if (row) return `{${Object.keys(row).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(row[key])}`).join(',')}}`
+  const encoded = JSON.stringify(value)
+  if (encoded === undefined) throw new Error('invalid_gate_completion_json')
+  return encoded
 }

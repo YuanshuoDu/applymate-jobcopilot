@@ -5,6 +5,8 @@ import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapsho
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { parseScheduledTaskGraphPrepareProof, scheduledTaskGraphAnalyzeCheckpointDigest, type ParsedScheduledTaskGraphPrepareProof, type ScheduledTaskGraphArtifactReference, type ScheduledTaskGraphPreparedMaterialRow, type ScheduledTaskGraphPreparedPackageRow } from './scheduled-taskgraph-gate-checkpoint'
 import { loadScheduledTaskGraphGateMaterials } from './scheduled-taskgraph-gate-materials'
+import { scheduledTaskGraphGateBindingIsCurrent, scheduledTaskGraphGateHistoryIsCurrent } from './scheduled-taskgraph-gate-history'
+import { parseScheduledTaskGraphGateResult, type ScheduledTaskGraphGateResult } from './scheduled-taskgraph-gate-service'
 
 const CONTINUATION_SCHEMA = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
 const COMPLETION_SCHEMA = 'agent-harness.v2.scheduled-taskgraph-prepare-completion.v1'
@@ -16,10 +18,12 @@ export type ScheduledTaskGraphGateInputRequest = Readonly<{
   analyzeCheckpoint: unknown
   analyzeAttestation: unknown
   prepareProof: unknown
+  gate?: Readonly<{ taskId: string; attemptCount: number; phase: 'running' | 'completed'; completionProof?: unknown }>
 }>
 export type ScheduledTaskGraphGateInput = Readonly<{
   packages: readonly ScheduledTaskGraphPreparedPackageRow[]
   materials: readonly ScheduledTaskGraphPreparedMaterialRow[]
+  gateResult?: ScheduledTaskGraphGateResult
 }>
 
 /** Reconstructs immutable Analyze facts from an allowed persisted Gate-family stage. */
@@ -46,7 +50,7 @@ export async function isScheduledTaskGraphGateProofCurrent(
     const proof = parseScheduledTaskGraphPrepareProof(input.prepareProof)
     return Boolean(proof && proof.result.snapshotDigest === marker.snapshotDigest
       && proof.result.checkpointDigest === checkpointDigest
-      && await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, tx, true))
+      && await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, tx, input.gate, true))
   } catch { return false }
 }
 
@@ -63,15 +67,22 @@ export async function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphG
 
     const proof = parseScheduledTaskGraphPrepareProof(input.prepareProof)
     if (!proof || proof.result.snapshotDigest !== marker.snapshotDigest || proof.result.checkpointDigest !== checkpointDigest
-      || !await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, db)) return null
-    return await loadScheduledTaskGraphGateMaterials({ owner, scoredJobs: checkpoint.scoredJobs,
+      || !await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, db, input.gate)) return null
+    const loaded = await loadScheduledTaskGraphGateMaterials({ owner, scoredJobs: checkpoint.scoredJobs,
       minScore: snapshot.minScore, dailyCap: snapshot.dailyCap, taskId: proof.result.taskId,
       jobs: proof.result.jobs, materials: proof.result.materials })
+    if (!loaded || input.gate?.phase !== 'completed') return loaded
+    const task = await db.subAgentTask.findFirst({ where: { id: input.gate.taskId, sessionId: owner.sessionId,
+      turnId: owner.turnId, rootTaskId: owner.rootTaskId, status: 'completed' }, select: { result: true } })
+    const envelope = record(task?.result), gateResult = parseScheduledTaskGraphGateResult(envelope?.structuredResult,
+      loaded.packages.map(pkg => pkg.jobId))
+    return gateResult?.status === 'completed' ? { ...loaded, gateResult } : null
   } catch { return null }
 }
 
 async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, marker: Record<string, unknown>, checkpointDigest: string,
-  attestationValue: unknown, proof: ParsedScheduledTaskGraphPrepareProof, reader: Prisma.TransactionClient, lockRows = false): Promise<boolean> {
+  attestationValue: unknown, proof: ParsedScheduledTaskGraphPrepareProof, reader: Prisma.TransactionClient,
+  gate?: ScheduledTaskGraphGateInputRequest['gate'], lockRows = false): Promise<boolean> {
   const { receipt, nodes } = proof, attestation = record(attestationValue), attestedOwner = record(attestation?.owner)
   const scoutProof = record(attestation?.scout), analystProof = record(attestation?.analyst)
   if (!attestation || !attestedOwner || !scoutProof || !analystProof || attestation.snapshotDigest !== marker.snapshotDigest
@@ -83,8 +94,9 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
     || receipt.snapshotDigest !== marker.snapshotDigest || receipt.evidenceDigest !== marker.evidenceDigest
     || receipt.checkpointDigest !== checkpointDigest || receipt.analyzeGraphRevision !== marker.graphRevision
     || receipt.prepareScheduleRevision !== Number(marker.graphRevision) + 1 || receipt.continuationKey !== stableReceiptKey(owner, receipt)) return false
+  if (gate && !await scheduledTaskGraphGateBindingIsCurrent({ reader, owner, marker, checkpointDigest, proof, gate })) return false
   if (lockRows) {
-    const taskIds = [owner.rootTaskId, ...nodes.map(node => node.taskId)]
+    const taskIds = [owner.rootTaskId, ...nodes.map(node => node.taskId), ...(gate ? [gate.taskId] : [])]
     const graphLocks = await reader.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT "id" FROM "agent_items"
       WHERE "id" = ${taskGraphItemId(owner.rootTaskId)} AND "sessionId" = ${owner.sessionId}
@@ -103,26 +115,27 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
         AND "type" = 'agent.plan.scheduled_prepare_binding' AND "itemId" IS NULL AND "taskId" IS NULL AND "actor" = 'system'
       ORDER BY "id" FOR UPDATE
     `)
-    if (graphLocks.length !== 1 || taskLocks.length !== 4 || receiptLocks.length !== 1) return false
+    if (graphLocks.length !== 1 || taskLocks.length !== (gate ? 5 : 4) || receiptLocks.length !== 1) return false
   }
   const [graph, tasks, receipts] = await Promise.all([
     reader.agentItem.findFirst({ where: { id: taskGraphItemId(owner.rootTaskId), sessionId: owner.sessionId, turnId: owner.turnId,
       taskId: owner.rootTaskId, type: 'task_graph', session: { is: { userId: owner.userId } }, turn: { is: { userId: owner.userId, rootTaskId: owner.rootTaskId } } },
     select: { id: true, sessionId: true, turnId: true, taskId: true, type: true, revision: true, content: true } }),
-    reader.subAgentTask.findMany({ where: { id: { in: [owner.rootTaskId, ...nodes.map(node => node.taskId)] }, sessionId: owner.sessionId, turnId: owner.turnId,
+    reader.subAgentTask.findMany({ where: { id: { in: [owner.rootTaskId, ...nodes.map(node => node.taskId), ...(gate ? [gate.taskId] : [])] }, sessionId: owner.sessionId, turnId: owner.turnId,
       rootTaskId: owner.rootTaskId, session: { is: { userId: owner.userId } } },
     select: { id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, status: true, role: true,
-      taskType: true, attemptCount: true, failureReason: true, result: true } }),
+      taskType: true, attemptCount: true, maxAttempts: true, failureReason: true, result: true, depth: true,
+      expectedOutputSchema: true, allowedActions: true } }),
     reader.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId, type: 'agent.plan.scheduled_prepare_binding',
       itemId: null, taskId: null, actor: 'system', session: { is: { userId: owner.userId } }, turn: { is: { userId: owner.userId, rootTaskId: owner.rootTaskId } } },
     select: { payload: true }, take: 2 }),
   ])
   if (!graph || graph.id !== taskGraphItemId(owner.rootTaskId) || graph.sessionId !== owner.sessionId || graph.turnId !== owner.turnId
-    || graph.taskId !== owner.rootTaskId || graph.type !== 'task_graph' || graph.revision !== proof.graphRevision
-    || tasks.length !== 4 || receipts.length !== 1
+    || graph.taskId !== owner.rootTaskId || graph.type !== 'task_graph'
+    || (!gate && graph.revision !== proof.graphRevision) || tasks.length !== (gate ? 5 : 4) || receipts.length !== 1
     || !sameJson(receipts[0]?.payload, receipt)) return false
   const content = record(graph.content), graphNodes = denseArray(content?.nodes)?.map(record), roles = ['scout', 'analyst', 'prepare']
-  if (content?.schemaVersion !== 'agent-harness.v2.task-graph' || !graphNodes || graphNodes.length !== 3
+  if (content?.schemaVersion !== 'agent-harness.v2.task-graph' || !graphNodes || graphNodes.length !== (gate ? 4 : 3)
     || new Set(nodes.map(node => node.taskId)).size !== 3) return false
   const byTask = uniqueMap(tasks, task => task.id)
   const root = byTask?.get(owner.rootTaskId)
@@ -146,6 +159,19 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
     } else if (!sameJson(envelope.structuredResult, proof.result.raw) || !sameJson(envelope.taskGraphScheduledPrepareProofFacts,
       { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-prepare-proof-facts.v1', receipt,
         completion: { schemaVersion: COMPLETION_SCHEMA, graphRevision: proof.graphRevision, nodes }, result: proof.result.raw })) return false
+  }
+  if (gate) {
+    const gateTask = byTask.get(gate.taskId), gateNode = graphNodes[3]
+    if (!gateTask || !gateNode || gateTask.id !== gate.taskId || gateTask.parentTaskId !== owner.rootTaskId
+      || gateTask.depth !== 1 || gateTask.role !== 'prepare' || gateTask.taskType !== 'scheduled_taskgraph_gate'
+      || gateTask.attemptCount !== gate.attemptCount || gateTask.status !== gate.phase
+      || !Number.isSafeInteger(gateTask.maxAttempts) || gateTask.maxAttempts < 1 || gateTask.failureReason !== null
+      || !Array.isArray(gateTask.allowedActions) || gateTask.allowedActions.length !== 0
+      || !sameJson(gateTask.expectedOutputSchema, { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' })
+      || !await scheduledTaskGraphGateHistoryIsCurrent({ reader, owner, prepareGraphRevision: proof.graphRevision,
+        prepareAttemptCount: proof.nodes[2].attemptCount, graphRevision: graph.revision, graphContent: graph.content,
+        gateTask: { id: gateTask.id, status: gateTask.status, attemptCount: gateTask.attemptCount, maxAttempts: gateTask.maxAttempts, result: gateTask.result },
+        gate, expectedJobIds: proof.result.jobs.filter(job => job.status === 'prepared').map(job => job.jobId) })) return false
   }
   return true
 }

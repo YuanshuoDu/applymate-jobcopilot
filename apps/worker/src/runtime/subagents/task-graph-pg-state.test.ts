@@ -2,13 +2,16 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
 import { currentTaskGraph, loadTaskGraph, lockTaskGraphScope } from "./task-graph-pg-state.js"
-import type { GraphIdentityScope, GraphScope } from "./task-graph-pg-state.js"
-import { canonicalTaskGraphJson, taskGraphItemId, taskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import type { GraphIdentityScope, GraphScope, GraphTaskRow } from "./task-graph-pg-state.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attempt.js"
+import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_OUTPUT_SCHEMA,
+  SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, scheduledGateCandidateSetDigest } from "./scheduled-gate-contract.js"
+import { SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
 
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
@@ -212,12 +215,54 @@ describe("TaskGraph PostgreSQL state loading", () => {
     expect(taskQueries).toHaveLength(1)
     expect(taskQueries[0]?.sql).toContain('task."allowedActions"')
     expect(taskQueries[0]?.sql).toContain('AS "contextIsObject"')
+    expect(taskQueries[0]?.sql).toContain('AS "contextIsEmpty"')
     expect(taskQueries[0]?.sql).toContain('AS "hasPrivateSelectionContext"')
     expect(taskQueries[0]?.sql).toContain('task."context" ?| ARRAY[')
     expect(taskQueries[0]?.sql).toContain("selectedJobPreparation")
     expect(taskQueries[0]?.sql).toContain("coverLetterBase")
     expect(taskQueries[0]?.sql).toContain("writerReviewFeedback")
     expect(taskQueries[0]?.sql).not.toMatch(/task\."context",/)
+  })
+
+  it("allows a null generic report only for a strict fixed scheduled Gate envelope", () => {
+    const prepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-1", attemptCount: 1,
+      snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs: [{ jobId: "job-1", status: "prepared" }], materials: [] }
+    const gateResult = (status: "waiting_for_user" | "completed", approvedJobIds: string[] = []) => ({ finalItemId: null, finalText: "", status,
+      stepCount: 0, toolCallCount: 0, taskGraphVerificationReport: null,
+      structuredResult: status === "waiting_for_user" ? { status: "question_required", kind: "weak_cover_letter", jobIds: ["job-1"],
+        candidateSetDigest: scheduledGateCandidateSetDigest("weak_cover_letter", ["job-1"]), allowedChoiceIds: ["continue", "review", "skip"] }
+        : { status: "completed", nextStage: "execute", approvedJobIds, pendingJobIds: approvedJobIds.length ? [] : ["job-1"],
+          skippedJobIds: [], counts: { approved: approvedJobIds.length, pending: approvedJobIds.length ? 0 : 1, skipped: 0 } } })
+    const fixture = (gateStatus: "waiting_for_user" | "completed", overrides: Record<string, unknown> = {}) => {
+      const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+        { key: "prepare", templateId: "prepare", goal: "Prepare exact materials", successCriteria: ["Prepared"], dependsOn: [], depth: 3,
+          taskId: "prepare-1", verificationDisposition: "specialized" },
+        { key: "gate", templateId: "gate", goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA,
+          dependsOn: ["prepare"], depth: 4, taskId: "gate-1", verificationDisposition: "specialized" },
+      ] })
+      const prepareTask: GraphTaskRow = { ...validTaskRow({ id: "prepare-1", role: "prepare", taskType: "scheduled_application_prepare",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", taskType: "scheduled_application_prepare" },
+        result: { structuredResult: prepareResult, taskGraphScheduledPrepareProofFacts: { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, result: prepareResult } } }), status: "completed" }
+      const gateTask: GraphTaskRow = { ...validTaskRow({ id: "gate-1", role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE,
+        expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA, allowedActions: [], contextIsEmpty: true, result: gateResult(gateStatus), ...overrides }), status: gateStatus }
+      const tasks = new Map<string, GraphTaskRow>([["prepare-1", prepareTask], ["gate-1", gateTask]])
+      const state = taskGraphState(snapshot, 5, new Map([["prepare-1", { status: "completed" as const, failureReason: null }],
+        ["gate-1", { status: gateStatus, failureReason: null }]]), [])
+      return { rootTaskId: identity.rootTaskId, snapshot, state, tasks, item: { id: "task_graph:root-1", revision: 5, content: snapshot, createdAt: new Date() } }
+    }
+    const waiting = currentTaskGraph(fixture("waiting_for_user"))
+    expect(waiting.nodes[1]).toMatchObject({ key: "gate", status: "waiting_for_user", resultProjection: { availability: "unavailable" } })
+    expect(waiting.nodes[1]).not.toHaveProperty("verificationReport")
+    const completed = currentTaskGraph(fixture("completed"))
+    expect(completed.nodes[1]).toMatchObject({ key: "gate", status: "completed", resultProjection: { availability: "unavailable" } })
+    const badCases = [
+      { taskType: "other" }, { role: "reviewer" }, { expectedOutputSchema: { ...SCHEDULED_GATE_OUTPUT_SCHEMA, taskType: "other" } },
+      { allowedActions: ["agent.plan"] }, { contextIsEmpty: false },
+      { result: { ...gateResult("waiting_for_user"), taskGraphVerificationReport: { forged: true } } },
+    ]
+    for (const overrides of badCases) expect(() => currentTaskGraph(fixture("waiting_for_user", overrides))).toThrow("task_graph_verification_report_invalid")
+    expect(() => currentTaskGraph(fixture("completed", { result: gateResult("completed", ["job-1"]) })))
+      .toThrow("task_graph_verification_report_invalid")
   })
 
   it("restores a typed contract from persisted canonical content across a Worker restart", async () => {

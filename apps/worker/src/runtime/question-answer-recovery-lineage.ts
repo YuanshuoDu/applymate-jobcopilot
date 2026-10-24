@@ -159,8 +159,12 @@ export async function recoverAnsweredQuestionLineage(
       AND answer_event."type" = 'question.answered' AND (answer_event."taskId" IS NULL OR answer_event."taskId" = item."taskId")))
     AND (item."content"->>'stage' = 'user_input' OR EXISTS (SELECT 1 FROM "agent_items" AS ask_call WHERE ask_call."sessionId" = item."sessionId"
       AND ask_call."turnId" = item."turnId" AND ask_call."taskId" = item."taskId" AND ask_call."type" = 'tool_call'
-      AND ask_call."content"->>'toolName' = 'agent.ask_user' AND ask_call."content"->>'toolCallId' = item."content"->>'toolCallId'))`
-  const questionFilter = input.rootOnly ? rootQuestionFilter : `(item."taskId" IS NULL OR item."taskId" = $4) AND item."type" = 'question'`
+      AND ask_call."content"->>'toolName' = 'agent.ask_user' AND ask_call."content"->>'toolCallId' = item."content"->>'toolCallId'))
+    AND item."content"->>'stage' IS DISTINCT FROM 'scheduled_prepare'
+    AND item."content"->>'stage' IS DISTINCT FROM 'scheduled_gate'`
+  const questionFilter = input.rootOnly ? rootQuestionFilter : `(item."taskId" IS NULL OR item."taskId" = $4) AND item."type" = 'question'
+    AND item."content"->>'stage' IS DISTINCT FROM 'scheduled_prepare'
+    AND item."content"->>'stage' IS DISTINCT FROM 'scheduled_gate'`
   const items = await client.query<Row>(
     `SELECT item."id", item."revision", item."sessionId", item."turnId", item."stepId", item."taskId", item."type", item."status", item."content",
             session."userId" AS "userId", turn."userId" AS "turnUserId"

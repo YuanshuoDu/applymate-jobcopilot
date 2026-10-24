@@ -1,13 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApplicationPackage, PipelineCtx } from '../types'
 
-const mocks = vi.hoisted(() => ({ createGateReviewReceipt: vi.fn(), skipApplicationForGate: vi.fn(), modelChat: vi.fn() }))
+const mocks = vi.hoisted(() => ({ createGateReviewReceipt: vi.fn(), findGateReviewReceiptReplay: vi.fn(), skipApplicationForGate: vi.fn(), modelChat: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: {} }))
 vi.mock('@/lib/model-router', () => ({ modelChat: mocks.modelChat }))
+vi.mock('../execution-control', () => ({ AgentExecutionCancelledError: class AgentExecutionCancelledError extends Error {
+  constructor() { super('Agent execution was cancelled'); this.name = 'AgentExecutionCancelledError' }
+} }))
 vi.mock('../application-control', () => ({ skipApplicationForGate: mocks.skipApplicationForGate }))
-vi.mock('./gate-review-receipt', () => ({ createGateReviewReceipt: mocks.createGateReviewReceipt }))
+vi.mock('./gate-review-receipt', () => ({ createGateReviewReceipt: mocks.createGateReviewReceipt, findGateReviewReceiptReplay: mocks.findGateReviewReceiptReplay }))
+vi.mock('./prepare', () => ({ tailoringConstraints: vi.fn(() => ({})) }))
 
-import { runGate } from './gate'
+import { runGate, runScheduledGate } from './gate'
+import { createScheduledTaskGraphGateQuestion } from '../scheduled-taskgraph-gate-service'
 
 function context(overrides: Partial<PipelineCtx['agentCfg']> = {}): PipelineCtx {
   return {
@@ -27,9 +32,9 @@ function context(overrides: Partial<PipelineCtx['agentCfg']> = {}): PipelineCtx 
   }
 }
 
-function packageFor(score: number, tailoredResumeId?: string): ApplicationPackage {
+function packageFor(score: number, tailoredResumeId?: string, jobId = 'job_1'): ApplicationPackage {
   return {
-    job: { id: 'job_1', company: 'Example', role: 'Cyber Security Analyst', description: null } as ApplicationPackage['job'],
+    job: { id: jobId, company: jobId === 'job_1' ? 'Example' : 'Example ' + jobId, role: 'Cyber Security Analyst', description: null } as ApplicationPackage['job'],
     score, matchedKeywords: ['SOC'], missingKeywords: [], recommendation: '', tailoredResumeId,
   }
 }
@@ -45,6 +50,8 @@ function draftArtifact(constraintHash: string) {
 beforeEach(() => {
   mocks.createGateReviewReceipt.mockReset()
   mocks.createGateReviewReceipt.mockResolvedValue({ projectedWait: true, receipt: { id: 'approval_1' } })
+  mocks.findGateReviewReceiptReplay.mockReset()
+  mocks.findGateReviewReceiptReplay.mockResolvedValue(null)
   mocks.skipApplicationForGate.mockReset()
   mocks.skipApplicationForGate.mockResolvedValue(true)
   mocks.modelChat.mockReset()
@@ -221,5 +228,181 @@ describe('runGate', () => {
     }))
     expect(ctx.emit).not.toHaveBeenCalledWith('application_review_ready', expect.anything())
     expect(ctx.emit).not.toHaveBeenCalledWith('agent_observation', expect.objectContaining({ observation: expect.stringContaining('✕ jump over') }))
+  })
+})
+
+describe('runScheduledGate', () => {
+  it('returns a bounded weak-letter question without invoking child askUser or emitting its body', async () => {
+    const ctx = context()
+    ctx.askUser = vi.fn()
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 4, fitGap: 'missing evidence', recommendation: 'add evidence', readyToApply: false }) })
+
+    const result = await runScheduledGate([{ ...packageFor(75), coverLetter: 'Private letter body' }], ctx)
+
+    expect(result).toEqual(createScheduledTaskGraphGateQuestion('weak_cover_letter', ['job_1']))
+    expect(ctx.askUser).not.toHaveBeenCalled()
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_question', expect.anything())
+    expect(mocks.createGateReviewReceipt).not.toHaveBeenCalled()
+  })
+
+  it('applies only a matching validated fixed choice and projects decision IDs', async () => {
+    const ctx = context()
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 4, fitGap: 'missing evidence', recommendation: 'add evidence', readyToApply: false }) })
+    const question = createScheduledTaskGraphGateQuestion('weak_cover_letter', ['job_1'])!
+    const choice = { kind: question.kind, jobIds: question.jobIds, choiceId: 'skip' }
+
+    const result = await runScheduledGate([{ ...packageFor(75), coverLetter: 'Private letter body' }], ctx, choice)
+
+    expect(result).toEqual({ status: 'completed', nextStage: 'execute', approvedJobIds: [], pendingJobIds: [], skippedJobIds: ['job_1'],
+      counts: { approved: 0, pending: 0, skipped: 1 } })
+    expect(mocks.skipApplicationForGate).toHaveBeenCalledWith(expect.objectContaining({ jobId: 'job_1', checkpoint: 'review_quality_declined' }))
+  })
+
+  it.each(['skip', 'review', 'continue'] as const)('honors the bound %s choice when a fresh quality score no longer asks the question', async choiceId => {
+    const ctx = context()
+    Object.assign(ctx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 4 } })
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 9, fitGap: 'private quality detail', recommendation: 'private model recommendation', readyToApply: true }) })
+    const question = createScheduledTaskGraphGateQuestion('weak_cover_letter', ['job_1'])!
+
+    const result = await runScheduledGate([{ ...packageFor(75), coverLetter: 'Private letter body' }], ctx,
+      { kind: question.kind, jobIds: question.jobIds, choiceId })
+
+    expect(result).toMatchObject(choiceId === 'skip'
+      ? { status: 'completed', skippedJobIds: ['job_1'], counts: { skipped: 1 } }
+      : { status: 'completed', pendingJobIds: ['job_1'], counts: { pending: 1 } })
+    expect(mocks.modelChat).toHaveBeenCalledOnce()
+    if (choiceId === 'skip') {
+      expect(mocks.skipApplicationForGate).toHaveBeenCalledWith(expect.objectContaining({ jobId: 'job_1', checkpoint: 'review_quality_declined' }))
+      expect(mocks.createGateReviewReceipt).not.toHaveBeenCalled()
+    } else expect(mocks.createGateReviewReceipt).toHaveBeenCalledOnce()
+  })
+
+  it('rejects a supplied choice that matches no server-derived question before doing work', async () => {
+    const ctx = context()
+    const question = createScheduledTaskGraphGateQuestion('weak_cover_letter', ['unknown_job'])!
+
+    await expect(runScheduledGate([{ ...packageFor(75), coverLetter: 'letter' }], ctx,
+      { kind: question.kind, jobIds: question.jobIds, choiceId: 'skip' })).rejects.toMatchObject({ name: 'AgentExecutionCancelledError' })
+
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.createGateReviewReceipt).not.toHaveBeenCalled()
+    expect(mocks.skipApplicationForGate).not.toHaveBeenCalled()
+  })
+
+  it('restores an exact prior receipt before quality review and emits no duplicate package events', async () => {
+    const ctx = context()
+    const ownerFence = { owner: { userId: 'user_1', sessionId: 'session_1', turnId: 'turn_1', rootTaskId: 'root_1', rootAttemptCount: 2,
+      turnLeaseOwnerId: 'lease_1', turnLeaseVersion: 1, executionId: 'execution_1', executionAttemptCount: 4 },
+      key: 'stable-gate-key', claimToken: 'claim_1', assertCurrent: vi.fn(async () => true) }
+    Object.assign(ctx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 4 }, scheduledTaskGraphOwnerFence: ownerFence })
+    mocks.findGateReviewReceiptReplay.mockResolvedValue({ id: 'prior_approval' })
+
+    const result = await runScheduledGate([{ ...packageFor(75), coverLetter: 'Private letter body' }], ctx)
+
+    expect(result).toMatchObject({ status: 'completed', pendingJobIds: ['job_1'], counts: { pending: 1 } })
+    expect(mocks.findGateReviewReceiptReplay).toHaveBeenCalledOnce()
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.createGateReviewReceipt).not.toHaveBeenCalled()
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_action', expect.anything())
+    expect(ctx.emit).not.toHaveBeenCalledWith('artifact_reviewed', expect.anything())
+    expect(ctx.emit).not.toHaveBeenCalledWith('application_review_ready', expect.anything())
+  })
+
+  it('does not emit free-text quality fit-gap or recommendations', async () => {
+    const ctx = context()
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 4, fitGap: 'PRIVATE_FIT_GAP', recommendation: 'PRIVATE_RECOMMENDATION', readyToApply: false }) })
+
+    const result = await runScheduledGate([{ ...packageFor(75), coverLetter: 'Private letter body' }], ctx)
+
+    expect(result).toMatchObject({ status: 'question_required', kind: 'weak_cover_letter', jobIds: ['job_1'] })
+    expect(JSON.stringify(vi.mocked(ctx.emit).mock.calls)).not.toContain('PRIVATE_FIT_GAP')
+    expect(JSON.stringify(vi.mocked(ctx.emit).mock.calls)).not.toContain('PRIVATE_RECOMMENDATION')
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_')
+  })
+
+  it('restores an earlier receipt before applying the next question in a multi-package Gate', async () => {
+    const ownerFence = { owner: { userId: 'user_1', sessionId: 'session_1', turnId: 'turn_1', rootTaskId: 'root_1', rootAttemptCount: 2,
+      turnLeaseOwnerId: 'lease_1', turnLeaseVersion: 1, executionId: 'execution_1', executionAttemptCount: 4 },
+      key: 'stable-gate-key', claimToken: 'claim_1', assertCurrent: vi.fn(async () => true) }
+    const choice1 = createScheduledTaskGraphGateQuestion('weak_cover_letter', ['job_1'])!
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 4, fitGap: 'private gap', recommendation: 'private text', readyToApply: false }) })
+    const firstCtx = context()
+    Object.assign(firstCtx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 4 }, scheduledTaskGraphOwnerFence: ownerFence })
+
+    const first = await runScheduledGate([
+      { ...packageFor(75, undefined, 'job_1'), coverLetter: 'letter 1' },
+      { ...packageFor(75, undefined, 'job_2'), coverLetter: 'letter 2' },
+    ], firstCtx, { kind: choice1.kind, jobIds: choice1.jobIds, choiceId: 'review' })
+
+    expect(first).toMatchObject({ status: 'question_required', kind: 'weak_cover_letter', jobIds: ['job_2'] })
+    expect(mocks.createGateReviewReceipt).toHaveBeenCalledTimes(1)
+    expect(mocks.createGateReviewReceipt.mock.calls[0]?.[1].job.id).toBe('job_1')
+
+    mocks.createGateReviewReceipt.mockClear()
+    mocks.findGateReviewReceiptReplay.mockImplementation(async (_ctx, pkg) => pkg.job.id === 'job_1' ? { id: 'prior_job_1_receipt' } : null)
+    const choice2 = createScheduledTaskGraphGateQuestion('weak_cover_letter', ['job_2'])!
+    const secondCtx = context()
+    Object.assign(secondCtx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 4 }, scheduledTaskGraphOwnerFence: ownerFence })
+
+    const second = await runScheduledGate([
+      { ...packageFor(75, undefined, 'job_1'), coverLetter: 'letter 1' },
+      { ...packageFor(75, undefined, 'job_2'), coverLetter: 'letter 2' },
+    ], secondCtx, { kind: choice2.kind, jobIds: choice2.jobIds, choiceId: 'skip' })
+
+    expect(second).toMatchObject({ status: 'completed', pendingJobIds: ['job_1'], skippedJobIds: ['job_2'] })
+    expect(mocks.modelChat).toHaveBeenCalledTimes(3)
+    expect(mocks.findGateReviewReceiptReplay).toHaveBeenCalledTimes(4)
+    expect(mocks.createGateReviewReceipt).not.toHaveBeenCalled()
+    expect(secondCtx.emit).not.toHaveBeenCalledWith('agent_action', { role: 'reviewer', action: expect.stringContaining('job_1') })
+  })
+
+  it('restores a prior skip while applying the current answer for the next weak-letter question', async () => {
+    const ownerFence = { owner: { userId: 'user_1', sessionId: 'session_1', turnId: 'turn_1', rootTaskId: 'root_1', rootAttemptCount: 2,
+      turnLeaseOwnerId: 'lease_1', turnLeaseVersion: 1, executionId: 'execution_1', executionAttemptCount: 4 },
+      key: 'stable-gate-key', claimToken: 'claim_1', assertCurrent: vi.fn(async () => true) }
+    const scheduledContext = () => {
+      const ctx = context()
+      Object.assign(ctx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 4 }, scheduledTaskGraphOwnerFence: ownerFence })
+      return ctx
+    }
+    const packages = [
+      { ...packageFor(75, undefined, 'job_1'), coverLetter: 'letter 1' },
+      { ...packageFor(75, undefined, 'job_2'), coverLetter: 'letter 2' },
+    ]
+    const firstCtx = scheduledContext()
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 4, fitGap: 'gap', recommendation: 'improve', readyToApply: false }) })
+    const first = await runScheduledGate(packages, firstCtx)
+    expect(first).toMatchObject({ status: 'question_required', kind: 'weak_cover_letter', jobIds: ['job_1'] })
+
+    const skipFirst = { kind: 'weak_cover_letter', jobIds: ['job_1'], choiceId: 'skip' }
+    const secondCtx = scheduledContext()
+    const second = await runScheduledGate(packages, secondCtx, skipFirst)
+    expect(second).toMatchObject({ status: 'question_required', kind: 'weak_cover_letter', jobIds: ['job_2'] })
+    expect(mocks.skipApplicationForGate).toHaveBeenCalledOnce()
+
+    const thirdCtx = scheduledContext()
+    mocks.modelChat.mockClear()
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 9, fitGap: '', recommendation: 'ready', readyToApply: true }) })
+    const reviewSecond = { kind: 'weak_cover_letter', jobIds: ['job_2'], choiceId: 'review' }
+    const third = await runScheduledGate(packages, thirdCtx, reviewSecond, [skipFirst])
+
+    expect(third).toMatchObject({ status: 'completed', pendingJobIds: ['job_2'], skippedJobIds: ['job_1'], counts: { pending: 1, skipped: 1 } })
+    expect(mocks.modelChat).toHaveBeenCalledOnce()
+    expect(mocks.findGateReviewReceiptReplay.mock.calls.slice(-2).map(call => call[1].job.id)).toEqual(['job_1', 'job_2'])
+    expect(mocks.skipApplicationForGate).toHaveBeenCalledTimes(2)
+    expect(mocks.createGateReviewReceipt).toHaveBeenCalledTimes(1)
+    expect(mocks.createGateReviewReceipt.mock.calls[0]?.[1].job.id).toBe('job_2')
+    expect(thirdCtx.emit).not.toHaveBeenCalledWith('agent_action', { role: 'reviewer', action: expect.stringContaining('job_1') })
+  })
+
+  it('keeps an unavailable quality review on the normal pending fallback path', async () => {
+    const ctx = context()
+    mocks.modelChat.mockRejectedValue(new Error('provider-secret-detail'))
+
+    const result = await runScheduledGate([{ ...packageFor(75), coverLetter: 'Private letter body',
+      job: { ...packageFor(75).job, description: 'Private job description' } }], ctx)
+
+    expect(result).toMatchObject({ status: 'completed', nextStage: 'execute', pendingJobIds: ['job_1'], counts: { pending: 1 } })
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_question', expect.anything())
   })
 })

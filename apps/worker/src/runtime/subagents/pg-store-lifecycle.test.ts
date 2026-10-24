@@ -6,6 +6,7 @@ import * as taskGraphLifecycle from "./task-graph-pg-lifecycle.js"
 import * as taskGraphState from "./task-graph-pg-state.js"
 import * as taskGraphVerification from "./task-graph-pg-verification.js"
 import * as scheduledPrepareVerification from "./scheduled-prepare-task-graph-verification.js"
+import * as scheduledGateVerification from "./pg-scheduled-task-graph-gate-verification.js"
 import type { PgSubagentPool } from "./types.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
@@ -203,6 +204,45 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
 }
 
 describe("subagent PostgreSQL lifecycle helpers", () => {
+  it("persists a Gate question only through the exact specialized waiting envelope", async () => {
+    const snapshot = { nodes: [{ key: "gate", templateId: "gate", taskId: "gate-1" }] }
+    const graph = { scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+      itemId: "item-1", taskId: "gate-1", expectedRevision: 5, snapshot,
+      event: { type: "task.waiting_for_user", nodeKey: "gate", expectedRevision: 5,
+        idempotencyKey: taskGraphLifecycleKey("root-1", "gate", 1, "task.waiting_for_user") },
+      state: { revision: 6, nodes: [{ key: "gate", taskId: "gate-1", templateId: "gate", status: "waiting_for_user", failureReason: null }] }, duplicate: false }
+    const failed = { ...graph, event: { ...graph.event, type: "task.failed", idempotencyKey: taskGraphLifecycleKey("root-1", "gate", 1, "task.failed") },
+      state: { revision: 6, nodes: [{ key: "gate", taskId: "gate-1", templateId: "gate", status: "failed", failureReason: "scheduled_gate_result_invalid" }] } }
+    const transition = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValueOnce(graph as never).mockResolvedValueOnce(failed as never)
+    const validate = vi.spyOn(scheduledGateVerification, "validateScheduledGateTaskGraphFinish").mockResolvedValueOnce(null)
+    const result = await prepareTaskGraphFinish({} as pg.PoolClient, { taskId: "gate-1", sessionId: "session-1", attemptCount: 1,
+      status: "waiting_for_user", retry: false, ownerId: "gate-owner", taskRole: "prepare", taskType: "scheduled_taskgraph_gate",
+      result: { finalItemId: null, finalText: "", status: "waiting_for_user", stepCount: 0, toolCallCount: 0,
+        taskGraphVerificationReport: null, structuredResult: { status: "question_required" } } })
+    expect(validate).toHaveBeenCalledOnce()
+    expect(transition.mock.calls[1]?.[1]).toMatchObject({ type: "task.failed", failureReason: "scheduled_gate_result_invalid" })
+    expect(result).toMatchObject({ status: "failed", failureReason: "scheduled_gate_result_invalid" })
+  })
+
+  it("keeps a validated Gate completion envelope and reconciles the Execute tail", async () => {
+    const snapshot = { nodes: [{ key: "gate", templateId: "gate", taskId: "gate-1" }] }
+    const graph = { scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+      itemId: "item-1", taskId: "gate-1", expectedRevision: 5, snapshot,
+      event: { type: "task.completed", nodeKey: "gate", expectedRevision: 5,
+        idempotencyKey: taskGraphLifecycleKey("root-1", "gate", 1, "task.completed") },
+      state: { revision: 6, nodes: [{ key: "gate", taskId: "gate-1", templateId: "gate", status: "completed", failureReason: null }] }, duplicate: false }
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValueOnce(graph as never)
+    const envelope = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+      taskGraphVerificationReport: null, structuredResult: { status: "completed", nextStage: "execute", approvedJobIds: [],
+        pendingJobIds: ["job-1"], skippedJobIds: [], counts: { approved: 0, pending: 1, skipped: 0 } } }
+    const validate = vi.spyOn(scheduledGateVerification, "validateScheduledGateTaskGraphFinish").mockResolvedValueOnce(envelope as never)
+    const result = await prepareTaskGraphFinish({} as pg.PoolClient, { taskId: "gate-1", sessionId: "session-1", attemptCount: 1,
+      status: "completed", retry: false, ownerId: "gate-owner", taskRole: "prepare", taskType: "scheduled_taskgraph_gate", result: envelope })
+    expect(prepare).toHaveBeenCalledOnce()
+    expect(validate).toHaveBeenCalledOnce()
+    expect(result).toEqual({ graph, status: "completed", result: envelope, reconcileDependents: true })
+  })
+
   it("stores only verifier-issued Prepare proof facts at the completed lifecycle revision", async () => {
     const snapshot = { nodes: [{ key: "prepare", templateId: "prepare", taskId: "prepare-1" }] }
     const graph = { scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },

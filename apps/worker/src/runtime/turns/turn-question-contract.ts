@@ -52,7 +52,7 @@ export type TurnQuestionStore = {
   cancelPausedQuestion(input: TurnQuestionPauseInput): Promise<"cancelled" | "prepared">
   waitForQuestion(input: TurnQuestionWaitInput): Promise<TurnQuestionWaitReceipt>
   readPendingQuestion(input: TurnQuestionOwnerInput): Promise<TurnQuestionRecovery>
-  readScheduledPrepareChoice(input: TurnQuestionScheduledChoiceReadInput): Promise<TurnQuestionScheduledChoiceRecovery>
+  readScheduledPrepareChoice(input: TurnQuestionScheduledChoiceReadInput): Promise<TurnQuestionScheduledChoiceRecovery>; readScheduledGateChoice?(input: TurnQuestionOwnerInput & { readonly binding: unknown }): Promise<import("./turn-question-gate-choice-contract.js").TurnQuestionGateChoiceRecovery>
 }
 export type TurnQuestionUsageInput = {
   readonly owner: TurnExecutionOwnerFence
@@ -68,7 +68,7 @@ export type TurnQuestionPauseInput = TurnQuestionUsageInput & {
 export type TurnQuestionOwnerInput = { readonly owner: TurnExecutionOwnerFence; readonly now: Date }
 export type TurnQuestionWaitInput = TurnQuestionOwnerInput & {
   readonly stepId: string
-  readonly toolCallId: string | null
+  readonly toolCallId: string | null; readonly gateChoiceBinding?: unknown; readonly gateChoiceQuestion?: string
   /** A Web-reported scheduled wait is only an expected value, never the authority. */
   readonly expectedWaitId?: string
   readonly finishReason?: string

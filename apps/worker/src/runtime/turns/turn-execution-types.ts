@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 
@@ -27,6 +28,8 @@ import type { DurableWaitControlReader } from "../tools/coordination-types.js"
 import type { RecoveredArchivedWaitControl } from "./turn-execution-wait.js"
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import type { TurnEngineQueryClient } from "./turn-engine-owner-sql.js"
+import { TURN_SCHEDULED_GATE_CHOICE_MAX_QUESTION_BYTES, parseTurnQuestionGateChoiceBinding,
+  turnScheduledGateChoiceWaitId, type TurnQuestionGateChoiceBinding, type TurnQuestionGateChoiceKind } from "./turn-question-gate-choice-contract.js"
 
 export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
 export const NATIVE_SEMANTIC_REJECTION: unique symbol = Symbol("native-semantic-rejection")
@@ -40,6 +43,8 @@ export type ScheduledPipelineCompletionDisposition =
   | Readonly<{ status: "waiting_for_dependency"; waitId: string; candidateText: string }>
   /** Worker-owned deterministic Prepare choice wait. */
   | Readonly<{ status: "waiting_for_user"; waitId: string; candidateText: string }>
+  /** Private, fixed Gate question persisted through the existing Turn question store. */
+  | Readonly<{ status: "waiting_for_scheduled_gate_choice"; waitId: string; candidateText: string; question: string; binding: TurnQuestionGateChoiceBinding }>
   /** A Web-owned question; its ID is never the Worker-owned Prepare choice ID. */
   | Readonly<{ status: "waiting_for_external_user"; externalWaitId: string; scheduledWaitId?: string; candidateText: string }>
   | Readonly<{ status: "blocked"; errorCode: string }>
@@ -69,6 +74,18 @@ export function parseScheduledPipelineCompletionDisposition(value: unknown): Sch
       && typeof record.waitId === "string" && record.waitId.trim() === record.waitId && record.waitId.length > 0 && record.waitId.length <= 256) {
       return { status: "waiting_for_user", waitId: record.waitId, candidateText: record.candidateText }
     }
+    if (record.status === "waiting_for_scheduled_gate_choice" && keys.length === 5
+      && ["status", "candidateText", "waitId", "question", "binding"].every(key => keys.includes(key))
+      && typeof record.candidateText === "string" && record.candidateText.trim().length > 0
+      && typeof record.question === "string" && record.question.trim() === record.question
+      && Buffer.byteLength(record.question, "utf8") > 0 && Buffer.byteLength(record.question, "utf8") <= TURN_SCHEDULED_GATE_CHOICE_MAX_QUESTION_BYTES
+      && typeof record.waitId === "string" && record.waitId.trim() === record.waitId && record.waitId.length > 0 && record.waitId.length <= 256) {
+      const binding = parseTurnQuestionGateChoiceBinding(record.binding)
+      const question = scheduledGateQuestionText(binding?.kind)
+      if (binding && question === record.question && turnScheduledGateChoiceWaitId(binding) === record.waitId) {
+        return { status: "waiting_for_scheduled_gate_choice", waitId: record.waitId, candidateText: record.candidateText, question, binding }
+      }
+    }
     if (record.status === "waiting_for_external_user"
       && (keys.length === 3 && keys.includes("status") && keys.includes("candidateText") && keys.includes("externalWaitId")
         || keys.length === 4 && keys.includes("status") && keys.includes("candidateText") && keys.includes("externalWaitId") && keys.includes("scheduledWaitId"))
@@ -87,6 +104,11 @@ export function parseScheduledPipelineCompletionDisposition(value: unknown): Sch
     }
     return null
   } catch { return null }
+}
+
+export function scheduledGateQuestionText(kind: TurnQuestionGateChoiceKind | undefined): string | null {
+  return kind === "borderline_match" ? "Some prepared applications are close to your match threshold. How should I handle them?"
+    : kind === "weak_cover_letter" ? "A prepared application has a weak cover letter. How should I handle it?" : null
 }
 
 export type TurnEngineCompletionGateResult =

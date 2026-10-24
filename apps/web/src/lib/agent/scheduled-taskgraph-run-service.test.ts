@@ -353,17 +353,20 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     expect(mocks.gateCheckpoint).toHaveBeenCalled()
   })
 
-  it("restores persisted Gate decisions against the exact reloaded package set", async () => {
+  it("requires a persisted Worker Gate completion proof before Execute and keeps checkpoint decisions bounded", async () => {
     mocks.items.mockResolvedValue(null)
-    const checkpoint = { nextStage: "execute", scheduledTaskGraphPreparedArtifacts: [
-      { jobId: job.id, kind: "resume", artifactRef: { artifactId: "artifact_1", version: 3, contentHash: "sha256:" + "1".repeat(64), sourceDigest: "sha256:" + "2".repeat(64) } },
-    ], scheduledTaskGraphGateDecisions: { approvedJobIds: [job.id], pendingJobIds: [], skippedJobIds: [] } }
-    const resume = await (await import("./scheduled-taskgraph-run-service")).buildScheduledTaskGraphGateResumeState({
+    const checkpoint = { nextStage: "execute" as const, scheduledTaskGraphPreparedArtifacts: [
+      { jobId: job.id, kind: "resume" as const, artifactRef: { artifactId: "artifact_1", version: 3, contentHash: "sha256:" + "1".repeat(64), sourceDigest: "sha256:" + "2".repeat(64) } },
+    ], scheduledTaskGraphGateDecisions: { approvedJobIds: [], pendingJobIds: [job.id], skippedJobIds: [] } }
+    await expect((await import("./scheduled-taskgraph-run-service")).buildScheduledTaskGraphGateResumeState({
       owner, snapshot, attestation: baseAttestation, continuationKey: key, claimToken, ownedJobs: [job],
-      persistedCheckpoint: checkpoint, prepareProof: { receipt: prepareReceipt, completion: {}, result: { taskId: "prepare_1" } },
+      persistedCheckpoint: checkpoint, prepareProof: workerPrepareProof(),
+    })).rejects.toBeInstanceOf(Error)
+    expect(mocks.gateInput).not.toHaveBeenCalled()
+    const serialized = (await import("./scheduled-taskgraph-run-service")).serializeScheduledTaskGraphCheckpoint({
+      ...checkpoint, gateOutput: { approved: [], pending: [{ job: { id: job.id }, coverLetter: "private-letter-body" }], skipped: [] } as never,
     })
-    expect(resume.nextStage).toBe("execute")
-    expect(resume.gateOutput?.approved).toHaveLength(1)
-    expect(resume.gateOutput?.approved[0]?.job.id).toBe(job.id)
+    expect(serialized?.scheduledTaskGraphGateDecisions).toEqual({ approvedJobIds: [], pendingJobIds: [job.id], skippedJobIds: [] })
+    expect(JSON.stringify(serialized)).not.toContain("private-letter-body")
   })
 })

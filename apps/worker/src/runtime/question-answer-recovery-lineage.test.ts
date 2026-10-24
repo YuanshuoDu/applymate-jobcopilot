@@ -51,8 +51,15 @@ function client(itemRows: Row[] = [item()], eventRows: Row[] = events(), rootOnl
     }
     if (sql.includes('event."idempotencyKey" = ANY($2::text[])')) return { rows: [] }
     if (sql.includes('SELECT prior."id", prior."createdAt", root."id" AS "rootTaskId"')) return { rows: [], rowCount: 0 }
-    return { rows: sql.includes('FROM "agent_items"')
-      ? rootOnly ? itemRows.filter(row => row.taskId === rootTaskId) : itemRows : eventRows }
+    if (!sql.includes('FROM "agent_items"')) return { rows: eventRows }
+    const candidates = rootOnly ? itemRows.filter(row => row.taskId === rootTaskId) : itemRows
+    const filtersPrivateStages = sql.includes(`IS DISTINCT FROM 'scheduled_prepare'`)
+      && sql.includes(`IS DISTINCT FROM 'scheduled_gate'`)
+    const rows = filtersPrivateStages ? candidates.filter(row => {
+      const stage = (row.content as Row | undefined)?.stage
+      return stage !== 'scheduled_prepare' && stage !== 'scheduled_gate'
+    }) : candidates
+    return { rows, rowCount: rows.length }
   }) }
   return value as unknown as Pick<pg.PoolClient, "query"> & { readonly query: typeof value.query }
 }
@@ -89,6 +96,40 @@ describe("durable question answer lineage", () => {
     expect(await recoverAnsweredQuestionHistory(client(rows, eventRows), supplied)).toEqual(lineage.flatMap(row => row.entries))
   })
 
+  it("excludes private scheduled Prepare and Gate choices while retaining native and legacy questions", async () => {
+    const ordinary = item("ordinary-question", "ordinary-wait", "ordinary-call", { taskId: rootTaskId, content: {
+      ...(item("ordinary-question", "ordinary-wait", "ordinary-call").content as Row), stage: "user_input",
+    } })
+    const legacy = item("legacy-question", "legacy-wait", "legacy-call", { taskId: null })
+    const prepare = item("prepare-question", "prepare-wait", "unused-call", { taskId: rootTaskId, content: {
+      ...(item("prepare-question", "prepare-wait", "unused-call").content as Row), toolCallId: null, stage: "scheduled_prepare",
+      answer: "keep_resume", answerAvailable: true, scheduledPrepareChoiceBinding: { privateBinding: "DO_NOT_PROJECT_PREPARE" },
+    } })
+    const gate = item("gate-question", "gate-wait", "unused-call", { taskId: rootTaskId, content: {
+      ...(item("gate-question", "gate-wait", "unused-call").content as Row), toolCallId: null, stage: "scheduled_gate",
+      answer: "skip", answerAvailable: true,
+      scheduledGateChoiceBinding: { privateBinding: "DO_NOT_PROJECT" },
+      scheduledGateChoiceResumeAcknowledgement: { privateAck: "DO_NOT_PROJECT" },
+    } })
+    const eventRows = [...events(ordinary), ...events(legacy), ...events(prepare), ...events(gate)]
+    const f = client([ordinary, legacy, prepare, gate], eventRows)
+    const lineage = await recoverAnsweredQuestionLineage(f, input({ toolItems: [
+      { id: "ordinary-call-item", stepId: "step-1", taskId: rootTaskId, type: "tool_call", content: { toolCallId: "ordinary-call" } },
+      { id: "legacy-call-item", stepId: "step-1", taskId: rootTaskId, type: "tool_call", content: { toolCallId: "legacy-call" } },
+    ] }))
+
+    expect(lineage.map(row => row.item.id)).toEqual(expect.arrayContaining([ordinary.id, legacy.id]))
+    expect(lineage.map(row => row.item.id)).toHaveLength(2)
+    expect(lineage.flatMap(row => row.entries).map(entry => entry.content)).toEqual(expect.arrayContaining([
+      { role: "assistant", type: "question", question: "Where should I focus?", options: [{ label: "Dublin", value: "dublin" }] },
+      { role: "user", type: "answer", questionId: "ordinary-wait", text: "dublin" },
+    ]))
+    expect(JSON.stringify(lineage)).not.toMatch(/DO_NOT_PROJECT|keep_resume|skip/)
+    const itemSql = f.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_items"'))?.[0] ?? ""
+    expect(itemSql).toContain(`IS DISTINCT FROM 'scheduled_prepare'`)
+    expect(itemSql).toContain(`IS DISTINCT FROM 'scheduled_gate'`)
+  })
+
   it("accepts the broker's null-task answer for a turn-scoped question only with the matching root tool call", async () => {
     const question = item()
     const result = await recoverAnsweredQuestionLineage(client([question]), input())
@@ -100,12 +141,22 @@ describe("durable question answer lineage", () => {
   it("keeps the native root-only query separate from legacy broker-scoped history", async () => {
     const rootQuestion = item("question-item", "wait-1", "call-1", { taskId: rootTaskId })
     const brokerQuestion = item("broker-item", "broker-wait", "broker-call", { taskId: null })
-    const f = client([rootQuestion, brokerQuestion], events(rootQuestion), true)
+    const prepare = item("prepare-question", "prepare-wait", "unused-call", { taskId: rootTaskId, content: {
+      ...(item("prepare-question", "prepare-wait", "unused-call").content as Row), toolCallId: null, stage: "scheduled_prepare",
+    } })
+    const gate = item("gate-question", "gate-wait", "unused-call", { taskId: rootTaskId, content: {
+      ...(item("gate-question", "gate-wait", "unused-call").content as Row), toolCallId: null, stage: "scheduled_gate",
+    } })
+    const f = client([rootQuestion, brokerQuestion, prepare, gate], [...events(rootQuestion), ...events(prepare), ...events(gate)], true)
     const result = await recoverAnsweredQuestionLineage(f, input({ rootOnly: true }))
     expect(result).toHaveLength(1)
     expect(result[0]?.item).toEqual(rootQuestion)
-    expect(f.query.mock.calls.some(([sql]) => sql.includes('item."taskId" = $4')
-      && sql.includes('ask_call."content"->>\'toolName\' = \'agent.ask_user\'') && sql.includes("question.answered"))).toBe(true)
+    const rootOnlySql = f.query.mock.calls.find(([sql]) => sql.includes('SELECT item."id"'))?.[0] ?? ""
+    expect(rootOnlySql).toContain('item."taskId" = $4')
+    expect(rootOnlySql).toContain(`IS DISTINCT FROM 'scheduled_prepare'`)
+    expect(rootOnlySql).toContain(`IS DISTINCT FROM 'scheduled_gate'`)
+    expect(rootOnlySql).toContain('ask_call."content"->>\'toolName\' = \'agent.ask_user\'')
+    expect(rootOnlySql).toContain("question.answered")
     const legacy = input({ toolItems: [{ id: "broker-call-item", stepId: "step-1", taskId: rootTaskId,
       type: "tool_call", content: { toolCallId: "broker-call" } }] })
     expect(await recoverAnsweredQuestionLineage(client([brokerQuestion], events(brokerQuestion)), legacy)).toHaveLength(1)
@@ -155,6 +206,11 @@ describe("durable question answer lineage", () => {
   })
 
   it("fails closed when root-call and Step lineage is absent, foreign, or ambiguous", async () => {
+    const ordinaryNullCall = item("native-null-call", "native-null-wait", "unused-call", { taskId: rootTaskId, content: {
+      ...(item("native-null-call", "native-null-wait", "unused-call").content as Row), toolCallId: null, stage: "user_input",
+    } })
+    await expect(recoverAnsweredQuestionLineage(client([ordinaryNullCall], events(ordinaryNullCall)), input({ toolItems: [] })))
+      .rejects.toThrow("question_recovery_tool_lineage_invalid")
     await expect(recoverAnsweredQuestionLineage(client(), input({ rootTaskId: null })))
       .rejects.toThrow("question_recovery_tool_lineage_invalid")
     await expect(recoverAnsweredQuestionLineage(client([item("question-item", "wait-1", "call-1", { stepId: "step-1" })]),

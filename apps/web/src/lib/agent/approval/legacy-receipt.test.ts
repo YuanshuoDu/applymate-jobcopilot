@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Prisma, PrismaClient } from "@prisma/client"
+import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
+import { protocolScope } from "./types"
 import type { LegacyReceiptInput } from "./legacy-receipt"
 
 const mocks = vi.hoisted(() => ({
@@ -16,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   txApprovalFindMany: vi.fn(),
   txTurnFindFirst: vi.fn(),
   queryRaw: vi.fn(),
+  lockOpenSession: vi.fn(),
+  refreshAgentExecutionAttempt: vi.fn(),
 }))
 
 afterEach(() => vi.unstubAllEnvs())
@@ -24,6 +28,11 @@ vi.mock("./store", () => ({
   consumeApprovalAndReserve: mocks.consumeApprovalAndReserve,
   issueApprovalReceipt: mocks.issueApprovalReceipt,
   validatePendingApprovalReceipt: mocks.validatePendingApprovalReceipt,
+}))
+vi.mock("../session/v2-turn", () => ({ lockOpenSession: mocks.lockOpenSession }))
+vi.mock("../execution-control", async importOriginal => ({
+  ...(await importOriginal<typeof import("../execution-control")>()),
+  refreshAgentExecutionAttempt: mocks.refreshAgentExecutionAttempt,
 }))
 vi.mock("../broker/store", () => ({ decideApproval: mocks.decideApproval }))
 vi.mock("./decision", async (importOriginal) => ({
@@ -174,7 +183,7 @@ describe("Gate receipt replay identity", () => {
     vi.stubEnv("AGENT_WORKER_SECRET", "test-server-only-shared-secret")
   })
 
-  function gateInput(overrides: Partial<Pick<LegacyReceiptInput, "jobId" | "material" | "answers" | "revision" | "expiresAt" | "executionAttempt" | "scheduledOwnerFence">> = {}) {
+  function gateInput(overrides: Partial<Pick<LegacyReceiptInput, "jobId" | "material" | "answers" | "revision" | "expiresAt" | "executionAttempt" | "scheduledOwnerFence" | "replayMode" | "prepareInTransaction">> = {}) {
     const jobId = overrides.jobId ?? "job_1"
     const executionAttempt = overrides.executionAttempt ?? { id: "execution_1", attemptCount: 4 }
     const scheduledOwnerFence = overrides.scheduledOwnerFence ?? {
@@ -264,6 +273,86 @@ describe("Gate receipt replay identity", () => {
     const issued = mocks.issueApprovalReceipt.mock.calls.map(call => call[1] as { approvalId: string; nonce: string })
     expect(issued[1]?.approvalId).toBe(issued[0]?.approvalId)
     expect(issued[1]?.nonce).toBe(issued[0]?.nonce)
+  })
+
+  it("binds the versioned scheduled Gate replay identity to the stable continuation key", async () => {
+    const { issueLegacyReceipt } = await import("./legacy-receipt")
+    const first = gateInput({ replayMode: "scheduled-taskgraph-gate-review" })
+    const owner = first.scheduledOwnerFence!
+    const same = gateInput({ replayMode: "scheduled-taskgraph-gate-review", scheduledOwnerFence: {
+      ...owner, claimToken: "claim_token_2", owner: { ...owner.owner, turnLeaseOwnerId: "lease_owner_2", turnLeaseVersion: 6 },
+    } })
+    const changed = gateInput({ replayMode: "scheduled-taskgraph-gate-review", scheduledOwnerFence: { ...owner, key: "continuation_key_2" } })
+
+    await issueLegacyReceipt({} as PrismaClient, first)
+    await issueLegacyReceipt({} as PrismaClient, same)
+    await issueLegacyReceipt({} as PrismaClient, changed)
+
+    const issued = mocks.issueApprovalReceipt.mock.calls.map(call => call[1] as { approvalId: string; nonce: string })
+    expect(issued[1]?.approvalId).toBe(issued[0]?.approvalId)
+    expect(issued[1]?.nonce).toBe(issued[0]?.nonce)
+    expect(issued[2]?.approvalId).not.toBe(issued[0]?.approvalId)
+    expect(issued[2]?.nonce).not.toBe(issued[0]?.nonce)
+  })
+
+  it("probes a scheduled Gate receipt without preparation or writes when absent", async () => {
+    const { findScheduledGateReviewReceiptReplay } = await import("./legacy-receipt")
+    const prepareInTransaction = vi.fn()
+    const input = gateInput({ replayMode: "scheduled-taskgraph-gate-review", prepareInTransaction })
+    const tx = {
+      agentExecution: { findFirst: vi.fn().mockResolvedValue({ id: "execution_1" }) },
+      agentApproval: { findFirst: vi.fn().mockResolvedValue(null) },
+      applicationTask: { findFirst: vi.fn() },
+    }
+    const db = { $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx)) } as unknown as PrismaClient
+
+    await expect(findScheduledGateReviewReceiptReplay(db, input as LegacyReceiptInput & { replayMode: "scheduled-taskgraph-gate-review" })).resolves.toBeNull()
+
+    expect(tx.agentApproval.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { id: expect.stringMatching(/^gate_review_[a-f0-9]{64}$/), userId: "user_1" } }))
+    expect(tx.applicationTask.findFirst).not.toHaveBeenCalled()
+    expect(tx.agentExecution.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: {
+      id: "execution_1", userId: "user_1", status: "running", attemptCount: 4,
+    } }))
+    expect(mocks.refreshAgentExecutionAttempt).not.toHaveBeenCalled()
+    expect(mocks.issueApprovalReceipt).not.toHaveBeenCalled()
+    expect(prepareInTransaction).not.toHaveBeenCalled()
+  })
+
+  it("recovers an exact persisted scheduled Gate receipt and validates its linked task", async () => {
+    const { findScheduledGateReviewReceiptReplay, issueLegacyReceipt } = await import("./legacy-receipt")
+    const input = gateInput({
+      replayMode: "scheduled-taskgraph-gate-review",
+      expiresAt: new Date(Date.now() + 60_000),
+      prepareInTransaction: async () => ({ taskId: "application_task_1", payload: { jobId: "job_1", applicationTaskId: "application_task_1" } }),
+    })
+    await issueLegacyReceipt({} as PrismaClient, input)
+    const issued = mocks.issueApprovalReceipt.mock.calls[0]?.[1] as {
+      approvalId: string; nonce: string; scope: Parameters<typeof protocolScope>[0]; title: string; body: string; payload: unknown
+    }
+    const nonceHash = await hashApprovalNonce(issued.nonce)
+    const scopeHash = await hashApprovalScope(protocolScope(issued.scope, nonceHash))
+    const row = {
+      id: issued.approvalId, userId: "user_1", sessionId: "session_1", turnId: "turn_1", taskId: "application_task_1",
+      toolCallId: issued.scope.toolCallId, jobId: "job_1", type: "review_application", status: "pending",
+      title: issued.title, body: issued.body, impact: null, payload: { jobId: "job_1", applicationTaskId: "application_task_1" },
+      resourceHash: issued.scope.resourceHash, materialHash: issued.scope.materialHash, answersHash: issued.scope.answersHash,
+      scopeHash, nonceHash, revision: issued.scope.revision, expiresAt: issued.scope.expiresAt, decidedAt: null, consumedAt: null,
+      createdAt: new Date(),
+    }
+    const tx = {
+      agentExecution: { findFirst: vi.fn().mockResolvedValue({ id: "execution_1" }) },
+      agentApproval: { findFirst: vi.fn().mockResolvedValue(row) },
+      applicationTask: { findFirst: vi.fn().mockResolvedValue({ id: "application_task_1" }) },
+    }
+    const db = { $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx)) } as unknown as PrismaClient
+
+    const recovered = await findScheduledGateReviewReceiptReplay(db, input as LegacyReceiptInput & { replayMode: "scheduled-taskgraph-gate-review" })
+
+    expect(recovered).toMatchObject({ approval: { id: issued.approvalId, status: "pending" }, nonce: issued.nonce })
+    expect(tx.applicationTask.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: {
+      id: "application_task_1", userId: "user_1", jobId: "job_1", sessionId: "session_1",
+    } }))
+    expect(mocks.issueApprovalReceipt).toHaveBeenCalledTimes(1)
   })
 
   it("fails closed without the existing shared server signing secret", async () => {

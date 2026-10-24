@@ -3,17 +3,25 @@ import { createHash } from "node:crypto"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationEvaluation } from "../planning/task-graph-verification.js"
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
-import { ROLE_RESULT_SCHEMA, type AnalystResult, type ScoutResult } from "./role-results.js"
-import { TASK_GRAPH_VERIFIER_VERSION, publicTaskGraphVerificationReport, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { ROLE_RESULT_SCHEMA, validateRoleResult, type AnalystResult, type ScoutResult } from "./role-results.js"
+import { TASK_GRAPH_VERIFIER_VERSION, publicTaskGraphVerificationReport, type TaskGraphStoredVerificationReport, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, canonicalTaskGraphJson, parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { taskGraphResultDigest, type TaskGraphPgVerificationResult } from "./task-graph-pg-verification.js"
 import type { TaskGraphCurrentState } from "./task-graph-command-port.js"
+import { buildScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, scheduledPrepareResultDigest } from "./scheduled-prepare-task-graph-verification.js"
+import type { PrepareResult } from "./role-results.js"
+import { TASK_GRAPH_TEMPLATES as TEMPLATES } from "./task-graph-templates.js"
+import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_OUTPUT_SCHEMA,
+  SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
+import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import {
   createScheduledAutomationPipelineBridge,
   SCHEDULED_PIPELINE_ATTESTATION_SCHEMA,
   type ScheduledAutomationPipelineBridgeDependencies,
   type ScheduledAutomationPipelineBridgeScope,
   type ScheduledAutomationPipelineBridgeState,
+  type ScheduledAutomationPipelineAttestation,
 } from "./scheduled-automation-pipeline-bridge.js"
 
 const scope: ScheduledAutomationPipelineBridgeScope = {
@@ -75,7 +83,7 @@ function makeFixture(options: FixtureOptions = {}) {
     nodeKey: scoutNode.key, taskId: scoutNode.taskId, attemptCount: 2, nodeDigest: taskGraphResultDigest(scoutNode),
     resultDigest: scoutReport.resultDigest!, evidenceDigest: scoutEvidenceDigest, reportDigest: taskGraphResultDigest(scoutReport),
   }
-  const analystReport = {
+  const analystReport: TaskGraphStoredVerificationReport = {
     verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
     criteria: [{ criterionId: "uses-scout", status: "passed", reasonCode: "criteria_met" }],
     evidenceDigest: analystEvidenceDigest, resultDigest: taskGraphResultDigest(analystResult), dependencyBindings: [dependencyBinding],
@@ -115,7 +123,90 @@ function makeFixture(options: FixtureOptions = {}) {
   }
   const verifyCompletedNode = vi.fn(async (input: Parameters<ScheduledAutomationPipelineBridgeDependencies["verifyCompletedNode"]>[0]) => verificationProof(input.structuredResult, input.node.templateId))
   const dependencies: ScheduledAutomationPipelineBridgeDependencies = { load: async () => state, verifyCompletedNode }
-  return { state, dependencies, verifyCompletedNode, scoutResult }
+  return { state, dependencies, verifyCompletedNode, scoutResult, scoutReport, analystReport }
+}
+
+const PREPARE_GOAL = "Prepare application materials using the persisted scheduled Analyze checkpoint."
+const PREPARE_CRITERIA = [
+  "Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.",
+  "Persist immutable owner-fenced material references and return no resume or letter bodies.",
+]
+
+function appendVerifiedPrepareAndGate(fixture: ReturnType<typeof makeFixture>, withGate: boolean) {
+  const snapshot = fixture.state.snapshot as { schemaVersion: string; nodes: readonly unknown[] }
+  const current = fixture.state.current
+  const prepareNode = { key: "prepare", taskId: "prepare-task", templateId: "prepare", goal: PREPARE_GOAL,
+    successCriteria: PREPARE_CRITERIA, dependsOn: ["analyst-node"], depth: 3, verificationDisposition: "specialized" }
+  const prepareResult: PrepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed",
+    taskId: "prepare-task", attemptCount: 1, snapshotDigest: `sha256:${"b".repeat(64)}`, checkpointDigest: "d".repeat(64), jobs: [], materials: [] }
+  const binding = { owner: { ...scope, executionId: "execution-1", executionAttemptCount: 1 },
+    continuationKey: `scheduled-taskgraph:sha256:${"f".repeat(64)}`, snapshotDigest: prepareResult.snapshotDigest,
+    evidenceDigest: "c".repeat(64), checkpointDigest: prepareResult.checkpointDigest,
+    analyzeGraphRevision: 7, prepareScheduleRevision: 8 }
+  const continuationKey = scheduledTaskGraphStableContinuationKey(binding)
+  if (!continuationKey) throw new Error("test_prepare_binding_invalid")
+  const receipt = buildScheduledTaskGraphContinuationReceipt({ ...binding, continuationKey })
+  if (!receipt) throw new Error("test_prepare_receipt_invalid")
+  const facts = { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, receipt, result: prepareResult,
+    completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 9, nodes: [
+      { taskId: "scout-task", attemptCount: 2, role: "scout", taskType: TEMPLATES.scout.taskType,
+        status: "completed", verification: "passed", dependsOnTaskIds: [] },
+      { taskId: "analyst-task", attemptCount: 3, role: "analyst", taskType: TEMPLATES.analyst.taskType,
+        status: "completed", verification: "passed", dependsOnTaskIds: ["scout-task"] },
+      { taskId: "prepare-task", attemptCount: 1, role: "prepare", taskType: TEMPLATES.prepare.taskType,
+        status: "completed", verification: "passed", dependsOnTaskIds: ["analyst-task"],
+        tool: "scheduled.application.prepare@1", resultDigest: scheduledPrepareResultDigest(prepareResult) },
+    ] } }
+  const prepareTask = { id: "prepare-task", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+    rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId, role: TEMPLATES.prepare.role,
+    taskType: TEMPLATES.prepare.taskType, status: "completed", attemptCount: 1, failureReason: null,
+    expectedOutputSchema: TEMPLATES.prepare.expectedOutputSchema, allowedActions: TEMPLATES.prepare.allowedActions,
+    result: { status: "completed", structuredResult: prepareResult, taskGraphScheduledPrepareProofFacts: facts } }
+  const currentPrepare = { ...prepareNode, status: "completed", readiness: "ready", resultSummary: null, failureReason: null }
+  const nodes = [...snapshot.nodes, prepareNode]
+  const currentNodes = [...current.nodes, currentPrepare]
+  const tasks = [...fixture.state.tasks, prepareTask]
+  if (withGate) {
+    const gateNode = { key: SCHEDULED_GATE_TEMPLATE_ID, taskId: "gate-task", templateId: SCHEDULED_GATE_TEMPLATE_ID,
+      goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA, dependsOn: ["prepare"], depth: 4,
+      verificationDisposition: "specialized" }
+    nodes.push(gateNode)
+    currentNodes.push({ ...gateNode, status: "waiting_for_user", readiness: "blocked_dependency", resultSummary: null, failureReason: null })
+    tasks.push({ id: "gate-task", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId, role: SCHEDULED_GATE_ROLE,
+      taskType: SCHEDULED_GATE_TASK_TYPE, status: "waiting_for_user", attemptCount: 1, failureReason: null,
+      expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA, allowedActions: [], result: { status: "waiting_for_user" } })
+  }
+  const extendedState = { ...fixture.state,
+    snapshot: { schemaVersion: snapshot.schemaVersion, nodes },
+    current: { revision: withGate ? 10 : 9, nodes: currentNodes } as unknown as TaskGraphCurrentState,
+    tasks,
+  }
+  return { ...fixture, state: extendedState,
+    dependencies: { ...fixture.dependencies, load: async () => extendedState } }
+}
+
+function legacyEvidenceDigest(fixture: ReturnType<typeof makeFixture>, attestation: ScheduledAutomationPipelineAttestation): string {
+  const stableOwner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+    rootTaskId: scope.rootTaskId, rootAttemptCount: scope.rootAttemptCount }
+  const digest = (value: unknown) => createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex")
+  return digest({ owner: stableOwner, snapshotDigest: attestation.snapshotDigest,
+    graphDigest: digest(parseTaskGraphSnapshot(fixture.state.snapshot)), graphRevision: 7,
+    receipt: attestation.scout.discoveryReceipt.receiptDigest,
+    scout: { taskId: "scout-task", attemptCount: 2, report: publicTaskGraphVerificationReport(fixture.scoutReport) },
+    analyst: { taskId: "analyst-task", attemptCount: 3, report: publicTaskGraphVerificationReport(fixture.analystReport),
+      bindings: fixture.analystReport.dependencyBindings },
+  })
+}
+
+function alterTaskResult(fixture: ReturnType<typeof makeFixture>, taskId: string) {
+  const state = { ...fixture.state, tasks: fixture.state.tasks.map(task => {
+    if (task.id !== taskId) return task
+    const envelope = task.result as Record<string, unknown>
+    const result = envelope.structuredResult as Record<string, unknown>
+    return { ...task, result: { ...envelope, structuredResult: { ...result, summary: "Changed persisted evidence" } } }
+  }) }
+  return { ...fixture, dependencies: { ...fixture.dependencies, load: async () => state } }
 }
 
 function taskRecord(id: string, role: string, taskType: string, attemptCount: number, result: unknown) {
@@ -190,6 +281,43 @@ describe("scheduled automation TaskGraph pipeline bridge", () => {
       expect(after.attestation.evidenceDigest).toBe(before.attestation.evidenceDigest)
     }
   })
+
+  it("preserves the legacy Analyze identity through valid Prepare and Gate suffixes", async () => {
+    const base = makeFixture()
+    const prepare = appendVerifiedPrepareAndGate(makeFixture(), false)
+    const gate = appendVerifiedPrepareAndGate(makeFixture(), true)
+    const rotatedGate = appendVerifiedPrepareAndGate(makeFixture({ turnLeaseOwnerId: "worker-2", turnLeaseVersion: 6 }), true)
+    const [baseResult, prepareResult, gateResult, rotatedResult] = await Promise.all([
+      createScheduledAutomationPipelineBridge(base.dependencies)(scope),
+      createScheduledAutomationPipelineBridge(prepare.dependencies)(scope),
+      createScheduledAutomationPipelineBridge(gate.dependencies)(scope),
+      createScheduledAutomationPipelineBridge(rotatedGate.dependencies)({ ...scope, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 6 }),
+    ])
+    expect([baseResult.status, prepareResult.status, gateResult.status, rotatedResult.status]).toEqual(["ready", "ready", "ready", "ready"])
+    if (baseResult.status !== "ready" || prepareResult.status !== "ready" || gateResult.status !== "ready" || rotatedResult.status !== "ready") return
+    const baseline = baseResult.attestation
+    expect(baseline.evidenceDigest).toBe(legacyEvidenceDigest(base, baseline))
+    expect(prepareResult.attestation.evidenceDigest).toBe(baseline.evidenceDigest)
+    expect(gateResult.attestation.evidenceDigest).toBe(baseline.evidenceDigest)
+    expect(rotatedResult.attestation.evidenceDigest).toBe(baseline.evidenceDigest)
+    const key = scheduledTaskGraphContinuationKey(scope, baseline, "execution-1", 1)
+    expect(scheduledTaskGraphContinuationKey(scope, prepareResult.attestation, "execution-1", 1)).toBe(key)
+    expect(scheduledTaskGraphContinuationKey(scope, gateResult.attestation, "execution-1", 1)).toBe(key)
+    expect(scheduledTaskGraphContinuationKey({ ...scope, turnLeaseOwnerId: "worker-2", turnLeaseVersion: 6 },
+      rotatedResult.attestation, "execution-1", 1)).toBe(key)
+  })
+
+  it.each([["Scout", "scout-task"], ["Analyst", "analyst-task"]] as const)(
+    "rejects changed persisted %s evidence instead of re-attesting it", async (_role, taskId) => {
+      const fixture = alterTaskResult(makeFixture(), taskId)
+      const state = await fixture.dependencies.load()
+      const task = state.tasks.find(value => value.id === taskId)!
+      const envelope = task.result as Record<string, unknown>
+      expect(() => validateRoleResult(envelope.structuredResult, taskId === "scout-task" ? "scout" : "analyst")).not.toThrow()
+      await expect(createScheduledAutomationPipelineBridge(fixture.dependencies)(scope))
+        .resolves.toEqual({ status: "blocked", reasonCode: "task_graph_evidence_unverified" })
+    },
+  )
 
   it("accepts zero candidates only when the canonical verifier proves the complete server receipt", async () => {
     const fixture = makeFixture({ candidateIds: [], findingIds: [], health: { candidateCount: 0 } })

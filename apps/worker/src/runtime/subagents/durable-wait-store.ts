@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 
-import type { DurableWaitControlReader, DurableWaitPort, DurableWaitResult } from "../tools/coordination-types.js"
+import type { DurableWaitControlReader, DurableWaitInvocation, DurableWaitPort, DurableWaitResult,
+  DurableWaitScheduledGateInvocation, DurableWaitScheduledGatePort } from "../tools/coordination-types.js"
 import { createPgDurableWaitControlReader } from "./durable-wait-control-reader.js"
+import { matchScheduledGateWaitTarget, scheduledGateWaitReplayMatches, type ScheduledGateWaitMatcher } from "./scheduled-gate-wait-match.js"
 import { suspendAndReleaseWait, type DurableWaitHandoffInput, type DurableWaitHandoffResult } from "./durable-wait-handoff.js"
 import { reconcileDurableWaits, type DurableWaitReconcileOptions, type DurableWaitReconcileReport } from "./durable-wait-resolver.js"
 
@@ -17,7 +19,7 @@ type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 
 export type DurableWaitResolveInput = { readonly userId: string; readonly sessionId: string; readonly waitId: string; readonly now?: Date }
-export type DurableWaitStore = DurableWaitPort & DurableWaitControlReader & {
+export type DurableWaitStore = DurableWaitPort & DurableWaitScheduledGatePort & DurableWaitControlReader & {
   resolve(input: DurableWaitResolveInput): Promise<DurableWaitResult | null>
   suspendAndRelease(input: DurableWaitHandoffInput): Promise<DurableWaitHandoffResult>
   reconcile(input?: DurableWaitReconcileOptions): Promise<DurableWaitReconcileReport>
@@ -85,7 +87,7 @@ function ensureScope(row: Row | undefined, message: string): Row {
 }
 function active(value: unknown, allowed: readonly string[]): boolean { return allowed.includes(String(value)) }
 function durableWaitReplayMatches(
-  row: Row, input: Parameters<DurableWaitPort["wait"]>[0], targetTaskIds: readonly string[],
+  row: Row, input: DurableWaitInvocation, targetTaskIds: readonly string[], gateMatcher?: ScheduledGateWaitMatcher,
 ): boolean {
   const createdAt = date(row.createdAt, "createdAt")
   const deadlineAt = date(row.deadlineAt, "deadlineAt")
@@ -93,17 +95,18 @@ function durableWaitReplayMatches(
   const timeoutMs = typeof request.timeoutMs === "number" ? request.timeoutMs : deadlineAt.getTime() - createdAt.getTime()
   const storedTargets = Array.isArray(request.targetTaskIds) ? request.targetTaskIds.filter((value): value is string => typeof value === "string") : ids(row.targetTaskIds)
   const storedMode = typeof request.mode === "string" ? request.mode : String(row.mode)
-  return String(row.userId) === input.userId && String(row.sessionId) === input.sessionId && String(row.turnId) === input.turnId
+  return scheduledGateWaitReplayMatches(row.result, gateMatcher)
+    && String(row.userId) === input.userId && String(row.sessionId) === input.sessionId && String(row.turnId) === input.turnId
     && String(row.stepId) === input.stepId && storedMode === input.mode && timeoutMs === input.timeoutMs && sameIds(storedTargets, targetTaskIds)
 }
-function waitReplay(row: Row, input: Parameters<DurableWaitPort["wait"]>[0], normalized: ReturnType<typeof validateInput>): DurableWaitResult {
-  if (!durableWaitReplayMatches(row, input, normalized.targetTaskIds)) throw new DurableWaitStoreError("wait_conflict", "Wait idempotency key has conflicting payload")
+function waitReplay(row: Row, input: DurableWaitInvocation, normalized: ReturnType<typeof validateInput>, gateMatcher?: ScheduledGateWaitMatcher): DurableWaitResult {
+  if (!durableWaitReplayMatches(row, input, normalized.targetTaskIds, gateMatcher)) throw new DurableWaitStoreError("wait_conflict", "Wait idempotency key has conflicting payload")
   return result(row)
 }
 
 export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
   const controlReader = createPgDurableWaitControlReader(pool, (row, input) => durableWaitReplayMatches(row, input, input.targetTaskIds))
-  async function wait(input: Parameters<DurableWaitPort["wait"]>[0]): Promise<DurableWaitResult> {
+  async function wait(input: DurableWaitInvocation, gateMatcher?: ScheduledGateWaitMatcher): Promise<DurableWaitResult> {
     const normalized = validateInput(input)
     return transaction(pool, input.userId, async client => {
       const session = (await client.query<Row>(`SELECT session."id", session."userId", session."status"
@@ -126,29 +129,59 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
         WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION}`, [normalized.targetTaskIds, input.sessionId, input.userId])
       if (targets.rows.length !== normalized.targetTaskIds.length) throw new DurableWaitStoreError("wait_scope_error", "A wait target is unavailable")
       for (const target of targets.rows) if (String(target.rootTaskId ?? target.id) !== normalized.rootTaskId || String(target.turnId ?? "") !== input.turnId || String(target.id) === normalized.parentTaskId) throw new DurableWaitStoreError("wait_scope_error", "Wait target is outside the task tree")
+      let gateDisposition: "pending" | "matched" | null = null
+      if (gateMatcher) {
+        if (normalized.parentTaskId !== normalized.rootTaskId || normalized.targetTaskIds.length !== 1
+          || normalized.targetTaskIds[0] !== gateMatcher.gateTaskId) throw new DurableWaitStoreError("wait_scope_error", "Scheduled Gate wait is outside the root scope")
+        const match = await matchScheduledGateWaitTarget(client, { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId,
+          rootTaskId: normalized.rootTaskId, stepId: input.stepId, gateTaskId: gateMatcher.gateTaskId, requestAttemptCount: gateMatcher.requestAttemptCount })
+        if (match !== "pending" && match !== "matched") throw new DurableWaitStoreError("wait_scope_error", "Scheduled Gate wait target is unavailable")
+        gateDisposition = match
+      }
       const existing = await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"
         FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2
           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`, [normalized.parentTaskId, input.idempotencyKey])
-      if (existing.rows[0]) return waitReplay(existing.rows[0], input, normalized)
+      if (existing.rows[0]) return waitReplay(existing.rows[0], input, normalized, gateMatcher)
       if (!active(parent.status, ACTIVE_TASK_STATUSES)) throw new DurableWaitStoreError("wait_scope_error", "Parent task is not active")
       if (!active(turn.status, ACTIVE_TURN_STATUSES)) throw new DurableWaitStoreError("wait_scope_error", "Turn is not active")
       const deadlineAt = new Date(normalized.now.getTime() + input.timeoutMs)
-      const matchedTaskIds = targets.rows.filter(target => TERMINAL_TASK_STATUSES.has(String(target.status))).map(target => String(target.id)).sort()
-      const status = normalized.now >= deadlineAt ? "timed_out" : (input.mode === "any" ? matchedTaskIds.length > 0 : matchedTaskIds.length === targets.rows.length) ? "ready" : "waiting"
+      const matchedTaskIds = gateMatcher ? gateDisposition === "matched" ? [gateMatcher.gateTaskId] : []
+        : targets.rows.filter(target => TERMINAL_TASK_STATUSES.has(String(target.status))).map(target => String(target.id)).sort()
+      const status = normalized.now >= deadlineAt ? "timed_out" : gateMatcher ? gateDisposition === "matched" ? "ready" : "waiting"
+        : (input.mode === "any" ? matchedTaskIds.length > 0 : matchedTaskIds.length === targets.rows.length) ? "ready" : "waiting"
+      const request = { targetTaskIds: normalized.targetTaskIds, mode: input.mode, timeoutMs: input.timeoutMs,
+        ...(gateMatcher ? { scheduledGate: gateMatcher } : {}) }
       const inserted = await client.query<Row>(`INSERT INTO "agent_wait_conditions"
         ("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt", "updatedAt")
         SELECT $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $14
         WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND session."userId" = $2 AND ${OPEN_SESSION})
         ON CONFLICT ("parentTaskId", "idempotencyKey") DO NOTHING
         RETURNING "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"`,
-      [`wait-${randomUUID()}`, input.userId, input.sessionId, input.turnId, normalized.parentTaskId, input.stepId, input.idempotencyKey, json(normalized.targetTaskIds), input.mode, status, deadlineAt, json(matchedTaskIds), json({ request: { targetTaskIds: normalized.targetTaskIds, mode: input.mode, timeoutMs: input.timeoutMs } }), normalized.now])
+      [`wait-${randomUUID()}`, input.userId, input.sessionId, input.turnId, normalized.parentTaskId, input.stepId, input.idempotencyKey, json(normalized.targetTaskIds), input.mode, status, deadlineAt, json(matchedTaskIds), json({ request }), normalized.now])
       if (inserted.rows[0]) return result(inserted.rows[0])
       const replay = await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"
         FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2
           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`, [normalized.parentTaskId, input.idempotencyKey])
       if (!replay.rows[0]) throw new DurableWaitStoreError("wait_conflict", "Wait idempotency record was lost")
-      return waitReplay(replay.rows[0], input, normalized)
+      return waitReplay(replay.rows[0], input, normalized, gateMatcher)
     })
+  }
+
+  async function waitScheduledGate(input: DurableWaitScheduledGateInvocation): Promise<DurableWaitResult> {
+    const allowed = ["gateTaskId", "requestAttemptCount", "userId", "sessionId", "turnId", "stepId", "taskId", "rootTaskId", "timeoutMs", "idempotencyKey"]
+    if (!input || typeof input !== "object" || Object.keys(input).sort().join(",") !== [...allowed].sort().join(",")) {
+      throw new DurableWaitStoreError("wait_invalid", "Scheduled Gate wait input is invalid")
+    }
+    const gateTaskId = required(input.gateTaskId, "gateTaskId")
+    if (!Number.isSafeInteger(input.requestAttemptCount) || input.requestAttemptCount < 0 || input.requestAttemptCount === Number.MAX_SAFE_INTEGER) {
+      throw new DurableWaitStoreError("wait_invalid", "Scheduled Gate wait attempt is invalid")
+    }
+    const parentTaskId = input.taskId ?? input.rootTaskId
+    if (typeof input.rootTaskId !== "string" || parentTaskId !== input.rootTaskId) throw new DurableWaitStoreError("wait_scope_error", "Scheduled Gate wait requires the root task")
+    const gateMatcher = { gateTaskId, requestAttemptCount: input.requestAttemptCount }
+    return wait({ userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
+      taskId: input.taskId, rootTaskId: input.rootTaskId, targetTaskIds: [gateTaskId], mode: "any",
+      timeoutMs: input.timeoutMs, idempotencyKey: input.idempotencyKey }, gateMatcher)
   }
 
   async function resolve(input: DurableWaitResolveInput): Promise<DurableWaitResult | null> {
@@ -206,7 +239,7 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
   }
 
   return {
-    wait, resolve, cancel,
+    wait, waitScheduledGate, resolve, cancel,
     readByInvocation: (input, admission) => controlReader.readByInvocation(input, admission),
     suspendAndRelease: input => suspendAndReleaseWait(pool, input),
     reconcile: input => reconcileDurableWaits(pool, input),

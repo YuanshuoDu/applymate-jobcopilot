@@ -4,6 +4,7 @@ import type pg from "pg"
 
 import type { LeasePool } from "../turns/lease.js"
 import { reconcileDurableSubagentWaits } from "./durable-subagent-wait-resolver.js"
+import { matchScheduledGateWaitTarget, scheduledGateWaitMatcherFromResult } from "./scheduled-gate-wait-match.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -119,10 +120,23 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
     [targetIds, turn.sessionId, turn.id, turn.userId],
   )
   if (targets.rows.length !== targetIds.length || targets.rows.some(target => String(target.rootTaskId ?? target.id) !== rootTaskId || String(target.id) === rootTaskId)) return "ignored"
-  const waitStatus = String(wait.status)
   const deadline = date(wait.deadlineAt)
-  const matched = targets.rows.filter(target => terminal(target.status)).map(target => String(target.id)).sort()
-  let resolvedStatus = deadline && now >= deadline ? "timed_out" : String(wait.mode) === "any" && matched.length > 0 ? "ready" : String(wait.mode) === "all" && matched.length === targetIds.length ? "ready" : "waiting"
+  const matcher = scheduledGateWaitMatcherFromResult(wait.result)
+  if (matcher === undefined) return "ignored"
+  let matched: string[]
+  let resolvedStatus: string
+  if (matcher) {
+    if (targetIds.length !== 1 || targetIds[0] !== matcher.gateTaskId) return "ignored"
+    const disposition = await matchScheduledGateWaitTarget(client, { userId: String(turn.userId), sessionId: String(turn.sessionId),
+      turnId: String(turn.id), rootTaskId, stepId: String(wait.stepId), gateTaskId: matcher.gateTaskId, requestAttemptCount: matcher.requestAttemptCount })
+    if (disposition === null || disposition === "stale" && (!deadline || now < deadline)) return "ignored"
+    matched = disposition === "matched" ? [matcher.gateTaskId] : []
+    resolvedStatus = deadline && now >= deadline ? "timed_out" : disposition === "matched" ? "ready" : "waiting"
+  } else {
+    matched = targets.rows.filter(target => terminal(target.status)).map(target => String(target.id)).sort()
+    resolvedStatus = deadline && now >= deadline ? "timed_out" : String(wait.mode) === "any" && matched.length > 0 ? "ready" : String(wait.mode) === "all" && matched.length === targetIds.length ? "ready" : "waiting"
+  }
+  const waitStatus = String(wait.status)
   if (resolvedStatus === "waiting" && waitStatus === "waiting" && wait.suspendedAt !== null && wait.suspendedAt !== undefined
     && String(turn.status) === "waiting_for_dependency" && String(turn.sessionStatus) === "running" && (turn.leaseOwnerId === null || turn.leaseOwnerId === undefined)) {
     const steer = await client.query<{ pending: boolean }>(
@@ -183,7 +197,7 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
     for (const turn of turns.rows) {
       await client.query("SELECT set_config('app.user_id', $1, true)", [String(turn.userId)])
       const waits = await client.query<Row>(
-        `SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "deadlineAt", "suspendedAt", "consumedAt"
+        `SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "deadlineAt", "suspendedAt", "consumedAt", "result"
          FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
            AND "status" IN ('waiting', 'ready', 'timed_out') AND "consumedAt" IS NULL
            AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})

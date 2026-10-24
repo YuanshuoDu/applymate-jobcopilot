@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { executionId, executionKey, parseScheduledPipelineCompletionDisposition, type TurnExecutionIdentity } from "./turn-execution-types.js"
+import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 
 const root: TurnExecutionIdentity = {
   kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
@@ -42,6 +43,23 @@ describe("scheduled pipeline completion disposition", () => {
       .toEqual({ status: "blocked", errorCode: "scheduled_pipeline_entitlement_required" })
   })
 
+  it("preserves only the exact private fixed Gate question binding", () => {
+    const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA,
+      owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
+        executionId: "execution-1", executionAttemptCount: 4 },
+      continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`, snapshotDigest: `sha256:${"b".repeat(64)}`,
+      evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 3, graphRevision: 5,
+      gateTaskId: "gate-1", gateAttempt: 1, kind: "weak_cover_letter", jobIds: ["job-1"],
+      allowedChoiceIds: ["continue", "review", "skip"] } as const
+    const waitId = turnScheduledGateChoiceWaitId(binding)!
+    const value = { status: "waiting_for_scheduled_gate_choice", waitId, candidateText: "Exact candidate.",
+      question: "A prepared application has a weak cover letter. How should I handle it?", binding }
+    expect(parseScheduledPipelineCompletionDisposition(value)).toEqual(value)
+    expect(parseScheduledPipelineCompletionDisposition({ ...value, waitId: "another-wait" })).toBeNull()
+    expect(parseScheduledPipelineCompletionDisposition({ ...value, question: "Use this untrusted question" })).toBeNull()
+    expect(parseScheduledPipelineCompletionDisposition({ ...value, extra: "not private" })).toBeNull()
+  })
+
   it.each([
     null,
     { status: "blocked", candidateText: "candidate" },
@@ -54,6 +72,7 @@ describe("scheduled pipeline completion disposition", () => {
     { status: "waiting_for_dependency", waitId: "dependency-123", candidateText: "candidate", errorCode: "ignored" },
     { status: "waiting_for_user", waitId: " question-123", candidateText: "candidate" },
     { status: "waiting_for_user", waitId: "question-123", candidateText: "candidate", errorCode: "ignored" },
+    { status: "waiting_for_scheduled_gate_choice", waitId: "question-123", candidateText: "candidate", question: "Question?", binding: {} },
     { status: "waiting_for_external_user", externalWaitId: "web-question-123", scheduledWaitId: "web-question-123", candidateText: "candidate" },
     { status: "waiting_for_external_user", externalWaitId: " web-question-123", candidateText: "candidate" },
     { status: "waiting_for_external_user", externalWaitId: "web-question-123", scheduledWaitId: "worker-choice-123", candidateText: " " },

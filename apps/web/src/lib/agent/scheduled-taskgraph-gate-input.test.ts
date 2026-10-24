@@ -5,13 +5,17 @@ import { hashArtifactContent } from './artifacts/hash'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphAnalyzeCheckpointDigest } from './scheduled-taskgraph-gate-checkpoint'
 
-const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), events: vi.fn(), queryRaw: vi.fn() }))
+const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), events: vi.fn(), queryRaw: vi.fn(), gateHistory: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: {
   agentSession: { findFirst: mocks.session }, job: { findMany: mocks.jobs }, resume: { findFirst: mocks.resume },
   personaFact: { findMany: mocks.facts }, agentArtifactVersion: { findMany: mocks.versions }, agentArtifact: { findMany: mocks.heads },
   agentItem: { findFirst: mocks.graph }, subAgentTask: { findMany: mocks.tasks }, agentEvent: { findMany: mocks.events },
   $queryRaw: mocks.queryRaw,
 } }))
+vi.mock('./scheduled-taskgraph-gate-history', async importOriginal => ({
+  ...await importOriginal<typeof import('./scheduled-taskgraph-gate-history')>(),
+  scheduledTaskGraphGateHistoryIsCurrent: mocks.gateHistory,
+}))
 
 import { isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
 
@@ -152,6 +156,36 @@ function setup() {
   return { input, result, proof, graph, resumeArtifact, letterArtifact, analyzeCheckpoint, analyzeAttestation }
 }
 
+function attachGate(input: ScheduledTaskGraphGateInputRequest, proof: ReturnType<typeof makeProof>, graph: Record<string, unknown>, attestation: Record<string, unknown>,
+  overrides: { receipt?: Record<string, unknown>; wait?: Record<string, unknown> } = {}) {
+  const gateTaskId = 'gate-task', continuationKey = String(proof.receipt.continuationKey)
+  const marker = (input.analyzeCheckpoint as { scheduledTaskGraphContinuation: { key: string } }).scheduledTaskGraphContinuation
+  const stableOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount }
+  const receipt = { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-gate-binding.v1', owner: stableOwner, continuationKey,
+    snapshotDigest: proof.receipt.snapshotDigest, evidenceDigest: proof.receipt.evidenceDigest, checkpointDigest: proof.receipt.checkpointDigest,
+    analyzeGraphRevision: proof.receipt.analyzeGraphRevision, prepareScheduleRevision: proof.receipt.prepareScheduleRevision,
+    prepareWaitId: proof.completion.wait.waitId, gateTaskId, gateAppendRevision: proof.completion.graphRevision + 1, ...overrides.receipt }
+  const eventKey = `scheduled-gate-binding:${createHash('sha256').update(JSON.stringify([continuationKey, gateTaskId]), 'utf8').digest('hex')}`
+  const event = { itemId: null, taskId: null, actor: 'system', idempotencyKey: eventKey, payload: receipt, hasOutbox: false }
+  const stepId = 'prepare-root-step', waitKey = `scheduled-prepare-dependency:${createHash('sha256').update(`${marker.key}\0${stepId}`, 'utf8').digest('hex')}`
+  const wait = { id: receipt.prepareWaitId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, parentTaskId: owner.rootTaskId,
+    stepId, idempotencyKey: waitKey, targetTaskIds: ['prepare-task'], mode: 'all', status: 'ready', matchedTaskIds: ['prepare-task'],
+    result: { request: { targetTaskIds: ['prepare-task'], mode: 'all', timeoutMs: 86_400_000 } }, stepTaskId: owner.rootTaskId, stepAttempt: 1,
+    ...overrides.wait }
+  const gateNode = { key: 'gate', taskId: gateTaskId, templateId: 'gate', depth: 4, dependsOn: ['prepare'], verificationDisposition: 'specialized' }
+  const content = graph.content as Record<string, unknown>; content.nodes = [...content.nodes as unknown[], gateNode]
+  graph.revision = proof.completion.graphRevision + 2
+  const rows = taskRows(proof, attestation)
+  rows.push({ id: gateTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+    depth: 1, role: 'prepare', taskType: 'scheduled_taskgraph_gate', status: 'running', attemptCount: 1, maxAttempts: 3, failureReason: null,
+    result: null, expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' }, allowedActions: [] })
+  mocks.tasks.mockResolvedValue(rows)
+  mocks.queryRaw.mockResolvedValueOnce([event]).mockResolvedValueOnce([wait])
+  mocks.gateHistory.mockResolvedValue(true)
+  return { ...input, gate: { taskId: gateTaskId, attemptCount: 1, phase: 'running' as const } }
+}
+
 describe('scheduled TaskGraph Gate input reload', () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
@@ -207,6 +241,29 @@ describe('scheduled TaskGraph Gate input reload', () => {
     await expect(loadScheduledTaskGraphGateInput(input)).resolves.toBeNull()
     expect(mocks.jobs).not.toHaveBeenCalled()
     expect(mocks.versions).not.toHaveBeenCalled()
+  })
+
+  it('binds Gate registration to the exact ready Prepare wait and its owning step', async () => {
+    const valid = setup()
+    const marker = (valid.input.analyzeCheckpoint as { scheduledTaskGraphContinuation: { key: string } }).scheduledTaskGraphContinuation
+    expect(marker.key).not.toBe(valid.proof.receipt.continuationKey)
+    await expect(loadScheduledTaskGraphGateInput(attachGate(valid.input, valid.proof, valid.graph, valid.analyzeAttestation)))
+      .resolves.toMatchObject({ packages: [{ jobId: jobRow.id }] })
+
+    mocks.jobs.mockClear()
+    const mismatched = setup()
+    const request = attachGate(mismatched.input, mismatched.proof, mismatched.graph, mismatched.analyzeAttestation,
+      { wait: { stepTaskId: 'foreign-root' } })
+    await expect(loadScheduledTaskGraphGateInput(request)).resolves.toBeNull()
+    expect(mocks.jobs).not.toHaveBeenCalled()
+
+    mocks.jobs.mockClear()
+    mocks.queryRaw.mockClear()
+    const wrongWait = setup()
+    const wrongRequest = attachGate(wrongWait.input, wrongWait.proof, wrongWait.graph, wrongWait.analyzeAttestation,
+      { receipt: { prepareWaitId: 'not-the-Prepare-wait' } })
+    await expect(loadScheduledTaskGraphGateInput(wrongRequest)).resolves.toBeNull()
+    expect(mocks.queryRaw).toHaveBeenCalledTimes(1)
   })
 
   it('rechecks the root attempt after package hydration before Gate admission', async () => {

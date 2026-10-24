@@ -44,6 +44,7 @@ function graphStatus(type: TaskGraphEventType): SubagentTaskStatus {
   switch (type) {
     case "task.started": return "running"
     case "task.queued": return "queued"
+    case "task.gate_choice_resumed": return "queued"
     case "task.waiting": return "waiting"
     case "task.waiting_for_user": return "waiting_for_user"
     case "task.retrying": return "queued"

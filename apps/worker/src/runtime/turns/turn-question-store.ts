@@ -1,14 +1,13 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { createTurnScheduledPrepareChoiceContent, isTurnQuestionUsage, parseTurnQuestionArguments, parseTurnQuestionIntentEnvelope, parseTurnScheduledPrepareChoiceItem, TurnQuestionStoreError,
-  type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionScheduledChoiceReadInput, type TurnQuestionScheduledChoiceRecovery,
-  type TurnQuestionStore, type TurnQuestionUsageInput, type TurnQuestionWaitInput, type TurnQuestionWaitReceipt } from "./turn-question-contract.js"
+  type TurnQuestionIntentEnvelope, type TurnQuestionRecovery, type TurnQuestionScheduledChoiceReadInput, type TurnQuestionScheduledChoiceRecovery, type TurnQuestionStore, type TurnQuestionUsageInput, type TurnQuestionWaitInput, type TurnQuestionWaitReceipt } from "./turn-question-contract.js"
 import { admitQuestionWork, assertQuestionOwner, assertQuestionUsage, completedQuestionResult, lockQuestionStep, persistedUsage, questionConflict, questionId, questionItemId, recoverIncompleteQuestionCall, withQuestionTransaction, type TurnQuestionPool, type TurnQuestionQueryClient, type TurnQuestionStepRow } from "./turn-question-store-guards.js"
 import { appendQuestionStartedEvents, appendScheduledChoiceWaitEvents, loadScheduledChoiceBinding, OrphanPauseUsageRecoveredError, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
 import { toRepositoryJson } from "./turn-engine-types.js"
 import { cancelPausedQuestion, hasQuestionPauseEvents, recoverPausedPartialQuestion } from "./turn-question-store-cancellation.js"
 import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
 import { readTurnQuestionPlanningWait } from "./turn-question-planning-history.js"
-
+import { readScheduledGateChoice, waitForScheduledGateChoice } from "./turn-question-gate-choice-store.js"
 type Row = Record<string, unknown>
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -120,6 +119,7 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
   return {
     cancelPausedQuestion: input => cancelPausedQuestion(pool, input),
     readScheduledPrepareChoice: input => readScheduledPrepareChoice(pool, input),
+    readScheduledGateChoice: input => readScheduledGateChoice(pool, input),
     async stageQuestionUsage(input: TurnQuestionUsageInput): Promise<void> {
       validUsage(input)
       await withQuestionTransaction(pool, input.owner, async (client, turn) => {
@@ -148,7 +148,9 @@ export function createPgTurnQuestionStore(pool: TurnQuestionPool): TurnQuestionS
     async waitForQuestion(input: TurnQuestionWaitInput): Promise<TurnQuestionWaitReceipt> {
       assertQuestionOwner(input.owner)
       const toolCallId = input.toolCallId
-      if (toolCallId === null) return waitForScheduledChoice(pool, input)
+      const hasGateBinding = input.gateChoiceBinding !== undefined || input.gateChoiceQuestion !== undefined
+      if (toolCallId === null) return hasGateBinding ? waitForScheduledGateChoice(pool, input) : waitForScheduledChoice(pool, input)
+      if (hasGateBinding) throw questionConflict("Gate binding on native tool question")
       if (!input.stepId.trim() || !toolCallId.trim() || !Number.isFinite(input.now.getTime())) throw new TurnQuestionStoreError("question_not_current", "Question call scope is invalid")
       const questionInput = { ...input, toolCallId }
       return withQuestionTransaction(pool, input.owner, async (client, turn) => {

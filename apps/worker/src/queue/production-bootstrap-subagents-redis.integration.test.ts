@@ -242,6 +242,11 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         const task = input.tasks.get(String(values[0]))
         return task && task.sessionId === values[1] ? { rows: [{ id: task.id, turnId: task.turnId }], rowCount: 1 } : none
       }
+      if (sql.includes('SELECT "id", "turnId", "rootTaskId", "role", "taskType" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2')) {
+        const task = input.tasks.get(String(values[0]))
+        return task && task.sessionId === values[1] ? { rows: [{ id: task.id, turnId: task.turnId, rootTaskId: task.rootTaskId,
+          role: task.role, taskType: task.taskType }], rowCount: 1 } : none
+      }
       if (sql.includes('SELECT dispatch."id", dispatch."aggregateId"') && sql.includes('ORDER BY dispatch."createdAt"')) {
         const rows = outbox.filter(row => row.topic === values[0] && row.publishedAt === null).map(row => ({ id: row.id, aggregateId: row.aggregateId, payload: row.payload, attemptCount: row.attemptCount }))
         return { rows, rowCount: rows.length }
@@ -272,6 +277,8 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         const rows = missingDispatchTasks().length > 0 ? [{ id: session.id }] : []
         return { rows, rowCount: rows.length }
       }
+      if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", session."userId"')
+        && sql.includes('session."id" = ANY($1::text[])') && sql.includes("task.\"taskType\" = 'scheduled_taskgraph_gate'")) return none
       if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId"')
         && sql.includes('LEFT JOIN "agent_outbox" AS dispatch') && sql.includes('session."id" = ANY($1::text[])')
         && sql.includes('LIMIT $3 FOR UPDATE OF task SKIP LOCKED')) {

@@ -24,6 +24,9 @@ import { createPgRootTaskHistoryResultPageStore } from "../context/root-task-his
 import { scheduleTaskGraphSupersession, stampCreatedScoutEnvelopes, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { requireNormalizedRootPlanCriteria, requireOwnedRootPlanCriteria, requireRootPlanCriteriaReadback } from "./root-plan-criteria.js"
 import { appendScheduledPrepare as appendScheduledPrepareCommand } from "./pg-scheduled-task-graph-prepare-command.js"
+import { appendScheduledGate as appendScheduledGateCommand } from "./pg-scheduled-task-graph-gate-command.js"
+import { resumeScheduledGateChoice as resumeScheduledGateChoiceCommand } from "./pg-scheduled-task-graph-gate-resume.js"
+import { verifyScheduledGateCompletion as verifyScheduledGateCompletionCommand } from "./pg-scheduled-task-graph-gate-verification.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -32,12 +35,23 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
   const historicalDiscoveryPageStore = createPgRootTaskHistoryResultPageStore(pool)
   return {
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
+      rejectPrivateScheduledGate(input.proposal)
       return transaction(pool, client => schedule(client, input))
     },
     async appendScheduledPrepare(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt> {
       return transaction(pool, client => appendScheduledPrepareCommand(client, input))
     },
+    async appendScheduledGate(input) {
+      return transaction(pool, client => appendScheduledGateCommand(client, input))
+    },
+    async resumeScheduledGateChoice(input) {
+      return transaction(pool, client => resumeScheduledGateChoiceCommand(client, input))
+    },
+    async verifyScheduledGateCompletion(input) {
+      return transaction(pool, client => verifyScheduledGateCompletionCommand(client, input))
+    },
     async appendAndScheduleWithReconciliation(input, operation) {
+      rejectPrivateScheduledGate(input.proposal)
       if (operation.decision !== "revise" || operation.expectedRevision !== input.proposal.expectedRevision
         || !sameExecutionScope(input.scope, operation.scope)) throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")
       return transaction(pool, client => schedule(client, input, operation))
@@ -99,6 +113,7 @@ function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: Steeri
     && left.turnLeaseVersion === right.turnLeaseVersion && left.parentLeaseOwner === right.parentLeaseOwner && left.parentAttemptCount === right.parentAttemptCount
 }
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
+  rejectPrivateScheduledGate(input.proposal)
   const rootSuccessCriteria = requireNormalizedRootPlanCriteria(input.rootSuccessCriteria)
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
@@ -138,6 +153,11 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
     now: new Date(), idempotencyKey: key, fingerprint, receipt })
   if (prepared) await writeSteeringReconciliationReceipt(client, prepared, created.state.revision)
   return receipt
+}
+function rejectPrivateScheduledGate(proposal: TaskGraphScheduleInput["proposal"]): void {
+  if (proposal.nodes.some(node => node.key === "gate" || node.templateId === "gate")) {
+    throw new TaskGraphCommandError("scheduled_gate_private", "The scheduled Gate is available only through its fixed server command")
+  }
 }
 async function requireTaskGraphContinuationBudget(client: Queryable, scope: TaskGraphScheduleInput["scope"]): Promise<void> {
   try {

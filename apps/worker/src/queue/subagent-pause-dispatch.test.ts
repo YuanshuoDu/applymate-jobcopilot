@@ -57,7 +57,7 @@ type RecoveryOptions = { activePause?: boolean; startedAt?: Date | null; marker?
 function recoveryPool(options: RecoveryOptions = {}) {
   const calls: Array<[string, unknown[]?]> = []
   const task = { id: "task-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", status: "queued", startedAt: options.startedAt ?? null,
-    attemptCount: options.attemptCount ?? 0, maxAttempts: options.maxAttempts ?? 3, leaseOwner: null, leaseExpiresAt: null,
+    role: "analyst", taskType: "research", attemptCount: options.attemptCount ?? 0, maxAttempts: options.maxAttempts ?? 3, leaseOwner: null, leaseExpiresAt: null,
     interruptRequestedAt: null, rootStatus: "running", turnStatus: "in_progress", childWaitResumable: options.childWaitResumable ?? false }
   const outbox: { id: string; payload: unknown; publishedAt: Date | null; attemptCount: number; lastError: string | null } = {
     id: "dispatch-1", payload: { ...payload }, publishedAt: new Date(), attemptCount: 3,
@@ -71,13 +71,18 @@ function recoveryPool(options: RecoveryOptions = {}) {
       if (sql.includes("set_config('app.user_id'")) return { rows: [], rowCount: 1 }
       if (sql.includes('SELECT task."turnId" FROM "sub_agent_tasks"')) return { rows: [{ turnId: "turn-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks" AS root') && sql.includes("FOR UPDATE")) return { rows: [{ id: "root-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
+      if (sql.startsWith('SELECT root."id", root."status", root."interruptRequestedAt" FROM "sub_agent_tasks" AS root') && sql.includes("FOR UPDATE")) return { rows: [{ id: "root-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
       if (sql.includes('AS "taskId"') && sql.includes("LIMIT $4")) return { rows: [{ taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, userId: "user-1", dispatchId: outbox.id, payload: outbox.payload, dispatchAttemptCount: outbox.attemptCount }], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('ORDER BY dispatch."createdAt"')) return outbox.publishedAt === null ? { rows: [{ id: outbox.id, aggregateId: "session-1", payload: outbox.payload, attemptCount: outbox.attemptCount }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT session."id", session."status"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", status: "running", userId: "user-1" }], rowCount: 1 }
-      if (sql.startsWith('SELECT "id", "turnId" FROM "sub_agent_tasks"')) return { rows: [{ id: task.id, turnId: task.turnId }], rowCount: 1 }
+      if (sql.startsWith('SELECT "id", "turnId", "rootTaskId", "role", "taskType" FROM "sub_agent_tasks"')) {
+        return { rows: [{ id: task.id, turnId: task.turnId, rootTaskId: task.rootTaskId, role: task.role, taskType: task.taskType }], rowCount: 1 }
+      }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task")) {
-        if (sql.includes('LEFT JOIN "agent_turns" AS turn')) return { rows: [{ ...task, rootId: task.rootTaskId, rootSessionId: task.sessionId, rootTurnId: task.turnId, turnRowId: task.turnId, turnSessionId: task.sessionId, turnUserId: "user-1", turnStatus: "in_progress", retryDue: true }], rowCount: 1 }
+        if (sql.includes('LEFT JOIN "agent_turns" AS turn')) {
+          const row = { ...task, rootId: task.rootTaskId, rootSessionId: task.sessionId, rootTurnId: task.turnId, turnRowId: task.turnId, turnSessionId: task.sessionId, turnUserId: "user-1", turnStatus: "in_progress", retryDue: true }
+          return { rows: [row], rowCount: 1 }
+        }
         return sql.includes('WHERE task."id" = $1 AND task."sessionId" = $3')
           ? { rows: [task], rowCount: 1 }
           : task.startedAt === null || task.childWaitResumable ? { rows: [{ ...task }], rowCount: 1 } : { rows: [], rowCount: 0 }

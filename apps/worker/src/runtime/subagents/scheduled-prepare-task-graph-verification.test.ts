@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import { createHash } from "node:crypto"
 import {
   buildScheduledPrepareTaskGraphProof,
   SCHEDULED_PREPARE_COMPLETION_SCHEMA,
@@ -6,14 +7,46 @@ import {
   scheduledPrepareResultDigest,
   verifyScheduledPrepareTaskGraphEvidence,
 } from "./scheduled-prepare-task-graph-verification.js"
-import { buildScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import { buildScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey,
+  SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT } from "./scheduled-taskgraph-continuation-receipt.js"
 import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphFingerprint } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION, publicTaskGraphVerificationReport } from "./task-graph-verification-report.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attempt.js"
+import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
 import { canonicalJson } from "@jobcopilot/shared"
 import { prepareToolResultJson, type CanonicalToolSourceName } from "../tools/tool-result-reference-types.js"
 import { verifyPrepareToolResultOutput } from "./scheduled-prepare-task-graph-verification.js"
+
+afterEach(() => { gateCheckpointMocks.stableKey = null; gateCheckpointMocks.handoffKey = null
+  gateCheckpointMocks.dependencies.mockReset(); gateCheckpointMocks.nodeEvidence.mockReset(); gateCheckpointMocks.receipts.mockReset() })
+
+const gateCheckpointMocks = vi.hoisted(() => ({ stableKey: null as string | null, handoffKey: null as string | null,
+  dependencies: vi.fn(), nodeEvidence: vi.fn(), receipts: vi.fn() }))
+vi.mock("./scheduled-taskgraph-continuation-receipt.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-taskgraph-continuation-receipt.js")>()
+  return { ...actual, scheduledTaskGraphStableContinuationKey: (value: unknown) => gateCheckpointMocks.stableKey
+    ?? actual.scheduledTaskGraphStableContinuationKey(value) }
+})
+vi.mock("./scheduled-pipeline-handoff.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-pipeline-handoff.js")>()
+  return { ...actual, scheduledTaskGraphContinuationKey: (...args: Parameters<typeof actual.scheduledTaskGraphContinuationKey>) =>
+    gateCheckpointMocks.handoffKey ?? actual.scheduledTaskGraphContinuationKey(...args) }
+})
+vi.mock("./task-graph-pg-completed-dependency-verification.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./task-graph-pg-completed-dependency-verification.js")>()
+  return { ...actual, verifyCompletedScoutDependencies: gateCheckpointMocks.dependencies }
+})
+vi.mock("./task-graph-pg-verification.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./task-graph-pg-verification.js")>()
+  return { ...actual, verifyCompletedTaskGraphNodeEvidence: gateCheckpointMocks.nodeEvidence }
+})
+vi.mock("./task-graph-pg-verification-receipts.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./task-graph-pg-verification-receipts.js")>()
+  return { ...actual, loadTaskGraphVerificationReceipts: gateCheckpointMocks.receipts }
+})
 
 const binding = {
   owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
@@ -65,6 +98,104 @@ function referenceFixture(expected: PrepareResult, leaseOwner: string, expired =
 function completedReferenceFixture(expected: PrepareResult) {
   const active = referenceFixture(expected, "worker-owner-1")
   return { ...active, row: { ...active.row, currentTaskStatus: "completed", currentLeaseOwner: null, currentLeaseExpiresAt: null } }
+}
+
+function checkpointFixture(stage: "prepare" | "gate") {
+  const owner = binding.owner, automation = { schemaVersion: SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION,
+    targetRoles: ["Software Engineer"], targetLocations: [], minScore: 50, dailyCap: 50, requireApproval: true, autoApply: false }
+  const snapshotDigest = `sha256:${createHash("sha256").update(JSON.stringify([automation.schemaVersion, automation.targetRoles,
+    automation.targetLocations, automation.minScore, automation.dailyCap, automation.requireApproval, automation.autoApply]), "utf8").digest("hex")}`
+  const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+    { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+  ] }
+  const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+    { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+  ] }
+  const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    { key: "scout", templateId: "scout", taskId: "scout-1", goal: "Find jobs", successCriteria: ["Find matching jobs"],
+      dependsOn: [], depth: 1, verificationDisposition: "typed", verification: scoutVerification },
+    { key: "analyst", templateId: "analyst", taskId: "analyst-1", goal: "Analyze jobs", successCriteria: ["Score jobs"],
+      dependsOn: ["scout"], depth: 2, verificationDisposition: "typed", verification: analystVerification },
+    { key: "prepare", templateId: "prepare", taskId: prepareScope.taskId, goal: "Prepare materials", successCriteria: ["Persist materials"],
+      dependsOn: ["analyst"], depth: 3, verificationDisposition: "specialized" },
+  ] }
+  const evidence = [{ id: "evidence-1", kind: "job", ref: "job-1", source: "test" }]
+  const scoutResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [
+    { jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["evidence-1"] },
+  ], evidence, summary: "one candidate" }
+  const analystResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [
+    { jobId: "job-1", score: 8, evidenceIds: ["evidence-1"] },
+  ], evidence, summary: "one finding" }
+  const dependencyBinding = { nodeKey: "scout", taskId: "scout-1", attemptCount: 1, nodeDigest: "1".repeat(64),
+    resultDigest: "2".repeat(64), evidenceDigest: "3".repeat(64), reportDigest: "4".repeat(64) }
+  const scoutReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+    criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "5".repeat(64),
+    resultDigest: taskGraphFingerprint(scoutResult) } as const
+  const analystReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+    criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "6".repeat(64),
+    resultDigest: taskGraphFingerprint(analystResult), dependencyBindings: [dependencyBinding] } as const
+  const scoutEnvelope = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 1,
+    taskGraphVerificationReport: scoutReport, structuredResult: scoutResult,
+    discoveryAttempt: { attemptCount: 1, health: { schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+      attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0, candidateCount: 1,
+      providerFailures: 0, materializationFailures: 0, hasMore: false } } }
+  const analystEnvelope = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+    taskGraphVerificationReport: analystReport, structuredResult: analystResult }
+  const scoredJobs = [{ job: { id: "job-1", userId: owner.userId }, score: 80, matchedKeywords: ["typescript"],
+    missingKeywords: [], recommendation: "review" }]
+  const evidenceDigest = taskGraphFingerprint({ owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+    rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount }, snapshotDigest,
+    graphDigest: taskGraphFingerprint({ schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2) }),
+    graphRevision: 12, receipt: taskGraphFingerprint({ status: "complete", taskId: "scout-1", attemptCount: 1,
+      completedCalls: 1, candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false }),
+    scout: { taskId: "scout-1", attemptCount: 1, report: publicTaskGraphVerificationReport(scoutReport) },
+    analyst: { taskId: "analyst-1", attemptCount: 2, report: publicTaskGraphVerificationReport(analystReport), bindings: [dependencyBinding] } })
+  const scoredProjection = [{ jobId: "job-1", score: 80, matchedKeywords: ["typescript"], missingKeywords: [], recommendation: "review" }]
+  const checkpointDigest = createHash("sha256").update(JSON.stringify({ owner: [owner.userId, owner.sessionId, owner.turnId,
+    owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount], snapshotDigest, evidenceDigest,
+    analyzeGraphRevision: 12, analysisFailed: 0, scoredJobs: scoredProjection }), "utf8").digest("hex")
+  const receiptBinding = { owner, continuationKey: `scheduled-taskgraph:sha256:${"0".repeat(64)}`, snapshotDigest,
+    evidenceDigest, checkpointDigest, analyzeGraphRevision: 12, prepareScheduleRevision: 13 }
+  const continuationKey = scheduledTaskGraphStableContinuationKey(receiptBinding)!
+  const privateReceipt = buildScheduledTaskGraphContinuationReceipt({ ...receiptBinding, continuationKey })!
+  gateCheckpointMocks.stableKey = continuationKey
+  gateCheckpointMocks.handoffKey = "handoff-key"
+  const prepareResult: PrepareResult = { ...result, taskId: prepareScope.taskId, attemptCount: prepareScope.attemptCount,
+    snapshotDigest, checkpointDigest, jobs: [{ jobId: "job-1", status: "skipped" }], materials: [] }
+  const prepareEnvelope = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 1,
+    taskGraphVerificationReport: null, structuredResult: prepareResult }
+  const task = (id: string, role: "scout" | "analyst" | "prepare", attemptCount: number, taskResult: unknown) => ({ id,
+    role: TASK_GRAPH_TEMPLATES[role].role, taskType: TASK_GRAPH_TEMPLATES[role].taskType, status: "completed", failureReason: null,
+    attemptCount, expectedOutputSchema: TASK_GRAPH_TEMPLATES[role].expectedOutputSchema, allowedActions: TASK_GRAPH_TEMPLATES[role].allowedActions,
+    result: taskResult })
+  const tasks = new Map([task("scout-1", "scout", 1, scoutEnvelope), task("analyst-1", "analyst", 2, analystEnvelope),
+    task(prepareScope.taskId, "prepare", prepareScope.attemptCount, prepareEnvelope)].map(value => [value.id, value]))
+  const current = { revision: 14, nodes: snapshot.nodes.map(node => ({ key: node.key, taskId: node.taskId, templateId: node.templateId,
+    status: "completed", readiness: "ready", failureReason: null,
+    verificationReport: node.key === "scout" ? publicTaskGraphVerificationReport(scoutReport)
+      : node.key === "analyst" ? publicTaskGraphVerificationReport(analystReport) : null })) }
+  const state = { nextStage: stage, analysisFailed: 0, scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs,
+    scheduledTaskGraphContinuation: { key: "handoff-key", snapshotDigest, graphRevision: 12, evidenceDigest,
+      owner: stage === "gate" ? { ...owner, turnLeaseOwnerId: "turn-owner-2", turnLeaseVersion: 5 } : owner } }
+  const query = vi.fn(async (sql: string) => {
+    if (sql.includes('FROM "agent_events" AS event')) return { rows: [{ type: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
+      itemId: null, taskId: null, actor: "system", payload: privateReceipt, idempotencyKey: "scheduled-prepare:fixture", hasOutbox: false }] }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ attemptCount: owner.rootAttemptCount }] }
+    if (sql.includes('FROM "agent_turns"')) return { rows: [{ source: "automation", executionMode: "canonical_task_graph",
+      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: automation } }] }
+    if (sql.includes('FROM "agent_executions"')) return { rows: [{ status: "running", attemptCount: owner.executionAttemptCount,
+      checkpoint: stage, state }] }
+    return { rows: [] }
+  })
+  const call = { toolCallId: "prepare-call", toolName: "scheduled.application.prepare", toolVersion: "1", input: {}, status: "completed", errorCode: null }
+  gateCheckpointMocks.dependencies.mockResolvedValue({ projections: {}, bindings: [dependencyBinding] })
+  gateCheckpointMocks.nodeEvidence.mockResolvedValue({ verified: true, report: publicTaskGraphVerificationReport(analystReport) })
+  gateCheckpointMocks.receipts.mockResolvedValue({ items: [
+    { type: "tool_call", stepId: "prepare-step", content: call },
+    { type: "tool_result", stepId: "prepare-step", content: { errorCode: null, output: prepareResult } },
+  ], replayReceipts: [], outcomes: new Map([["prepare-call", "completed"]]) })
+  return { query, state, input: { scope: prepareScope, snapshot, current, tasks, structuredResult: prepareResult,
+    completionGraphRevision: 14, referenceVerificationMode: { phase: "persisted_gate" as const } } }
 }
 
 describe("scheduled Prepare TaskGraph proof", () => {
@@ -188,5 +319,35 @@ describe("scheduled Prepare TaskGraph proof", () => {
     })
     expect(rejectedFailure).toEqual({ verified: false, reasonCode: "scheduled_prepare_graph_invalid" })
     expect(query).not.toHaveBeenCalled()
+  })
+
+  it("verifies the persisted Gate checkpoint with only transient Turn lease drift", async () => {
+    const fixture = checkpointFixture("gate")
+    const verified = await verifyScheduledPrepareTaskGraphEvidence({ query: fixture.query } as never,
+      { ...fixture.input, checkpointStage: "gate" } as never)
+    expect(verified).toMatchObject({ verified: true, facts: { receipt: { checkpointDigest: expect.any(String) } } })
+    expect(fixture.query.mock.calls.some(([sql]) => String(sql).includes('FROM "agent_executions"'))).toBe(true)
+  })
+
+  it("keeps Prepare as the default checkpoint stage and rejects Gate stage, changed digest, or changed stable owner", async () => {
+    const prepare = checkpointFixture("prepare")
+    await expect(verifyScheduledPrepareTaskGraphEvidence({ query: prepare.query } as never, prepare.input as never))
+      .resolves.toMatchObject({ verified: true })
+
+    const wrongStage = checkpointFixture("gate")
+    await expect(verifyScheduledPrepareTaskGraphEvidence({ query: wrongStage.query } as never, wrongStage.input as never))
+      .resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_checkpoint_invalid" })
+
+    const wrongDigest = checkpointFixture("gate")
+    ;(wrongDigest.state.scoredJobs[0] as { score: number }).score = 81
+    await expect(verifyScheduledPrepareTaskGraphEvidence({ query: wrongDigest.query } as never,
+      { ...wrongDigest.input, checkpointStage: "gate" } as never))
+      .resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_checkpoint_invalid" })
+
+    const wrongOwner = checkpointFixture("gate")
+    wrongOwner.state.scheduledTaskGraphContinuation.owner.rootTaskId = "other-root"
+    await expect(verifyScheduledPrepareTaskGraphEvidence({ query: wrongOwner.query } as never,
+      { ...wrongOwner.input, checkpointStage: "gate" } as never))
+      .resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_checkpoint_invalid" })
   })
 })

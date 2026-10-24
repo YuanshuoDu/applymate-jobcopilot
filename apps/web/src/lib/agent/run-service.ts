@@ -20,6 +20,7 @@ import { finishScheduledTaskGraphExecution, isScheduledTaskGraphOwnerCurrent, pe
 import { isScheduledTaskGraphGateProofCurrent } from "@/lib/agent/scheduled-taskgraph-gate-input";
 import type { PipelineCtx } from "@/lib/agent/pipeline-context";
 import { buildScheduledTaskGraphGateResumeState, runScheduledTaskGraphAnalyzeOnly, serializeScheduledTaskGraphCheckpoint, type ScheduledTaskGraphAnalyzeCheckpointProof } from "@/lib/agent/scheduled-taskgraph-run-service";
+import { scheduledTaskGraphExecuteGateCompletionProof } from "@/lib/agent/scheduled-taskgraph-gate-rpc";
 type HistoryEvent = { event: string; at: string; data: unknown };
 export type ScheduledTaskGraphWaitResult = { status: "waiting_for_user"; waitId: string; stage: string };
 export interface AgentPipelineRunInput {
@@ -36,9 +37,9 @@ export interface AgentPipelineRunInput {
   autonomous: boolean;
   source?: V2TurnSource;
   emit?: (event: string, data: unknown) => void;
-  scheduledTaskGraph?: { owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; prepareProof?: unknown; scheduledWaitId?: string };
+  scheduledTaskGraph?: { owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; prepareProof?: unknown; scheduledWaitId?: string; gateCompletionProof?: unknown };
 }
-export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<RunReport | ScheduledTaskGraphWaitResult | ScheduledTaskGraphAnalyzeCheckpointProof | null> {
+export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<RunReport | ScheduledTaskGraphWaitResult | ScheduledTaskGraphAnalyzeCheckpointProof | { status: "gate_checkpointed" } | null> {
   const startedAt = Date.now(), events: HistoryEvent[] = [];
   const dualWrite = await isRuntimeAgentHarnessFeatureEnabled(
     "AGENT_PROTOCOL_V2_DUAL_WRITE",
@@ -222,11 +223,15 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       return checkpointProof;
     }
     if (scheduled) {
+      const gateProof = scheduledTaskGraphExecuteGateCompletionProof(scheduled.gateCompletionProof)
+      const gate = gateProof?.gate as { taskId: string; attemptCount: number } | undefined
       const gateProofInput = { owner: scheduled.owner, snapshot: scheduled.snapshot, analyzeCheckpoint: scheduledState,
-        analyzeAttestation: scheduled.attestation, prepareProof: scheduled.prepareProof };
+        analyzeAttestation: scheduled.attestation, prepareProof: scheduled.prepareProof,
+        ...(gate ? { gate: { ...gate, phase: "completed" as const, completionProof: scheduled.gateCompletionProof } } : {}) };
       const gateResumeState = await buildScheduledTaskGraphGateResumeState({ owner: scheduled.owner, snapshot: scheduled.snapshot,
         attestation: scheduled.attestation, continuationKey: scheduled.continuationKey, claimToken: scheduled.claimToken,
         ownedJobs: scheduled.ownedJobs, persistedCheckpoint: scheduledState, prepareProof: scheduled.prepareProof,
+        ...(scheduled.gateCompletionProof !== undefined ? { gateCompletionProof: scheduled.gateCompletionProof } : {}),
         ...(scheduled.scheduledWaitId ? { scheduledWaitId: scheduled.scheduledWaitId } : {}) })
       const safeCheckpoint = serializeScheduledTaskGraphCheckpoint(gateResumeState)
       if (!safeCheckpoint || !await saveScheduledTaskGraphCheckpoint({ expectedState: scheduledState, state: safeCheckpoint,
@@ -236,6 +241,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
       scheduledState = safeCheckpoint
       resumeState = gateResumeState
     }
+    if (scheduled?.prepareProof !== undefined && scheduled.gateCompletionProof === undefined) { await eventWriter.drain(); return { status: "gate_checkpointed" } }
     const report = await runPipeline({ ...pipelineInput, resumeState });
     const finished = await finishOwnedAttempt("completed")
     if (!finished || !await canPublishAttemptResult("completed")) return null

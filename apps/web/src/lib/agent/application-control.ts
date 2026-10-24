@@ -35,6 +35,7 @@ type GateWriteOwner = {
   turnId: string
   executionAttempt?: { id: string; attemptCount: number }
   signal?: AbortSignal
+  assertScheduledGateCurrent?: (tx: Prisma.TransactionClient) => Promise<boolean>
 }
 
 const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
@@ -58,7 +59,9 @@ async function assertGateWriteOwner(tx: Prisma.TransactionClient, input: { userI
   if (!turns[0] || !ACTIVE_TURN_STATUSES.includes(turns[0].status as (typeof ACTIVE_TURN_STATUSES)[number])) {
     throw new AgentExecutionCancelledError()
   }
-  if (input.owner.executionAttempt) {
+  if (input.owner.assertScheduledGateCurrent) {
+    if (!await input.owner.assertScheduledGateCurrent(tx) || input.owner.signal?.aborted) throw new AgentExecutionCancelledError()
+  } else if (input.owner.executionAttempt) {
     const current = await refreshAgentExecutionAttempt(tx, { ...input.owner.executionAttempt, userId: input.userId })
     if (input.owner.signal?.aborted || !current) throw new AgentExecutionCancelledError()
   }

@@ -43,6 +43,7 @@ import { type ScheduledPipelineCandidateStore } from "./subagents/scheduled-pipe
 import { createCanonicalTurnScheduledPipeline } from "./canonical-turn-scheduled-pipeline.js"
 import { prepareCanonicalTurnSetup, taskGraphDenialCheckpointReader, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
 import type { TurnEngineQueryClient } from "./turns/turn-engine-owner-sql.js"
+import type { TurnQuestionStore } from "./turns/turn-question-contract.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"; export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
@@ -210,6 +211,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     }), owner: scheduledPipelineOwner, onWebAccepted: () => { webOwnsExecution = true },
       candidateStore: scheduledCandidateStore, rootAttemptCount: scheduledPipelineOwner?.rootAttemptCount ?? 1,
       waitPort: durableWaitPort,
+      questionStore: turnStore as TurnEngineStore & Partial<TurnQuestionStore>, nativeQuestionWaitEnabled,
       ...(recoveredScheduledCandidate ? { recoveredCandidate: recoveredScheduledCandidate } : {}) })
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,

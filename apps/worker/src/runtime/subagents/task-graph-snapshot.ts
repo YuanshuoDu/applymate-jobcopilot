@@ -34,7 +34,7 @@ const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
 const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
 const NODE_KEYS_WITH_REPAIR = "dependsOn,depth,goal,key,repairOf,successCriteria,taskId,templateId,verification,verificationDisposition"
 const NATIVE_NODE_KEYS = "dependsOn,depth,goal,key,nativeDelegation,successCriteria,taskId,templateId,verificationDisposition"
-const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID, "prepare"])
+const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer", APPLICATION_FILLER_TEMPLATE_ID, "prepare", "gate"])
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
@@ -240,10 +240,15 @@ export function parseTaskGraphEvent(value: unknown): TaskGraphEvent | null {
   const row = object(value)
   if (!row || !text(row.type) || !text(row.idempotencyKey) || !text(row.nodeKey)
     || !Number.isSafeInteger(row.expectedRevision) || (row.expectedRevision as number) < 0) return null
-  const allowed = new Set(["task.started", "task.queued", "task.waiting", "task.waiting_for_user", "task.retrying", "task.completed", "task.failed", "task.interrupted", "task.cancelled", "task.closed"])
+  const allowed = new Set(["task.started", "task.queued", "task.gate_choice_resumed", "task.waiting", "task.waiting_for_user", "task.retrying", "task.completed", "task.failed", "task.interrupted", "task.cancelled", "task.closed"])
   if (!allowed.has(row.type)) return null
-  const keys = row.type === "task.failed" ? "expectedRevision,failureReason,idempotencyKey,nodeKey,type" : "expectedRevision,idempotencyKey,nodeKey,type"
+  const keys = row.type === "task.failed" ? "expectedRevision,failureReason,idempotencyKey,nodeKey,type"
+    : row.type === "task.gate_choice_resumed" ? "expectedRevision,gateTaskId,idempotencyKey,nodeKey,requestAttemptCount,resumedAttemptCount,type"
+      : "expectedRevision,idempotencyKey,nodeKey,type"
   if (Object.keys(row).sort().join(",") !== keys) return null
   if (row.type === "task.failed") return text(row.failureReason) ? row as unknown as TaskGraphEvent : null
+  if (row.type === "task.gate_choice_resumed" && (!text(row.gateTaskId) || !Number.isSafeInteger(row.requestAttemptCount)
+    || Number(row.requestAttemptCount) < 1 || !Number.isSafeInteger(row.resumedAttemptCount)
+    || Number(row.resumedAttemptCount) !== Number(row.requestAttemptCount) + 1)) return null
   return row as unknown as TaskGraphEvent
 }

@@ -3,7 +3,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { createOptionalProductionChildExecutor, childExecutionEnabled, createProductionChildPolicy } from "./production-child-runtime.js"
+import { createOptionalProductionChildExecutor, childExecutionEnabled, createProductionChildExecutor, createProductionChildPolicy } from "./production-child-runtime.js"
 import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
@@ -27,8 +27,13 @@ const applicationFillExecutorMock = vi.hoisted(() => ({
     status: "completed" as const, result: { status: "filled_for_user_review" },
   })),
 }))
+const scheduledGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const selectedJobSourceCanary = "APPLYMATE_TRANSIENT_SELECTED_JOB_CANARY"
 vi.mock("./application-fill-for-review.js", () => ({ executeApplicationFillForReview: applicationFillExecutorMock.execute }))
+vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./scheduled-gate-child-runtime.js")>(),
+  createScheduledGateChildExecutor: scheduledGateRuntimeMock.factory,
+}))
 vi.mock("../tools/artifact-tools.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../tools/artifact-tools.js")>()
   return {
@@ -45,6 +50,7 @@ afterEach(() => {
   vi.doUnmock("@/lib/agent/discover")
   vi.unstubAllEnvs()
   vi.resetModules()
+  scheduledGateRuntimeMock.factory.mockReset()
 })
 
 const profile = {
@@ -754,6 +760,36 @@ describe("production child runtime", () => {
     expect(childExecutionEnabled("0")).toBe(false)
     expect(childExecutionEnabled("1")).toBe(true)
     expect(createOptionalProductionChildExecutor({ enabled: false, pool: undefined as never })).toBeUndefined()
+  })
+
+  it("routes the fixed Gate before generic model, tool, or native dispatch setup", async () => {
+    const child = { ...lease(), role: "prepare", taskType: "scheduled_taskgraph_gate", allowedActions: [],
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", taskType: "scheduled_taskgraph_gate" } } satisfies SubagentLease
+    const fixed = vi.fn(async (_input: { lease: SubagentLease }) => ({ status: "completed" as const, result: { status: "completed" } }))
+    scheduledGateRuntimeMock.factory.mockReturnValue(fixed)
+    const modelFactory = vi.fn(async () => { throw new Error("Gate must not construct a model runtime") })
+    const toolFactory = vi.fn(async () => { throw new Error("Gate must not construct a tool runtime") })
+    const pool = { connect: vi.fn(), query: vi.fn() }
+    const executor = createProductionChildExecutor({ pool: pool as never, modelRuntimeFactory: modelFactory, toolRuntimeFactory: toolFactory as never })
+
+    await expect(executor({ lease: child })).resolves.toEqual({ status: "completed", result: { status: "completed" } })
+    expect(scheduledGateRuntimeMock.factory).toHaveBeenCalledWith({ pool })
+    expect(fixed).toHaveBeenCalledWith({ lease: child })
+    expect(modelFactory).not.toHaveBeenCalled()
+    expect(toolFactory).not.toHaveBeenCalled()
+    expect(pool.connect).not.toHaveBeenCalled()
+    expect(pool.query).not.toHaveBeenCalled()
+  })
+
+  it("rejects a Gate task with the wrong fixed role before generic execution", async () => {
+    scheduledGateRuntimeMock.factory.mockClear()
+    const modelFactory = vi.fn(async () => { throw new Error("malformed Gate must not construct a model") })
+    const executor = createProductionChildExecutor({ pool: {} as never, modelRuntimeFactory: modelFactory })
+    await expect(executor({ lease: { ...lease(), taskType: "scheduled_taskgraph_gate" } })).resolves.toEqual({
+      status: "failed", failureReason: "scheduled_gate_role_task_type_mismatch", retryDisposition: "terminal",
+    })
+    expect(scheduledGateRuntimeMock.factory).not.toHaveBeenCalled()
+    expect(modelFactory).not.toHaveBeenCalled()
   })
 
   it("dispatches the exact application filler directly without constructing model or tool runtimes", async () => {

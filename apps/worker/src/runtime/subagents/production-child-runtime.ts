@@ -30,6 +30,8 @@ import { createHarnessModelRuntime } from "../harness-model.js"
 import { createScheduledApplicationPrepareRuntime } from "./scheduled-application-prepare-runtime.js"
 import { createScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
 import { createPrivateSelectedJobToolExecutor, registerProductionChildWaitTool } from "./production-child-tools.js"
+import { createScheduledGateChildExecutor, isScheduledGateTask } from "./scheduled-gate-child-runtime.js"
+import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
 
 export type ProductionChildRuntimeOptions = {
@@ -212,7 +214,13 @@ function defaultSameAttemptContinuationLoader(pool: pg.Pool): ChildExecutorOptio
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   let genericExecutor: SubagentExecutor | undefined
+  let gateExecutor: SubagentExecutor | undefined
   return async ({ lease, continuation }) => {
+    if (lease.taskType === SCHEDULED_GATE_TASK_TYPE) {
+      if (!isScheduledGateTask(lease)) return { status: "failed", failureReason: "scheduled_gate_role_task_type_mismatch", retryDisposition: "terminal" }
+      gateExecutor ??= createScheduledGateChildExecutor({ pool: options.pool })
+      return gateExecutor({ lease })
+    }
     if (lease.role === "application_filler" || lease.taskType === "application_fill_for_review") {
       if (lease.role !== "application_filler" || lease.taskType !== "application_fill_for_review") return { status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal" }
       if (continuation) return { status: "failed", failureReason: "application_fill_continuation_unsupported", retryDisposition: "terminal" }
