@@ -65,8 +65,12 @@ const relationValue = {
   planEvent: { id: "plan-event", sequence: planSequence, idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision) },
   requestFingerprint, agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: observedRevision, replaceBranch: branch },
 }
-const relation = parseTaskGraphFailedBranchRepairRelation(relationValue)
-if (!relation) throw new Error("failed branch history fixture relation must parse")
+function requiredRelation(value: unknown): TaskGraphFailedBranchRepairRelation {
+  const parsed = parseTaskGraphFailedBranchRepairRelation(value)
+  if (!parsed) throw new Error("failed branch history fixture relation must parse")
+  return parsed
+}
+const relation = requiredRelation(relationValue)
 
 function toolStartKey(): string {
   const identity = { kind: "turn" as const, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
@@ -172,11 +176,10 @@ describe("persisted failed-branch repair history", () => {
     f.callRow.eventSequence = "13"
     const callItem = f.callRow.itemContent as Row
     f.callRow.itemContent = { ...callItem, input: inputAtObserved }
-    const nextRelation = parseTaskGraphFailedBranchRepairRelation({ ...relationValue, observedRevision: 6, resultingRevision: 7,
+    const nextRelation = requiredRelation({ ...relationValue, observedRevision: 6, resultingRevision: 7,
       requestFingerprint: fingerprint,
       planEvent: { id: "plan-event", sequence: "14", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 6) },
       agentPlanCall: { ...relationValue.agentPlanCall, expectedRevision: 6 } })
-    if (!nextRelation) throw new Error("delayed retirement fixture relation must parse")
     f.relation = nextRelation
     f.receiptEvent = { id: "reconciliation-event", sequence: 15n, stepId: scope.stepId, idempotencyKey: operationKey }
     prove.mockReset().mockResolvedValue({ failedSource: nextRelation.failedSource, cancellations: nextRelation.cancellations,

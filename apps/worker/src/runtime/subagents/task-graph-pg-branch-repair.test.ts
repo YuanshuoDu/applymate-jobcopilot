@@ -15,7 +15,7 @@ const branch = { root: { nodeKey: "source-scout", taskId: "task-scout" }, source
 
 describe("scheduleTaskGraphBranchRepair", () => {
   it("checks a stored v3 receipt without loading current graph state when none exists", async () => {
-    const query = vi.fn(async () => ({ rows: [] }))
+    const query = vi.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] }))
     const client = { query } as unknown as Queryable
     const input = { scope, proposal: { expectedRevision: 3, nodes: [] }, templates: {} } as unknown as TaskGraphScheduleInput
     const operation: SteeringReconciliationOperation = { scope, decision: "revise", expectedRevision: 3, callId: "call-1", replaceBranch: branch }

@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { proveTaskGraphFailedBranchEvidence } from "./task-graph-pg-failed-branch-evidence.js"
-import { taskGraphItemId, taskGraphLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { taskGraphItemId, taskGraphLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 
 type Row = Record<string, unknown>
@@ -15,7 +15,7 @@ const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERS
   criteria: [{ id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } }] }
 const digest = "a".repeat(64)
 
-function node(key: string, templateId: "scout" | "analyst", taskId: string, dependsOn: string[], depth: number) {
+function node(key: string, templateId: "scout" | "analyst", taskId: string, dependsOn: string[], depth: number): StoredTaskGraphNode {
   return { key, templateId, taskId, goal: `Goal ${key}`, successCriteria: [`Criterion ${key}`], dependsOn, depth,
     verificationDisposition: "typed", verification: templateId === "scout" ? scoutVerification : analystVerification }
 }
@@ -39,7 +39,9 @@ function task(id: string, role: string, status: string, attemptCount: number, re
     contextSnapshotId: null, outputArtifactIds: [] }
 }
 function event(nodeKey: string, taskId: string, sequence: number, expectedRevision: number,
-  type: "task.completed" | "task.failed" | "task.cancelled", graph: TaskGraphSnapshot) {
+  type: "task.completed" | "task.failed" | "task.cancelled", graph: TaskGraphSnapshot): Row & {
+    id: string; taskId: string; sequence: string; payload: Row; outboxPayload: Row
+  } {
   const attempt = type === "task.cancelled" ? 0 : 1
   const key = taskGraphLifecycleKey(scope.rootTaskId, nodeKey, attempt, type)
   const value = { type, nodeKey, expectedRevision, idempotencyKey: key,

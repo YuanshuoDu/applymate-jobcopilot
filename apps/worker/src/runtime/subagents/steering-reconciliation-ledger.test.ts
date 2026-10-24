@@ -13,8 +13,10 @@ import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphFaile
 import { STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION } from "./steering-reconciliation-contract.js"
 import { taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { prepareSteeringReconciliation, findSteeringReconciliationReplay, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
+import type { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"
 
-const failedBranchHistory = vi.hoisted(() => ({ assert: vi.fn(async () => ({ status: "accepted" as const, revision: 2,
+type FailedBranchHistoryArgs = Parameters<typeof assertTaskGraphFailedBranchRepairHistory>
+const failedBranchHistory = vi.hoisted(() => ({ assert: vi.fn(async (..._args: FailedBranchHistoryArgs) => ({ status: "accepted" as const, revision: 2,
   nodes: [{ key: "fresh-scout", taskId: "fresh-scout-task", status: "queued" as const }], readyTaskIds: ["fresh-scout-task"] })) }))
 vi.mock("./steering-reconciliation-failed-branch-history.js", () => ({
   assertTaskGraphFailedBranchRepairHistory: failedBranchHistory.assert,
