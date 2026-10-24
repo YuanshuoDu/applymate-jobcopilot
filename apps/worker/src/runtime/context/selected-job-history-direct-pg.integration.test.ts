@@ -223,11 +223,11 @@ async function materializeUnresolvedRepairSource(): Promise<void> {
         readyTaskIds: snapshot.nodes.map(node => node.taskId) } })
 
     const output = { jobs: [{ id: jobId, source: "greenhouse" }, { id: `repair-secondary-${suffix}`, source: "lever" }] }
-    const insertSearchReceipt = async (taskId: string, label: string, startedSequence: number): Promise<void> => {
+    const insertSearchReceipt = async (taskId: string, label: string, ordinal: number, startedSequence: number): Promise<void> => {
       const stepId = `direct-history-${label}-step-${suffix}`, callId = `direct-history-${label}-call-${suffix}`
       const callItemId = `direct-history-${label}-call-item-${suffix}`, resultItemId = `direct-history-${label}-result-item-${suffix}`
       await client.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-        VALUES ($1, $2, $3, $4, 0, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, sessionId, source.turnId, taskId])
+        VALUES ($1, $2, $3, $4, $5, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, sessionId, source.turnId, taskId, ordinal])
       await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
         VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
           ($7, $2, $3, $4, $5, 'tool_result', 'completed', 1, $8::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
@@ -242,8 +242,8 @@ async function materializeUnresolvedRepairSource(): Promise<void> {
         `direct-history-${label}-call-completed-${suffix}`, startedSequence + 1, `direct-history-${label}:${callId}:completed`,
         JSON.stringify({ taskId, toolCallId: callId, toolName: "jobs.search", status: "completed", errorCode: null })])
     }
-    await insertSearchReceipt(source.childId, "repair-target", 41)
-    await insertSearchReceipt(repairTaskId, "repair-attempt", 43)
+    await insertSearchReceipt(source.childId, "repair-target", 0, 41)
+    await insertSearchReceipt(repairTaskId, "repair-attempt", 1, 43)
     await client.query(`UPDATE "agent_sessions" SET "eventSequence" = 44 WHERE "id" = $1 AND "userId" = $2`, [sessionId, userId])
 
     const initial = await loadTaskGraph(client, scope, true)
