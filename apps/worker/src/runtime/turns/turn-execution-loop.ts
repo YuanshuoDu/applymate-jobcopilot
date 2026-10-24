@@ -51,7 +51,21 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       const recoveredWait = await handoffRecoveredArchivedWait(options, writer, options.recoveredWaitControl, { stepCount: steps, toolCallCount: toolCalls }, now)
       if (recoveredWait) return recoveredWait
     }
-    const recoveredToolObservations = await recoverPersistedToolCalls(executionOptions, writer, now)
+    let recoveredToolObservations: Awaited<ReturnType<typeof recoverPersistedToolCalls>>
+    try {
+      recoveredToolObservations = await recoverPersistedToolCalls(executionOptions, writer, now)
+    } catch (error: unknown) {
+      const replayStepIds = discoveryReplayOverflowStepIds(error)
+      for (const stepId of replayStepIds) {
+        try {
+          await handleTurnExecutionStepError({ error, options, writer, step: { id: stepId, ordinal: Math.max(0, (options.resume?.nextOrdinal ?? 1) - 1) },
+            stepOutput: null, questionIntentCallId: null, executionOptions, signal, now, closedSteps, receiptClosedSteps })
+        } catch (stepError: unknown) {
+          if (stepError !== error) throw stepError
+        }
+      }
+      throw error
+    }
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
     const recoveredQuestion = await recoverPendingNativeQuestion(executionOptions, now, steps, toolCalls)
     if (recoveredQuestion) return recoveredQuestion
@@ -218,6 +232,12 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     return terminalizeTurnExecutionError({ error, options, writer, signal, lastStep, stepOpen: !!lastStep && !closedSteps.has(lastStep.id),
       stepCount: steps, toolCallCount: toolCalls, usage: budget.usage(), now, inputThroughSequence, consumedInputIds })
   }
+}
+
+function discoveryReplayOverflowStepIds(error: unknown): readonly string[] {
+  if (!error || typeof error !== "object" || Array.isArray(error)) return []
+  const stepIds = (error as { discoveryReplayStepIds?: unknown }).discoveryReplayStepIds
+  return Array.isArray(stepIds) && stepIds.every(stepId => typeof stepId === "string" && stepId.length > 0) ? stepIds : []
 }
 
 function isModelFinishReason(value: string): value is ModelStepResult["finishReason"] {

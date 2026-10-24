@@ -233,6 +233,54 @@ describe("canonical Turn context builder", () => {
     expect(context.canonicalJson).not.toBe("base-context-json")
   })
 
+  it("preflights each unique replay Step without building generic context", async () => {
+    const projection = { schemaVersion: "applymate.discovery-persona-projection.v1" as const, purpose: "discovery" as const, facts: [] }
+    discoveryPersona.load.mockReset().mockResolvedValue({ kind: "accepted", projection })
+    const baseBuilder = { build: vi.fn(async (request: StepContextRequest): Promise<StepContext> => ({
+      schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+      inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}",
+    })) }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected readers avoid database access") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), baseBuilder, scope, lease, rootTaskId: "root-a", rootAttemptCount: 4,
+      planningEnabled: true, selectedJobMode: false, discoveryPersonaMemoryEnabled: true,
+      rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
+    })
+
+    await builder.preflightDiscoveryPersonaMemory?.(["step-replay-a", "step-replay-b", "step-replay-a"])
+
+    expect(discoveryPersona.load).toHaveBeenCalledTimes(2)
+    expect(discoveryPersona.load).toHaveBeenNthCalledWith(1, expect.anything(), {
+      scope, lease, rootTaskId: "root-a", rootAttemptCount: 4, stepId: "step-replay-a",
+    })
+    expect(discoveryPersona.load).toHaveBeenNthCalledWith(2, expect.anything(), {
+      scope, lease, rootTaskId: "root-a", rootAttemptCount: 4, stepId: "step-replay-b",
+    })
+    expect(baseBuilder.build).not.toHaveBeenCalled()
+  })
+
+  it("uses the context-build overflow mapping during replay preflight", async () => {
+    discoveryPersona.load.mockReset()
+      .mockResolvedValueOnce({ kind: "accepted", projection: { schemaVersion: "applymate.discovery-persona-projection.v1" as const, purpose: "discovery" as const, facts: [] } })
+      .mockResolvedValueOnce({ kind: "overflow", reason: "byte_limit", observedFactCount: 1, canonicalUtf8Bytes: 8193 })
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected readers avoid database access") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 4,
+      planningEnabled: true, selectedJobMode: false, discoveryPersonaMemoryEnabled: true,
+      rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
+    })
+
+    const preflight = builder.preflightDiscoveryPersonaMemory
+    expect(preflight).toBeDefined()
+    await expect(preflight!(["step-accepted", "step-overflow"])).rejects.toMatchObject({
+      code: "discovery_memory_overflow",
+      message: "Confirmed Persona facts exceed the discovery memory limit. Narrow the facts shared for discovery in Persona settings, then start a new Turn.",
+    })
+    expect(discoveryPersona.load).toHaveBeenCalledTimes(2)
+    expect(discoveryPersona.load).toHaveBeenNthCalledWith(1, expect.anything(), expect.objectContaining({ stepId: "step-accepted" }))
+    expect(discoveryPersona.load).toHaveBeenNthCalledWith(2, expect.anything(), expect.objectContaining({ stepId: "step-overflow" }))
+  })
+
   it("does not load Persona memory outside the exact enabled ordinary-planning builder gates", async () => {
     discoveryPersona.load.mockReset()
     const baseBuilder = { build: vi.fn(async (request: StepContextRequest): Promise<StepContext> => ({
@@ -248,9 +296,15 @@ describe("canonical Turn context builder", () => {
     })
     const build = (builder: ReturnType<typeof makeBuilder>) => builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId,
       stepId: "step-disabled", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } })
-    await build(makeBuilder(true, false, false))
-    await build(makeBuilder(false, false, true))
-    await build(makeBuilder(true, true, true))
+    const disabled = makeBuilder(true, false, false)
+    const unplanned = makeBuilder(false, false, true)
+    const selectedJob = makeBuilder(true, true, true)
+    await build(disabled)
+    await build(unplanned)
+    await build(selectedJob)
+    expect(disabled.preflightDiscoveryPersonaMemory).toBeUndefined()
+    expect(unplanned.preflightDiscoveryPersonaMemory).toBeUndefined()
+    expect(selectedJob.preflightDiscoveryPersonaMemory).toBeUndefined()
     expect(discoveryPersona.load).not.toHaveBeenCalled()
   })
 

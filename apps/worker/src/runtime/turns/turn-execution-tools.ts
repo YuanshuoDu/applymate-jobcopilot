@@ -155,6 +155,19 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
   const recovery = await recoverableNativeQuestionCalls(options, options.toolCallRecovery ?? [], now)
   if (recovery.length === 0) return []
   const mustFailTurn = recovery.some(item => item.action === "fail" || item.action === "terminal")
+  const replayStepIds = !mustFailTurn
+    ? [...new Set(recovery.filter(item => item.action === "replay").map(item => item.stepId))]
+    : []
+  if (replayStepIds.length > 0 && options.preflightDiscoveryPersonaMemory) {
+    try {
+      await options.preflightDiscoveryPersonaMemory(replayStepIds)
+    } catch (error: unknown) {
+      if (error instanceof TurnEngineError && error.code === "discovery_memory_overflow") {
+        Object.assign(error, { discoveryReplayStepIds: replayStepIds })
+      }
+      throw error
+    }
+  }
   const observations: Array<{ id: string; content: ReturnType<typeof toRepositoryJson> }> = []
   for (const item of recovery) {
     let result = item.durableResult

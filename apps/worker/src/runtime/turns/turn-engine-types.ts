@@ -177,7 +177,11 @@ export type TurnEngineOptions = {
       steeringMarkerContext?: SteeringMarkerContext
       steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
     }): Promise<StepContext>
+    /** Validates durable discovery memory for recovered replay Steps without building model context. */
+    preflightDiscoveryPersonaMemory?(stepIds: readonly string[]): Promise<void>
   }
+  /** Preflight callback passed through the root compatibility wrapper before replay. */
+  readonly preflightDiscoveryPersonaMemory?: (stepIds: readonly string[]) => Promise<void>
   readonly store: TurnEngineStore
   readonly model: ModelAdapter
   readonly tools: readonly unknown[]

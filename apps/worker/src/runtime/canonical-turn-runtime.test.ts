@@ -2797,6 +2797,23 @@ describe("createCanonicalTurnRuntime", () => {
     expect(JSON.stringify(result.result)).not.toContain("PRIVATE_DISCOVERY_PREFERENCE_SENTINEL")
   })
 
+  it("preflights recovered discovery replay through TurnEngine before replay and closes the persisted Step", async () => {
+    discoveryPersonaMemory.state.kind = "overflow"
+    const result = await taskGraphRootSurface(false, true, "agent.spawn", "jobs.search", true, undefined, true, false)
+
+    expect(discoveryPersonaMemory.load).toHaveBeenCalledOnce()
+    expect(discoveryPersonaMemory.load).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ stepId: "prior-step" }))
+    expect(result.requests).toEqual([])
+    expect(result.route).not.toHaveBeenCalled()
+    const stepClosedAt = result.events.findIndex(event => event.type === "step.completed" && event.payload
+      && (event.payload as Record<string, unknown>).stepId === "prior-step")
+    const turnFailedAt = result.events.findIndex(event => event.type === "turn.failed")
+    expect(result.events[stepClosedAt]?.payload).toMatchObject({ stepId: "prior-step", status: "failed", errorCode: "discovery_memory_overflow" })
+    expect(stepClosedAt).toBeGreaterThanOrEqual(0)
+    expect(turnFailedAt).toBeGreaterThan(stepClosedAt)
+    expect(result.result).toMatchObject({ status: "failed", summary: "discovery_memory_overflow" })
+  })
+
   it("activates discovery restrictions only for the trusted intent and persists a failed root marker without a validated shortlist", async () => {
     const discovery = await taskGraphRootSurface(false, false, "jobs.get", "jobs.get", true)
     const safeRootTools = ["agent.plan", "agent.wait", "agent.list", "list_subagents"]

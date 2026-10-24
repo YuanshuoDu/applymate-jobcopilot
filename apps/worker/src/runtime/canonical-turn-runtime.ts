@@ -219,6 +219,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ...(recoveredScheduledCandidate ? { recoveredCandidate: recoveredScheduledCandidate } : {}) })
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
+      ...(contextBuilder.preflightDiscoveryPersonaMemory ? { preflightDiscoveryPersonaMemory: contextBuilder.preflightDiscoveryPersonaMemory } : {}),
       store: turnStore, model, tools: rootTools, ...rootToolGuards,
       rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole, capabilities: toolCapabilities, signal,
