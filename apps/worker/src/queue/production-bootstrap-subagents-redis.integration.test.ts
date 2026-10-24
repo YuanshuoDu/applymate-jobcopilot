@@ -272,6 +272,8 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         const rows = missingDispatchTasks().length > 0 ? [{ id: session.id }] : []
         return { rows, rowCount: rows.length }
       }
+      if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", session."userId"')
+        && sql.includes('session."id" = ANY($1::text[])') && sql.includes("task.\"taskType\" = 'scheduled_taskgraph_gate'")) return none
       if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId"')
         && sql.includes('LEFT JOIN "agent_outbox" AS dispatch') && sql.includes('session."id" = ANY($1::text[])')
         && sql.includes('LIMIT $3 FOR UPDATE OF task SKIP LOCKED')) {

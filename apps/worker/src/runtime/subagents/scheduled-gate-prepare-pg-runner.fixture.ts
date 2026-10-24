@@ -127,11 +127,13 @@ function createBridge(pool: Pool, seed: ScheduledGatePrepareSeedFixture) {
     async load(scope): Promise<ScheduledAutomationPipelineBridgeState> {
       const turn = (await pool.query(`SELECT "id" AS "turnId", "userId", "sessionId", "rootTaskId", "source", "executionMode", "input", "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt" FROM "agent_turns" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`, [scope.turnId, scope.userId, scope.sessionId])).rows[0]
       const root = (await pool.query(`SELECT task."id", session."userId", task."sessionId", task."turnId", task."status", task."attemptCount" FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id"=task."sessionId" WHERE task."id"=$1 AND task."sessionId"=$2 AND task."turnId"=$3 AND session."userId"=$4`, [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])).rows[0]
-      const graph = await loadTaskGraph(pool as never, graphScope(seed, scope), false)
-      const tasks = (await pool.query<ScheduledAutomationPipelineBridgeState["tasks"][number]>(`SELECT "id", "userId", "sessionId", "turnId", "rootTaskId", "parentTaskId", "role", "taskType", "status", "attemptCount", "failureReason", "expectedOutputSchema", "allowedActions", "result"
-        FROM "sub_agent_tasks" WHERE "sessionId"=$1 AND "turnId"=$2 AND "rootTaskId"=$3`, [scope.sessionId, scope.turnId, scope.rootTaskId])).rows
+      const graph = await loadTaskGraph(pool as never, graphScope(seed, scope), false), current = currentTaskGraph(graph)
+      const tasks = (await pool.query<ScheduledAutomationPipelineBridgeState["tasks"][number]>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", task."role", task."taskType", task."status", task."attemptCount", task."failureReason", task."expectedOutputSchema", task."allowedActions", task."result"
+        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+        WHERE task."id" = ANY($1::text[]) AND task."sessionId"=$2 AND task."turnId"=$3 AND task."rootTaskId"=$4 AND session."userId"=$5`,
+      [current.nodes.map(node => node.taskId), scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId])).rows
       if (!turn || !root || tasks.length < 2) throw new Error("scheduled_gate_prepare_owner_rows_missing")
-      return { turn, root, snapshot: graph.snapshot, current: currentTaskGraph(graph), tasks }
+      return { turn, root, snapshot: graph.snapshot, current, tasks }
     },
     async verifyCompletedNode(input) { return verifyCompletedTaskGraphNodeEvidence(pool as never, input) },
   })
