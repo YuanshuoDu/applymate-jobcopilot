@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
 
@@ -89,8 +89,11 @@ function brokerApprovalRow(sequence: bigint, status: "approved" | "rejected" = "
 }
 
 describe("agent timeline query API", () => {
+  beforeAll(async () => {
+    await import("./route")
+  })
+
   beforeEach(() => {
-    vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.sessionFindFirst.mockReset()
     mocks.itemFindFirst.mockReset()
@@ -179,12 +182,14 @@ describe("agent timeline query API", () => {
     ["duplicate", "?itemId=first&itemId=second"],
     ["cursor mixed in", "?itemId=first&cursor=eyJ4IjoxfQ"],
     ["limit mixed in", "?itemId=first&limit=1"],
+    ["unknown query parameter", "?itemId=first&unexpected=1"],
     ["control character", "?itemId=%00"],
   ])("rejects an %s direct item target after the owner check", async (_name, path) => {
     const { GET } = await import("./route")
     const response = await GET(request(path) as never, params)
 
     expect(response.status).toBe(400)
+    expect(mocks.requireAuth).toHaveBeenCalledBefore(mocks.sessionFindFirst)
     expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
     expect(mocks.itemFindFirst).not.toHaveBeenCalled()
     expect(mocks.itemFindMany).not.toHaveBeenCalled()
