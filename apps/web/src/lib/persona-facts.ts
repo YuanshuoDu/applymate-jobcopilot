@@ -37,7 +37,7 @@ function nextVersion(previous: Date | null, now = new Date()): Date {
 }
 
 async function lockPersonaFacts(tx: FactTransaction, userId: string) {
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('applymate:persona-facts:' || ${userId}::text, 0))`
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('applymate:persona-facts:' || ${userId}::text, 0))::text AS lock_acquired`
 }
 
 function toField(fact: {

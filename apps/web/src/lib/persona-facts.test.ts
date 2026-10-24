@@ -53,10 +53,11 @@ describe('persona facts', () => {
   })
 
   it('locks generic fact writes and preserves active same-value discovery consent', async () => {
+    mocks.lock.mockResolvedValueOnce([{ lock_acquired: '' }])
     mocks.findUnique.mockResolvedValue(row({ allowedUses: ['form_fill', 'discovery'] }))
     await confirmPersonaFacts('user_1', [{ key: 'notice_period', label: 'Notice period', value: 'One month', category: 'work', confidence: 1, source: 'manual', updatedAt: '' }])
     const [query, userId] = mocks.lock.mock.calls[0] as [TemplateStringsArray, string]
-    expect(query.join('?')).toContain("pg_advisory_xact_lock(hashtextextended('applymate:persona-facts:' || ?::text, 0))")
+    expect(query.join('?')).toContain("pg_advisory_xact_lock(hashtextextended('applymate:persona-facts:' || ?::text, 0))::text AS lock_acquired")
     expect(userId).toBe('user_1')
     expect(mocks.upsert.mock.calls[0]?.[0].update.allowedUses).toEqual(['form_fill', 'discovery'])
   })
