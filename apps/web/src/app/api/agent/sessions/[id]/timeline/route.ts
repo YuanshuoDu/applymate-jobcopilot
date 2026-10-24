@@ -58,8 +58,8 @@ export async function GET(request: NextRequest, context: RouteContext) {
     const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
     if (!session) return sessionNotFound()
     const itemId = itemIds[0]
-    if (itemIds.length !== 1 || query.has("cursor") || query.has("limit") || !safeTimelineId(itemId)) {
-      return Response.json({ error: { code: "invalid_item_id", message: "itemId must be a single safe timeline item without cursor or limit", details: {} } }, { status: 400 })
+    if (itemIds.length !== 1 || query.size !== 1 || !safeTimelineId(itemId)) {
+      return Response.json({ error: { code: "invalid_item_id", message: "itemId must be the only safe timeline query parameter", details: {} } }, { status: 400 })
     }
     const row = await db.agentItem.findFirst({ where: { id: itemId, sessionId }, select: ITEM_QUERY_SELECT })
     if (!row) return Response.json({ error: { code: "timeline_item_not_found", message: "Timeline item not found", details: {} } }, { status: 404 })

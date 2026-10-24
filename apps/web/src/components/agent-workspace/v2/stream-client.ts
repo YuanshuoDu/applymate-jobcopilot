@@ -43,7 +43,7 @@ export async function hydrateTimeline(options: TimelineHydrationOptions): Promis
     const page = await response.json() as TimelinePageResponse
     if (options.signal?.aborted) return
     const item = finalItemFromResponse(page.items, options.finalItemTarget, options.sessionId)
-    if (item) options.dispatch({ type: 'hydrate', items: [item] })
+    if (item) options.dispatch({ type: 'replay', items: [item] })
     return
   }
   const items: unknown[] = []
