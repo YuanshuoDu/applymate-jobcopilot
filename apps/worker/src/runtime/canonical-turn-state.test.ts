@@ -223,9 +223,9 @@ describe("loadCanonicalTurnState", () => {
     const reloaded = await loadCanonicalTurnState(pool({ ...options, snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 2, content: persisted }] }), lease)
     expect(reloaded.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toHaveLength(1)
     expect(reloaded.snapshot.steerHistory).toEqual([
+      ordinary,
       { id: "agent-question:current-question:question", content: { role: "assistant", type: "question", question: "Which city?", options: [] } },
       { id: "agent-question:current-question:answer", content: { role: "user", type: "answer", questionId: "current-wait", text: "Dublin" } },
-      ordinary,
       expect.objectContaining({ id: "native-verification-advisory:0" }),
     ])
     for (const collision of [
@@ -403,7 +403,7 @@ describe("loadCanonicalTurnState", () => {
 
   it("keeps answered Q/A in answer-event order and anchors the latest safe summary to its exact pair", async () => {
     const options = [{ label: "Dublin", value: "dublin" }]
-    const pairs = ["step-1", "step-2"].map((stepId, ordinal) => {
+    const pairs = ["step-b", "step-a"].map((stepId, ordinal) => {
       const toolCallId = `question-call-${ordinal + 1}`
       const waitId = questionId({ sessionId: "session-1", turnId: "turn-1" }, stepId, toolCallId)
       const itemId = questionItemId(waitId)
@@ -418,13 +418,18 @@ describe("loadCanonicalTurnState", () => {
     })
     const snapshotPairOrder = [...pairs].sort((left, right) => left.itemId.localeCompare(right.itemId))
     const answerEventOrder = [...snapshotPairOrder].reverse()
+    const olderAnsweredPair = answerEventOrder[0]!
+    const newerAnsweredPair = answerEventOrder[1]!
+    const canonicalLatestPair = pairs[1]!
+    expect(snapshotPairOrder.map(pair => pair.stepId)).toEqual(["step-b", "step-a"])
+    expect(answerEventOrder.map(pair => pair.stepId)).toEqual(["step-a", "step-b"])
+    expect(canonicalLatestPair).not.toBe(newerAnsweredPair)
     const safeSummary = { observedPlanRevision: 3, graphRevisionAtAsk: 7, pendingSteerCount: 0, unconsumedSteerCount: 0, inputThroughSequence: "12" }
-    const snapshotHistory = [
+    const ordinaryHistory = [
       { id: "0-ordinary-before", content: { role: "user", text: "Keep first ordinary steer" } },
-      ...snapshotPairOrder.flatMap(pair => pair.history),
       { id: "agent-question;ordinary-between", content: { role: "assistant", text: "Keep middle ordinary history" } },
       { id: "z-ordinary-after", content: { role: "user", text: "Keep last ordinary steer" } },
-    ].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+    ]
     const steps = pairs.map(pair => ({ id: pair.stepId, taskId: "root-1", ordinal: pair.ordinal, attempt: 1, status: "completed",
       finishReason: "tool_calls", inputThroughSequence: "0", consumedInputIds: [], inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 }))
     const items = pairs.flatMap(pair => [
@@ -454,8 +459,8 @@ describe("loadCanonicalTurnState", () => {
     const planningEvents = pairs.map(pair => {
       const receipt = { schemaVersion: TURN_QUESTION_PLANNING_SCHEMA_VERSION, sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
         stepId: pair.stepId, toolCallId: pair.toolCallId, waitId: pair.waitId, questionItemId: pair.itemId,
-        observedPlanRevision: pair.stepId === "step-2" ? safeSummary.observedPlanRevision : 2,
-        graphRevisionAtAsk: pair.stepId === "step-2" ? safeSummary.graphRevisionAtAsk : 6,
+        observedPlanRevision: pair === canonicalLatestPair ? safeSummary.observedPlanRevision : 2,
+        graphRevisionAtAsk: pair === canonicalLatestPair ? safeSummary.graphRevisionAtAsk : 6,
         pendingSteers: [], inputCheckpoint: { throughSequence: "12", consumedInputIds: [] } }
       return { id: `planning-${pair.stepId}`, sessionId: "session-1", turnId: "turn-1", taskId: "root-1", itemId: null,
         type: TURN_QUESTION_PLANNING_EVENT_TYPE, actor: "orchestrator", correlationId: "turn-1", causationId: null,
@@ -465,46 +470,70 @@ describe("loadCanonicalTurnState", () => {
     const content = {
       schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "20", goal: staleGoal,
       userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
-      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: snapshotHistory, toolObservations: [] },
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: [], toolObservations: [] },
       tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
     }
-    const fake = pool({
+    const rows = {
       turn: { input: { goal: "Current Turn goal" }, rootTaskId: "root-1", contextSnapshotId: "snapshot-pinned", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       steps, items, questionItems, questionEvents, planningEvents,
-      snapshots: [{ id: "snapshot-pinned", throughSequence: "20", version: 1, content }],
-    })
-
-    const value = await loadCanonicalTurnState(fake, lease)
-    const pairHistory = value.snapshot.steerHistory.filter(entry => entry.id.startsWith("agent-question:"))
-    const expectedAnswerOrder = answerEventOrder.flatMap(pair => pair.history.map(entry => entry.id))
-    expect(value.contextSnapshotPinned).toBe(true)
-    expect(value.snapshot.goal?.content).toBe("Current Turn goal")
-    expect(value.snapshot.steerHistory.filter(entry => !entry.id.startsWith("agent-question:")).map(entry => entry.id))
-      .toEqual(["0-ordinary-before", "agent-question;ordinary-between", "z-ordinary-after"])
-    expect.soft(pairHistory.map(entry => entry.id)).toEqual(expectedAnswerOrder)
-
-    const latest = pairs.find(pair => pair.stepId === "step-2")!
-    const expectedPair = { questionEntryId: latest.history[0]!.id, answerEntryId: latest.history[1]!.id }
-    expect(value.snapshot.planningClarifications).toEqual([safeSummary])
-    expect(value.snapshot.planningClarificationHistoryPair).toEqual(expectedPair)
-    const claimStore: InputClaimStore = {
-      scope: { userId: "user-1" },
-      async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
-        return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
-          claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
-      },
     }
-    const context = await new StepContextBuilder(claimStore).build({
-      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "resume-step", snapshot: value.snapshot, now: new Date(0),
-    })
-    const blockIds = context.blocks.map(block => block.id)
-    const questionBlockIndex = blockIds.indexOf(`history:${expectedPair.questionEntryId}`)
-    expect.soft(blockIds.slice(questionBlockIndex, questionBlockIndex + 3)).toEqual([
-      `history:${expectedPair.questionEntryId}`, `history:${expectedPair.answerEntryId}`, "planning-clarification:latest-answered-question",
-    ])
-    expect(context).not.toHaveProperty("planningClarificationHistoryPair")
-    expect(context.canonicalJson).not.toContain("questionEntryId")
-    expect(context.canonicalJson).not.toContain("answerEntryId")
+    const snapshotCases = [
+      { name: "both Q/A pairs were snapshotted in stable-ID order", includedPairs: snapshotPairOrder },
+      { name: "the older answered pair is absent while the newer pair is snapshotted", includedPairs: [newerAnsweredPair] },
+    ]
+    expect(snapshotCases[1]!.includedPairs).not.toContain(olderAnsweredPair)
+
+    for (const scenario of snapshotCases) {
+      const snapshotHistory = [
+        ...ordinaryHistory,
+        ...scenario.includedPairs.flatMap(pair => pair.history),
+      ].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+      const snapshotContent = { ...content, context: { ...content.context, steerHistory: snapshotHistory } }
+      const fake = pool({ ...rows, snapshots: [{ id: "snapshot-pinned", throughSequence: "20", version: 1, content: snapshotContent }] })
+      const value = await loadCanonicalTurnState(fake, lease)
+      const pairHistory = value.snapshot.steerHistory.filter(entry => entry.id.startsWith("agent-question:"))
+      const expectedAnswerOrder = answerEventOrder.flatMap(pair => pair.history)
+      expect(value.contextSnapshotPinned).toBe(true)
+      expect(value.snapshot.goal?.content).toBe("Current Turn goal")
+      expect(value.snapshot.steerHistory.filter(entry => !entry.id.startsWith("agent-question:")).map(entry => entry.id))
+        .toEqual(["0-ordinary-before", "agent-question;ordinary-between", "z-ordinary-after"])
+      expect(pairHistory, scenario.name).toEqual(expectedAnswerOrder)
+
+      const expectedPair = { questionEntryId: canonicalLatestPair.history[0]!.id, answerEntryId: canonicalLatestPair.history[1]!.id }
+      expect(value.snapshot.planningClarifications).toEqual([safeSummary])
+      expect(value.snapshot.planningClarificationHistoryPair).toEqual(expectedPair)
+      const claimStore: InputClaimStore = {
+        scope: { userId: "user-1" },
+        async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+          return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+            claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
+        },
+      }
+      const context = await new StepContextBuilder(claimStore).build({
+        scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "resume-step", snapshot: value.snapshot, now: new Date(0),
+      })
+      const blockIds = context.blocks.map(block => block.id)
+      expect(context.blocks.filter(block => block.id.startsWith("history:agent-question:")).map(block => block.id))
+        .toEqual(expectedAnswerOrder.map(entry => `history:${entry.id}`))
+      const ordinaryBlockIds = ordinaryHistory.map(entry => `history:${entry.id}`)
+      expect(blockIds.filter(id => ordinaryBlockIds.includes(id))).toEqual(ordinaryBlockIds)
+      const questionBlockIndex = blockIds.indexOf(`history:${expectedPair.questionEntryId}`)
+      expect(questionBlockIndex, scenario.name).toBeGreaterThanOrEqual(0)
+      expect(blockIds.slice(questionBlockIndex, questionBlockIndex + 3), scenario.name).toEqual([
+        `history:${expectedPair.questionEntryId}`, `history:${expectedPair.answerEntryId}`, "planning-clarification:latest-answered-question",
+      ])
+      const summaryBlock = context.blocks.find(block => block.id === "planning-clarification:latest-answered-question")
+      expect(summaryBlock?.content).toEqual(safeSummary)
+      const serializedSummary = JSON.stringify(context.planningClarifications)
+      for (const privateId of [canonicalLatestPair.waitId, canonicalLatestPair.toolCallId, canonicalLatestPair.itemId,
+        expectedPair.questionEntryId, expectedPair.answerEntryId]) {
+        expect(serializedSummary).not.toContain(privateId)
+      }
+      expect(context).not.toHaveProperty("planningClarificationHistoryPair")
+      expect(context.canonicalJson).not.toContain("planningClarificationHistoryPair")
+      expect(context.canonicalJson).not.toContain("questionEntryId")
+      expect(context.canonicalJson).not.toContain("answerEntryId")
+    }
   })
 
   it("restores a complete earlier root answer after compaction as untrusted model history without replacing the current goal", async () => {
