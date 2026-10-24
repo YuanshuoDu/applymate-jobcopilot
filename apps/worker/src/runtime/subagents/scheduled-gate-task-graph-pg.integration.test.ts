@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import { once } from "node:events"
 import { Queue } from "bullmq"
 import Redis from "ioredis"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { claimTurnLease, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
@@ -23,7 +23,7 @@ import type { TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { canonicalTaskGraphJson, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { buildScheduledPrepareTaskGraphProof, SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
-import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
+import { loadPersistedScheduledPrepareProof, matchScheduledGateWaitTarget, scheduledGateWaitMatcherFromResult } from "./scheduled-gate-wait-match.js"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 
@@ -149,6 +149,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     expect(initial.status).toBe("waiting_for_dependency")
     if (initial.status !== "waiting_for_dependency") throw new Error("scheduled_gate_initial_wait_missing")
     await suspendRoot(fixture, lease, firstStep, initial.waitId, turnStore, durableWait)
+    let activeWait = { stepId: firstStep, waitId: initial.waitId }
 
     const generations: number[] = []
     const completedQuestionItems: Array<{ itemId: string; answer: string; attempt: number; binding: TurnQuestionGateChoiceBinding }> = []
@@ -175,8 +176,10 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       child = undefined
 
       if (attempt === 5) break
+      const waitDiagnostic = await diagnoseScheduledGateWait(pool, fixture, gateTaskId, activeWait.stepId,
+        activeWait.waitId, attempt - 1)
       const reconciled = await durableWait.reconcile({ batchSize: 50 })
-      expect(reconciled.woken).toBeGreaterThanOrEqual(1)
+      expect(reconciled.woken, `scheduled Gate reconcile: ${JSON.stringify(waitDiagnostic)}`).toBeGreaterThanOrEqual(1)
       expect(await drainAgentWakeups(pool, 10)).toBeGreaterThanOrEqual(1)
       lease = await claimTurnLease(pool, { turnId: fixture.ids.turnId, sessionId: fixture.ids.sessionId,
         ownerId: `scheduled-gate-root-resume-${attempt}-${randomUUID()}` })
@@ -223,6 +226,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       await assertResumeReplayFences(pool, command, fixture, lease, owner, resumeStep, question, attempt)
       await assertPrivateAcknowledgement(pool, question.itemId, gateTaskId, attempt, question.waitId)
       await suspendRoot(fixture, lease, resumeStep, resumed.waitId, turnStore, durableWait)
+      activeWait = { stepId: resumeStep, waitId: resumed.waitId }
     }
 
     const finalReconcile = await durableWait.reconcile({ batchSize: 50 })
@@ -301,7 +305,9 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     await stopWorker(child)
     child = undefined
 
-    expect((await durableWait.reconcile({ batchSize: 50 })).woken).toBeGreaterThanOrEqual(1)
+    const waitDiagnostic = await diagnoseScheduledGateWait(pool, fixture, gateTaskId, firstStep, initial.waitId, 0)
+    const reconciled = await durableWait.reconcile({ batchSize: 50 })
+    expect(reconciled.woken, `scheduled Gate reconcile: ${JSON.stringify(waitDiagnostic)}`).toBeGreaterThanOrEqual(1)
     expect(await drainAgentWakeups(pool, 10)).toBeGreaterThanOrEqual(1)
     lease = await claimTurnLease(pool, { turnId: fixture.ids.turnId, sessionId: fixture.ids.sessionId,
       ownerId: `scheduled-gate-cancel-question-${randomUUID()}` })
@@ -510,6 +516,113 @@ async function assertPrepareProofPreflight(database: Pool, fixture: GateFixture,
         preparedCount: fixture.preparedJobIds.length, preparedIdsMatch: true, expectedAttempt },
     },
   })
+}
+
+type GateMatcherStage = "gate_scope" | "graph_item" | "graph_tasks" | "graph_events" | "registration"
+  | "prepare_wait" | "prepare_step" | "question_ack" | "other"
+type GateMatcherTrace = { stage: GateMatcherStage; rows: number }
+type GateWaitDiagnosticRow = Record<string, unknown> & {
+  waitStatus: unknown; suspended: boolean; unconsumed: boolean; parentMatches: boolean; stepMatches: boolean
+  stepScopeMatches: boolean; stepStatus: unknown; stepAttemptOne: boolean; turnStatus: unknown; turnRootMatches: boolean
+  leaseReleased: boolean; sessionStatus: unknown; sessionOwnerMatches: boolean; mode: unknown; targetTaskIds: unknown; waitResult: unknown
+}
+
+/** Read-only snapshot of resolver admission and the actual private Gate matcher; all output is finite metadata. */
+async function diagnoseScheduledGateWait(clientPool: Pool, fixture: GateFixture, gateTaskId: string, stepId: string,
+  waitId: string, requestAttemptCount: number): Promise<unknown> {
+  let client: PoolClient
+  try { client = await clientPool.connect() } catch { return { diagnostic: "unavailable" } }
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [fixture.ids.userId])
+    const waitResult = await client.query<GateWaitDiagnosticRow>(`SELECT wait."status" AS "waitStatus",
+        wait."suspendedAt" IS NOT NULL AS "suspended", wait."consumedAt" IS NULL AS "unconsumed",
+        parent."id" = turn."rootTaskId" AS "parentMatches", wait."stepId" = $6 AS "stepMatches",
+        step."taskId" = turn."rootTaskId" OR step."taskId" IS NULL AS "stepScopeMatches",
+        step."status" AS "stepStatus", step."attempt" = 1 AS "stepAttemptOne", turn."status" AS "turnStatus",
+        turn."rootTaskId" = $4 AS "turnRootMatches", turn."leaseOwnerId" IS NULL AS "leaseReleased",
+        session."status" AS "sessionStatus", session."userId" = $2 AS "sessionOwnerMatches",
+        wait."mode", wait."targetTaskIds", wait."result" AS "waitResult"
+      FROM "agent_wait_conditions" AS wait
+      JOIN "agent_turns" AS turn ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
+      JOIN "agent_sessions" AS session ON session."id" = wait."sessionId"
+      LEFT JOIN "sub_agent_tasks" AS parent ON parent."id" = wait."parentTaskId" AND parent."sessionId" = wait."sessionId"
+        AND parent."turnId" = wait."turnId" AND COALESCE(parent."rootTaskId", parent."id") = turn."rootTaskId"
+      LEFT JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId"
+      WHERE wait."id" = $1 AND wait."sessionId" = $3 AND wait."turnId" = $5`,
+    [waitId, fixture.ids.userId, fixture.ids.sessionId, fixture.ids.rootTaskId, fixture.ids.turnId, stepId])
+    const wait = waitResult.rows[0]
+    const rawTargets = parseJson(wait?.targetTaskIds)
+    const targetIds = Array.isArray(rawTargets) && rawTargets.every(value => typeof value === "string") ? rawTargets as string[] : []
+    const targets = targetIds.length ? await client.query<Record<string, unknown>>(`SELECT task."id", task."rootTaskId"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4
+        AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.userId])
+      : { rows: [] }
+    const marker = scheduledGateWaitMatcherFromResult(wait?.waitResult)
+    const trace: GateMatcherTrace[] = []
+    const tracedClient = traceGateMatcherQueries(client, trace)
+    let disposition = "error"
+    try {
+      const result = await matchScheduledGateWaitTarget(tracedClient, { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+        turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId, stepId, gateTaskId, requestAttemptCount })
+      disposition = result ?? "null"
+    } catch { /* Keep diagnostics bounded; the original reconcile still reports its own failure. */ }
+    return {
+      resolver: { waitRows: waitResult.rows.length, waitStatus: diagnosticLabel(wait?.waitStatus, ["waiting", "ready", "timed_out", "interrupted"]),
+        suspended: wait?.suspended === true, unconsumed: wait?.unconsumed === true, parentMatches: wait?.parentMatches === true,
+        stepMatches: wait?.stepMatches === true, stepScopeMatches: wait?.stepScopeMatches === true,
+        stepStatus: diagnosticLabel(wait?.stepStatus, ["streaming", "waiting_for_tool", "waiting_for_user", "completed", "failed", "cancelled"]),
+        stepAttemptOne: wait?.stepAttemptOne === true, turnStatus: diagnosticLabel(wait?.turnStatus,
+          ["queued", "in_progress", "waiting_for_dependency", "waiting_for_user", "interrupted", "completed"]),
+        turnRootMatches: wait?.turnRootMatches === true, leaseReleased: wait?.leaseReleased === true,
+        sessionStatus: diagnosticLabel(wait?.sessionStatus, ["running", "aborted", "archived", "completed"]),
+        sessionOwnerMatches: wait?.sessionOwnerMatches === true, mode: diagnosticLabel(wait?.mode, ["any", "all"]),
+        targetCount: targetIds.length, targetRows: targets.rows.length,
+        targetsScoped: targets.rows.length === targetIds.length && targets.rows.every(row => row.id !== fixture.ids.rootTaskId
+          && (row.rootTaskId ?? row.id) === fixture.ids.rootTaskId),
+        gateMarkerValid: marker !== undefined && marker !== null, gateTargetMatches: marker?.gateTaskId === gateTaskId,
+        requestAttemptMatches: marker?.requestAttemptCount === requestAttemptCount },
+      matcher: { disposition: diagnosticLabel(disposition, ["pending", "matched", "stale", "null", "error"]),
+        queries: trace.slice(-12) },
+    }
+  } catch {
+    return { diagnostic: "unavailable" }
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined)
+    client.release()
+  }
+}
+
+function traceGateMatcherQueries(client: PoolClient, trace: GateMatcherTrace[]): PoolClient {
+  return new Proxy(client, { get(target, property) {
+    if (property !== "query") return Reflect.get(target, property, target)
+    return (sql: string, values?: unknown[]) => {
+      const stage = gateMatcherStage(sql)
+      return target.query(sql, values).then(result => {
+        trace.push({ stage, rows: result.rows.length })
+        return result
+      })
+    }
+  } }) as PoolClient
+}
+
+function gateMatcherStage(query: unknown): GateMatcherStage {
+  const sql = typeof query === "string" ? query : record(query)?.text
+  if (typeof sql !== "string") return "other"
+  if (sql.includes('FROM "sub_agent_tasks" AS gate')) return "gate_scope"
+  if (sql.includes('FROM "agent_items" AS item') && sql.includes("task_graph")) return "graph_item"
+  if (sql.includes('FROM "agent_events" AS event') && sql.includes('"agent_outbox"')) return "registration"
+  if (sql.includes('FROM "agent_events" AS event')) return "graph_events"
+  if (sql.includes('FROM "agent_wait_conditions"')) return "prepare_wait"
+  if (sql.includes('FROM "agent_steps"')) return "prepare_step"
+  if (sql.includes('FROM "agent_items" AS item')) return "question_ack"
+  if (sql.includes('FROM "sub_agent_tasks" AS task')) return "graph_tasks"
+  return "other"
+}
+
+function diagnosticLabel(value: unknown, allowed: readonly string[]): string {
+  return typeof value === "string" && allowed.includes(value) ? value : "other"
 }
 
 function record(value: unknown): Record<string, unknown> | null {
