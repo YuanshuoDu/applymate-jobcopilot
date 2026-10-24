@@ -166,13 +166,14 @@ describe("scheduled pipeline continuation route", () => {
   it("passes a Worker-verified Prepare proof through the existing internal route", async () => {
     const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
     const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    mocks.runPipeline.mockResolvedValueOnce({ status: "gate_checkpointed" });
     mocks.execution.mockResolvedValueOnce({ ...initialExecution, state: { nextStage: "prepare", scheduledTaskGraphClaim: ownerClaim(),
       scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key, owner: fullOwner,
         snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision, evidenceDigest: attestation.evidenceDigest } } });
     const { POST } = await import("./route");
     const response = await POST(request({ owner, attestation, prepareProof, scheduledWaitId }));
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: "completed", report, scheduledWaitId });
+    expect(await response.json()).toEqual({ status: "gate_checkpointed" });
     expect(mocks.validatePrepareWait).toHaveBeenCalledWith({ owner: fullOwner, snapshot: scheduledSnapshot, proof: prepareProof, scheduledWaitId });
     expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
       scheduledTaskGraph: expect.objectContaining({ prepareProof, scheduledWaitId, claimToken }),
