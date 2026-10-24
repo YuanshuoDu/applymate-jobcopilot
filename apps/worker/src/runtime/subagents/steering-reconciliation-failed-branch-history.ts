@@ -66,7 +66,7 @@ async function readCall(client: Client, scope: SteeringReconciliationScope, rela
 }
 
 async function readObservedSnapshot(client: Client, scope: SteeringReconciliationScope, beforeSequence: bigint,
-  expectedRevision: number): Promise<Readonly<{ snapshot: TaskGraphSnapshot; sequence: bigint; id: string }>> {
+  expectedRevision: number): Promise<Readonly<{ snapshot: TaskGraphSnapshot; sequence: bigint; id: string; itemStepId: string | null }>> {
   const result = await client.query<Row>(`SELECT event."id", event."sessionId", event."turnId", event."itemId", event."taskId",
       event."sequence"::text AS "sequence", event."type", event."actor", event."correlationId", event."causationId",
       event."idempotencyKey", event."payload", session."userId" AS "sessionUserId", turn."userId" AS "turnUserId",
@@ -81,7 +81,8 @@ async function readObservedSnapshot(client: Client, scope: SteeringReconciliatio
     ORDER BY event."sequence" DESC LIMIT 1`, [scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId,
     taskGraphItemId(scope.rootTaskId), beforeSequence.toString()])
   const row = result.rows[0], payload = object(row?.payload), item = object(payload?.item), seq = sequence(row?.sequence)
-  const snapshot = parseSnapshot(item?.content)
+  const snapshot = parseSnapshot(item?.content), itemStepId = item?.stepId
+  if (itemStepId !== null && (typeof itemStepId !== "string" || itemStepId.length === 0)) invalid()
   if (result.rows.length !== 1 || !row || !payload || !item || !snapshot || seq === null || seq >= beforeSequence
     || Number(payload.revision) !== expectedRevision || item.revision !== expectedRevision || item.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION
     || item.id !== taskGraphItemId(scope.rootTaskId) || item.sessionId !== scope.sessionId || item.turnId !== scope.turnId
@@ -109,7 +110,7 @@ async function readObservedSnapshot(client: Client, scope: SteeringReconciliatio
       || row.idempotencyKey !== taskGraphProposalKey(scope.rootTaskId, expectedRevision - 1)
       || !parseReceipt(payload.receipt) || canonicalTaskGraphJson(payload.content) !== canonicalTaskGraphJson(item.content)) invalid()
   } else invalid()
-  return { snapshot, sequence: seq, id: String(row.id) }
+  return { snapshot, sequence: seq, id: String(row.id), itemStepId }
 }
 
 function validLifecycleKey(key: unknown, rootTaskId: string, nodeKey: string, type: string): boolean {
@@ -168,7 +169,7 @@ export async function assertTaskGraphFailedBranchRepairHistory(client: Client, s
     || validation.value.sourceNodes.some((node, index) => relation.sources[index]?.source.nodeKey !== node.key
       || relation.sources[index]?.source.taskId !== node.taskId
       || relation.sources[index]?.replacementKey !== validation.value.sourceToReplacementKey.get(node.key))) invalid()
-  if (!await verifyTaskGraphFailedBranchCancellationHistory(client, scope, relation, observed.snapshot, call.sequence, result.rows)) invalid()
+  if (!await verifyTaskGraphFailedBranchCancellationHistory(client, scope, relation, observed.snapshot, observed.itemStepId, call.sequence, result.rows)) invalid()
   const planRow = rows.get(relation.planEvent.id), planSequence = sequence(planRow?.sequence), planPayload = object(planRow?.payload)
   const planItem = object(planPayload?.item), after = parseSnapshot(planItem?.content), receipt = parseReceipt(planPayload?.receipt)
   const expectedPlanOutbox = planRow && { eventId: planRow.id, sessionId: planRow.sessionId, turnId: planRow.turnId,

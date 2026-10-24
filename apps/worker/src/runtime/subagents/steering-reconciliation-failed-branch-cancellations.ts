@@ -23,7 +23,7 @@ function seq(value: unknown): bigint | null {
 
 /** Verifies only cancellations created by this call, then checks their retained rows stayed unexecuted. */
 export async function verifyTaskGraphFailedBranchCancellationHistory(client: Client, scope: GraphIdentityScope,
-  relation: TaskGraphFailedBranchRepairRelation, snapshot: TaskGraphSnapshot, callSequence: bigint,
+  relation: TaskGraphFailedBranchRepairRelation, snapshot: TaskGraphSnapshot, observedItemStepId: string | null, callSequence: bigint,
   persistedEvents: readonly unknown[]): Promise<boolean> {
   const expected = relation.sources.filter(binding => binding.source.nodeKey !== relation.branchRoot.nodeKey)
   if (expected.length !== relation.cancellations.length || expected.length < 1) return false
@@ -47,7 +47,7 @@ export async function verifyTaskGraphFailedBranchCancellationHistory(client: Cli
       || event.expectedRevision !== relation.observedRevision + index || payload?.revision !== relation.observedRevision + index + 1
       || !item || item.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || item.id !== taskGraphItemId(scope.rootTaskId)
       || item.sessionId !== scope.sessionId || item.turnId !== scope.turnId || item.taskId !== scope.rootTaskId
-      || item.stepId !== relation.agentPlanCall.stepId || item.type !== "task_graph" || item.revision !== payload.revision
+      || item.stepId !== observedItemStepId || item.type !== "task_graph" || item.revision !== payload.revision
       || !content || canonicalTaskGraphJson(content) !== canonicalTaskGraphJson(snapshot)) return false
     const expectedOutbox = { eventId: row.id, sessionId: row.sessionId, turnId: row.turnId, itemId: row.itemId,
       taskId: row.taskId, sequence: sequence.toString(), type: row.type, actor: row.actor, correlationId: row.correlationId,

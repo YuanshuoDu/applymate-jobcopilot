@@ -101,11 +101,11 @@ function fixture() {
     event: { type: "task.failed", nodeKey: "scout-old", expectedRevision: 3, idempotencyKey: failedIdentity.idempotencyKey,
       failureReason: "task_graph_verification_unverified" },
     item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId,
-      type: "task_graph", revision: 4, content: before } }
+      type: "task_graph", revision: 4, stepId: "prior-plan-step", content: before } }
   const cancelledPayload = { kind: "lifecycle", revision: 5,
     event: { type: "task.cancelled", nodeKey: "analyst-old", expectedRevision: 4, idempotencyKey: cancellationIdentity.idempotencyKey },
     item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId,
-      stepId: scope.stepId, type: "task_graph", revision: 5, content: before } }
+      stepId: "prior-plan-step", type: "task_graph", revision: 5, content: before } }
   const planPayload = { kind: "proposal", fingerprint: requestFingerprint, revision: 6, receipt, content: after,
     item: { id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, stepId: scope.stepId, taskId: scope.rootTaskId,
       type: "task_graph", revision: 6, content: after } }
@@ -179,7 +179,7 @@ describe("persisted failed-branch repair history", () => {
     const cancellationItem = cancellationPayload.item as Row
     cancellation.payload = { ...cancellationPayload, revision: 6,
       event: { ...(cancellationPayload.event as Row), expectedRevision: 5 },
-      item: { ...cancellationItem, revision: 6, content: observedGraph } }
+      item: { ...cancellationItem, stepId: scope.stepId, revision: 6, content: observedGraph } }
     const cancellationOutbox = cancellation.outboxPayload as Row
     cancellation.outboxPayload = { ...cancellationOutbox, sequence: "13", payload: cancellation.payload }
     const planIndex = f.events.findIndex(row => row.id === "plan-event")
@@ -209,6 +209,15 @@ describe("persisted failed-branch repair history", () => {
   it("rejects an extant original call whose full request no longer matches its fingerprint", async () => {
     const f = fixture(), content = f.callRow.itemContent as Row
     f.callRow.itemContent = { ...content, input: { ...input, nodes: [{ ...proposals[0]!, goal: "Changed after persistence" }, proposals[1]] } }
+    await expect(assertTaskGraphFailedBranchRepairHistory(f.client, scope, f.relation, f.receiptEvent))
+      .rejects.toThrow("steering_reconciliation_failed_branch_event_invalid")
+  })
+
+  it("binds cancellation item provenance to the observed graph item Step, not its current cause", async () => {
+    const f = fixture(), row = f.events[1]!, payload = row.payload as Row, item = payload.item as Row
+    row.payload = { ...payload, item: { ...item, stepId: "misbound-prior-step" } }
+    const outbox = row.outboxPayload as Row
+    row.outboxPayload = { ...outbox, payload: row.payload }
     await expect(assertTaskGraphFailedBranchRepairHistory(f.client, scope, f.relation, f.receiptEvent))
       .rejects.toThrow("steering_reconciliation_failed_branch_event_invalid")
   })

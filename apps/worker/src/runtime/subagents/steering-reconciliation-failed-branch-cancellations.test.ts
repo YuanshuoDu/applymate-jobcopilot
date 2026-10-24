@@ -34,6 +34,7 @@ const cancellationEvents = [
   { id: "cancel-a", sequence: "21", idempotencyKey: taskGraphLifecycleKey("root", "analyst-a", 0, "task.cancelled") },
   { id: "cancel-b", sequence: "22", idempotencyKey: taskGraphLifecycleKey("root", "analyst-b", 0, "task.cancelled") },
 ]
+const observedItemStepId = "prior-plan-step"
 const relation: TaskGraphFailedBranchRepairRelation = {
   schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
   operationKey: `agent.plan.reconciliation:sha256:${"a".repeat(64)}`, graphRootTaskId: "root", observedRevision: 4, resultingRevision: 7,
@@ -54,7 +55,7 @@ function lifecycleRow(id: string, sequence: string, key: string, nodeKey: string
   const payload = { kind: "lifecycle", revision: expectedRevision + 1,
     event: { type: "task.cancelled", nodeKey, expectedRevision, idempotencyKey: key },
     item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: taskGraphItemId(scope.rootTaskId), sessionId: scope.sessionId,
-      turnId: scope.turnId, stepId: "step", taskId: scope.rootTaskId, type: "task_graph", revision: expectedRevision + 1, content: snapshot } }
+      turnId: scope.turnId, stepId: observedItemStepId, taskId: scope.rootTaskId, type: "task_graph", revision: expectedRevision + 1, content: snapshot } }
   const row = { id, sessionId: scope.sessionId, turnId: scope.turnId, itemId: taskGraphItemId(scope.rootTaskId), taskId,
     sequence, type: "item.delta", actor: "system", correlationId: scope.turnId, causationId: "step", idempotencyKey: key, payload,
     sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId }
@@ -85,7 +86,7 @@ function fixture() {
 describe("failed-branch operation cancellation history", () => {
   it("accepts exact post-call cancellation receipts and requires clean retained rows with dispatch removed", async () => {
     const f = fixture()
-    await expect(verifyTaskGraphFailedBranchCancellationHistory(f.client, scope, relation, snapshot, 20n, f.events)).resolves.toBe(true)
+    await expect(verifyTaskGraphFailedBranchCancellationHistory(f.client, scope, relation, snapshot, observedItemStepId, 20n, f.events)).resolves.toBe(true)
     expect(f.query).toHaveBeenCalledTimes(2)
     expect(f.query.mock.calls[1]?.[0]).toContain("agent.subagent.dispatch")
   })
@@ -98,10 +99,16 @@ describe("failed-branch operation cancellation history", () => {
       row.payload = { ...payload, revision: 7, event: { ...(payload.event as Row), expectedRevision: 6 } }
     }],
     ["a present cancellation bound to another task", (f: ReturnType<typeof fixture>) => { f.events[0]!.taskId = "foreign-task" }],
+    ["a lifecycle item bound to another prior plan Step", (f: ReturnType<typeof fixture>) => {
+      const row = f.events[0]!, payload = row.payload as Row, item = payload.item as Row
+      row.payload = { ...payload, item: { ...item, stepId: "foreign-prior-step" } }
+      const outbox = row.outboxPayload as Row
+      row.outboxPayload = { ...outbox, payload: row.payload }
+    }],
     ["a missing outbox mirror", (f: ReturnType<typeof fixture>) => { delete f.events[0]!.outboxPayload }],
   ])("rejects %s", async (_name, mutate) => {
     const f = fixture(); mutate(f)
-    await expect(verifyTaskGraphFailedBranchCancellationHistory(f.client, scope, relation, snapshot, 20n, f.events)).resolves.toBe(false)
+    await expect(verifyTaskGraphFailedBranchCancellationHistory(f.client, scope, relation, snapshot, observedItemStepId, 20n, f.events)).resolves.toBe(false)
   })
 
   it.each([
@@ -110,6 +117,6 @@ describe("failed-branch operation cancellation history", () => {
     ["a retained dispatch", (f: ReturnType<typeof fixture>) => { f.evidenceState.dispatch = true }],
   ])("rejects %s", async (_name, mutate) => {
     const f = fixture(); mutate(f)
-    await expect(verifyTaskGraphFailedBranchCancellationHistory(f.client, scope, relation, snapshot, 20n, f.events)).resolves.toBe(false)
+    await expect(verifyTaskGraphFailedBranchCancellationHistory(f.client, scope, relation, snapshot, observedItemStepId, 20n, f.events)).resolves.toBe(false)
   })
 })
