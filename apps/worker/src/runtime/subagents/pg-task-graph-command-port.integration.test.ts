@@ -7,7 +7,7 @@ import { createCanonicalScheduledDraftRuntime } from "../scheduled-draft-runtime
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
-import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationEvidenceProjection, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
@@ -580,8 +580,68 @@ async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> 
 
 type TypedSupersessionOptions = Readonly<{
   includeIndependentPrerequisite?: boolean
+  includeWaitingLegacyDependency?: boolean
+  includeTypedWaitingAncestor?: boolean
   replacementDependsOn?: readonly string[]
 }>
+
+async function seedHistoricalLegacyNode(pool: PgPool, value: Fixture, nodeKey: string,
+  proposal: TaskGraphScheduleInput["proposal"]): Promise<void> {
+  const graphResult = await pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
+  [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId])
+  const current = parseTaskGraphSnapshot(graphResult.rows[0]?.content)
+  const sourceNode = current.nodes.find(node => node.key === nodeKey)
+  if (!sourceNode || sourceNode.verificationDisposition !== "typed" || !sourceNode.verification) {
+    throw new Error("TaskGraph legacy fixture did not find its typed historical node")
+  }
+  const historicalSnapshot = parseTaskGraphSnapshot({
+    ...current,
+    nodes: current.nodes.map(node => {
+      if (node.key !== nodeKey) return node
+      const legacy = { ...node } as Record<string, unknown>
+      delete legacy.verification
+      delete legacy.verificationDisposition
+      return legacy
+    }),
+  })
+  const legacyProposal = {
+    ...proposal,
+    nodes: proposal.nodes.map(node => {
+      if (node.key !== nodeKey) return node
+      const legacy = { ...node }
+      delete legacy.verification
+      return legacy
+    }),
+  }
+  const eventResult = await pool.query<{ id: string; payload: unknown }>(`SELECT "id", "payload" FROM "agent_events"
+    WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "type" = 'item.started'
+      AND "payload"->>'kind' = 'proposal'`, [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId)])
+  if (eventResult.rows.length !== 1) throw new Error("TaskGraph legacy fixture did not find its original plan receipt")
+  const event = eventResult.rows[0]!
+  const payload = event.payload as Record<string, unknown>
+  const item = payload.item as Record<string, unknown> | undefined
+  if (!item) throw new Error("TaskGraph legacy fixture plan receipt omitted its stream item")
+  const historicalPayload = {
+    ...payload,
+    fingerprint: taskGraphFingerprint(legacyProposal),
+    item: { ...item, content: historicalSnapshot },
+  }
+  const updatedItem = await pool.query(`UPDATE "agent_items" SET "content" = $4::jsonb
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "revision" = 1`,
+  [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId, JSON.stringify(historicalSnapshot)])
+  if (updatedItem.rowCount !== 1) throw new Error("TaskGraph legacy fixture could not persist its historical snapshot")
+  const updatedEvent = await pool.query(`UPDATE "agent_events" SET "payload" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4`,
+  [event.id, JSON.stringify(historicalPayload), value.sessionId, value.turnId])
+  if (updatedEvent.rowCount !== 1) throw new Error("TaskGraph legacy fixture could not update its original plan receipt")
+  const outboxPayload = await pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_outbox"
+    WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [value.sessionId, `agent-event:${event.id}`])
+  const outbox = outboxPayload.rows[0]?.payload as Record<string, unknown> | undefined
+  if (!outbox) throw new Error("TaskGraph legacy fixture did not find its original event outbox row")
+  const updatedOutbox = await pool.query(`UPDATE "agent_outbox" SET "payload" = $3::jsonb
+    WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [value.sessionId, `agent-event:${event.id}`, JSON.stringify({ ...outbox, payload: historicalPayload })])
+  if (updatedOutbox.rowCount !== 1) throw new Error("TaskGraph legacy fixture could not update its original event outbox row")
+}
 
 async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
   rootSuccessCriteria?: readonly string[], options: TypedSupersessionOptions = {}) {
@@ -608,10 +668,13 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     consumedInputIds: [value.originalInputId],
   })
 
-  const scheduledInput = scheduleInput(value, options.includeIndependentPrerequisite ? 2 : 1, true)
-  const initialNodes = options.includeIndependentPrerequisite
-    ? scheduledInput.proposal.nodes.map(node => ({ ...node, dependsOn: [] }))
-    : scheduledInput.proposal.nodes
+  const legacyFixtureNodeCount = options.includeWaitingLegacyDependency ? (options.includeTypedWaitingAncestor ? 4 : 3) : 0
+  const scheduledInput = scheduleInput(value, legacyFixtureNodeCount || (options.includeIndependentPrerequisite ? 2 : 1), true)
+  const initialNodes = options.includeWaitingLegacyDependency
+    ? scheduledInput.proposal.nodes.map((node, index) => ({ ...node, dependsOn: index === 2 ? ["task-2"] : index === 3 ? ["task-3"] : [] }))
+    : options.includeIndependentPrerequisite
+      ? scheduledInput.proposal.nodes.map(node => ({ ...node, dependsOn: [] }))
+      : scheduledInput.proposal.nodes
   const initialInput: TaskGraphScheduleInput = { ...scheduledInput, proposal: { ...scheduledInput.proposal, nodes: initialNodes },
     ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}), templates: {
     ...scheduledInput.templates, analyst: analystTemplate,
@@ -620,6 +683,7 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
   const initial = await command.appendAndSchedule(initialPlanInput)
   if (initial.revision !== 1) throw new Error("TaskGraph supersession fixture did not create revision one")
+  if (options.includeWaitingLegacyDependency) await seedHistoricalLegacyNode(pool, value, "task-3", initialInput.proposal)
   await pool.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [value.originStepId])
   const source = (await command.readCurrent(readScope(value))).nodes[0]
   const originalNode = initialInput.proposal.nodes[0]
@@ -669,7 +733,9 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     rootInputId: value.originalInputId, replaceUnstartedNodeKey: source.key,
   }
   return { command, input, operation, source, replacement, rawCallInput, replacementFingerprint,
-    incompletePrerequisite: options.includeIndependentPrerequisite ? initialInput.proposal.nodes[1] : undefined }
+    incompletePrerequisite: options.includeIndependentPrerequisite || options.includeWaitingLegacyDependency ? initialInput.proposal.nodes[1] : undefined,
+    legacyDependency: options.includeWaitingLegacyDependency ? initialInput.proposal.nodes[2] : undefined,
+    typedWaitingAncestor: options.includeTypedWaitingAncestor ? initialInput.proposal.nodes[3] : undefined }
 }
 
 async function supersessionDurableRows(pool: PgPool, value: Fixture): Promise<Record<string, unknown>> {
@@ -2457,6 +2523,63 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const afterTamper = await supersessionDurableRows(adminPool!, value)
     await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)).rejects.toThrow()
     expect(await supersessionDurableRows(adminPool!, value)).toEqual(afterTamper)
+  }, 60_000)
+
+  it("rejects reachable waiting legacy dependencies atomically and permits unrelated legacy work", async () => {
+    for (const route of [
+      { label: "direct", includeTypedWaitingAncestor: false, dependencyKey: "task-3" },
+      { label: "transitive through a typed waiting ancestor", includeTypedWaitingAncestor: true, dependencyKey: "task-4" },
+    ]) {
+      const value = fixture()
+      additionalFixtures.push(value)
+      const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, value, undefined, {
+        includeWaitingLegacyDependency: true,
+        includeTypedWaitingAncestor: route.includeTypedWaitingAncestor,
+        replacementDependsOn: [route.dependencyKey],
+      })
+      const prerequisite = prepared.incompletePrerequisite
+      const legacy = prepared.legacyDependency
+      if (!prerequisite || !legacy) throw new Error(`TaskGraph ${route.label} fixture lost its dependency nodes`)
+      const snapshotRows = await adminPool!.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'task_graph'`,
+      [taskGraphItemId(value.rootTaskId), value.sessionId, value.turnId])
+      const snapshot = parseTaskGraphSnapshot(snapshotRows.rows[0]?.content)
+      expect(snapshot.nodes.find(node => node.key === legacy.key)?.verificationDisposition).toBe("legacy_unverified")
+      const current = await prepared.command.readCurrent(readScope(value))
+      expect(current.nodes.find(node => node.key === prerequisite.key)?.status).toBe("queued")
+      expect(current.nodes.find(node => node.key === legacy.key)).toMatchObject({ status: "waiting", readiness: "waiting_for_dependencies" })
+      if (route.includeTypedWaitingAncestor) {
+        const ancestor = prepared.typedWaitingAncestor
+        if (!ancestor) throw new Error("TaskGraph transitive fixture lost its typed waiting ancestor")
+        expect(snapshot.nodes.find(node => node.key === ancestor.key)?.verificationDisposition).toBe("typed")
+        expect(current.nodes.find(node => node.key === ancestor.key)).toMatchObject({ status: "waiting", readiness: "waiting_for_dependencies" })
+      }
+
+      const before = await supersessionDurableRows(adminPool!, value)
+      await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation),
+        `TaskGraph supersession with a ${route.label} path to waiting legacy work should be rejected`)
+        .rejects.toMatchObject({ code: "task_graph_dependency_unverified" })
+      expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+    }
+
+    const unrelatedValue = fixture()
+    additionalFixtures.push(unrelatedValue)
+    const unrelated = await prepareTypedSupersession(adminPool!, commandPool!, roleName, unrelatedValue, undefined, {
+      includeWaitingLegacyDependency: true,
+      replacementDependsOn: [],
+    })
+    const legacy = unrelated.legacyDependency
+    if (!legacy) throw new Error("TaskGraph unrelated legacy fixture lost its legacy node")
+    const beforeAcceptance = await unrelated.command.readCurrent(readScope(unrelatedValue))
+    expect(beforeAcceptance.nodes.find(node => node.key === legacy.key)).toMatchObject({ status: "waiting", readiness: "waiting_for_dependencies" })
+    const accepted = await unrelated.command.appendAndScheduleWithReconciliation!(unrelated.input, unrelated.operation)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 3, nodes: [{ key: "replacement-1", status: "queued" }] })
+    expect(accepted.readyTaskIds).toEqual([accepted.nodes[0]?.taskId])
+    const afterAcceptance = await unrelated.command.readCurrent(readScope(unrelatedValue))
+    expect(afterAcceptance.nodes.find(node => node.key === legacy.key)?.status).toBe("waiting")
+    expect(afterAcceptance.nodes.find(node => node.key === "replacement-1")).toMatchObject({
+      status: "queued", readiness: "ready", dependsOn: [],
+    })
   }, 60_000)
 
   it("rejects missing, duplicate, self-cyclic, and superseded-source rewiring edges atomically", async () => {
