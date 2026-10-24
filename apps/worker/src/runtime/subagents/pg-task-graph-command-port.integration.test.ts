@@ -900,7 +900,10 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
     VALUES ($1, $2, $3, $4, 3, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
   [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId])
+  let planStepId = value.laterStepId
   if (options.addNativeSnapshot) {
+    await seedReconciliationAgenda(pool, value, { id: value.laterStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
+      planRevision: current.revision, consumedInputIds: [] })
     const native = await command.appendNativeCoordination!({
       scope: { ...readScope(value), stepId: value.laterStepId },
       request: { kind: "spawn", idempotencyKey: `failed-branch-native-${value.sessionId}`, role: "auditor", taskType: "audit",
@@ -914,18 +917,27 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
     if (current.nodes.length !== 8 || !current.nodes.some(node => node.taskId === native.child.taskId)) {
       throw new Error("Failed-branch fixture did not retain its native task at the graph limit")
     }
+    const completedNativeStep = await pool.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "status" = 'streaming'`,
+    [value.laterStepId, value.sessionId, value.turnId])
+    if (completedNativeStep.rowCount !== 1) throw new Error("Failed-branch fixture could not complete its native command Step")
+    await pool.query(`INSERT INTO "agent_steps"
+      ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+      VALUES ($1, $2, $3, $4, 4, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+    [value.keepStepId, value.sessionId, value.turnId, value.rootTaskId])
+    planStepId = value.keepStepId
   }
   const turnUsage = await pool.query(`UPDATE "agent_turns" SET "inputTokens" = 47, "outputTokens" = 13,
     "estimatedCostUsd" = 0.0042 WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
   const stepUsage = await pool.query(`UPDATE "agent_steps" SET "inputTokens" = 47, "outputTokens" = 13,
     "estimatedCostUsd" = 0.0042 WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3`,
-  [value.laterStepId, value.turnId, value.sessionId])
+  [planStepId, value.turnId, value.sessionId])
   if (turnUsage.rowCount !== 1 || stepUsage.rowCount !== 1) throw new Error("Failed-branch fixture could not seed cumulative usage")
-  const scope: TaskGraphScheduleInput["scope"] = { ...readScope(value), stepId: value.laterStepId }
-  await seedReconciliationAgenda(pool, value, { id: value.laterStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
+  const scope: TaskGraphScheduleInput["scope"] = { ...readScope(value), stepId: planStepId }
+  await seedReconciliationAgenda(pool, value, { id: planStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
     planRevision: current.revision, consumedInputIds: [] })
   const request = branchPlanRequest(scope, templates, current.nodes, current.revision, value.planCallId, replacementPrefix)
-  await seedReconciliationToolCall(pool, value, { id: value.planCallId, stepId: value.laterStepId, toolName: "agent.plan",
+  await seedReconciliationToolCall(pool, value, { id: value.planCallId, stepId: planStepId, toolName: "agent.plan",
     input: request.rawCallInput, sequence: await nextEventSequence(pool, value) })
   return { pool, command, value, templates, sourceTaskIds: [sourceScout.taskId, sourceAnalyst.taskId],
     repairTargetId: target.taskId, scope, current, ...request }
