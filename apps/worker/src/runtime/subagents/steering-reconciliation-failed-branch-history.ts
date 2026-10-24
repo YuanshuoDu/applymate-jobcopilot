@@ -7,6 +7,7 @@ import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, ta
 import type { StoredTaskGraphNode, TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { parseTaskGraphFailedBranchRepairRelation, taskGraphFailedBranchRepairFingerprint,
   type TaskGraphFailedBranchRepairRelation } from "./task-graph-pg-failed-branch-relation.js"
+import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-command.js"
 import { proveTaskGraphFailedBranchEvidence } from "./task-graph-pg-failed-branch-evidence.js"
 import { verifyTaskGraphFailedBranchCancellationHistory } from "./steering-reconciliation-failed-branch-cancellations.js"
 import { steeringReconciliationIdempotencyKey, validSteeringReconciliationToolCall,
@@ -109,6 +110,14 @@ async function readObservedSnapshot(client: Client, scope: SteeringReconciliatio
       || typeof row.causationId !== "string" || !/^[0-9a-f]{64}$/.test(String(payload.fingerprint))
       || row.idempotencyKey !== taskGraphProposalKey(scope.rootTaskId, expectedRevision - 1)
       || !parseReceipt(payload.receipt) || canonicalTaskGraphJson(payload.content) !== canonicalTaskGraphJson(item.content)) invalid()
+  } else if (payload.kind === "native_command") {
+    const receipt = parsePersistedTaskGraphNativeReceipt(payload, {
+      type: row.type, itemId: row.itemId, taskId: row.taskId, idempotencyKey: row.idempotencyKey,
+    }, { id: taskGraphItemId(scope.rootTaskId), revision: expectedRevision }, snapshot, {
+      sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId,
+    })
+    if (row.actor !== "orchestrator" || typeof itemStepId !== "string" || row.causationId !== itemStepId
+      || receipt.graphRevision !== expectedRevision || canonicalTaskGraphJson(payload.content) !== canonicalTaskGraphJson(item.content)) invalid()
   } else invalid()
   return { snapshot, sequence: seq, id: String(row.id), itemStepId }
 }

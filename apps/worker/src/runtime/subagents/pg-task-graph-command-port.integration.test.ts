@@ -832,9 +832,10 @@ async function failQueuedTypedTask(pool: PgPool, value: Fixture, taskId: string,
 }
 
 async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
-  replacementPrefix = "failed-replacement") {
+  replacementPrefix = "failed-replacement", options: Readonly<{ retainedNodeCount?: number; addNativeSnapshot?: boolean }> = {}) {
   await seed(pool, value)
   const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
+  const retainedKeys = ["retained-a", "retained-b", "retained-c", "retained-d"].slice(0, options.retainedNodeCount ?? 4)
   const allowedActions = [...new Set(["agent.plan", ...Object.values(templates).flatMap(template => template.allowedActions)])]
   await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [value.rootTaskId, JSON.stringify(allowedActions)])
   const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
@@ -849,11 +850,11 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
       dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION },
     { key: "reserve-target", templateId: "analyst", goal: "Score repair target", successCriteria: ["Return one finding"],
       dependsOn: [], verification: ANALYST_VERIFICATION },
-    ...["retained-a", "retained-b", "retained-c", "retained-d"].map(key => ({ key, templateId: "analyst" as const,
+    ...retainedKeys.map(key => ({ key, templateId: "analyst" as const,
       goal: `Retain ${key}`, successCriteria: ["Return one finding"], dependsOn: [], verification: ANALYST_VERIFICATION })),
   ]
   const initial = await command.appendAndSchedule({ scope: initialScope, proposal: { expectedRevision: 0, nodes: initialNodes }, templates })
-  if (initial.revision !== 1 || initial.nodes.length !== 7) throw new Error("Failed-branch fixture did not create its initial seven-node graph")
+  if (initial.revision !== 1 || initial.nodes.length !== 3 + retainedKeys.length) throw new Error("Failed-branch fixture did not create its initial graph")
   const target = initial.nodes.find(node => node.key === "reserve-target")
   if (!target) throw new Error("Failed-branch fixture lost its retained repair target")
   await failQueuedTypedTask(commandPool, value, target.taskId, `worker-fail-repair-target-${randomUUID()}`)
@@ -881,8 +882,8 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
   const sourceScout = initial.nodes.find(node => node.key === "source-scout"), sourceAnalyst = initial.nodes.find(node => node.key === "source-analyst")
   if (!sourceScout || !sourceAnalyst) throw new Error("Failed-branch fixture lost the Scout source")
   await failQueuedTypedTask(commandPool, value, sourceScout.taskId, `worker-fail-source-scout-${randomUUID()}`)
-  const current = await command.readCurrent(readScope(value))
-  if (current.nodes.length !== 8 || current.nodes.find(node => node.key === "source-scout")?.status !== "failed"
+  let current = await command.readCurrent(readScope(value))
+  if (current.nodes.length !== 4 + retainedKeys.length || current.nodes.find(node => node.key === "source-scout")?.status !== "failed"
     || current.nodes.find(node => node.key === "source-analyst")?.status !== "waiting"
     || !current.nodes.some(node => node.key === "retained-repair" && node.repairOf)) {
     const safeReason = (reason: string | null | undefined) => reason == null ? null
@@ -899,6 +900,21 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
     VALUES ($1, $2, $3, $4, 3, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
   [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId])
+  if (options.addNativeSnapshot) {
+    const native = await command.appendNativeCoordination!({
+      scope: { ...readScope(value), stepId: value.laterStepId },
+      request: { kind: "spawn", idempotencyKey: `failed-branch-native-${value.sessionId}`, role: "auditor", taskType: "audit",
+        goal: "Retain an independently authorized audit task", constraints: ["read only"],
+        successCriteria: ["Record findings"], context: { fixture: "current native snapshot" } },
+    })
+    if (native.status !== "accepted" || native.graphRevision !== current.revision + 1 || native.child.status !== "queued") {
+      throw new Error("Failed-branch fixture could not append its native graph snapshot")
+    }
+    current = await command.readCurrent(readScope(value))
+    if (current.nodes.length !== 8 || !current.nodes.some(node => node.taskId === native.child.taskId)) {
+      throw new Error("Failed-branch fixture did not retain its native task at the graph limit")
+    }
+  }
   const turnUsage = await pool.query(`UPDATE "agent_turns" SET "inputTokens" = 47, "outputTokens" = 13,
     "estimatedCostUsd" = 0.0042 WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
   const stepUsage = await pool.query(`UPDATE "agent_steps" SET "inputTokens" = 47, "outputTokens" = 13,
@@ -3302,6 +3318,43 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       cancellations: [expect.objectContaining({ source: { nodeKey: "source-analyst", taskId: waitingDescendantId },
         event: { id: cancellationEvent.rows[0]!.id, sequence: cancellationEvent.rows[0]!.sequence, idempotencyKey: cancellationKey } })],
       planEvent: { idempotencyKey: taskGraphProposalKey(value.rootTaskId, prepared.current.revision + 1) } })
+  }, 60_000)
+
+  it("accepts a strict native command as the latest pre-call failed-branch snapshot", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareFailedBranchReplan(adminPool!, commandPool!, roleName, value, "native-observed",
+      { retainedNodeCount: 3, addNativeSnapshot: true })
+    expect(prepared.current.nodes).toHaveLength(8)
+    const nativeEvent = await adminPool!.query<{ id: string; sequence: string; type: string; payload: unknown }>(
+      `SELECT "id", "sequence"::text AS "sequence", "type", "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "payload"->>'kind' = 'native_command'
+        ORDER BY "sequence" DESC LIMIT 1`, [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId)])
+    const native = nativeEvent.rows[0]?.payload as { kind: string; revision: number; receipt: { nodeKey: string; child: { taskId: string } } } | undefined
+    expect(nativeEvent.rows).toHaveLength(1)
+    expect(nativeEvent.rows[0]).toMatchObject({ type: "item.delta" })
+    expect(native).toMatchObject({ kind: "native_command", revision: prepared.current.revision,
+      receipt: { status: "accepted", child: { taskId: expect.any(String) } } })
+    const call = await adminPool!.query<{ sequence: string }>(`SELECT "sequence"::text AS "sequence" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_call.started' AND "correlationId" = $3`,
+    [value.sessionId, value.turnId, value.planCallId])
+    expect(call.rows).toHaveLength(1)
+    const latestBeforeCall = await adminPool!.query<{ id: string; sequence: string; payload: unknown }>(
+      `SELECT "id", "sequence"::text AS "sequence", "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "type" IN ('item.started', 'item.delta')
+          AND "sequence" < $4::bigint ORDER BY "sequence" DESC LIMIT 1`,
+    [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId), call.rows[0]!.sequence])
+    expect(latestBeforeCall.rows).toHaveLength(1)
+    expect(latestBeforeCall.rows[0]).toMatchObject({ id: nativeEvent.rows[0]!.id, sequence: nativeEvent.rows[0]!.sequence })
+
+    const receipt = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(receipt).toMatchObject({ status: "accepted", revision: prepared.current.revision + 2 })
+    expect(receipt.nodes.map(node => node.key)).toEqual(["native-observed-scout", "native-observed-analyst"])
+    const after = await prepared.command.readCurrent(readScope(value))
+    expect(after.nodes).toHaveLength(8)
+    expect(after.nodes).toContainEqual(expect.objectContaining({ key: native!.receipt.nodeKey,
+      taskId: native!.receipt.child.taskId }))
+    expect(after.nodes.some(node => node.key === "source-scout" || node.key === "source-analyst")).toBe(false)
   }, 60_000)
 
   it("proves exact failed-branch replay after a later replan and still fences a completed original Step", async () => {
