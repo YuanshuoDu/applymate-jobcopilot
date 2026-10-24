@@ -85,13 +85,13 @@ class FakeClient {
     if (sql.includes('LEFT JOIN "agent_mailbox_hydration_checkpoints"')) {
       const cp = this.db.checkpoints.filter(row => row.sessionId === values[1] && row.taskId === values[4] && row.attemptCount === values[6])
       const ids = new Set(cp.map(row => row.messageId))
-      const selected = this.pending(values).filter(row => !ids.has(row.id)).slice(0, Number(values[7]))
+      const selected = this.prioritize(this.pending(values, 6).filter(row => !ids.has(row.id)), values[7]).slice(0, Number(values[8]))
       return rows(selected as unknown as Record<string, unknown>[])
     }
     if (sql.includes('FROM "agent_mailbox_hydration_checkpoints" AS checkpoint') && sql.includes('SELECT message."id"')) {
       const ids = new Set(this.db.checkpoints.filter(row => row.userId === values[0] && row.sessionId === values[1] && row.turnId === values[2]
         && row.rootTaskId === values[3] && row.taskId === values[4] && row.attemptCount === values[5]).map(row => row.messageId))
-      return rows(this.pending(values).filter(row => ids.has(row.id)).slice(0, Number(values[6])) as unknown as Record<string, unknown>[])
+      return rows(this.prioritize(this.pending(values, 5).filter(row => ids.has(row.id)), values[6]).slice(0, Number(values[7])) as unknown as Record<string, unknown>[])
     }
     if (sql.includes('INSERT INTO "agent_mailbox_hydration_checkpoints"')) {
       if (this.db.failOnInsert) throw new Error("insert failed")
@@ -105,11 +105,17 @@ class FakeClient {
     return empty()
   }
 
-  private pending(values: readonly unknown[]): StoredMessage[] {
-    const attempt = Number(values.length > 7 ? values[6] : values[5])
+  private pending(values: readonly unknown[], attemptIndex: number): StoredMessage[] {
+    const attempt = Number(values[attemptIndex])
     return this.db.messages.filter(row => row.sessionId === values[1] && row.turnId === values[2] && row.toTaskId === values[4] && row.consumedAt === null)
       .filter(row => row.targetAttemptCount === attempt || (row.targetAttemptCount == null && row.kind !== "human_follow_up"))
       .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id))
+  }
+
+  private prioritize(rows: readonly StoredMessage[], rawIds: unknown): StoredMessage[] {
+    const ids = Array.isArray(rawIds) ? rawIds as string[] : []
+    const rank = new Map(ids.map((id, index) => [id, index]))
+    return [...rows].sort((left, right) => (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER))
   }
 
   release(): void {}
@@ -168,6 +174,20 @@ describe("hydrateChildMailbox", () => {
     const { result } = await hydrate(db)
     expect(result).toHaveLength(20)
     expect(result.map(row => row.id)).toEqual(Array.from({ length: 20 }, (_, index) => `message-${String(index).padStart(2, "0")}`))
+  })
+
+  it("hydrates an exact missing id before older messages already checkpointed at the 20-message cap", async () => {
+    const db = state({ messages: Array.from({ length: 25 }, (_, index) => message(`message-${String(index).padStart(2, "0")}`, now)) })
+    const first = await hydrate(db)
+    const continued = await hydrate(db, { priorityMessageIds: ["message-24"] })
+
+    expect(first.result).toHaveLength(20)
+    expect(continued.result).toHaveLength(20)
+    expect(continued.result[0]?.id).toBe("message-24")
+    expect(db.checkpoints.some(row => row.messageId === "message-24")).toBe(true)
+    const targetedRead = continued.client.calls.find(call => call.sql.includes("LEFT JOIN \"agent_mailbox_hydration_checkpoints\""))
+    expect(targetedRead?.values[7]).toEqual(["message-24"])
+    expect(targetedRead?.sql).toContain('array_position($8::text[], message."id")')
   })
 
   it.each([

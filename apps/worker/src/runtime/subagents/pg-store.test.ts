@@ -217,7 +217,7 @@ function validAnalystResult() {
 
 function fakeGraphFinishPool(options: {
   legacy?: boolean; includeDependent?: boolean; repair?: boolean; plannedRepair?: boolean; priorReceipt?: boolean; fenceTaskUpdate?: boolean;
-  targetReport?: Record<string, unknown> | null;
+  targetReport?: Record<string, unknown> | null; pendingMailbox?: boolean;
 } = {}) {
   const childId = options.repair ? "repair-1" : "child-1"
   const nodes = [
@@ -264,6 +264,7 @@ function fakeGraphFinishPool(options: {
   const fake = fakePool((sql, params) => {
     const taskId = String(params?.[0] ?? childId)
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+    if (options.pendingMailbox && sql.includes('FROM "agent_mailbox_messages" AS message') && sql.includes("FOR UPDATE OF message")) return { rows: [{ id: "message-late" }], rowCount: 1 }
     if (sql.startsWith("SELECT task.*, session.")) return { rows: [taskRow({
       id: childId, userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
       role: "analyst", taskType: "research", status: "running", leaseOwner: "worker-1", attemptCount: 1, maxAttempts: 2,
@@ -398,6 +399,23 @@ describe("PgSubagentTaskStore", () => {
     if (verificationStatus === "failed") expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toEqual(validAnalystResult())
     else expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toBeUndefined()
     expect(fake.lifecycleEvents.some(event => JSON.stringify(event.payload).includes('"type":"task.completed"'))).toBe(false)
+  })
+
+  it("defers a proof-failed completion when unobserved same-attempt input is pending", async () => {
+    const fake = fakeGraphFinishPool({ pendingMailbox: true })
+    setVerifierResult("failed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toEqual({ status: "input_pending", messageIds: ["message-late"] })
+
+    expect(verifyEvidenceMock).toHaveBeenCalledOnce()
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"') || sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_events"') || sql.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+    expect(fake.lifecycleEvents).toHaveLength(0)
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
   })
 
   it("fails legacy-unverified nodes with a server report even if a mocked verifier claims pass", async () => {
@@ -957,6 +975,26 @@ describe("PgSubagentTaskStore", () => {
     expect(mailboxUpdate?.[0]).toContain('message."consumedAt" IS NULL')
     expect(mailboxUpdate?.[1]).toEqual(["session-1", "task-1", ["message-2", "unknown", "message-1"]])
     expect(fake.calls.map(([sql]) => sql)).toContain("BEGIN")
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it("returns exact unseen mailbox ids without any terminal or consumption writes", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.includes('FROM "agent_mailbox_messages" AS message') && sql.includes("FOR UPDATE OF message")) return { rows: [{ id: "message-unseen" }], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({
+      taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now,
+      mailboxMessageIds: ["message-seen"],
+    })).resolves.toEqual({ status: "input_pending", messageIds: ["message-unseen"] })
+
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
     expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
   })
 

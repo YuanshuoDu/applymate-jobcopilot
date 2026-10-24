@@ -10,7 +10,7 @@ import { CHILD_WAIT_RESUMABLE_SQL, dispatchTaskInvalidReason, lockDispatchTask, 
 import { lockAndAdmitSubagentDispatch, markPauseAwareDispatchError, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches, runSubagentQueueJob } from "./subagent-pause-dispatch.js"
 import { runWithSubagentConcurrencyDeferral } from "./subagent-concurrency-deferral.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
-import { parseSubagentJobPayload, type PgSubagentPool, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
+import { parseSubagentJobPayload, type PgSubagentPool, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease, type SubagentMailboxContinuation } from "../runtime/subagents/types.js"
 import { parseSubagentDispatchJobId, subagentDispatchJobId, SUBAGENT_DISPATCH_IDENTITY_MISMATCH } from "../runtime/subagents/dispatch-identity.js"
 import { OPEN_SESSION, RUNNABLE_SESSION } from "../runtime/session-gate.js"
 export const SUBAGENT_QUEUE_NAME = "agent-subagents"
@@ -20,7 +20,7 @@ export const SUBAGENT_MAX_BATCH = 50
 export { persistSubagentDispatch }
 export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; getJob?(jobId: string): Promise<unknown>; close?(): Promise<void> }
 /** Queue boundary preserves the complete runtime outcome for manager.run to persist. */
-export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>
+export type SubagentExecutor = (input: { lease: SubagentLease; continuation?: SubagentMailboxContinuation }) => Promise<SubagentExecutionResult>
 type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
 /** BullMQ custom IDs reject colon characters; encode user controlled IDs. */
 export function subagentJobId(taskId: string, generation = 0): string {

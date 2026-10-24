@@ -778,6 +778,31 @@ describe("production child runtime", () => {
     expect(pool.query).not.toHaveBeenCalled()
   })
 
+  it("rejects mailbox continuation for an application filler without invoking its completed browser flow", async () => {
+    applicationFillExecutorMock.execute.mockClear()
+    const pool = { connect: vi.fn(), query: vi.fn() }
+    const executor = createOptionalProductionChildExecutor({ enabled: true, pool: pool as never })
+    if (!executor) throw new Error("production child executor was not created")
+    const child = { ...lease(), role: "application_filler", taskType: "application_fill_for_review", allowedActions: [] } satisfies SubagentLease
+
+    await expect(executor({ lease: child, continuation: { kind: "mailbox_input_pending", missingMessageIds: ["mail-1"], observedMessageIds: [] } }))
+      .resolves.toMatchObject({ status: "failed", failureReason: "application_fill_continuation_unsupported", retryDisposition: "terminal" })
+    expect(applicationFillExecutorMock.execute).not.toHaveBeenCalled()
+    expect(pool.connect).not.toHaveBeenCalled()
+    expect(pool.query).not.toHaveBeenCalled()
+  })
+
+  it("preserves application filler mismatch rejection when a continuation is present", async () => {
+    applicationFillExecutorMock.execute.mockClear()
+    const executor = createOptionalProductionChildExecutor({ enabled: true, pool: {} as never })
+    if (!executor) throw new Error("production child executor was not created")
+
+    await expect(executor({ lease: { ...lease(), role: "application_filler", taskType: "research" },
+      continuation: { kind: "mailbox_input_pending", missingMessageIds: ["mail-1"], observedMessageIds: [] } }))
+      .resolves.toMatchObject({ status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal" })
+    expect(applicationFillExecutorMock.execute).not.toHaveBeenCalled()
+  })
+
   it.each([
     { role: "application_filler", taskType: "research" },
     { role: "analyst", taskType: "application_fill_for_review" },
@@ -910,6 +935,75 @@ describe("production child runtime", () => {
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
     expect(poolWithConnect.connect).toHaveBeenCalledTimes(2)
     expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
+  })
+
+  it("uses the server-owned same-attempt loader and forwards mailbox continuation in production", async () => {
+    const child = { ...lease(), attemptCount: 2, leaseExpiresAt: new Date("2099-09-14T12:00:00.000Z") }
+    const refreshedExpiry = new Date("2099-09-14T13:00:00.000Z")
+    const currentStep = { id: "step-current", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, rootTaskId: child.rootTaskId,
+      ordinal: 0, attempt: child.attemptCount, status: "completed", inputThroughSequence: "3", consumedInputIds: [], inputTokens: 2, outputTokens: 1, estimatedCostUsd: "0.01" }
+    const completedCall = { id: "call-current", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, rootTaskId: child.rootTaskId,
+      stepId: currentStep.id, ordinal: 0, attempt: child.attemptCount, type: "tool_call", status: "completed", phase: null,
+      content: { toolCallId: "checkpoint-call", toolName: "jobs.search", input: {} }, createdAt: new Date("2099-09-14T10:58:00.000Z") }
+    const completedResult = { id: "result-current", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, rootTaskId: child.rootTaskId,
+      stepId: currentStep.id, ordinal: 0, attempt: child.attemptCount, type: "tool_result", status: "completed", phase: null,
+      content: { toolCallId: "checkpoint-call", output: { jobs: [{ id: "job-1" }] }, errorCode: null }, createdAt: new Date("2099-09-14T10:58:30.000Z") }
+    const finalItem = { id: "final-current", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, rootTaskId: child.rootTaskId,
+      stepId: currentStep.id, ordinal: 0, attempt: child.attemptCount, type: "agent_message", status: "completed", phase: "final_answer",
+      content: { text: "Prior checkpoint answer" }, createdAt: new Date("2099-09-14T10:59:00.000Z") }
+    const queries: Array<{ sql: string; values: readonly unknown[] }> = []
+    const client = {
+      query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+        queries.push({ sql, values })
+        if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR SHARE")) return { rows: [{ id: child.sessionId }], rowCount: 1 }
+        if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT task."id"')) return { rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId,
+          rootTaskId: child.rootTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: refreshedExpiry,
+          interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 }
+        if (sql.includes('FROM "agent_steps" AS step')) return { rows: sql.includes('step."attempt" = $6') ? [currentStep] : [], rowCount: sql.includes('step."attempt" = $6') ? 1 : 0 }
+        if (sql.includes('FROM "agent_items" AS item')) return { rows: sql.includes('step."attempt" = $6') ? [completedCall, completedResult, finalItem] : [], rowCount: sql.includes('step."attempt" = $6') ? 3 : 0 }
+        throw new Error(`unexpected same-attempt continuation query: ${sql}`)
+      }),
+      release: vi.fn(),
+    }
+    const poolConnect = vi.fn(async () => client)
+    const pool = { connect: poolConnect, query: vi.fn() } as unknown as never
+    const mailbox = { id: "mail-1", sessionId: child.sessionId, turnId: child.turnId ?? "turn-1", fromTaskId: "root-1", toTaskId: child.id,
+      kind: "instruction", idempotencyKey: "mail-1-key", createdAt: new Date("2099-09-14T11:00:00.000Z"), payload: { text: "New requested detail" }, deliveredAt: null, consumedAt: null }
+    const requests: HarnessModelRequest[] = [], ordinals: number[] = []
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) { requests.push(request); yield { type: "text_delta", text: "Continued answer" }; yield { type: "completed", finishReason: "stop" } },
+    }
+    const engineStore: TurnEngineStore = { ...store(), startStep: async ({ stepId, ordinal }) => { ordinals.push(ordinal); return { id: stepId, ordinal } } }
+    const execute = vi.fn(async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({
+      ...request, status: "completed" as const, output: { jobs: [{ id: "unexpected-replay" }] }, errorCode: null,
+    }))
+    const runtimeLeases: SubagentLease[] = []
+    const executor = createOptionalProductionChildExecutor({
+      enabled: true, pool, turnStore: engineStore, treeBudget: budget(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model, mailboxReader: { listPendingMessages: async () => [mailbox] },
+      toolRuntimeFactory: ({ lease: runtimeLease }) => {
+        runtimeLeases.push(runtimeLease)
+        return { definitions: [publicTool("jobs.search")], router: { execute }, validateArguments: validateFixtureToolArguments }
+      },
+    })
+    if (!executor) throw new Error("child executor was not created")
+    const continued = await executor({ lease: child, continuation: { kind: "mailbox_input_pending", missingMessageIds: [mailbox.id], observedMessageIds: [] } })
+    if (continued.status !== "completed") throw new Error(`same-attempt continuation outcome: ${JSON.stringify(continued)}`)
+    expect(poolConnect).toHaveBeenCalledOnce()
+    expect(queries.some(query => query.sql.includes("FOR SHARE"))).toBe(true)
+    expect(queries.find(query => query.sql.includes('FROM "agent_steps" AS step') && query.sql.includes('step."attempt" = $6'))?.values)
+      .toEqual([child.id, child.sessionId, child.turnId, child.userId, child.rootTaskId, child.attemptCount])
+    expect(ordinals).toEqual([1])
+    expect(runtimeLeases).toHaveLength(1)
+    expect(runtimeLeases[0]).toMatchObject({ id: child.id, ownerId: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: refreshedExpiry })
+    expect(runtimeLeases[0]).not.toBe(child)
+    expect(child.leaseExpiresAt).toEqual(new Date("2099-09-14T12:00:00.000Z"))
+    expect(execute).not.toHaveBeenCalled()
+    expect(JSON.stringify(requests[0]?.messages)).toContain("Prior checkpoint answer")
+    expect(JSON.stringify(requests[0]?.messages)).toContain("New requested detail")
   })
 
   it("pins selected evidence reads to the server job, base resume, and cover-letter persona scope", async () => {

@@ -49,8 +49,9 @@ class FakeClient {
     private readonly ownerTask: OwnerTaskState = activeOwnerTask(),
     private readonly taskTurnIds: Readonly<Record<string, string>> = {},
     private readonly taskEvidence: Pick<CoordinationTaskView, "context" | "result" | "failureReason"> = { context: null, result: null, failureReason: null },
+    private readonly targetTaskStatus: CoordinationTaskView["status"] = task.status,
   ) {
-    this.rows = { ...task, ...this.taskEvidence, createdAt: new Date("2026-09-03T00:00:00.000Z") }
+    this.rows = { ...task, status: this.targetTaskStatus, ...this.taskEvidence, createdAt: new Date("2026-09-03T00:00:00.000Z") }
     this.mailboxRows = mailboxRows.map(row => ({ ...row }))
   }
 
@@ -96,6 +97,9 @@ class FakeClient {
       const now = values[5] instanceof Date ? values[5] : null
       const valid = this.matchesOwner(String(values[0]), String(values[1]), String(values[2]), String(values[3]), Number(values[4]), now)
       return valid ? { rows: [{ id: task.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
+    if (text.includes('SELECT target."status"') && text.includes('FROM "sub_agent_tasks" AS target')) {
+      return this.mode === "task" ? { rows: [{ status: this.targetTaskStatus }], rowCount: 1 } : { rows: [], rowCount: 0 }
     }
     if (text.includes('UPDATE "agent_mailbox_messages"')) {
       const sessionId = String(values[0])
@@ -438,6 +442,40 @@ describe("PgCoordinationStore", () => {
     await expect(store.sendMessage(input)).resolves.toMatchObject({
       duplicate: true, message: { id: "message-replay", turnId: "turn-a", fromTaskId: "task-sender" },
     })
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_mailbox_messages"'))).toBe(false)
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it.each(["completed", "failed", "interrupted", "cancelled", "closed"] as const)("rejects a fresh mailbox message for a %s target without writing message or outbox", async status => {
+    const client = new FakeClient("task", "running", [], "user-a", activeOwnerTask(), {}, {}, status)
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.sendMessage({
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", fromTaskId: null,
+      toTaskId: "task-1", kind: "result", payload: { ok: true }, idempotencyKey: "terminal-target",
+    })).rejects.toMatchObject({ code: "coordination_task_not_found" })
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_mailbox_messages"'))).toBe(false)
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    const sessionLock = client.queries.findIndex(query => query.sql.includes('FROM "agent_sessions"') && query.sql.includes("FOR UPDATE"))
+    const replayLookup = client.queries.findIndex(query => query.sql.includes('WHERE "sessionId" = $1 AND "idempotencyKey" = $2'))
+    const terminalGuard = client.queries.findIndex(query => query.sql.includes('SELECT target."status"'))
+    expect(sessionLock).toBeGreaterThanOrEqual(0)
+    expect(replayLookup).toBeGreaterThan(sessionLock)
+    expect(replayLookup).toBeGreaterThanOrEqual(0)
+    expect(terminalGuard).toBeGreaterThan(replayLookup)
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
+  })
+
+  it("replays an exact prior message after its target becomes terminal", async () => {
+    const existing = mailboxRow({ id: "message-terminal-replay", fromTaskId: "task-sender", idempotencyKey: "terminal-replay-key" })
+    const client = new FakeClient("task", "running", [existing], "user-a", activeOwnerTask(), { "task-sender": "turn-a" }, {}, "failed")
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.sendMessage({
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", fromTaskId: "task-sender",
+      toTaskId: "task-1", kind: "result", payload: { ok: true }, idempotencyKey: "terminal-replay-key",
+    })).resolves.toMatchObject({ duplicate: true, message: { id: "message-terminal-replay" } })
+    expect(client.queries.some(query => query.sql.includes('SELECT target."status"'))).toBe(false)
     expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_mailbox_messages"'))).toBe(false)
     expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })

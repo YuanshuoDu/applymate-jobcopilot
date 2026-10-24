@@ -10,7 +10,9 @@ import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentS
 import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
 import type { SubagentDispatchIdentity } from "./dispatch-identity.js"
 import { dateValue, json, rowToTask, SELECT_TASK, spawnKey, transaction, uniqueMessageIds } from "./pg-store-persistence.js"
+import { findUnobservedMailboxMessageIds } from "./subagent-mailbox-completion.js"
 import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
+import type { SubagentFinishResult } from "./types.js"
 export class PgSubagentTaskStore implements SubagentStore {
   constructor(private readonly pool: PgSubagentPool, private readonly leaseMs = 60_000) {}
   private async leaseTimeAfterLock(client: pg.PoolClient, input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number }): Promise<Date | null> {
@@ -96,7 +98,7 @@ export class PgSubagentTaskStore implements SubagentStore {
       return state.rows[0]?.interruptRequestedAt && state.rows[0]?.turnStatus === "interrupted" ? "interrupted" : "lost"
     })
   }
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<SubagentFinishResult | null> {
     const mailboxMessageIds = uniqueMessageIds(input.mailboxMessageIds)
     try {
       return await transaction(this.pool, async (client) => {
@@ -141,6 +143,12 @@ export class PgSubagentTaskStore implements SubagentStore {
         if (input.status === "waiting" && row.parentTaskId !== null && row.parentTaskId !== undefined) {
           const handoff = await handoffDurableSubagentWaitWithGraph(client, { lease: { id: input.taskId, userId: sessionRow.userId, sessionId: input.sessionId, turnId: String(row.turnId), rootTaskId: String(row.rootTaskId), ownerId: input.ownerId, attemptCount: input.attemptCount, leaseExpiresAt: lockedExpiry }, now: finishAt })
           if (handoff) return "blocked" in handoff ? null : "waiting"
+        }
+        if (input.status === "completed" && !interrupted) {
+          const missingMessageIds = await findUnobservedMailboxMessageIds(client, {
+            sessionId: input.sessionId, taskId: input.taskId, attemptCount: input.attemptCount, observedMessageIds: mailboxMessageIds,
+          })
+          if (missingMessageIds.length > 0) return { status: "input_pending", messageIds: missingMessageIds }
         }
         const nextAttemptAt = retry ? computeSubagentNextAttemptAt(input.attemptCount, finishAt) : null
         const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,

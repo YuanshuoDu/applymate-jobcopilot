@@ -7,6 +7,7 @@ import type { TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-rev
 import type { SelectedJobArtifactContextBundle } from "./selected-job-artifact-context.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
 import { structuredRoleOutputGuidance } from "./role-results.js"
+import { prioritizeMailboxMessages } from "./child-mailbox-continuation.js"
 import type { SubagentTaskRecord } from "./types.js"
 const CHILD_MAILBOX_READ_LIMIT = 20
 /** Maximum UTF-8 size of a normalized mailbox payload before it is summarized. */
@@ -23,6 +24,7 @@ export type ChildMailboxHydrationInput = {
   readonly attemptCount: number
   readonly stepId: string
   readonly limit: number
+  readonly priorityMessageIds?: readonly string[]
 }
 export type ChildMailboxReader = {
   readonly listPendingMessages: (input: {
@@ -243,12 +245,8 @@ function assertOwner(task: SubagentTaskRecord, identity: ExecutionOwnerFence, sc
     throw new Error("child_context_owner_mismatch")
   }
 }
-export function createChildContextBuilder(task: SubagentTaskRecord, initial = childContextSnapshot(task), mailboxReader?: ChildMailboxReader, transientSources: SelectedJobArtifactContextBundle["transientSources"] = [], writerReviewFeedback?: TaskGraphWriterReviewFeedbackFrame): ChildContextBuilder {
-  // Keep the first normalized block for each id. A Map preserves first-read
-  // order and prevents later reads from replacing an already visible payload.
+export function createChildContextBuilder(task: SubagentTaskRecord, initial = childContextSnapshot(task), mailboxReader?: ChildMailboxReader, transientSources: SelectedJobArtifactContextBundle["transientSources"] = [], writerReviewFeedback?: TaskGraphWriterReviewFeedbackFrame, priorityMessageIds: readonly string[] = []): ChildContextBuilder {
   const mailboxBlocks = new Map<string, ContextBlock>()
-  // This is the largest number of distinct valid rows omitted by one read.
-  // It reports the bounded overflow without retaining an unbounded id set.
   let omittedMessageCount = 0
   return {
     async build(request: { scope: TenantScope; identity: ExecutionOwnerFence; stepId: string; snapshot: StepContextSnapshot }): Promise<StepContext> {
@@ -257,13 +255,14 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
       const pendingMessages = mailboxReader?.hydrateMessages
         ? await mailboxReader.hydrateMessages({
           userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, rootTaskId: task.rootTaskId, toTaskId: task.id,
-          ownerId: request.identity.ownerId, attemptCount: request.identity.attemptCount, stepId: request.stepId, limit: CHILD_MAILBOX_READ_LIMIT,
+          ownerId: request.identity.ownerId, attemptCount: request.identity.attemptCount, stepId: request.stepId, limit: CHILD_MAILBOX_READ_LIMIT, priorityMessageIds,
         })
         : mailboxReader
           ? await mailboxReader.listPendingMessages({ userId: task.userId, sessionId: task.sessionId, toTaskId: task.id, limit: CHILD_MAILBOX_READ_LIMIT })
           : []
-      const scopedMessages = pendingMessages.filter(message => typeof message.id === "string" && message.id.length > 0
-        && message.sessionId === task.sessionId && message.turnId === task.turnId && message.toTaskId === task.id)
+      const scopedMessages = prioritizeMailboxMessages(pendingMessages.filter(message => typeof message.id === "string" && message.id.length > 0
+        && message.sessionId === task.sessionId && message.turnId === task.turnId && message.toTaskId === task.id), priorityMessageIds)
+      if (priorityMessageIds.some(id => !scopedMessages.some(message => message.id === id))) throw new Error("child_mailbox_priority_unavailable")
       const seenThisBuild = new Set<string>()
       let omittedThisBuild = 0
       for (const message of scopedMessages) {
@@ -275,6 +274,7 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
         }
         mailboxBlocks.set(message.id, mailboxBlock(message))
       }
+      if (priorityMessageIds.some(id => !mailboxBlocks.has(id))) throw new Error("child_mailbox_priority_unavailable")
       omittedMessageCount = Math.max(omittedMessageCount, omittedThisBuild)
       const cachedMailboxBlocks = [...mailboxBlocks.values()].map(copyBlock)
       if (omittedMessageCount > 0) cachedMailboxBlocks.push(mailboxMetadataBlock(mailboxBlocks.size, omittedMessageCount))

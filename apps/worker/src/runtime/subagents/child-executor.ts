@@ -1,7 +1,5 @@
 import type { ModelAdapter } from "@jobcopilot/agent-model"
-import { redactSensitiveText } from "@jobcopilot/shared"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
-import { Buffer } from "node:buffer"
 import { executionOwnerFence } from "../execution-owner.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
@@ -20,10 +18,11 @@ import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, s
 import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
 import { dispatchNativeVerificationTask } from "./native-verification-executor.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
-import type { ChildResumeLoader } from "./child-resume.js"
+import type { ChildAttemptResume, ChildResumeLoader, ChildSameAttemptResume, ChildSameAttemptResumeLoader } from "./child-resume.js"
+import { projectChildFinalText } from "./child-mailbox-continuation.js"
 import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-contract.js"
-import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
+import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentMailboxContinuation, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
@@ -37,27 +36,6 @@ import type { ChildPublicDefinition, ChildToolRuntime } from "./child-executor-a
 import type { DurableWaitResume } from "./child-resume-observations.js"
 export type { ChildPublicDefinition, ChildToolRuntime } from "./child-executor-admission.js"
 
-const MAX_CHILD_FINAL_TEXT_BYTES = 8 * 1024
-const CHILD_FINAL_TEXT_TRUNCATION_MARKER = "...[TRUNCATED]"
-function utf8Prefix(value: string, maxBytes: number): string {
-  let bytes = 0
-  let prefix = ""
-  for (const character of value) {
-    const characterBytes = Buffer.byteLength(character, "utf8")
-    if (bytes + characterBytes > maxBytes) break
-    prefix += character
-    bytes += characterBytes
-  }
-  return prefix
-}
-
-function projectChildFinalText(value: string): string {
-  const redacted = redactSensitiveText(value)
-  if (Buffer.byteLength(redacted, "utf8") <= MAX_CHILD_FINAL_TEXT_BYTES) return redacted
-  const markerBytes = Buffer.byteLength(CHILD_FINAL_TEXT_TRUNCATION_MARKER, "utf8")
-  return `${utf8Prefix(redacted, MAX_CHILD_FINAL_TEXT_BYTES - markerBytes)}${CHILD_FINAL_TEXT_TRUNCATION_MARKER}`
-}
-
 export type ChildExecutorOptions = {
   readonly store: TurnExecutionStore
   readonly treeBudget: TreeBudgetReservationStore
@@ -70,6 +48,8 @@ export type ChildExecutorOptions = {
   readonly resumeLoader?: ChildResumeLoader
   /** Acknowledges a delivered durable wait only after the continuation step exists. */
   readonly durableWaitResumeCommitter?: (lease: SubagentLease, wait: DurableWaitResume, nextStepOrdinal: number) => Promise<boolean | void>
+  /** Restores only durable checkpoints from a completed step in this exact attempt. */
+  readonly sameAttemptContinuationLoader?: ChildSameAttemptResumeLoader
   readonly now?: () => Date
 }
 
@@ -90,12 +70,28 @@ async function defaultModel(task: SubagentTaskRecord): Promise<ModelAdapter> {
   return (await createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
 
-export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult> {
+export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease; continuation?: SubagentMailboxContinuation }) => Promise<SubagentExecutionResult> {
   if (!options.treeBudget) throw new TypeError("treeBudget is required for child execution")
-  return async ({ lease }) => {
+  return async ({ lease, continuation }) => {
     if (!lease.turnId) return { status: "failed", failureReason: "child_turn_missing" }
-    const owner = executionOwnerFence({ kind: "task", lease })
-    const verifier = await dispatchNativeVerificationTask({ lease, owner, store: options.store, treeBudget: options.treeBudget, authorizeUsage: options.authorizeUsage, resolveModel: () => options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease), now: options.now }); if (verifier) return verifier
+    if (continuation && lease.role === "auditor" && lease.taskType === "native_verification") return { status: "failed", failureReason: "child_mailbox_continuation_unsupported", retryDisposition: "terminal" }
+    let executionLease = lease, sameAttemptRestored: ChildSameAttemptResume | undefined
+    if (continuation) {
+      if (!options.sameAttemptContinuationLoader || continuation.kind !== "mailbox_input_pending"
+        || continuation.missingMessageIds.length < 1 || continuation.missingMessageIds.length > 20
+        || continuation.missingMessageIds.some(id => typeof id !== "string" || !id.trim())) return { status: "failed", failureReason: "child_mailbox_continuation_unavailable", retryDisposition: "terminal" }
+      try {
+        sameAttemptRestored = await options.sameAttemptContinuationLoader(lease) ?? undefined
+        if (!sameAttemptRestored || !sameAttemptRestored.previousFinalText.trim()
+          || !(sameAttemptRestored.leaseExpiresAt instanceof Date) || !Number.isFinite(sameAttemptRestored.leaseExpiresAt.getTime())
+          || sameAttemptRestored.leaseExpiresAt.getTime() <= (options.now?.() ?? new Date()).getTime()) return { status: "failed", failureReason: "child_mailbox_continuation_checkpoint_unavailable", retryDisposition: "terminal" }
+        executionLease = { ...lease, leaseExpiresAt: sameAttemptRestored.leaseExpiresAt }
+      } catch (error: unknown) {
+        return { status: "failed", failureReason: isDeterministicChildResumeError(error) ? "child_mailbox_continuation_checkpoint_invalid" : "child_mailbox_continuation_checkpoint_unavailable", retryDisposition: "terminal" }
+      }
+    }
+    const owner = executionOwnerFence({ kind: "task", lease: executionLease })
+    const verifier = await dispatchNativeVerificationTask({ lease: executionLease, owner, store: options.store, treeBudget: options.treeBudget, authorizeUsage: options.authorizeUsage, resolveModel: () => options.modelRuntimeFactory?.({ task: executionLease }) ?? defaultModel(executionLease), now: options.now }); if (verifier) return verifier
     const selectedJob = selectedJobId(lease), selectedEvidenceTask = Boolean(selectedJob && (lease.role === "scout" || lease.role === "analyst"))
     let reviewerArtifactRef: ArtifactVersionReference | undefined
     if ((lease.role === "writer" || lease.role === "reviewer") && !selectedJob) {
@@ -106,7 +102,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       catch { return { status: "failed", failureReason: "writer_dependency_unavailable", retryDisposition: "terminal" } }
     }
     let runtime: ChildToolRuntime
-    try { runtime = await options.toolRuntimeFactory({ task: lease, owner, lease }) }
+    try { runtime = await options.toolRuntimeFactory({ task: executionLease, owner, lease: executionLease }) }
     catch (error: unknown) {
       if (error instanceof TaskGraphWriterReviewFeedbackError) {
         return { status: "failed", failureReason: error.code, retryDisposition: "terminal" }
@@ -123,27 +119,31 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     let durableWaitResume: DurableWaitResume | undefined
     const observedEvidence = createObservedEvidenceIndex()
     const durableWaitResumeEligible = canManageChildrenWithWaitAction(policy, lease.allowedActions)
-    if (options.resumeLoader && (lease.attemptCount > 1 || durableWaitResumeEligible)) {
-      try {
-        const restored = await options.resumeLoader(lease)
-        if (restored) {
-          durableWaitResume = restored.durableWait
-          if (!selectedEvidenceTask) {
-            try {
-              const prepare = await resolveScheduledPrepareResumeEvidence(restored.observations, runtime.resolveScheduledPrepareReference, lease.id, lease.attemptCount)
-              const evidence = restored.observations.filter(item => !["scheduled.application.prepare", "wait_subagents"].includes(String(record(item.content).toolName)))
-              hydrateObservedEvidence(observedEvidence, evidence, { taskId: lease.id, attemptCount: lease.attemptCount })
-              for (const item of prepare) recordReadToolOutput(observedEvidence, "scheduled.application.prepare", item.result, undefined,
-                { toolCallId: item.toolCallId, taskId: lease.id, attemptCount: lease.attemptCount, ...(item.reference ? { reference: item.reference } : {}) })
-            } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
-            snapshot = { ...snapshot, toolObservations: [...restored.observations] }
-          }
-          resume = restored.resume
-        }
-      } catch (error: unknown) {
+    let restored: ChildAttemptResume | undefined = sameAttemptRestored
+    if (continuation) {
+      snapshot = { ...snapshot, profile: [...snapshot.profile, { id: `child-mailbox-continuation:${lease.id}:${lease.attemptCount}`, content: { previousFinalText: projectChildFinalText(sameAttemptRestored!.previousFinalText) } }], toolObservations: [...sameAttemptRestored!.observations] }
+      resume = sameAttemptRestored!.resume
+    }
+    if (!continuation && options.resumeLoader && (lease.attemptCount > 1 || durableWaitResumeEligible)) {
+      try { restored = await options.resumeLoader(lease) }
+      catch (error: unknown) {
         if (isDeterministicChildResumeError(error)) return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" }
         return { status: "failed", failureReason: "child_resume_unavailable" }
       }
+    }
+    if (restored) {
+      if (!continuation) durableWaitResume = restored.durableWait
+      if (!selectedEvidenceTask) {
+        try {
+          const prepare = await resolveScheduledPrepareResumeEvidence(restored.observations, runtime.resolveScheduledPrepareReference, lease.id, lease.attemptCount)
+          const evidence = restored.observations.filter(item => !["scheduled.application.prepare", "wait_subagents"].includes(String(record(item.content).toolName)))
+          hydrateObservedEvidence(observedEvidence, evidence, { taskId: lease.id, attemptCount: lease.attemptCount })
+          for (const item of prepare) recordReadToolOutput(observedEvidence, "scheduled.application.prepare", item.result, undefined,
+            { toolCallId: item.toolCallId, taskId: lease.id, attemptCount: lease.attemptCount, ...(item.reference ? { reference: item.reference } : {}) })
+        } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
+        if (!continuation) snapshot = { ...snapshot, toolObservations: [...restored.observations] }
+      }
+      resume = restored.resume
     }
     if (durableWaitResume && (!resume || durableWaitResume.attempt !== lease.attemptCount || resume.nextOrdinal !== durableWaitResume.ordinal + 1)) {
       return { status: "failed", failureReason: "child_resume_wait_step_lineage", retryDisposition: "terminal" }
@@ -155,7 +155,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     if (selectedJobPreparation && (lease.role === "writer" || lease.role === "reviewer") && !structuredRole) {
       return { status: "failed", failureReason: "selected_job_output_contract_unavailable", retryDisposition: "terminal" }
     }
-    const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
+    const adapter = await (options.modelRuntimeFactory?.({ task: executionLease }) ?? defaultModel(executionLease))
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
     const router = createSelectedJobReadRouter(runtime.router, runtime.selectedJobArtifactContext)
     const routedTool = createToolRouterExecutor(router)
@@ -196,6 +196,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       lease, snapshot, options.mailboxReader,
       lease.role === "writer" || lease.role === "reviewer" ? runtime.selectedJobArtifactContext?.transientSources : undefined,
       lease.role === "writer" ? runtime.writerReviewRevision?.feedback : undefined,
+      continuation?.missingMessageIds ?? [],
     )
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,

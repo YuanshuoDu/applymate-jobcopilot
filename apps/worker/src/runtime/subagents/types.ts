@@ -122,6 +122,15 @@ export type SubagentExecutionResult = {
   mailboxMessageIds?: readonly string[]
 }
 
+export type SubagentMailboxContinuation = {
+  readonly kind: "mailbox_input_pending"
+  readonly missingMessageIds: readonly string[]
+  readonly observedMessageIds: readonly string[]
+}
+
+export type SubagentFinishResult = "completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted"
+  | { readonly status: "input_pending"; readonly messageIds: readonly string[] }
+
 export type SubagentStore = {
   create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord>
   createWithSpawn?(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult>
@@ -129,7 +138,7 @@ export type SubagentStore = {
   claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }): Promise<SubagentTaskRecord | null>
   matchesPublishedDispatch?(input: { payload: SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean>
   heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost">
-  finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
+  finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<SubagentFinishResult | null>
   release?(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean>
   close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean>
   interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number>

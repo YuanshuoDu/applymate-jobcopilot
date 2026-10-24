@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool } from "pg"
+import type pg from "pg"
 
 import { hydrateChildMailbox } from "./hydration.js"
 import { drainSubagentMailboxOutbox } from "./outbox-consumer.js"
 import { PgCoordinationStore } from "./store.js"
+import { PgSubagentTaskStore } from "../subagents/pg-store.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -162,11 +164,264 @@ describeWithPostgres("attempt-bound mailbox messages in PostgreSQL", () => {
     await expect(pool.query(`SELECT "publishedAt", "attemptCount", "lastError" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [`subagent-dispatch:${fixture.taskId}`]))
       .resolves.toMatchObject({ rows: [{ publishedAt: expect.any(Date), attemptCount: 4, lastError: "prior_failure" }] })
   })
+
+  it("returns actionable pending input when a send commits before finish, then completes only after same-attempt observation", async () => {
+    await restoreFixtureOwners(pool)
+    const task = await insertRunningRaceTask(pool, "send-first")
+    const seededCurrentId = `mailbox-attempt-send-first-current-${randomUUID()}`
+    const seededLegacyId = `mailbox-attempt-send-first-legacy-${randomUUID()}`
+    const oldAttemptId = `mailbox-attempt-send-first-old-${randomUUID()}`
+    await insertMessage(pool, seededCurrentId, `${seededCurrentId}-key`, "human_follow_up", 2, task.taskId)
+    await insertMessage(pool, seededLegacyId, `${seededLegacyId}-key`, "result", null, task.taskId)
+    await insertMessage(pool, oldAttemptId, `${oldAttemptId}-key`, "human_follow_up", 1, task.taskId)
+
+    const senderGate = createSessionLockBarrier()
+    const finishGate = createSessionLockBarrier()
+    const coordination = new PgCoordinationStore(poolWithSessionLockBarrier(pool, senderGate))
+    const taskStore = new PgSubagentTaskStore(poolWithSessionLockBarrier(pool, finishGate))
+    const sendInput = raceSendInput(task, `send-first-${randomUUID()}`)
+    let sendPromise: ReturnType<PgCoordinationStore["sendMessage"]> | undefined
+    let finishPromise: ReturnType<PgSubagentTaskStore["finish"]> | undefined
+    try {
+      sendPromise = coordination.sendMessage(sendInput)
+      await withDeadline(senderGate.acquired, "sender session-lock acquisition")
+      finishPromise = taskStore.finish(raceFinishInput(task, [seededCurrentId, seededLegacyId]))
+      await withDeadline(finishGate.attempted, "finish session-lock attempt")
+
+      senderGate.release()
+      const sent = await withDeadline(sendPromise, "sender commit")
+      expect(sent.duplicate).toBe(false)
+      const sentMessageId = sent.message.id
+      await withDeadline(finishGate.acquired, "finish session-lock acquisition")
+      const beforePending = await taskAndSideEffectSnapshot(pool, task.taskId)
+      finishGate.release()
+
+      await expect(withDeadline(finishPromise, "pending finish result"))
+        .resolves.toEqual({ status: "input_pending", messageIds: [sentMessageId] })
+      const afterPending = await taskAndSideEffectSnapshot(pool, task.taskId)
+      expect(afterPending.effects).toEqual(beforePending.effects)
+      expect(afterPending.task).toMatchObject({ status: "running", attemptCount: 2, leaseOwner: task.ownerId, result: null, failureReason: null, completedAt: null })
+      await expect(pool.query(`SELECT "id", "consumedAt" FROM "agent_mailbox_messages" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+        [[seededCurrentId, seededLegacyId, sentMessageId, oldAttemptId]])).resolves.toMatchObject({
+        rows: [seededCurrentId, seededLegacyId, sentMessageId, oldAttemptId].sort().map(id => ({ id, consumedAt: null })),
+      })
+
+      const final = await taskStore.finish(raceFinishInput(task, [seededCurrentId, seededLegacyId, sentMessageId]))
+      expect(final).toBe("completed")
+      const consumed = await pool.query<{ id: string }>(`SELECT "id" FROM "agent_mailbox_messages" WHERE "id" = ANY($1::text[]) AND "consumedAt" IS NOT NULL ORDER BY "id"`,
+        [[seededCurrentId, seededLegacyId, sentMessageId, oldAttemptId]])
+      expect(consumed.rows.map(row => row.id)).toEqual([seededCurrentId, seededLegacyId, sentMessageId].sort())
+      await expect(pool.query(`SELECT "status", "attemptCount", "leaseOwner", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [task.taskId]))
+        .resolves.toMatchObject({ rows: [{ status: "completed", attemptCount: 2, leaseOwner: null, result: { finished: true } }] })
+    } finally {
+      senderGate.release()
+      finishGate.release()
+      await settleRacePromise(sendPromise)
+      await settleRacePromise(finishPromise)
+    }
+  })
+
+  it("linearizes finish before a competing send, rejects that new message, and still accepts an exact terminal replay", async () => {
+    await restoreFixtureOwners(pool)
+    const task = await insertRunningRaceTask(pool, "finish-first")
+    const coordination = new PgCoordinationStore(pool)
+    const originalInput = raceSendInput(task, `finish-first-replay-${randomUUID()}`)
+    const original = await coordination.sendMessage(originalInput)
+    expect(original.duplicate).toBe(false)
+
+    const finishGate = createSessionLockBarrier()
+    const senderGate = createSessionLockBarrier()
+    const taskStore = new PgSubagentTaskStore(poolWithSessionLockBarrier(pool, finishGate))
+    const competingSender = new PgCoordinationStore(poolWithSessionLockBarrier(pool, senderGate))
+    const freshInput = raceSendInput(task, `finish-first-fresh-${randomUUID()}`)
+    let finishPromise: ReturnType<PgSubagentTaskStore["finish"]> | undefined
+    let freshSendPromise: ReturnType<PgCoordinationStore["sendMessage"]> | undefined
+    try {
+      finishPromise = taskStore.finish(raceFinishInput(task, [original.message.id]))
+      await withDeadline(finishGate.acquired, "finish session-lock acquisition")
+      const beforeFinish = await taskAndSideEffectSnapshot(pool, task.taskId)
+      freshSendPromise = competingSender.sendMessage(freshInput)
+      await withDeadline(senderGate.attempted, "competing sender session-lock attempt")
+
+      finishGate.release()
+      await expect(withDeadline(finishPromise, "terminal finish result")).resolves.toBe("completed")
+      await withDeadline(senderGate.acquired, "competing sender session-lock acquisition")
+      senderGate.release()
+      await expect(withDeadline(freshSendPromise, "rejected fresh send"))
+        .rejects.toMatchObject({ code: "coordination_task_not_found" })
+
+      const afterReject = await taskAndSideEffectSnapshot(pool, task.taskId)
+      expect(afterReject.task).toMatchObject({ status: "completed", attemptCount: 2, leaseOwner: null, result: { finished: true } })
+      expect(afterReject.effects.outbox).toBe(beforeFinish.effects.outbox)
+      expect(afterReject.effects.events).toBe(beforeFinish.effects.events)
+      expect(afterReject.effects.eventSequence).toBe(beforeFinish.effects.eventSequence)
+      expect(afterReject.effects.mailbox).toBe(beforeFinish.effects.mailbox)
+      const replay = await coordination.sendMessage(originalInput)
+      expect(replay).toMatchObject({ duplicate: true, message: { id: original.message.id } })
+      const afterReplay = await taskAndSideEffectSnapshot(pool, task.taskId)
+      expect(afterReplay.effects).toEqual(afterReject.effects)
+      await expect(pool.query(`SELECT "consumedAt" FROM "agent_mailbox_messages" WHERE "id" = $1`, [original.message.id]))
+        .resolves.toMatchObject({ rows: [{ consumedAt: expect.any(Date) }] })
+      await expect(pool.query(`SELECT COUNT(*)::int AS count FROM "agent_mailbox_messages" WHERE "toTaskId" = $1 AND "idempotencyKey" = $2`,
+        [task.taskId, freshInput.idempotencyKey])).resolves.toMatchObject({ rows: [{ count: 0 }] })
+    } finally {
+      finishGate.release()
+      senderGate.release()
+      await settleRacePromise(finishPromise)
+      await settleRacePromise(freshSendPromise)
+    }
+  })
+
+  it.each(["owner", "attempt"] as const)("does not terminalize or acknowledge input with a stale %s fence", async fence => {
+    await restoreFixtureOwners(pool)
+    const task = await insertRunningRaceTask(pool, `stale-${fence}`)
+    const messageId = `mailbox-attempt-stale-${fence}-${randomUUID()}`
+    await insertMessage(pool, messageId, `${messageId}-key`, "result", null, task.taskId)
+    const before = await taskAndSideEffectSnapshot(pool, task.taskId)
+    const input = raceFinishInput(task, [messageId], {
+      ownerId: fence === "owner" ? `${task.ownerId}-stale` : task.ownerId,
+      attemptCount: fence === "attempt" ? 1 : 2,
+    })
+
+    await expect(new PgSubagentTaskStore(pool).finish(input)).resolves.toBeNull()
+    const after = await taskAndSideEffectSnapshot(pool, task.taskId)
+    expect(after.task).toEqual(before.task)
+    expect(after.effects).toEqual(before.effects)
+    await expect(pool.query(`SELECT "consumedAt" FROM "agent_mailbox_messages" WHERE "id" = $1`, [messageId]))
+      .resolves.toMatchObject({ rows: [{ consumedAt: null }] })
+  })
 })
 
-async function insertMessage(pool: PgPool, id: string, key: string, kind: string, targetAttemptCount: number | null): Promise<void> {
+async function insertMessage(pool: PgPool, id: string, key: string, kind: string, targetAttemptCount: number | null, toTaskId = fixture.taskId): Promise<void> {
   await pool.query(`INSERT INTO "agent_mailbox_messages" ("id", "sessionId", "turnId", "toTaskId", "kind", "targetAttemptCount", "payload", "idempotencyKey")
-    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)`, [id, fixture.sessionId, fixture.turnId, fixture.taskId, kind, targetAttemptCount, JSON.stringify(kind === "human_follow_up" ? { text: `follow-up attempt ${targetAttemptCount}` } : { legacy: true }), key])
+    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)`, [id, fixture.sessionId, fixture.turnId, toTaskId, kind, targetAttemptCount, JSON.stringify(kind === "human_follow_up" ? { text: `follow-up attempt ${targetAttemptCount}` } : { legacy: true }), key])
+}
+
+type RaceTask = { taskId: string; ownerId: string }
+
+async function restoreFixtureOwners(pool: PgPool): Promise<void> {
+  await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'running' WHERE "id" = $1`, [fixture.rootTaskId])
+  await pool.query(`UPDATE "agent_turns" SET "status" = 'in_progress' WHERE "id" = $1`, [fixture.turnId])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'running' WHERE "id" = $1`, [fixture.ancestorTaskId])
+}
+
+async function insertRunningRaceTask(pool: PgPool, label: string): Promise<RaceTask> {
+  const id = `mailbox-attempt-${label}-${randomUUID()}`
+  const ownerId = `worker-${label}-${randomUUID()}`
+  const path = `/root/ancestor/${label}-${randomUUID()}`
+  await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, $6, 2, 'analyst', 'inspect', 'running', $7, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 2, 3, $8, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`,
+  [id, fixture.sessionId, fixture.turnId, fixture.rootTaskId, fixture.ancestorTaskId, path, `Mailbox race ${label}`, ownerId])
+  return { taskId: id, ownerId }
+}
+
+function raceSendInput(task: RaceTask, idempotencyKey: string) {
+  return {
+    userId: fixture.userId, sessionId: fixture.sessionId, turnId: fixture.turnId, fromTaskId: fixture.rootTaskId,
+    toTaskId: task.taskId, kind: "result", payload: { source: "controlled-mailbox-race" }, idempotencyKey,
+  }
+}
+
+function raceFinishInput(task: RaceTask, mailboxMessageIds: readonly string[], overrides: { ownerId?: string; attemptCount?: number } = {}) {
+  return {
+    taskId: task.taskId, sessionId: fixture.sessionId, ownerId: overrides.ownerId ?? task.ownerId,
+    attemptCount: overrides.attemptCount ?? 2, status: "completed" as const, result: { finished: true },
+    mailboxMessageIds, now: new Date(),
+  }
+}
+
+type SessionLockBarrier = {
+  attempted: Promise<void>
+  acquired: Promise<void>
+  attemptedNow(): void
+  asyncAcquiredAndHold(): Promise<void>
+  release(): void
+}
+
+function createSessionLockBarrier(): SessionLockBarrier {
+  let resolveAttempted!: () => void
+  let resolveAcquired!: () => void
+  let resolveReleased!: () => void
+  const attempted = new Promise<void>(resolve => { resolveAttempted = resolve })
+  const acquired = new Promise<void>(resolve => { resolveAcquired = resolve })
+  const released = new Promise<void>(resolve => { resolveReleased = resolve })
+  let didAttempt = false
+  let didAcquire = false
+  let didRelease = false
+  return {
+    attempted,
+    acquired,
+    attemptedNow() { if (!didAttempt) { didAttempt = true; resolveAttempted() } },
+    asyncAcquiredAndHold() {
+      if (!didAcquire) { didAcquire = true; resolveAcquired() }
+      return released
+    },
+    release() { if (!didRelease) { didRelease = true; resolveReleased() } },
+  }
+}
+
+function isSessionLockQuery(input: unknown): boolean {
+  const query = typeof input === "string" ? input
+    : typeof input === "object" && input !== null && "text" in input && typeof input.text === "string" ? input.text : ""
+  return /FROM\s+"agent_sessions"[\s\S]*\bFOR\s+UPDATE\b/i.test(query)
+}
+
+function poolWithSessionLockBarrier(pool: PgPool, barrier: SessionLockBarrier): PgPool {
+  return {
+    connect: async () => {
+      const client = await pool.connect()
+      const query = client.query.bind(client) as unknown as (...args: unknown[]) => Promise<{ rows?: unknown[] }>
+      return new Proxy(client, {
+        get(target, property, receiver) {
+          if (property === "query") {
+            const intercepted = async (queryInput: unknown, ...args: unknown[]): Promise<{ rows?: unknown[] }> => {
+              const isLock = isSessionLockQuery(queryInput)
+              if (isLock) barrier.attemptedNow()
+              const result = await query(queryInput, ...args)
+              if (isLock && result.rows?.length) await barrier.asyncAcquiredAndHold()
+              return result
+            }
+            return intercepted as unknown as pg.PoolClient["query"]
+          }
+          const value = Reflect.get(target, property, receiver) as unknown
+          return typeof value === "function" ? value.bind(target) : value
+        },
+      })
+    },
+  } as unknown as PgPool
+}
+
+async function withDeadline<T>(promise: Promise<T>, label: string, milliseconds = 8_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), milliseconds)
+    })
+    return await Promise.race([promise, deadline])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function settleRacePromise(promise: Promise<unknown> | undefined): Promise<void> {
+  if (promise) await withDeadline(promise.then(() => undefined, () => undefined), "race cleanup", 8_000).catch(() => undefined)
+}
+
+async function taskAndSideEffectSnapshot(pool: PgPool, taskId: string): Promise<{
+  task: { status: string; attemptCount: number; leaseOwner: string | null; result: unknown; failureReason: string | null; completedAt: Date | null }
+  effects: { eventSequence: string; events: number; outbox: number; mailbox: number }
+}> {
+  const task = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; result: unknown; failureReason: string | null; completedAt: Date | null }>(
+    `SELECT "status", "attemptCount", "leaseOwner", "result", "failureReason", "completedAt" FROM "sub_agent_tasks" WHERE "id" = $1`, [taskId])
+  const effects = await pool.query<{ eventSequence: string; events: number; outbox: number; mailbox: number }>(`SELECT session."eventSequence"::text AS "eventSequence",
+      (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1) AS "events",
+      (SELECT COUNT(*)::int FROM "agent_outbox" WHERE "aggregateId" = $1) AS "outbox",
+      (SELECT COUNT(*)::int FROM "agent_mailbox_messages" WHERE "sessionId" = $1 AND "toTaskId" = $2) AS "mailbox"
+    FROM "agent_sessions" AS session WHERE session."id" = $1`, [fixture.sessionId, taskId])
+  const taskRow = task.rows[0]
+  const effectRow = effects.rows[0]
+  if (!taskRow || !effectRow) throw new Error("Mailbox race snapshot could not read its task and side effects")
+  return { task: taskRow, effects: effectRow }
 }
 
 async function insertMailboxOutbox(pool: PgPool, id: string, messageId: string, key: string, targetAttemptCount: number): Promise<void> {

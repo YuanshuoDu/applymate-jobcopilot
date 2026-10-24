@@ -18,6 +18,7 @@ export type ChildMailboxHydrationInput = {
   readonly attemptCount: number
   readonly stepId: string
   readonly limit: number
+  readonly priorityMessageIds?: readonly string[]
 }
 
 const TERMINAL_TASK = `'completed', 'failed', 'interrupted', 'cancelled', 'closed'`
@@ -38,12 +39,10 @@ export async function hydrateChildMailbox(pool: PoolLike, rawInput: ChildMailbox
     await requireStep(client, input)
     await lockCheckpoints(client, input)
 
-    const existing = await readHydrated(client, input)
-    const available = input.limit - existing.length
-    if (available > 0) {
-      const pending = await readUncheckpointed(client, input, available)
-      for (const row of pending) await insertCheckpoint(client, input, row)
-    }
+    // Materialize exact newly-missing IDs first, even when older checkpointed
+    // messages already occupy the context budget. Final reads still cap at 20.
+    const pending = await readUncheckpointed(client, input, input.limit)
+    for (const row of pending) await insertCheckpoint(client, input, row)
     const result = await readHydrated(client, input)
     await client.query("COMMIT")
     return result
@@ -139,8 +138,9 @@ async function readHydrated(client: Queryable, input: ChildMailboxHydrationInput
       AND target."sessionId" = $2 AND target."turnId" = $3 AND target."rootTaskId" = $4
       AND session."userId" = $1 AND message."consumedAt" IS NULL
       AND (message."targetAttemptCount" = $6 OR (message."targetAttemptCount" IS NULL AND message."kind" <> 'human_follow_up'))
-    ORDER BY message."createdAt" ASC, message."id" ASC
-    LIMIT $7
+    ORDER BY CASE WHEN array_position($7::text[], message."id") IS NULL THEN 1 ELSE 0 END ASC,
+      array_position($7::text[], message."id") ASC NULLS LAST, message."createdAt" ASC, message."id" ASC
+    LIMIT $8
     FOR UPDATE OF message`, values(input, input.limit))
   return result.rows.map(row => mailboxMessageRow(row as Row))
 }
@@ -164,9 +164,10 @@ async function readUncheckpointed(client: Queryable, input: ChildMailboxHydratio
       AND target."leaseExpiresAt" > CURRENT_TIMESTAMP
       AND message."consumedAt" IS NULL AND checkpoint."id" IS NULL
       AND (message."targetAttemptCount" = $7 OR (message."targetAttemptCount" IS NULL AND message."kind" <> 'human_follow_up'))
-    ORDER BY message."createdAt" ASC, message."id" ASC
-    LIMIT $8
-    FOR UPDATE OF message`, [input.userId, input.sessionId, input.turnId, input.rootTaskId, input.toTaskId, input.ownerId, input.attemptCount, limit])
+    ORDER BY CASE WHEN array_position($8::text[], message."id") IS NULL THEN 1 ELSE 0 END ASC,
+      array_position($8::text[], message."id") ASC NULLS LAST, message."createdAt" ASC, message."id" ASC
+    LIMIT $9
+    FOR UPDATE OF message`, [input.userId, input.sessionId, input.turnId, input.rootTaskId, input.toTaskId, input.ownerId, input.attemptCount, input.priorityMessageIds, limit])
   return result.rows as Row[]
 }
 
@@ -180,7 +181,7 @@ async function insertCheckpoint(client: Queryable, input: ChildMailboxHydrationI
 }
 
 function values(input: ChildMailboxHydrationInput, limit = input.limit): unknown[] {
-  return [input.userId, input.sessionId, input.turnId, input.rootTaskId, input.toTaskId, input.attemptCount, limit]
+  return [input.userId, input.sessionId, input.turnId, input.rootTaskId, input.toTaskId, input.attemptCount, input.priorityMessageIds, limit]
 }
 
 function checkpointValues(input: ChildMailboxHydrationInput): unknown[] {
@@ -208,6 +209,7 @@ function normalizeInput(value: ChildMailboxHydrationInput): ChildMailboxHydratio
     userId: requiredText(row.userId, "userId"), sessionId: requiredText(row.sessionId, "sessionId"), turnId: requiredText(row.turnId, "turnId"),
     rootTaskId: requiredText(row.rootTaskId, "rootTaskId"), toTaskId: requiredText(row.toTaskId, "toTaskId"), ownerId: requiredText(row.ownerId, "ownerId"),
     attemptCount: positiveInt(row.attemptCount, "attemptCount"), stepId: requiredText(row.stepId, "stepId"), limit: boundedLimit(row.limit),
+    priorityMessageIds: boundedPriorityIds(row.priorityMessageIds),
   }
 }
 
@@ -222,6 +224,14 @@ function positiveInt(value: unknown, name: string): number {
 function boundedLimit(value: unknown): number {
   if (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) > 20) throw new CoordinationError("coordination_invalid_input", "limit must be a safe integer between 0 and 20")
   return Number(value)
+}
+function boundedPriorityIds(value: unknown): readonly string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.length > 20 || value.some(id => typeof id !== "string" || id.trim().length === 0 || id.length > 256)) {
+    throw new CoordinationError("coordination_invalid_input", "priorityMessageIds must contain at most 20 valid message ids")
+  }
+  if (new Set(value).size !== value.length) throw new CoordinationError("coordination_invalid_input", "priorityMessageIds must be unique")
+  return value
 }
 function textValue(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0) throw new CoordinationError("coordination_scope_error", `${name} is invalid`)

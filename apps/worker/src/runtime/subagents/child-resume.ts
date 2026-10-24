@@ -13,6 +13,8 @@ export type ChildAttemptResume = {
   readonly durableWait?: DurableWaitResume
 }
 export type ChildResumeLoader = (lease: SubagentLease) => Promise<ChildAttemptResume | undefined>
+export type ChildSameAttemptResume = ChildAttemptResume & { readonly previousFinalText: string; readonly leaseExpiresAt: Date }
+export type ChildSameAttemptResumeLoader = (lease: SubagentLease) => Promise<ChildSameAttemptResume | null>
 
 const TERMINAL_TURN_STATUSES = "('completed', 'failed', 'interrupted', 'cancelled')"
 const TERMINAL_ROOT_STATUSES = "('completed', 'failed', 'interrupted', 'cancelled', 'closed')"
@@ -76,7 +78,16 @@ function waitResumeItemsSql(): string {
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_PRIOR_ITEMS + 1}`
 }
 
-async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease): Promise<DurableWaitResume | undefined> {
+export async function loadChildConsumedWaitResume(client: QueryClient, lease: SubagentLease, waitId?: string): Promise<DurableWaitResume | undefined> {
+  if (waitId !== undefined && (!waitId.trim() || waitId !== waitId.trim())) throw new Error("child_resume_wait_lineage")
+  const waitIdParam = waitId === undefined ? "" : 'AND candidateWait."id" = $7'
+  const latestContinuationGuard = waitId === undefined
+    ? `AND (candidateStep."attempt" < $6 OR next."ordinal" = (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest
+          WHERE latest."sessionId" = candidateStep."sessionId" AND latest."turnId" = candidateStep."turnId" AND latest."taskId" = candidateStep."taskId" AND latest."attempt" = candidateStep."attempt"))`
+    : ""
+  const exactWaitId = waitId === undefined ? "" : 'AND wait."id" = $7'
+  const values: unknown[] = [lease.userId, lease.sessionId, lease.turnId, lease.id, lease.rootTaskId, lease.attemptCount]
+  if (waitId !== undefined) values.push(waitId)
   const rows = (await client.query<Row>(`WITH latest_wait AS (
     SELECT candidateWait."id" FROM "agent_wait_conditions" AS candidateWait
     JOIN "agent_steps" AS candidateStep ON candidateStep."id" = candidateWait."stepId" AND candidateStep."sessionId" = candidateWait."sessionId" AND candidateStep."turnId" = candidateWait."turnId" AND candidateStep."taskId" = candidateWait."parentTaskId"
@@ -88,8 +99,8 @@ async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease)
         AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later WHERE later."sessionId" = candidateStep."sessionId"
           AND later."turnId" = candidateStep."turnId" AND later."taskId" = candidateStep."taskId" AND later."attempt" = candidateStep."attempt"
           AND later."ordinal" > candidateStep."ordinal")
-        AND (candidateStep."attempt" < $6 OR next."ordinal" = (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest
-          WHERE latest."sessionId" = candidateStep."sessionId" AND latest."turnId" = candidateStep."turnId" AND latest."taskId" = candidateStep."taskId" AND latest."attempt" = candidateStep."attempt")))
+        ${latestContinuationGuard})
+      ${waitIdParam}
     ORDER BY candidateStep."attempt" DESC, candidateStep."ordinal" DESC, candidateWait."createdAt" DESC, candidateWait."id" DESC LIMIT 1
   )
     SELECT wait."id" AS "waitId", wait."stepId", wait."targetTaskIds", wait."idempotencyKey", wait."mode", wait."status", wait."deadlineAt", wait."matchedTaskIds", wait."result" AS "waitResult", step."attempt", step."ordinal", next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest WHERE latest."sessionId" = step."sessionId" AND latest."turnId" = step."turnId" AND latest."taskId" = step."taskId" AND latest."attempt" = step."attempt") AS "continuationLatestOrdinal", call."content" AS "callContent", call."status" AS "callStatus", result."id" AS "sourceItemId", result."content" AS "resultContent", result."status" AS "resultStatus"
@@ -111,8 +122,8 @@ async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease)
       AND task."rootTaskId" = $5 AND step."attempt" <= $6 AND step."status" IN ('waiting_for_tool', 'completed')
       AND wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NOT NULL
       AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
-    ORDER BY step."attempt" DESC, step."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 2 FOR SHARE OF wait, step, next, call`,
-  [lease.userId, lease.sessionId, lease.turnId, lease.id, lease.rootTaskId, lease.attemptCount])).rows
+      ${exactWaitId}
+    ORDER BY step."attempt" DESC, step."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 2 FOR SHARE OF wait, step, next, call`, values)).rows
   if (rows.length === 0) return undefined
   if (rows.length !== 1) throw new Error("child_resume_wait_tool_call_conflict")
   const row = rows[0]
@@ -155,7 +166,7 @@ async function loadConsumedWaitResume(client: QueryClient, lease: SubagentLease)
   const continuationOrdinal = Number(row.continuationOrdinal); const continuationLatestOrdinal = Number(row.continuationLatestOrdinal)
   if (!stepId.trim() || !sourceItemId.trim() || !Number.isSafeInteger(attempt) || attempt < 1 || attempt > lease.attemptCount
     || !Number.isSafeInteger(ordinal) || ordinal < 0 || !continuationStepId.trim() || !Number.isSafeInteger(continuationOrdinal) || continuationOrdinal <= ordinal
-    || attempt === lease.attemptCount && continuationLatestOrdinal !== continuationOrdinal) throw new Error("child_resume_wait_lineage")
+    || waitId === undefined && attempt === lease.attemptCount && continuationLatestOrdinal !== continuationOrdinal) throw new Error("child_resume_wait_lineage")
   return { waitId: String(row.waitId), stepId, attempt, ordinal, toolCallId, sourceItemId,
     input: safeSubagentWaitJson(input, 8_192), output }
 }
@@ -172,6 +183,42 @@ function assertTask(row: Row, lease: SubagentLease, now: Date): void {
   if (lease.interruptRequestedAt !== null || lease.leaseExpiresAt.getTime() <= now.getTime()) throw new Error("child_resume_lease_expired")
 }
 
+function summarizePriorAttempts(stepRows: readonly Row[], itemRows: readonly Row[], lease: SubagentLease): ChildAttemptResume {
+  let lastOrdinal = 0, lastAttempt = 0, lastStatus = "", toolCallCount = 0
+  let inputThroughSequence = 0n, inputTokens = 0, outputTokens = 0, estimatedCostUsd = 0
+  const consumedInputIds: string[] = [], consumed = new Set<string>()
+  for (const row of stepRows) {
+    const ordinal = integer(row, "ordinal"), attempt = integer(row, "attempt", 1)
+    if (!text(row, "id") || text(row, "sessionId") !== lease.sessionId || text(row, "turnId") !== lease.turnId || text(row, "taskId") !== lease.id
+      || text(row, "rootTaskId") !== lease.rootTaskId || attempt >= lease.attemptCount
+      || typeof row.status !== "string" || !["queued", "streaming", "completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(row.status)) throw new Error("child_resume_step_lineage")
+    if (attempt > lastAttempt || attempt === lastAttempt && ordinal >= lastOrdinal) { lastAttempt = attempt; lastOrdinal = ordinal; lastStatus = row.status }
+    const cursor = sequence(row, "inputThroughSequence")
+    if (cursor > inputThroughSequence) inputThroughSequence = cursor
+    for (const id of ids(row)) if (!consumed.has(id)) { consumed.add(id); consumedInputIds.push(id) }
+    inputTokens += integer(row, "inputTokens")
+    outputTokens += integer(row, "outputTokens")
+    estimatedCostUsd += amount(row, "estimatedCostUsd")
+    if (!Number.isSafeInteger(inputTokens) || !Number.isSafeInteger(outputTokens) || !Number.isFinite(estimatedCostUsd)) throw new Error("child_resume_usage_overflow")
+  }
+  const nextOrdinal = ["completed", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(lastStatus) ? lastOrdinal + 1 : lastOrdinal
+  const restoredObservations = buildChildResumeObservations(itemRows, lease)
+  toolCallCount = countChildResumeToolCalls(itemRows, lease)
+  return { resume: { nextOrdinal, stepCount: stepRows.length, toolCallCount, inputThroughSequence, consumedInputIds,
+    usage: { inputTokens, outputTokens, estimatedCostUsd } }, observations: restoredObservations }
+}
+
+/** Loads accounting/evidence from prior attempts on this exact task using the caller's transaction. */
+export async function loadChildPriorAttemptResume(client: Pick<pg.PoolClient, "query">, lease: SubagentLease): Promise<ChildAttemptResume | undefined> {
+  if (lease.attemptCount <= 1) return undefined
+  const prior = await client.query<Row>(stepsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
+  if (prior.rows.length > MAX_PRIOR_STEPS) throw new Error("child_resume_step_limit")
+  if (prior.rows.length === 0) return undefined
+  const items = await client.query<Row>(itemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
+  if (items.rows.length > MAX_PRIOR_ITEMS) throw new Error("child_resume_item_limit")
+  return summarizePriorAttempts(prior.rows, items.rows, lease)
+}
+
 export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLease, now = new Date(), durableWait?: DurableWaitResume): Promise<ChildAttemptResume | undefined> {
   const client: QueryClient = await pool.connect()
   let committed = false
@@ -182,7 +229,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
     if (!current.rows[0]) throw new Error("child_resume_owner_mismatch")
     assertTask(current.rows[0], lease, now)
     if (durableWait && durableWait.attempt !== lease.attemptCount) throw new Error("child_resume_wait_step_lineage")
-    const waitResume = durableWait ?? await loadConsumedWaitResume(client, lease)
+    const waitResume = durableWait ?? await loadChildConsumedWaitResume(client, lease)
     const currentAttemptWait = waitResume?.attempt === lease.attemptCount ? waitResume : undefined
     const prior = await client.query<Row>(stepsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
     const sameAttempt = currentAttemptWait

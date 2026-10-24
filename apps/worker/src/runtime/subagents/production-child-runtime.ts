@@ -13,6 +13,7 @@ import { durableLifecycleSink } from "../canonical-turn-runtime.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
+import { loadChildSameAttemptContinuation } from "./child-mailbox-continuation.js"
 import { loadChildAttemptResume } from "./child-resume.js"
 import { commitDurableSubagentWaitResume, loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
@@ -40,6 +41,7 @@ export type ProductionChildRuntimeOptions = {
   readonly toolRuntimeFactory?: ChildExecutorOptions["toolRuntimeFactory"]
   readonly mailboxReader?: ChildExecutorOptions["mailboxReader"]
   readonly resumeLoader?: ChildExecutorOptions["resumeLoader"]
+  readonly sameAttemptContinuationLoader?: ChildExecutorOptions["sameAttemptContinuationLoader"]
   readonly jobDiscoveryClient?: JobDiscoveryClient
 }
 
@@ -202,12 +204,18 @@ function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"
     return loadChildAttemptResume(pool, lease, new Date(), wait)
   }
 }
+function defaultSameAttemptContinuationLoader(pool: pg.Pool): ChildExecutorOptions["sameAttemptContinuationLoader"] | undefined {
+  const candidate = pool as unknown as { readonly connect?: unknown }
+  if (typeof candidate.connect !== "function") return undefined
+  return lease => loadChildSameAttemptContinuation(pool, lease)
+}
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   let genericExecutor: SubagentExecutor | undefined
-  return async ({ lease }) => {
+  return async ({ lease, continuation }) => {
     if (lease.role === "application_filler" || lease.taskType === "application_fill_for_review") {
       if (lease.role !== "application_filler" || lease.taskType !== "application_fill_for_review") return { status: "failed", failureReason: "application_fill_role_task_type_mismatch", retryDisposition: "terminal" }
+      if (continuation) return { status: "failed", failureReason: "application_fill_continuation_unsupported", retryDisposition: "terminal" }
       return (await import("./application-fill-for-review.js")).executeApplicationFillForReview({ pool: options.pool, lease })
     }
     if (!genericExecutor) {
@@ -224,9 +232,10 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
         durableWaitResumeCommitter: (lease, wait, nextStepOrdinal) => commitDurableSubagentWaitResume(options.pool, lease, {
           waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,
         }),
+        sameAttemptContinuationLoader: options.sameAttemptContinuationLoader ?? defaultSameAttemptContinuationLoader(options.pool),
       })
     }
-    return genericExecutor({ lease })
+    return genericExecutor({ lease, ...(continuation ? { continuation } : {}) })
   }
 }
 export function createOptionalProductionChildExecutor(options: ProductionChildRuntimeOptions & { readonly enabled?: boolean }): SubagentExecutor | undefined {

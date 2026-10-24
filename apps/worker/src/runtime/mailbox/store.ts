@@ -110,6 +110,7 @@ export class PgCoordinationStore implements CoordinationStore {
         }
         return { message: messageRow(row), duplicate: true }
       }
+      await requireNonTerminalTarget(client, input)
       const id = `mailbox-${randomUUID()}`
       const inserted = await client.query(`INSERT INTO "agent_mailbox_messages"
         ("id", "sessionId", "turnId", "fromTaskId", "toTaskId", "kind", "payload", "idempotencyKey")
@@ -205,6 +206,18 @@ async function requireTask(client: Queryable, userId: string, sessionId: string,
   const result = await client.query(`SELECT 1 FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
     WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3${turnPredicate}`, values)
   if (!result.rows[0]) throw new CoordinationError("coordination_task_not_found", message)
+}
+async function requireNonTerminalTarget(
+  client: Queryable,
+  input: { userId: string; sessionId: string; turnId: string; toTaskId: string },
+): Promise<void> {
+  const result = await client.query(`SELECT target."status" FROM "sub_agent_tasks" AS target
+    JOIN "agent_sessions" AS session ON session."id" = target."sessionId"
+    WHERE target."id" = $1 AND target."sessionId" = $2 AND session."userId" = $3 AND target."turnId" = $4`,
+  [input.toTaskId, input.sessionId, input.userId, input.turnId])
+  if (!result.rows[0] || TERMINAL.includes(String(result.rows[0].status))) {
+    throw new CoordinationError("coordination_task_not_found", "Target task is unavailable")
+  }
 }
 function taskRow(row: Record<string, unknown>): CoordinationTaskView {
   return { id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId), turnId: row.turnId ? String(row.turnId) : null, rootTaskId: String(row.rootTaskId ?? row.id), parentTaskId: row.parentTaskId ? String(row.parentTaskId) : null, path: String(row.path), depth: Number(row.depth), role: String(row.role), taskType: String(row.taskType), status: String(row.status) as CoordinationTaskView["status"], goal: String(row.goal), context: row.context ?? null, attemptCount: Number(row.attemptCount), maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null, leaseExpiresAt: row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : row.leaseExpiresAt ? new Date(String(row.leaseExpiresAt)) : null, interruptRequestedAt: row.interruptRequestedAt instanceof Date ? row.interruptRequestedAt : row.interruptRequestedAt ? new Date(String(row.interruptRequestedAt)) : null, result: row.result ?? null, failureReason: row.failureReason == null ? null : String(row.failureReason) }
