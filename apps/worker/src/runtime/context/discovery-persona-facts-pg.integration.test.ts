@@ -181,10 +181,19 @@ describePg("discovery persona Worker/Web PostgreSQL serialization", () => {
 
   it("snapshots an entire Prisma batch after the writer wins the shared advisory queue", async () => {
     const userId = await createOwner(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
+    const initialFacts = await Promise.all([
+      seedDiscoveryFact(userId, "target_location", "Dublin"),
+      seedDiscoveryFact(userId, "salary_expectation", "75000 EUR"),
+    ])
+    const previousVersions = new Map(initialFacts.map(fact => [fact.key, fact.updatedAt.getTime()]))
+    const updatedFields = [
+      { ...field("target_location", "Dublin"), label: "Target city", source: "batch-confirmation" },
+      { ...field("salary_expectation", "75000 EUR"), label: "Salary target", source: "batch-confirmation" },
+    ]
     const blocker = await beginLockBlocker(userId)
     let write: Promise<unknown> | undefined, read: Promise<DiscoveryPersonaSnapshotResult> | undefined
     try {
-      write = confirmPersonaFacts(userId, [field("target_location", "Dublin"), field("salary_expectation", "75000 EUR")], prisma!)
+      write = confirmPersonaFacts(userId, updatedFields, prisma!)
       await waitForAdvisoryWait(prismaApplication)
       read = loadOrCreateDiscoveryPersonaSnapshot(pool!, workerInput(fixture))
       await waitForAdvisoryWait(workerApplication)
@@ -193,6 +202,15 @@ describePg("discovery persona Worker/Web PostgreSQL serialization", () => {
       expect(snapshot).toMatchObject({ kind: "accepted" })
       if (snapshot.kind !== "accepted") throw new Error("Expected accepted discovery snapshot")
       expect(snapshot.projection.facts.map(fact => fact.key)).toEqual(["salary_expectation", "target_location"])
+      expect(snapshot.projection.facts.map(({ key, label, source }) => ({ key, label, source }))).toEqual([
+        { key: "salary_expectation", label: "Salary target", source: "batch-confirmation" },
+        { key: "target_location", label: "Target city", source: "batch-confirmation" },
+      ])
+      for (const fact of snapshot.projection.facts) {
+        const previousVersion = previousVersions.get(fact.key)
+        if (previousVersion === undefined) throw new Error(`Missing seed version for ${fact.key}`)
+        expect(Date.parse(fact.updatedAt)).toBeGreaterThan(previousVersion)
+      }
       expect((await eventRows(sessionId)).map(row => row.type)).toEqual([DISCOVERY_PERSONA_SNAPSHOT_EVENT])
       expect(await outboxRows(sessionId)).toHaveLength(1)
       const later = await advanceTurn(fixture)
