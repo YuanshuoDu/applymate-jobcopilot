@@ -208,6 +208,25 @@ describe("agent query DTO redaction", () => {
     expect(JSON.stringify(dto)).not.toContain("tokens\":9")
   })
 
+  it("shows safe discovery-memory overflow recovery text without private snapshot values", () => {
+    const recovery = "Some saved discovery preferences exceed the memory limit. Narrow your preferences and start a new search."
+    const dto = itemDto({
+      id: "item_overflow", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 1,
+      content: { text: recovery, final: {
+        summary: recovery, goal: "PRIVATE_DISCOVERY_GOAL", blocker: "discovery_memory_overflow",
+        next: "PRIVATE_DISCOVERY_NEXT", factValue: "PRIVATE_DISCOVERY_FACT_VALUE",
+      } },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+
+    expect(dto.content).toEqual({ text: recovery, summary: recovery })
+    const serialized = JSON.stringify(dto)
+    for (const secret of ["PRIVATE_DISCOVERY_GOAL", "PRIVATE_DISCOVERY_NEXT", "PRIVATE_DISCOVERY_FACT_VALUE", "discovery_memory_overflow"]) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
   it("omits summary for malformed, oversized, non-final, and non-message items", () => {
     const base = {
       id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,

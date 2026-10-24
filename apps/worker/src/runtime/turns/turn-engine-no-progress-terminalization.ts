@@ -229,11 +229,14 @@ export async function terminalizeTurnExecutionError(input: Readonly<{
   if (error instanceof BudgetExceededError) await writer.append("turn.budget_exhausted", options.identity.turnId, null,
     { reasonCode: error.code, metric: error.metric, limit: error.limit, attempted: error.attempted, used: error.used, taskId: options.identity.taskId },
     "turn-budget-exhausted").catch(() => undefined)
+  const discoveryOverflow = code === "discovery_memory_overflow"
+    ? "Confirmed Persona facts exceed the discovery memory limit. Narrow the facts shared for discovery in Persona settings, then start a new Turn." : null
   const terminalReason = error instanceof BudgetExceededError ? "budget_exhausted" : error instanceof NoProgressError ? "no_progress"
     : code === "final_unverified" || code.startsWith("evidence_") || code === "business_precondition_failed" ? "final_unverified" : "unrecoverable_error"
-  const finalResponse = finalizeTurn({ goal: options.goal, terminalReason, blocker: error instanceof Error ? error.message : code,
+  const finalResponse = finalizeTurn({ goal: options.goal, terminalReason, blocker: discoveryOverflow ?? (error instanceof Error ? error.message : code),
     usage: totalTurnUsage(options.resume?.usage, input.usage), stepCount: input.stepCount, toolCallCount: input.toolCallCount,
-    next: ["Review the blocker and resume the Turn"] })
+    next: discoveryOverflow ? ["Narrow the confirmed facts shared for discovery in Persona settings, then start a new Turn"] : ["Review the blocker and resume the Turn"],
+    ...(discoveryOverflow ? { response: discoveryOverflow, summaryOverride: discoveryOverflow } : {}) })
   if (options.isOwnershipLost?.(error, signal)) throw error
   const finalItem = await publishFinalResponse(writer, options, input.lastStep, finalResponse, now).catch(() => null)
   if (finalItem && canPersistFinalResponse(options)) await options.store.recordFinalResponse?.({ identity: options.identity,
