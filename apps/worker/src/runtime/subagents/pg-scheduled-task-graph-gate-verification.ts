@@ -206,7 +206,7 @@ async function readGateTurnSnapshot(client: Queryable, scope: GraphIdentityScope
     JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"
     JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
     WHERE session."id" = $1 AND session."userId" = $2 AND session."status" NOT IN ('aborted', 'archived')
-      AND turn."id" = $3 AND turn."rootTaskId" = $4 AND turn."status" IN ('in_progress', 'waiting_for_tool')
+      AND turn."id" = $3 AND turn."rootTaskId" = $4 AND turn."status" IN ('in_progress', 'waiting_for_dependency')
       AND root."id" = $4 AND root."status" IN ('running', 'waiting', 'waiting_for_user')
       AND root."interruptRequestedAt" IS NULL AND root."closedAt" IS NULL`,
   [scope.sessionId, scope.userId, scope.turnId, scope.rootTaskId])
@@ -214,7 +214,7 @@ async function readGateTurnSnapshot(client: Queryable, scope: GraphIdentityScope
   if (result.rows.length !== 1 || !row || row.sessionId !== scope.sessionId || row.sessionUserId !== scope.userId
     || row.sessionStatus === "aborted" || row.sessionStatus === "archived" || row.turnId !== scope.turnId
     || row.turnSessionId !== scope.sessionId || row.turnUserId !== scope.userId || row.turnRootTaskId !== scope.rootTaskId
-    || !["in_progress", "waiting_for_tool"].includes(String(row.turnStatus)) || row.rootId !== scope.rootTaskId
+    || !["in_progress", "waiting_for_dependency"].includes(String(row.turnStatus)) || row.rootId !== scope.rootTaskId
     || row.rootSessionId !== scope.sessionId || row.rootTurnId !== scope.turnId
     || !["running", "waiting", "waiting_for_user"].includes(String(row.rootStatus))
     || Number(row.rootAttemptCount) !== expectedRootAttemptCount || !Number.isSafeInteger(row.rootAttemptCount)
