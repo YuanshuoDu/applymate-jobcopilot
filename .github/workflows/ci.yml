@@ -39,6 +39,71 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Run all tests
         run: pnpm test:all
+  scheduled-gate-postgres:
+    name: Scheduled Gate PostgreSQL and Redis integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_agent_brain_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d applymate_agent_brain_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Apply existing migrations to the disposable PostgreSQL service
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Web Prisma client for the Worker fixture
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Build Worker workspace before focused test
+        run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify scheduled Gate questions across Worker restarts
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          REDIS_URL: redis://127.0.0.1:6379/15
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/subagents/scheduled-gate-task-graph-pg.integration.test.ts
   agent-runtime-postgres:
     name: Agent runtime PostgreSQL integration
     runs-on: ubuntu-latest

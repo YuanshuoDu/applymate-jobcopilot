@@ -8,6 +8,8 @@ import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.ts"
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.ts"
 import { scheduledGatePreparedJobIds, parseScheduledGateResult, parseScheduledGateChoice,
   scheduledGateCandidateSetDigest } from "./scheduled-gate-contract.ts"
+import { createScheduledGateFinishDiagnosticPool, isScheduledGateFailureReason, isScheduledGateFinishStage,
+  withScheduledGateFinishTrace } from "./scheduled-gate-task-graph-diagnostics.fixture.ts"
 
 const [, , mode, queueName, expectedTaskId, rawPlan] = process.argv
 const FIXTURE_WEB_URL = "http://scheduled-gate-fixture.invalid"
@@ -16,30 +18,12 @@ const MAX_PLAN_BYTES = 64_000
 const FIXTURE_FAILURE_CODES = new Set([
   "unexpected_subagent_task", "dispatch_identity_invalid", "gate_task_outcome_invalid", "gate_task_persistence_invalid",
 ])
+const FIXTURE_STARTUP_CODES = new Set(["fixture_arguments_invalid", "response_plan_invalid", "disposable_services_required"])
 const PG_FAILURE_CODES = new Set([
   "23503", "23505", "23514", "40001", "40P01", "42501", "42703", "42P01", "55P03", "57014", "22P02",
 ])
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const OUTCOME_STATUSES = new Set([...TASK_STATUSES, "skipped", "lease_lost"])
-const GATE_FAILURE_REASONS = new Set([
-  "scheduled_gate_task_invalid", "scheduled_gate_cancelled", "scheduled_gate_handoff_retryable", "scheduled_gate_runtime_failed",
-  "scheduled_gate_checkpoint_invalid", "scheduled_gate_owner_stale", "scheduled_gate_graph_invalid",
-  "scheduled_gate_registration_invalid", "scheduled_gate_prepare_proof_invalid", "scheduled_gate_analyze_proof_invalid",
-  "scheduled_pipeline_owner_mismatch", "scheduled_pipeline_turn_stale", "scheduled_pipeline_mode_mismatch",
-  "scheduled_pipeline_root_mismatch", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_attestation_invalid",
-  "scheduled_pipeline_snapshot_mismatch", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_jobs_mismatch",
-  "scheduled_pipeline_claim_conflict", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_request_invalid",
-  "scheduled_pipeline_unauthorized", "scheduled_pipeline_account_unavailable", "scheduled_pipeline_entitlement_required",
-  "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_ai_budget_exhausted", "scheduled_pipeline_gate_checkpoint_missing",
-  "scheduled_pipeline_wait_identity_mismatch", "scheduled_pipeline_gate_checkpoint_unexpected",
-  "scheduled_pipeline_analyze_checkpoint_invalid", "scheduled_pipeline_gate_input_invalid", "scheduled_pipeline_gate_response_invalid",
-  "scheduled_pipeline_agent_unavailable", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_execution_failed",
-  "scheduled_pipeline_gate_proof_invalid", "scheduled_pipeline_handoff_unavailable", "scheduled_pipeline_handoff_in_progress",
-  "scheduled_pipeline_handoff_retryable",
-  "scheduled_gate_result_invalid", "task_graph_verification_unverified", "task_graph_verification_failed",
-  "task_graph_repair_target_unresolved",
-])
-
 function emit(marker, value) {
   process.stdout.write(`${marker} ${JSON.stringify(value)}\n`)
 }
@@ -48,7 +32,7 @@ function fixtureError(code) {
   emit("ERROR", { code })
 }
 
-function failedJobCode(error, outcomeDiagnostic) {
+function failedJobCode(error, outcomeDiagnostic, finishStage) {
   let cause = "unknown"
   if (error && typeof error === "object") {
     if (typeof error.message === "string" && FIXTURE_FAILURE_CODES.has(error.message)) {
@@ -69,7 +53,8 @@ function failedJobCode(error, outcomeDiagnostic) {
   }
   const diagnostic = typeof outcomeDiagnostic === "string" && /^[a-z0-9_]{1,180}$/.test(outcomeDiagnostic)
     ? outcomeDiagnostic : "outcome_unavailable"
-  return `bullmq_job_failed_${cause}_${diagnostic}`
+  const stage = isScheduledGateFinishStage(finishStage) ? finishStage : "not_observed"
+  return `bullmq_job_failed_${cause}_${diagnostic}_${stage}`
 }
 
 function persistedGateOutcomeDiagnostic(task, payload, leaseScope, requestedAttempt, outcome) {
@@ -88,7 +73,7 @@ function persistedGateOutcomeDiagnostic(task, payload, leaseScope, requestedAtte
     && attemptMatches && task.status === persistedStatus
   if (!matches) return `${outcomeStatus}_task_unbound`
   const reason = task.failureReason == null ? "none"
-    : GATE_FAILURE_REASONS.has(task.failureReason) ? task.failureReason : "unlisted"
+    : isScheduledGateFailureReason(task.failureReason) ? task.failureReason : "unlisted"
   return `${outcomeStatus}_${task.status}_${reason}`
 }
 
@@ -215,11 +200,24 @@ async function main() {
   process.env.AGENT_WORKER_SECRET = FIXTURE_WORKER_SECRET
   const pool = new Pool({ connectionString: databaseUrl, max: 6 })
   const redis = new Redis(redisUrl, { maxRetriesPerRequest: null })
-  const store = new PgSubagentTaskStore(pool, 30_000)
+  const store = new PgSubagentTaskStore(createScheduledGateFinishDiagnosticPool(pool), 30_000)
   const manager = new AgentTreeManager(store, { heartbeatMs: 2_000 })
   let requestedAttempt = null
   let leaseScope = null
   let outcomeDiagnostic = null
+  let candidateFinishSeen = false
+  let candidateFinishStage = "not_observed"
+  const originalFinish = store.finish.bind(store)
+  store.finish = async input => {
+    if (candidateFinishSeen || input.taskId !== expectedTaskId || !["waiting_for_user", "completed"].includes(input.status)) {
+      return originalFinish(input)
+    }
+    candidateFinishSeen = true
+    const traced = await withScheduledGateFinishTrace(() => originalFinish(input))
+    candidateFinishStage = traced.stage
+    if (!traced.ok) throw traced.error
+    return traced.value
+  }
   const runGate = createScheduledGateChildExecutor({ pool, fetcher: createFixtureFetcher(plan, attempt => { requestedAttempt = attempt }) })
   const executeGate = async ({ lease }) => {
     leaseScope = { taskId: lease.id, userId: lease.userId, sessionId: lease.sessionId, rootTaskId: lease.rootTaskId,
@@ -244,7 +242,7 @@ async function main() {
     if (job.data?.taskId !== expectedTaskId) throw new Error("unexpected_subagent_task")
     const identity = parseSubagentDispatchJobId(job.id, expectedTaskId)
     if (!identity) throw new Error("dispatch_identity_invalid")
-    requestedAttempt = null; leaseScope = null; outcomeDiagnostic = null
+    requestedAttempt = null; leaseScope = null; outcomeDiagnostic = null; candidateFinishSeen = false; candidateFinishStage = "not_observed"
     const outcome = await runSubagentQueueJob(pool, manager, executeGate, job.data, identity)
     if (outcome.taskId !== expectedTaskId) throw new Error("unexpected_subagent_task")
     if (!["waiting_for_user", "completed"].includes(outcome.status)) {
@@ -268,7 +266,7 @@ async function main() {
   })
   worker.on("failed", (job, error) => {
     if (job?.data?.taskId !== expectedTaskId) return
-    reportError(failedJobCode(error, outcomeDiagnostic))
+    reportError(failedJobCode(error, outcomeDiagnostic, candidateFinishStage))
   })
   worker.on("error", () => reportError("bullmq_worker_error"))
 
@@ -279,7 +277,7 @@ async function main() {
 }
 
 main().catch(error => {
-  const code = error instanceof Error && /^[a-z0-9_]{1,80}$/.test(error.message) ? error.message : "fixture_failed"
+  const code = error instanceof Error && FIXTURE_STARTUP_CODES.has(error.message) ? error.message : "fixture_failed"
   fixtureError(code)
   process.exitCode = 1
 })
