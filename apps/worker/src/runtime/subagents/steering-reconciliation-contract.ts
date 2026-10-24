@@ -4,10 +4,13 @@ import { executionKey } from "../turns/turn-execution-types.js"
 import { normalizeRootPlanCriteria } from "./root-plan-criteria.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { parseTaskGraphSupersessionRelation, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
+import { parseTaskGraphBranchRepairRelation, TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, type TaskGraphBranchRepairRelation } from "./task-graph-pg-branch-repair-relation.js"
+import { parseTaskGraphBranchReplacement, type TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 
 export const STEERING_RECONCILIATION_EVENT_TYPE = "agent.plan.reconciliation" as const
 export const STEERING_RECONCILIATION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v1" as const
 export const STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v2" as const
+export const STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION = "agent-harness.v2.plan-reconciliation.v3" as const
 export const STEERING_RECONCILIATION_BLOCKER = "steering_reconciliation_pending" as const
 export const STEERING_RECONCILIATION_FEEDBACK = "Accepted user steering must be reconciled against the current TaskGraph before completion. Review current input and plan, then use agent.reconcile to keep the current revision or agent.plan to revise it." as const
 export const STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS = 128
@@ -16,7 +19,7 @@ const MAX_SEQUENCE = 9_223_372_036_854_775_807n
 type Row = Record<string, unknown>
 
 export type SteeringReconciliationReceipt = Readonly<{
-  schemaVersion: typeof STEERING_RECONCILIATION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
+  schemaVersion: typeof STEERING_RECONCILIATION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION | typeof STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
   sessionId: string
   turnId: string
   rootTaskId: string
@@ -27,6 +30,7 @@ export type SteeringReconciliationReceipt = Readonly<{
   steerInputIds: readonly string[]
   inputCheckpoint: Readonly<{ throughSequence: string }>
   supersession?: TaskGraphSupersessionRelation
+  branchRepair?: TaskGraphBranchRepairRelation
 }>
 export type SteeringReconciliationScope = TaskGraphReadScope & Readonly<{ stepId?: string; rootInputId?: string | null }>
 export type SteeringReconciliationOperation = Readonly<{
@@ -36,6 +40,7 @@ export type SteeringReconciliationOperation = Readonly<{
   callId: string
   rootInputId?: string | null
   replaceUnstartedNodeKey?: string
+  replaceBranch?: TaskGraphBranchReplacement
 }>
 export type SteeringReconciliationPendingInput = Readonly<{
   id: string
@@ -104,7 +109,7 @@ export function steeringReconciliationIdempotencyKey(scope: TaskGraphExecutionSc
   return `agent.plan.reconciliation:sha256:${createHash("sha256").update(identity, "utf8").digest("hex")}`
 }
 export function validSteeringReconciliationToolCall(event: Row, item: Row, scope: TaskGraphReadScope, stepId: string,
-  decision: "keep" | "revise", expectedRevision: number, replaceUnstartedNodeKey?: string): boolean {
+  decision: "keep" | "revise", expectedRevision: number, replaceUnstartedNodeKey?: string, replaceBranch?: TaskGraphBranchReplacement): boolean {
   const call = record(event.payload), content = record(item.content), input = record(content?.input)
   const toolName = decision === "keep" ? "agent.reconcile" : "agent.plan"
   const callId = call?.toolCallId
@@ -112,12 +117,19 @@ export function validSteeringReconciliationToolCall(event: Row, item: Row, scope
   const hasRootSuccessCriteria = Boolean(input && Object.hasOwn(input, "rootSuccessCriteria"))
   const normalizedRootSuccessCriteria = hasRootSuccessCriteria ? normalizeRootPlanCriteria(input?.rootSuccessCriteria) : undefined
   const expectedInputKeys = decision === "keep" ? ["decision,expectedRevision"]
-    : replaceUnstartedNodeKey === undefined
-      ? ["expectedRevision,nodes", "expectedRevision,nodes,rootSuccessCriteria"]
-      : ["expectedRevision,nodes,replaceUnstarted", "expectedRevision,nodes,replaceUnstarted,rootSuccessCriteria"]
+    : replaceBranch !== undefined
+      ? ["expectedRevision,nodes,replaceBranch", "expectedRevision,nodes,replaceBranch,rootSuccessCriteria"]
+      : replaceUnstartedNodeKey === undefined
+        ? ["expectedRevision,nodes", "expectedRevision,nodes,rootSuccessCriteria"]
+        : ["expectedRevision,nodes,replaceUnstarted", "expectedRevision,nodes,replaceUnstarted,rootSuccessCriteria"]
   const replacement = record(input?.replaceUnstarted)
+  const parsedBranch = replaceBranch === undefined ? undefined
+    : parseTaskGraphBranchReplacement(input?.replaceBranch, Array.isArray(input?.nodes) ? input.nodes : undefined)
+  const expectedBranch = replaceBranch === undefined ? undefined : parseTaskGraphBranchReplacement(replaceBranch)
   const validInputShape = expectedInputKeys.includes(inputKeys)
     && (!hasRootSuccessCriteria || normalizedRootSuccessCriteria !== null && normalizedRootSuccessCriteria !== undefined)
+    && (replaceBranch === undefined ? !Object.hasOwn(input ?? {}, "replaceBranch")
+      : parsedBranch?.ok === true && expectedBranch?.ok === true && JSON.stringify(parsedBranch.value) === JSON.stringify(expectedBranch.value))
   const scoped: TaskGraphExecutionScope = { ...scope, stepId }
   const executionIdentity = { kind: "turn" as const, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner,
@@ -133,7 +145,8 @@ export function validSteeringReconciliationToolCall(event: Row, item: Row, scope
     && content?.toolCallId === callId && content.toolName === toolName && content.toolVersion === "1" && input
     && validInputShape && input.expectedRevision === expectedRevision
     && (decision === "keep" ? input.decision === "keep" : Array.isArray(input.nodes)
-      && input.nodes.length > 0 && (replaceUnstartedNodeKey === undefined
+      && input.nodes.length > 0 && (replaceBranch !== undefined ? replaceUnstartedNodeKey === undefined && parsedBranch?.ok === true
+        : replaceUnstartedNodeKey === undefined
         || input.nodes.length === 1 && steeringReconciliationId(replaceUnstartedNodeKey)
           && replacement !== null && exact(replacement, ["nodeKey"]) && replacement.nodeKey === replaceUnstartedNodeKey)))
 }
@@ -148,20 +161,31 @@ export function parseSteeringReconciliationReceipt(value: unknown, expected?: St
       || !Array.isArray(row.steerInputIds)) return null
     const supersession = row.schemaVersion === STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
       ? parseTaskGraphSupersessionRelation(row.supersession) : null
+    const branchRepair = row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
+      ? parseTaskGraphBranchRepairRelation(row.branchRepair) : null
     if (row.schemaVersion === STEERING_RECONCILIATION_SCHEMA_VERSION) {
       if (!exact(row, baseKeys) || row.resultingRevision !== (row.decision === "keep" ? row.observedRevision : row.observedRevision + 1)) return null
-    } else if (row.schemaVersion !== STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION || !exact(row, [...baseKeys, "supersession"])
-      || row.decision !== "revise" || !supersession || supersession.observedRevision !== row.observedRevision
-      || supersession.resultingRevision !== row.resultingRevision || supersession.agentPlanCall.stepId !== row.stepId) return null
+    } else if (row.schemaVersion === STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION) {
+      if (!exact(row, [...baseKeys, "supersession"]) || row.decision !== "revise" || !supersession
+        || supersession.observedRevision !== row.observedRevision || supersession.resultingRevision !== row.resultingRevision
+        || supersession.agentPlanCall.stepId !== row.stepId) return null
+    } else if (row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION) {
+      if (!exact(row, [...baseKeys, "branchRepair"]) || row.decision !== "revise" || !branchRepair
+        || branchRepair.observedRevision !== row.observedRevision || branchRepair.resultingRevision !== row.resultingRevision
+        || branchRepair.agentPlanCall.stepId !== row.stepId) return null
+    } else return null
     const inputIds = row.steerInputIds as unknown[]
-    if (inputIds.length === 0 || inputIds.length > STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS || !inputIds.every(steeringReconciliationId)
+    const isBranchRepairReceipt = row.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
+    if ((inputIds.length === 0 && !isBranchRepairReceipt)
+      || inputIds.length > STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS || !inputIds.every(steeringReconciliationId)
       || new Set(inputIds).size !== inputIds.length || inputIds.some((id, index) => index > 0 && String(inputIds[index - 1]) >= id)) return null
     const checkpoint = record(row.inputCheckpoint)
     if (!checkpoint || !exact(checkpoint, ["throughSequence"]) || steeringReconciliationSequence(checkpoint.throughSequence) === null) return null
     if (expected && (row.sessionId !== expected.sessionId || row.turnId !== expected.turnId || row.rootTaskId !== expected.rootTaskId
       || expected.stepId !== undefined && row.stepId !== expected.stepId
-      || supersession && supersession.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, supersession.agentPlanCall.callId))) return null
-    const receipt = (supersession ? { ...row, supersession } : row) as unknown as SteeringReconciliationReceipt
+      || supersession && supersession.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, supersession.agentPlanCall.callId)
+      || branchRepair && branchRepair.operationKey !== steeringReconciliationIdempotencyKey({ ...expected, stepId: row.stepId }, branchRepair.agentPlanCall.callId))) return null
+    const receipt = (supersession ? { ...row, supersession } : branchRepair ? { ...row, branchRepair } : row) as unknown as SteeringReconciliationReceipt
     return Buffer.byteLength(JSON.stringify(receipt), "utf8") <= MAX_BYTES ? receipt : null
   } catch { return null }
 }

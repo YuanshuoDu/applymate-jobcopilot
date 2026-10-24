@@ -1,15 +1,14 @@
 import type pg from "pg"
 import { parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
-import {
-  parseSteeringReconciliationReceipt, steeringReconciliationId, steeringReconciliationIdempotencyKey, steeringReconciliationRevision, steeringReconciliationSequence,
-  STEERING_RECONCILIATION_EVENT_TYPE, validSteeringReconciliationScope, validSteeringReconciliationToolCall,
-  type SteeringReconciliationReceipt, type SteeringReconciliationScope,
-} from "./steering-reconciliation-contract.js"
+import { parseSteeringReconciliationReceipt, steeringReconciliationId, steeringReconciliationIdempotencyKey, steeringReconciliationRevision,
+  steeringReconciliationSequence, STEERING_RECONCILIATION_EVENT_TYPE, validSteeringReconciliationScope, validSteeringReconciliationToolCall,
+  type SteeringReconciliationReceipt, type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { loadTaskGraphCancellationSource, taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import { callMatches, type SupersessionCallBinding } from "./root-plan-criteria.js"
 import { taskGraphSupersessionEnvelopeMatches } from "./task-graph-pg-events.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
+import { assertTaskGraphBranchRepairHistory } from "./steering-reconciliation-branch-repair-history.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -32,10 +31,12 @@ function historyStep(row: Row | undefined): HistoryStep | null {
     || !Number.isSafeInteger(row.attempt) || Number(row.attempt) < 1 || typeof row.status !== "string" || !STEP_STATUSES.has(row.status) || cursor === null) return null
   return { id: row.id, ordinal: Number(row.ordinal), attempt: Number(row.attempt), cursor }
 }
+
 function ownerScope(scope: SteeringReconciliationScope): TaskGraphReadScope {
   return { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId,
     turnLeaseOwner: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion, parentLeaseOwner: scope.parentLeaseOwner, parentAttemptCount: scope.parentAttemptCount }
 }
+
 const callMatchDependencies = { object, validToolCall: validSteeringReconciliationToolCall, normalizedProposalNode,
   fingerprint: taskGraphSupersessionFingerprint, sameProposalNode }
 function toolCallQuery(): string {
@@ -45,16 +46,18 @@ function toolCallQuery(): string {
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'tool_call.started' AND event."taskId" = $3
       AND event."correlationId" = $4 AND item."taskId" = $3 AND item."type" = 'tool_call' AND item."stepId" = $5 LIMIT 2`
 }
+
 export async function assertSteeringReconciliationCall(client: Client, scope: TaskGraphExecutionScope, callId: string,
   decision: "keep" | "revise", expectedRevision: number, binding?: SupersessionCallBinding): Promise<bigint | null> {
   if (!validSteeringReconciliationScope(scope) || !steeringReconciliationId(callId) || !steeringReconciliationRevision(expectedRevision)) throw new Error("steering_reconciliation_call_invalid")
   const result = await client.query<Row>(toolCallQuery(), [scope.sessionId, scope.turnId, scope.rootTaskId, callId, scope.stepId])
   const sequence = result.rows.length === 1 ? steeringReconciliationSequence(result.rows[0]!.eventSequence) : null
-  let matches = result.rows.length === 1 && callMatches(result.rows[0]!, scope, scope.stepId, decision, expectedRevision, binding, callMatchDependencies)
+  const row = result.rows[0]
+  let matches = result.rows.length === 1 && callMatches(row!, scope, scope.stepId, decision, expectedRevision, binding, callMatchDependencies)
   if (!matches && result.rows.length === 1 && binding?.replacementFingerprint && binding.source) {
     const source = await loadTaskGraphCancellationSource(client, scope, { nodeKey: binding.source.nodeKey, taskId: binding.source.taskId,
       expectedRevision, stepId: scope.stepId })
-    if (source) matches = callMatches(result.rows[0]!, scope, scope.stepId, decision, expectedRevision,
+    if (source) matches = callMatches(row!, scope, scope.stepId, decision, expectedRevision,
       { ...binding, source: { ...binding.source, dependsOn: source.dependsOn } }, callMatchDependencies)
   }
   if (result.rows.length !== 1 || !matches
@@ -257,9 +260,11 @@ export async function* readSteeringReconciliationHistory(client: Client, scope: 
     })
     afterSequence = parsed.at(-1)!.sequence
     afterId = String(result.rows.at(-1)?.id)
-    const replacements = await assertSteeringReconciliationSupersessionEvents(client, scope, parsed.flatMap(entry => entry.receipt.supersession
-      ? [{ relation: entry.receipt.supersession, receiptEventId: entry.id, receiptSequence: entry.sequence }] : []))
-    await assertHistoryCalls(client, scope, parsed, replacements)
+    const replacements = await assertSteeringReconciliationSupersessionEvents(client, scope, parsed.flatMap(entry => entry.receipt.supersession ?
+      [{ relation: entry.receipt.supersession, receiptEventId: entry.id, receiptSequence: entry.sequence }] : []))
+    await Promise.all(parsed.flatMap(entry => entry.receipt.branchRepair ? [assertTaskGraphBranchRepairHistory(client, scope,
+      entry.receipt.branchRepair, { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey })] : []))
+    await assertHistoryCalls(client, scope, parsed.filter(entry => !entry.receipt.branchRepair), replacements)
     const stepIds = [...new Set(parsed.map(entry => entry.receipt.stepId))]
     const stepRows = await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence" FROM "agent_steps"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])`, [scope.sessionId, scope.turnId, scope.rootTaskId, stepIds])

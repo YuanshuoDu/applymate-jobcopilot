@@ -239,7 +239,8 @@ describe("agent.plan tool executor", () => {
     expect(descriptionTool.description).toContain("Repeat exactly those criteria and checks")
     expect(descriptionTool.description).toContain("omit graphRootTaskId because the server binds the active Root")
     expect(descriptionTool.description).toContain("must not add the target to dependsOn")
-    expect(descriptionTool.description).toContain("eight-node lifetime history cap, separate from active-child concurrency")
+    expect(descriptionTool.description).toContain("eight-node limit on the current graph snapshot, including retained terminal nodes")
+    expect(descriptionTool.description).toContain("not a lifetime task-creation cap")
     expect(descriptionTool.description).toContain("task_graph_current.nodeCapacity")
     expect(descriptionTool.description).toContain("may use the reserve in any node order")
     expect(descriptionTool.description).toContain("it does not pass a criterion")
@@ -487,6 +488,60 @@ describe("agent.plan tool executor", () => {
     expect(registry.validateArguments("agent.plan", { ...input, replaceUnstarted: { nodeKey: "stale-scout", taskId: "forged" } }, "1")).toEqual(expect.any(String))
   })
 
+  it("passes an exact multi-node branch mapping and rejects mixed replacement modes", async () => {
+    const { tool, commandPort, getReceived, getOperation } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+    })
+    const branchInput = {
+      expectedRevision: 4,
+      nodes: [
+        { ...proposal.nodes[0], key: "scout-new", goal: "Search with the revised approach" },
+        { key: "analyst-new", templateId: "analyst", goal: "Reassess current evidence", successCriteria: ["Explain the new evidence"],
+          dependsOn: ["scout-new"], verification: {
+            schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+            criteria: [{ id: "source-match", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-new" } }],
+          } },
+      ],
+      replaceBranch: {
+        root: { nodeKey: "scout-old", taskId: "task-scout-old" },
+        sources: [
+          { nodeKey: "scout-old", taskId: "task-scout-old", replacementKey: "scout-new" },
+          { nodeKey: "analyst-old", taskId: "task-analyst-old", replacementKey: "analyst-new" },
+        ],
+      },
+    }
+    const registry = new ToolRegistry([tool])
+    expect(registry.validateArguments("agent.plan", branchInput, "1")).toBe(true)
+    await expect(tool.execute(context(), branchInput)).resolves.toEqual(receipt)
+    expect(getReceived()?.replaceBranch).toEqual(branchInput.replaceBranch)
+    expect(getOperation()).toMatchObject({ decision: "revise", expectedRevision: 4, replaceBranch: branchInput.replaceBranch })
+    expect(getReceived()?.proposal.nodes.map(node => node.key)).toEqual(["scout-new", "analyst-new"])
+
+    const mixed = { ...branchInput, replaceUnstarted: { nodeKey: "scout-old" } }
+    expect(registry.validateArguments("agent.plan", mixed, "1")).toBe(true)
+    await expect(tool.execute(context(), mixed)).rejects.toMatchObject({ code: "task_graph_replacement_modes_conflict" })
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+  })
+
+  it("rejects an incomplete branch mapping before calling the command port", async () => {
+    const { tool, commandPort } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+    })
+    const invalid = {
+      expectedRevision: 4,
+      nodes: [proposal.nodes[0], proposal.nodes[0]],
+      replaceBranch: {
+        root: { nodeKey: "scout-old", taskId: "task-scout-old" },
+        sources: [{ nodeKey: "scout-old", taskId: "task-scout-old", replacementKey: proposal.nodes[0].key },
+          { nodeKey: "analyst-old", taskId: "task-analyst-old", replacementKey: "analyst-new" }],
+      },
+    }
+    await expect(tool.execute(context(), invalid)).rejects.toMatchObject({ code: "task_graph_branch_replacement_invalid" })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+  })
+
   it("returns the durable scheduler receipt to the model", async () => {
     const { tool, commandPort } = setup()
 
@@ -514,6 +569,29 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("if none is active, correct the rejected batch so each target/criterion has only one proposed attempt")
     expect(tool.description).toContain("wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits")
     expect(tool.description).toContain("An active repair is not evidence of success")
+  })
+
+  it("gives the model accurate branch-replanning and current-capacity guidance", () => {
+    const { tool } = setup()
+    const description = tool.description
+
+    expect(description).toContain("refresh the owner-scoped current TaskGraph and current Step agenda")
+    expect(description).toContain("replaceBranch: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }")
+    expect(description).toContain("every node in its transitive dependsOn descendant closure")
+    expect(description).toContain("preserve topology, registered roles, exact typed verification IDs/checks")
+    expect(description).toContain("remap only structured dependency selectors")
+    expect(description).toContain("replaceBranch and replaceUnstarted are mutually exclusive")
+    expect(description).toContain("queued or dependency-waiting sources with attemptCount=0")
+    expect(description).toContain("no lease, execution, wait condition, result, artifact, evidence, or reservation")
+    expect(description).toContain("a fresh model Step with the current graph and agenda revision")
+    expect(description).toContain("it does not require another human message")
+    expect(description).toContain("remaining is current-snapshot space")
+    expect(description).toContain("separate from active-child maxFanOut")
+    expect(description).toContain("Existing cumulative Root execution usage and reservations remain in force")
+    expect(description).toContain("not a lifetime task-creation cap")
+    expect(description).toContain("one global final current-snapshot slot for a valid failed-target criterion repair")
+    expect(description).not.toContain("eight-node lifetime history cap")
+    expect(description).not.toContain("consumes one lifetime slot")
   })
 
   it("requires two remaining root steps before persisting a plan", async () => {

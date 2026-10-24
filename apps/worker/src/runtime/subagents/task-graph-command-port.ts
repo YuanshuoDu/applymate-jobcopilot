@@ -1,5 +1,6 @@
 import type { PoolClient } from "pg"
 import type { TaskGraphProposal, TaskGraphReadiness, TaskGraphRepairOf } from "../planning/task-graph.js"
+import type { TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import type { SubagentTaskStatus } from "./types.js"
 import {
   TASK_GRAPH_VERIFIER_VERSION,
@@ -168,6 +169,8 @@ export type TaskGraphScheduleInput = Readonly<{
   rootSuccessCriteria?: readonly string[]
   /** Present only for the atomic native Root typed-leaf supersession path. */
   replaceUnstarted?: Readonly<{ nodeKey: string }>
+  /** Present only for atomic replacement of a complete unstarted typed branch. */
+  replaceBranch?: TaskGraphBranchReplacement
   /** Server-resolved from the persisted Turn objective; never populated from model tool input. */
   verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>

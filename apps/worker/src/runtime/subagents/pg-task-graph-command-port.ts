@@ -27,6 +27,7 @@ import { appendScheduledPrepare as appendScheduledPrepareCommand } from "./pg-sc
 import { appendScheduledGate as appendScheduledGateCommand } from "./pg-scheduled-task-graph-gate-command.js"
 import { resumeScheduledGateChoice as resumeScheduledGateChoiceCommand } from "./pg-scheduled-task-graph-gate-resume.js"
 import { verifyScheduledGateCompletion as verifyScheduledGateCompletionCommand } from "./pg-scheduled-task-graph-gate-verification.js"
+import { scheduleTaskGraphBranchRepair } from "./task-graph-pg-branch-repair.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -35,7 +36,6 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
   const historicalDiscoveryPageStore = createPgRootTaskHistoryResultPageStore(pool)
   return {
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
-      rejectPrivateScheduledGate(input.proposal)
       return transaction(pool, client => schedule(client, input))
     },
     async appendScheduledPrepare(input: TaskGraphScheduledPrepareInput): Promise<TaskGraphScheduledPrepareReceipt> {
@@ -51,9 +51,6 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
       return transaction(pool, client => verifyScheduledGateCompletionCommand(client, input))
     },
     async appendAndScheduleWithReconciliation(input, operation) {
-      rejectPrivateScheduledGate(input.proposal)
-      if (operation.decision !== "revise" || operation.expectedRevision !== input.proposal.expectedRevision
-        || !sameExecutionScope(input.scope, operation.scope)) throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")
       return transaction(pool, client => schedule(client, input, operation))
     },
     async reconcileSteering(operation) {
@@ -114,9 +111,20 @@ function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: Steeri
 }
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
   rejectPrivateScheduledGate(input.proposal)
-  const rootSuccessCriteria = requireNormalizedRootPlanCriteria(input.rootSuccessCriteria)
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
+  if (operation && (operation.decision !== "revise" || !sameExecutionScope(input.scope, operation.scope))) {
+    throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")
+  }
+  if (input.replaceBranch || operation?.replaceBranch) {
+    if (!operation) throw new TaskGraphCommandError("task_graph_branch_repair_not_eligible", "The branch replacement request is incomplete")
+    return scheduleTaskGraphBranchRepair(client, input, parent, operation, () => requireTaskGraphContinuationBudget(client, input.scope))
+  }
+  if (operation && operation.expectedRevision !== input.proposal.expectedRevision) {
+    throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")
+  }
+  rejectPrivateScheduledGate(input.proposal)
+  const rootSuccessCriteria = requireNormalizedRootPlanCriteria(input.rootSuccessCriteria)
   const loaded = await loadTaskGraph(client, input.scope, true, {
     includeSourceProvenance: !input.replaceUnstarted, currentStepId: input.scope.stepId,
     // TaskGraph is root-only, and TurnEngine records root Step attempts as 1.
