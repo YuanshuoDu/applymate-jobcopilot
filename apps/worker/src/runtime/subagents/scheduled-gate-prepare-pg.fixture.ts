@@ -217,7 +217,7 @@ async function persistToolReceipt(client: PoolClient, ids: ScheduledGatePrepareS
   await client.query(`INSERT INTO "agent_items"
     ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "startedAt", "completedAt", "createdAt", "updatedAt")
     VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-      ($7, $2, $3, $4, $5, 'tool_result', 'completed', $8::jsonb, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      ($7, $2, $3, $4, $5, 'tool_result', 'completed', $8::jsonb, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [callItemId, ids.sessionId, ids.turnId, stepId, taskId, JSON.stringify(call), resultItemId, JSON.stringify(result)])
   await persistToolEvent(client, ids, taskId, callItemId, callId, toolName, "tool_call.started", { taskId, toolCallId: callId, toolName, toolVersion: "1" })
   await persistToolEvent(client, ids, taskId, callItemId, callId, toolName, "tool_call.completed", {
