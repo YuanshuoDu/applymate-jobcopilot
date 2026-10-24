@@ -15,7 +15,7 @@ import {
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
 import { resolveTaskGraphRepairDependencies } from "./subagents/task-graph-dependency-context.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState } from "./subagents/task-graph-snapshot.js"
-import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
@@ -75,6 +75,39 @@ function historyReport(status: "failed" | "passed" | "unverified", criterionIds:
     evidenceDigest: status === "unverified" ? null : HISTORY_DIGEST,
     resultDigest: salt.repeat(64),
   }
+}
+
+function unresolvedRepairGraph(jobId: string, graphRootTaskId: string) {
+  const structuredResult = {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+    candidates: [{ jobId, source: "greenhouse", url: null, evidenceIds: ["selected-job-evidence"] }],
+    evidence: [{ id: "selected-job-evidence", kind: "job", ref: jobId, source: "greenhouse" }], summary: "Candidate found",
+  }
+  const target = { key: "repair-target", taskId: "repair-target-task", templateId: "scout", goal: "Find candidates",
+    successCriteria: ["Find two candidates"], dependsOn: [], status: "failed", readiness: "terminal",
+    verificationCriterionIds: ["candidate-count"], verificationReport: {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_missing",
+      criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "canonical_evidence_missing" }],
+      evidenceDigest: null, resultDigest: null,
+    }, resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" },
+  }
+  const repair = { key: "repair-attempt", taskId: "repair-attempt-task", templateId: "scout", goal: "Find candidates",
+    successCriteria: ["Find two candidates"], dependsOn: [], status: "failed", readiness: "terminal",
+    repairOf: { graphRootTaskId, nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-count"] },
+    verificationCriterionIds: ["candidate-count"], verificationReport: {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "repair_target_unresolved",
+      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: null, resultDigest: taskGraphResultDigest(structuredResult),
+    }, resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" },
+  }
+  return { revision: 4, nodes: [target, repair] }
+}
+
+function unresolvedRepairMemory(jobId: string, sourceTurnId: string, sourceRootTaskId: string, throughSequence: string) {
+  const record = projectSelectedJobMemory({ jobId, sourceTurnId, sourceRootTaskId, throughSequence,
+    graph: unresolvedRepairGraph(jobId, sourceRootTaskId) })
+  if (!record) throw new Error("canonical unresolved-repair memory fixture was invalid")
+  return record
 }
 
 function historicalRoleResult(role: "scout" | "analyst", count: number, status: "completed" | "partial", marker: string) {
@@ -841,6 +874,66 @@ describe("canonical Turn context builder", () => {
     }
     expect(systemText).not.toContain("private-prior")
     expect(systemText).not.toContain(jobId)
+    expect(request.tools).toEqual([{ name: "agent.plan", version: "1" }])
+    const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
+    expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
+    expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
+  })
+
+  it("retains only the fixed unresolved-repair hint through selected-job memory and the real request builder", async () => {
+    const jobId = "selected-job-repair-hint"
+    const graph = unresolvedRepairGraph(jobId, "root-a")
+    const currentMemory = unresolvedRepairMemory(jobId, lease.turnId, "root-a", "17")
+    const priorMemory = unresolvedRepairMemory(jobId, "PRIVATE_REPAIR_SOURCE_TURN", "PRIVATE_REPAIR_SOURCE_ROOT", "12")
+    expect(priorMemory.nodes.find(node => node.role === "scout" && node.historicalRepairReasonHint))
+      .toMatchObject({ status: "failed", historicalRepairReasonHint: "repair_target_unresolved" })
+    const historyReader: SelectedJobHistoryReader = {
+      load: vi.fn(async () => [{ record: priorMemory, terminalSequence: 12n }]),
+    }
+    const calls: unknown[] = []
+    const claimStore = store(calls)
+    const ownerFence: ContextOwnerFence = {
+      assertReferenceOwned: async () => undefined,
+      assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
+    }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("the injected history reader avoids another database client") } } as unknown as Pick<pg.Pool, "connect">,
+      store: claimStore, baseBuilder: new StepContextBuilder(claimStore, ownerFence), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+      planningEnabled: false, selectedJobMode: true, selectedJobMemories: [currentMemory], selectedJobId: jobId,
+      selectedJobHistoryReader: historyReader,
+    })
+    const snapshot: StepContextRequest["snapshot"] = {
+      system: [{ id: "fixed-system", content: "Keep current authorization checks." }], profile: [],
+      goal: { id: "goal-current", content: "CURRENT_GOAL_REPAIR_SENTINEL: find suitable roles" },
+      steerHistory: [{ id: "qa-current", content: { question: "Preferred city?", answer: "CURRENT_STEER_REPAIR_SENTINEL: Berlin" } }],
+      businessRefs: [{ id: jobId, kind: "job", ownerId: scope.userId, label: "Selected role" }],
+      toolObservations: [{ id: "task-graph-current", content: { kind: "task_graph_current", revision: graph.revision, nodes: graph.nodes } }],
+    }
+    const context = await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-repair-hint", snapshot,
+      now, mode: "new", lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now } })
+    const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context, model, tools: [{ name: "agent.plan", version: "1" }], sessionId: lease.sessionId,
+      turnId: lease.turnId, stepId: "step-repair-hint", userId: scope.userId, taskId: "root-a", signal: new AbortController().signal, freshSteering: true })
+    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const historyBlock = context.blocks.find(block => block.id === "observation:selected-job-history")
+    const memoryBlock = context.blocks.find(block => block.id === "observation:selected-job-memory")
+    const safeHistory = JSON.stringify(historyBlock?.content)
+    const visibleMemory = JSON.stringify(memoryBlock?.content)
+
+    expect(historyReader.load).toHaveBeenCalledWith(expect.objectContaining({ records: [currentMemory], jobId, rootTaskId: "root-a" }))
+    expect(safeHistory).toContain('"reasonHints":["repair_target_unresolved"]')
+    expect(safeHistory).not.toContain("historicalRepairReasonHint")
+    expect(safeHistory).not.toContain("PRIVATE_REPAIR_SOURCE_TURN")
+    expect(safeHistory).not.toContain("PRIVATE_REPAIR_SOURCE_ROOT")
+    expect(visibleMemory).toContain("selected_job_memory")
+    expect(visibleMemory).not.toContain("historicalRepairReasonHint")
+    expect(requestText).toContain("CURRENT_GOAL_REPAIR_SENTINEL")
+    expect(requestText).toContain("CURRENT_STEER_REPAIR_SENTINEL")
+    expect(requestText).toContain("selected_job_history")
+    expect(requestText).toContain('"reasonHints":["repair_target_unresolved"]')
+    expect(requestText).not.toContain("historicalRepairReasonHint")
+    expect(requestText).not.toContain("PRIVATE_REPAIR_SOURCE_TURN")
+    expect(requestText).not.toContain("PRIVATE_REPAIR_SOURCE_ROOT")
     expect(request.tools).toEqual([{ name: "agent.plan", version: "1" }])
     const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
     expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))

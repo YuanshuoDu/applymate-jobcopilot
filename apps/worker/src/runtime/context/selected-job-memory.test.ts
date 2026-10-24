@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { injectSelectedJobMemory, mergeSelectedJobMemories, parseSelectedJobMemories, projectSelectedJobMemory } from "./selected-job-memory.js"
+import { projectSelectedJobMemoryNodes } from "./selected-job-memory-node-projection.js"
+import { sha256Hex } from "./context-compaction-canonical.js"
 import type { StepContextSnapshot } from "./step-context-builder.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 
@@ -26,6 +28,9 @@ const snapshot: StepContextSnapshot = {
   system: [], profile: [], steerHistory: [], businessRefs: [],
   toolObservations: [{ id: "task-graph-current", content: { kind: "task_graph_current", revision: graph.revision, nodes: graph.nodes } }],
 }
+const unresolvedGraph = { revision: 5, nodes: [{ ...graph.nodes[0], status: "failed", verificationCriterionIds: ["salary-floor"],
+  verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "repair_target_unresolved",
+    evidenceDigest: null, resultDigest: "c".repeat(64), criteria: [{ criterionId: "salary-floor", status: "passed", reasonCode: "criteria_met" }] } }] }
 
 describe("selected-job memory", () => {
   it("projects only the selected job typed result and excludes graph narrative and internal IDs", () => {
@@ -38,6 +43,44 @@ describe("selected-job memory", () => {
       expect(serialized).not.toContain(secret)
     }
     expect(parseSelectedJobMemories([memory])).toEqual([memory])
+    const legacyNodes = projectSelectedJobMemoryNodes({ jobId: "job-a", graph })
+    if (!legacyNodes) throw new Error("expected the original unmarked node projection")
+    const oldIdentity = { schemaVersion: memory.schemaVersion, jobId: memory.jobId, sourceTurnId: memory.sourceTurnId,
+      sourceRootTaskId: memory.sourceRootTaskId, graphRevision: memory.graphRevision, throughSequence: memory.throughSequence, nodes: legacyNodes }
+    expect(memory).toEqual({ ...oldIdentity, graphDigest: sha256Hex(oldIdentity) })
+  })
+
+  it("retains only the exact unresolved-repair marker and binds it into the digest", () => {
+    const repair = projectSelectedJobMemory({ jobId: "job-a", sourceTurnId: "turn-repair", sourceRootTaskId: "root-repair",
+      throughSequence: "20", graph: unresolvedGraph })
+    expect(repair?.nodes[0]).toMatchObject({ status: "failed", historicalRepairReasonHint: "repair_target_unresolved" })
+    expect(repair?.nodes[0]).not.toHaveProperty("verification")
+    expect(parseSelectedJobMemories(repair ? [repair] : [])).toEqual(repair ? [repair] : [])
+    if (!repair) throw new Error("expected canonical unresolved-repair memory")
+
+    const withoutMarker = repair.nodes.map(({ historicalRepairReasonHint: _hint, ...node }) => node)
+    expect(parseSelectedJobMemories([{ ...repair, nodes: withoutMarker }])).toBeUndefined()
+    expect(parseSelectedJobMemories([{ ...repair, nodes: repair.nodes.map(node => ({ ...node, historicalRepairReasonHint: "private_reason" })) }])).toBeUndefined()
+    expect(parseSelectedJobMemories([{ ...repair, nodes: repair.nodes.map(node => ({ ...node, verification: { status: "unverified", criteria: [{ status: "passed", reasonCode: "criteria_met" }] } })) }])).toBeUndefined()
+
+    const ambiguousNodes = projectSelectedJobMemoryNodes({ jobId: "job-a", graph: unresolvedGraph })
+    if (!ambiguousNodes) throw new Error("expected the unmarked ambiguous legacy projection")
+    const ambiguousIdentity = { schemaVersion: repair.schemaVersion, jobId: repair.jobId, sourceTurnId: repair.sourceTurnId,
+      sourceRootTaskId: repair.sourceRootTaskId, graphRevision: repair.graphRevision, throughSequence: repair.throughSequence, nodes: ambiguousNodes }
+    expect(parseSelectedJobMemories([{ ...ambiguousIdentity, graphDigest: sha256Hex(ambiguousIdentity) }])).toBeUndefined()
+  })
+
+  it("strips the historical marker from the same-Turn model observation after freshness validation", () => {
+    const repair = projectSelectedJobMemory({ jobId: "job-a", sourceTurnId: "turn-repair", sourceRootTaskId: "root-repair",
+      throughSequence: "20", graph: unresolvedGraph })
+    if (!repair) throw new Error("expected canonical unresolved-repair memory")
+    const repairSnapshot: StepContextSnapshot = { ...snapshot, toolObservations: [{ id: "task-graph-current",
+      content: { kind: "task_graph_current", revision: unresolvedGraph.revision, nodes: unresolvedGraph.nodes } }] }
+    const injected = injectSelectedJobMemory({ snapshot: repairSnapshot, records: [repair], jobId: "job-a", turnId: "turn-repair", rootTaskId: "root-repair" })
+    const observation = injected.toolObservations.find(item => item.id === "selected-job-memory")?.content
+    expect(observation).toMatchObject({ kind: "selected_job_memory", nodes: [{ role: "analyst", status: "failed" }] })
+    expect(observation).not.toHaveProperty("nodes.0.historicalRepairReasonHint")
+    expect(JSON.stringify(observation)).not.toContain("repair_target_unresolved")
   })
 
   it("injects only when selector, turn, root and current graph digest all match", () => {
