@@ -2,6 +2,7 @@ import { Type, type TSchema } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphRepairOf } from "../planning/task-graph.js"
+import { TaskGraphBranchReplacementInputSchema, parseTaskGraphBranchReplacement, type TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
 import type { TaskGraphObjectiveCoverageRejection } from "../planning/task-graph-objective-coverage.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
@@ -93,6 +94,7 @@ function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?:
     replaceUnstarted: Type.Optional(Type.Object({
       nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
     }, { additionalProperties: false })),
+    replaceBranch: Type.Optional(TaskGraphBranchReplacementInputSchema),
   }, { additionalProperties: false })
 }
 
@@ -104,6 +106,7 @@ export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly
   nodes: readonly ModelTaskGraphNodeProposal[]
   rootSuccessCriteria?: readonly string[]
   replaceUnstarted?: Readonly<{ nodeKey: string }>
+  replaceBranch?: TaskGraphBranchReplacement
 }>
 
 export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
@@ -202,13 +205,22 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
+    if (input.replaceUnstarted && input.replaceBranch) {
+      throw new ToolExecutionError("task_graph_replacement_modes_conflict", "Choose either single-node or branch replacement")
+    }
     if (input.replaceUnstarted && input.nodes.length !== 1) {
       throw new ToolExecutionError("task_graph_supersession_requires_one_replacement", "Supersession accepts exactly one replacement node")
     }
+    const branch = input.replaceBranch ? parseTaskGraphBranchReplacement(input.replaceBranch, input.nodes) : undefined
+    if (branch && !branch.ok) {
+      throw new ToolExecutionError(branch.code, "Branch replacement mapping must be complete and match the proposed nodes", { code: branch.code })
+    }
     const reconciliation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
-    const operation = input.replaceUnstarted
-      ? { ...reconciliation, replaceUnstartedNodeKey: input.replaceUnstarted.nodeKey }
-      : reconciliation
+    const operation = {
+      ...reconciliation,
+      ...(input.replaceUnstarted ? { replaceUnstartedNodeKey: input.replaceUnstarted.nodeKey } : {}),
+      ...(branch?.ok ? { replaceBranch: branch.value } : {}),
+    }
     const scope = operation.scope
     const proposal: TaskGraphProposal = {
       expectedRevision: input.expectedRevision,
@@ -238,6 +250,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
         ...(input.replaceUnstarted ? {
           replaceUnstarted: { nodeKey: input.replaceUnstarted.nodeKey },
         } : {}),
+        ...(branch?.ok ? { replaceBranch: branch.value } : {}),
       }, operation)
       return receipt
     } catch (error: unknown) {

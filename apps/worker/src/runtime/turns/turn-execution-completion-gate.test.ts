@@ -460,6 +460,74 @@ describe("TaskGraph terminal verification gate", () => {
       expect.objectContaining({ blocker: "task_graph_verification_unverified" }), `final-rejected:${step.id}`)
   })
 
+  it("requires fresh Scout and Analyst reports after branch replanning", async () => {
+    const analystContract = {
+      schemaVersion: "agent-harness.v2.task-graph-verification.v1",
+      role: "analyst",
+      criteria: [{ id: "finding-present", check: { kind: "finding_count_gte", minimum: 1 } }],
+    }
+    const oldNodes = [node("source-scout", "source-scout-task"), {
+      key: "source-analyst", taskId: "source-analyst-task", templateId: "analyst", goal: "Score candidates",
+      successCriteria: ["Score one candidate"], dependsOn: ["source-scout"], depth: 2, verificationDisposition: "typed", verification: analystContract,
+    }]
+    const replacementNodes = [node("replacement-scout", "replacement-scout-task"), {
+      key: "replacement-analyst", taskId: "replacement-analyst-task", templateId: "analyst", goal: "Score refreshed candidates",
+      successCriteria: ["Score one refreshed candidate"], dependsOn: ["replacement-scout"], depth: 2, verificationDisposition: "typed", verification: analystContract,
+    }]
+    const analystResult = {
+      schemaVersion: "agent-harness.v2.subagent.result", role: "analyst", status: "completed",
+      findings: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }],
+      evidence: [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Verified",
+    }
+    const oldTasks = [
+      { id: "source-scout-task", status: "completed", role: "scout", taskType: "scout", failureReason: null, result: storedResult("passed") },
+      { id: "source-analyst-task", status: "completed", role: "analyst", taskType: "analyst", failureReason: null,
+        result: { taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+          criteria: [{ criterionId: "finding-present", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: digest,
+          resultDigest: taskGraphResultDigest(analystResult) }, structuredResult: analystResult } },
+    ]
+    const replacementTasks = [
+      { id: "replacement-scout-task", status: "queued", role: "scout", taskType: "scout", failureReason: null, result: null },
+      { id: "replacement-analyst-task", status: "waiting", role: "analyst", taskType: "analyst", failureReason: null, result: null },
+    ]
+    const durableTasks = [...oldTasks, ...replacementTasks]
+    const originalOldTasks = structuredClone(oldTasks)
+    const taskReads: string[][] = []
+    const clientFor = (nodes: unknown[], revision: number) => {
+      const content = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }
+      return { query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: "graph-item", revision, content }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks" AS task')) {
+          const requestedIds = params?.[0] as string[]
+          taskReads.push([...requestedIds])
+          const rows = durableTasks.filter(task => requestedIds.includes(task.id))
+          return { rows: rows.map(task => ({ ...task, expectedOutputSchema: {}, allowedActions: [], contextIsObject: true,
+            contextIsEmpty: true, hasPrivateSelectionContext: false, attemptCount: task.status === "queued" ? 0 : 1 })), rowCount: rows.length }
+        }
+        if (sql.includes('FROM "agent_events" AS event')) return { rows: [], rowCount: 0 }
+        throw new Error(`Unexpected graph query: ${sql}`)
+      }) } as never
+    }
+
+    await expect(checkTaskGraphTerminalVerification(clientFor(oldNodes, 4), graphLease, "root-1"))
+      .resolves.toMatchObject({ ok: true })
+    expect(oldTasks.map(task => task.result)).toEqual(originalOldTasks.map(task => task.result))
+
+    const replanned = await checkTaskGraphTerminalVerification(clientFor(replacementNodes, 5), graphLease, "root-1")
+    expect(replanned).toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    if (replanned.ok) return
+    expect(replanned.feedback).toContain("required evidence is missing, invalid, failed, or unresolved")
+    expect(taskReads).toEqual([
+      ["source-scout-task", "source-analyst-task"],
+      ["replacement-scout-task", "replacement-analyst-task"],
+    ])
+    expect(durableTasks.filter(task => task.id.startsWith("source-"))).toEqual(originalOldTasks)
+    expect(replacementTasks).toEqual([
+      expect.objectContaining({ id: "replacement-scout-task", status: "queued", result: null }),
+      expect.objectContaining({ id: "replacement-analyst-task", status: "waiting", result: null }),
+    ])
+  })
+
   it("returns bounded criterion feedback from the validated report without role-result contents", async () => {
     const target = node("scout", "task-scout"), sensitiveResult = { ...structuredResult("failed"), summary: "private alice@example.com" }
     const verifiedReport = { ...report("failed"), resultDigest: taskGraphResultDigest(sensitiveResult) }

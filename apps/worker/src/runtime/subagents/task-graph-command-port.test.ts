@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { TaskGraphCommandError, parseRegisteredScoutEnvelope, parseTaskGraphVerificationReport, taskGraphNodeKeysMatch } from "./task-graph-command-port.js"
-import type { TaskGraphCommandPort, TaskGraphExecutionScope, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
+import type { TaskGraphCommandPort, TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
 import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphDiscoveryRecoveryPageRequest } from "./task-graph-discovery-recovery-page-contract.js"
 
@@ -39,6 +39,25 @@ describe("scheduled Prepare receipt", () => {
 
     expect(waiting.choice).toEqual({ required: true, status: "waiting", waitId: "agent-question:turn:canonical:wait" })
     expect(noChoice.choice).toEqual({ required: false })
+  })
+})
+
+describe("branch replacement scheduling input", () => {
+  it("carries the exact source-to-fresh-key mapping to the atomic command port", () => {
+    const replaceBranch = {
+      root: { nodeKey: "scout-old", taskId: "task-scout-old" },
+      sources: [
+        { nodeKey: "scout-old", taskId: "task-scout-old", replacementKey: "scout-new" },
+        { nodeKey: "analyst-old", taskId: "task-analyst-old", replacementKey: "analyst-new" },
+      ],
+    } as const
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", parentTaskId: "root",
+        stepId: "step", turnLeaseOwner: "worker", turnLeaseVersion: 1, parentLeaseOwner: "worker", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 3, nodes: [] }, templates: {}, replaceBranch,
+    }
+    expect(input.replaceBranch).toEqual(replaceBranch)
+    expect(input.replaceUnstarted).toBeUndefined()
   })
 })
 

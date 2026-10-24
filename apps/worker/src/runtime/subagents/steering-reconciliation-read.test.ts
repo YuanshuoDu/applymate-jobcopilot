@@ -1,21 +1,48 @@
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type pg from "pg"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
-import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_SCHEMA_VERSION } from "./steering-reconciliation-contract.js"
+import {
+  parseSteeringReconciliationReceipt,
+  steeringReconciliationIdempotencyKey,
+  STEERING_RECONCILIATION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
+  type SteeringReconciliationReceipt,
+} from "./steering-reconciliation-contract.js"
+import type { SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
+import { TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, parseTaskGraphBranchRepairRelation,
+  taskGraphBranchRepairFingerprint, type TaskGraphBranchRepairCall } from "./task-graph-pg-branch-repair-relation.js"
+import { taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { assertNoUnresolvedSteering, readSteeringReconciliationState } from "./steering-reconciliation-read.js"
+
+const historyOverride = vi.hoisted(() => ({ entries: null as readonly unknown[] | null }))
+vi.mock("./steering-reconciliation-history.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./steering-reconciliation-history.js")>()
+  return {
+    ...actual,
+    readSteeringReconciliationHistory: (...args: Parameters<typeof actual.readSteeringReconciliationHistory>) => {
+      const entries = historyOverride.entries
+      if (entries === null) return actual.readSteeringReconciliationHistory(...args)
+      return (async function* () {
+        for (const entry of entries) yield entry as SteeringReconciliationHistoryEntry
+      })()
+    },
+  }
+})
 
 const scope: TaskGraphExecutionScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   stepId: "decision-step", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "root-owner", parentAttemptCount: 1 }
 const date = new Date("2026-10-01T00:00:00.000Z")
 const agendaContext: StepContext = { schemaVersion: "agent-harness.v2", sessionId: scope.sessionId, turnId: scope.turnId, stepId: scope.stepId,
   inputThroughSequence: 20n, consumedInputIds: [], canonicalJson: "{}", blocks: [] }
-function agendaPayload(stepId = scope.stepId) {
+function agendaPayload(stepId = scope.stepId, planRevision = 1) {
   const receipt = buildCognitiveAgendaReceipt({ sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, stepId,
-    agenda: { ...buildCognitiveActionAgenda({ ...agendaContext, stepId }), planRevision: 1 } })
+    agenda: { ...buildCognitiveActionAgenda({ ...agendaContext, stepId }), planRevision } })
   if (!receipt) throw new Error("agenda fixture should be valid")
   return receipt
 }
@@ -110,6 +137,111 @@ function fixture(options: { steerStatus?: string; steerConsumer?: string | null;
     return { rows: [], rowCount: 0 }
   }) } as unknown as Pick<pg.PoolClient, "query">
   return { client, calls, rootHint: options.rootHint }
+}
+
+function branchReceipt(stepId: string, cursor: string, observedRevision: number, suffix: string, sequence: number): SteeringReconciliationReceipt {
+  const replaceBranch = {
+    root: { nodeKey: "old-scout", taskId: "old-scout-task" },
+    sources: [
+      { nodeKey: "old-scout", taskId: "old-scout-task", replacementKey: "new-scout" },
+      { nodeKey: "old-analyst", taskId: "old-analyst-task", replacementKey: "new-analyst" },
+    ],
+  }
+  const callId = `branch-call-${suffix}`
+  const call: TaskGraphBranchRepairCall = { expectedRevision: observedRevision, replaceBranch,
+    nodes: [{ key: "new-scout" }, { key: "new-analyst" }] }
+  const relation = parseTaskGraphBranchRepairRelation({
+    schemaVersion: TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+    operationKey: steeringReconciliationIdempotencyKey({ ...scope, stepId }, callId), graphRootTaskId: scope.rootTaskId,
+    observedRevision, resultingRevision: observedRevision + 3,
+    root: replaceBranch.root,
+    sources: replaceBranch.sources.map((source, index) => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId },
+      replacementKey: source.replacementKey, cancellationEvent: { id: `cancel-${suffix}-${index}`, sequence: String(sequence + index) } })),
+    planEvent: { id: `plan-${suffix}`, sequence: String(sequence + 2), idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision) },
+    replacementFingerprint: taskGraphBranchRepairFingerprint(call),
+    agentPlanCall: { callId, stepId, expectedRevision: observedRevision, replaceBranch },
+  })
+  if (!relation) throw new Error("v3 branch receipt relation fixture must be valid")
+  const parsed = parseSteeringReconciliationReceipt({
+    schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, sessionId: scope.sessionId, turnId: scope.turnId,
+    rootTaskId: scope.rootTaskId, stepId, decision: "revise", observedRevision, resultingRevision: observedRevision + 3,
+    steerInputIds: [], inputCheckpoint: { throughSequence: cursor }, branchRepair: relation,
+  }, { ...scope, stepId })
+  if (!parsed) throw new Error("v3 branch receipt fixture must satisfy the stored contract")
+  return parsed
+}
+
+function legacyReceipt(version: "v1" | "v2", stepId: string, cursor: string, steerInputIds: readonly string[], suffix: string): SteeringReconciliationReceipt {
+  const callId = `legacy-call-${suffix}`, observedRevision = 1
+  const base = { sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId,
+    decision: version === "v1" ? "keep" as const : "revise" as const,
+    observedRevision, resultingRevision: version === "v1" ? observedRevision : observedRevision + 2,
+    steerInputIds, inputCheckpoint: { throughSequence: cursor } }
+  if (version === "v1") {
+    const parsed = parseSteeringReconciliationReceipt({ schemaVersion: STEERING_RECONCILIATION_SCHEMA_VERSION, ...base }, { ...scope, stepId })
+    if (!parsed) throw new Error("v1 receipt fixture must satisfy the stored contract")
+    return parsed
+  }
+  const supersession = {
+    schemaVersion: "agent-harness.v2.task-graph-supersession.v2",
+    operationKey: steeringReconciliationIdempotencyKey({ ...scope, stepId }, callId),
+    observedRevision, cancellationRevision: observedRevision + 1, resultingRevision: observedRevision + 2,
+    source: { nodeKey: "stale-scout", taskId: "stale-task" }, replacement: { nodeKey: "fresh-scout", taskId: "fresh-task" },
+    cancellationEvent: { id: `legacy-cancel-${suffix}`, sequence: "51" },
+    planEvent: { id: `legacy-plan-${suffix}`, sequence: "52", idempotencyKey: taskGraphSupersessionProposalKey(scope.rootTaskId, observedRevision) },
+    replacementFingerprint: "a".repeat(64),
+    agentPlanCall: { callId, stepId, expectedRevision: observedRevision, replaceUnstarted: { nodeKey: "stale-scout" } },
+  }
+  const parsed = parseSteeringReconciliationReceipt({ schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, ...base, supersession }, { ...scope, stepId })
+  if (!parsed) throw new Error("v2 receipt fixture must satisfy the stored contract")
+  return parsed
+}
+
+function historyEntry(receipt: SteeringReconciliationReceipt, stepOrdinal: number): SteeringReconciliationHistoryEntry {
+  return { receipt, stepOrdinal, stepAttempt: 1 }
+}
+
+function cursorFixture(options: Readonly<{
+  entries: readonly SteeringReconciliationHistoryEntry[]
+  currentStepId: string
+  currentOrdinal: number
+  currentCursor: string
+  currentRevision?: number
+  inputs?: ReturnType<typeof input>[]
+  consumers?: readonly Record<string, unknown>[]
+}>) {
+  const allInputs = options.inputs ?? []
+  const acceptedRows = allInputs.map(row => accepted(row))
+  const currentStep = { id: options.currentStepId, taskId: scope.rootTaskId, ordinal: options.currentOrdinal, attempt: 1,
+    status: "streaming", inputThroughSequence: options.currentCursor, consumedInputIds: [] as string[] }
+  const currentAgenda = agendaPayload(options.currentStepId)
+  const calls: Array<{ sql: string; values?: unknown[]; rows: number }> = []
+  const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+    let rows: Array<Record<string, unknown>> = []
+    if (sql.startsWith('SELECT session."id"') && sql.includes("pause_request")) rows = [{ id: scope.sessionId }]
+    else if (sql.includes('FOR UPDATE') && sql.includes('FROM "agent_sessions"')) rows = [{ id: scope.sessionId }]
+    else if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) rows = [{ id: scope.turnId }]
+    else if (sql.includes('FROM "sub_agent_tasks" AS task')) rows = [{ id: scope.rootTaskId }]
+    else if (sql.includes("WITH wall_clock")) rows = [{ turnLeaseValid: true, parentLeaseValid: true }]
+    else if (sql.includes('SELECT turn."input"')) rows = [{ input: { goal: "Find jobs" } }]
+    else if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) {
+      const after = values?.[3] == null ? null : BigInt(String(values[3])), afterId = String(values?.[4] ?? "")
+      rows = allInputs.filter(row => after === null || BigInt(row.acceptedSequence) > after
+        || BigInt(row.acceptedSequence) === after && row.id > afterId).slice(0, 64)
+    } else if (sql.includes('FROM "agent_inputs" AS input')) {
+      const ids = values?.[3] as string[]
+      rows = acceptedRows.filter(row => ids.includes(String(row.id)))
+    } else if (sql.includes('FROM "agent_steps"') && sql.includes("ANY($4::text[])")) {
+      const ids = values?.[3] as string[]
+      rows = (options.consumers ?? []).filter(row => ids.includes(String(row.id)))
+    } else if (sql.includes('FROM "agent_steps"') && values?.[0] === options.currentStepId) rows = [currentStep]
+    else if (sql.includes("cognitive.agenda")) rows = [{ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId,
+      correlationId: options.currentStepId, payload: currentAgenda }]
+    else if (sql.includes('FROM "agent_items"')) rows = [{ revision: options.currentRevision ?? 10 }]
+    calls.push({ sql, values, rows: rows.length })
+    return { rows, rowCount: rows.length }
+  }) } as unknown as Pick<pg.PoolClient, "query">
+  return { client, calls }
 }
 function longReadFixture(count: number, malformedIndex = -1, reverseDetails = false) {
   const root = input("original-input", "steer", "accepted", "1", null)
@@ -274,6 +406,8 @@ function capacityReadFixture(pendingCount: number, consumedCount = 0) {
   return { client, calls, scope: currentScope }
 }
 
+afterEach(() => { historyOverride.entries = null })
+
 describe("durable steering reconciliation reader", () => {
   it("excludes the Turn-bound original regardless of delivery and validates historical consumption", async () => {
     const f = fixture({ rootHint: null })
@@ -373,5 +507,78 @@ describe("durable steering reconciliation reader", () => {
     const f = longReadFixture(270, 269)
     await expect(readSteeringReconciliationState(f.client, scope)).rejects.toThrow("steering_reconciliation_receipt_invalid")
     expect(f.calls.filter(call => call.sql.includes('event."type" = $3')).length).toBeGreaterThan(4)
+  })
+
+  it("allows a consumed steer receipt followed by an empty branch receipt at the same stored Step cursor", async () => {
+    const steer = input("steer-1", "steer", "consumed", "10", "consumer-step")
+    const entries = [
+      historyEntry(legacyReceipt("v1", "decision-one", "10", [steer.id], "consumed"), 1),
+      historyEntry(branchReceipt("decision-two", "10", 1, "empty-after-consumption", 61), 2),
+    ]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "decision-three", currentOrdinal: 3, currentCursor: "10", currentRevision: 4,
+      inputs: [steer], consumers: [{ id: "consumer-step", taskId: scope.rootTaskId, ordinal: 0, attempt: 1,
+        status: "completed", inputThroughSequence: "10", consumedInputIds: [steer.id] }] })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "decision-three" })
+    expect(state.unresolvedInputs).toEqual([])
+    expect(state.decisionInputThroughSequence).toBe(10n)
+  })
+
+  it("allows an empty v3 receipt at the same cursor as its own current Step", async () => {
+    const entries = [historyEntry(branchReceipt("same-step", "10", 1, "same-step", 70), 1)]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "same-step", currentOrdinal: 1, currentCursor: "10", currentRevision: 4 })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "same-step" })
+    expect(state.decisionStepId).toBe("same-step")
+    expect(state.unresolvedInputs).toEqual([])
+  })
+
+  it("retains repeated empty v3 receipts at one cursor across later Steps", async () => {
+    const entries = [
+      historyEntry(branchReceipt("first-empty-step", "10", 1, "first-empty", 80), 1),
+      historyEntry(branchReceipt("later-empty-step", "10", 4, "later-empty", 83), 2),
+    ]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "current-step", currentOrdinal: 3, currentCursor: "10", currentRevision: 7 })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" })
+    expect(state.unresolvedInputs).toEqual([])
+    expect(state.decisionStepId).toBe("current-step")
+  })
+
+  it.each(["v1", "v2"] as const)("rejects repeated equal-cursor legacy %s receipts", async version => {
+    const steer = input("steer-1", "steer", "consumed", "10", "consumer-step")
+    const entries = [
+      historyEntry(legacyReceipt("v1", "decision-one", "10", [steer.id], "first-legacy"), 1),
+      historyEntry(legacyReceipt(version, "decision-two", "10", [steer.id], `second-${version}`), 2),
+    ]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "decision-three", currentOrdinal: 3, currentCursor: "10", currentRevision: 10,
+      inputs: [steer], consumers: [{ id: "consumer-step", taskId: scope.rootTaskId, ordinal: 0, attempt: 1,
+        status: "completed", inputThroughSequence: "10", consumedInputIds: [steer.id] }] })
+    await expect(readSteeringReconciliationState(f.client, { ...scope, stepId: "decision-three" }))
+      .rejects.toThrow("steering_reconciliation_receipt_history_invalid")
+  })
+
+  it("rejects a decreasing checkpoint even when both receipts are empty v3 branch decisions", async () => {
+    const entries = [
+      historyEntry(branchReceipt("first-step", "10", 1, "decrease-first", 90), 1),
+      historyEntry(branchReceipt("second-step", "9", 4, "decrease-second", 93), 2),
+    ]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "current-step", currentOrdinal: 3, currentCursor: "10", currentRevision: 7 })
+    await expect(readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" }))
+      .rejects.toThrow("steering_reconciliation_receipt_history_invalid")
+  })
+
+  it("does not infer a consumed steer omitted from an empty v3 receipt", async () => {
+    const steer = input("steer-1", "steer", "consumed", "10", "consumer-step")
+    const entries = [historyEntry(branchReceipt("empty-step", "10", 1, "omitted-steer", 100), 1)]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "current-step", currentOrdinal: 2, currentCursor: "10", currentRevision: 4,
+      inputs: [steer], consumers: [{ id: "consumer-step", taskId: scope.rootTaskId, ordinal: 0, attempt: 1,
+        status: "completed", inputThroughSequence: "10", consumedInputIds: [steer.id] }] })
+    await expect(readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" }))
+      .rejects.toThrow("steering_reconciliation_receipt_incomplete")
+    expect(f.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 })

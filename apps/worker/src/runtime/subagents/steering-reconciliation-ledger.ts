@@ -2,14 +2,17 @@ import type pg from "pg"
 import {
   parseSteeringReconciliationReceipt, steeringReconciliationIdempotencyKey, steeringReconciliationRevision,
   steeringReconciliationId, steeringReconciliationSequence, STEERING_RECONCILIATION_EVENT_TYPE,
-  STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
   type PreparedSteeringReconciliation, type SteeringReconciliationOperation, type SteeringReconciliationReceipt,
 } from "./steering-reconciliation-contract.js"
 import { assertNoUnresolvedSteering, readSteeringReconciliationState } from "./steering-reconciliation-read.js"
 import { assertSteeringReconciliationCall, assertSteeringReconciliationSupersessionEvents } from "./steering-reconciliation-history.js"
-import { appendTaskGraphReceipt } from "./task-graph-pg-events.js"
+import { assertTaskGraphBranchRepairCall, assertTaskGraphBranchRepairHistory, assertTaskGraphBranchRepairToolCall } from "./steering-reconciliation-branch-repair-history.js"
+import { appendTaskGraphReceiptWithIdentity } from "./task-graph-pg-events.js"
 import type { GraphEventScope } from "./task-graph-pg-state.js"
 import { parseTaskGraphSupersessionRelation, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
+import { parseTaskGraphBranchRepairRelation, type TaskGraphBranchRepairRelation } from "./task-graph-pg-branch-repair-relation.js"
+import { parseTaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -34,7 +37,11 @@ function operationKeyMatches(row: Row, operation: SteeringReconciliationOperatio
     || operation.replaceUnstartedNodeKey !== undefined && (!receipt.supersession
       || receipt.supersession.operationKey !== key || receipt.supersession.agentPlanCall.callId !== operation.callId
       || receipt.supersession.agentPlanCall.stepId !== operation.scope.stepId
-      || receipt.supersession.agentPlanCall.replaceUnstarted.nodeKey !== operation.replaceUnstartedNodeKey)) throw new Error("steering_reconciliation_idempotency_conflict")
+      || receipt.supersession.agentPlanCall.replaceUnstarted.nodeKey !== operation.replaceUnstartedNodeKey)
+    || operation.replaceBranch === undefined && receipt.branchRepair !== undefined
+    || operation.replaceBranch !== undefined && (!receipt.branchRepair || receipt.branchRepair.operationKey !== key
+      || receipt.branchRepair.agentPlanCall.callId !== operation.callId || receipt.branchRepair.agentPlanCall.stepId !== operation.scope.stepId
+      || !sameBranch(operation.replaceBranch, receipt.branchRepair.agentPlanCall.replaceBranch))) throw new Error("steering_reconciliation_idempotency_conflict")
   return receipt
 }
 async function existingReceipt(client: Client, operation: SteeringReconciliationOperation, key: string): Promise<Row | null> {
@@ -51,15 +58,19 @@ function prepared(operation: SteeringReconciliationOperation, receipt: SteeringR
     resultingRevision: receipt.resultingRevision, steerInputIds: receipt.steerInputIds,
     inputThroughSequence: BigInt(receipt.inputCheckpoint.throughSequence), idempotencyKey: key, receipt }
 }
+function sameBranch(left: SteeringReconciliationOperation["replaceBranch"], right: TaskGraphBranchRepairRelation["agentPlanCall"]["replaceBranch"]): boolean {
+  const parsed = parseTaskGraphBranchReplacement(left)
+  return parsed.ok && JSON.stringify(parsed.value) === JSON.stringify(right)
+}
 
 export async function prepareSteeringReconciliation(client: Client, operation: SteeringReconciliationOperation): Promise<PreparedSteeringReconciliation | null> {
   const { scope, expectedRevision, callId, decision } = operation
   const key = steeringReconciliationIdempotencyKey(scope, callId)
   if (!key || !steeringReconciliationRevision(expectedRevision) || decision !== "keep" && decision !== "revise") throw new Error("steering_reconciliation_operation_invalid")
   const state = await readSteeringReconciliationState(client, { ...scope, rootInputId: operation.rootInputId })
-  await assertSteeringReconciliationCall(client, scope, callId, decision, expectedRevision, operation.replaceUnstartedNodeKey === undefined ? undefined : {
-    replaceUnstartedNodeKey: operation.replaceUnstartedNodeKey, callId, stepId: scope.stepId, operationKey: key,
-  })
+  if (operation.replaceBranch) await assertTaskGraphBranchRepairToolCall(client, scope, callId, expectedRevision, operation.replaceBranch)
+  else await assertSteeringReconciliationCall(client, scope, callId, decision, expectedRevision,
+    operation.replaceUnstartedNodeKey === undefined ? undefined : { replaceUnstartedNodeKey: operation.replaceUnstartedNodeKey, callId, stepId: scope.stepId, operationKey: key })
   if (state.decisionStepId !== scope.stepId || state.agendaPlanRevision !== expectedRevision) throw new Error("steering_reconciliation_agenda_revision_conflict")
   const prior = await existingReceipt(client, operation, key)
   if (prior) {
@@ -69,11 +80,11 @@ export async function prepareSteeringReconciliation(client: Client, operation: S
     return prepared(operation, receipt, key)
   }
   if (state.currentRevision !== expectedRevision) throw new Error("steering_reconciliation_revision_conflict")
-  if (state.unresolvedInputs.length === 0) return null
+  if (state.unresolvedInputs.length === 0 && !operation.replaceBranch) return null
   if (state.decisionInputThroughSequence === null || state.unresolvedInputs.some(input => input.status !== "consumed" || !input.consumedByStepId
     || input.acceptedSequence > state.decisionInputThroughSequence!)) throw new Error("steering_reconciliation_unconsumed_input")
   const value = receiptFor(operation, state.unresolvedInputs.map(input => input.id), state.decisionInputThroughSequence)
-  if (!parseSteeringReconciliationReceipt(value, scope)) throw new Error("steering_reconciliation_receipt_invalid")
+  if (value.steerInputIds.length && !parseSteeringReconciliationReceipt(value, scope)) throw new Error("steering_reconciliation_receipt_invalid")
   return prepared(operation, value, key)
 }
 
@@ -92,6 +103,10 @@ function relationReceipt(base: SteeringReconciliationReceipt, relation: TaskGrap
   return { ...base, schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
     resultingRevision: relation.resultingRevision, supersession: relation }
 }
+function branchRepairReceipt(base: SteeringReconciliationReceipt, relation: TaskGraphBranchRepairRelation): SteeringReconciliationReceipt {
+  return { ...base, schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
+    resultingRevision: relation.resultingRevision, branchRepair: relation }
+}
 
 async function validateSupersession(client: Client, scope: SteeringReconciliationOperation["scope"], relation: TaskGraphSupersessionRelation,
   receiptEvent?: Row): Promise<void> {
@@ -108,15 +123,21 @@ async function validateSupersession(client: Client, scope: SteeringReconciliatio
 }
 
 export async function writeSteeringReconciliationReceipt(client: Client, value: PreparedSteeringReconciliation,
-  actualResultingRevision: number, requestedSupersession?: TaskGraphSupersessionRelation): Promise<void> {
+  actualResultingRevision: number, requestedSupersession?: TaskGraphSupersessionRelation,
+  requestedBranchRepair?: TaskGraphBranchRepairRelation): Promise<void> {
   const { scope } = value
   const key = steeringReconciliationIdempotencyKey(scope, value.callId)
   const relation = requestedSupersession ?? value.receipt.supersession
+  const branch = requestedBranchRepair ?? value.receipt.branchRepair
   const parsedRelation = relation ? parseTaskGraphSupersessionRelation(relation) : null
-  const receipt = parsedRelation ? value.receipt.supersession
+  const parsedBranch = branch ? parseTaskGraphBranchRepairRelation(branch) : null
+  const receipt = parsedBranch ? value.receipt.branchRepair
+    ? (sameReceipt(value.receipt, branchRepairReceipt(value.receipt, parsedBranch)) ? value.receipt : null)
+    : branchRepairReceipt(value.receipt, parsedBranch)
+    : parsedRelation ? value.receipt.supersession
     ? (sameReceipt(value.receipt, relationReceipt(value.receipt, parsedRelation)) ? value.receipt : null)
     : relationReceipt(value.receipt, parsedRelation) : value.receipt
-  if (!key || key !== value.idempotencyKey || !steeringReconciliationRevision(actualResultingRevision)
+  if (!key || key !== value.idempotencyKey || parsedRelation && parsedBranch || !steeringReconciliationRevision(actualResultingRevision)
     || !receipt || !parseSteeringReconciliationReceipt(receipt, scope)
     || value.receipt.decision !== value.decision || value.receipt.observedRevision !== value.expectedRevision
     || value.receipt.resultingRevision !== value.resultingRevision || value.inputThroughSequence < 0n
@@ -126,33 +147,50 @@ export async function writeSteeringReconciliationReceipt(client: Client, value: 
       || parsedRelation.agentPlanCall.stepId !== scope.stepId || parsedRelation.observedRevision !== value.expectedRevision
       || parsedRelation.resultingRevision !== value.expectedRevision + 2 || value.decision !== "revise"
       || actualResultingRevision !== parsedRelation.resultingRevision
-      || value.receipt.supersession && JSON.stringify(value.receipt.supersession) !== JSON.stringify(parsedRelation))) {
+      || value.receipt.supersession && JSON.stringify(value.receipt.supersession) !== JSON.stringify(parsedRelation))
+    || parsedBranch && (parsedBranch.operationKey !== key || parsedBranch.graphRootTaskId !== scope.rootTaskId
+      || parsedBranch.agentPlanCall.callId !== value.callId || parsedBranch.agentPlanCall.stepId !== scope.stepId
+      || parsedBranch.observedRevision !== value.expectedRevision || value.decision !== "revise"
+      || actualResultingRevision !== parsedBranch.resultingRevision
+      || value.receipt.branchRepair && JSON.stringify(value.receipt.branchRepair) !== JSON.stringify(parsedBranch))) {
     throw new Error("steering_reconciliation_prepared_invalid")
   }
-  if (!parsedRelation && actualResultingRevision !== value.resultingRevision) throw new Error("steering_reconciliation_prepared_invalid")
+  if (!parsedRelation && !parsedBranch && actualResultingRevision !== value.resultingRevision) throw new Error("steering_reconciliation_prepared_invalid")
   const operation: SteeringReconciliationOperation = { scope, decision: value.decision, expectedRevision: value.expectedRevision,
-    callId: value.callId, ...(parsedRelation ? { replaceUnstartedNodeKey: parsedRelation.source.nodeKey } : {}) }
+    callId: value.callId, ...(parsedRelation ? { replaceUnstartedNodeKey: parsedRelation.source.nodeKey } : {}),
+    ...(parsedBranch ? { replaceBranch: parsedBranch.agentPlanCall.replaceBranch } : {}) }
   const state = await readSteeringReconciliationState(client, scope)
-  let prior = parsedRelation ? await existingReceipt(client, operation, key!) : null
+  let prior = parsedRelation || parsedBranch ? await existingReceipt(client, operation, key!) : null
   if (parsedRelation) await validateSupersession(client, scope, parsedRelation, prior ?? undefined)
+  else if (parsedBranch) await assertTaskGraphBranchRepairCall(client, scope, parsedBranch)
   else await assertSteeringReconciliationCall(client, scope, value.callId, value.decision, value.expectedRevision)
-  if (!parsedRelation) prior = await existingReceipt(client, operation, key)
+  if (!parsedRelation && !parsedBranch) prior = await existingReceipt(client, operation, key)
   if (prior) {
     const priorReceipt = operationKeyMatches(prior, operation, key)
     if (!sameReceipt(priorReceipt, receipt)) throw new Error("steering_reconciliation_idempotency_conflict")
     if (state.currentRevision < priorReceipt.resultingRevision || state.decisionStepId !== scope.stepId
       || state.decisionInputThroughSequence?.toString() !== priorReceipt.inputCheckpoint.throughSequence) throw new Error("steering_reconciliation_idempotency_conflict")
+    if (parsedBranch) {
+      const sequence = steeringReconciliationSequence(prior.sequence)
+      if (!sequence || !steeringReconciliationId(prior.id)) throw new Error("steering_reconciliation_idempotency_conflict")
+      await assertTaskGraphBranchRepairHistory(client, scope, parsedBranch, { id: prior.id, sequence })
+    }
     return
   }
   const currentRevision = state.currentRevision
   const expected = value.decision === "keep" ? value.expectedRevision : value.expectedRevision + 1
-  const resultingRevision = parsedRelation?.resultingRevision ?? expected
+  const resultingRevision = parsedRelation?.resultingRevision ?? parsedBranch?.resultingRevision ?? expected
   if (actualResultingRevision !== resultingRevision || currentRevision !== actualResultingRevision) throw new Error("steering_reconciliation_graph_result_conflict")
   if (!matchesPrepared(state, operation, value)) throw new Error("steering_reconciliation_pending_set_changed")
-  await appendTaskGraphReceipt(client, {
+  const event = await appendTaskGraphReceiptWithIdentity(client, {
     scope: scope as GraphEventScope, itemId: null, taskId: scope.rootTaskId, type: STEERING_RECONCILIATION_EVENT_TYPE,
     idempotencyKey: key, actor: "orchestrator", causationId: scope.stepId, payload: receipt, outbox: false,
   })
+  if (parsedBranch) {
+    const sequence = steeringReconciliationSequence(event.sequence)
+    if (!sequence || !steeringReconciliationId(event.id)) throw new Error("steering_reconciliation_branch_repair_event_invalid")
+    await assertTaskGraphBranchRepairHistory(client, scope, parsedBranch, { id: event.id, sequence })
+  }
 }
 
 export { assertNoUnresolvedSteering, readSteeringReconciliationState }

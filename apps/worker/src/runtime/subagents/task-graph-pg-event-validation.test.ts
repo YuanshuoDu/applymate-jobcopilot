@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
-import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 
 const scope = { sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
@@ -85,6 +85,22 @@ describe("persisted TaskGraph event envelopes", () => {
       proposalIdentity(1))).toBeNull()
     expect(() => parsePersistedTaskGraphReceipt("item.delta", proposal(), loaded, snapshot, scope, proposalIdentity(0)))
       .toThrow("task_graph_receipt_invalid")
+  })
+
+  it("accepts an ordinary group-plan receipt keyed at the append revision after source cancellations", () => {
+    const observedRevision = 4, sourceCount = 2, resultRevision = observedRevision + sourceCount + 1
+    const groupLoaded = { ...loaded, revision: resultRevision }
+    const groupSnapshot = parseTaskGraphSnapshot(snapshot)
+    const groupProposal = proposal({
+      revision: resultRevision,
+      receipt: { status: "accepted", revision: resultRevision, nodes: [{ key: "child", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"] },
+      item: graphItem(resultRevision, { content: groupSnapshot }), content: groupSnapshot,
+    })
+
+    expect(parsePersistedTaskGraphReceipt("item.delta", groupProposal, groupLoaded, groupSnapshot, scope,
+      proposalIdentity(observedRevision + sourceCount))).toBeNull()
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", groupProposal, groupLoaded, groupSnapshot, scope,
+      proposalIdentity(observedRevision))).toThrow("task_graph_receipt_invalid")
   })
 
   it("rejects v2 proposals whose observed revision or event key does not bind the R-to-R+2 transition", () => {

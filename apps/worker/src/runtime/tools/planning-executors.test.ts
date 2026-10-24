@@ -487,6 +487,60 @@ describe("agent.plan tool executor", () => {
     expect(registry.validateArguments("agent.plan", { ...input, replaceUnstarted: { nodeKey: "stale-scout", taskId: "forged" } }, "1")).toEqual(expect.any(String))
   })
 
+  it("passes an exact multi-node branch mapping and rejects mixed replacement modes", async () => {
+    const { tool, commandPort, getReceived, getOperation } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+    })
+    const branchInput = {
+      expectedRevision: 4,
+      nodes: [
+        { ...proposal.nodes[0], key: "scout-new", goal: "Search with the revised approach" },
+        { key: "analyst-new", templateId: "analyst", goal: "Reassess current evidence", successCriteria: ["Explain the new evidence"],
+          dependsOn: ["scout-new"], verification: {
+            schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+            criteria: [{ id: "source-match", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-new" } }],
+          } },
+      ],
+      replaceBranch: {
+        root: { nodeKey: "scout-old", taskId: "task-scout-old" },
+        sources: [
+          { nodeKey: "scout-old", taskId: "task-scout-old", replacementKey: "scout-new" },
+          { nodeKey: "analyst-old", taskId: "task-analyst-old", replacementKey: "analyst-new" },
+        ],
+      },
+    }
+    const registry = new ToolRegistry([tool])
+    expect(registry.validateArguments("agent.plan", branchInput, "1")).toBe(true)
+    await expect(tool.execute(context(), branchInput)).resolves.toEqual(receipt)
+    expect(getReceived()?.replaceBranch).toEqual(branchInput.replaceBranch)
+    expect(getOperation()).toMatchObject({ decision: "revise", expectedRevision: 4, replaceBranch: branchInput.replaceBranch })
+    expect(getReceived()?.proposal.nodes.map(node => node.key)).toEqual(["scout-new", "analyst-new"])
+
+    const mixed = { ...branchInput, replaceUnstarted: { nodeKey: "scout-old" } }
+    expect(registry.validateArguments("agent.plan", mixed, "1")).toBe(true)
+    await expect(tool.execute(context(), mixed)).rejects.toMatchObject({ code: "task_graph_replacement_modes_conflict" })
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+  })
+
+  it("rejects an incomplete branch mapping before calling the command port", async () => {
+    const { tool, commandPort } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+    })
+    const invalid = {
+      expectedRevision: 4,
+      nodes: [proposal.nodes[0], proposal.nodes[0]],
+      replaceBranch: {
+        root: { nodeKey: "scout-old", taskId: "task-scout-old" },
+        sources: [{ nodeKey: "scout-old", taskId: "task-scout-old", replacementKey: proposal.nodes[0].key },
+          { nodeKey: "analyst-old", taskId: "task-analyst-old", replacementKey: "analyst-new" }],
+      },
+    }
+    await expect(tool.execute(context(), invalid)).rejects.toMatchObject({ code: "task_graph_branch_replacement_invalid" })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+  })
+
   it("returns the durable scheduler receipt to the model", async () => {
     const { tool, commandPort } = setup()
 
