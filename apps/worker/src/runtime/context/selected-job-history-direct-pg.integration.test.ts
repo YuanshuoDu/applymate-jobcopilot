@@ -51,6 +51,10 @@ const unresolvedRepairStructuredResult = {
   ],
   summary: "Found two candidate roles",
 }
+const unresolvedRepairAttemptVerification: TaskGraphVerificationContract = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+  criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
+}
 const matchingSources: Source[] = Array.from({ length: 10 }, (_, index) => ({
   turnId: `direct-history-source-turn-${index}-${suffix}`, rootTaskId: `direct-history-source-root-${index}-${suffix}`,
   childId: `direct-history-source-child-${index}-${suffix}`, finalItemId: `direct-history-source-final-${index}-${suffix}`,
@@ -72,7 +76,10 @@ const unresolvedRepairSource: Source = { turnId: `direct-history-repair-turn-${s
   childId: `direct-history-repair-target-${suffix}`, finalItemId: `direct-history-repair-final-${suffix}`,
   sessionId, userId, jobId, startSequence: 35, status: "failed", unresolvedRepair: true, verification: {
     schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
-    criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
+    criteria: [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } },
+      { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 3 } },
+    ],
   } }
 const otherSessionSource: Source = { turnId: `direct-history-other-session-turn-${suffix}`, rootTaskId: `direct-history-other-session-root-${suffix}`,
   childId: `direct-history-other-session-child-${suffix}`, finalItemId: `direct-history-other-session-final-${suffix}`,
@@ -118,7 +125,7 @@ async function insertSource(source: Source): Promise<void> {
     { key: "repair-target", templateId: "scout", goal: "Find a suitable role", successCriteria: ["Find one role"], dependsOn: [], depth: 1,
       taskId: source.childId, verificationDisposition: "typed", verification: source.verification! },
     { key: "repair-attempt", templateId: "scout", goal: "Find a suitable role", successCriteria: ["Find one role"], dependsOn: [], depth: 1,
-      taskId: repairChildId, verificationDisposition: "typed", verification: source.verification!, repairOf: {
+      taskId: repairChildId, verificationDisposition: "typed", verification: unresolvedRepairAttemptVerification, repairOf: {
         graphRootTaskId: source.rootTaskId, nodeKey: "repair-target", taskId: source.childId, criterionIds: ["candidate-count"],
       } },
   ] : [{ key: "scout", templateId: "scout", goal: "Find a suitable role", successCriteria: ["Find one role"], dependsOn: [], depth: 1, taskId: source.childId,
@@ -136,10 +143,7 @@ async function insertSource(source: Source): Promise<void> {
       CASE WHEN $4 = 'running' THEN NULL ELSE CURRENT_TIMESTAMP END, CURRENT_TIMESTAMP)`,
   [source.rootTaskId, source.sessionId, source.turnId, persistedRootStatus])
   const childRows = source.unresolvedRepair ? [
-    { id: source.childId, path: "/source/scout-target", status: "failed", failureReason: "fixture_stale_target_failure_reason", result: {
-      taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_missing",
-        evidenceDigest: null, resultDigest: null, criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "canonical_evidence_missing" }] },
-    } },
+    { id: source.childId, path: "/source/scout-target", status: "running", failureReason: null, result: null },
     { id: repairChildId, path: "/source/scout-repair", status: "running", failureReason: null, result: null },
   ] : [{ id: source.childId, path: "/source/scout", status: source.verification ? "running" : "completed", failureReason: null, result: null }]
   for (const child of childRows) {
@@ -201,7 +205,7 @@ async function materializeUnresolvedRepairSource(): Promise<void> {
     { key: "repair-target", templateId: "scout", goal: "Find a suitable role", successCriteria: ["Find one role"], dependsOn: [], depth: 1,
       taskId: source.childId, verificationDisposition: "typed", verification: source.verification! },
     { key: "repair-attempt", templateId: "scout", goal: "Find a suitable role", successCriteria: ["Find one role"], dependsOn: [], depth: 1,
-      taskId: repairTaskId, verificationDisposition: "typed", verification: source.verification!, repairOf: {
+      taskId: repairTaskId, verificationDisposition: "typed", verification: unresolvedRepairAttemptVerification, repairOf: {
         graphRootTaskId: source.rootTaskId, nodeKey: "repair-target", taskId: source.childId, criterionIds: ["candidate-count"],
       } },
   ] })
@@ -218,29 +222,60 @@ async function materializeUnresolvedRepairSource(): Promise<void> {
         nodes: snapshot.nodes.map(node => ({ key: node.key, taskId: node.taskId, status: "queued" as const })),
         readyTaskIds: snapshot.nodes.map(node => node.taskId) } })
 
-    const stepId = `direct-history-repair-step-${suffix}`, callId = `direct-history-repair-call-${suffix}`
-    const callItemId = `direct-history-repair-call-item-${suffix}`, resultItemId = `direct-history-repair-result-item-${suffix}`
     const output = { jobs: [{ id: jobId, source: "greenhouse" }, { id: `repair-secondary-${suffix}`, source: "lever" }] }
-    await client.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-      VALUES ($1, $2, $3, $4, 0, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [stepId, sessionId, source.turnId, repairTaskId])
-    await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
-      VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
-        ($7, $2, $3, $4, $5, 'tool_result', 'completed', 1, $8::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-    [callItemId, sessionId, source.turnId, stepId, repairTaskId,
-      JSON.stringify({ toolCallId: callId, toolName: "jobs.search", toolVersion: "1", input: {}, status: "completed", errorCode: null }),
-      resultItemId, JSON.stringify({ toolCallId: callId, output, errorCode: null })])
-    await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-      VALUES ($1, $2, $3, $4, $5, 41, 'tool_call.started', 'orchestrator', $6, $7, $8::jsonb),
-        ($9, $2, $3, $4, $5, 42, 'tool_call.completed', 'orchestrator', $6, $10, $11::jsonb)`,
-    [`direct-history-repair-call-started-${suffix}`, sessionId, source.turnId, callItemId, repairTaskId, callId,
-      `direct-history-repair:${callId}:started`, JSON.stringify({ taskId: repairTaskId, toolCallId: callId, toolName: "jobs.search" }),
-      `direct-history-repair-call-completed-${suffix}`, `direct-history-repair:${callId}:completed`,
-      JSON.stringify({ taskId: repairTaskId, toolCallId: callId, toolName: "jobs.search", status: "completed", errorCode: null })])
-    await client.query(`UPDATE "agent_sessions" SET "eventSequence" = 42 WHERE "id" = $1 AND "userId" = $2`, [sessionId, userId])
+    const insertSearchReceipt = async (taskId: string, label: string, startedSequence: number): Promise<void> => {
+      const stepId = `direct-history-${label}-step-${suffix}`, callId = `direct-history-${label}-call-${suffix}`
+      const callItemId = `direct-history-${label}-call-item-${suffix}`, resultItemId = `direct-history-${label}-result-item-${suffix}`
+      await client.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 0, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, sessionId, source.turnId, taskId])
+      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+          ($7, $2, $3, $4, $5, 'tool_result', 'completed', 1, $8::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [callItemId, sessionId, source.turnId, stepId, taskId,
+        JSON.stringify({ toolCallId: callId, toolName: "jobs.search", toolVersion: "1", input: {}, status: "completed", errorCode: null }),
+        resultItemId, JSON.stringify({ toolCallId: callId, output, errorCode: null })])
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'tool_call.started', 'orchestrator', $7, $8, $9::jsonb),
+          ($10, $2, $3, $4, $5, $11, 'tool_call.completed', 'orchestrator', $7, $12, $13::jsonb)`,
+      [`direct-history-${label}-call-started-${suffix}`, sessionId, source.turnId, callItemId, taskId, startedSequence, callId,
+        `direct-history-${label}:${callId}:started`, JSON.stringify({ taskId, toolCallId: callId, toolName: "jobs.search" }),
+        `direct-history-${label}-call-completed-${suffix}`, startedSequence + 1, `direct-history-${label}:${callId}:completed`,
+        JSON.stringify({ taskId, toolCallId: callId, toolName: "jobs.search", status: "completed", errorCode: null })])
+    }
+    await insertSearchReceipt(source.childId, "repair-target", 41)
+    await insertSearchReceipt(repairTaskId, "repair-attempt", 43)
+    await client.query(`UPDATE "agent_sessions" SET "eventSequence" = 44 WHERE "id" = $1 AND "userId" = $2`, [sessionId, userId])
+
+    const initial = await loadTaskGraph(client, scope, true)
+    if (!initial.snapshot || !initial.item || !initial.state) throw new Error("unresolved repair graph was not loaded")
+    const targetNode = initial.snapshot.nodes.find(node => node.taskId === source.childId)
+    if (!targetNode) throw new Error("unresolved repair target node was not loaded")
+    const targetVerification = await verifyTaskGraphNodeEvidence(client, { scope: { ...scope, taskId: source.childId, attemptCount: 1 },
+      snapshot: initial.snapshot, node: targetNode, structuredResult: unresolvedRepairStructuredResult })
+    expect(targetVerification.verified).toBe(false)
+    expect(targetVerification.report).toMatchObject({ status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+      ] })
+    expect(targetVerification.report.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(targetVerification.report.resultDigest).toBe(taskGraphResultDigest(unresolvedRepairStructuredResult))
+    const targetFinish = await prepareTaskGraphFinish(client, { taskId: source.childId, sessionId, attemptCount: 1,
+      status: "completed", retry: false, result: { structuredResult: unresolvedRepairStructuredResult },
+      ownerId: workerId, taskRole: "scout", taskType: "scout" })
+    expect(targetFinish.status).toBe("failed")
+    expect(targetFinish.failureReason).toBe("task_graph_verification_failed")
+    if (!targetFinish.graph || "blocked" in targetFinish.graph) throw new Error("repair target finish did not prepare a lifecycle transition")
+    const updatedTarget = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $6, "failureReason" = $7, "result" = $8::jsonb,
+      "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
+        AND "status" = 'running' AND "attemptCount" = $5`,
+    [source.childId, sessionId, source.turnId, source.rootTaskId, 1, targetFinish.status, targetFinish.failureReason, JSON.stringify(targetFinish.result)])
+    if (updatedTarget.rowCount !== 1) throw new Error("repair target fixture lost its running attempt fence")
+    await persistGraphTransition(client, targetFinish.graph, new Date())
 
     const loaded = await loadTaskGraph(client, scope, true)
-    if (!loaded.snapshot || !loaded.item || !loaded.state) throw new Error("unresolved repair graph was not loaded")
+    if (!loaded.snapshot || !loaded.item || !loaded.state) throw new Error("unresolved repair graph was not loaded after target failure")
     const repairNode = loaded.snapshot.nodes.find(node => node.taskId === repairTaskId)
     if (!repairNode) throw new Error("unresolved repair node was not loaded")
     const verification = await verifyTaskGraphNodeEvidence(client, { scope: { ...scope, taskId: repairTaskId, attemptCount: 1 },
@@ -257,9 +292,14 @@ async function materializeUnresolvedRepairSource(): Promise<void> {
     const graphBefore = await client.query(`SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2`,
       [taskGraphItemId(source.rootTaskId), sessionId])
     const targetRow = targetBefore.rows[0] as Record<string, unknown> | undefined
-    if (!targetRow || targetRow.failureReason !== "fixture_stale_target_failure_reason") throw new Error("fixture did not set the deliberate repair-target failureReason mismatch")
+    if (!targetRow || targetRow.failureReason !== "task_graph_verification_failed") throw new Error("repair target did not persist its canonical typed failure")
     const targetReport = (targetRow.result as Record<string, unknown>).taskGraphVerificationReport as Record<string, unknown>
-    expect(targetReport).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing", evidenceDigest: null })
+    expect(targetReport).toMatchObject({ status: "failed", reasonCode: "criterion_not_met",
+      evidenceDigest: targetVerification.report.evidenceDigest, resultDigest: targetVerification.report.resultDigest,
+      criteria: [
+        { criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+      ] })
 
     const finish = await prepareTaskGraphFinish(client, { taskId: repairTaskId, sessionId, attemptCount: 1,
       status: "completed", retry: false, result: { structuredResult: unresolvedRepairStructuredResult },
@@ -430,7 +470,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
     }
   })
 
-  it("projects the producer's unresolved-repair result after a deliberately mismatched target failureReason", async () => {
+  it("projects the producer's unresolved-repair result when a repair targets an already-passed criterion", async () => {
     const input: DirectSelectedJobHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, jobId, now: new Date() }
     const client = await pool!.connect()
@@ -446,7 +486,9 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
       const decision = await checkTaskGraphTerminalVerification(client, sourceLease, unresolvedRepairSource.rootTaskId)
       expect(decision).toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
       if (decision.ok) throw new Error("an unresolved repair source must not pass terminal TaskGraph verification")
+      expect(decision.feedback).toContain("issue=repair_receipt")
       expect(decision.feedback).toContain("reasonCode=repair_target_unresolved")
+      expect(decision.feedback).toContain("repair=rejected")
     } finally {
       client.release()
     }
@@ -465,7 +507,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
     })
     const encoded = JSON.stringify(block?.content ?? null)
     for (const privateValue of [unresolvedRepairSource.turnId, unresolvedRepairSource.rootTaskId, unresolvedRepairSource.childId,
-      `${unresolvedRepairSource.childId}-repair`, "repair-target", "repair-attempt", "candidate-count", TASK_GRAPH_VERIFIER_VERSION,
+      `${unresolvedRepairSource.childId}-repair`, "repair-target", "repair-attempt", "candidate-count", "evidence-count", TASK_GRAPH_VERIFIER_VERSION,
       jobId, `repair-secondary-${suffix}`, `read:job:${jobId}`, `read:job:repair-secondary-${suffix}`,
       "verification", "criteria", "criteria_met", "evidenceDigest", "resultDigest", "structuredResult", "Found two candidate roles",
       "task_graph_repair_target_unresolved"]) {
