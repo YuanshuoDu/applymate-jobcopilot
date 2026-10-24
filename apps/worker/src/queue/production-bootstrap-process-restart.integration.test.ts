@@ -148,6 +148,8 @@ type FixtureIds = {
   checkpointJobId?: string
   checkpointAnswer?: string
   readCallId?: string
+  policyJobId?: string
+  policySearchTarget?: string
 }
 type WorkerChild = ChildProcess & { output: string[]; errors: string[] }
 type ExitWaitContext = { stage: string; pid?: number; requestedSignal?: string; signalAccepted?: boolean; timeoutMs?: number }
@@ -199,7 +201,7 @@ type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: Command
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
 
-function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "duplicate-turn-redelivery" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
+function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "duplicate-turn-redelivery" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "policy-replay-worker1" | "policy-replay-worker2" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
@@ -729,6 +731,61 @@ async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId:
      FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`,
     [turnId, sessionId, toolCallId],
   )
+}
+
+async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId: string, toolCallId: string) {
+  const [events, tools, root] = await Promise.all([
+    pool.query<{
+      id: string; taskId: string | null; idempotencyKey: string; payload: Record<string, unknown>
+      outboxCount: string; eventReferenceCount: string; outboxId: string | null; outboxTopic: string | null
+      outboxAggregateId: string | null; outboxIdempotencyKey: string | null; outboxPayload: Record<string, unknown> | null
+    }>(
+      `SELECT event."id", event."taskId", event."idempotencyKey", event."payload",
+         (SELECT COUNT(*)::text FROM "agent_outbox" AS outbox
+          WHERE outbox."topic" = 'agent.events' AND outbox."aggregateId" = event."sessionId"
+            AND outbox."idempotencyKey" = 'agent-event:' || event."id") AS "outboxCount",
+         (SELECT COUNT(*)::text FROM "agent_outbox" AS outbox
+          WHERE outbox."topic" = 'agent.events' AND outbox."aggregateId" = event."sessionId"
+            AND outbox."payload"->>'eventId' = event."id") AS "eventReferenceCount",
+         outbox."id" AS "outboxId", outbox."topic" AS "outboxTopic", outbox."aggregateId" AS "outboxAggregateId",
+         outbox."idempotencyKey" AS "outboxIdempotencyKey", outbox."payload" AS "outboxPayload"
+       FROM "agent_events" AS event
+       LEFT JOIN "agent_outbox" AS outbox ON outbox."topic" = 'agent.events' AND outbox."aggregateId" = event."sessionId"
+         AND outbox."idempotencyKey" = 'agent-event:' || event."id"
+       WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'policy.decision'
+         AND event."correlationId" = $3 ORDER BY event."sequence"`,
+      [sessionId, turnId, toolCallId],
+    ),
+    pool.query<{
+      callCount: string; resultCount: string; completedCallCount: string; completedEventCount: string
+      result: Record<string, unknown> | null
+    }>(
+      `SELECT
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "callCount",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "resultCount",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_call' AND "status" = 'completed'
+           AND "content"->>'toolCallId' = $2 AND "content"->>'status' = 'completed') AS "completedCallCount",
+         (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = $1 AND "type" = 'tool_call.completed' AND "correlationId" = $2) AS "completedEventCount",
+         (SELECT "content" FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "result"`,
+      [turnId, toolCallId],
+    ),
+    pool.query<{
+      status: string; leaseOwnerId: string | null; leaseVersion: number; rootTaskId: string
+      rootStatus: string; rootAttemptCount: number; rootLeaseOwner: string | null
+      stepId: string | null; stepAttempt: number | null; stepTaskId: string | null
+    }>(
+      `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."rootTaskId",
+         root."status" AS "rootStatus", root."attemptCount" AS "rootAttemptCount", root."leaseOwner" AS "rootLeaseOwner",
+         step."id" AS "stepId", step."attempt" AS "stepAttempt", step."taskId" AS "stepTaskId"
+       FROM "agent_turns" AS turn
+       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+       LEFT JOIN "agent_items" AS item ON item."turnId" = turn."id" AND item."type" = 'tool_call' AND item."content"->>'toolCallId' = $3
+       LEFT JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."turnId" = turn."id"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2`,
+      [turnId, sessionId, toolCallId],
+    ),
+  ])
+  return { events: events.rows, tools: tools.rows[0] ?? null, root: root.rows[0] ?? null }
 }
 
 type CheckpointResumeDiagnostics = {
@@ -1591,6 +1648,120 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     if (cleanupFailures.length > 0) throw new Error(`Process-restart per-test cleanup failed:\n${cleanupFailures.join("\n")}`)
   })
 
+  async function restartAtDurablePolicyDecision(): Promise<void> {
+    const suffix = randomUUID()
+    const userId = `policy-replay-user-${suffix}`
+    const sessionId = `policy-replay-session-${suffix}`
+    const jobId = `policy-replay-job-${suffix}`
+    const searchTarget = `PolicyReplay-${suffix}`
+    const toolCallId = `policy-replay-read-${suffix}`
+    const policyIds: FixtureIds = {
+      suffix, userId, sessionId, turnId: `policy-replay-turn-pending-${suffix}`,
+      policyJobId: jobId, policySearchTarget: searchTarget, readCallId: toolCallId,
+    }
+    fixtureSessionIds.add(sessionId)
+    auxiliaryUserIds.add(userId)
+    fixtureJobIds.add(jobId)
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [userId, `${userId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Replay a durable policy decision before a read-only tool executes', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
+    await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "source", "updatedAt")
+      VALUES ($1, $2, $3, 'Fixture Engineer', 'manual', CURRENT_TIMESTAMP)`, [jobId, userId, searchTarget])
+
+    commandAcceptance = startWorker("accept-message", policyIds)
+    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: "policy-replay-command-acceptance", pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const acceptance = parseCommandAcceptance(acceptedLine)
+    expect(acceptance.accepted.disposition).toBe("started")
+    policyIds.turnId = acceptance.accepted.turnId
+    turnFixtureIds.add(policyIds.turnId)
+
+    workerOne = startWorker("policy-replay-worker1", policyIds)
+    const committedLine = await waitForLine(workerOne, "POLICY_DECISION_COMMITTED ", 30_000)
+    const committed = JSON.parse(committedLine.slice("POLICY_DECISION_COMMITTED ".length)) as {
+      eventId: string; idempotencyKey: string; outcome: string; taskId: string; attemptCount: number | null
+    }
+    const before = await policyDecisionReplayReceipt(pool!, policyIds.turnId, sessionId, toolCallId)
+    expect(before.events).toHaveLength(1)
+    const decision = before.events[0]!
+    const rootBefore = before.root
+    expect(rootBefore).toMatchObject({ status: "in_progress", rootStatus: "running", rootLeaseOwner: rootBefore?.leaseOwnerId })
+    expect(rootBefore?.leaseOwnerId).toBeTruthy()
+    expect(rootBefore?.rootTaskId).toBe(decision.taskId)
+    expect(rootBefore?.stepTaskId).toBe(rootBefore?.rootTaskId)
+    expect(rootBefore?.stepId).toBe((decision.payload.scope as Record<string, unknown>).stepId)
+    expect(Number.isSafeInteger(rootBefore?.rootAttemptCount)).toBe(true)
+    expect(Number.isSafeInteger(rootBefore?.stepAttempt)).toBe(true)
+    expect(decision).toMatchObject({
+      idempotencyKey: expect.stringMatching(/^policy-decision:/),
+      outboxCount: "1", eventReferenceCount: "1", outboxId: `agent-outbox-${decision.id}`,
+      outboxTopic: "agent.events", outboxAggregateId: sessionId, outboxIdempotencyKey: `agent-event:${decision.id}`,
+    })
+    expect(decision.payload).toMatchObject({
+      hook: "before_tool_use", outcome: "allow",
+      scope: { userId, sessionId, turnId: policyIds.turnId, stepId: rootBefore?.stepId,
+        toolCallId, toolName: "jobs.search", toolVersion: "1" },
+    })
+    expect(decision.outboxPayload).toMatchObject({ eventId: decision.id, sessionId, turnId: policyIds.turnId, payload: decision.payload })
+    expect(committed).toMatchObject({
+      eventId: decision.id, idempotencyKey: decision.idempotencyKey, outcome: "allow",
+      taskId: rootBefore?.rootTaskId, attemptCount: null,
+    })
+    expect(before.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedEventCount: "0" })
+    expect(workerOne.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
+
+    if (!workerOne.pid) throw new Error("Policy decision Worker A has no PID at the restart boundary")
+    const workerOnePid = workerOne.pid
+    const killContext: ExitWaitContext = { stage: "policy-replay-worker1-after-SIGKILL", pid: workerOnePid, requestedSignal: "SIGKILL" }
+    const killed = waitForExit(workerOne, killContext)
+    killContext.signalAccepted = workerOne.kill("SIGKILL")
+    await killed
+    expect(killContext.signalAccepted, exitWaitDiagnostics(workerOne, killContext)).toBe(true)
+    expect({ pid: workerOne.pid, signalCode: workerOne.signalCode }).toEqual({ pid: workerOnePid, signalCode: "SIGKILL" })
+
+    const expiredTurn = await pool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "leaseOwnerId" = $2 AND "status" = 'in_progress'`, [policyIds.turnId, rootBefore?.leaseOwnerId])
+    const expiredRoot = await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "status" = 'running' AND "leaseOwner" = $2`, [rootBefore?.rootTaskId, rootBefore?.leaseOwnerId])
+    expect(expiredTurn.rowCount).toBe(1)
+    expect(expiredRoot.rowCount).toBe(1)
+
+    workerTwo = startWorker("policy-replay-worker2", policyIds)
+    expect(workerTwo.pid).not.toBe(workerOnePid)
+    await waitForLine(workerTwo, "POLICY_REPLAY_WORKER_READY worker2", 30_000)
+    const replayLine = await waitForLine(workerTwo, "POLICY_DECISION_REPLAYED ", 60_000)
+    const replayed = JSON.parse(replayLine.slice("POLICY_DECISION_REPLAYED ".length)) as typeof committed
+    expect(replayed).toMatchObject({
+      eventId: decision.id, idempotencyKey: decision.idempotencyKey, outcome: "allow",
+      taskId: rootBefore?.rootTaskId, attemptCount: null,
+    })
+    await waitForLine(workerTwo, `POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`, 30_000)
+    await waitForLine(workerTwo, `POLICY_REPLAY_CONTEXT_OK ${toolCallId}`, 30_000)
+    await waitForTurnStatus(pool!, policyIds.turnId, "completed", 60_000, workerTwo)
+
+    const after = await policyDecisionReplayReceipt(pool!, policyIds.turnId, sessionId, toolCallId)
+    expect(after.events).toHaveLength(1)
+    expect(after.events[0]).toEqual(decision)
+    expect(after.root).toMatchObject({ rootTaskId: rootBefore?.rootTaskId, rootAttemptCount: rootBefore?.rootAttemptCount,
+      stepId: rootBefore?.stepId, stepAttempt: rootBefore?.stepAttempt, stepTaskId: rootBefore?.rootTaskId })
+    expect(after.tools).toMatchObject({ callCount: "1", resultCount: "1", completedCallCount: "1", completedEventCount: "1" })
+    expect(after.tools?.result).toMatchObject({
+      toolCallId, toolName: "jobs.search", status: "completed",
+      output: { jobs: [{ id: jobId, company: searchTarget }] },
+    })
+    const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [policyIds.turnId, sessionId])
+    expect(final.rows[0]?.finalResponse).toContain(`POLICY_REPLAY_FINAL_${suffix}`)
+    expect(workerOne.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
+    expect(workerTwo.output.filter(line => line === `POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`)).toHaveLength(1)
+    expect(workerTwo.output.filter(line => line.startsWith("POLICY_DECISION_REPLAYED "))).toHaveLength(1)
+
+    workerTwo.stdin?.write("shutdown\n")
+    await waitForLine(workerTwo, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
+    await waitForExit(workerTwo, { stage: "policy-replay-worker2-after-shutdown", pid: workerTwo.pid })
+    expect(workerTwo.exitCode).toBe(0)
+  }
+
   async function resumeAtDurableCheckpoint(kind: CheckpointKind): Promise<void> {
     const suffix = randomUUID()
     const userId = `checkpoint-user-${suffix}`
@@ -1797,6 +1968,10 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     async kind => resumeAtDurableCheckpoint(kind),
     90_000,
   )
+
+  it("re-evaluates the same policy decision after Worker A stops post-commit and before a read-only tool executes", async () => {
+    await restartAtDurablePolicyDecision()
+  }, 90_000)
 
   it("redelivers the retained completed BullMQ job ID without repeating persisted Turn work", async () => {
     const uuidNonce = randomUUID()

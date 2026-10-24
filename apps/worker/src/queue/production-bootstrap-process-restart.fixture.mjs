@@ -1,5 +1,6 @@
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../runtime/canonical-turn-runtime.ts"
+import { createPgTurnEngineStore } from "../runtime/turns/turn-engine-store.ts"
 import { startProductionAgentRuntime as startProductionAgentRuntimeHelper } from "./production-bootstrap.ts"
 import { startProductionWorkerRuntime } from "./production-worker-runtime.ts"
 
@@ -779,6 +780,109 @@ function checkpointInputs() {
   return ids
 }
 
+function installPolicyReplayToolMarker() {
+  if (!ids.policySearchTarget || !ids.readCallId) throw new Error("policy_replay_fixture_ids_missing")
+  const query = pool.query.bind(pool)
+  pool.query = (...args) => {
+    const sql = typeof args[0] === "string" ? args[0] : args[0]?.text
+    const values = Array.isArray(args[1]) ? args[1] : args[0]?.values
+    if (typeof sql === "string" && sql.includes('FROM "Job"') && values?.[1] === ids.policySearchTarget) {
+      say("POLICY_REPLAY_TOOL_EXECUTED " + ids.readCallId)
+    }
+    return query(...args)
+  }
+}
+
+function assertPolicyReplayResumeRequest(request) {
+  const callId = ids.readCallId
+  const parts = request.messages.flatMap((message, messageIndex) => Array.isArray(message.content)
+    ? message.content.map((part, partIndex) => ({ message, messageIndex, partIndex, part })) : [])
+  const calls = parts.filter(entry => entry.part?.type === "tool_use" && entry.part.id === callId)
+  const results = parts.filter(entry => entry.part?.type === "tool_result" && entry.part.toolUseId === callId)
+  const content = results[0]?.part.content
+  let output
+  try { output = typeof content === "string" ? JSON.parse(content) : undefined } catch { output = undefined }
+  const job = output?.jobs?.[0]
+  if (calls.length !== 1 || calls[0].message.role !== "assistant" || calls[0].part.name !== "jobs.search"
+    || results.length !== 1 || results[0].message.role !== "tool" || calls[0].messageIndex >= results[0].messageIndex
+    || output?.jobs?.length !== 1 || job?.id !== ids.policyJobId || job?.company !== ids.policySearchTarget) {
+    throw new Error("policy_replay_resume_context_missing_unique_read_result")
+  }
+  say("POLICY_REPLAY_CONTEXT_OK " + callId)
+}
+
+async function makePolicyReplayWorker(firstWorker) {
+  installPolicyReplayToolMarker()
+  await startFixtureProductionRuntime({
+    workerId: `policy-replay-worker-${firstWorker ? "worker1" : "worker2"}-${process.pid}`,
+    productionFlags: {
+      childExecutionEnabled: false,
+      coordinationEnabled: false,
+      consumeWaitOutcomes: false,
+      canonicalAutomationEnabled: false,
+    },
+    runtimeOptions: {
+      turnEngineStoreFactory(database, terminalGuard) {
+        const store = createPgTurnEngineStore(database, terminalGuard)
+        return {
+          ...store,
+          async appendEvent(input) {
+            const result = await store.appendEvent(input)
+            if (input.type === "policy.decision" && input.correlationId === ids.readCallId) {
+              const marker = JSON.stringify({
+                eventId: result.id,
+                idempotencyKey: input.idempotencyKey,
+                outcome: input.payload?.outcome,
+                taskId: input.owner.taskId,
+                attemptCount: input.owner.kind === "task" ? input.owner.attemptCount : null,
+              })
+              if (firstWorker) {
+                say("POLICY_DECISION_COMMITTED " + marker)
+                await waitForCommand("release-policy-decision")
+              } else say("POLICY_DECISION_REPLAYED " + marker)
+            }
+            return result
+          },
+        }
+      },
+      modelRuntimeFactory() {
+        let modelCalls = 0
+        return {
+          adapter: {
+            id: `policy-replay-${firstWorker ? "worker1" : "worker2"}-fixture-model`,
+            profile: modelProfile(),
+            async *stream(request) {
+              modelCalls += 1
+              if (firstWorker) {
+                if (modelCalls !== 1) throw new Error("unexpected_policy_replay_worker1_model_round")
+                const tools = request.tools.flatMap(tool => tool && typeof tool === "object" && typeof tool.name === "string" ? [tool.name] : [])
+                if (!tools.includes("jobs.search")) throw new Error("canonical_jobs_search_tool_not_visible")
+                yield {
+                  type: "tool_call_completed", callId: ids.readCallId, name: "jobs.search",
+                  arguments: { target: ids.policySearchTarget, page: 1, limit: 1 },
+                }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (modelCalls !== 1) throw new Error("unexpected_policy_replay_worker2_model_round")
+              assertPolicyReplayResumeRequest(request)
+              yield { type: "text_delta", text: "POLICY_REPLAY_FINAL_" + ids.suffix }
+              yield { type: "completed", finishReason: "stop" }
+            },
+          },
+          registry: {}, candidates: [],
+        }
+      },
+    },
+    bootstrapOptions: {
+      ownerId: `policy-replay-${firstWorker ? "worker1" : "worker2"}-${process.pid}`,
+      turnRecoveryIntervalMs: 10,
+    },
+  })
+  say(`POLICY_REPLAY_WORKER_READY ${firstWorker ? "worker1" : "worker2"}`)
+  await waitForStop()
+}
+
 async function persistCheckpointWait() {
   const checkpoint = checkpointInputs()
   const turnResult = await pool.query(`SELECT "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [ids.turnId, ids.sessionId, ids.userId])
@@ -1022,6 +1126,8 @@ async function run() {
   else if (mode === "accept-active-follow-up") await acceptActiveFollowUp()
   else if (mode === "resume-active-follow-up") await makeFollowUpResumeWorker()
   else if (mode === "replay-active-terminal") await replayActiveTerminal()
+  else if (mode === "policy-replay-worker1") await makePolicyReplayWorker(true)
+  else if (mode === "policy-replay-worker2") await makePolicyReplayWorker(false)
   else if (mode === "checkpoint-worker1") await makeCheckpointWorker(true)
   else if (mode === "checkpoint-worker2") await makeCheckpointWorker(false)
   else if (mode === "resolve-checkpoint") await resolveCheckpointWait()
